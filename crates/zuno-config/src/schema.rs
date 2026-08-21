@@ -110,6 +110,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "attachment",
     "enterprise",
     "web_search",
+    "goal",
     "tool_output",
     "compaction",
     "memory",
@@ -246,6 +247,9 @@ pub struct Config {
     /// Web-search provider and runtime-owned batch limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_search: Option<WebSearchConfig>,
+    /// Persistent goal continuation and retry settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<GoalConfig>,
     /// Thresholds for truncating tool output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<ToolOutputConfig>,
@@ -442,6 +446,31 @@ pub enum WebSearchBackend {
     Exa,
     /// Parallel MCP search.
     Parallel,
+}
+
+/// Persistent goal runtime settings.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct GoalConfig {
+    /// Automatic recovery after a retryable terminal turn failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<GoalRetryConfig>,
+}
+
+/// Exponential backoff settings for automatic goal recovery.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct GoalRetryConfig {
+    /// Delay before the first retry, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_delay_ms: Option<NonZeroU64>,
+    /// Maximum delay between retries, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_delay_ms: Option<NonZeroU64>,
+    /// Symmetric jitter percentage for locally selected delays, in the inclusive range 0..=100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jitter_percent: Option<u8>,
+    /// Maximum wait before checking for queued human input, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<NonZeroU64>,
 }
 
 /// Tool-output truncation thresholds (`config/config.ts:137-150`).

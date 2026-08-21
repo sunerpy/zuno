@@ -37,7 +37,7 @@
 use serde_json::Value;
 use zuno_db::message::{MessageRole, MessageStore, MessageWithParts, PartKind};
 use zuno_db::{Connection, open, session};
-use zuno_error::DbError;
+use zuno_error::{DbError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools};
 use zuno_llm::event::{Message, Role, StreamEvent};
 use zuno_llm::registry::{CompletionRequest, Provider};
@@ -45,8 +45,8 @@ use zuno_tool::ToolDefinition;
 
 use crate::compaction::{
     CompactionCache, CompactionError, CompactionHooks, CompactionOutcome, CompactionPolicy,
-    CompactionRequest, CompactionState, CompactionTrigger, TokenWindow, TranscriptEntry,
-    run_compaction, summary_safe_message_owned,
+    CompactionRequest, CompactionState, CompactionStopReason, CompactionTrigger, TokenWindow,
+    TranscriptEntry, run_compaction, summary_safe_message_owned,
 };
 use crate::r#loop::{
     ResolvedModel, hydrate_retained_history, map_project_history_owned_with_ids, project_history,
@@ -197,6 +197,13 @@ pub async fn run_prelude(
         Err(CompactionSkipped::Reason(reason)) => {
             outcome.skipped.push(format!("compaction: {reason}"));
         }
+        Err(CompactionSkipped::Stopped {
+            reason, message, ..
+        }) => {
+            outcome
+                .skipped
+                .push(format!("compaction: {reason:?}: {message}"));
+        }
     }
     Ok(outcome)
 }
@@ -292,6 +299,12 @@ pub enum CompactionSkipped {
     Database(DbError),
     /// The history overflowed and the attempt could not be made or completed.
     Reason(String),
+    /// A compaction attempt reached a typed terminal result.
+    Stopped {
+        reason: CompactionStopReason,
+        message: String,
+        recovery: Recovery,
+    },
 }
 
 /// The prelude-facing result of checking and, when needed, compacting history.
@@ -425,9 +438,15 @@ async fn compact_history(
             continue_turn: transcript.auto_continue,
         }),
         CompactionOutcome::NotNeeded => Ok(PreludeCompactionOutcome::NOT_NEEDED),
-        CompactionOutcome::Stopped { reason, message } => {
-            Err(CompactionSkipped::Reason(format!("{reason:?}: {message}")))
-        }
+        CompactionOutcome::Stopped {
+            reason,
+            message,
+            recovery,
+        } => Err(CompactionSkipped::Stopped {
+            reason,
+            message,
+            recovery,
+        }),
     }
 }
 

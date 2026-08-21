@@ -810,6 +810,31 @@ fn malformed_json_is_reported_as_json_not_validation() {
     assert_eq!(source.line(), 2);
 }
 
+#[test]
+fn goal_retry_settings_preserve_every_backoff_tunable() {
+    let config = parse_value(json!({
+        "goal": {
+            "retry": {
+                "initial_delay_ms": 2_000,
+                "max_delay_ms": 300_000,
+                "jitter_percent": 20,
+                "poll_interval_ms": 250
+            }
+        }
+    }))
+    .expect("goal retry config parses");
+    let retry = config
+        .goal
+        .expect("goal config")
+        .retry
+        .expect("retry config");
+
+    assert_eq!(retry.initial_delay_ms.map(NonZeroU64::get), Some(2_000));
+    assert_eq!(retry.max_delay_ms.map(NonZeroU64::get), Some(300_000));
+    assert_eq!(retry.jitter_percent, Some(20));
+    assert_eq!(retry.poll_interval_ms.map(NonZeroU64::get), Some(250));
+}
+
 // ---------------------------------------------------------------------------
 // QA: the real corpora.
 // ---------------------------------------------------------------------------

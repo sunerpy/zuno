@@ -63,7 +63,11 @@ Session input uses a durable FIFO inbox shared by user prompts, live steering, a
 reports. Background `task` calls support `reportDelivery: nextStep | quiet`, while the `job` tool
 queries durable status. `web_search` accepts a `queries` array, runs queries concurrently, cancels
 sibling requests after the first failure, waits for settlement, and merges results deterministically
-with URL deduplication. See [the Harness Runtime guide](../harness-runtime.md).
+with URL deduplication. Active goals persist exponential backoff for network, rate-limit, truncated
+stream, database-lock, and turn-budget failures, then reconstruct the deadline when the session is
+reopened. Human input wins over automatic work. Tool failures become model-visible tool results and
+are never replayed mechanically; authentication, cancellation, and permanent configuration failures
+pause or block instead. See [the Harness Runtime guide](../harness-runtime.md).
 
 ## Documentation
 

@@ -27,6 +27,36 @@ User prompts and subagent reports share this protocol:
 - An idle parent is claimed and driven immediately.
 - A restarted process recovers pending reports from the durable inbox.
 
+## Durable goal recovery
+
+An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. If that sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
+
+The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
+
+Local delays use exponential backoff with symmetric jitter. A valid provider `Retry-After` value is used exactly and is never shortened by negative jitter. A provider delay beyond the local ceiling falls back to the capped local policy instead of stalling the harness for an unbounded interval.
+
+```json
+{
+  "goal": {
+    "retry": {
+      "initial_delay_ms": 2000,
+      "max_delay_ms": 300000,
+      "jitter_percent": 20,
+      "poll_interval_ms": 250
+    }
+  }
+}
+```
+
+Recovery is selected from typed errors, never rendered messages:
+
+- Transport failures, rate limits, incomplete streams, SQLite writer contention, empty assistant messages, and per-turn step limits schedule another goal turn.
+- Context-limit failures compact retained history before retrying. Successful compaction is persisted as its own retry phase so a restart does not compact the same history twice.
+- Authentication failures, user interruption, and a closed event consumer pause the goal for human action.
+- Invalid provider protocol, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal.
+
+Tool failures do not cause the harness to replay a call. The loop persists the failed tool result and gives it to the model in the next step, including timeouts that might have completed an external side effect before their response was lost. A later recovery turn receives a hidden, SQL-derived notice naming the retry attempt and requiring inspection of the worktree or external state before repeating an action with side effects.
+
 ## Background subagents
 
 `task` creates a distinct `job_*` identifier for each background run while retaining a separate child session identifier for conversational continuation.

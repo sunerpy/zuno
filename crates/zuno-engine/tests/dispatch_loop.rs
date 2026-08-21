@@ -120,6 +120,37 @@ impl Tool for SequentialTool {
     }
 }
 
+struct TimeoutTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for TimeoutTool {
+    fn id(&self) -> &str {
+        "fragile"
+    }
+
+    fn description(&self) -> &str {
+        "A side-effecting operation whose response may time out."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(ToolError::Timeout {
+            tool: self.id().to_owned(),
+            elapsed: Duration::from_secs(30),
+        })
+    }
+}
+
 fn seeded() -> Connection {
     let mut connection = open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
     migration::apply(&mut connection).expect("apply schema");
@@ -353,6 +384,80 @@ async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
     assert_eq!(statuses, ["error", "completed"]);
     assert_eq!(order, ["git status"]);
     eprintln!("DENIAL_QA transcript={transcript:?} persisted={statuses:?} order={order:?}");
+}
+
+#[tokio::test]
+async fn dispatch_loop_reports_a_tool_timeout_without_replaying_the_call() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "fragile",
+        &[("call-timeout", "publish once")],
+    )));
+    let providers = registry(provider);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(TimeoutTool {
+            calls: Arc::clone(&calls),
+        })],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-tool-timeout", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 2, .. })
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the model may inspect the timeout and decide what to do; the harness must not replay \
+         a possibly side-effecting call"
+    );
+    assert_eq!(
+        lifecycle(&events),
+        [
+            "call-timeout:running",
+            "call-timeout:error",
+            "call-timeout:result:error",
+        ]
+    );
+
+    let tool_part = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate turn")
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .find(|part| part.kind == PartKind::Tool)
+        .expect("timeout tool result is persisted");
+    assert_eq!(tool_part.data["state"]["status"], "error");
+    assert!(
+        tool_part.data["state"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")),
+        "{tool_part:?}"
+    );
 }
 
 /// A tool that writes files and reports them the way the real file tools do.

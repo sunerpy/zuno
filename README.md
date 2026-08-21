@@ -64,7 +64,10 @@ workflow、远程执行器或专用编码 Agent 可以替换循环和工具面�
 会话输入进入持久化 FIFO inbox；用户 prompt、运行中 steer 与子代理报告共享同一交付协议。
 后台 `task` 支持 `reportDelivery: nextStep | quiet`，完成状态可用 `job` 工具查询。
 `web_search` 接收 `queries` 数组，并发执行、首错取消兄弟请求、等待收敛后按稳定顺序合并及 URL
-去重。完整生命周期、作用域和自定义 Harness 示例见
+去重。活动 Goal 对网络、限流、断流、数据库锁和单轮步数耗尽使用持久化指数退避；进程重开后按
+SQLite 中的 deadline 恢复，人工输入优先。工具失败作为 tool result 交回模型，不会被调度器
+机械重放；认证、取消与永久配置错误分别暂停或阻断。完整生命周期、恢复矩阵、配置和自定义
+Harness 示例见
 [docs/harness-runtime.md](docs/harness-runtime.md)。
 
 ## 文档

@@ -20,7 +20,7 @@ use super::{
 };
 use crate::compaction::{
     AutoContinueHookInput, CompactionHookInput, CompactionHooks, CompactionPrompt, CompactionState,
-    TOOL_OUTPUT_MAX_CHARS, TokenWindow, select_boundary,
+    CompactionStopReason, TOOL_OUTPUT_MAX_CHARS, TokenWindow, select_boundary,
 };
 use crate::r#loop::retained_history;
 
@@ -1059,7 +1059,14 @@ async fn a_failed_compaction_leaves_the_full_history_in_place() {
     )
     .await;
 
-    assert!(matches!(outcome, Err(CompactionSkipped::Reason(_))));
+    assert!(matches!(
+        outcome,
+        Err(CompactionSkipped::Stopped {
+            reason: CompactionStopReason::Provider,
+            recovery: zuno_error::Recovery::Retry { .. },
+            ..
+        })
+    ));
     let history = MessageStore::new(&connection)
         .hydrate_session(SESSION_ID)
         .expect("history is readable");

@@ -79,6 +79,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         vision_available: false,
         reasoning_supported: false,
         effort: None,
+        goal_retry_policy: GoalRetryPolicy::default(),
         directory,
         project,
         config: zuno_config::schema::Config::default(),
@@ -95,6 +96,73 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         },
         notes: Vec::new(),
     }
+}
+
+#[test]
+fn goal_retry_policy_resolves_defaults_and_rejects_invalid_ranges() {
+    let defaults =
+        resolve_goal_retry_policy(&zuno_config::schema::Config::default()).expect("defaults");
+    assert_eq!(
+        defaults.delay(1, None, 0),
+        DEFAULT_GOAL_RETRY_INITIAL_DELAY.saturating_sub(DEFAULT_GOAL_RETRY_INITIAL_DELAY / 5)
+    );
+    assert_eq!(defaults.poll_interval(), DEFAULT_GOAL_RETRY_POLL_INTERVAL);
+
+    let mut config = zuno_config::schema::Config {
+        goal: Some(zuno_config::schema::GoalConfig {
+            retry: Some(zuno_config::schema::GoalRetryConfig {
+                initial_delay_ms: std::num::NonZeroU64::new(5_000),
+                max_delay_ms: std::num::NonZeroU64::new(1_000),
+                jitter_percent: Some(0),
+                poll_interval_ms: std::num::NonZeroU64::new(100),
+            }),
+        }),
+        ..Default::default()
+    };
+    let error = resolve_goal_retry_policy(&config).expect_err("max before initial is invalid");
+    assert!(error.contains("max delay"), "{error}");
+
+    config.goal.as_mut().expect("goal").retry = Some(zuno_config::schema::GoalRetryConfig {
+        initial_delay_ms: std::num::NonZeroU64::new(1_000),
+        max_delay_ms: std::num::NonZeroU64::new(5_000),
+        jitter_percent: Some(101),
+        poll_interval_ms: std::num::NonZeroU64::new(100),
+    });
+    let error = resolve_goal_retry_policy(&config).expect_err("jitter above 100 is invalid");
+    assert!(error.contains("0..=100"), "{error}");
+}
+
+#[test]
+fn prepared_user_message_persistence_preserves_database_busy() {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let location = zuno_paths::DbLocation::File(directory.path().join("locked.db"));
+    let mut connection = zuno_db::open::open(&location).expect("open primary connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .busy_timeout(std::time::Duration::ZERO)
+        .expect("disable retry delay for the lock assertion");
+    let mut blocker = zuno_db::open::open(&location).expect("open blocking connection");
+    let _write_lock = blocker
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("hold the database write lock");
+    let (message, parts) = prepare_user_message(
+        UserMessageInput {
+            session_id: "ses_locked",
+            agent: "build",
+            provider_id: "provider",
+            model_id: "model",
+            text: "Persist me after the writer releases the lock.",
+            message_id: Some("msg_locked"),
+            now: 1_780_000_000_000,
+        },
+        None,
+    )
+    .expect("prepare user message");
+
+    let error = persist_prepared_user_message(&connection, &message, &parts)
+        .expect_err("the active writer must make this write retryable");
+
+    assert!(matches!(error, zuno_error::DbError::Busy { .. }));
 }
 
 fn stub_internals() -> Internals {

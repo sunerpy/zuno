@@ -50,6 +50,13 @@ pub enum GoalError {
         expected: String,
     },
 
+    /// A retry reason in the auxiliary table is outside the closed runtime set.
+    #[error("unknown goal retry reason `{value}`")]
+    UnknownRetryReason {
+        /// Corrupt stored discriminator.
+        value: String,
+    },
+
     /// `create_goal` found a goal that is not finished yet.
     ///
     /// Distinct from a plain conflict because the remedy is specific: finish the
@@ -138,6 +145,7 @@ impl GoalError {
             | Self::GoalNotReplaceable { .. }
             | Self::EmptyObjective => true,
             Self::Db(_)
+            | Self::UnknownRetryReason { .. }
             | Self::Spill { .. }
             | Self::PointerTooLong { .. }
             | Self::Document { .. }

@@ -5,6 +5,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::Duration;
 
+use zuno_engine::r#loop::{TurnError, TurnRecovery, TurnRetryReason};
 use zuno_engine::retry::{
     MAX_CONTEXT_LIMIT_RETRIES, MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS,
     MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError,
@@ -16,6 +17,116 @@ use zuno_llm::event::StreamEvent;
 
 fn policy(max_attempts: u32) -> ProviderRetryPolicy {
     ProviderRetryPolicy::new(NonZeroU32::new(max_attempts).expect("non-zero test policy"))
+}
+
+#[test]
+fn every_terminal_turn_error_has_an_explicit_goal_recovery_decision() {
+    let cases = [
+        (
+            TurnError::StepLimit {
+                agent: "build".to_owned(),
+                max_steps: 100,
+            },
+            TurnRecovery::Retry {
+                reason: TurnRetryReason::StepLimit,
+                after: None,
+            },
+        ),
+        (
+            TurnError::StreamEndedWithoutMessageEnd { step: 1 },
+            TurnRecovery::Retry {
+                reason: TurnRetryReason::ProviderStream,
+                after: None,
+            },
+        ),
+        (
+            TurnError::EmptyAssistantMessage {
+                provider_id: "test".to_owned(),
+                step: 1,
+            },
+            TurnRecovery::Retry {
+                reason: TurnRetryReason::EmptyAssistantMessage,
+                after: None,
+            },
+        ),
+        (
+            TurnError::Database(zuno_error::DbError::Busy {
+                retry_after: Some(Duration::from_millis(50)),
+            }),
+            TurnRecovery::Retry {
+                reason: TurnRetryReason::DatabaseBusy,
+                after: Some(Duration::from_millis(50)),
+            },
+        ),
+        (
+            TurnError::Provider(ProviderError::RateLimited {
+                retry_after: Some(Duration::from_secs(7)),
+            }),
+            TurnRecovery::Retry {
+                reason: TurnRetryReason::RateLimited,
+                after: Some(Duration::from_secs(7)),
+            },
+        ),
+        (
+            TurnError::Provider(ProviderError::Transient {
+                status: Some(503),
+                source: None,
+            }),
+            TurnRecovery::Retry {
+                reason: TurnRetryReason::ProviderTransient,
+                after: None,
+            },
+        ),
+        (
+            TurnError::ProviderRetryDeadlineExceeded {
+                attempt: 3,
+                elapsed: Duration::from_secs(180),
+            },
+            TurnRecovery::Retry {
+                reason: TurnRetryReason::ProviderRetryDeadline,
+                after: None,
+            },
+        ),
+        (
+            TurnError::Provider(ProviderError::ContextLimit {
+                limit_tokens: Some(200_000),
+                used_tokens: Some(210_000),
+            }),
+            TurnRecovery::Compact,
+        ),
+        (
+            TurnError::Provider(ProviderError::Auth {
+                provider: "test".to_owned(),
+                source: None,
+            }),
+            TurnRecovery::Pause,
+        ),
+        (TurnError::EventConsumerClosed, TurnRecovery::Pause),
+        (
+            TurnError::Provider(ProviderError::Fatal {
+                status: Some(400),
+                source: None,
+            }),
+            TurnRecovery::Fail,
+        ),
+        (
+            TurnError::Provider(ProviderError::Refused {
+                provider: "test".to_owned(),
+                provider_text: None,
+            }),
+            TurnRecovery::Fail,
+        ),
+        (
+            TurnError::AgentNotFound {
+                agent: "missing".to_owned(),
+            },
+            TurnRecovery::Fail,
+        ),
+    ];
+
+    for (error, expected) in cases {
+        assert_eq!(error.recovery(), expected, "{error}");
+    }
 }
 
 #[tokio::test(start_paused = true)]

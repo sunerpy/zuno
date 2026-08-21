@@ -952,6 +952,35 @@ fn the_table_declares_the_check_constraint_and_deliberately_no_foreign_key() {
         .expect("count the table's foreign keys");
     assert_eq!(foreign_keys, 0);
 
+    let retry_ddl: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'goal_retry'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the retry table's DDL");
+    assert!(retry_ddl.contains("CHECK(attempt >= 1)"), "{retry_ddl}");
+    for reason in [
+        "rate_limited",
+        "provider_transient",
+        "provider_stream",
+        "provider_retry_deadline",
+        "database_busy",
+        "step_limit",
+        "empty_assistant_message",
+        "context_limit",
+        "context_compacted",
+    ] {
+        assert!(
+            retry_ddl.contains(&format!("'{reason}'")),
+            "the retry CHECK constraint omits {reason}: {retry_ddl}"
+        );
+    }
+    assert!(
+        !retry_ddl.to_ascii_uppercase().contains("FOREIGN KEY"),
+        "retry state follows the goal's explicit ownership: {retry_ddl}"
+    );
+
     let tables: i64 = connection
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -960,7 +989,7 @@ fn the_table_declares_the_check_constraint_and_deliberately_no_foreign_key() {
         )
         .expect("count the tables");
     assert_eq!(
-        tables, 4,
+        tables, 5,
         "the goal database holds its goal and runtime tables"
     );
 }

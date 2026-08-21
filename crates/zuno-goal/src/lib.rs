@@ -59,6 +59,7 @@
 pub mod continuation;
 pub mod error;
 pub mod projection;
+pub mod retry;
 pub mod spill;
 pub mod status;
 pub mod store;
@@ -75,6 +76,11 @@ pub use crate::projection::{
     Notes, OBJECTIVE_BEGIN, OBJECTIVE_END, PROJECT_DIRECTORY, Refusal, RejectedEdit, document_path,
     parse, render,
 };
+pub use crate::retry::{
+    DEFAULT_GOAL_RETRY_INITIAL_DELAY, DEFAULT_GOAL_RETRY_JITTER_PERCENT,
+    DEFAULT_GOAL_RETRY_MAX_DELAY, DEFAULT_GOAL_RETRY_POLL_INTERVAL, GoalFailureDisposition,
+    GoalRetryPolicy, GoalRetryPolicyError, GoalRetryReason, GoalRetryState, GoalTerminalFailure,
+};
 pub use crate::spill::{
     MAX_OBJECTIVE_CHARS, OBJECTIVE_FILE_NAME, OBJECTIVE_POINTER_PREFIX, OBJECTIVE_POINTER_SUFFIX,
 };
@@ -88,3 +94,7 @@ pub use crate::tools::{
     GetGoalTool, UPDATE_GOAL_TOOL_ID, UpdateGoalParams, UpdateGoalStatus, UpdateGoalTool,
     goal_from_metadata, goal_tools,
 };
+
+#[cfg(test)]
+#[path = "retry_tests.rs"]
+mod retry_tests;

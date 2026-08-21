@@ -14,7 +14,7 @@ use zuno_engine::compaction::{
     CompactionState, CompactionStopReason, CompactionTrigger, TokenWindow, TranscriptEntry,
     run_compaction, select_boundary,
 };
-use zuno_error::ProviderError;
+use zuno_error::{ProviderError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools, McpToolStatus, StaticSystemPrompt};
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{Capabilities, CompletionRequest, Provider, ProviderStream};
@@ -524,6 +524,7 @@ async fn compaction_failure_marks_the_summary_message_and_never_reenters() {
         first,
         CompactionOutcome::Stopped {
             reason: CompactionStopReason::Provider,
+            recovery: Recovery::Fail,
             ..
         }
     ));
@@ -544,6 +545,7 @@ async fn compaction_failure_marks_the_summary_message_and_never_reenters() {
         second,
         CompactionOutcome::Stopped {
             reason: CompactionStopReason::AlreadyFailed,
+            recovery: Recovery::Fail,
             ..
         }
     ));

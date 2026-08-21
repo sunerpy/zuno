@@ -1230,6 +1230,22 @@ async fn drive_turns(
     mut events: TurnEventSender,
 ) {
     loop {
+        let queued = if prompts.is_empty() && selections.is_empty() {
+            zuno_goal::QueuedUserInput::Absent
+        } else {
+            zuno_goal::QueuedUserInput::Present
+        };
+        match driver
+            .host
+            .continue_goal_if_idle(queued, events.clone())
+            .await
+        {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(message) => {
+                report_turn_failure(&events, message).await;
+            }
+        }
         // A selection is taken only between turns, never during one: rebuilding the host
         // mid-turn would drop the stream the loop is still reading.
         let prompt = tokio::select! {
@@ -1449,28 +1465,32 @@ async fn drive_one(
         }
         .await;
         if let Err(message) = outcome {
-            let reported = events
-                .publish(TurnEvent::TurnInterrupted {
-                    assistant_message_id: None,
-                    steps: 0,
-                })
-                .await
-                .and(
-                    events
-                        .publish(TurnEvent::Provider {
-                            step: 0,
-                            event: StreamEvent::Error {
-                                message,
-                                retry_after: None,
-                            },
-                        })
-                        .await,
-                );
-            // A closed event channel means the render loop has gone; there is nothing
-            // left to report a failure to.
-            let _closed = reported.is_err();
+            report_turn_failure(events, message).await;
         }
     }
+}
+
+async fn report_turn_failure(events: &TurnEventSender, message: String) {
+    let reported = events
+        .publish(TurnEvent::TurnInterrupted {
+            assistant_message_id: None,
+            steps: 0,
+        })
+        .await
+        .and(
+            events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::Error {
+                        message,
+                        retry_after: None,
+                    },
+                })
+                .await,
+        );
+    // A closed event channel means the render loop has gone; there is nothing
+    // left to report a failure to.
+    let _closed = reported.is_err();
 }
 
 async fn finish_snapshot(

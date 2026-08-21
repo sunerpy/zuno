@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use zuno_config::schema::CompactionConfig;
 use zuno_db::Connection;
 use zuno_db::message::{MessageRecord, MessageStore, PartRecord, now_millis};
-use zuno_error::DbError;
+use zuno_error::{DbError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools};
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{CompletionRequest, Provider};
@@ -374,7 +374,7 @@ where
 #[derive(Debug, Default)]
 pub struct CompactionState {
     budgets: RecoveryBudgets,
-    failure: Option<String>,
+    failure: Option<CompactionFailure>,
 }
 
 impl CompactionState {
@@ -394,9 +394,26 @@ impl CompactionState {
         self.failure = None;
     }
 
-    fn mark_failed(&mut self, message: String) {
-        self.failure = Some(message);
+    /// Permit another compaction only when the latched provider failure was retryable.
+    pub fn reset_retryable_failure(&mut self) {
+        if self
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.recovery.is_retry())
+        {
+            self.failure = None;
+        }
     }
+
+    fn mark_failed(&mut self, message: String, recovery: Recovery) {
+        self.failure = Some(CompactionFailure { message, recovery });
+    }
+}
+
+#[derive(Debug)]
+struct CompactionFailure {
+    message: String,
+    recovery: Recovery,
 }
 
 /// Inputs for one compaction attempt.
@@ -491,6 +508,7 @@ pub enum CompactionOutcome {
     Stopped {
         reason: CompactionStopReason,
         message: String,
+        recovery: Recovery,
     },
 }
 
@@ -520,10 +538,11 @@ where
     T: Clone + PartialEq,
     H: CompactionHooks + ?Sized,
 {
-    if let Some(message) = &state.failure {
+    if let Some(failure) = &state.failure {
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::AlreadyFailed,
-            message: message.clone(),
+            message: failure.message.clone(),
+            recovery: failure.recovery,
         });
     }
 
@@ -537,10 +556,11 @@ where
         u32::try_from(policy.preserve_recent_tokens).unwrap_or(u32::MAX),
     ) else {
         let message = "session has no compactable history before the preserved tail".to_owned();
-        state.mark_failed(message.clone());
+        state.mark_failed(message.clone(), Recovery::Fail);
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::NoCompactableHistory,
             message,
+            recovery: Recovery::Fail,
         });
     };
 
@@ -550,10 +570,11 @@ where
         let message = error.to_string();
         let mut summary_message = persist_compaction_shell(connection, &request, boundary)?;
         persist_failure(connection, &mut summary_message, &message)?;
-        state.mark_failed(message.clone());
+        state.mark_failed(message.clone(), Recovery::Fail);
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::BudgetExhausted,
             message,
+            recovery: Recovery::Fail,
         });
     }
 
@@ -570,10 +591,11 @@ where
         .await
     {
         persist_failure(connection, &mut summary_message, &message)?;
-        state.mark_failed(message.clone());
+        state.mark_failed(message.clone(), Recovery::Fail);
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::Hook,
             message,
+            recovery: Recovery::Fail,
         });
     }
 
@@ -605,12 +627,19 @@ where
     while let Some(event) = stream.next().await {
         match event {
             Ok(StreamEvent::TextDelta(text)) => chunks.push(text),
-            Ok(StreamEvent::Error { message, .. }) => {
-                provider_failure = Some(message);
+            Ok(StreamEvent::Error {
+                message,
+                retry_after,
+            }) => {
+                provider_failure = Some((message, Recovery::Retry { after: retry_after }));
                 break;
             }
             Err(error) => {
-                provider_failure = Some(error.to_string());
+                let recovery = match error.recovery() {
+                    Recovery::Compact => Recovery::Fail,
+                    recovery => recovery,
+                };
+                provider_failure = Some((error.to_string(), recovery));
                 break;
             }
             Ok(_) => {}
@@ -618,12 +647,13 @@ where
     }
     drop(stream);
 
-    if let Some(message) = provider_failure {
+    if let Some((message, recovery)) = provider_failure {
         persist_failure(connection, &mut summary_message, &message)?;
-        state.mark_failed(message.clone());
+        state.mark_failed(message.clone(), recovery);
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::Provider,
             message,
+            recovery,
         });
     }
 
@@ -631,10 +661,11 @@ where
     if summary.trim().is_empty() {
         let message = "compaction model returned an empty summary".to_owned();
         persist_failure(connection, &mut summary_message, &message)?;
-        state.mark_failed(message.clone());
+        state.mark_failed(message.clone(), Recovery::Fail);
         return Ok(CompactionOutcome::Stopped {
             reason: CompactionStopReason::EmptySummary,
             message,
+            recovery: Recovery::Fail,
         });
     }
 
@@ -661,10 +692,11 @@ where
             Ok(enabled) => enabled,
             Err(message) => {
                 persist_failure(connection, &mut summary_message, &message)?;
-                state.mark_failed(message.clone());
+                state.mark_failed(message.clone(), Recovery::Fail);
                 return Ok(CompactionOutcome::Stopped {
                     reason: CompactionStopReason::Hook,
                     message,
+                    recovery: Recovery::Fail,
                 });
             }
         }

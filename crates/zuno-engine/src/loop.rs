@@ -257,6 +257,102 @@ pub enum TurnError {
     Cache(#[from] CacheViolation),
 }
 
+/// Why a retryable terminal turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRetryReason {
+    /// The provider explicitly rate limited the request.
+    RateLimited,
+    /// A transport or upstream server failure is expected to clear.
+    ProviderTransient,
+    /// The stream ended without a complete assistant message.
+    ProviderStream,
+    /// The bounded same-request recovery sequence exhausted its deadline.
+    ProviderRetryDeadline,
+    /// SQLite reported another active writer.
+    DatabaseBusy,
+    /// One turn reached its step ceiling while the larger goal may continue.
+    StepLimit,
+    /// The provider returned no assistant content.
+    EmptyAssistantMessage,
+}
+
+/// Action a goal controller may take after a terminal turn failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnRecovery {
+    /// Start a fresh goal turn after backoff.
+    Retry {
+        /// Typed retry class.
+        reason: TurnRetryReason,
+        /// Peer-requested delay, when one was supplied.
+        after: Option<Duration>,
+    },
+    /// Compact retained history before another attempt.
+    Compact,
+    /// Stop automatic work until a user explicitly resumes it.
+    Pause,
+    /// Repeating cannot repair this failure.
+    Fail,
+}
+
+impl TurnError {
+    /// Classify the failure without inspecting its rendered message.
+    #[must_use]
+    pub fn recovery(&self) -> TurnRecovery {
+        match self {
+            Self::StepLimit { .. } => TurnRecovery::Retry {
+                reason: TurnRetryReason::StepLimit,
+                after: None,
+            },
+            Self::StreamEndedWithoutMessageEnd { .. } => TurnRecovery::Retry {
+                reason: TurnRetryReason::ProviderStream,
+                after: None,
+            },
+            Self::EmptyAssistantMessage { .. } => TurnRecovery::Retry {
+                reason: TurnRetryReason::EmptyAssistantMessage,
+                after: None,
+            },
+            Self::Database(DbError::Busy { retry_after }) => TurnRecovery::Retry {
+                reason: TurnRetryReason::DatabaseBusy,
+                after: *retry_after,
+            },
+            Self::Database(
+                DbError::LegacyDatabase { .. }
+                | DbError::Open { .. }
+                | DbError::Migration { .. }
+                | DbError::MigrationTooNew { .. }
+                | DbError::Query { .. }
+                | DbError::NotFound { .. }
+                | DbError::Decode { .. },
+            ) => TurnRecovery::Fail,
+            Self::Provider(ProviderError::ContextLimit { .. }) => TurnRecovery::Compact,
+            Self::Provider(ProviderError::RateLimited { retry_after }) => TurnRecovery::Retry {
+                reason: TurnRetryReason::RateLimited,
+                after: *retry_after,
+            },
+            Self::Provider(ProviderError::Transient { .. }) => TurnRecovery::Retry {
+                reason: TurnRetryReason::ProviderTransient,
+                after: None,
+            },
+            Self::Provider(ProviderError::Auth { .. }) | Self::EventConsumerClosed => {
+                TurnRecovery::Pause
+            }
+            Self::Provider(ProviderError::Refused { .. } | ProviderError::Fatal { .. })
+            | Self::NoUserMessage { .. }
+            | Self::MissingUserField { .. }
+            | Self::AgentNotFound { .. }
+            | Self::ModelNotFound { .. }
+            | Self::NestedToolUse { .. }
+            | Self::ToolUseEndWithoutStart { .. }
+            | Self::Hook(_)
+            | Self::Cache(_) => TurnRecovery::Fail,
+            Self::ProviderRetryDeadlineExceeded { .. } => TurnRecovery::Retry {
+                reason: TurnRetryReason::ProviderRetryDeadline,
+                after: None,
+            },
+        }
+    }
+}
+
 /// Agent data the loop needs after configuration resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAgent {

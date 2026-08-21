@@ -253,22 +253,159 @@ fn changed_blocker_restarts_the_persistent_count() {
 }
 
 #[test]
-fn terminal_turn_error_blocks_active_goal_immediately() {
+fn retry_backoff_suppresses_until_due_then_prepares_the_goal() {
     let fixture = Fixture::new();
-    fixture.create("do not loop on provider failure");
-    let stopped = fixture
-        .continuation
-        .on_terminal_turn_error("ses_goal")
-        .expect("stop goal")
-        .expect("goal exists");
-    assert_eq!(stopped.status, GoalStatus::Blocked);
+    fixture.create("keep working after a transient outage");
+    fixture
+        .store
+        .schedule_retry(
+            "ses_goal",
+            crate::GoalRetryReason::ProviderTransient,
+            None,
+            crate::GoalRetryPolicy::new(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(30),
+                0,
+                std::time::Duration::from_millis(250),
+            )
+            .expect("valid policy"),
+            1_000,
+            0,
+        )
+        .expect("schedule retry")
+        .expect("active goal");
     assert!(matches!(
         fixture
             .continuation
-            .prepare_if_idle("ses_goal", GoalTurnMode::Work, QueuedUserInput::Absent)
-            .expect("idle after error"),
-        ContinuationAttempt::Suppressed(ContinuationSuppression::NoActiveGoal)
+            .prepare_if_idle_at(
+                "ses_goal",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                2_999,
+            )
+            .expect("backoff before deadline"),
+        ContinuationAttempt::Suppressed(ContinuationSuppression::RetryBackoff { remaining })
+            if remaining == std::time::Duration::from_millis(1)
     ));
+    assert!(matches!(
+        fixture
+            .continuation
+            .prepare_if_idle_at(
+                "ses_goal",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                3_000,
+            )
+            .expect("retry at deadline"),
+        ContinuationAttempt::Prepared(_)
+    ));
+}
+
+#[test]
+fn a_reopened_continuation_honors_the_persisted_retry_deadline() {
+    let database = tempfile::tempdir().expect("create database directory");
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let path = database.path().join(crate::GOAL_DB_FILE);
+    {
+        let store = GoalStore::open_at(&path, spill.path().to_owned()).expect("open goal store");
+        store
+            .create_goal("ses_restart_retry", "resume after restart", None)
+            .expect("create goal");
+        store
+            .schedule_retry(
+                "ses_restart_retry",
+                crate::GoalRetryReason::ProviderStream,
+                None,
+                crate::GoalRetryPolicy::new(
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_secs(30),
+                    0,
+                    std::time::Duration::from_millis(250),
+                )
+                .expect("valid policy"),
+                1_000,
+                0,
+            )
+            .expect("schedule retry")
+            .expect("active goal");
+    }
+
+    let store =
+        Arc::new(GoalStore::open_at(&path, spill.path().to_owned()).expect("reopen goal store"));
+    let runs = SessionRunRegistry::new();
+    let continuation = GoalContinuation::new(Arc::clone(&store), runs.clone());
+    assert!(matches!(
+        continuation
+            .prepare_if_idle_at(
+                "ses_restart_retry",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                2_999,
+            )
+            .expect("read persisted backoff"),
+        ContinuationAttempt::Suppressed(ContinuationSuppression::RetryBackoff { remaining })
+            if remaining == std::time::Duration::from_millis(1)
+    ));
+
+    let ContinuationAttempt::Prepared(prepared) = continuation
+        .prepare_if_idle_at(
+            "ses_restart_retry",
+            GoalTurnMode::Work,
+            QueuedUserInput::Absent,
+            3_000,
+        )
+        .expect("prepare persisted retry at deadline")
+    else {
+        panic!("the reopened scheduler must resume the due goal");
+    };
+    assert_eq!(runs.status("ses_restart_retry"), SessionStatus::Busy);
+    assert!(text(prepared.entry()).contains("recovery attempt 1"));
+    assert!(text(prepared.entry()).contains("provider_stream"));
+}
+
+#[test]
+fn retry_context_tells_the_model_to_verify_side_effects_before_repeating_them() {
+    let fixture = Fixture::new();
+    fixture.create("deploy the release");
+    fixture
+        .store
+        .schedule_retry(
+            "ses_goal",
+            crate::GoalRetryReason::ProviderStream,
+            None,
+            crate::GoalRetryPolicy::new(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(30),
+                0,
+                std::time::Duration::from_millis(250),
+            )
+            .expect("valid policy"),
+            1_000,
+            0,
+        )
+        .expect("schedule retry")
+        .expect("active goal");
+
+    let context = fixture
+        .continuation
+        .injection("ses_goal")
+        .expect("read retry context")
+        .expect("active goal")
+        .message
+        .content;
+    let rendered = context
+        .iter()
+        .filter_map(|block| match block {
+            zuno_llm::event::RequestContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(rendered.contains("provider_stream"), "{rendered}");
+    assert!(rendered.contains("recovery attempt 1"), "{rendered}");
+    assert!(
+        rendered.contains("before repeating an action with side effects"),
+        "{rendered}"
+    );
 }
 
 #[test]

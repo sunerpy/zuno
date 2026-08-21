@@ -58,6 +58,7 @@
 //!   The refusal is the statement returning no row.
 
 use crate::error::GoalError;
+use crate::retry::{GoalRetryPolicy, GoalRetryReason, GoalRetryState};
 use crate::spill;
 use crate::status::{GoalStatus, ModelStatus, SystemStatus};
 use rusqlite::{OptionalExtension, Row, Transaction, params};
@@ -129,6 +130,25 @@ CREATE TABLE IF NOT EXISTS goal_failure_streak (
     session_id TEXT PRIMARY KEY NOT NULL,
     signal TEXT NOT NULL,
     consecutive_turns INTEGER NOT NULL CHECK(consecutive_turns BETWEEN 1 AND 3)
+);
+CREATE TABLE IF NOT EXISTS goal_retry (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    goal_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK(attempt >= 1),
+    reason TEXT NOT NULL CHECK(reason IN (
+        'rate_limited',
+        'provider_transient',
+        'provider_stream',
+        'provider_retry_deadline',
+        'database_busy',
+        'step_limit',
+        'empty_assistant_message',
+        'context_limit',
+        'context_compacted'
+    )),
+    delay_ms INTEGER NOT NULL CHECK(delay_ms >= 0),
+    retry_at_ms INTEGER NOT NULL,
+    scheduled_at_ms INTEGER NOT NULL
 )";
 
 const COLUMNS: &str = "session_id, goal_id, objective, status, token_budget, tokens_used, \
@@ -484,6 +504,133 @@ impl GoalStore {
         Ok(consumed)
     }
 
+    /// Persist the next automatic turn for the current active goal.
+    ///
+    /// The schedule is tied to `goal_id`; replacement clears it in the same
+    /// transaction that mints a new goal. Consecutive failures increment the
+    /// attempt before computing exponential backoff.
+    pub fn schedule_retry(
+        &self,
+        session_id: &str,
+        reason: GoalRetryReason,
+        retry_after: Option<std::time::Duration>,
+        policy: GoalRetryPolicy,
+        scheduled_at_ms: i64,
+        entropy: u64,
+    ) -> Result<Option<GoalRetryState>, GoalError> {
+        let state = self.pool.transaction(|tx| {
+            let goal_id = tx
+                .query_row(
+                    "SELECT goal_id FROM goal WHERE session_id = ?1 AND status = 'active'",
+                    params![session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(zuno_db::map_error)?;
+            let Some(goal_id) = goal_id else {
+                return Ok(None);
+            };
+            let previous = tx
+                .query_row(
+                    "SELECT attempt FROM goal_retry \
+                     WHERE session_id = ?1 AND goal_id = ?2",
+                    params![session_id, goal_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(zuno_db::map_error)?;
+            let attempt = previous
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_default()
+                .saturating_add(1);
+            let delay = policy.delay(attempt, retry_after, entropy);
+            let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+            let retry_at_ms = scheduled_at_ms.saturating_add(delay_ms);
+            tx.execute(
+                "INSERT INTO goal_retry (
+                    session_id, goal_id, attempt, reason, delay_ms,
+                    retry_at_ms, scheduled_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    goal_id = excluded.goal_id,
+                    attempt = excluded.attempt,
+                    reason = excluded.reason,
+                    delay_ms = excluded.delay_ms,
+                    retry_at_ms = excluded.retry_at_ms,
+                    scheduled_at_ms = excluded.scheduled_at_ms",
+                params![
+                    session_id,
+                    goal_id,
+                    i64::from(attempt),
+                    reason.as_str(),
+                    delay_ms,
+                    retry_at_ms,
+                    scheduled_at_ms,
+                ],
+            )
+            .map_err(zuno_db::map_error)?;
+            Ok(Some(GoalRetryState {
+                session_id: session_id.to_owned(),
+                goal_id,
+                attempt,
+                reason,
+                delay_ms,
+                retry_at_ms,
+                scheduled_at_ms,
+            }))
+        })?;
+        Ok(state)
+    }
+
+    /// Read the pending automatic retry for a session.
+    pub fn retry_state(&self, session_id: &str) -> Result<Option<GoalRetryState>, GoalError> {
+        let connection = self.pool.get()?;
+        let row = connection
+            .query_row(
+                "SELECT session_id, goal_id, attempt, reason, delay_ms,
+                        retry_at_ms, scheduled_at_ms
+                 FROM goal_retry WHERE session_id = ?1",
+                params![session_id],
+                retry_row_from_row,
+            )
+            .optional()
+            .map_err(zuno_db::map_error)?;
+        row.map(GoalRetryState::try_from).transpose()
+    }
+
+    /// Remove any retry schedule for a session.
+    pub fn clear_retry(&self, session_id: &str) -> Result<bool, GoalError> {
+        self.pool
+            .transaction(|tx| clear_retry_state(tx, session_id))
+            .map(|changed| changed > 0)
+            .map_err(GoalError::from)
+    }
+
+    /// Mark a context-limit retry as durably compacted without incrementing backoff.
+    ///
+    /// A process that stops after compaction but before the provider request can then
+    /// resume from the compacted transcript instead of compacting the same history
+    /// again.
+    pub fn mark_retry_context_compacted(&self, session_id: &str) -> Result<bool, GoalError> {
+        self.pool
+            .transaction(|tx| {
+                tx.execute(
+                    "UPDATE goal_retry
+                     SET reason = 'context_compacted'
+                     WHERE session_id = ?1
+                       AND reason = 'context_limit'
+                       AND goal_id = (
+                         SELECT goal_id FROM goal
+                         WHERE session_id = ?1 AND status = 'active'
+                       )",
+                    params![session_id],
+                )
+                .map_err(zuno_db::map_error)
+            })
+            .map(|changed| changed > 0)
+            .map_err(GoalError::from)
+    }
+
     /// Stage the blocking condition reported during the current real turn.
     ///
     /// Repeated tool calls in one turn overwrite this row instead of incrementing
@@ -539,6 +686,7 @@ impl GoalStore {
     ) -> Result<Option<FailureStreak>, GoalError> {
         let signal = signal.map(str::trim).filter(|signal| !signal.is_empty());
         let streak = self.pool.transaction(|tx| {
+            clear_retry_state(tx, session_id)?;
             let Some(signal) = signal else {
                 tx.execute(
                     "DELETE FROM goal_failure_streak WHERE session_id = ?1",
@@ -603,9 +751,15 @@ impl GoalStore {
     ) -> Result<Option<Goal>, GoalError> {
         let now_ms = now_ms()?;
         let goal = self.pool.transaction(|tx| {
-            let mut statement = tx.prepare(SET_TOKEN_BUDGET).map_err(zuno_db::map_error)?;
-            read_optional(&mut statement, params![token_budget, now_ms, session_id])
-                .map_err(into_db_error)
+            let goal = {
+                let mut statement = tx.prepare(SET_TOKEN_BUDGET).map_err(zuno_db::map_error)?;
+                read_optional(&mut statement, params![token_budget, now_ms, session_id])
+                    .map_err(into_db_error)?
+            };
+            if goal.as_ref().is_some_and(|goal| !goal.status.is_active()) {
+                clear_retry_state(tx, session_id)?;
+            }
+            Ok(goal)
         })?;
         Ok(goal)
     }
@@ -631,9 +785,15 @@ impl GoalStore {
         let objective = spill::store_objective(&self.spill_dir, objective)?;
         let now_ms = now_ms()?;
         let goal = self.pool.transaction(|tx| {
-            let mut statement = tx.prepare(SET_OBJECTIVE).map_err(zuno_db::map_error)?;
-            read_optional(&mut statement, params![objective, now_ms, session_id])
-                .map_err(into_db_error)
+            let goal = {
+                let mut statement = tx.prepare(SET_OBJECTIVE).map_err(zuno_db::map_error)?;
+                read_optional(&mut statement, params![objective, now_ms, session_id])
+                    .map_err(into_db_error)?
+            };
+            if goal.is_some() {
+                clear_retry_state(tx, session_id)?;
+            }
+            Ok(goal)
         })?;
         Ok(goal)
     }
@@ -668,12 +828,18 @@ impl GoalStore {
         let time_delta_seconds = time_delta_seconds.max(0);
         let now_ms = now_ms()?;
         let goal = self.pool.transaction(|tx| {
-            let mut statement = tx.prepare(RECORD_USAGE).map_err(zuno_db::map_error)?;
-            read_optional(
-                &mut statement,
-                params![token_delta, time_delta_seconds, now_ms, session_id],
-            )
-            .map_err(into_db_error)
+            let goal = {
+                let mut statement = tx.prepare(RECORD_USAGE).map_err(zuno_db::map_error)?;
+                read_optional(
+                    &mut statement,
+                    params![token_delta, time_delta_seconds, now_ms, session_id],
+                )
+                .map_err(into_db_error)?
+            };
+            if goal.as_ref().is_some_and(|goal| !goal.status.is_active()) {
+                clear_retry_state(tx, session_id)?;
+            }
+            Ok(goal)
         })?;
         Ok(goal)
     }
@@ -705,6 +871,7 @@ impl GoalStore {
                     params![session_id],
                 )
                 .map_err(zuno_db::map_error)?;
+                clear_retry_state(tx, session_id)?;
             }
             Ok(goal)
         })?;
@@ -872,7 +1039,16 @@ fn clear_auxiliary_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), D
         params![session_id],
     )
     .map_err(zuno_db::map_error)?;
+    clear_retry_state(tx, session_id)?;
     Ok(())
+}
+
+fn clear_retry_state(tx: &Transaction<'_>, session_id: &str) -> Result<usize, DbError> {
+    tx.execute(
+        "DELETE FROM goal_retry WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(zuno_db::map_error)
 }
 
 fn failure_streak_from_row(row: &Row<'_>) -> rusqlite::Result<FailureStreak> {
@@ -881,6 +1057,46 @@ fn failure_streak_from_row(row: &Row<'_>) -> rusqlite::Result<FailureStreak> {
         signal: row.get("signal")?,
         consecutive_turns: u32::try_from(count).unwrap_or(3),
     })
+}
+
+struct RetryRow {
+    session_id: String,
+    goal_id: String,
+    attempt: i64,
+    reason: String,
+    delay_ms: i64,
+    retry_at_ms: i64,
+    scheduled_at_ms: i64,
+}
+
+fn retry_row_from_row(row: &Row<'_>) -> rusqlite::Result<RetryRow> {
+    Ok(RetryRow {
+        session_id: row.get("session_id")?,
+        goal_id: row.get("goal_id")?,
+        attempt: row.get("attempt")?,
+        reason: row.get("reason")?,
+        delay_ms: row.get("delay_ms")?,
+        retry_at_ms: row.get("retry_at_ms")?,
+        scheduled_at_ms: row.get("scheduled_at_ms")?,
+    })
+}
+
+impl TryFrom<RetryRow> for GoalRetryState {
+    type Error = GoalError;
+
+    fn try_from(row: RetryRow) -> Result<Self, Self::Error> {
+        let reason = GoalRetryReason::parse(&row.reason)
+            .ok_or(GoalError::UnknownRetryReason { value: row.reason })?;
+        Ok(Self {
+            session_id: row.session_id,
+            goal_id: row.goal_id,
+            attempt: u32::try_from(row.attempt).unwrap_or(u32::MAX),
+            reason,
+            delay_ms: row.delay_ms,
+            retry_at_ms: row.retry_at_ms,
+            scheduled_at_ms: row.scheduled_at_ms,
+        })
+    }
 }
 
 fn read_optional(

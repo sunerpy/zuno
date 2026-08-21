@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -41,16 +41,19 @@ use zuno_engine::driver::AgentDriver;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest, TurnContext,
-    TurnError, TurnEvent, TurnEventSender, TurnOutcome,
+    TurnError, TurnEvent, TurnEventSender, TurnOutcome, TurnRecovery,
 };
 use zuno_engine::prelude::{
-    InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome, compact_requested,
-    run_prelude,
+    CompactionSkipped, InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome,
+    compact_requested, run_prelude,
 };
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
-use zuno_error::ProviderError;
+use zuno_error::{DbError, ProviderError, Recovery};
 use zuno_goal::{
-    ContinuationAttempt, GoalContinuation, GoalProjection, GoalStore, GoalTurnMode,
+    ContinuationAttempt, ContinuationSuppression, DEFAULT_GOAL_RETRY_INITIAL_DELAY,
+    DEFAULT_GOAL_RETRY_JITTER_PERCENT, DEFAULT_GOAL_RETRY_MAX_DELAY,
+    DEFAULT_GOAL_RETRY_POLL_INTERVAL, GoalContinuation, GoalFailureDisposition, GoalProjection,
+    GoalRetryPolicy, GoalRetryReason, GoalRetryState, GoalStore, GoalTerminalFailure, GoalTurnMode,
     GoalTurnOutcome, QueuedUserInput,
 };
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -178,6 +181,8 @@ pub(crate) struct TurnPlan {
     reasoning_supported: bool,
     /// The reasoning level this plan resolved with, echoed back for display.
     effort: Option<zuno_llm::effort::ReasoningEffort>,
+    /// Fully validated automatic recovery policy for active goals.
+    goal_retry_policy: GoalRetryPolicy,
 }
 
 impl TurnPlan {
@@ -212,6 +217,7 @@ impl TurnPlan {
             // instruction. This is the path both the TUI and `zuno run` take, which
             // made it the one place a config error reached a user unactionable.
             .map_err(|error| error.report())?;
+        let goal_retry_policy = resolve_goal_retry_policy(&config)?;
         let credentials = zuno_auth::AuthStore::resolve(&layout, env)
             .all()
             .map_err(to_string)?
@@ -342,6 +348,7 @@ impl TurnPlan {
             vision_available,
             reasoning_supported,
             effort: options.effort,
+            goal_retry_policy,
         })
     }
 
@@ -420,6 +427,32 @@ fn token_count(limit: f64) -> u64 {
     } else {
         0
     }
+}
+
+fn resolve_goal_retry_policy(
+    config: &zuno_config::schema::Config,
+) -> Result<GoalRetryPolicy, String> {
+    let retry = config.goal.as_ref().and_then(|goal| goal.retry.as_ref());
+    let initial_delay = retry
+        .and_then(|retry| retry.initial_delay_ms)
+        .map_or(DEFAULT_GOAL_RETRY_INITIAL_DELAY, |value| {
+            Duration::from_millis(value.get())
+        });
+    let max_delay = retry
+        .and_then(|retry| retry.max_delay_ms)
+        .map_or(DEFAULT_GOAL_RETRY_MAX_DELAY, |value| {
+            Duration::from_millis(value.get())
+        });
+    let jitter_percent = retry
+        .and_then(|retry| retry.jitter_percent)
+        .unwrap_or(DEFAULT_GOAL_RETRY_JITTER_PERCENT);
+    let poll_interval = retry
+        .and_then(|retry| retry.poll_interval_ms)
+        .map_or(DEFAULT_GOAL_RETRY_POLL_INTERVAL, |value| {
+            Duration::from_millis(value.get())
+        });
+    GoalRetryPolicy::new(initial_delay, max_delay, jitter_percent, poll_interval)
+        .map_err(|error| format!("invalid goal.retry configuration: {error}"))
 }
 
 /// Resolve `compaction`, `title` and `summary` through todo 64's model policy.
@@ -662,6 +695,67 @@ pub(crate) struct TurnHost {
     title_sink: Option<Arc<dyn SessionTitleSink>>,
 }
 
+#[derive(Debug)]
+enum TurnFailure {
+    Engine(TurnError),
+    Host(String),
+    EventConsumer(String),
+    GoalRecovery {
+        message: String,
+        failure: GoalTerminalFailure,
+    },
+}
+
+impl TurnFailure {
+    fn host(error: impl std::fmt::Display) -> Self {
+        Self::Host(error.to_string())
+    }
+
+    fn event_consumer(error: impl std::fmt::Display) -> Self {
+        Self::EventConsumer(error.to_string())
+    }
+
+    fn goal_recovery(message: impl Into<String>, failure: GoalTerminalFailure) -> Self {
+        Self::GoalRecovery {
+            message: message.into(),
+            failure,
+        }
+    }
+
+    fn rendered(&self, credential: Option<&str>) -> String {
+        match self {
+            Self::Engine(error) => describe_turn_failure(error, credential),
+            Self::Host(message)
+            | Self::EventConsumer(message)
+            | Self::GoalRecovery { message, .. } => message.clone(),
+        }
+    }
+
+    fn goal_failure(&self) -> GoalTerminalFailure {
+        if let Self::GoalRecovery { failure, .. } = self {
+            return *failure;
+        }
+        let recovery = match self {
+            Self::Engine(error) => error.recovery(),
+            Self::Host(_) => TurnRecovery::Fail,
+            Self::EventConsumer(_) => TurnRecovery::Pause,
+            Self::GoalRecovery { .. } => unreachable!("handled above"),
+        };
+        match recovery {
+            TurnRecovery::Retry { reason, after } => GoalTerminalFailure::Retry {
+                reason: GoalRetryReason::from(reason),
+                retry_after: after,
+            },
+            TurnRecovery::Compact => GoalTerminalFailure::Retry {
+                reason: GoalRetryReason::ContextLimit,
+                retry_after: None,
+            },
+            TurnRecovery::Pause => GoalTerminalFailure::Pause,
+            TurnRecovery::Fail => GoalTerminalFailure::Block,
+        }
+    }
+}
+
 /// Told when the prelude names the session, so a live surface can show the name.
 ///
 /// A trait, and declared here rather than taking the TUI's projection directly, for the
@@ -796,7 +890,12 @@ impl TurnHost {
         let goal_store = Arc::new(GoalStore::open_default().map_err(to_string)?);
         let goal_projection = GoalProjection::new(worktree.as_deref(), &session.id)
             .ok_or_else(|| format!("session id `{}` cannot name a goal projection", session.id))?;
-        let goal_continuation = GoalContinuation::new(Arc::clone(&goal_store), runs.clone());
+        let goal_continuation = GoalContinuation::new(Arc::clone(&goal_store), runs.clone())
+            .with_retry_policy(plan.goal_retry_policy);
+        let active_goal = goal_store
+            .goal(&session.id)
+            .map_err(to_string)?
+            .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
 
         let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
         let command_worktree = memory_root.to_string_lossy();
@@ -923,7 +1022,7 @@ impl TurnHost {
             background_jobs,
             background_reports: child_host,
             background_reports_recovered: false,
-            last_turn_completed: false,
+            last_turn_completed: active_goal,
             title_sink: None,
         })
     }
@@ -1177,7 +1276,7 @@ impl TurnHost {
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = self
-            .drive_input_unaccounted(prompt, message_id, content, guard, events)
+            .drive_input_unaccounted(prompt, message_id, content, guard, events.clone())
             .await;
         match result {
             Ok(outcome) => {
@@ -1187,15 +1286,10 @@ impl TurnHost {
                 self.finish_goal_turn(usage_before, started, outcome.as_ref())?;
                 Ok(())
             }
-            Err(error) => {
-                self.last_turn_completed = false;
-                match self.finish_goal_error(usage_before, started) {
-                    Ok(()) => Err(error),
-                    Err(goal_error) => Err(format!(
-                        "{error}; additionally failed to record terminal goal state: {goal_error}"
-                    )),
-                }
-            }
+            Err(error) => self
+                .handle_turn_failure(usage_before, started, error, &events)
+                .await
+                .map(|_| ()),
         }
     }
 
@@ -1206,10 +1300,11 @@ impl TurnHost {
         content: Option<&[RequestContentBlock]>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
-    ) -> Result<Option<TurnOutcome>, String> {
+    ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let latest = zuno_db::message::MessageStore::new(&self.connection)
             .latest_time_created(&self.session_id)
-            .map_err(to_string)?;
+            .map_err(TurnError::Database)
+            .map_err(TurnFailure::Engine)?;
         let (message, parts) = prepare_user_message(
             UserMessageInput {
                 session_id: &self.session_id,
@@ -1221,14 +1316,19 @@ impl TurnHost {
                 now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
             },
             content,
-        )?;
-        persist_prepared_user_message(&self.connection, &message, &parts)?;
+        )
+        .map_err(TurnFailure::host)?;
+        persist_prepared_user_message(&self.connection, &message, &parts)
+            .map_err(TurnError::Database)
+            .map_err(TurnFailure::Engine)?;
         let outcome = self.run_prelude().await?;
-        report_prelude(&events, &self.notes, &outcome).await?;
+        report_prelude(&events, &self.notes, &outcome)
+            .await
+            .map_err(TurnFailure::event_consumer)?;
         if !outcome.continue_turn {
             return Ok(None);
         }
-        let dynamic_context = self.goal_dynamic_context()?;
+        let dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
         self.execute_turn_unaccounted(dynamic_context, guard, events)
             .await
     }
@@ -1249,17 +1349,52 @@ impl TurnHost {
         } else {
             GoalTurnMode::Work
         };
+        let queued_input = if queued_input == QueuedUserInput::Present
+            || !self
+                .inbox
+                .pending(&self.session_id)
+                .map_err(to_string)?
+                .is_empty()
+        {
+            QueuedUserInput::Present
+        } else {
+            QueuedUserInput::Absent
+        };
         let prepared = match self
             .goal_continuation
             .prepare_if_idle(&self.session_id, mode, queued_input)
             .map_err(to_string)?
         {
             ContinuationAttempt::Prepared(prepared) => prepared,
+            ContinuationAttempt::Suppressed(ContinuationSuppression::RetryBackoff {
+                remaining,
+            }) => {
+                tokio::time::sleep(
+                    remaining.min(self.goal_continuation.retry_policy().poll_interval()),
+                )
+                .await;
+                return Ok(true);
+            }
             ContinuationAttempt::Suppressed(_) => return Ok(false),
         };
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
-        let result = self.continue_goal_unaccounted(&prepared, events).await;
+        let retry_reason = self
+            .goal_store
+            .retry_state(&self.session_id)
+            .map_err(to_string)?
+            .map(|retry| retry.reason);
+        let result = async {
+            if retry_reason == Some(GoalRetryReason::ContextLimit) {
+                self.recover_goal_context().await?;
+                self.goal_store
+                    .mark_retry_context_compacted(&self.session_id)
+                    .map_err(TurnFailure::host)?;
+            }
+            self.continue_goal_unaccounted(&prepared, events.clone())
+                .await
+        }
+        .await;
         match result {
             Ok(outcome) => {
                 self.last_turn_completed = outcome
@@ -1269,13 +1404,8 @@ impl TurnHost {
                 Ok(self.last_turn_completed)
             }
             Err(error) => {
-                self.last_turn_completed = false;
-                match self.finish_goal_error(usage_before, started) {
-                    Ok(()) => Err(error),
-                    Err(goal_error) => Err(format!(
-                        "{error}; additionally failed to record terminal goal state: {goal_error}"
-                    )),
-                }
+                self.handle_turn_failure(usage_before, started, error, &events)
+                    .await
             }
         }
     }
@@ -1284,7 +1414,7 @@ impl TurnHost {
         &mut self,
         prepared: &zuno_goal::PreparedContinuation,
         events: TurnEventSender,
-    ) -> Result<Option<TurnOutcome>, String> {
+    ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let dynamic_context = dynamic_context_from_goal_entry(prepared.entry());
         let prelude = self.run_prelude().await;
         let prelude = match prelude {
@@ -1292,7 +1422,9 @@ impl TurnHost {
             Ok(_) => return Ok(None),
             Err(error) => return Err(error),
         };
-        report_prelude(&events, &self.notes, &prelude).await?;
+        report_prelude(&events, &self.notes, &prelude)
+            .await
+            .map_err(TurnFailure::event_consumer)?;
         self.execute_turn_unaccounted(dynamic_context, prepared.run_guard(), events)
             .await
     }
@@ -1302,7 +1434,7 @@ impl TurnHost {
         dynamic_context: DynamicContext,
         guard: &SessionRunGuard,
         events: TurnEventSender,
-    ) -> Result<Option<TurnOutcome>, String> {
+    ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let context = TurnContext::new(
             &mut self.connection,
             &self.providers,
@@ -1323,9 +1455,51 @@ impl TurnHost {
                 events.clone(),
             )
             .await;
-        outcome
-            .map(Some)
-            .map_err(|error| describe_turn_failure(&error, self.credential.as_deref()))
+        outcome.map(Some).map_err(TurnFailure::Engine)
+    }
+
+    async fn recover_goal_context(&mut self) -> Result<(), TurnFailure> {
+        self.compaction_state.reset_retryable_failure();
+        let providers = RegistryProviders(&self.providers);
+        let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
+        let mut context = PreludeContext {
+            connection: &mut self.connection,
+            providers: &providers,
+            internals: &self.internals,
+            compaction: &self.compaction_config,
+            window: self.window,
+            state: &mut self.compaction_state,
+            hooks: &noop_hooks,
+        };
+        compact_requested(&self.session_id, &mut context, true)
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                CompactionSkipped::Database(error) => {
+                    TurnFailure::Engine(TurnError::Database(error))
+                }
+                CompactionSkipped::Reason(message) => TurnFailure::host(format!(
+                    "goal context compaction could not start: {message}"
+                )),
+                CompactionSkipped::Stopped {
+                    reason,
+                    message,
+                    recovery,
+                } => {
+                    let failure = match recovery {
+                        Recovery::Retry { after } => GoalTerminalFailure::Retry {
+                            reason: GoalRetryReason::ContextLimit,
+                            retry_after: after,
+                        },
+                        Recovery::Reauthenticate => GoalTerminalFailure::Pause,
+                        Recovery::Compact | Recovery::Fail => GoalTerminalFailure::Block,
+                    };
+                    TurnFailure::goal_recovery(
+                        format!("goal context compaction stopped ({reason:?}): {message}"),
+                        failure,
+                    )
+                }
+            })
     }
 
     fn goal_dynamic_context(&self) -> Result<DynamicContext, String> {
@@ -1340,30 +1514,72 @@ impl TurnHost {
     }
 
     fn finish_goal_turn(
-        &self,
+        &mut self,
         usage_before: GoalUsage,
         started: Instant,
         outcome: Option<&TurnOutcome>,
     ) -> Result<(), String> {
         self.record_goal_usage(usage_before, started)?;
-        if let Some(outcome) = outcome {
-            let audit = match outcome {
-                TurnOutcome::Completed { .. } => GoalTurnOutcome::Progress,
-                TurnOutcome::Interrupted { .. } => GoalTurnOutcome::Blocking("turn interrupted"),
-            };
-            self.goal_continuation
-                .record_turn_outcome(&self.session_id, audit)
-                .map_err(to_string)?;
+        match outcome {
+            Some(TurnOutcome::Completed { .. }) => {
+                self.goal_continuation
+                    .record_turn_outcome(&self.session_id, GoalTurnOutcome::Progress)
+                    .map_err(to_string)?;
+                self.compaction_state.reset_after_turn_success();
+            }
+            Some(TurnOutcome::Interrupted { .. }) => {
+                self.goal_continuation
+                    .record_terminal_failure(&self.session_id, GoalTerminalFailure::Pause)
+                    .map_err(to_string)?;
+            }
+            None => {}
         }
         self.write_goal_projection()
     }
 
-    fn finish_goal_error(&self, usage_before: GoalUsage, started: Instant) -> Result<(), String> {
+    fn finish_goal_error(
+        &self,
+        usage_before: GoalUsage,
+        started: Instant,
+        failure: GoalTerminalFailure,
+    ) -> Result<GoalFailureDisposition, String> {
         self.record_goal_usage(usage_before, started)?;
-        self.goal_continuation
-            .on_terminal_turn_error(&self.session_id)
+        let disposition = self
+            .goal_continuation
+            .record_terminal_failure(&self.session_id, failure)
             .map_err(to_string)?;
-        self.write_goal_projection()
+        self.write_goal_projection()?;
+        Ok(disposition)
+    }
+
+    async fn handle_turn_failure(
+        &mut self,
+        usage_before: GoalUsage,
+        started: Instant,
+        failure: TurnFailure,
+        events: &TurnEventSender,
+    ) -> Result<bool, String> {
+        let rendered = failure.rendered(self.credential.as_deref());
+        let disposition = self
+            .finish_goal_error(usage_before, started, failure.goal_failure())
+            .map_err(|goal_error| {
+                format!(
+                    "{rendered}; additionally failed to record terminal goal state: {goal_error}"
+                )
+            })?;
+        match disposition {
+            GoalFailureDisposition::RetryScheduled(retry) => {
+                self.last_turn_completed = true;
+                report_goal_retry(events, &retry, &rendered).await?;
+                Ok(true)
+            }
+            GoalFailureDisposition::Paused(_)
+            | GoalFailureDisposition::Blocked(_)
+            | GoalFailureDisposition::NoActiveGoal => {
+                self.last_turn_completed = false;
+                Err(rendered)
+            }
+        }
     }
 
     fn record_goal_usage(&self, before: GoalUsage, started: Instant) -> Result<(), String> {
@@ -1397,8 +1613,8 @@ impl TurnHost {
             }
             Err(error) => {
                 self.last_turn_completed = false;
-                match self.finish_goal_error(usage_before, started) {
-                    Ok(()) => Err(error),
+                match self.finish_goal_error(usage_before, started, GoalTerminalFailure::Block) {
+                    Ok(_) => Err(error),
                     Err(goal_error) => Err(format!(
                         "{error}; additionally failed to record terminal goal state: {goal_error}"
                     )),
@@ -1435,7 +1651,7 @@ impl TurnHost {
     /// [`zuno_engine::prelude::summarize`] with this context rather than resolving a
     /// second model of its own — resolving separately is exactly how all three
     /// internals came to be declared and never invoked.
-    async fn run_prelude(&mut self) -> Result<PreludeOutcome, String> {
+    async fn run_prelude(&mut self) -> Result<PreludeOutcome, TurnFailure> {
         let providers = RegistryProviders(&self.providers);
         let noop_hooks = zuno_engine::compaction::NoopCompactionHooks;
         let mut context = PreludeContext {
@@ -1449,7 +1665,8 @@ impl TurnHost {
         };
         let outcome = run_prelude(&self.session_id, &mut context)
             .await
-            .map_err(to_string)?;
+            .map_err(TurnError::Database)
+            .map_err(TurnFailure::Engine)?;
         // Here rather than in either caller, because both `drive_input` and
         // `continue_goal_unaccounted` reach the prelude through this method — and a title
         // published from only one of them appears or not depending on whether the turn was
@@ -1762,6 +1979,28 @@ async fn report_prelude(
             .map_err(to_string)?;
     }
     Ok(())
+}
+
+async fn report_goal_retry(
+    events: &TurnEventSender,
+    retry: &GoalRetryState,
+    failure: &str,
+) -> Result<(), String> {
+    let delay = Duration::from_millis(u64::try_from(retry.delay_ms).unwrap_or_default());
+    events
+        .publish(TurnEvent::Provider {
+            step: 0,
+            event: StreamEvent::Error {
+                message: format!(
+                    "{failure}; active goal retry {} is scheduled in {delay:?} ({})",
+                    retry.attempt,
+                    retry.reason.as_str()
+                ),
+                retry_after: Some(delay),
+            },
+        })
+        .await
+        .map_err(to_string)
 }
 
 /// Pick the model this turn runs on.
@@ -2786,15 +3025,11 @@ fn persist_prepared_user_message(
     connection: &rusqlite::Connection,
     message: &zuno_db::message::MessageRecord,
     parts: &[zuno_db::message::PartRecord],
-) -> Result<(), String> {
+) -> Result<(), DbError> {
     let store = zuno_db::message::MessageStore::new(connection);
-    store
-        .put_message_at(message, message.time_created)
-        .map_err(to_string)?;
+    store.put_message_at(message, message.time_created)?;
     for part in parts {
-        store
-            .put_part_at(part, part.time_created)
-            .map_err(to_string)?;
+        store.put_part_at(part, part.time_created)?;
     }
     Ok(())
 }
