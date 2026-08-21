@@ -6,7 +6,6 @@
 //! without the recovery information the model needs.
 
 use std::collections::BTreeSet;
-use std::error::Error as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -605,11 +604,21 @@ fn joined_result(
     }
 }
 
+/// Render a failed call for the model: its category, then every cause beneath it.
+///
+/// # Why the whole chain and not the first cause
+///
+/// A [`zuno_error::ToolError`] classifies and hangs the detail off a `#[source]`, and
+/// a chain is routinely deeper than one link: an MCP proxy reports `tool X failed`
+/// wrapping the server's rejection wrapping the transport error that caused it.
+/// Unwrapping exactly one level therefore stops one link short of the reason on every
+/// failure whose cause is itself wrapped, and hands the model a message naming a
+/// category it cannot act on. [`zuno_error::source::describe`] walks the chain once
+/// for every variant, which is why it is called here rather than reimplemented — its
+/// own documentation records that reaching for a cause by hand at a call site fixes
+/// that site and leaves the next one broken.
 fn tool_error_result(tool: &str, error: &zuno_error::ToolError) -> ToolDispatchResult {
-    let detail = error
-        .source()
-        .map_or_else(|| error.to_string(), |source| format!("{error}: {source}"));
-    error_result(tool, detail)
+    error_result(tool, zuno_error::source::describe(error))
 }
 
 fn error_result(tool: &str, message: String) -> ToolDispatchResult {
