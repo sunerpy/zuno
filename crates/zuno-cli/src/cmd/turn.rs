@@ -156,6 +156,15 @@ pub(crate) struct TurnPlan {
     /// load could hand back a body for a name the prompt never advertised, or refuse
     /// one it did.
     skills: Arc<zuno_catalog::skill::Skills>,
+    /// The `AGENTS.md`-class rule files this session runs under, read once here.
+    ///
+    /// Loaded during resolution rather than at host construction because the read is
+    /// `async` and [`TurnHost::open_with_runtime_and_mcp`] is not — and because these
+    /// bytes must not be re-read per turn: a rule file the user edits mid-session
+    /// would otherwise change the static prompt prefix underneath the provider's
+    /// cache, which is the same reason [`zuno_memory::SessionMemory`] freezes its
+    /// blocks at session start.
+    instructions: zuno_config::LoadedInstructions,
     /// Catalog facts for the models a delegation may name. See [`delegation_facts`].
     delegation_facts: Arc<zuno_tools::task::FixedFacts>,
     /// Whether any reachable model accepts images, which gates one delegation target.
@@ -327,6 +336,15 @@ impl TurnPlan {
             ))
             .await,
         );
+        let instructions =
+            zuno_config::Instructions::discover(&zuno_config::InstructionOptions::from_config(
+                directory.as_path(),
+                worktree.as_deref(),
+                env,
+                &config,
+            ))
+            .load()
+            .await;
         Ok(Self {
             directory,
             project,
@@ -348,6 +366,7 @@ impl TurnPlan {
             plugins,
             catalog_models,
             skills,
+            instructions,
             delegation_facts,
             vision_available,
             reasoning_supported,
@@ -814,6 +833,7 @@ impl TurnHost {
             zuno_tools::ScopePaths::discover(memory_root),
         )?;
         let mut notes = plan.notes;
+        announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes);
         announce_skills(&mut plan.resolver, &plan.skills, &mut notes);
 
         let runtime_tools = super::tool_runtime::assemble(
@@ -1573,6 +1593,87 @@ fn announce_skills(
         rendered.text
     } else {
         format!("{}\n\n{}", resolver.system_prompt, rendered.text)
+    };
+}
+
+/// How many bytes of instruction files may enter the system prompt.
+///
+/// Twice [`SKILL_PROMPT_BUDGET`], because these are the rules the user wrote for this
+/// repository rather than a catalogue of capabilities they may never invoke, and
+/// because the realistic corpus is larger than it looks: the `AGENTS.md` files on one
+/// developer machine here run from 4 KB to 80 KB, and the global-plus-project pair is
+/// typically under 15 KB. 64 KB admits that whole range and still bounds one
+/// pathological file from consuming a small model's context.
+const INSTRUCTION_PROMPT_BUDGET: usize = 64 * 1024;
+
+/// Put the `AGENTS.md`-class rules in the system prompt, and say what did not fit.
+///
+/// # Placement: after memory, before the skill catalogue
+///
+/// The oracle builds `[...environment, ...instructions, ...mcp, ...skills]` under the
+/// agent prompt (`session/prompt.ts:1257-1269` at 1.18.13, with the agent prompt
+/// prepended in `session/llm/request.ts:56-66`). Instructions therefore sit **before**
+/// skills, and this call is placed to match: getting that backwards would silently
+/// change which text wins when a rule file and a skill description disagree.
+///
+/// Resident memory takes the oracle's `environment` slot — it is the workspace-facts
+/// segment, machine-maintained and frozen at session start — so the assembled order
+/// here is agent prompt, memory, instructions, skills, which maps one-to-one onto the
+/// oracle's.
+///
+/// # Whole files are admitted or dropped, never cut
+///
+/// [`announce_skills`] may drop individual skills because each is independent and an
+/// unmentioned skill merely goes unused. A rule file cut mid-sentence is worse than
+/// an absent one: "do X unless Y" truncated after "do X" inverts the rule the user
+/// wrote, while they go on believing it is in force. So the budget admits complete
+/// blocks in discovery order and names, by path and size, every file it had to leave
+/// out. Contents are never logged — they are user-authored and may say anything.
+///
+/// Warnings from the load ([`zuno_config::WarningKind`]) are surfaced the same way. A
+/// *missing* instruction file never reaches here at all, because discovery only
+/// records paths that exist — which is what keeps the common case, a project with no
+/// `AGENTS.md`, completely silent.
+fn announce_instructions(
+    resolver: &mut Resolver,
+    loaded: &zuno_config::LoadedInstructions,
+    notes: &mut Vec<String>,
+) {
+    for warning in loaded.warnings() {
+        notes.push(format!("warning: {warning}"));
+    }
+
+    let mut admitted = String::new();
+    for entry in loaded.entries() {
+        let block = entry.render();
+        let projected = if admitted.is_empty() {
+            block.len()
+        } else {
+            admitted.len() + 2 + block.len()
+        };
+        if projected > INSTRUCTION_PROMPT_BUDGET {
+            notes.push(format!(
+                "warning: instruction file {} ({} bytes) did not fit the \
+                 {INSTRUCTION_PROMPT_BUDGET}-byte prompt budget, so none of its rules are in \
+                 force; shorten it or remove it from `instructions`",
+                entry.source(),
+                block.len(),
+            ));
+            continue;
+        }
+        if !admitted.is_empty() {
+            admitted.push_str("\n\n");
+        }
+        admitted.push_str(&block);
+    }
+
+    if admitted.is_empty() {
+        return;
+    }
+    resolver.system_prompt = if resolver.system_prompt.is_empty() {
+        admitted
+    } else {
+        format!("{}\n\n{}", resolver.system_prompt, admitted)
     };
 }
 

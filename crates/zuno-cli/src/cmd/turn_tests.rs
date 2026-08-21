@@ -65,6 +65,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         },
         catalog_models: Vec::new(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
+        instructions: zuno_config::LoadedInstructions::default(),
         delegation_facts: Arc::new(zuno_tools::task::FixedFacts::new()),
         vision_available: false,
         reasoning_supported: false,
@@ -3146,6 +3147,343 @@ mod skill_prompt {
             notes[0]
         );
     }
+}
+
+/// The `AGENTS.md`-class rules must reach the system prompt, or they govern nothing.
+///
+/// [`zuno_config::Instructions`] was a complete, tested port with **zero** production
+/// callers: a user could write `AGENTS.md` at either level, or list files in
+/// `instructions`, and none of it was ever sent. These assertions run the real
+/// discovery against real files, so they cover the seam and the semantics together.
+mod instruction_prompt {
+    use super::*;
+    use std::path::Path;
+
+    fn env_for(root: &Path) -> Env {
+        Env::empty()
+            .with(
+                zuno_paths::env::HOME,
+                root.join("home").to_string_lossy().into_owned(),
+            )
+            .with(
+                zuno_paths::env::XDG_CONFIG_HOME,
+                root.join("home/.config").to_string_lossy().into_owned(),
+            )
+    }
+
+    fn write(path: &Path, body: impl AsRef<[u8]>) {
+        std::fs::create_dir_all(path.parent().expect("a parent directory")).expect("mkdir");
+        std::fs::write(path, body).expect("write");
+    }
+
+    fn options(
+        root: &Path,
+        directory: PathBuf,
+        instructions: Vec<String>,
+    ) -> zuno_config::InstructionOptions {
+        zuno_config::InstructionOptions::new(
+            directory,
+            Some(root.join("repo")),
+            &env_for(root),
+            instructions,
+        )
+    }
+
+    fn resolver() -> Resolver {
+        Resolver {
+            requested_agent: "build".to_owned(),
+            system_prompt: "AGENT PROMPT".to_owned(),
+            max_steps: DEFAULT_MAX_STEPS,
+            requested_provider: "provider".to_owned(),
+            requested_model: "model".to_owned(),
+            wire_model: "model".to_owned(),
+            spec: Spec::new(COMPATIBLE_PROVIDER),
+            reasoning_options: serde_json::Map::new(),
+        }
+    }
+
+    async fn inject(options: &zuno_config::InstructionOptions) -> (Resolver, Vec<String>) {
+        let loaded = zuno_config::Instructions::discover(options).load().await;
+        let mut resolver = resolver();
+        let mut notes = Vec::new();
+        announce_instructions(&mut resolver, &loaded, &mut notes);
+        (resolver, notes)
+    }
+
+    #[tokio::test]
+    async fn the_global_rule_file_reaches_the_system_prompt() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let global = root.path().join("home/.config/zuno/AGENTS.md");
+        write(&global, "GLOBAL_RULE_MARKER");
+        std::fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
+
+        let (resolver, notes) =
+            inject(&options(root.path(), root.path().join("repo"), Vec::new())).await;
+
+        assert!(
+            resolver.system_prompt.starts_with("AGENT PROMPT"),
+            "the agent's own prompt must stay first: {}",
+            resolver.system_prompt
+        );
+        assert!(
+            resolver.system_prompt.contains("GLOBAL_RULE_MARKER"),
+            "the global rule file never reached the prompt: {}",
+            resolver.system_prompt
+        );
+        assert!(
+            resolver
+                .system_prompt
+                .contains(&format!("Instructions from: {}", global.display())),
+            "the oracle's header must name the source: {}",
+            resolver.system_prompt
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[tokio::test]
+    async fn the_project_cascade_reaches_the_prompt_at_every_level() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
+        write(&repo.join("sub/AGENTS.md"), "SUB_RULE_MARKER");
+
+        let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
+
+        let sub_at = resolver
+            .system_prompt
+            .find("SUB_RULE_MARKER")
+            .expect("the nearest level must reach the prompt");
+        let root_at = resolver
+            .system_prompt
+            .find("ROOT_RULE_MARKER")
+            .expect("the worktree level must reach the prompt too, not only the nearest");
+        assert!(
+            sub_at < root_at,
+            "the cascade renders deepest first: {}",
+            resolver.system_prompt
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// The cascade's sharp edge, preserved deliberately.
+    ///
+    /// The first *filename* found anywhere on the chain claims the whole chain, so a
+    /// nearer `CLAUDE.md` loses to a further `AGENTS.md` and is not loaded at all. That
+    /// is the oracle's behaviour (`instruction.ts:122-132`), it surprises people, and
+    /// this exists so nobody "fixes" it into a per-level merge.
+    #[tokio::test]
+    async fn a_nearer_claude_md_is_not_loaded_once_a_further_agents_md_exists() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
+        write(&repo.join("sub/CLAUDE.md"), "SUB_CLAUDE_MARKER");
+
+        let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
+
+        assert!(
+            resolver.system_prompt.contains("ROOT_RULE_MARKER"),
+            "{}",
+            resolver.system_prompt
+        );
+        assert!(
+            !resolver.system_prompt.contains("SUB_CLAUDE_MARKER"),
+            "`AGENTS.md` anywhere on the chain claims it, so this `CLAUDE.md` must not be \
+             loaded: {}",
+            resolver.system_prompt
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[tokio::test]
+    async fn configured_instruction_entries_reach_the_prompt() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        write(&repo.join("docs/house-style.md"), "CONFIGURED_RULE_MARKER");
+        write(
+            &root.path().join("home/tilde-rules.md"),
+            "TILDE_RULE_MARKER",
+        );
+
+        let (resolver, notes) = inject(&options(
+            root.path(),
+            repo,
+            vec!["docs/*.md".to_owned(), "~/tilde-rules.md".to_owned()],
+        ))
+        .await;
+
+        assert!(
+            resolver.system_prompt.contains("CONFIGURED_RULE_MARKER"),
+            "an `instructions` glob never reached the prompt: {}",
+            resolver.system_prompt
+        );
+        assert!(
+            resolver.system_prompt.contains("TILDE_RULE_MARKER"),
+            "a `~/`-relative `instructions` entry never reached the prompt: {}",
+            resolver.system_prompt
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// The common case — no rule file anywhere — must cost nothing and say nothing.
+    ///
+    /// Byte equality, not "contains": a stray `\n\n` for an absent file would ride in
+    /// front of every request for the life of the session and invalidate a prompt cache
+    /// that had no reason to move.
+    #[tokio::test]
+    async fn a_project_with_no_rule_file_leaves_the_prompt_byte_identical() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let (resolver, notes) = inject(&options(root.path(), repo, Vec::new())).await;
+
+        assert_eq!(
+            resolver.system_prompt.as_bytes(),
+            b"AGENT PROMPT",
+            "an absent instruction file must add no bytes at all"
+        );
+        assert!(
+            notes.is_empty(),
+            "a missing rule file is the normal case and must be silent: {notes:?}"
+        );
+    }
+
+    /// An unreadable file is reported, once, and never silently skipped.
+    ///
+    /// A rule the user wrote and believes is in force, that the agent never received,
+    /// is the worst of the three outcomes — worse than a hard failure, which they would
+    /// at least notice. The count matters as much as the text: this is surfaced from a
+    /// load that happens once per host, not once per turn.
+    #[tokio::test]
+    async fn an_unreadable_rule_file_is_reported_exactly_once() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        write(&repo.join("AGENTS.md"), [0xff_u8, 0xfe, 0x00, 0x9c]);
+
+        let (resolver, notes) = inject(&options(root.path(), repo.clone(), Vec::new())).await;
+
+        assert_eq!(
+            resolver.system_prompt.as_bytes(),
+            b"AGENT PROMPT",
+            "an unreadable file must not contribute bytes"
+        );
+        assert_eq!(
+            notes.len(),
+            1,
+            "an unreadable rule file must be reported once — no more, and never zero: \
+             {notes:?}"
+        );
+        assert!(
+            notes[0].contains(&repo.join("AGENTS.md").display().to_string()),
+            "the report must name the file the user has to fix: {}",
+            notes[0]
+        );
+        assert!(
+            notes[0].contains("could not be read"),
+            "the report must say what went wrong: {}",
+            notes[0]
+        );
+    }
+
+    /// Past the budget a whole file is dropped and named — never cut mid-rule.
+    #[tokio::test]
+    async fn an_oversized_rule_file_is_dropped_whole_and_the_drop_is_reported() {
+        let root = tempfile::TempDir::new().expect("temporary instruction root");
+        let repo = root.path().join("repo");
+        let oversized = repo.join("AGENTS.md");
+        write(
+            &oversized,
+            format!(
+                "OVERSIZED_RULE_MARKER{}",
+                "r".repeat(INSTRUCTION_PROMPT_BUDGET)
+            ),
+        );
+        write(&root.path().join("home/small.md"), "SMALL_RULE_MARKER");
+
+        let (resolver, notes) =
+            inject(&options(root.path(), repo, vec!["~/small.md".to_owned()])).await;
+
+        assert!(
+            !resolver.system_prompt.contains("OVERSIZED_RULE_MARKER"),
+            "a file past the budget must be dropped whole, not truncated into a rule \
+             that says something else"
+        );
+        assert!(
+            resolver.system_prompt.len() <= "AGENT PROMPT".len() + 2 + INSTRUCTION_PROMPT_BUDGET,
+            "the prompt exceeded the budget: {} bytes",
+            resolver.system_prompt.len()
+        );
+        assert!(
+            resolver.system_prompt.contains("SMALL_RULE_MARKER"),
+            "one oversized file must not starve the rest: {}",
+            resolver.system_prompt
+        );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains(&oversized.display().to_string()),
+            "the report must name the file: {}",
+            notes[0]
+        );
+        assert!(
+            notes[0].contains("none of its rules are in force"),
+            "the report must say the rules are not in effect, not merely that bytes were \
+             trimmed: {}",
+            notes[0]
+        );
+        assert!(
+            !notes[0].contains("OVERSIZED_RULE_MARKER"),
+            "instruction contents are user-authored and must never be echoed: {}",
+            notes[0]
+        );
+    }
+}
+
+/// Instruction files must be injected once, and between memory and the skills.
+///
+/// Two independent failures this pins. **Absence**: the injection deleted compiles,
+/// lints and passes every behavioural test above, because those call
+/// [`announce_instructions`] directly rather than through the composition root — the
+/// exact shape of the original defect, where the whole module had no caller.
+/// **Order**: the oracle assembles `[...environment, ...instructions, ...skills]`
+/// (`session/prompt.ts:1257-1269`), and moving this call past `announce_skills` would
+/// silently invert precedence between a user's rule and a skill's description.
+#[test]
+fn instruction_files_are_injected_once_between_memory_and_the_skill_catalogue() {
+    let turn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+    )
+    .expect("turn.rs is readable");
+
+    let memory_at = turn
+        .find("configure_resident_memory(\n            &mut plan.resolver,")
+        .expect("the resident-memory call site moved; this test's anchors need updating");
+    let instructions_at = turn
+        .find("announce_instructions(&mut plan.resolver")
+        .expect(
+            "`turn.rs` no longer injects instruction files, so a user's `AGENTS.md` reaches \
+             no request and nothing reports it",
+        );
+    let skills_at = turn
+        .find("announce_skills(&mut plan.resolver")
+        .expect("the skill-catalogue call site moved; this test's anchors need updating");
+
+    assert!(
+        memory_at < instructions_at && instructions_at < skills_at,
+        "instruction files must be assembled after memory and before the skill \
+         catalogue, mirroring the oracle's segment order"
+    );
+    assert_eq!(
+        turn.matches("announce_instructions(&mut plan.resolver")
+            .count(),
+        1,
+        "instruction files must be injected at exactly one site: a second call would \
+         charge the user for every rule file twice on every request"
+    );
+    assert!(
+        turn.contains("instructions,\n            delegation_facts,"),
+        "`TurnPlan` no longer carries the loaded instruction files, so the read would \
+         have to repeat per turn"
+    );
 }
 
 /// The three wirings this task closed, asserted at their production call sites.
