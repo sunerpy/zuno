@@ -30,7 +30,7 @@ use zuno_llm::event::{
 };
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
-    ProviderStream, Spec, Unavailable,
+    ProviderStream, Spec, Unavailable, generation,
 };
 use zuno_llm::sse::{SseEvent, SseParser, ensure_tool_input_size};
 
@@ -221,9 +221,21 @@ impl GeminiOptions {
         Self {
             base_url: spec.base_url.clone(),
             generation: GeminiGenerationConfig {
-                max_output_tokens: option_u64(spec, &["maxOutputTokens", "max_output_tokens"]),
-                temperature: option_f64(spec, &["temperature"]),
-                top_p: option_f64(spec, &["topP", "top_p"]),
+                // Gemini's own field name first, then the cross-provider option the
+                // composition root writes: `gemini.ts:307` builds
+                // `maxOutputTokens: generation?.maxTokens`, so both spellings name one
+                // value and a config that used the Gemini name keeps winning.
+                max_output_tokens: option_u64(
+                    spec,
+                    &[
+                        "maxOutputTokens",
+                        "max_output_tokens",
+                        generation::MAX_TOKENS,
+                        "max_tokens",
+                    ],
+                ),
+                temperature: option_f64(spec, generation::TEMPERATURE_KEYS),
+                top_p: option_f64(spec, generation::TOP_P_KEYS),
                 top_k: option_u64(spec, &["topK", "top_k"]),
                 stop_sequences: option_array(spec, &["stopSequences", "stop_sequences"])
                     .into_iter()
@@ -1058,6 +1070,8 @@ pub struct VertexAnthropicOptions {
     pub max_tokens: u64,
     /// Sampling temperature.
     pub temperature: Option<f64>,
+    /// Nucleus-sampling cutoff, sent as `top_p`.
+    pub top_p: Option<f64>,
     /// Additional system text placed before system-role request messages.
     pub system: Vec<String>,
     /// Anthropic tool definitions (`name`, `description`, `input_schema`).
@@ -1079,6 +1093,7 @@ impl Default for VertexAnthropicOptions {
             anthropic_version: VERTEX_ANTHROPIC_VERSION.to_owned(),
             max_tokens: 4_096,
             temperature: None,
+            top_p: None,
             system: Vec::new(),
             tools: Vec::new(),
             tool_choice: None,
@@ -1098,10 +1113,20 @@ impl VertexAnthropicOptions {
         if let Some(version) = &spec.api_version {
             options.anthropic_version.clone_from(version);
         }
-        if let Some(max_tokens) = option_u64(spec, &["maxTokens", "max_tokens"]) {
+        if let Some(max_tokens) = option_u64(spec, generation::MAX_TOKENS_KEYS) {
             options.max_tokens = max_tokens;
         }
-        options.temperature = option_f64(spec, &["temperature"]);
+        options.temperature = option_f64(spec, generation::TEMPERATURE_KEYS);
+        options.top_p = option_f64(spec, generation::TOP_P_KEYS);
+        options.tool_choice = spec
+            .options
+            .iter()
+            .find_map(|(name, value)| {
+                generation::TOOL_CHOICE_KEYS
+                    .contains(&name.as_str())
+                    .then_some(value)
+            })
+            .cloned();
         options
     }
 }
@@ -1293,6 +1318,7 @@ fn build_vertex_anthropic_body(
         body.insert("tool_choice".to_owned(), tool_choice.clone());
     }
     insert_optional_f64(&mut body, "temperature", options.temperature);
+    insert_optional_f64(&mut body, "top_p", options.top_p);
     if let Some(effort) = options.effort {
         resolve_effort(
             ProviderFamily::Anthropic,
@@ -2591,5 +2617,99 @@ mod tests {
             error,
             ServiceAccountSigningError::PrivateKeyRejected(_)
         ));
+    }
+
+    /// The Gemini body a provider configured from an option bag sends.
+    ///
+    /// Through `GeminiOptions::from_spec` — what `google_factory` calls — rather than
+    /// by constructing `GeminiGenerationConfig`, because a test that filled the struct
+    /// directly would keep passing while `from_spec` ignored the key the composition
+    /// root writes. That is exactly how an accepted-and-ignored option survives.
+    fn gemini_body_from_options(options: serde_json::Value) -> Value {
+        let mut spec = Spec::new("google");
+        for (name, value) in options.as_object().expect("options are an object") {
+            spec = spec.with_option(name.clone(), value.clone());
+        }
+        let provider = GoogleGenerativeAi::new("test-api-key", GeminiOptions::from_spec(&spec))
+            .expect("provider configuration");
+        let request = CompletionRequest::new(
+            "gemini-2.5-flash",
+            vec![Message::new(Role::User, "Say hello.")],
+        );
+        provider.prepare(&request).expect("Gemini request").body
+    }
+
+    #[test]
+    fn the_cross_provider_output_cap_reaches_gemini_generation_config() {
+        assert_eq!(
+            gemini_body_from_options(json!({"maxTokens": 16_384}))["generationConfig"]["maxOutputTokens"],
+            json!(16_384),
+            "`gemini.ts:307` builds `maxOutputTokens` from `generation.maxTokens`, so a \
+             provider reading only Gemini's own spelling drops the cap the composition \
+             root writes for every family"
+        );
+    }
+
+    #[test]
+    fn geminis_own_spelling_still_outranks_the_cross_provider_one() {
+        assert_eq!(
+            gemini_body_from_options(json!({"maxOutputTokens": 2_048, "maxTokens": 16_384}))["generationConfig"]
+                ["maxOutputTokens"],
+            json!(2_048),
+            "a config written against Gemini's own field name must keep winning, or \
+             adding the alias would silently change an existing deployment"
+        );
+    }
+
+    #[test]
+    fn gemini_sampling_controls_reach_generation_config() {
+        let config = gemini_body_from_options(json!({"temperature": 0.3, "topP": 0.9}));
+        assert_eq!(config["generationConfig"]["temperature"], json!(0.3));
+        assert_eq!(config["generationConfig"]["topP"], json!(0.9));
+    }
+
+    /// The Vertex-Anthropic body a provider configured from an option bag sends.
+    fn vertex_anthropic_body_from_options(options: serde_json::Value) -> Value {
+        let mut spec = Spec::new("google-vertex-anthropic");
+        for (name, value) in options.as_object().expect("options are an object") {
+            spec = spec.with_option(name.clone(), value.clone());
+        }
+        let provider = VertexAnthropic::new(
+            "project-a",
+            "us",
+            VertexCredentials::access_token("test-token"),
+            VertexAnthropicOptions::from_spec(&spec),
+        )
+        .expect("Vertex Anthropic");
+        let request = CompletionRequest::new(
+            "claude-model-under-test",
+            vec![Message::new(Role::User, "Say hello.")],
+        );
+        provider.prepare(&request).expect("Anthropic request").body
+    }
+
+    #[test]
+    fn vertex_anthropic_carries_every_configured_generation_control() {
+        let body = vertex_anthropic_body_from_options(json!({
+            "maxTokens": 8_192,
+            "temperature": 0.3,
+            "topP": 0.9,
+            "toolChoice": {"type": "any"}
+        }));
+
+        assert_eq!(body["max_tokens"], json!(8_192));
+        assert_eq!(body["temperature"], json!(0.3));
+        assert_eq!(
+            body["top_p"],
+            json!(0.9),
+            "this path had no `top_p` field at all, so a configured cutoff was accepted \
+             and dropped"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "any"}),
+            "the field existed and only the `with_*` builders could set it, so a \
+             configured `toolChoice` never reached the wire"
+        );
     }
 }
