@@ -1732,10 +1732,19 @@ mod tests {
         assert_eq!(result, Some(String::from("draft edited")));
         assert!(observed.load(Ordering::SeqCst));
         assert!(transcript.released_by("tui"));
-        assert!(matches!(
-            wake_source.try_recv(),
-            Ok(zuno_tui::app::TerminalEvent::Wake)
-        ));
+        // `drive_external_editor` sends the result and *then* nudges, so a delivered
+        // result is a proxy for readiness rather than readiness itself: `try_recv` here
+        // read an empty channel in 6 of 60 runs, the wake landing 8-28µs later across the
+        // two-thread hand-off. Waiting for the nudge on a budget cannot be made wrong by
+        // load, only slower, and each way it ends names a different failure.
+        let nudged = tokio::time::timeout(std::time::Duration::from_secs(5), wake_source.recv())
+            .await
+            .expect("the worker published a result but never nudged the render loop")
+            .expect("the worker dropped the nudge channel without waking the render loop");
+        assert!(
+            matches!(nudged, zuno_tui::app::TerminalEvent::Wake),
+            "the worker nudged with {nudged:?}, which no render loop redraws on"
+        );
         drop(requests);
         worker.await.expect("worker exits with its request channel");
     }
