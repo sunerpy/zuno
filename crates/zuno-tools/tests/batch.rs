@@ -548,3 +548,76 @@ async fn batch_oversized_subcall_output_is_persisted_and_refused_not_truncated()
     assert!(!output.output.contains("(truncated)"));
     assert!(output.output.contains("Completed: 0 succeeded, 1 failed"));
 }
+
+/// A sub-tool that fails with a cause two links deep, like an MCP proxy relaying a
+/// server's rejection of a call the transport had already refused.
+struct NestedFailureTool;
+
+#[derive(Debug, thiserror::Error)]
+#[error("the browser refused the request")]
+struct BrowserRefused(#[source] NoPage);
+
+#[derive(Debug, thiserror::Error)]
+#[error("no open page to attach to")]
+struct NoPage;
+
+#[async_trait]
+impl Tool for NestedFailureTool {
+    fn id(&self) -> &str {
+        "chrome_devtools_list_pages"
+    }
+
+    fn description(&self) -> &str {
+        "Fail with a nested cause."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::Failed {
+            tool: "chrome_devtools_list_pages".to_owned(),
+            source: Box::new(BrowserRefused(NoPage)),
+        })
+    }
+}
+
+/// Composition must not be where a diagnosis is lost.
+///
+/// `format!("Error: {error}")` rendered only the outermost link, so anything invoked
+/// through `execute` reported its category and dropped the reason.
+#[tokio::test]
+async fn batch_a_failed_subcall_keeps_every_cause_beneath_it() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let registry = registry(root.path(), vec![Arc::new(NestedFailureTool)]);
+
+    let output = registry
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [{
+                    "tool": "chrome_devtools_list_pages",
+                    "intent": "list the open pages"
+                }]
+            }),
+            context(Arc::new(zuno_tool::AllowAll)),
+        )
+        .await
+        .expect("the batch itself completes even though the sub-call failed");
+
+    let reported = &output.output;
+    assert!(
+        reported.contains("tool chrome_devtools_list_pages failed"),
+        "the category must still name the tool: {reported}"
+    );
+    assert!(
+        reported.contains("the browser refused the request"),
+        "the first cause must survive composition: {reported}"
+    );
+    assert!(
+        reported.contains("no open page to attach to"),
+        "the innermost cause is the diagnosis and must not be truncated: {reported}"
+    );
+    assert!(reported.contains("Completed: 0 succeeded, 1 failed"));
+}

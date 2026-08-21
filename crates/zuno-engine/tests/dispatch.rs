@@ -754,3 +754,78 @@ fn available_tools_omits_unconditionally_denied_entries() {
         ["tool_search"]
     );
 }
+
+/// A tool whose failure carries a cause two links deep, like an MCP proxy relaying a
+/// server's rejection of a call the transport had already refused.
+struct NestedFailureTool;
+
+#[derive(Debug, thiserror::Error)]
+#[error("the browser refused the request")]
+struct BrowserRefused(#[source] NoPage);
+
+#[derive(Debug, thiserror::Error)]
+#[error("no open page to attach to")]
+struct NoPage;
+
+#[async_trait]
+impl Tool for NestedFailureTool {
+    fn id(&self) -> &str {
+        "chrome_devtools_list_pages"
+    }
+
+    fn description(&self) -> &str {
+        "Fail with a nested cause."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::Failed {
+            tool: "chrome_devtools_list_pages".to_owned(),
+            source: Box::new(BrowserRefused(NoPage)),
+        })
+    }
+}
+
+/// The model must receive every cause, not the category plus one link.
+///
+/// Unwrapping exactly one `source()` stopped here: `tool X failed: the browser refused
+/// the request`, with the sentence naming what to do still one link below.
+#[tokio::test]
+async fn dispatch_hands_the_model_every_cause_beneath_a_failure() {
+    let dispatcher = dispatcher(
+        vec![Arc::new(NestedFailureTool)],
+        Vec::new(),
+        Arc::new(RecordingApprover::default()),
+        InterruptSignal::new(),
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call_nested",
+            "chrome_devtools_list_pages",
+            json!({ "intent": "list the open pages" }),
+        ))
+        .await;
+
+    assert!(
+        result.is_error,
+        "the tool failed, so the result must say so"
+    );
+    let reported = &result.output.output;
+    assert!(
+        reported.contains("tool chrome_devtools_list_pages failed"),
+        "the category must still name the tool: {reported}"
+    );
+    assert!(
+        reported.contains("the browser refused the request"),
+        "the first cause must survive: {reported}"
+    );
+    assert!(
+        reported.contains("no open page to attach to"),
+        "the innermost cause is the diagnosis and must not be truncated: {reported}"
+    );
+}

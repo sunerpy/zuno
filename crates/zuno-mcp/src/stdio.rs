@@ -749,7 +749,23 @@ async fn read_loop(
         line.clear();
         match reader.read_line(&mut line).await {
             Ok(0) => {
-                fail_pending(&pending, ReaderFailure::Closed);
+                // Every other arm of this match already reports itself; end-of-stream
+                // was the one server death that happened in silence. It is split by
+                // whether calls were outstanding because both a crash and an ordinary
+                // shutdown arrive here: a stream closing with nothing in flight is what
+                // stopping a server looks like, and reporting that at a level demanding
+                // attention would fire on every clean exit.
+                let in_flight = fail_pending(&pending, ReaderFailure::Closed);
+                if in_flight == 0 {
+                    tracing::debug!(%server, "MCP server closed its output stream");
+                } else {
+                    tracing::warn!(
+                        %server,
+                        in_flight,
+                        "MCP server closed its output stream while calls were in flight; \
+                         they were failed"
+                    );
+                }
                 break;
             }
             Ok(_) => {

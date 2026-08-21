@@ -146,16 +146,32 @@ pub trait Tool: Send + Sync {
         &[]
     }
 
-    /// Runs the tool. **The single point where injected properties are removed.**
+    /// Runs the tool. **The single point where injected properties are removed, and
+    /// the single point where a failed call is recorded.**
     ///
     /// Every caller outside this crate goes through here rather than
     /// [`Tool::execute`], so the removal covers derived and proxied tools alike, in
     /// the same spirit as [`Tool::definition`] covering both for injection. Runs
     /// after the permission gate, which reads the intent off the un-stripped
     /// arguments. Not intended to be overridden.
+    ///
+    /// # Why the failure record is emitted here
+    ///
+    /// The two production callers — the engine's dispatch boundary and the registry
+    /// that composed sub-calls run through — both reach every tool through this one
+    /// method, so a record placed here covers builtins, MCP proxies, plugin tools and
+    /// batch sub-calls together. Placing it at either caller would have covered one of
+    /// those sets and left the other silent, which is how a session full of failing
+    /// MCP calls produced a log containing no MCP entry at all.
     async fn invoke(&self, mut args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         guard::strip_injected_except(&mut args, self.consumed_injected_keys());
-        self.execute(args, ctx).await
+        let session_id = ctx.session_id.clone();
+        let call_id = ctx.call_id.clone();
+        let result = self.execute(args, ctx).await;
+        if let Err(error) = &result {
+            report_tool_failure(self.id(), &session_id, &call_id, error);
+        }
+        result
     }
 
     /// The provider-facing definition. **The single augmentation point.**
@@ -169,6 +185,60 @@ pub trait Tool: Send + Sync {
             description: self.description().to_owned(),
             parameters: schema::augment(self.raw_parameters_schema()),
         }
+    }
+}
+
+/// Record one failed tool call: which tool, which call, and every cause.
+///
+/// # Why only failures, and why nothing on success
+///
+/// A per-call record on a *successful* tool would be the defect this project already
+/// lived through in another place. Duplicate-skill precedence was reported with one
+/// `WARN` per duplicate per launch, which put 189 lines demanding attention into a
+/// 202-line log and buried the twelve warnings that were real faults. Volume at a
+/// level reserved for action is how a true signal becomes unreadable, so the
+/// successful path stays silent and only an outcome a user may need to act on is
+/// recorded.
+///
+/// # Why a denial is quieter than the rest
+///
+/// [`ToolError::Denied`] is the permission layer doing exactly what it was
+/// configured to do, at the user's own instruction, and the user was already told at
+/// the moment it happened. Recording it at `WARN` would emit a line every time
+/// someone declines a prompt — a normal condition at a level that demands attention,
+/// which is the same mistake in a new place. It stays at `DEBUG`, so
+/// `--log-level debug` still recovers it. Every other variant is either a fault or a
+/// call the model could not complete, and those surface by default.
+///
+/// # What is deliberately not recorded
+///
+/// The arguments are never logged. They carry file contents, prompts, patch bodies,
+/// URLs and anything else the model chose to pass, so a record of them is a
+/// credential-disclosure risk that outweighs its diagnostic value; the tool name and
+/// the cause chain are what a reader needs to act. The session and call ids are
+/// recorded because they are generated identifiers with no user content, and the call
+/// id is the key that locates the failing row without reading the database by hand.
+///
+/// The cause chain itself is reproduced verbatim, because it *is* the diagnosis.
+/// [`zuno_error::source::describe`] documents that it cannot know which bytes are
+/// sensitive; a caller that both walks a chain and knows a secret is the one
+/// responsible for keeping it out, and no secret is known at this layer.
+fn report_tool_failure(tool: &str, session_id: &str, call_id: &str, error: &ToolError) {
+    let reason = zuno_error::source::describe(error);
+    if matches!(error, ToolError::Denied { .. }) {
+        tracing::debug!(
+            "tool.name" = tool,
+            "session.id" = session_id,
+            "tool.call_id" = call_id,
+            "tool call denied: {reason}"
+        );
+    } else {
+        tracing::warn!(
+            "tool.name" = tool,
+            "session.id" = session_id,
+            "tool.call_id" = call_id,
+            "tool call failed: {reason}"
+        );
     }
 }
 

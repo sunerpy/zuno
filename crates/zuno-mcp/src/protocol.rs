@@ -139,11 +139,18 @@ pub(crate) fn route_message(
     }
 }
 
-pub(crate) fn fail_pending(pending: &Pending, failure: ReaderFailure) {
+/// Fail every in-flight request, returning how many there were.
+///
+/// The count is what lets a caller tell a server that died mid-call from one that
+/// closed its stream with nothing outstanding. Both reach the same code path, but only
+/// the first cost the user a tool call.
+pub(crate) fn fail_pending(pending: &Pending, failure: ReaderFailure) -> usize {
     let waiters: Vec<_> = lock(pending).drain().map(|(_, waiter)| waiter).collect();
+    let in_flight = waiters.len();
     for waiter in waiters {
         let _receiver = waiter.send(Err(failure.clone()));
     }
+    in_flight
 }
 
 pub(crate) fn decode_error(line: &str) -> serde_json::Error {

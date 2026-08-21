@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use tokio::task::JoinSet;
 use zuno_error::ToolError;
+use zuno_error::source::describe;
 use zuno_tool::{OutputLimits, ToolContext, ToolOutput, ToolOutputStore, TypedTool};
 
 /// Maximum declared and expanded sub-calls in one composition.
@@ -271,6 +272,13 @@ fn bind_successes(
     }
 }
 
+/// Render every sub-call result, failures included, into one model-facing block.
+///
+/// A failed sub-call is rendered through [`describe`] rather than its own `Display`.
+/// `{error}` prints only the outermost link, so a sub-call that failed inside an MCP
+/// server or a plugin host arrived here classified as `tool X failed` with the reason
+/// still hanging off `source()` — every diagnosis reached through composition was lost
+/// at this line.
 fn render(mut results: Vec<Invocation>, session_id: &str, store: &ToolOutputStore) -> ToolOutput {
     results.sort_by_key(Invocation::order);
     let budget = TOTAL_OUTPUT_BYTES / results.len().max(1);
@@ -307,13 +315,13 @@ fn render(mut results: Vec<Invocation>, session_id: &str, store: &ToolOutputStor
                     }
                     Err(error) => {
                         failed += 1;
-                        lines.push(format!("Error: {error}"));
+                        lines.push(format!("Error: {}", describe(&error)));
                     }
                 }
             }
             Err(error) => {
                 failed += 1;
-                lines.push(format!("Error: {error}"));
+                lines.push(format!("Error: {}", describe(&error)));
             }
         }
         lines.push(String::new());
