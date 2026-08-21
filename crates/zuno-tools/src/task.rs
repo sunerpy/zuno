@@ -856,6 +856,17 @@ impl FixedFacts {
     }
 }
 
+impl FixedFacts {
+    /// Whether the declared model reasons, or [`None`] when it is not declared here.
+    ///
+    /// Keyed on the same `provider/model` string [`ProviderFacts::facts`] resolves, so a
+    /// surface asking this and a delegation asking that cannot disagree about a model.
+    #[must_use]
+    pub fn reasons(&self, model: &str) -> Option<bool> {
+        self.known.get(model).map(|facts| facts.reasoning)
+    }
+}
+
 impl ProviderFacts for FixedFacts {
     fn facts(&self, model: &ModelChoice) -> Option<ModelFacts> {
         self.known.get(&model.model).cloned()

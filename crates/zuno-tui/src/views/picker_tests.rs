@@ -39,11 +39,13 @@ fn models() -> Vec<ModelEntry> {
             id: String::from("anthropic/claude-x"),
             name: String::from("Claude X"),
             provider: String::from("Anthropic"),
+            reasoning: false,
         },
         ModelEntry {
             id: String::from("openai/gpt-y"),
             name: String::from("GPT Y"),
             provider: String::from("OpenAI"),
+            reasoning: false,
         },
     ]
 }
@@ -512,6 +514,7 @@ fn views_picker_escape_cancels_because_its_footer_says_it_does() {
             id: String::from("prov/one"),
             name: String::from("one"),
             provider: String::from("prov"),
+            reasoning: false,
         }],
     );
     assert!(
@@ -540,11 +543,13 @@ fn picker_finds_a_model_by_the_id_the_engine_takes_not_only_by_its_display_name(
                 id: String::from("myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0"),
                 name: String::from("Claude Haiku 4.5"),
                 provider: String::from("myopenai"),
+                reasoning: false,
             },
             ModelEntry {
                 id: String::from("amazon-bedrock/amazon.nova-2-lite-v1:0"),
                 name: String::from("Nova 2 Lite"),
                 provider: String::from("amazon-bedrock"),
+                reasoning: false,
             },
         ],
     );
@@ -573,11 +578,13 @@ fn picker_ranks_a_label_match_above_a_value_match() {
                 id: String::from("p/contains-sonnet-inside-the-id"),
                 name: String::from("Something Else"),
                 provider: String::from("p"),
+                reasoning: false,
             },
             ModelEntry {
                 id: String::from("p/anthropic.x"),
                 name: String::from("Sonnet"),
                 provider: String::from("p"),
+                reasoning: false,
             },
         ],
     );
@@ -599,21 +606,25 @@ fn two_providers() -> Vec<ModelEntry> {
             id: String::from("openai/gpt-5-mini"),
             name: String::from("gpt-5-mini"),
             provider: String::from("openai"),
+            reasoning: false,
         },
         ModelEntry {
             id: String::from("amazon-bedrock/anthropic.claude-opus-4-6-v1"),
             name: String::from("anthropic.claude-opus-4-6-v1"),
             provider: String::from("amazon-bedrock"),
+            reasoning: false,
         },
         ModelEntry {
             id: String::from("openai/gpt-5-codex"),
             name: String::from("gpt-5-codex"),
             provider: String::from("openai"),
+            reasoning: false,
         },
         ModelEntry {
             id: String::from("amazon-bedrock/amazon.nova-lite-v1:0"),
             name: String::from("amazon.nova-lite-v1:0"),
             provider: String::from("amazon-bedrock"),
+            reasoning: false,
         },
     ]
 }

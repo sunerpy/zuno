@@ -671,6 +671,8 @@ pub enum Selection {
     Session(String),
     /// A different theme.
     Theme(String),
+    /// A different reasoning level for subsequent turns.
+    Effort(zuno_llm::effort::ReasoningEffort),
 }
 
 /// A prompt-channel message. Catalog invocations stay typed until the CLI host
@@ -711,6 +713,15 @@ pub struct SessionCatalog {
     pub model: Option<String>,
     /// The agent currently in use.
     pub agent: Option<String>,
+    /// Whether the model in use accepts a reasoning level at all.
+    ///
+    /// Stated by the host from the resolved catalog, because the view cannot know it: a
+    /// model's reasoning capability is a catalog fact. It gates the cycling key, so a
+    /// model without reasoning gets a key that says why rather than one that relabels a
+    /// control the request would not send.
+    pub reasoning: bool,
+    /// The reasoning level in use, when one was chosen.
+    pub effort: Option<zuno_llm::effort::ReasoningEffort>,
 }
 
 impl SessionScreen {
@@ -2112,6 +2123,7 @@ impl SessionScreen {
             "agent_list" => self.request(self.agent_picker()),
             "agent_cycle" => self.cycle_agent(1),
             "agent_cycle_reverse" => self.cycle_agent(-1),
+            "variant_cycle" => self.cycle_effort(1),
             "session_list" => self.request(self.session_picker()),
             // Two statements because opening the theme picker also records the theme to
             // put back on escape, which needs `&mut self` while `request` does too.
@@ -2119,6 +2131,7 @@ impl SessionScreen {
                 let dialog = self.theme_picker();
                 self.request(dialog)
             }
+            "session_child_first" => self.request(self.subagent_view()),
             "mcp_list" => self.request(self.mcp_list()),
             "status_view" => self.request(self.status_panel()),
             "debug_view" => self.request(self.debug_panel()),
@@ -2231,6 +2244,19 @@ impl SessionScreen {
         Some(Box::new(crate::views::picker::mcp_list(
             self.context.clone(),
             self.mcp.clone(),
+        )))
+    }
+
+    /// The delegated-task view, over the delegations this conversation actually made.
+    ///
+    /// Always present, for the reason the census below is: "this session has delegated
+    /// nothing" is itself the answer a user opening it wants, and returning `None` would
+    /// replace that answer with `request`'s generic "nothing to choose from here yet",
+    /// which reads as a surface that failed rather than as a session with no subagents.
+    fn subagent_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        Some(Box::new(crate::views::subagent::SubagentView::new(
+            self.context.clone(),
+            crate::views::subagent::delegations(self.transcript.transcript().messages()),
         )))
     }
 
@@ -2395,6 +2421,7 @@ impl SessionScreen {
                 self.catalog.model = Some(value.to_owned());
                 self.status.set_configured_model(value);
                 self.sidebar.ambient_mut().model = Some(value.to_owned());
+                self.adopt_model_reasoning(value);
                 Selection::Model(value.to_owned())
             }
             crate::views::picker::AGENT_DIALOG_ID => {
@@ -2461,6 +2488,9 @@ impl SessionScreen {
             Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
             Selection::Session(id) => format!("session {id} selected"),
             Selection::Theme(theme) => format!("theme {theme} selected"),
+            Selection::Effort(effort) => {
+                format!("reasoning set to {effort} for the next turn")
+            }
         };
         let delivered = self
             .selections
@@ -2537,6 +2567,78 @@ impl SessionScreen {
         self.status.set_configured_agent(&name);
         self.sidebar.ambient_mut().agent = Some(name.clone());
         let (text, level) = self.commit_selection(Selection::Agent(name));
+        self.toasts.push(Toast::new(level, text));
+        EventResult::REDRAW
+    }
+
+    /// Track whether the newly chosen model reasons, and drop a level it cannot use.
+    ///
+    /// Both halves matter. Keeping `reasoning` stale leaves the cycling key looking live
+    /// on a model that ignores it; keeping the level itself would leave `think:high` on
+    /// the strip next to a model whose request carries no such control — the exact lie
+    /// this feature must not tell. The host reaches the same conclusion independently in
+    /// `session_reasoning_options`, so the strip and the wire agree.
+    ///
+    /// A model absent from the catalog list leaves both untouched: an unknown row is not
+    /// evidence that reasoning went away.
+    fn adopt_model_reasoning(&mut self, qualified: &str) {
+        let Some(entry) = self
+            .catalog
+            .models
+            .iter()
+            .find(|entry| entry.id == qualified)
+        else {
+            return;
+        };
+        self.catalog.reasoning = entry.reasoning;
+        if !entry.reasoning {
+            self.catalog.effort = None;
+            self.status.set_effort(None);
+        }
+    }
+
+    /// Step the reasoning level, and say so when the model has none to step.
+    ///
+    /// # Why this refuses rather than cycling a label
+    ///
+    /// A level only means something if the request carries it, and the request carries it
+    /// only when the catalog says the model reasons — `session_reasoning_options` in
+    /// `zuno-cli/src/cmd/turn.rs` returns nothing otherwise. Cycling here anyway would
+    /// give a key that changes the strip and nothing else, which is the failure this
+    /// project has removed repeatedly. The toast names the model so the refusal is
+    /// actionable: the answer is to switch models, not to press harder.
+    ///
+    /// The cycle runs over [`ReasoningEffort::ALL`], weakest to strongest, and starts at
+    /// `Off` when no level is set yet — so the first press lands on the weakest level
+    /// rather than jumping into the middle of the scale.
+    fn cycle_effort(&mut self, step: isize) -> EventResult {
+        use zuno_llm::effort::ReasoningEffort;
+        if !self.catalog.reasoning {
+            self.toasts.push(Toast::warning(match &self.catalog.model {
+                Some(model) => format!("{model} does not accept a reasoning level"),
+                None => String::from("no model resolved, so no reasoning level applies"),
+            }));
+            return EventResult::REDRAW;
+        }
+        let levels = ReasoningEffort::ALL;
+        let length = isize::try_from(levels.len()).unwrap_or(isize::MAX);
+        let current = self
+            .catalog
+            .effort
+            .and_then(|active| levels.iter().position(|level| *level == active));
+        // `rem_euclid` over the signed sum, as `cycle_agent` does, so one expression
+        // serves both directions including the wrap backwards off the first level.
+        let next = match current {
+            Some(index) => {
+                let moved = isize::try_from(index).unwrap_or(0).saturating_add(step);
+                usize::try_from(moved.rem_euclid(length)).unwrap_or(0)
+            }
+            None => 0,
+        };
+        let chosen = levels[next];
+        self.catalog.effort = Some(chosen);
+        self.status.set_effort(Some(chosen));
+        let (text, level) = self.commit_selection(Selection::Effort(chosen));
         self.toasts.push(Toast::new(level, text));
         EventResult::REDRAW
     }
@@ -2764,6 +2866,14 @@ pub fn scopes() -> Vec<String> {
         // unbound `debug_view` — so neither can claim a bare letter the way `diff` below
         // does, and no other row in the table spells `<leader>s`.
         "status", "debug",
+        // `variant` costs no typeable character either: the complete scope is
+        // `variant_cycle` on `ctrl+t` plus an unbound `variant_list`, and a control chord
+        // is not something text entry produces. Unregistered, `ctrl+t` was the same dead
+        // key `editor` above describes — the table advertised "Cycle model variants" and
+        // no scope claimed the chord, so it resolved to `Unmatched` and fell through to
+        // the editor, which inserts nothing for it. `views/slash.rs:267` recorded the
+        // scope's shape while nothing was reaching it.
+        "variant",
         // `diff` after `input` and `messages`, and only for `diff_open`'s sake. The scope
         // also carries the viewer's own bare characters — `q`, `n`, `p`, `d`, `v`, `s`,
         // `b`, `[`, `]`, `?`, `E` — which resolve here whether or not the viewer is open.

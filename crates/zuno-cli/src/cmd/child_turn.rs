@@ -236,6 +236,10 @@ impl ChildTurnHost for ChildSessionHost {
             agent: Some(request.agent.clone()),
             session: SessionChoice::Existing(session_id.clone()),
             title: request.description.clone(),
+            // The delegation's own level, which until this field existed was resolved
+            // by the `task` tool and then dropped here: the child ran at the
+            // provider's default no matter what `effort` the caller passed.
+            effort: request.effort,
         };
         let plan = TurnPlan::resolve(&options, &self.environment)
             .await

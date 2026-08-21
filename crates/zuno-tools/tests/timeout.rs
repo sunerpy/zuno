@@ -66,8 +66,7 @@ async fn timeout_policy_promotes_a_live_process_to_a_reachable_background_task()
     assert!(output.output.contains(
         "The command is still running; do not rerun it unless you intentionally want a second copy."
     ));
-    wait_for_file(&pid_file).await;
-    let pid = read_pid(&pid_file);
+    let pid = wait_for_pid(&pid_file).await;
     assert!(process_exists(pid), "promoted process {pid} was killed");
 
     let task_id = output.metadata["task_id"]
@@ -114,8 +113,7 @@ async fn timeout_policy_hard_ceiling_still_terminates_the_process_group() {
     let task_id = error.metadata["task_id"]
         .as_str()
         .expect("promoted task id");
-    wait_for_file(&pid_file).await;
-    let pid = read_pid(&pid_file);
+    let pid = wait_for_pid(&pid_file).await;
     let failed = wait_for_task(&manager, task_id).await;
     assert_eq!(failed.status, BackgroundTaskStatus::Failed);
     assert!(
@@ -148,23 +146,31 @@ async fn wait_for_task(
     .expect("background task must settle")
 }
 
+/// The child creates the pid file and writes to it as two separate steps, so waiting only for
+/// the path to exist can observe a created-but-empty file and parse `""`.
 #[cfg(unix)]
-async fn wait_for_file(path: &Path) {
+async fn wait_for_pid(path: &Path) -> u32 {
     tokio::time::timeout(Duration::from_secs(1), async {
-        while !path.exists() {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+            {
+                return pid;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{} was not created", path.display()));
-}
-
-#[cfg(unix)]
-fn read_pid(path: &Path) -> u32 {
-    std::fs::read_to_string(path)
-        .expect("pid file")
-        .parse()
-        .expect("numeric pid")
+    .unwrap_or_else(|_| {
+        if path.exists() {
+            panic!(
+                "{} never contained a numeric pid (last contents: {:?})",
+                path.display(),
+                std::fs::read_to_string(path).ok()
+            )
+        }
+        panic!("{} was not created", path.display())
+    })
 }
 
 #[cfg(unix)]

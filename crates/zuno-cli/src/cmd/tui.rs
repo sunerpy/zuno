@@ -217,6 +217,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         agent: args.agent.clone(),
         session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
         title: None,
+        effort: None,
     };
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
     let layout = zuno_paths::Layout::resolve(environment.resolved());
@@ -1037,10 +1038,17 @@ async fn session_catalog(
     environment: &StartupEnvironment,
 ) -> zuno_tui::views::session::SessionCatalog {
     let env = environment.resolved();
+    // Reasoning support per row comes from the same `FixedFacts` a delegation resolves a
+    // model through, so the picker and the `task` tool cannot disagree about which models
+    // reason. An undeclared model is treated as not reasoning: that yields a key which
+    // explains itself rather than one that sends a control the provider may reject.
     let models = plan
         .catalog_model_ids()
         .into_iter()
-        .map(|qualified| model_entry(&qualified))
+        .map(|qualified| {
+            let reasoning = plan.model_reasons(&qualified);
+            model_entry(&qualified, reasoning)
+        })
         .collect();
     // Filtered here rather than in `agent::list`, which must keep returning everything: the
     // turn loop resolves a delegation by name and needs the subagents this drops. Both TUI
@@ -1073,6 +1081,8 @@ async fn session_catalog(
         sessions: Vec::new(),
         model: Some(plan.qualified_model()),
         agent: Some(plan.agent_name().to_owned()),
+        reasoning: plan.reasoning_supported(),
+        effort: plan.effort(),
     }
 }
 
@@ -1088,12 +1098,13 @@ async fn session_catalog(
 /// as `{provider}/{model}`. Should one arrive anyway the whole string becomes the name
 /// under an empty heading rather than being dropped: a visibly odd row is debuggable, and
 /// a silently missing model is the defect this function exists to fix.
-fn model_entry(qualified: &str) -> zuno_tui::views::picker::ModelEntry {
+fn model_entry(qualified: &str, reasoning: bool) -> zuno_tui::views::picker::ModelEntry {
     let (provider, name) = qualified.split_once('/').unwrap_or(("", qualified));
     zuno_tui::views::picker::ModelEntry {
         id: qualified.to_owned(),
         name: name.to_owned(),
         provider: provider.to_owned(),
+        reasoning,
     }
 }
 
@@ -1127,9 +1138,22 @@ async fn apply_selection(
 ) -> Option<TurnEventSender> {
     let mut next = rebuild.options.clone();
     next.session = SessionChoice::Existing(host.session_id().to_owned());
+    // Seeded from the live host, not from the launch options, for the reason
+    // `refresh_mcp_host` does the same: the host is what the previous selection actually
+    // produced. Reading the launch options alone made each pick discard the one before
+    // it — choose a model, then an agent, and the model reverted to the launched one.
+    next.model = Some(host.qualified_model());
+    next.agent = Some(host.agent_name().to_owned());
+    next.effort = host.effort();
     match selection {
         zuno_tui::views::session::Selection::Model(model) => next.model = Some(model),
         zuno_tui::views::session::Selection::Agent(agent) => next.agent = Some(agent),
+        // Through the same rebuild as a model change, rather than mutating the live host:
+        // the level is resolved against the model's declared variants and capability, so
+        // it has to be re-resolved by `TurnPlan::resolve` to become the right provider
+        // shape. That is also what makes a level chosen here survive a later model
+        // switch, and what silently drops it when the new model does not reason.
+        zuno_tui::views::session::Selection::Effort(effort) => next.effort = Some(effort),
         // A theme is the view layer's own business and a session change is not something
         // this task can honour without discarding the turn it may be running.
         zuno_tui::views::session::Selection::Session(_)
@@ -2653,7 +2677,7 @@ mod tests {
         ];
         let entries = lines
             .iter()
-            .map(|line| model_entry(line))
+            .map(|line| model_entry(line, false))
             .collect::<Vec<_>>();
 
         let providers = entries
@@ -2693,7 +2717,7 @@ mod tests {
     /// A model id may itself contain slashes, so only the first one is the provider.
     #[test]
     fn a_nested_model_id_keeps_every_segment_past_the_provider() {
-        let entry = model_entry("anyapi/openai/gpt");
+        let entry = model_entry("anyapi/openai/gpt", false);
         assert_eq!(entry.provider, "anyapi");
         assert_eq!(entry.name, "openai/gpt");
         assert_eq!(

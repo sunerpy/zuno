@@ -72,6 +72,7 @@ impl ServerSessionMutationExecutor {
             agent,
             session: SessionChoice::Existing(session_id.clone()),
             title: None,
+            effort: None,
         };
         let plan = TurnPlan::resolve(&options, &self.environment).await?;
         let approval: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {

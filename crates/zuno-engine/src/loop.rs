@@ -284,6 +284,18 @@ pub struct ResolvedModel {
     /// Model id sent on the provider wire.
     pub model_id: String,
     pub surface: ApiSurface,
+    /// Provider-native reasoning controls for the session's chosen effort level.
+    ///
+    /// The resolved options rather than a `ReasoningEffort`, because the canonical
+    /// level means nothing on a wire: Anthropic wants `thinking.budgetTokens`,
+    /// Google `thinkingConfig.thinkingLevel`, OpenAI `reasoningEffort`.
+    /// `zuno_llm::effort::resolve_effort` owns that translation and needs the
+    /// provider family — a catalog fact this module deliberately does not hold. The
+    /// caller resolves, the engine transports.
+    ///
+    /// Empty for a model without reasoning support or a session that chose no level,
+    /// which is what keeps such a request byte-identical to the pre-effort build.
+    pub reasoning_options: Map<String, Value>,
 }
 
 impl ResolvedModel {
@@ -296,7 +308,18 @@ impl ResolvedModel {
             provider,
             model_id,
             surface,
+            reasoning_options: Map::new(),
         }
+    }
+
+    /// Attach the provider-native reasoning controls for the chosen effort level.
+    ///
+    /// Built by the caller with `zuno_llm::effort::resolve_effort`, whose
+    /// `EffortResolution::options` is exactly this shape.
+    #[must_use]
+    pub fn with_reasoning_options(mut self, options: Map<String, Value>) -> Self {
+        self.reasoning_options = options;
+        self
     }
 
     /// Attach the catalog identity when it differs from the transport factory or wire id.
@@ -1652,16 +1675,63 @@ fn append_transformed_message_owned(messages: &mut Vec<Message>, message: HookMe
 
 fn append_reasoning_owned(content: &mut Vec<RequestContentBlock>, mut data: Map<String, Value>) {
     let thinking = take_string(&mut data, "text");
-    let signature = match data.remove("metadata") {
-        Some(Value::Object(mut metadata)) => take_string(&mut metadata, "signature"),
-        Some(_) | None => None,
+    let mut metadata = match data.remove("metadata") {
+        Some(Value::Object(metadata)) => metadata,
+        Some(_) | None => Map::new(),
     };
-    if let (Some(thinking), Some(signature)) = (thinking, signature) {
+    if let Some(Value::Object(capsule)) = metadata.remove(PROVIDER_REASONING_KEY) {
+        push_provider_reasoning_owned(content, capsule);
+        return;
+    }
+    if let (Some(thinking), Some(signature)) = (thinking, take_string(&mut metadata, "signature")) {
         content.push(RequestContentBlock::SignedThinking {
             thinking,
             signature,
         });
     }
+}
+
+/// The `metadata` key the stream projection stores a native reasoning capsule under.
+///
+/// Named once because the writer and this reader disagreeing about it silently drops
+/// the capsule from every replayed turn, which an Anthropic-family model answers with
+/// HTTP 400: the assistant message no longer opens with the reasoning it sealed.
+const PROVIDER_REASONING_KEY: &str = "providerReasoning";
+
+/// Rebuild a native reasoning capsule for replay, consuming the stored metadata.
+///
+/// `encryptedContent` is required. A capsule the provider never sealed cannot prove
+/// anything, and the OpenAI Responses request builder rejects a reasoning item
+/// without it — so an unsealed one is history only, exactly like unsigned thinking.
+fn push_provider_reasoning_owned(
+    content: &mut Vec<RequestContentBlock>,
+    mut capsule: Map<String, Value>,
+) {
+    let Some(encrypted_content) = take_string(&mut capsule, "encryptedContent") else {
+        return;
+    };
+    let Some(id) = take_string(&mut capsule, "id") else {
+        return;
+    };
+    // The summary is replayed as the provider emitted it, line for line. Re-joining
+    // it and splitting it again is how a capsule's visible prefix stops matching
+    // what the provider sealed.
+    let summary = match capsule.remove("summary") {
+        Some(Value::Array(lines)) => lines
+            .into_iter()
+            .filter_map(|line| match line {
+                Value::String(text) => Some(text),
+                _ => None,
+            })
+            .collect(),
+        Some(_) | None => Vec::new(),
+    };
+    content.push(RequestContentBlock::ProviderEncryptedReasoning {
+        id,
+        summary,
+        encrypted_content: Some(encrypted_content),
+        status: take_string(&mut capsule, "status"),
+    });
 }
 
 fn append_tool_pair_owned(
@@ -1708,11 +1778,16 @@ fn append_tool_pair_owned(
 }
 
 fn append_reasoning(content: &mut Vec<RequestContentBlock>, part: &PartRecord) {
-    let thinking = part.data.get("text").and_then(Value::as_str);
-    let signature = part
-        .data
-        .get("metadata")
+    let metadata = part.data.get("metadata").and_then(Value::as_object);
+    if let Some(capsule) = metadata
+        .and_then(|metadata| metadata.get(PROVIDER_REASONING_KEY))
         .and_then(Value::as_object)
+    {
+        push_provider_reasoning(content, capsule);
+        return;
+    }
+    let thinking = part.data.get("text").and_then(Value::as_str);
+    let signature = metadata
         .and_then(|metadata| metadata.get("signature"))
         .and_then(Value::as_str);
     if let (Some(thinking), Some(signature)) = (thinking, signature) {
@@ -1721,6 +1796,35 @@ fn append_reasoning(content: &mut Vec<RequestContentBlock>, part: &PartRecord) {
             signature: signature.to_owned(),
         });
     }
+}
+
+fn push_provider_reasoning(content: &mut Vec<RequestContentBlock>, capsule: &Map<String, Value>) {
+    let Some(encrypted_content) = capsule.get("encryptedContent").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(id) = capsule.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let summary = capsule
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    content.push(RequestContentBlock::ProviderEncryptedReasoning {
+        id: id.to_owned(),
+        summary,
+        encrypted_content: Some(encrypted_content.to_owned()),
+        status: capsule
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    });
 }
 
 fn append_tool_pair(
@@ -1819,6 +1923,15 @@ fn assistant_message(
     .map_err(TurnError::from)
 }
 
+/// # Why the reasoning controls travel as `parameters`
+///
+/// `parameters` is the one channel every provider family already overlays onto its
+/// outbound body: `CompletionRequest::apply_parameters` is called by all six
+/// adapters (anthropic, openai, bedrock, compatible, and google's three surfaces).
+/// Reaching the wire any other way would mean editing each adapter to read a new
+/// field, and the two that already accept native reasoning read it from
+/// *provider-scoped* options — a per-session choice cannot live there without
+/// rewriting the model spec on every keypress.
 fn completion_request(
     model: &ResolvedModel,
     prepared: PreparedTurn<ToolDefinition>,
@@ -1836,7 +1949,7 @@ fn completion_request(
                 parameters: tool.parameters.clone(),
             })
             .collect(),
-        parameters: Map::new(),
+        parameters: model.reasoning_options.clone(),
         headers: std::collections::BTreeMap::new(),
     }
 }

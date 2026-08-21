@@ -938,6 +938,12 @@ pub struct ModelEntry {
     pub name: String,
     /// The provider's display name.
     pub provider: String,
+    /// Whether this model declares reasoning support in the catalog.
+    ///
+    /// Carried per row so that picking a model teaches the screen whether a reasoning
+    /// level applies to it. Without it, a level chosen on a reasoning model would keep
+    /// its key looking live after switching to a model that ignores it.
+    pub reasoning: bool,
 }
 
 /// The model picker, grouped by provider and sorted by name inside each provider.
