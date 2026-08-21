@@ -23,7 +23,7 @@
 //! `unlink`s the old file; this pass only reports. Detection and reporting, never
 //! repair.
 //!
-//! # The eleven forms
+//! # The twelve forms
 //!
 //! | Form | Oracle |
 //! |---|---|
@@ -31,6 +31,7 @@
 //! | a `{mode,modes}/` agent directory | `packages/opencode/src/config/agent.ts:32-58` |
 //! | agent `tools` | `packages/core/src/v1/config/agent.ts:68-77` |
 //! | agent `maxSteps` | `packages/core/src/v1/config/agent.ts:79` |
+//! | agent `variant` with no `model` | `packages/opencode/src/session/prompt.ts:648-654` gates the variant on the agent's own model, so this combination is inert upstream too — Zuno rejects rather than ignoring it |
 //! | `layout` | `packages/core/src/v1/config/config.ts:127` |
 //! | `autoshare` | `packages/core/src/v1/config/config.ts:61-63` |
 //! | `CONTEXT.md` | `packages/opencode/src/session/instruction.ts:68` |
@@ -94,6 +95,8 @@ pub enum DeprecatedForm {
     AgentTools,
     /// An agent's `maxSteps`.
     AgentMaxSteps,
+    /// An agent's `variant` with no `model` to apply it to.
+    AgentVariantWithoutModel,
     /// The top-level `layout` key.
     Layout,
     /// The top-level `autoshare` key.
@@ -119,6 +122,7 @@ impl DeprecatedForm {
             Self::ModeBlock
             | Self::AgentTools
             | Self::AgentMaxSteps
+            | Self::AgentVariantWithoutModel
             | Self::Layout
             | Self::Autoshare
             | Self::Reference
@@ -256,8 +260,8 @@ pub fn reject(root: &Path, found: Vec<Deprecation>) -> Result<(), ConfigError> {
 
 /// Every deprecated form in one config document.
 ///
-/// Covers six of the ten: `mode.<name>`, `layout`, `autoshare`, `reference`, and
-/// agent-level `tools` and `maxSteps`.
+/// Covers seven of the twelve: `mode.<name>`, `layout`, `autoshare`, `reference`,
+/// and agent-level `tools`, `maxSteps`, and `variant` without `model`.
 ///
 /// Agent-level forms are looked for under **both** `agent` and `mode`, because the
 /// oracle spreads each `mode` entry into `agent` verbatim
@@ -376,6 +380,19 @@ fn inspect_agent(
                 replacement.to_owned(),
             ));
         }
+    }
+    if definition.contains_key("variant") && !definition.get("model").is_some_and(Value::is_string)
+    {
+        let mut pointer = prefix.to_vec();
+        pointer.push("variant".to_owned());
+        found.push(Deprecation::keyed(
+            path,
+            pointer,
+            DeprecatedForm::AgentVariantWithoutModel,
+            "add `model`, or delete `variant` — a variant names a level the agent's own \
+             model declares, so without `model` it can never be applied"
+                .to_owned(),
+        ));
     }
     found
 }
