@@ -682,6 +682,15 @@ impl StepAccumulator {
         self.cache_write_input_tokens = None;
     }
 
+    fn provider_reasoning_capsules(&self) -> impl Iterator<Item = &RequestContentBlock> {
+        self.provider_reasoning.iter().filter(|block| {
+            matches!(
+                block,
+                RequestContentBlock::ProviderEncryptedReasoning { .. }
+            )
+        })
+    }
+
     fn has_generated_output(&self) -> bool {
         !self.text.is_empty()
             || !self.reasoning.is_empty()
@@ -2043,6 +2052,17 @@ fn checkpoint_assistant(
         )?;
         store.put_part_at(&reasoning, completed)?;
     }
+    for (capsule_index, capsule) in accumulator.provider_reasoning_capsules().enumerate() {
+        let part = provider_reasoning_part(
+            request,
+            step,
+            capsule_index,
+            assistant,
+            completed,
+            capsule.clone(),
+        )?;
+        store.put_part_at(&part, completed)?;
+    }
     for (call_index, call) in accumulator.calls.iter().enumerate() {
         let tool = pending_tool_part(request, step, call_index, &assistant.id, call)?;
         store.put_part_at(&tool, completed)?;
@@ -2072,6 +2092,52 @@ fn update_usage(data: &mut Map<String, Value>, accumulator: &StepAccumulator) {
             Value::from(accumulator.cache_write_input_tokens.unwrap_or(0)),
         );
     }
+}
+
+/// Persist one provider reasoning capsule under the key [`append_reasoning_owned`]
+/// reads, so a replayed turn can re-send it.
+///
+/// The stored key spelling is [`PROVIDER_REASONING_KEY`] and the inner field names
+/// are the ones [`push_provider_reasoning_owned`] takes; writing any other spelling
+/// drops the capsule silently on replay, which is an HTTP 400 from the models that
+/// require an assistant turn to open with the reasoning they signed.
+fn provider_reasoning_part(
+    request: &RunTurnRequest,
+    step: u32,
+    capsule_index: usize,
+    assistant: &MessageRecord,
+    completed: i64,
+    capsule: RequestContentBlock,
+) -> Result<PartRecord, TurnError> {
+    let RequestContentBlock::ProviderEncryptedReasoning {
+        id,
+        summary,
+        encrypted_content,
+        status,
+    } = capsule
+    else {
+        unreachable!("provider_reasoning_capsules yields only encrypted reasoning blocks");
+    };
+    PartRecord::from_json(
+        json!({
+            "id": provider_reasoning_part_id(&request.turn_id, step, capsule_index),
+            "sessionID": request.session_id,
+            "messageID": assistant.id,
+            "type": "reasoning",
+            "text": summary.join("\n"),
+            "metadata": {
+                PROVIDER_REASONING_KEY: {
+                    "id": id,
+                    "summary": summary,
+                    "encryptedContent": encrypted_content,
+                    "status": status,
+                }
+            },
+            "time": { "start": assistant.time_created, "end": completed }
+        }),
+        assistant.time_created,
+    )
+    .map_err(TurnError::from)
 }
 
 fn pending_tool_part(
@@ -2156,6 +2222,15 @@ fn text_part_id(turn_id: &str, step: u32) -> String {
 
 fn reasoning_part_id(turn_id: &str, step: u32) -> String {
     format!("prt_{turn_id}_{step:04}_reasoning")
+}
+
+/// Parts come back `ORDER BY id ASC` (`zuno-db/src/message.rs:807`), and this id
+/// has to sort *before* [`text_part_id`] and [`tool_part_id`] so the capsule is
+/// replayed as the assistant message's opening content — which is the only
+/// position the provider accepts it in. `"reasoning_"` &lt; `"text"` &lt; `"tool_"`
+/// holds, and the zero-padded index keeps several capsules in stream order.
+fn provider_reasoning_part_id(turn_id: &str, step: u32, capsule_index: usize) -> String {
+    format!("prt_{turn_id}_{step:04}_reasoning_{capsule_index:04}")
 }
 
 fn tool_part_id(turn_id: &str, step: u32, call_index: usize) -> String {

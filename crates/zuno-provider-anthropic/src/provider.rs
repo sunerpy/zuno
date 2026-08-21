@@ -9,8 +9,8 @@ use zuno_auth::{AuthStore, Credential, Secret};
 use zuno_error::ProviderError;
 use zuno_llm::event::StreamEvent;
 use zuno_llm::registry::{
-    Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider, ProviderStream, Spec,
-    Unavailable,
+    ApiSurface, Capabilities, CompletionRequest, Declined, FactoryOutcome, Provider,
+    ProviderStream, Spec, Unavailable,
 };
 use zuno_llm::sse::StreamIdleTimeout;
 
@@ -338,7 +338,9 @@ async fn start_stream(
     request: CompletionRequest,
 ) -> Result<ProviderStream<'static>, ProviderError> {
     let mut body = build_request_body(&request, &config)?;
-    request.apply_parameters(&mut body);
+    // This crate posts to `/v1/messages` unconditionally, whatever the request's
+    // surface hint says, so the surface it lowers against is fixed.
+    request.apply_parameters(&mut body, ApiSurface::Messages);
     let model = request.model_id;
     let provider = config.provider.clone();
     let mut endpoint = messages_endpoint(&config.base_url);

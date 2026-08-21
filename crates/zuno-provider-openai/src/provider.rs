@@ -345,8 +345,8 @@ async fn start_stream(
     request: CompletionRequest,
 ) -> Result<ProviderStream<'static>, ProviderError> {
     let mut body = build_request_body(&request, &config)?;
-    request.apply_parameters(&mut body);
     let surface = resolve_surface(request.surface);
+    request.apply_parameters(&mut body, surface);
     let endpoint = endpoint(&config.base_url, surface);
     let provider = config.provider.clone();
     let model = request.model_id;

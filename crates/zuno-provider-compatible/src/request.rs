@@ -315,6 +315,13 @@ fn translate_response_message(message: &Message, quirks: &Quirks) -> Vec<Value> 
     }
 }
 
+/// Project one assistant turn onto the Responses `input` list, in source order.
+///
+/// `input` is an ordered history, so "called a tool, then spoke" and "spoke, then
+/// called a tool" are different turns as far as the model is concerned. Accumulated
+/// text is therefore flushed as its own assistant item *before* each non-text
+/// block rather than appended once at the end — the same `flushText()` rule the
+/// oracle applies in `packages/llm/src/protocols/openai-responses.ts:381-430`.
 fn translate_response_assistant(message: &Message) -> Vec<Value> {
     let mut items = Vec::new();
     let mut content = Vec::new();
@@ -347,25 +354,40 @@ fn translate_response_assistant(message: &Message) -> Vec<Value> {
                 if let Some(status) = status {
                     item.insert("status".to_owned(), json!(status));
                 }
+                flush_response_assistant_text(&mut items, &mut content);
                 items.push(Value::Object(item));
             }
             RequestContentBlock::ToolUse {
                 id, name, input, ..
-            } => items.push(json!({
-                "type": "function_call",
-                "call_id": id,
-                "name": name,
-                "arguments": input.to_string(),
-            })),
+            } => {
+                flush_response_assistant_text(&mut items, &mut content);
+                items.push(json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": input.to_string(),
+                }));
+            }
             RequestContentBlock::SignedThinking { .. }
             | RequestContentBlock::ToolResult { .. }
             | RequestContentBlock::Image { .. } => {}
         }
     }
-    if !content.is_empty() {
-        items.push(json!({"role": "assistant", "content": content}));
-    }
+    flush_response_assistant_text(&mut items, &mut content);
     items
+}
+
+/// Emit the text collected so far as one assistant item, if there is any.
+///
+/// Called immediately before each emitted item rather than before each non-text
+/// *block*, so a block that turns out to contribute nothing — a capsule with no
+/// ciphertext, a signature-only thinking block — does not split the surrounding
+/// text into two assistant items.
+fn flush_response_assistant_text(items: &mut Vec<Value>, content: &mut Vec<Value>) {
+    if content.is_empty() {
+        return;
+    }
+    items.push(json!({"role": "assistant", "content": std::mem::take(content)}));
 }
 
 fn translate_response_tool_results(message: &Message, quirks: &Quirks) -> Vec<Value> {
@@ -581,7 +603,10 @@ fn translate_tool_results(message: &Message) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zuno_llm::registry::{ApiSurface, Capabilities};
+    use zuno_llm::effort::{
+        DeclaredVariants, EffortCapabilities, ProviderFamily, ReasoningEffort, resolve_effort,
+    };
+    use zuno_llm::registry::{ApiSurface, Capabilities, CompletionRequest};
 
     fn quirks(reasoning_protocol: bool, sampling: bool) -> Quirks {
         Quirks {
@@ -750,13 +775,75 @@ mod tests {
         assert!(built.get("tools").is_none());
     }
 
+    /// `extraBody` is a verbatim escape hatch for whatever an endpoint accepts.
+    ///
+    /// The key changed from `reasoning_effort` to `service_tier`. Nothing about the
+    /// old assertion was false — a hand-inserted `reasoning_effort` did survive —
+    /// but naming an effort field here made the suite *look* as though it covered
+    /// reasoning effort, while the session path was in fact emitting
+    /// `reasoningEffort`. This test never had anything to do with effort
+    /// resolution; the coverage it appeared to give is now real and lives in
+    /// [`the_sessions_effort_reaches_the_chat_body_as_reasoning_effort`].
     #[test]
     fn extra_body_reaches_unprotected_keys() {
         let mut body = RequestBody::new("gpt-oss-20b", vec![Message::new(Role::User, "hi")]);
         body.extra_body
-            .insert("reasoning_effort".to_owned(), json!("high"));
+            .insert("service_tier".to_owned(), json!("flex"));
         let built = body.build(&quirks(false, true));
+        assert_eq!(built["service_tier"], json!("flex"));
+    }
+
+    /// The chosen level must reach a Chat body as `reasoning_effort`.
+    ///
+    /// Every input is production: [`resolve_effort`] builds the options exactly as
+    /// `session_reasoning_options` does, and [`RequestBody::build`] is the same
+    /// builder the provider ships. Nothing here is hand-written except the level.
+    #[test]
+    fn the_sessions_effort_reaches_the_chat_body_as_reasoning_effort() {
+        let resolved = resolve_effort(
+            ProviderFamily::OpenAi,
+            ReasoningEffort::High,
+            EffortCapabilities::default(),
+            &DeclaredVariants::new(),
+        );
+        let request = CompletionRequest::new("gpt-oss-20b", vec![Message::new(Role::User, "hi")])
+            .on_surface(ApiSurface::Chat);
+        let mut request = request;
+        request.parameters = resolved.options.clone();
+
+        let mut built = RequestBody::new("gpt-oss-20b", vec![Message::new(Role::User, "hi")])
+            .build(&quirks(false, true));
+        request.apply_parameters(&mut built, ApiSurface::Chat);
+
         assert_eq!(built["reasoning_effort"], json!("high"));
+        assert!(
+            built.get("reasoningEffort").is_none(),
+            "the SDK option name must not reach a chat body: {built}"
+        );
+    }
+
+    /// The same level must reach a Responses body as `reasoning.effort`.
+    #[test]
+    fn the_sessions_effort_reaches_the_responses_body_as_nested_reasoning() {
+        let resolved = resolve_effort(
+            ProviderFamily::OpenAi,
+            ReasoningEffort::High,
+            EffortCapabilities::default(),
+            &DeclaredVariants::new(),
+        );
+        let mut request = CompletionRequest::new("gpt-5", vec![Message::new(Role::User, "hi")])
+            .on_surface(ApiSurface::Responses);
+        request.parameters = resolved.options;
+
+        let mut built = RequestBody::new("gpt-5", vec![Message::new(Role::User, "hi")])
+            .build(&responses_quirks());
+        request.apply_parameters(&mut built, ApiSurface::Responses);
+
+        assert_eq!(built["reasoning"], json!({"effort": "high"}));
+        assert!(
+            built.get("reasoningEffort").is_none() && built.get("reasoning_effort").is_none(),
+            "the Responses surface takes the level nested, not flat: {built}"
+        );
     }
 
     #[test]
@@ -776,6 +863,132 @@ mod tests {
         assert_eq!(built["max_output_tokens"], json!(321));
         assert!(built.get("messages").is_none());
         assert!(built.get("max_tokens").is_none());
+    }
+
+    /// The Responses `input` list must preserve the assistant turn's source order.
+    ///
+    /// The content is exactly what `project_history_owned` hands over for a turn
+    /// that reasoned, spoke, then called a tool — the same three blocks in the same
+    /// order that the engine's own
+    /// `reasoning_replay::production_round_trip` test proves come out of the
+    /// database. So this asserts the second half of the round trip on the shape
+    /// the first half produces, not on an arrangement invented here.
+    ///
+    /// Before the fix `input` came out as `function_call, assistant` with no
+    /// reasoning item at all: the capsule was never persisted, and the text was
+    /// appended after the loop instead of at its own position.
+    #[test]
+    fn responses_input_keeps_the_reasoning_then_text_then_call_order() {
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    id: "rs_capsule".to_owned(),
+                    summary: vec!["Deciding to read the fixture.".to_owned()],
+                    encrypted_content: Some("ENCRYPTED-CAPSULE".to_owned()),
+                    status: Some("completed".to_owned()),
+                },
+                RequestContentBlock::Text {
+                    text: "Let me check that file.".to_owned(),
+                },
+                RequestContentBlock::ToolUse {
+                    id: "call_read".to_owned(),
+                    name: "read".to_owned(),
+                    input: json!({"filePath": "/tmp/fixture.txt"}),
+                    thought_signature: None,
+                },
+            ],
+        );
+        let built = RequestBody::new("gpt-5", vec![message]).build(&responses_quirks());
+        let items = built["input"].as_array().expect("an input array");
+        let kinds: Vec<&str> = items
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .or_else(|| item.get("role"))
+                    .and_then(Value::as_str)
+                    .expect("every item is typed or roled")
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["reasoning", "assistant", "function_call"],
+            "the Responses input list is ordered history: {built}"
+        );
+        assert_eq!(items[0]["encrypted_content"], json!("ENCRYPTED-CAPSULE"));
+        assert_eq!(
+            items[0]["summary"][0],
+            json!({"type": "summary_text", "text": "Deciding to read the fixture."})
+        );
+        assert_eq!(
+            items[1]["content"][0]["text"],
+            json!("Let me check that file.")
+        );
+        assert_eq!(items[2]["call_id"], json!("call_read"));
+    }
+
+    /// Text that follows a tool call must stay after it.
+    ///
+    /// The mirror of the previous test, and the one that fails if the flush is
+    /// merely moved to the top of the function rather than performed per item.
+    #[test]
+    fn responses_input_keeps_text_after_a_preceding_call() {
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::ToolUse {
+                    id: "call_first".to_owned(),
+                    name: "read".to_owned(),
+                    input: json!({}),
+                    thought_signature: None,
+                },
+                RequestContentBlock::Text {
+                    text: "and now I will explain".to_owned(),
+                },
+            ],
+        );
+        let built = RequestBody::new("gpt-5", vec![message]).build(&responses_quirks());
+        let items = built["input"].as_array().expect("an input array");
+        let kinds: Vec<&str> = items
+            .iter()
+            .map(|item| {
+                item.get("type")
+                    .or_else(|| item.get("role"))
+                    .and_then(Value::as_str)
+                    .expect("every item is typed or roled")
+            })
+            .collect();
+        assert_eq!(kinds, ["function_call", "assistant"], "{built}");
+    }
+
+    /// A capsule with no ciphertext must not split the text around it.
+    ///
+    /// It contributes no item, so flushing on it would break one assistant item
+    /// into two and change the turn the model sees.
+    #[test]
+    fn a_dropped_capsule_does_not_split_the_surrounding_text() {
+        let message = Message::from_content(
+            Role::Assistant,
+            vec![
+                RequestContentBlock::Text {
+                    text: "first half ".to_owned(),
+                },
+                RequestContentBlock::ProviderEncryptedReasoning {
+                    id: "rs_unsealed".to_owned(),
+                    summary: Vec::new(),
+                    encrypted_content: None,
+                    status: None,
+                },
+                RequestContentBlock::Text {
+                    text: "second half".to_owned(),
+                },
+            ],
+        );
+        let built = RequestBody::new("gpt-5", vec![message]).build(&responses_quirks());
+        let items = built["input"].as_array().expect("an input array");
+        assert_eq!(items.len(), 1, "expected one assistant item: {built}");
+        assert_eq!(items[0]["role"], json!("assistant"));
+        assert_eq!(items[0]["content"].as_array().expect("content").len(), 2);
     }
 
     #[test]

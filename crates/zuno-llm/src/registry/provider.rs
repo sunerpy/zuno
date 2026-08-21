@@ -218,12 +218,47 @@ impl CompletionRequest {
     }
 
     /// Overlay request-local parameters onto an object-shaped provider body.
-    pub fn apply_parameters(&self, body: &mut serde_json::Value) {
+    ///
+    /// Parameters arrive in SDK provider-option vocabulary — that is what
+    /// [`resolve_effort`](crate::effort::resolve_effort) and a model catalog's
+    /// declared variants both speak — so they are lowered to `sending_to` before
+    /// they are merged. This is the single choke point through which request-local
+    /// parameters reach *any* provider body, so a provider that skips it receives
+    /// no parameters at all rather than shipping an option name the endpoint does
+    /// not read.
+    ///
+    /// `sending_to` is a required argument rather than a read of
+    /// [`surface`](Self::surface) because those two are not the same thing: a
+    /// request may carry [`ApiSurface::Default`] while the provider's own rules
+    /// resolve that to `/responses`, and one option name lowers differently on
+    /// each. Passing it in forces every adapter to name the surface it is actually
+    /// posting to, and a new adapter cannot compile without answering the question.
+    ///
+    /// The merge is recursive: an object-valued parameter is merged into an
+    /// object already at that key instead of replacing it. Without that, Gemini's
+    /// `generationConfig.thinkingConfig` would arrive by evicting the sampling
+    /// fields the provider had already written to `generationConfig`.
+    pub fn apply_parameters(&self, body: &mut serde_json::Value, sending_to: ApiSurface) {
         let Some(object) = body.as_object_mut() else {
             return;
         };
-        for (name, value) in &self.parameters {
-            object.insert(name.clone(), value.clone());
+        let wire = crate::effort::lower_to_wire(&self.parameters, sending_to);
+        merge_into(object, &wire);
+    }
+}
+
+fn merge_into(
+    target: &mut serde_json::Map<String, Value>,
+    update: &serde_json::Map<String, Value>,
+) {
+    for (name, value) in update {
+        match (target.get_mut(name), value) {
+            (Some(Value::Object(existing)), Value::Object(incoming)) => {
+                merge_into(existing, incoming);
+            }
+            _ => {
+                target.insert(name.clone(), value.clone());
+            }
         }
     }
 }

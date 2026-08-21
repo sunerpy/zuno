@@ -329,7 +329,9 @@ fn request_body(
         BedrockOperation::ConverseStream => converse_body(request)?,
         BedrockOperation::InvokeModelWithResponseStream => native_body(request)?,
     };
-    request.apply_parameters(&mut value);
+    // Bedrock speaks neither OpenAI surface; both operations are Anthropic-shaped
+    // bodies posted to a Bedrock Runtime action.
+    request.apply_parameters(&mut value, ApiSurface::Messages);
     serde_json::to_vec(&value).map_err(ProviderError::fatal)
 }
 

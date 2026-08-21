@@ -8,6 +8,7 @@
 //! provider family continue to use token budgets, without model-name policy in
 //! the binary.
 
+use crate::registry::ApiSurface;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -233,14 +234,137 @@ pub struct EffortResolution {
 }
 
 impl EffortResolution {
-    /// Recursively merge the resolved options into an outbound JSON body.
+    /// Lower these options to `surface`'s wire vocabulary and merge them into an
+    /// outbound JSON body.
+    ///
+    /// The merge is recursive so that a nested wire placement — Gemini's
+    /// `generationConfig.thinkingConfig` — lands beside the sampling fields the
+    /// provider already wrote there rather than replacing the whole object.
+    ///
+    /// `surface` is required rather than inferred because one option name reaches
+    /// the wire under two different names depending on it: see [`lower_to_wire`].
     ///
     /// Provider adapters should start from the same base body for each request.
     /// Reusing a body previously decorated for another effort can retain fields
     /// that do not exist in the new variant.
-    pub fn apply_to(&self, body: &mut Map<String, Value>) {
-        merge_objects(body, &self.options);
+    pub fn apply_to(&self, body: &mut Map<String, Value>, surface: ApiSurface) {
+        merge_objects(body, &lower_to_wire(&self.options, surface));
     }
+}
+
+/// Translate SDK provider-option names into the field names `surface` reads.
+///
+/// # Why this exists at all
+///
+/// [`resolve_effort`] deals in *SDK provider-option* names, not wire names, and so
+/// does every model catalog that declares [`DeclaredVariants`]. That is the same
+/// vocabulary the oracle's `provider-options` layer uses, and the oracle lowers it
+/// in each protocol writer just before serialising:
+///
+/// - `packages/llm/src/protocols/openai-chat.ts:335,340` reads `reasoningEffort`
+///   and writes `reasoning_effort`.
+/// - `packages/llm/src/protocols/openai-responses.ts:459,472` reads the same
+///   option and writes `reasoning: { effort }` — **the same name, a different
+///   wire shape, chosen by the surface.**
+/// - `packages/llm/src/protocols/anthropic-messages.ts:494-503` (`lowerThinking`)
+///   accepts `budgetTokens` or `budget_tokens` and always writes `budget_tokens`.
+/// - `packages/llm/src/protocols/gemini.ts:292-330` reads `thinkingConfig` from
+///   provider options and writes it *inside* `generationConfig`.
+///
+/// A name that must become two different things cannot be resolved where the
+/// surface is unknown, and a name that arrives verbatim from a catalog cannot be
+/// fixed at construction time. So the translation belongs here, at the moment an
+/// option map becomes body keys, and both callers — this module's
+/// [`EffortResolution::apply_to`] and
+/// [`CompletionRequest::apply_parameters`](crate::registry::CompletionRequest::apply_parameters)
+/// — go through it.
+///
+/// # What is deliberately left alone
+///
+/// Names that are *already* wire names pass through untouched, because they are
+/// not SDK options that happen to look wrong:
+///
+/// - OpenRouter's `reasoning.effort` is OpenRouter's documented request field.
+/// - Bedrock's `reasoningConfig` / `maxReasoningEffort` is Amazon Nova 2's
+///   documented `additionalModelRequestFields` shape, which is genuinely
+///   camelCase.
+///
+/// The function is idempotent: applying it to a map already in wire vocabulary
+/// changes nothing, because every rule keys off the SDK spelling.
+#[must_use]
+pub fn lower_to_wire(options: &Map<String, Value>, surface: ApiSurface) -> Map<String, Value> {
+    let mut wire = Map::new();
+    for (name, value) in options {
+        match name.as_str() {
+            OPEN_AI_EFFORT_OPTION => lower_open_ai_effort(&mut wire, value.clone(), surface),
+            ANTHROPIC_THINKING_OPTION => {
+                merge_objects(&mut wire, &object_entry(name, lower_thinking(value)));
+            }
+            GOOGLE_THINKING_OPTION => {
+                merge_objects(
+                    &mut wire,
+                    &object_entry(
+                        GOOGLE_GENERATION_CONFIG_FIELD,
+                        json!({ GOOGLE_THINKING_OPTION: value.clone() }),
+                    ),
+                );
+            }
+            _ => {
+                wire.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    wire
+}
+
+// `_OPTION` names are SDK provider-option spellings; `_FIELD` names are wire
+// spellings. `GOOGLE_THINKING_OPTION` is deliberately both.
+const OPEN_AI_EFFORT_OPTION: &str = "reasoningEffort";
+const OPEN_AI_CHAT_EFFORT_FIELD: &str = "reasoning_effort";
+const OPEN_AI_RESPONSES_REASONING_FIELD: &str = "reasoning";
+const OPEN_AI_RESPONSES_EFFORT_FIELD: &str = "effort";
+const ANTHROPIC_THINKING_OPTION: &str = "thinking";
+const ANTHROPIC_BUDGET_OPTION: &str = "budgetTokens";
+const ANTHROPIC_BUDGET_FIELD: &str = "budget_tokens";
+const GOOGLE_THINKING_OPTION: &str = "thinkingConfig";
+const GOOGLE_GENERATION_CONFIG_FIELD: &str = "generationConfig";
+
+fn lower_open_ai_effort(wire: &mut Map<String, Value>, effort: Value, surface: ApiSurface) {
+    match surface {
+        ApiSurface::Responses => merge_objects(
+            wire,
+            &object_entry(
+                OPEN_AI_RESPONSES_REASONING_FIELD,
+                json!({ OPEN_AI_RESPONSES_EFFORT_FIELD: effort }),
+            ),
+        ),
+        ApiSurface::Default | ApiSurface::Chat | ApiSurface::Messages => {
+            wire.insert(OPEN_AI_CHAT_EFFORT_FIELD.to_owned(), effort);
+        }
+    }
+}
+
+/// Rewriting field by field rather than replacing the object keeps `type`, and
+/// every thinking field added later, instead of silently dropping it.
+fn lower_thinking(thinking: &Value) -> Value {
+    let Some(fields) = thinking.as_object() else {
+        return thinking.clone();
+    };
+    let mut lowered = Map::new();
+    for (name, value) in fields {
+        if name == ANTHROPIC_BUDGET_OPTION {
+            lowered.insert(ANTHROPIC_BUDGET_FIELD.to_owned(), value.clone());
+        } else {
+            lowered.insert(name.clone(), value.clone());
+        }
+    }
+    Value::Object(lowered)
+}
+
+fn object_entry(name: &str, value: Value) -> Map<String, Value> {
+    let mut entry = Map::new();
+    entry.insert(name.to_owned(), value);
+    entry
 }
 
 /// Resolve one canonical effort into the request shape for `family`.
@@ -405,6 +529,169 @@ fn merge_objects(target: &mut Map<String, Value>, update: &Map<String, Value>) {
 mod tests {
     use super::*;
 
+    /// Every rename the wire demands, per family and per surface.
+    ///
+    /// Four rules, each citing the oracle protocol writer that performs it. The
+    /// exhaustive walk in [`lowering_renames_every_sdk_option_the_wire_spells_differently`]
+    /// asserts that a combination absent from this table survives *byte-identically*,
+    /// so a family added later whose SDK option name differs from its wire field
+    /// fails that test until it is listed here. That is the property the old
+    /// SDK-vocabulary-only table did not have.
+    fn wire_renames(
+        family: ProviderFamily,
+        surface: ApiSurface,
+    ) -> &'static [(&'static [&'static str], &'static [&'static str])] {
+        match (family, surface) {
+            // `openai-responses.ts:459,472`
+            (ProviderFamily::OpenAi, ApiSurface::Responses) => {
+                &[(&["reasoningEffort"], &["reasoning", "effort"])]
+            }
+            // `openai-chat.ts:335,340`
+            (ProviderFamily::OpenAi, _) => &[(&["reasoningEffort"], &["reasoning_effort"])],
+            // `anthropic-messages.ts:494-503` (`lowerThinking`)
+            (ProviderFamily::Anthropic, _) => &[(
+                &["thinking", "budgetTokens"],
+                &["thinking", "budget_tokens"],
+            )],
+            // `gemini.ts:292-330`
+            (ProviderFamily::Google, _) => {
+                &[(&["thinkingConfig"], &["generationConfig", "thinkingConfig"])]
+            }
+            // OpenRouter's `reasoning.effort` and Bedrock's `reasoningConfig` are
+            // already the documented request fields.
+            (ProviderFamily::Bedrock | ProviderFamily::OpenRouter, _) => &[],
+        }
+    }
+
+    /// Move `from` to `to`, creating intermediate objects. A generic path mover
+    /// driven by [`wire_renames`], deliberately *not* a second implementation of
+    /// [`lower_to_wire`]: it cannot rename a key the table does not name.
+    fn move_path(root: &mut Map<String, Value>, from: &[&str], to: &[&str]) {
+        let Some(value) = remove_path(root, from) else {
+            return;
+        };
+        let (last, parents) = to.split_last().expect("a destination path has a leaf");
+        let mut cursor = root;
+        for step in parents {
+            cursor = cursor
+                .entry((*step).to_owned())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("intermediate path steps are objects");
+        }
+        cursor.insert((*last).to_owned(), value);
+    }
+
+    fn remove_path(root: &mut Map<String, Value>, path: &[&str]) -> Option<Value> {
+        let (last, parents) = path.split_last()?;
+        let mut cursor = root;
+        for step in parents {
+            cursor = cursor.get_mut(*step)?.as_object_mut()?;
+        }
+        cursor.remove(*last)
+    }
+
+    /// The lowered body must equal the resolved options with exactly the declared
+    /// renames applied, for every family, level and surface.
+    ///
+    /// This is the assertion the suite was missing. `resolve_effort` speaks SDK
+    /// provider-option names, so a table that only checks *its* output — which is
+    /// all [`effort_table_covers_every_level_and_provider_family`] did, and still
+    /// does — passes while `reasoningEffort` goes out on a wire that reads
+    /// `reasoning_effort`. Both halves are production functions here; only the
+    /// four-rule rename table is written by hand.
+    #[test]
+    fn lowering_renames_every_sdk_option_the_wire_spells_differently() {
+        let variants = DeclaredVariants::new();
+        let surfaces = [
+            ApiSurface::Default,
+            ApiSurface::Chat,
+            ApiSurface::Responses,
+            ApiSurface::Messages,
+        ];
+        let mut combinations = 0;
+        for family in ProviderFamily::ALL {
+            for effort in ReasoningEffort::ALL {
+                let sdk = resolve_effort(family, effort, EffortCapabilities::default(), &variants)
+                    .options;
+                for surface in surfaces {
+                    let mut expected = sdk.clone();
+                    for (from, to) in wire_renames(family, surface) {
+                        move_path(&mut expected, from, to);
+                    }
+                    let wire = lower_to_wire(&sdk, surface);
+                    assert_eq!(
+                        wire, expected,
+                        "{family:?} at {effort} on {surface:?} did not lower to its wire fields"
+                    );
+                    assert_eq!(
+                        lower_to_wire(&wire, surface),
+                        wire,
+                        "{family:?} at {effort} on {surface:?} is not idempotent, so a body \
+                         already in wire vocabulary would be rewritten again"
+                    );
+                    combinations += 1;
+                }
+            }
+        }
+        assert_eq!(
+            combinations,
+            ProviderFamily::ALL.len() * ReasoningEffort::ALL.len() * surfaces.len()
+        );
+    }
+
+    /// No lowered body may still carry an SDK option name.
+    ///
+    /// A belt-and-braces check independent of the rename table: it names the three
+    /// spellings the wire never accepts and asserts they are gone whatever route
+    /// produced the body. If a future family reintroduces one, this fails even if
+    /// its rename row was added incorrectly.
+    #[test]
+    fn no_lowered_body_carries_an_sdk_option_name() {
+        let variants = DeclaredVariants::new();
+        for family in ProviderFamily::ALL {
+            for effort in ReasoningEffort::ALL {
+                for surface in [
+                    ApiSurface::Default,
+                    ApiSurface::Chat,
+                    ApiSurface::Responses,
+                    ApiSurface::Messages,
+                ] {
+                    let resolution =
+                        resolve_effort(family, effort, EffortCapabilities::default(), &variants);
+                    let mut body = Map::new();
+                    resolution.apply_to(&mut body, surface);
+                    let serialised = Value::Object(body.clone()).to_string();
+                    for option in [OPEN_AI_EFFORT_OPTION, ANTHROPIC_BUDGET_OPTION] {
+                        assert!(
+                            !serialised.contains(&format!("\"{option}\"")),
+                            "{family:?} at {effort} on {surface:?} shipped the SDK option \
+                             `{option}` to the wire: {serialised}"
+                        );
+                    }
+                    // `thinkingConfig` is a real Gemini field, but only nested
+                    // inside `generationConfig`; at the top level it is the
+                    // unlowered SDK option.
+                    assert!(
+                        !body.contains_key(GOOGLE_THINKING_OPTION),
+                        "{family:?} at {effort} on {surface:?} left `{GOOGLE_THINKING_OPTION}` at \
+                         the body root instead of inside `{GOOGLE_GENERATION_CONFIG_FIELD}`: \
+                         {serialised}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The resolver's own output vocabulary, which is SDK provider options.
+    ///
+    /// Deliberately left asserting the camelCase SDK names: that *is* what
+    /// `resolve_effort` contracts to return, and a catalog's declared variants are
+    /// written in the same vocabulary. What changed is that this is no longer the
+    /// only table — see
+    /// [`lowering_renames_every_sdk_option_the_wire_spells_differently`], which
+    /// pins what actually reaches a body. On its own this test passed happily while
+    /// the wire was wrong.
     #[test]
     fn effort_table_covers_every_level_and_provider_family() {
         let rows: [(ProviderFamily, [Value; 6]); 5] = [
@@ -537,6 +824,12 @@ mod tests {
         );
     }
 
+    /// Changing the level must move exactly one wire field, on either surface.
+    ///
+    /// The assertion changed from the SDK name `reasoningEffort` to the two wire
+    /// fields it becomes, and gained the Responses half. The original could only
+    /// ever observe the pre-lowering name, which is why it stayed green while the
+    /// level shipped under a field no endpoint reads.
     #[test]
     fn switching_medium_to_xhigh_changes_only_the_effort_field() {
         let variants = DeclaredVariants::new();
@@ -545,31 +838,47 @@ mod tests {
             "store": false,
             "input": "hello"
         });
-        let mut medium = object(base.clone());
-        resolve_effort(
-            ProviderFamily::OpenAi,
-            ReasoningEffort::Medium,
-            EffortCapabilities::default(),
-            &variants,
-        )
-        .apply_to(&mut medium);
-        let mut xhigh = object(base);
-        resolve_effort(
-            ProviderFamily::OpenAi,
-            ReasoningEffort::Xhigh,
-            EffortCapabilities::default(),
-            &variants,
-        )
-        .apply_to(&mut xhigh);
+        let decorated = |effort, surface| {
+            let mut body = object(base.clone());
+            resolve_effort(
+                ProviderFamily::OpenAi,
+                effort,
+                EffortCapabilities::default(),
+                &variants,
+            )
+            .apply_to(&mut body, surface);
+            body
+        };
 
-        let changed: Vec<&str> = medium
-            .keys()
-            .filter(|key| medium.get(*key) != xhigh.get(*key))
-            .map(String::as_str)
-            .collect();
-        assert_eq!(changed, ["reasoningEffort"]);
-        assert_eq!(medium["reasoningEffort"], "medium");
-        assert_eq!(xhigh["reasoningEffort"], "xhigh");
+        for (surface, field, medium_value, xhigh_value) in [
+            (
+                ApiSurface::Chat,
+                "reasoning_effort",
+                json!("medium"),
+                json!("xhigh"),
+            ),
+            (
+                ApiSurface::Responses,
+                "reasoning",
+                json!({"effort": "medium"}),
+                json!({"effort": "xhigh"}),
+            ),
+        ] {
+            let medium = decorated(ReasoningEffort::Medium, surface);
+            let xhigh = decorated(ReasoningEffort::Xhigh, surface);
+            let changed: Vec<&str> = medium
+                .keys()
+                .filter(|key| medium.get(*key) != xhigh.get(*key))
+                .map(String::as_str)
+                .collect();
+            assert_eq!(changed, [field], "on {surface:?}");
+            assert_eq!(medium[field], medium_value, "on {surface:?}");
+            assert_eq!(xhigh[field], xhigh_value, "on {surface:?}");
+            assert!(
+                !medium.contains_key(OPEN_AI_EFFORT_OPTION),
+                "the SDK option name must not survive onto the body: {medium:?}"
+            );
+        }
     }
 
     #[test]

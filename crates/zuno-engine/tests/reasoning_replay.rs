@@ -431,3 +431,239 @@ fn plain_reasoning_with_no_signature_or_capsule_stays_history_only() {
         "unsigned reasoning must stay out of requests: {messages:#?}"
     );
 }
+
+/// A capsule the provider streamed must come back out of the database.
+///
+/// Every fixture above starts from a hand-written `PartRecord`, which is why they
+/// all passed while nothing in production wrote one: the only writer of
+/// `metadata.providerReasoning` was `StreamProjector::persist_provider_reasoning`,
+/// and it had no production callers, so the accumulated capsule was cleared at the
+/// end of each step without ever being persisted. This test starts one step
+/// earlier — from the `StreamEvent` a provider actually emits — and runs the real
+/// `run_turn` persistence path, so it cannot be satisfied by a fixture.
+///
+/// It also pins the position: the capsule must be the assistant message's *first*
+/// content block, because that is the only arrangement the sealing models accept.
+mod production_round_trip {
+    use super::{SESSION_ID, SYSTEM};
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use futures::stream;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use zuno_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
+    use zuno_db::{Connection, migration, open};
+    use zuno_engine::interrupt::InterruptSignal;
+    use zuno_engine::r#loop::{
+        AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
+        RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnEvent, event_channel,
+        project_history_owned, run_turn,
+    };
+    use zuno_error::ProviderError;
+    use zuno_llm::cache::{DynamicContext, McpToolStatus};
+    use zuno_llm::event::{FinishReason, RequestContentBlock, Role, StreamEvent};
+    use zuno_llm::registry::{
+        ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream,
+        Spec,
+    };
+
+    const CAPSULE_ID: &str = "rs_production_capsule";
+    const CIPHERTEXT: &str = "ENCRYPTED-CAPSULE-PRODUCTION-PATH";
+
+    #[derive(Debug)]
+    struct ScriptedProvider(Mutex<VecDeque<Vec<Result<StreamEvent, ProviderError>>>>);
+
+    impl Provider for ScriptedProvider {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::text_only()
+        }
+
+        fn stream(&self, _request: CompletionRequest) -> ProviderStream<'_> {
+            let events = self
+                .0
+                .lock()
+                .expect("response lock")
+                .pop_front()
+                .expect("one scripted response per request");
+            Box::pin(stream::iter(events))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Resolver;
+
+    impl AgentModelResolver for Resolver {
+        fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+            (requested == "build").then(|| ResolvedAgent::new("build", SYSTEM, 4))
+        }
+
+        fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
+            (provider_id == "scripted" && model_id == "scripted-model").then(|| {
+                ResolvedModel::new(
+                    Spec::new("scripted"),
+                    "scripted-model",
+                    ApiSurface::Responses,
+                )
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct NoTools;
+
+    #[async_trait]
+    impl ToolDispatcher for NoTools {
+        fn available_tools(&self) -> AvailableTools {
+            AvailableTools::new(Vec::new(), McpToolStatus::Ready)
+        }
+
+        async fn dispatch(&self, _request: DispatchRequest) -> ToolDispatchResult {
+            ToolDispatchResult::error(zuno_tool::ToolOutput::text("none", "no tools"))
+        }
+    }
+
+    fn seeded() -> Connection {
+        let mut connection =
+            open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
+        migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-capsule', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('{SESSION_ID}', 'project-capsule', 'capsule', '/workspace', 'c', '1', 1, 1);"
+            ))
+            .expect("seed project and session");
+        let store = MessageStore::new(&connection);
+        let user = MessageRecord::from_json(json!({
+            "id": "msg_capsule_user",
+            "sessionID": SESSION_ID,
+            "role": "user",
+            "time": { "created": 10 },
+            "agent": "build",
+            "model": { "providerID": "scripted", "modelID": "scripted-model" }
+        }))
+        .expect("valid user message");
+        store.put_message_at(&user, 10).expect("store user message");
+        let part = PartRecord::from_json(
+            json!({
+                "id": "prt_capsule_user",
+                "sessionID": SESSION_ID,
+                "messageID": "msg_capsule_user",
+                "type": "text",
+                "text": "Read the fixture and summarise it."
+            }),
+            10,
+        )
+        .expect("valid text part");
+        store.put_part_at(&part, 10).expect("store user part");
+        connection
+    }
+
+    async fn drain(mut receiver: mpsc::Receiver<TurnEvent>) {
+        while receiver.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn a_streamed_capsule_is_persisted_and_replays_as_the_first_content_block() {
+        let mut connection = seeded();
+        let provider = Arc::new(ScriptedProvider(Mutex::new(VecDeque::from(vec![vec![
+            Ok(StreamEvent::ProviderReasoningItem {
+                id: CAPSULE_ID.to_owned(),
+                summary: vec!["Deciding to read the fixture.".to_owned()],
+                encrypted_content: Some(CIPHERTEXT.to_owned()),
+                status: Some("completed".to_owned()),
+            }),
+            Ok(StreamEvent::TextDelta("Let me check that file.".to_owned())),
+            Ok(StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            }),
+        ]]))));
+        let mut providers = ProviderRegistry::new();
+        {
+            let provider = Arc::clone(&provider);
+            providers.register("scripted", move |_spec| provider.clone());
+        }
+        let resolver = Resolver;
+        let dispatcher = NoTools;
+        let interrupt = InterruptSignal::new();
+        let (sender, receiver) = event_channel();
+
+        let turn = run_turn(
+            RunTurnRequest::new(SESSION_ID, "turn-capsule", DynamicContext::default()),
+            TurnContext::new(
+                &mut connection,
+                &providers,
+                &resolver,
+                &dispatcher,
+                &interrupt,
+            ),
+            sender,
+        );
+        let (outcome, ()) = tokio::join!(turn, drain(receiver));
+        outcome.expect("the turn completes");
+
+        let store = MessageStore::new(&connection);
+        let history = store.hydrate_session(SESSION_ID).expect("hydrate session");
+
+        let capsules: Vec<&PartRecord> = history
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter(|part| {
+                part.kind == PartKind::Reasoning
+                    && part
+                        .data
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("providerReasoning"))
+                        .is_some()
+            })
+            .collect();
+        assert_eq!(
+            capsules.len(),
+            1,
+            "the streamed capsule was never persisted, so no later turn can replay it"
+        );
+        let stored = capsules[0]
+            .data
+            .get("metadata")
+            .and_then(|metadata| metadata.get("providerReasoning"))
+            .expect("the capsule metadata is present");
+        assert_eq!(stored["id"], json!(CAPSULE_ID));
+        assert_eq!(stored["encryptedContent"], json!(CIPHERTEXT));
+        assert_eq!(stored["status"], json!("completed"));
+        assert_eq!(
+            stored["summary"],
+            json!(["Deciding to read the fixture."]),
+            "the summary must survive verbatim, it is part of what the provider signed"
+        );
+
+        let messages = project_history_owned(SYSTEM, history);
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("the turn persisted an assistant message");
+        match assistant.content.first() {
+            Some(RequestContentBlock::ProviderEncryptedReasoning {
+                id,
+                encrypted_content,
+                ..
+            }) => {
+                assert_eq!(id, CAPSULE_ID);
+                assert_eq!(encrypted_content.as_deref(), Some(CIPHERTEXT));
+            }
+            other => panic!(
+                "the capsule must be the assistant message's first content block, found {other:#?} \
+                 in {:#?}",
+                assistant.content
+            ),
+        }
+    }
+}
