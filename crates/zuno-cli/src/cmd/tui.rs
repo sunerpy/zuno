@@ -376,6 +376,39 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         host.tool_count(),
         RuntimeIdentity::resolve(host.session_id(), plugins.as_ref(), environment.resolved()),
     );
+    // Before every notice below, and that order is load-bearing in both directions.
+    //
+    // Before, because `Transcript::replay` only acts on an empty transcript — a guard that
+    // is what makes the replayed run a prefix, which is what lets the message menu tell a
+    // turn this process ran from one it only read back.
+    //
+    // Before also because these notices are about *this* launch, and history is what came
+    // first. A fresh session replays nothing, so PR #23's case — startup notices coexisting
+    // with the welcome screen — is reached by exactly the same code and is unchanged:
+    // `conversation_started` excludes `Role::System`.
+    match host.resumed_history() {
+        Ok(history) => {
+            let replay = super::tui_replay::project(history);
+            let omission = replay.omission_notice();
+            screen
+                .transcript_mut()
+                .transcript_mut()
+                .replay(replay.messages);
+            if let Some(notice) = omission {
+                screen.transcript_mut().transcript_mut().push(notice);
+            }
+        }
+        // Reported, never fatal: a session whose stored parts cannot be decoded still opens,
+        // because the alternative is refusing to open the one session a user needs to export
+        // or prune. A blank transcript with no explanation is the defect this whole path
+        // exists to remove, so the explanation is mandatory even when the transcript is not.
+        Err(error) => {
+            screen
+                .transcript_mut()
+                .transcript_mut()
+                .push(super::tui_replay::failure_notice(host.session_id(), &error));
+        }
+    }
     // Theme fallback is recoverable, unlike an unreadable or malformed config file.
     // Put its diagnostic in the transcript rather than stderr: the alternate screen
     // would hide a pre-raw warning until shutdown, while this is visible on frame one.

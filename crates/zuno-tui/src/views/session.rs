@@ -1922,6 +1922,17 @@ impl SessionScreen {
     /// rather than present and inert. A menu entry that silently does nothing is worse than a
     /// shorter menu, and it is the failure mode this codebase has paid for repeatedly.
     ///
+    /// # A replayed prompt is never offered it, newest included
+    ///
+    /// [`Transcript::replay`](crate::views::message::Transcript::replay) puts a resumed
+    /// session's persisted history on screen, which introduces prompts this process never
+    /// ran. `SnapshotHistory` is rebuilt empty on every launch, so the checkpoint any of
+    /// them opened belongs to an exited process — including the newest, which the `newest`
+    /// test above would otherwise accept. Offering the row there would be exactly the
+    /// defect the paragraph above refuses: a row whose only possible outcome is
+    /// `nothing to undo`. The prefix boundary is
+    /// [`Transcript::replayed`](crate::views::message::Transcript::replayed).
+    ///
     /// Whether the host has a checkpoint to restore is deliberately **not** asked here. It
     /// cannot be — the stack is the host's — and it does not need to be: `restore_snapshot`
     /// answers `nothing to undo` and that refusal is reported. The same fallible-sink
@@ -1937,6 +1948,7 @@ impl SessionScreen {
         if message.role != crate::views::message::Role::User {
             return None;
         }
+        let lived_through = index >= self.transcript.transcript().replayed();
         let newest = messages
             .iter()
             .rposition(|held| held.role == crate::views::message::Role::User)
@@ -1946,7 +1958,7 @@ impl SessionScreen {
                 .described("put this prompt on the clipboard")
                 .valued(MESSAGE_ACTION_COPY),
         ];
-        if newest {
+        if newest && lived_through {
             items.push(
                 crate::views::picker::Item::new("Revert this turn")
                     .described("restore the worktree to before this prompt ran")

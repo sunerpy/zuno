@@ -553,6 +553,18 @@ pub struct Transcript {
     /// slow. The dialog stack is the only thing that knows the difference, so it is what
     /// sets this.
     awaiting_permission: bool,
+    /// How many leading messages were read back from the database rather than lived through.
+    ///
+    /// A count rather than a flag per message, because [`Self::replay`] refuses a
+    /// non-empty transcript: everything it installs is therefore a prefix and everything
+    /// appended afterwards is live *by construction*, rather than by every push site
+    /// remembering to set a flag.
+    ///
+    /// It exists because `SnapshotHistory` is rebuilt empty on every launch
+    /// (`zuno-cli/src/cmd/tui.rs`), so the worktree checkpoint a replayed turn opened
+    /// belongs to a process that has exited — see
+    /// [`SessionScreen::message_actions`](crate::views::session::SessionScreen).
+    replayed: usize,
 }
 
 impl Transcript {
@@ -704,6 +716,39 @@ impl Transcript {
     /// Append a message written locally, such as the user's own prompt.
     pub fn push(&mut self, message: Message) {
         self.messages.push(message);
+    }
+
+    /// Install a session's persisted history, read back from the database on resume.
+    ///
+    /// This is what closes the gap between what the model is given and what the user can
+    /// see. The next request rehydrates the whole session from the database
+    /// (`zuno-engine/src/loop.rs`), so a resumed session used to reach the model with a
+    /// conversation the screen had never heard of — the user read a welcome screen while
+    /// the reply quoted turns that were nowhere on it.
+    ///
+    /// # Only on an empty transcript, and that is enforced
+    ///
+    /// A no-op on a transcript that already holds messages, because the only correct
+    /// moment is before the first frame: it must precede the startup notices so a fresh
+    /// session's welcome screen still works ([`Self::conversation_started`] excludes
+    /// [`Role::System`] precisely so those notices do not claim a conversation began),
+    /// and it must precede any prompt the command line supplied. Refusing here rather
+    /// than trusting the caller is what makes [`Self::replayed`] a prefix rather than a
+    /// claim.
+    pub fn replay(&mut self, messages: Vec<Message>) {
+        if !self.messages.is_empty() {
+            return;
+        }
+        self.replayed = messages.len();
+        self.messages = messages;
+    }
+
+    /// How many leading messages came from the database rather than from this session.
+    ///
+    /// Every index below this was replayed; every index at or above it was lived through.
+    #[must_use]
+    pub const fn replayed(&self) -> usize {
+        self.replayed
     }
 
     /// Fold one engine event into the transcript.
