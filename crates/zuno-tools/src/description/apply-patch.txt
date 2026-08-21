@@ -1,0 +1,6 @@
+Use the `apply_patch` tool to edit files. Your patch language is a stripped-down, file-oriented diff format.
+
+A patch starts with `*** Begin Patch`, ends with `*** End Patch`, and contains one or more file sections.
+Each section starts with `*** Add File: <path>`, `*** Delete File: <path>`, or `*** Update File: <path>`.
+An update may include `*** Move to: <path>` and uses `@@` hunks with context, removed, and added lines.
+Every initial-content line in an Add File section must start with `+`.

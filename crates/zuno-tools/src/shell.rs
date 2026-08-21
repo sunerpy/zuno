@@ -23,7 +23,8 @@ use zuno_tool::{OutputLimits, PermissionAsk, Tool, ToolContext, ToolOutput, Tool
 const TOOL_ID: &str = "bash";
 const BACKGROUND_DIRECTORY: &str = "background";
 const TERMINATE_GRACE: Duration = Duration::from_millis(200);
-const DESCRIPTION: &str = "Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. A deterministic destructive-command gate runs before every foreground or background spawn. This is not a sandbox: commands retain the user's full filesystem, network, and credentials; confinement is a future decision, not an implied guarantee. Use workdir instead of changing directories inside the command.";
+/// The description the model reads.
+pub const DESCRIPTION: &str = include_str!("description/bash.txt");
 
 const CWD_COMMANDS: &[&str] = &[
     "cd",

@@ -1,0 +1,1 @@
+Get the current goal for this session, including status, budget, usage, and remaining tokens.

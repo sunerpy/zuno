@@ -52,7 +52,7 @@ use zuno_tool::{ToolContext, ToolOutput, TypedTool};
 pub const WIRE_ID: &str = "plan_exit";
 
 /// The description the model reads, verbatim from `tool/plan-exit.txt`.
-pub const DESCRIPTION: &str = include_str!("plan_exit/plan-exit.txt");
+pub const DESCRIPTION: &str = include_str!("description/plan-exit.txt");
 
 /// The short label beside the approval prompt, verbatim from `plan.ts:35`.
 pub const QUESTION_HEADER: &str = "Build Agent";

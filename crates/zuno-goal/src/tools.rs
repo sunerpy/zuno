@@ -16,10 +16,12 @@ pub const CREATE_GOAL_TOOL_ID: &str = "create_goal";
 /// Wire name of the model-authorized status updater.
 pub const UPDATE_GOAL_TOOL_ID: &str = "update_goal";
 
-const GET_DESCRIPTION: &str =
-    "Get the current goal for this session, including status, budget, usage, and remaining tokens.";
-const CREATE_DESCRIPTION: &str = "Create a goal only when explicitly requested. An unfinished goal cannot be replaced. Set token_budget only when the user explicitly requested one.";
-const UPDATE_DESCRIPTION: &str = "Mark the current goal complete, or report a blocking condition for the current turn. Complete requires evidence for every requirement. Blocked requires blocking_condition and becomes terminal only after the same condition persists for three consecutive goal turns.";
+/// The description the model reads for [`GetGoalTool`].
+pub const GET_DESCRIPTION: &str = include_str!("description/get-goal.txt");
+/// The description the model reads for [`CreateGoalTool`].
+pub const CREATE_DESCRIPTION: &str = include_str!("description/create-goal.txt");
+/// The description the model reads for [`UpdateGoalTool`].
+pub const UPDATE_DESCRIPTION: &str = include_str!("description/update-goal.txt");
 
 /// No-argument payload for [`GetGoalTool`].
 #[derive(Debug, Default, Deserialize, JsonSchema)]

@@ -21,7 +21,7 @@ pub const MAX_SUBCALLS: usize = 10;
 pub const TOTAL_OUTPUT_BYTES: usize = 50_000;
 
 /// The model-facing description stays terse; parameter docs carry the protocol.
-pub const DESCRIPTION: &str = "Run tools in parallel with optional result binding.";
+pub const DESCRIPTION: &str = include_str!("description/batch.txt");
 
 /// Arguments for one composed execution.
 #[derive(Debug, Deserialize, JsonSchema)]

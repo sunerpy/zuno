@@ -107,18 +107,7 @@ pub const BACKGROUND_ID_PREFIX: &str = "bg_";
 /// whatever the caller's catalog resolved, and naming a model here would bake
 /// today's market into the binary — the failure `zuno-agent`'s
 /// [`zuno_agent::model_policy`] exists to refuse.
-pub const DESCRIPTION: &str = concat!(
-    "Delegate a self-contained unit of work to a subagent in its own session.\n",
-    "Name exactly one of `subagent_type` (a specific agent) or `category` (a preset ",
-    "shorthand, which runs the generic worker at that preset's model).\n",
-    "Foreground is the default and blocks until the child answers; `background: true` ",
-    "returns immediately with a job id and notifies you on completion — use it only ",
-    "for work that does not overlap what you continue doing.\n",
-    "Pass `task_id` from a previous call to continue that same child session instead ",
-    "of starting a fresh one.\n",
-    "Skills are not an argument: each agent's permissions already decide which skills ",
-    "it can load."
-);
+pub const DESCRIPTION: &str = include_str!("description/task.txt");
 
 /// The background job id for `session_id`.
 #[must_use]

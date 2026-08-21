@@ -10,16 +10,8 @@ use std::sync::Arc;
 use zuno_error::ToolError;
 use zuno_tool::{ToolContext, ToolOutput, TypedTool};
 
-const DESCRIPTION: &str = concat!(
-    "Performs exact string replacements in files.\n\n",
-    "Usage:\n",
-    "- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.\n",
-    "- When editing text from Read tool output, preserve the exact indentation after the line number prefix and never include the prefix in oldString or newString.\n",
-    "- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n",
-    "- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n",
-    "- The edit fails if oldString is absent or non-unique unless replaceAll is true.\n",
-    "- Use replaceAll for replacing and renaming strings across the file."
-);
+/// The description the model reads.
+pub const DESCRIPTION: &str = include_str!("description/edit.txt");
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

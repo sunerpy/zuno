@@ -104,34 +104,7 @@ pub const MAX_CONSOLIDATION_FAILURES_PER_TURN: usize = 3;
 ///
 /// This string rides on **every** request for the whole session, so each word is
 /// paid repeatedly. It is as terse as the structure allows and no terser.
-pub const DESCRIPTION: &str = concat!(
-    "Save durable facts to persistent memory that survive across sessions. Memory is ",
-    "injected into every future session, so keep entries compact and high-signal.\n\n",
-    "HOW: make ALL your changes in ONE call via an 'operations' array (each item: ",
-    "{action, content?, old_text?}). The batch applies atomically and the char limit is ",
-    "checked only on the FINAL result — so a single call can remove/replace stale entries ",
-    "to free room AND add new ones, even when an add alone would overflow. The response ",
-    "reports current/limit chars and confirms completion; one batch call finishes the ",
-    "update, so don't repeat it. Use the bare action/content/old_text fields only for a ",
-    "single lone change. 'old_text' is a short substring that must identify exactly one ",
-    "entry.\n\n",
-    "WHEN: save proactively when the user states a preference or correction, or you learn ",
-    "a stable fact about their environment, this codebase's conventions, or how they want ",
-    "to be worked with. Priority: user preferences & corrections > project conventions & ",
-    "commands > tool quirks you had to rediscover. The best memory stops the user ",
-    "repeating themselves.\n\n",
-    "IF FULL: the write is rejected with the current entries shown. Reissue as ONE batch ",
-    "that removes or shortens enough stale entries and adds the new one together.\n\n",
-    "TARGETS: 'global' = habits that travel with the user into every repository (their ",
-    "preferences, corrections, working style, tool quirks). 'project' = rules that belong ",
-    "to this repository only (its build and test commands, layout, conventions, gotchas). ",
-    "A repo rule filed globally is paid for in every unrelated session; a travelling habit ",
-    "filed per-project is relearned in every checkout.\n\n",
-    "SKIP: trivial or obvious information, facts you could rediscover in seconds, raw data ",
-    "dumps, and anything about the work in flight — task progress, completed-work logs and ",
-    "temporary TODO state belong to the goal tools (get_goal/update_goal) and ",
-    "session_search, not here. A reusable procedure belongs in a skill, not memory.",
-);
+pub const DESCRIPTION: &str = include_str!("description/memory.txt");
 
 /// The terminal instruction the breaker returns once the per-turn budget is spent.
 ///

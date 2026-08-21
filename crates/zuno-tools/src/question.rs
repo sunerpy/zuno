@@ -45,7 +45,7 @@ use zuno_tool::{ToolContext, ToolOutput, TypedTool};
 pub const WIRE_ID: &str = "question";
 
 /// The description the model reads, verbatim from `tool/question.txt`.
-pub const DESCRIPTION: &str = include_str!("question/question.txt");
+pub const DESCRIPTION: &str = include_str!("description/question.txt");
 
 /// What a question with no selected answer renders as.
 ///

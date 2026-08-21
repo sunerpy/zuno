@@ -41,7 +41,7 @@ pub const WIRE_ID: &str = "invalid";
 /// Three words, verbatim from `invalid.ts:12`. Deliberately not expanded: a longer
 /// description would spend prompt tokens teaching a tool the model should never
 /// choose.
-pub const DESCRIPTION: &str = "Do not use";
+pub const DESCRIPTION: &str = include_str!("description/invalid.txt");
 
 /// The title on the rendered result, verbatim from `invalid.ts:16`.
 pub const TITLE: &str = "Invalid Tool";
