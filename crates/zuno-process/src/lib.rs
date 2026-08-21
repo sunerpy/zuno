@@ -19,6 +19,14 @@ const MONITOR_FOREGROUND_MODE: &str = "monitor-foreground";
 const EXEC_MODE: &str = "exec";
 const EXEC_FOREGROUND_MODE: &str = "exec-foreground";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long a teardown waits for the contained group to stop being able to run.
+///
+/// The wait begins only after `SIGKILL` has reached the whole group, so what remains is
+/// scheduler latency rather than cooperation, and it returns the moment the condition
+/// holds — the ordinary cost is one syscall. The bound covers the case that is not
+/// scheduler latency, a member stuck in uninterruptible I/O, where hanging would be
+/// worse than the hazard because a TUI with a waiting user sits above this.
+const GROUP_QUIET_BUDGET: Duration = Duration::from_millis(500);
 static GUARD_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Enables guarded child launches in the current process.
@@ -251,6 +259,7 @@ fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 terminate_process_group(child_pid);
+                settle_contained_process_group(child_pid);
                 return Ok(status);
             }
             Ok(None) => {}
@@ -477,6 +486,157 @@ fn terminate_process_group(pid: u32) {
 }
 
 #[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum GroupQuiet {
+    Reached,
+    /// Empty means "some, but this platform cannot name them" — never "none".
+    Refused(Vec<u32>),
+}
+
+/// Drives process group `pgid` until no member can execute another instruction.
+///
+/// A zombie counts as quiet. It has no address space and no file descriptors, so it
+/// cannot write to the terminal, and the only transition left for it — being reaped —
+/// belongs to whichever process inherits the orphan. Waiting for the group to be
+/// *empty* would therefore make every editor exit depend on a third party's
+/// scheduling, and never complete at all under an init that does not reap orphans.
+///
+/// Each pass re-signals before it observes, so this converges rather than merely
+/// watching. The already-pending `SIGKILL` on a member the caller's sweep reached
+/// makes the repeat redundant for that member, but a member that forked into the group
+/// while the kernel was walking it never received that signal, and only a later pass
+/// can reach it.
+#[cfg(unix)]
+fn wait_for_process_group_to_go_quiet(pgid: u32, budget: Duration) -> GroupQuiet {
+    drive_until_quiet(budget, || {
+        signal_process_group(pgid, rustix::process::Signal::KILL);
+        process_group_quiet(pgid)
+    })
+}
+
+/// The bound, apart from what it is bounding.
+///
+/// Split out because a group that refuses `SIGKILL` cannot be constructed — the kernel
+/// does not offer one — so the only way to prove the budget is honoured is to hand the
+/// loop an observation that never succeeds.
+#[cfg(unix)]
+fn drive_until_quiet(budget: Duration, mut pass: impl FnMut() -> GroupQuiet) -> GroupQuiet {
+    let started = Instant::now();
+    loop {
+        let quiet = pass();
+        if quiet == GroupQuiet::Reached || started.elapsed() >= budget {
+            return quiet;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// One observation of what group `pgid` can still do.
+///
+/// `SIGnal 0` answers the common case — an empty group — in a single syscall, which
+/// matters because this runs on every editor exit. The `/proc` walk is only paid for
+/// when somebody is still there.
+#[cfg(unix)]
+fn process_group_quiet(pgid: u32) -> GroupQuiet {
+    let Some(group) = rustix::process::Pid::from_raw(pgid as i32) else {
+        return GroupQuiet::Reached;
+    };
+    // `ESRCH` — the group is gone — is the only answer that lets the terminal go back.
+    // A present group and an unanswerable one both keep waiting until the budget stops.
+    if rustix::process::test_kill_process_group(group) == Err(rustix::io::Errno::SRCH) {
+        return GroupQuiet::Reached;
+    }
+    let live = live_process_group_members(pgid);
+    if live.is_empty() {
+        GroupQuiet::Reached
+    } else {
+        GroupQuiet::Refused(live)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn live_process_group_members(pgid: u32) -> Vec<u32> {
+    let mut live = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if process_is_live_member_of(pid, pgid) {
+            live.push(pid);
+        }
+    }
+    live
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_live_member_of(pid: u32, pgid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // `comm` is parenthesised and may itself hold spaces and parentheses, so the fixed
+    // fields — state, ppid, pgrp — start after its last `)`.
+    let Some(fields) = stat.rfind(')').and_then(|end| stat.get(end + 1..)) else {
+        return false;
+    };
+    let mut fields = fields.split_whitespace();
+    let Some(state) = fields.next() else {
+        return false;
+    };
+    fields
+        .nth(1)
+        .and_then(|group| group.parse::<u32>().ok())
+        .is_some_and(|group| group == pgid && state != "Z")
+}
+
+/// Every other Unix lacks a `/proc` state field, so membership is the whole answer.
+///
+/// The caller has already established that the group is not empty, which on this
+/// platform is as much as can be known: the wait then holds out for an empty group,
+/// which is stricter than necessary but still bounded.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn live_process_group_members(_pgid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+/// Waits for the contained group and reports on the guard's stderr if it refuses.
+///
+/// The report is not promoted to a failing exit status on purpose. This runs on the
+/// ordinary path too, where the payload succeeded, and turning a stray background job
+/// into a failure would throw away the text the user just wrote — a worse outcome than
+/// a repaint artefact. The guard's stderr is the terminal the editor was using and is
+/// where every other containment failure is already reported.
+#[cfg(unix)]
+fn settle_contained_process_group(pgid: u32) {
+    if let GroupQuiet::Refused(members) =
+        wait_for_process_group_to_go_quiet(pgid, GROUP_QUIET_BUDGET)
+    {
+        eprintln!("{}", group_refused_to_go_quiet(pgid, &members));
+    }
+}
+
+#[cfg(unix)]
+fn group_refused_to_go_quiet(pgid: u32, members: &[u32]) -> String {
+    let who = if members.is_empty() {
+        "members this platform cannot name".to_owned()
+    } else {
+        format!("{members:?}")
+    };
+    format!(
+        "child-process guard: process group {pgid} still had {who} able to run \
+         {} ms after SIGKILL; the terminal is being handed back while they could still \
+         write to it",
+        GROUP_QUIET_BUDGET.as_millis()
+    )
+}
+
+#[cfg(unix)]
 fn signal_process_group(pid: u32, signal: rustix::process::Signal) {
     if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
         let _result = rustix::process::kill_process_group(pid, signal);
@@ -497,6 +657,7 @@ fn terminate_guarded_process_group(
     }
     let status = child.wait()?;
     terminate_process_group(child_pid);
+    settle_contained_process_group(child_pid);
     Ok(status)
 }
 
@@ -577,4 +738,205 @@ fn exit_code(status: ExitStatus) -> ExitCode {
 #[must_use]
 pub fn is_active_guard(path: &Path) -> bool {
     GUARD_EXECUTABLE.get().is_some_and(|active| active == path)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+
+    /// A live process group in its own group, so signalling it cannot reach the suite.
+    fn sleeping_group() -> std::process::Child {
+        Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a sleeping process group")
+    }
+
+    #[test]
+    fn a_group_nobody_else_will_kill_is_driven_quiet_by_the_wait_itself() {
+        let mut group = sleeping_group();
+        let pgid = group.id();
+
+        let quiet = wait_for_process_group_to_go_quiet(pgid, Duration::from_secs(5));
+
+        let reaped = group.wait().expect("the group leader is reapable");
+        assert_eq!(
+            quiet,
+            GroupQuiet::Reached,
+            "nothing else in this test signals the group, so a wait that only observes \
+             can never see it go quiet — it must drive the group there"
+        );
+        assert_eq!(
+            reaped.signal(),
+            Some(rustix::process::Signal::KILL.as_raw()),
+            "the group leader ended some other way than the wait's own signal: {reaped}"
+        );
+    }
+
+    #[test]
+    fn a_live_process_group_is_never_reported_as_unable_to_run() {
+        let mut group = sleeping_group();
+        let pgid = group.id();
+
+        let observed = process_group_quiet(pgid);
+
+        terminate_process_group(pgid);
+        let _reaped = group.wait();
+        assert_eq!(
+            observed,
+            GroupQuiet::Refused(vec![pgid]),
+            "a sleeping process was treated as unable to run, yet it can write to the \
+             terminal the moment it is scheduled"
+        );
+    }
+
+    #[test]
+    fn a_zombie_is_quiet_because_it_can_no_longer_execute_anything() {
+        let mut group = sleeping_group();
+        let pgid = group.id();
+        terminate_process_group(pgid);
+        // Deliberately unreaped: this is the state an orphaned descendant sits in until
+        // init gets to it, and it must not hold the terminal hostage.
+        wait_until_zombie(pgid);
+
+        let observed = process_group_quiet(pgid);
+
+        let _reaped = group.wait();
+        assert_eq!(
+            observed,
+            GroupQuiet::Reached,
+            "an unreaped zombie was treated as able to run, which would make every \
+             editor exit wait on whoever inherits the orphan"
+        );
+    }
+
+    #[test]
+    fn an_observation_that_never_succeeds_still_ends_at_the_budget() {
+        let budget = Duration::from_millis(50);
+        let mut passes = 0_u32;
+
+        let started = Instant::now();
+        let quiet = drive_until_quiet(budget, || {
+            passes += 1;
+            GroupQuiet::Refused(vec![7])
+        });
+        let waited = started.elapsed();
+
+        assert_eq!(quiet, GroupQuiet::Refused(vec![7]));
+        assert!(
+            passes > 1,
+            "the wait gave up after {passes} pass(es), so a group that needs a moment \
+             to die is reported as holding the terminal"
+        );
+        assert!(
+            waited < budget * 40,
+            "the wait ran for {waited:?} against a {budget:?} budget, which is a hang \
+             rather than a bounded wait"
+        );
+    }
+
+    /// The shipped budget must allow the drain to poll more than once.
+    ///
+    /// Every other test here passes its own budget, so the constant production actually
+    /// uses was for a while pinned by nothing: setting it to zero left the whole crate
+    /// green while collapsing the drain to one signal and one observation. That
+    /// degradation is close to invisible in the integration fixtures — a single `/proc`
+    /// walk is enough delay for an ordinary descendant — and it removes precisely the
+    /// convergence the drain exists for.
+    #[test]
+    fn the_shipped_budget_leaves_room_for_more_than_one_pass() {
+        assert!(
+            GROUP_QUIET_BUDGET > POLL_INTERVAL,
+            "the drain polls every {POLL_INTERVAL:?} but is allowed only \
+             {GROUP_QUIET_BUDGET:?}, so it gives up after its first observation and a \
+             member that joined the group during the kernel's kill walk is never \
+             reached again"
+        );
+    }
+
+    /// Both routes out of `monitor` must settle the group before the guard exits.
+    ///
+    /// Behaviour cannot assert this: whether a member is still runnable at the instant
+    /// the guard returns is a scheduling outcome, so removing either call leaves the
+    /// suite green on an idle host and red a few times in sixty under load. The wiring
+    /// is what has to be pinned, and only the source states it.
+    #[test]
+    fn every_route_out_of_the_guard_settles_the_contained_group() {
+        let source = include_str!("lib.rs");
+        let ordinary = "                terminate_process_group(child_pid);\n                \
+                        settle_contained_process_group(child_pid);";
+        let terminated = "    terminate_process_group(child_pid);\n    \
+                          settle_contained_process_group(child_pid);";
+
+        assert!(
+            source.contains(ordinary),
+            "the route taken when the editor exits by itself kills the group and then \
+             hands the terminal back without waiting, so a descendant it orphaned can \
+             still write over the first frame the TUI paints"
+        );
+        assert!(
+            source.contains(terminated),
+            "the route taken when the editor is cancelled kills the group and then hands \
+             the terminal back without waiting, so a descendant it orphaned can still \
+             write over the first frame the TUI paints"
+        );
+    }
+
+    fn wait_until_zombie(pid: u32) {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            if live_process_group_members(pid).is_empty() {
+                return;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        panic!("the killed process never became a zombie");
+    }
+
+    #[test]
+    fn a_group_with_no_members_is_quiet_without_spending_the_budget() {
+        let mut group = sleeping_group();
+        let pgid = group.id();
+        terminate_process_group(pgid);
+        let _reaped = group.wait();
+
+        let started = Instant::now();
+        let quiet = wait_for_process_group_to_go_quiet(pgid, Duration::from_secs(5));
+        let waited = started.elapsed();
+
+        assert_eq!(quiet, GroupQuiet::Reached);
+        assert!(
+            waited < Duration::from_millis(500),
+            "an empty group cost {waited:?}, so every editor exit would pay for it"
+        );
+    }
+
+    #[test]
+    fn the_refusal_says_which_members_held_the_terminal() {
+        let named = group_refused_to_go_quiet(4321, &[91, 92]);
+
+        assert!(
+            named.contains("4321") && named.contains("[91, 92]"),
+            "the diagnostic names neither the group nor its members: {named}"
+        );
+        assert!(
+            named.contains("SIGKILL") && named.contains("write to it"),
+            "the diagnostic does not say what the hazard is: {named}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_this_platform_cannot_attribute_still_reports_the_hazard() {
+        let unnamed = group_refused_to_go_quiet(4321, &[]);
+
+        assert!(
+            unnamed.contains("cannot name"),
+            "an unattributable refusal must not read as an empty one: {unnamed}"
+        );
+    }
 }
