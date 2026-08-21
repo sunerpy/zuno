@@ -57,6 +57,41 @@ use crate::app::{Component, EventResult};
 pub const DEFAULT_THEME: &str = "opencode";
 
 /// The one name the terminal-derived layer can occupy (`index.ts:181`).
+///
+/// This name exists on **two** tiers, and which one answers depends on whether the
+/// terminal told us anything:
+///
+/// 1. **Derived**, when a probe answers: [`derive_system_theme`] computes a grey
+///    scale from the terminal's *actual* background and reads its *actual* palette
+///    entries. This is the oracle's own behaviour and is the better tier.
+/// 2. **Built-in asset**, otherwise: `assets/themes/system.json`, which is a static
+///    stand-in for tier 1. It exists because the only probe this binary has is
+///    `COLORFGBG` ([`EnvironmentPalette`]), which most emulators never set — so
+///    without it `theme: "system"` was a name that resolved to `opencode` with a
+///    diagnostic and could not be selected from the picker at all.
+///
+/// Tier 1 still shadows tier 2, because [`ThemeRegistry::definition`] checks the
+/// system layer first. Nothing about the derived path changed to add the asset.
+///
+/// # Why the asset does not use `"none"` for its backgrounds
+///
+/// The oracle documents `system` as using `none` for text and background so the
+/// emulator's own colours show through, and tier 1 does exactly that
+/// (`("background", transparent)`). A `none` background resolves to
+/// [`ratatui::style::Color::Reset`], and two views paint `background` *directly*
+/// rather than through a fill that covers the frame: `views::message`'s scrollbar
+/// track and `views::diff_browser`'s selected row. A Reset there sits beside an
+/// opaque `backgroundPanel` and reproduces the colour seam
+/// `views::session`'s fill comment describes — a column of the emulator's own
+/// background inside a panel that is not that colour.
+///
+/// Tier 1 accepts that because a probe told it what the emulator's background
+/// actually *is*, so its panel greys are computed from that colour and the seam is
+/// invisible. Tier 2 has no such information: its greys are fixed, so a Reset
+/// column beside them would be an arbitrary colour. The asset therefore gives
+/// `background` an opaque per-mode value one step below its panel. The cost is that
+/// terminal-background pass-through is a tier-1-only property; the benefit is that
+/// tier 2 cannot seam.
 pub const SYSTEM_THEME: &str = "system";
 
 /// Default opacity applied to "thinking" text when a theme does not set one
@@ -761,7 +796,7 @@ fn baseline(mode: Mode) -> &'static Palette {
 ///
 /// Asserted against the embedded table so a dropped asset fails a test instead of
 /// quietly shrinking the theme list.
-pub const BUILTIN_THEME_COUNT: usize = 33;
+pub const BUILTIN_THEME_COUNT: usize = 34;
 
 /// The oracle's `packages/tui/src/theme/assets/` directory, embedded.
 ///
@@ -819,6 +854,7 @@ static BUILTIN_THEME_SOURCES: [(&str, &str); BUILTIN_THEME_COUNT] = [
         "synthwave84",
         include_str!("../assets/themes/synthwave84.json"),
     ),
+    ("system", include_str!("../assets/themes/system.json")),
     (
         "tokyonight",
         include_str!("../assets/themes/tokyonight.json"),

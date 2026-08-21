@@ -365,35 +365,47 @@ fn theme_system_derives_from_terminal_capabilities_when_available() {
 fn theme_system_without_terminal_capabilities_does_not_panic() {
     // The acceptance criterion: under `cargo test` there is no terminal, so the
     // probe answers `None` and `theme: "system"` must still produce a palette.
+    //
+    // Before `assets/themes/system.json` existed that palette was `opencode`'s, with
+    // a diagnostic. The asset is tier 2 of the two tiers `SYSTEM_THEME` documents, so
+    // the claim is now strictly stronger: the name resolves to a real theme, with no
+    // diagnostic at all, and it is *not* the default theme wearing `system`'s name.
     let mut registry = ThemeRegistry::new();
     let outcome = registry.refresh_system_theme(&FakePalette(None), None, Mode::Dark);
     assert_eq!(outcome, SystemThemeOutcome::Unavailable);
-    assert!(!registry.names().contains(&String::from(SYSTEM_THEME)));
+    assert!(registry.names().contains(&String::from(SYSTEM_THEME)));
+    assert_eq!(registry.layer_of(SYSTEM_THEME), Some(ThemeLayer::Builtin));
 
     let resolved = registry.resolve(SYSTEM_THEME, Mode::Dark);
-    assert_eq!(resolved.name, DEFAULT_THEME);
+    assert_eq!(resolved.name, SYSTEM_THEME);
     assert_eq!(
         resolved.diagnostics(),
-        vec![String::from(
-            "theme \"opencode\": no theme named \"system\" in any layer; falling back to the built-in \"opencode\" theme"
-        )]
+        Vec::<String>::new(),
+        "the asset sets every key, so nothing may fall back to {DEFAULT_THEME:?}"
     );
-    assert_eq!(
+    assert_ne!(
         resolved.palette,
-        registry.resolve(DEFAULT_THEME, Mode::Dark).palette
+        registry.resolve(DEFAULT_THEME, Mode::Dark).palette,
+        "`system` must be its own style, not a rename of the default theme"
     );
 }
 
 #[test]
 fn theme_system_refresh_clears_a_stale_derived_layer() {
     let mut registry = ThemeRegistry::new();
+    let asset = registry.resolve(SYSTEM_THEME, Mode::Dark).palette;
     registry.refresh_system_theme(&FakePalette(Some(dark_terminal())), None, Mode::Dark);
     assert_eq!(registry.layer_of(SYSTEM_THEME), Some(ThemeLayer::System));
+    let derived = registry.resolve(SYSTEM_THEME, Mode::Dark).palette;
+    assert_ne!(derived, asset, "tier 1 must not be tier 2");
     assert_eq!(
         registry.refresh_system_theme(&FakePalette(None), None, Mode::Dark),
         SystemThemeOutcome::Unavailable
     );
-    assert_eq!(registry.layer_of(SYSTEM_THEME), None);
+    // The stale derived layer is gone, so tier 2 answers again. Asserting the palette
+    // reverted is what proves the clear, now that the name never disappears.
+    assert_eq!(registry.layer_of(SYSTEM_THEME), Some(ThemeLayer::Builtin));
+    assert_eq!(registry.resolve(SYSTEM_THEME, Mode::Dark).palette, asset);
 }
 
 #[test]
@@ -439,6 +451,218 @@ fn theme_system_is_unavailable_when_the_terminal_reports_nothing_usable() {
         registry.refresh_system_theme(&FakePalette(Some(empty)), None, Mode::Dark),
         SystemThemeOutcome::Unavailable
     );
+}
+
+#[test]
+fn theme_system_is_registered_and_selectable_by_its_name() {
+    // MUST-DO 1. A theme nobody can name is not a theme: this asserts the asset is in
+    // the embedded table, in the picker's list, and reachable through the `theme`
+    // config key — with no terminal probe anywhere, which is the case that used to
+    // make `system` unreachable.
+    let registry = ThemeRegistry::new();
+    assert!(
+        builtin_theme_names().contains(&SYSTEM_THEME),
+        "`system` must be in the embedded asset table"
+    );
+    assert!(registry.has(SYSTEM_THEME));
+    assert_eq!(registry.layer_of(SYSTEM_THEME), Some(ThemeLayer::Builtin));
+    assert!(
+        registry.names().contains(&String::from(SYSTEM_THEME)),
+        "`names` is what the theme picker lists, so absence here means unselectable"
+    );
+
+    let config: TuiConfig =
+        serde_json::from_str("{\"theme\": \"system\"}").expect("a theme name is valid config");
+    for mode in [Mode::Dark, Mode::Light] {
+        let resolved = registry.resolve_configured(config.theme(), mode);
+        assert_eq!(resolved.name, SYSTEM_THEME);
+        assert_eq!(resolved.mode, mode);
+        assert!(resolved.issues.is_empty(), "{:?}", resolved.diagnostics());
+    }
+}
+
+#[test]
+fn theme_system_populates_every_colour_role_the_ui_reads() {
+    // MUST-DO 2. The silent failure this guards: an unset role is *not* a hole, it is
+    // silently filled from the `opencode` theme by `resolve_key`. The palette would
+    // still render, so no test that only asked "does it paint" would notice that part
+    // of the screen belongs to a different theme.
+    let registry = ThemeRegistry::new();
+    let definition = registry
+        .definition(SYSTEM_THEME)
+        .expect("`system` is a built-in");
+    let declared: BTreeSet<&str> = definition.keys().into_iter().collect();
+
+    for key in Palette::REQUIRED_KEYS
+        .iter()
+        .chain(Palette::OPTIONAL_KEYS.iter())
+    {
+        assert!(
+            declared.contains(key),
+            "`system` leaves {key:?} unset, so it would be filled from {DEFAULT_THEME:?} \
+             and that part of the screen would silently belong to another theme"
+        );
+    }
+
+    // Declared-keys plus an issue-free resolve is exactly sufficient: `resolve_key`
+    // pushes `MissingKey` precisely when a key is absent, so zero issues over the full
+    // 52-entry palette means no role was borrowed from anywhere.
+    for mode in [Mode::Dark, Mode::Light] {
+        let resolved = registry.resolve(SYSTEM_THEME, mode);
+        assert_eq!(
+            resolved.issues,
+            Vec::new(),
+            "a diagnostic in {mode:?} means a role fell back to {DEFAULT_THEME:?}"
+        );
+        assert_eq!(resolved.palette.entries().len(), 52);
+        assert!(resolved.palette.has_selected_list_item_text);
+    }
+}
+
+#[test]
+fn theme_a_misspelt_system_name_still_falls_back_with_a_diagnostic() {
+    // MUST-DO 3. `theme_unknown_name_falls_back_with_a_diagnostic` already guards the
+    // path for a name unlike anything shipped. This guards the near-miss, which is the
+    // risk adding a *new* name creates: a lookup loosened to case-insensitive or to
+    // prefix matching would make every spelling below resolve to `system` instead, and
+    // the user who typed it would never learn their config was wrong.
+    let registry = ThemeRegistry::new();
+    for misspelt in [
+        "systm", "System", "SYSTEM", "system ", " system", "systems", "sys",
+    ] {
+        assert!(
+            !registry.has(misspelt),
+            "{misspelt:?} must not resolve to the {SYSTEM_THEME:?} theme"
+        );
+        let resolved = registry.resolve(misspelt, Mode::Dark);
+        assert_eq!(resolved.name, DEFAULT_THEME);
+        assert_eq!(
+            resolved.issues,
+            vec![ThemeIssue::UnknownTheme {
+                requested: String::from(misspelt),
+            }]
+        );
+        assert!(
+            resolved.diagnostics()[0].contains(&format!("{misspelt:?}")),
+            "the diagnostic must quote what the user actually typed"
+        );
+    }
+}
+
+#[test]
+fn theme_system_keeps_every_surface_legible_and_bordered() {
+    // A theme that makes a border invisible is a defect, not a style. Every pair below
+    // is one the renderer actually puts next to each other: `views::surface` seats
+    // `text` on `backgroundPanel`, `views::element` seats it on `backgroundElement`,
+    // and `views::accent` draws the composer's `▌`/`▐` rules and the user message's
+    // frame in `borderActive` on `backgroundPanel`.
+    //
+    // The threshold is a luminance *difference* on the 0..255 scale `Rgba::luminance`
+    // returns, not a WCAG ratio, because that is the only contrast measure this crate
+    // already defines (`selected_foreground` compares against `0.5 * 255.0`).
+    let registry = ThemeRegistry::new();
+    for mode in [Mode::Dark, Mode::Light] {
+        let palette = registry.resolve(SYSTEM_THEME, mode).palette;
+        let gap = |a: Rgba, b: Rgba| (a.luminance() - b.luminance()).abs();
+
+        for (name, fg, bg, floor) in [
+            (
+                "text on panel",
+                palette.text,
+                palette.background_panel,
+                90.0,
+            ),
+            (
+                "text on element",
+                palette.text,
+                palette.background_element,
+                90.0,
+            ),
+            (
+                "muted text on panel",
+                palette.text_muted,
+                palette.background_panel,
+                40.0,
+            ),
+            (
+                "border on panel",
+                palette.border,
+                palette.background_panel,
+                12.0,
+            ),
+            (
+                "active border on panel",
+                palette.border_active,
+                palette.background_panel,
+                40.0,
+            ),
+            (
+                "subtle border on panel",
+                palette.border_subtle,
+                palette.background_panel,
+                6.0,
+            ),
+            (
+                "selected row text on primary",
+                selected_foreground(&palette, Some(palette.primary)),
+                palette.primary,
+                40.0,
+            ),
+            (
+                "accent on panel",
+                palette.accent,
+                palette.background_panel,
+                40.0,
+            ),
+            (
+                "error on panel",
+                palette.error,
+                palette.background_panel,
+                30.0,
+            ),
+            (
+                "warning on panel",
+                palette.warning,
+                palette.background_panel,
+                40.0,
+            ),
+            (
+                "success on panel",
+                palette.success,
+                palette.background_panel,
+                40.0,
+            ),
+            (
+                "link on panel",
+                palette.markdown_link,
+                palette.background_panel,
+                40.0,
+            ),
+        ] {
+            let measured = gap(fg, bg);
+            assert!(
+                measured >= floor,
+                "`system` in {mode:?}: {name} has a luminance gap of {measured:.1}, \
+                 under the {floor:.1} floor — {} on {}",
+                fg.to_hex(),
+                bg.to_hex()
+            );
+        }
+
+        // The base background is opaque on purpose, so the scrollbar track and the
+        // diff browser's selected row cannot paint a `Color::Reset` column beside an
+        // opaque panel. See `SYSTEM_THEME`'s own documentation.
+        assert_ne!(
+            palette.background.a, 0,
+            "a transparent base would reintroduce the colour seam in {mode:?}"
+        );
+        assert_ne!(Color::from(palette.background), Color::Reset);
+        assert!(
+            gap(palette.background, palette.background_panel) <= 20.0,
+            "the base and the panel must be one step apart, or the seam is merely \
+             recoloured rather than removed"
+        );
+    }
 }
 
 #[test]
@@ -860,17 +1084,21 @@ fn theme_config_key_accepts_the_system_value() {
     let config: TuiConfig = serde_json::from_str("{\"theme\": \"system\"}").expect("valid config");
     assert_eq!(config.theme(), Some(SYSTEM_THEME));
 
-    // Without a terminal: falls back, with a diagnostic, no panic.
-    let unavailable = registry.resolve_configured(config.theme(), Mode::Dark);
-    assert_eq!(unavailable.name, DEFAULT_THEME);
-    assert_eq!(unavailable.issues.len(), 1);
+    // Without a terminal: tier 2, the built-in asset. This used to be a fallback to
+    // `opencode` carrying one diagnostic; it is now a clean resolve of `system`
+    // itself, which is the whole point of shipping the asset.
+    let asset = registry.resolve_configured(config.theme(), Mode::Dark);
+    assert_eq!(asset.name, SYSTEM_THEME);
+    assert!(asset.issues.is_empty());
+    assert_eq!(registry.layer_of(SYSTEM_THEME), Some(ThemeLayer::Builtin));
 
-    // With one: the derived palette.
+    // With one: tier 1, the derived palette, under the same name.
     registry.refresh_system_theme(&FakePalette(Some(dark_terminal())), None, Mode::Dark);
     let derived = registry.resolve_configured(config.theme(), Mode::Dark);
     assert_eq!(derived.name, SYSTEM_THEME);
     assert!(derived.issues.is_empty());
-    assert_ne!(derived.palette, unavailable.palette);
+    assert_eq!(registry.layer_of(SYSTEM_THEME), Some(ThemeLayer::System));
+    assert_ne!(derived.palette, asset.palette);
 }
 
 #[test]
