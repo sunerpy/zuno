@@ -124,7 +124,7 @@ fn provider_config(
                 "name": "Test",
                 "id": "test",
                 "env": [],
-                "npm": "@ai-sdk/openai-compatible",
+                "transport": "openai-compatible",
                 "options": serde_json::Value::Object(options),
                 "models": {
                     "test-model": {

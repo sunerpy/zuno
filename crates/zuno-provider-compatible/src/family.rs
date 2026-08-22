@@ -17,27 +17,20 @@
 //! # The escape hatch, and why it is explicit
 //!
 //! Users legitimately point this profile at endpoints nobody has enumerated — a
-//! local llama.cpp server, a corporate gateway. The oracle admits those the same
-//! way: an arbitrary provider reaches `createOpenAICompatible` only because its
-//! catalog entry *declares* `npm: "@ai-sdk/openai-compatible"`
-//! (`packages/opencode/src/provider/provider.ts:108`, and the declaration is read
-//! at `:1485`, `:1198`). This module mirrors that: an unclaimed id is accepted
-//! when — and only when — the spec carries that declaration, via
-//! [`Spec::options`](zuno_llm::registry::Spec::options) key [`NPM_OPTION`]. Silence
-//! is never taken as consent.
+//! local llama.cpp server, a corporate gateway. An unclaimed id is accepted when
+//! and only when its resolved model selects the native `openai-compatible`
+//! transport, carried through [`Spec::options`](zuno_llm::registry::Spec::options)
+//! under [`TRANSPORT_OPTION`]. Silence is never taken as consent.
 
 use std::fmt;
 
 use zuno_llm::registry::{ApiSurface, Spec};
 
-/// The `provider.*.options` key that declares an unlisted id compatible.
-///
-/// Named after the oracle's own catalog field so a user copying a models.dev
-/// entry does not have to translate it.
-pub const NPM_OPTION: &str = "npm";
+/// Internal [`Spec::options`] key carrying the resolved native transport.
+pub const TRANSPORT_OPTION: &str = "transport";
 
-/// The value of [`NPM_OPTION`] this profile accepts as an opt-in.
-pub const OPENAI_COMPATIBLE_NPM: &str = "@ai-sdk/openai-compatible";
+/// The value of [`TRANSPORT_OPTION`] this profile accepts as an opt-in.
+pub const OPENAI_COMPATIBLE_TRANSPORT: &str = "openai-compatible";
 
 /// A provider family, as the workspace splits provider crates.
 ///
@@ -270,7 +263,7 @@ pub fn elsewhere(provider: &str) -> Option<Family> {
 /// # Errors
 ///
 /// Returns [`UnsupportedProvider`] when the id belongs to another family, or when
-/// it is unknown and the spec carries no [`NPM_OPTION`] declaration. Both cases
+/// it is unknown and the spec carries no [`TRANSPORT_OPTION`] declaration. Both cases
 /// render as "unsupported"; only the first can name a destination crate, and the
 /// error keeps that distinction as data rather than as prose.
 pub fn resolve(spec: &Spec) -> Result<Profile, UnsupportedProvider> {
@@ -295,9 +288,9 @@ pub fn resolve(spec: &Spec) -> Result<Profile, UnsupportedProvider> {
 /// Whether the spec declares this id OpenAI-compatible.
 fn declares_compatible(spec: &Spec) -> bool {
     spec.options
-        .get(NPM_OPTION)
+        .get(TRANSPORT_OPTION)
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|npm| npm == OPENAI_COMPATIBLE_NPM)
+        .is_some_and(|transport| transport == OPENAI_COMPATIBLE_TRANSPORT)
 }
 
 /// A profile for a declared-compatible id, which is not in the static table.
@@ -306,7 +299,7 @@ fn declares_compatible(spec: &Spec) -> bool {
 /// the default treatment, and the surface still travels on the spec.
 fn row_owned(_provider: &str) -> Profile {
     Profile {
-        provider: OPENAI_COMPATIBLE_NPM,
+        provider: OPENAI_COMPATIBLE_TRANSPORT,
         surface: SurfaceRule::Fixed(ApiSurface::Default),
         routes_upstreams: false,
     }
@@ -345,9 +338,9 @@ impl fmt::Display for UnsupportedProvider {
             None => write!(
                 formatter,
                 "no implemented provider family claims this id. If it really is an \
-                 OpenAI-compatible endpoint, declare it with \
-                 `provider.{}.options.{} = \"{}\"`; otherwise it belongs to one of {}",
-                self.provider, NPM_OPTION, OPENAI_COMPATIBLE_NPM, FamilyList,
+                 OpenAI-compatible endpoint, set \
+                 `provider.{}.transport = \"{}\"`; otherwise it belongs to one of {}",
+                self.provider, OPENAI_COMPATIBLE_TRANSPORT, FamilyList,
             ),
         }
     }
@@ -414,21 +407,20 @@ mod tests {
         assert_eq!(error.carried_by, None);
         let rendered = error.to_string();
         assert!(rendered.contains("unsupported"), "{rendered}");
-        assert!(rendered.contains(OPENAI_COMPATIBLE_NPM), "{rendered}");
+        assert!(rendered.contains(OPENAI_COMPATIBLE_TRANSPORT), "{rendered}");
     }
 
     #[test]
     fn an_unknown_id_that_declares_itself_compatible_is_accepted() {
-        let spec =
-            Spec::new("some-local-server").with_option(NPM_OPTION, json!(OPENAI_COMPATIBLE_NPM));
+        let spec = Spec::new("some-local-server")
+            .with_option(TRANSPORT_OPTION, json!(OPENAI_COMPATIBLE_TRANSPORT));
         let profile = resolve(&spec).expect("declared compatible");
         assert_eq!(profile.surface, SurfaceRule::Fixed(ApiSurface::Default));
     }
 
     #[test]
     fn a_declaration_naming_a_different_sdk_is_not_consent() {
-        let spec =
-            Spec::new("some-local-server").with_option(NPM_OPTION, json!("@ai-sdk/anthropic"));
+        let spec = Spec::new("some-local-server").with_option(TRANSPORT_OPTION, json!("anthropic"));
         assert!(resolve(&spec).is_err());
     }
 }

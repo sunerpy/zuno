@@ -56,7 +56,9 @@ The TUI favors dense, keyboard-first operation:
   and otherwise preserves the terminal's foreground and background defaults;
 - terminal-native mouse selection across the transcript, sidebar, and input by
   default; `mouse: true` in `tui.json` explicitly trades selection for TUI mouse
-  capture and click handling;
+  capture and click handling; native-selection mode enables terminal
+  alternate-scroll translation so wheel input scrolls a long transcript while
+  the composer is empty;
 - no empty LSP status or setup prompt; the sidebar adds LSP only for configured
   services or real diagnostics;
 - warning and error notices wrap inside the viewport and remain visible long

@@ -12,7 +12,7 @@
     "myopenai": {
       "name": "My OpenAI-compatible gateway",
       "id": "myopenai",
-      "npm": "@ai-sdk/openai-compatible",
+      "transport": "openai-compatible",
       "env": ["MYOPENAI_API_KEY"],
       "options": {
         "baseURL": "https://gateway.example.com/v1"
@@ -34,7 +34,7 @@
 }
 ```
 
-The `npm` value is protocol metadata retained in the model catalog. Zuno does not load that npm package or run TypeScript. `@ai-sdk/openai-compatible` selects Zuno's native OpenAI-compatible transport.
+`transport` names a native Rust implementation. It is optional for a custom provider because `openai-compatible` is the default; declare it when the endpoint uses another implemented protocol. Zuno does not load npm packages or run a TypeScript AI SDK.
 
 ## Setting credentials
 
@@ -61,11 +61,13 @@ The request path is native Rust:
 
 1. `zuno-config` parses and merges `provider.myopenai`.
 2. `zuno-llm` resolves the model catalog and builds a typed provider `Spec`.
-3. `zuno-cli` selects `zuno-provider-compatible` for `@ai-sdk/openai-compatible`.
+3. `zuno-cli` selects `zuno-provider-compatible` for the `openai-compatible` transport.
 4. `zuno-provider-compatible` builds Chat Completions or Responses JSON, applies model capabilities and provider options, then sends the request with `reqwest`.
 5. `zuno-llm` parses SSE framing and the provider crate translates chunks into shared stream events consumed by the engine.
 
-OpenAI's own `@ai-sdk/openai` catalog family is implemented by `zuno-provider-openai` and normally uses the Responses API. A custom `@ai-sdk/openai-compatible` provider defaults to `/chat/completions`; rule-driven providers may select `/responses`. Anthropic, Bedrock, and Google use separate native crates because their request and stream protocols are not OpenAI-compatible.
+The `openai` transport is implemented by `zuno-provider-openai` and normally uses the Responses API. A custom `openai-compatible` provider defaults to `/chat/completions`; rule-driven providers may select `/responses`. `anthropic`, `bedrock`, and the Google transports use separate native crates because their request and stream protocols are not OpenAI-compatible.
+
+Supported configuration values are `openai`, `openai-compatible`, `openrouter`, `anthropic`, `bedrock`, `bedrock-mantle`, `google`, `google-vertex`, and `google-vertex-anthropic`. The old `npm` key is not part of Zuno's schema.
 
 Important options include:
 

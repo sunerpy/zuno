@@ -308,7 +308,7 @@ fn an_unknown_provider_id_is_never_silently_attempted() {
     let chained = render_chain(&error);
     assert!(chained.contains("unsupported"), "{chained}");
     assert!(
-        chained.contains("@ai-sdk/openai-compatible"),
+        chained.contains(r#"transport = "openai-compatible""#),
         "the message must say how to opt in: {chained}"
     );
     assert_eq!(error.recovery(), Recovery::Fail);

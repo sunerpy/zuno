@@ -27,6 +27,7 @@
 //! does with it: `run` prints, the TUI folds the events into its component tree.
 //! That is the whole reason one driver can serve both.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
 use zuno_auth::Credential;
+use zuno_config::schema::provider::ProviderTransport;
 use zuno_engine::compaction::{CompactionState, TokenWindow};
 use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::driver::AgentDriver;
@@ -156,6 +158,14 @@ pub(crate) struct TurnPlan {
     /// Filled from [`Catalog::model_lines`], which is the same enumeration `zuno models`
     /// prints. One function, so the two surfaces cannot disagree again.
     catalog_models: Vec<String>,
+    /// Canonical reasoning levels the TUI may offer for each catalog model.
+    ///
+    /// A model that explicitly declares canonical variants contributes only those
+    /// variants. A model whose capability says it reasons but declares no variants
+    /// receives the provider-neutral scale. This keeps the picker and request builder
+    /// from treating an omitted capability flag as stronger evidence than explicit
+    /// per-level request options.
+    reasoning_efforts: BTreeMap<String, Vec<zuno_llm::effort::ReasoningEffort>>,
     /// Every discovered skill, shared by the prompt catalogue and the `skill` tool.
     ///
     /// One load, one [`Arc`], two consumers — because a tool answering from a second
@@ -253,14 +263,23 @@ impl TurnPlan {
             .or(config.model.as_deref());
         let (provider_id, model_id, catalog_model) =
             select_model(&catalog, requested_model, loaded.provenance())?;
-        if provider_factory_key(&catalog_model.provider_id, &catalog_model.api.npm).is_none() {
+        if provider_factory_key(catalog_model.api.transport).is_none() {
             return Err(format!(
-                "model {provider_id}/{model_id} uses unsupported transport {}",
-                catalog_model.api.npm
+                "model {provider_id}/{model_id} has no native provider transport"
             ));
         }
-        let reasoning_supported = catalog_model.capabilities.reasoning;
         let catalog_models = picker_model_ids(&catalog);
+        let reasoning_efforts = catalog_models
+            .iter()
+            .filter_map(|qualified| {
+                let (provider, model) = qualified.split_once('/')?;
+                let resolved = catalog.model(provider, model)?;
+                Some((qualified.clone(), selectable_reasoning_efforts(resolved)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let reasoning_supported = reasoning_efforts
+            .get(&format!("{provider_id}/{model_id}"))
+            .is_some_and(|levels| !levels.is_empty());
         let vision_available = catalog_models.iter().any(|line| {
             line.split_once('/').is_some_and(|(provider, model)| {
                 catalog
@@ -297,7 +316,6 @@ impl TurnPlan {
             wire_model: catalog_model.api.id.clone(),
             reasoning_options: session_reasoning_options(
                 turn_effort(options.effort, &agent, &provider_id, &model_id),
-                &provider_id,
                 catalog_model,
             ),
             spec: with_agent_options(model_spec(&catalog, catalog_model, env)?, &agent),
@@ -362,6 +380,7 @@ impl TurnPlan {
             window,
             notes,
             catalog_models,
+            reasoning_efforts,
             skills,
             instructions,
             delegation_facts,
@@ -405,6 +424,17 @@ impl TurnPlan {
     /// the cache and re-applying plugin extensions, and a picker must not do that.
     pub(crate) fn catalog_model_ids(&self) -> Vec<String> {
         self.catalog_models.clone()
+    }
+
+    /// Canonical reasoning levels the model picker may offer for `qualified`.
+    pub(crate) fn model_reasoning_efforts(
+        &self,
+        qualified: &str,
+    ) -> Vec<zuno_llm::effort::ReasoningEffort> {
+        self.reasoning_efforts
+            .get(qualified)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// `provider/model`, as resolved.
@@ -534,7 +564,7 @@ fn resolve_internals(
             return None;
         }
         let model = catalog.model(small_provider, small_model)?;
-        if provider_factory_key(&model.provider_id, &model.api.npm).is_none()
+        if provider_factory_key(model.api.transport).is_none()
             || model_spec(catalog, model, env).is_err()
         {
             notes.push(format!(
@@ -552,7 +582,7 @@ fn resolve_internals(
             ));
             return false;
         }
-        if provider_factory_key(&model.provider_id, &model.api.npm).is_none()
+        if provider_factory_key(model.api.transport).is_none()
             || model_spec(catalog, model, env).is_err()
         {
             notes.push(format!(
@@ -584,11 +614,11 @@ fn resolve_internals(
                     return None;
                 }
                 let model = catalog.model(chosen_provider, chosen_model)?;
-                if provider_factory_key(&model.provider_id, &model.api.npm).is_none() {
+                if provider_factory_key(model.api.transport).is_none() {
                     notes.push(format!(
-                        "{name}: `{}` uses transport {}, which this runtime has no \
-                         provider for; using `{provider_id}/{model_id}` instead",
-                        choice.model, model.api.npm
+                        "{name}: `{}` has no native provider transport; using \
+                         `{provider_id}/{model_id}` instead",
+                        choice.model
                     ));
                     return None;
                 }
@@ -2114,32 +2144,6 @@ fn select_model<'a>(
     Err(message)
 }
 
-/// Provider identities whose dedicated upstream SDK still speaks the compatible
-/// wire family implemented by `zuno-provider-compatible`.
-///
-/// This is intentionally a closed `(identity, transport)` table. Matching only
-/// the transport would admit an arbitrary provider id into a profile it did not
-/// claim; matching only the identity would turn a misspelled or future transport
-/// into an unsafe protocol guess. The generic compatible transport is the sole
-/// explicit opt-in for an unlisted identity.
-const COMPATIBLE_TRANSPORTS: &[(&str, &str)] = &[
-    ("alibaba", "@ai-sdk/alibaba"),
-    ("azure", "@ai-sdk/azure"),
-    ("cerebras", "@ai-sdk/cerebras"),
-    ("cohere", "@ai-sdk/cohere"),
-    ("deepinfra", "@ai-sdk/deepinfra"),
-    ("github-copilot", "@ai-sdk/github-copilot"),
-    ("gitlab", "gitlab-ai-provider"),
-    ("groq", "@ai-sdk/groq"),
-    ("mistral", "@ai-sdk/mistral"),
-    ("openrouter", "@openrouter/ai-sdk-provider"),
-    ("perplexity", "@ai-sdk/perplexity"),
-    ("togetherai", "@ai-sdk/togetherai"),
-    ("venice", "venice-ai-sdk-provider"),
-    ("vercel", "@ai-sdk/vercel"),
-    ("xai", "@ai-sdk/xai"),
-];
-
 /// Catalog facts for every reachable model, for [`zuno_tools::task::ProviderFacts`].
 ///
 /// Built here because this is where the catalog is already resolved, and keyed on the
@@ -2148,9 +2152,8 @@ const COMPATIBLE_TRANSPORTS: &[(&str, &str)] = &[
 ///
 /// Three of the four facts are read from the catalog: `reasoning` from the model's
 /// declared capability, `variants` from its declared variants, and `family` from the
-/// transport [`provider_factory_key`] already resolves — reused rather than
-/// re-switched on `api.npm`, so a transport added there cannot silently fall through
-/// to the wrong request shape here.
+/// transport [`provider_factory_key`] already resolves, so a transport added there
+/// cannot silently fall through to the wrong request shape here.
 ///
 /// `effort` is [`EffortCapabilities::default`], and that is a real limitation rather
 /// than a chosen value: nothing in the resolved catalog carries a model's adaptive or
@@ -2170,14 +2173,14 @@ fn delegation_facts(catalog: &Catalog) -> zuno_tools::task::FixedFacts {
         let Some(model) = catalog.model(provider_id, model_id) else {
             continue;
         };
-        let Some(family) = effort_family(provider_id, &model.api.npm) else {
+        let Some(family) = effort_family(model.api.transport) else {
             continue;
         };
         facts = facts.with(
             line.clone(),
             zuno_tools::task::ModelFacts {
                 family,
-                reasoning: model.capabilities.reasoning,
+                reasoning: !selectable_reasoning_efforts(model).is_empty(),
                 effort: zuno_llm::effort::EffortCapabilities::default(),
                 variants: model.variants.clone(),
             },
@@ -2188,41 +2191,33 @@ fn delegation_facts(catalog: &Catalog) -> zuno_tools::task::FixedFacts {
 
 /// Which request-shape family a transport's reasoning options belong to.
 ///
-/// Keyed off [`provider_factory_key`]'s answer rather than `npm` directly, so the two
-/// cannot disagree about what a transport is.
-fn effort_family(provider_id: &str, npm: &str) -> Option<zuno_llm::effort::ProviderFamily> {
+/// Keyed off the resolved native transport used by provider construction.
+fn effort_family(transport: Option<ProviderTransport>) -> Option<zuno_llm::effort::ProviderFamily> {
     use zuno_llm::effort::ProviderFamily;
-    let family = match provider_factory_key(provider_id, npm)? {
-        "anthropic" | "google-vertex/anthropic" => ProviderFamily::Anthropic,
-        "amazon-bedrock" | "amazon-bedrock/mantle" => ProviderFamily::Bedrock,
-        "google" | "google-vertex" => ProviderFamily::Google,
-        "openai" => ProviderFamily::OpenAi,
-        // Every remaining transport reaches a provider through the OpenAI-compatible
-        // factory, and OpenRouter is the one whose reasoning options differ from
-        // OpenAI's own — it nests them under `reasoning.effort`.
-        _ if npm == "@openrouter/ai-sdk-provider" => ProviderFamily::OpenRouter,
-        _ => ProviderFamily::OpenAi,
+    let family = match transport? {
+        ProviderTransport::Anthropic | ProviderTransport::GoogleVertexAnthropic => {
+            ProviderFamily::Anthropic
+        }
+        ProviderTransport::Bedrock | ProviderTransport::BedrockMantle => ProviderFamily::Bedrock,
+        ProviderTransport::Google | ProviderTransport::GoogleVertex => ProviderFamily::Google,
+        ProviderTransport::Openrouter => ProviderFamily::OpenRouter,
+        ProviderTransport::Openai | ProviderTransport::OpenaiCompatible => ProviderFamily::OpenAi,
     };
     Some(family)
 }
 
-fn provider_factory_key(provider_id: &str, npm: &str) -> Option<&'static str> {
-    match npm {
-        "@ai-sdk/anthropic" => Some("anthropic"),
-        "@ai-sdk/amazon-bedrock" => Some("amazon-bedrock"),
-        "@ai-sdk/amazon-bedrock/mantle" => Some("amazon-bedrock/mantle"),
-        "@ai-sdk/google" => Some("google"),
-        "@ai-sdk/google-vertex" => Some("google-vertex"),
-        "@ai-sdk/google-vertex/anthropic" => Some("google-vertex/anthropic"),
-        "@ai-sdk/openai" => Some("openai"),
-        "@ai-sdk/openai-compatible" => Some(COMPATIBLE_PROVIDER),
-        _ if COMPATIBLE_TRANSPORTS
-            .iter()
-            .any(|&(identity, transport)| identity == provider_id && transport == npm) =>
-        {
+fn provider_factory_key(transport: Option<ProviderTransport>) -> Option<&'static str> {
+    match transport? {
+        ProviderTransport::Anthropic => Some("anthropic"),
+        ProviderTransport::Bedrock => Some("amazon-bedrock"),
+        ProviderTransport::BedrockMantle => Some("amazon-bedrock/mantle"),
+        ProviderTransport::Google => Some("google"),
+        ProviderTransport::GoogleVertex => Some("google-vertex"),
+        ProviderTransport::GoogleVertexAnthropic => Some("google-vertex/anthropic"),
+        ProviderTransport::Openai => Some("openai"),
+        ProviderTransport::OpenaiCompatible | ProviderTransport::Openrouter => {
             Some(COMPATIBLE_PROVIDER)
         }
-        _ => None,
     }
 }
 
@@ -2481,7 +2476,7 @@ fn overlay(
 ///
 /// Upstream treats `model.api` as an SDK-shape hint: `:230-232` reads
 /// `model.api.endpoint` to choose `sdk.responses` over `sdk.chat`, and `:368` reads
-/// `model.api.npm` to pick a factory. Its `url` is the catalog's rung, which is why it
+/// `model.api.transport` to pick a factory. Its `url` is the catalog's rung, which is why it
 /// is last here rather than first. A provider configured the documented way — endpoint
 /// in `options.baseURL`, nothing top-level — carries no `api.url` at all.
 ///
@@ -2618,18 +2613,32 @@ fn model_spec(
     env: &zuno_paths::Env,
 ) -> Result<Spec, String> {
     let provider = catalog.provider(&model.provider_id);
+    let transport = model.api.transport.ok_or_else(|| {
+        format!(
+            "model `{}/{}` has no native provider transport",
+            model.provider_id, model.id
+        )
+    })?;
     let custom_openai =
-        model.api.npm == "@ai-sdk/openai" && provider_option_endpoint(provider).is_some();
+        transport == ProviderTransport::Openai && provider_option_endpoint(provider).is_some();
     let factory_key = if custom_openai {
         COMPATIBLE_PROVIDER
     } else {
-        provider_factory_key(&model.provider_id, &model.api.npm)
-            .ok_or_else(|| format!("unsupported provider transport `{}`", model.api.npm))?
+        provider_factory_key(Some(transport))
+            .ok_or_else(|| format!("unsupported provider transport `{transport}`"))?
     };
-    let surface = match model.api.npm.as_str() {
-        "@ai-sdk/anthropic" | "@ai-sdk/google-vertex/anthropic" => ApiSurface::Messages,
-        "@ai-sdk/openai" => openai_surface(provider, model),
-        "@ai-sdk/openai-compatible" | "@openrouter/ai-sdk-provider" => ApiSurface::Chat,
+    let surface = match transport {
+        ProviderTransport::Anthropic | ProviderTransport::GoogleVertexAnthropic => {
+            ApiSurface::Messages
+        }
+        ProviderTransport::Openai => openai_surface(provider, model),
+        // Keep the generic compatible transport unresolved here. The native
+        // compatible provider still has the provider id and model endpoint map, so
+        // its Rust profiles can select Azure, Copilot, or a declared Responses
+        // surface. `Default` becomes Chat only after those rules have had a chance
+        // to run.
+        ProviderTransport::OpenaiCompatible => ApiSurface::Default,
+        ProviderTransport::Openrouter => ApiSurface::Chat,
         _ => ApiSurface::Default,
     };
     let mut spec = Spec::new(&model.provider_id)
@@ -2681,17 +2690,12 @@ fn model_spec(
         spec = spec.with_option(generation::MAX_TOKENS, json!(output_ceiling(model)));
     }
     if factory_key == COMPATIBLE_PROVIDER {
-        // `family::resolve` accepts an unlisted identity only when its resolved
-        // catalog metadata explicitly declares the generic compatible SDK. The
-        // transport belongs to the model API, not the provider option bag, so
-        // carry it across this boundary rather than making the family guess.
+        // `family::resolve` accepts an unlisted identity only when its resolved model
+        // explicitly selects the generic compatible transport. Carry that typed
+        // decision across this boundary rather than making the family guess.
         spec = spec.with_option(
-            zuno_provider_compatible::family::NPM_OPTION,
-            json!(if custom_openai {
-                zuno_provider_compatible::family::OPENAI_COMPATIBLE_NPM
-            } else {
-                model.api.npm.as_str()
-            }),
+            zuno_provider_compatible::family::TRANSPORT_OPTION,
+            json!(ProviderTransport::OpenaiCompatible.as_str()),
         );
         if let Some(endpoint) = model.api.endpoint {
             spec = spec.with_option(
@@ -2794,6 +2798,32 @@ fn turn_effort(
     })
 }
 
+/// Canonical effort variants a model explicitly declares, weakest first.
+fn declared_reasoning_efforts(
+    model: &zuno_llm::catalog::ResolvedModel,
+) -> Vec<zuno_llm::effort::ReasoningEffort> {
+    zuno_llm::effort::ReasoningEffort::ALL
+        .into_iter()
+        .filter(|effort| model.variants.contains_key(effort.as_str()))
+        .collect()
+}
+
+/// Reasoning levels safe for an interactive selector to offer on `model`.
+///
+/// Explicit canonical variants are authoritative even when a custom provider omitted
+/// the coarse `reasoning` capability. When no variants are declared, a true capability
+/// means the provider-neutral scale is available through the generic mapping.
+fn selectable_reasoning_efforts(
+    model: &zuno_llm::catalog::ResolvedModel,
+) -> Vec<zuno_llm::effort::ReasoningEffort> {
+    let declared = declared_reasoning_efforts(model);
+    if declared.is_empty() && model.capabilities.reasoning {
+        zuno_llm::effort::ReasoningEffort::ALL.to_vec()
+    } else {
+        declared
+    }
+}
+
 /// The provider-native reasoning controls for `effort` on `model`, if any.
 ///
 /// Empty when the session chose no level, or when the catalog says the model does not
@@ -2808,13 +2838,15 @@ fn turn_effort(
 /// generic mapping.
 fn session_reasoning_options(
     effort: Option<zuno_llm::effort::ReasoningEffort>,
-    provider_id: &str,
     model: &zuno_llm::catalog::ResolvedModel,
 ) -> serde_json::Map<String, serde_json::Value> {
-    let Some(effort) = effort.filter(|_| model.capabilities.reasoning) else {
+    let declared_efforts = declared_reasoning_efforts(model);
+    let Some(effort) =
+        effort.filter(|effort| model.capabilities.reasoning || declared_efforts.contains(effort))
+    else {
         return serde_json::Map::new();
     };
-    let Some(family) = effort_family(provider_id, &model.api.npm) else {
+    let Some(family) = effort_family(model.api.transport) else {
         return serde_json::Map::new();
     };
     let mut declared = zuno_llm::effort::DeclaredVariants::new();

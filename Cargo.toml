@@ -130,6 +130,7 @@ tower-http = { version = "0.7.0", features = ["fs", "trace", "cors"] }
 # -- terminal UI ------------------------------------------------------------
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", features = ["serde"] }
+terminal-colorsaurus = "=1.0.3"
 # CommonMark parsing for the transcript's assistant bodies (plan §7.1). A *pull*
 # parser rather than an AST builder is what the renderer wants: the events arrive
 # in document order, so a body becomes rows in one pass with no intermediate tree

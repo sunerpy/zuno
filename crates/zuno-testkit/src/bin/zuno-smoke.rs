@@ -424,7 +424,7 @@ fn provider_config(base_url: &str) -> String {
                 "name": "Test",
                 "id": "test",
                 "env": [],
-                "npm": "@ai-sdk/openai-compatible",
+                "transport": "openai-compatible",
                 "api": format!("{base_url}/v1"),
                 "models": {
                     "test-model": {

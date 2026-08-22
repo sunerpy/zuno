@@ -90,8 +90,8 @@ fn provider_config(api: Option<&str>, endpoint: Option<&str>, base_url: Option<&
     provider.insert("id".to_owned(), serde_json::json!("test"));
     provider.insert("env".to_owned(), serde_json::json!([]));
     provider.insert(
-        "npm".to_owned(),
-        serde_json::json!("@ai-sdk/openai-compatible"),
+        "transport".to_owned(),
+        serde_json::json!("openai-compatible"),
     );
     if let Some(api) = api {
         provider.insert("api".to_owned(), serde_json::json!(api));

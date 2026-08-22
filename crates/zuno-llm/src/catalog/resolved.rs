@@ -1,17 +1,14 @@
 //! The resolved catalog: what a model looks like after models.dev, config, env
 //! and auth have all had their say.
 //!
-//! These are ports of `Provider.Info` and `Provider.Model`
-//! (`packages/opencode/src/provider/provider.ts:1036-1062`), which is the shape
-//! `opencode models --verbose` prints and therefore the shape every consumer
-//! downstream of this crate — the picker, the agent model policy, each provider
-//! family — reads. Two things are worth naming about it:
+//! These are the model facts every downstream consumer reads: the picker, agent
+//! model policy, and each provider family.
 //!
-//! - **`api` is resolved transport metadata, not the catalog's optionals.** The catalog has
-//!   an optional provider-level `api`/`npm` and an optional per-model override;
-//!   by the time a model reaches a provider crate the choice is already made and
-//!   `api.id`/`api.npm`/`api.url` are populated. A plugin-advertised endpoint stays
-//!   optional because the model-id rule remains the fallback when it is absent.
+//! - **`api` is resolved native transport metadata, not the external catalog's
+//!   optionals.** models.dev package names are translated while importing the
+//!   catalog. By the time a model reaches a provider crate, `api.id`,
+//!   `api.transport`, and `api.url` are populated without exposing a JavaScript
+//!   package as a runtime choice.
 //! - **`capabilities` is booleans, not the catalog's arrays.** `modalities.input`
 //!   is a list upstream and five flags here, because that is what the oracle
 //!   flattens it to (`provider.ts:1465-1481`) and what a caller actually asks.
@@ -19,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use zuno_config::schema::provider::ProviderTransport;
 
 use crate::catalog::availability::Availability;
 use crate::catalog::models_dev::{CatalogStatus, Interleaved};
@@ -60,7 +58,7 @@ pub struct ResolvedModel {
     pub release_date: String,
     /// Lifecycle status, defaulted to [`CatalogStatus::Active`].
     pub status: CatalogStatus,
-    /// Resolved transport metadata: wire id, npm package, base URL and endpoint hint.
+    /// Resolved transport metadata: wire id, native transport, base URL and endpoint hint.
     pub api: ModelApi,
     /// Flattened capability flags.
     pub capabilities: ModelCapabilities,
@@ -82,8 +80,9 @@ pub struct ResolvedModel {
 pub struct ModelApi {
     /// The id to put on the wire.
     pub id: String,
-    /// The npm package whose factory speaks this model's protocol.
-    pub npm: String,
+    /// Native provider transport, or `None` when an external catalog entry names
+    /// a protocol this build does not implement.
+    pub transport: Option<ProviderTransport>,
     /// The base URL, possibly containing `${VAR}` placeholders.
     pub url: String,
     /// A model-advertised SDK surface, when its provider reports one.

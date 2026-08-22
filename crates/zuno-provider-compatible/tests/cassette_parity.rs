@@ -434,8 +434,8 @@ async fn the_canonical_openai_chat_shape_parses_under_a_declared_compatible_id()
     let spec = Spec::new("my-openai-proxy")
         .with_base_url("https://api.openai.com/v1")
         .with_option(
-            zuno_provider_compatible::family::NPM_OPTION,
-            serde_json::json!(zuno_provider_compatible::family::OPENAI_COMPATIBLE_NPM),
+            zuno_provider_compatible::family::TRANSPORT_OPTION,
+            serde_json::json!(zuno_provider_compatible::family::OPENAI_COMPATIBLE_TRANSPORT),
         );
     let provider = CompatibleProvider::new(
         spec,

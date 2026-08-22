@@ -56,9 +56,9 @@ pub const USE_COMPLETION_URLS_OPTION: &str = "useCompletionUrls";
 
 /// The `provider.*.options` key declaring which surfaces an endpoint exposes.
 ///
-/// An array of `"chat"`, `"responses"`, `"messages"`. The oracle reads this from
-/// the shape of an npm package, which a Rust process cannot introspect, so it
-/// becomes declared configuration with a documented default per rule.
+/// An array of `"chat"`, `"responses"`, `"messages"`. A Rust provider cannot
+/// introspect a remote endpoint, so this is declared configuration with a
+/// documented default per rule.
 pub const SURFACES_OPTION: &str = "surfaces";
 
 /// The `provider.*.options` key declaring a model's own endpoint.

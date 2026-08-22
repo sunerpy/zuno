@@ -1102,7 +1102,7 @@
               "type": "null"
             }
           ],
-          "description": "The npm package and API endpoint backing this model."
+          "description": "The native transport and API endpoint backing this model."
         },
         "reasoning": {
           "description": "Whether the model reasons.",
@@ -1295,7 +1295,8 @@
       "type": "object"
     },
     "ModelProvider": {
-      "description": "The npm package and API endpoint backing a single model\n(`config/provider.ts:64-66`).",
+      "additionalProperties": false,
+      "description": "The native transport and API endpoint backing a single model.",
       "properties": {
         "api": {
           "description": "API endpoint.",
@@ -1304,12 +1305,16 @@
             "null"
           ]
         },
-        "npm": {
-          "description": "npm package implementing the provider.",
-          "type": [
-            "string",
-            "null"
-          ]
+        "transport": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderTransport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native request transport implemented by Zuno."
         }
       },
       "type": "object"
@@ -1524,6 +1529,7 @@
       "type": "object"
     },
     "ProviderConfig": {
+      "additionalProperties": false,
       "description": "One entry of the `provider` map (`config/provider.ts:82-126`).",
       "properties": {
         "api": {
@@ -1578,13 +1584,6 @@
             "null"
           ]
         },
-        "npm": {
-          "description": "npm package implementing the provider.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "options": {
           "anyOf": [
             {
@@ -1595,6 +1594,17 @@
             }
           ],
           "description": "Provider-level options, including SDK options this schema does not name."
+        },
+        "transport": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderTransport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native request transport implemented by Zuno."
         },
         "whitelist": {
           "description": "Models to keep, to the exclusion of the rest.",
@@ -1674,6 +1684,56 @@
         }
       },
       "type": "object"
+    },
+    "ProviderTransport": {
+      "description": "Native provider transports implemented by the Rust workspace.",
+      "oneOf": [
+        {
+          "const": "anthropic",
+          "description": "Anthropic Messages.",
+          "type": "string"
+        },
+        {
+          "const": "bedrock",
+          "description": "AWS Bedrock Converse/Invoke transport.",
+          "type": "string"
+        },
+        {
+          "const": "bedrock-mantle",
+          "description": "Bedrock through the Mantle OpenAI-compatible endpoint.",
+          "type": "string"
+        },
+        {
+          "const": "google",
+          "description": "Google Generative AI.",
+          "type": "string"
+        },
+        {
+          "const": "google-vertex",
+          "description": "Google Vertex Gemini.",
+          "type": "string"
+        },
+        {
+          "const": "google-vertex-anthropic",
+          "description": "Anthropic Messages through Google Vertex.",
+          "type": "string"
+        },
+        {
+          "const": "openai",
+          "description": "OpenAI native Responses/Chat transport.",
+          "type": "string"
+        },
+        {
+          "const": "openai-compatible",
+          "description": "Generic OpenAI-compatible Chat/Responses transport.",
+          "type": "string"
+        },
+        {
+          "const": "openrouter",
+          "description": "OpenRouter's OpenAI-compatible transport and reasoning options.",
+          "type": "string"
+        }
+      ]
     },
     "ReferenceEntry": {
       "anyOf": [

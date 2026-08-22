@@ -81,7 +81,7 @@ async fn a_config_only_provider_resolves_with_no_cache_and_no_network() {
     let source = source_in(temp.path(), &[(ZUNO_DISABLE_MODELS_FETCH, "1")]);
     let config: Config = serde_json::from_str(
         r#"{"provider":{"test":{"name":"Test","id":"test","env":[],
-             "npm":"@ai-sdk/openai-compatible","api":"https://gateway.internal/v1",
+             "transport":"openai-compatible","api":"https://gateway.internal/v1",
              "models":{"test-model":{"id":"test-model","name":"Test Model",
                "tool_call":true,"limit":{"context":100000,"output":10000},
                "cost":{"input":0,"output":0}}},

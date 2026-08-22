@@ -92,6 +92,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             reasoning_options: serde_json::Map::new(),
         },
         catalog_models: Vec::new(),
+        reasoning_efforts: std::collections::BTreeMap::new(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
         instructions: zuno_config::LoadedInstructions::default(),
         delegation_facts: Arc::new(zuno_tools::task::FixedFacts::new()),
@@ -445,64 +446,53 @@ fn model_selection_splits_only_the_provider_prefix() {
 #[test]
 fn every_declared_wire_transport_selects_its_production_registry_key() {
     let cases = [
-        ("anthropic", "@ai-sdk/anthropic", "anthropic"),
-        ("amazon-bedrock", "@ai-sdk/amazon-bedrock", "amazon-bedrock"),
+        (ProviderTransport::Anthropic, "anthropic"),
+        (ProviderTransport::Bedrock, "amazon-bedrock"),
+        (ProviderTransport::BedrockMantle, "amazon-bedrock/mantle"),
+        (ProviderTransport::Google, "google"),
+        (ProviderTransport::GoogleVertex, "google-vertex"),
         (
-            "amazon-bedrock/mantle",
-            "@ai-sdk/amazon-bedrock/mantle",
-            "amazon-bedrock/mantle",
-        ),
-        ("google", "@ai-sdk/google", "google"),
-        ("google-vertex", "@ai-sdk/google-vertex", "google-vertex"),
-        (
-            "google-vertex/anthropic",
-            "@ai-sdk/google-vertex/anthropic",
+            ProviderTransport::GoogleVertexAnthropic,
             "google-vertex/anthropic",
         ),
-        ("openai", "@ai-sdk/openai", "openai"),
-        (
-            "private-gateway",
-            "@ai-sdk/openai-compatible",
-            COMPATIBLE_PROVIDER,
-        ),
+        (ProviderTransport::Openai, "openai"),
+        (ProviderTransport::OpenaiCompatible, COMPATIBLE_PROVIDER),
+        (ProviderTransport::Openrouter, COMPATIBLE_PROVIDER),
     ];
 
-    for (provider_id, npm, expected) in cases {
+    for (transport, expected) in cases {
         assert_eq!(
-            provider_factory_key(provider_id, npm),
+            provider_factory_key(Some(transport)),
             Some(expected),
-            "resolved npm metadata `{npm}` selected the wrong production factory"
+            "resolved native transport `{transport}` selected the wrong production factory"
         );
     }
-    assert_eq!(
-        provider_factory_key("unknown", "@ai-sdk/not-implemented"),
-        None
-    );
+    assert_eq!(provider_factory_key(None), None);
 }
 
-fn named_compatible_cases() -> [(&'static str, &'static str); 15] {
+fn named_compatible_cases() -> [(&'static str, ProviderTransport); 15] {
     [
-        ("openrouter", "@openrouter/ai-sdk-provider"),
-        ("xai", "@ai-sdk/xai"),
-        ("mistral", "@ai-sdk/mistral"),
-        ("groq", "@ai-sdk/groq"),
-        ("deepinfra", "@ai-sdk/deepinfra"),
-        ("cerebras", "@ai-sdk/cerebras"),
-        ("cohere", "@ai-sdk/cohere"),
-        ("togetherai", "@ai-sdk/togetherai"),
-        ("perplexity", "@ai-sdk/perplexity"),
-        ("vercel", "@ai-sdk/vercel"),
-        ("alibaba", "@ai-sdk/alibaba"),
-        ("gitlab", "gitlab-ai-provider"),
-        ("venice", "venice-ai-sdk-provider"),
-        ("azure", "@ai-sdk/azure"),
-        ("github-copilot", "@ai-sdk/github-copilot"),
+        ("openrouter", ProviderTransport::Openrouter),
+        ("xai", ProviderTransport::OpenaiCompatible),
+        ("mistral", ProviderTransport::OpenaiCompatible),
+        ("groq", ProviderTransport::OpenaiCompatible),
+        ("deepinfra", ProviderTransport::OpenaiCompatible),
+        ("cerebras", ProviderTransport::OpenaiCompatible),
+        ("cohere", ProviderTransport::OpenaiCompatible),
+        ("togetherai", ProviderTransport::OpenaiCompatible),
+        ("perplexity", ProviderTransport::OpenaiCompatible),
+        ("vercel", ProviderTransport::OpenaiCompatible),
+        ("alibaba", ProviderTransport::OpenaiCompatible),
+        ("gitlab", ProviderTransport::OpenaiCompatible),
+        ("venice", ProviderTransport::OpenaiCompatible),
+        ("azure", ProviderTransport::OpenaiCompatible),
+        ("github-copilot", ProviderTransport::OpenaiCompatible),
     ]
 }
 
 fn production_wire_spec_result(
     provider_id: &str,
-    npm: &str,
+    transport: ProviderTransport,
     model_id: &str,
     endpoint: &str,
     extra_options: serde_json::Value,
@@ -528,7 +518,7 @@ fn production_wire_spec_result(
             "id": provider_id,
             "name": "Production wire replay",
             "env": [],
-            "npm": npm,
+            "transport": transport,
             "options": serde_json::Value::Object(options),
             "models": serde_json::Value::Object(models)
         }),
@@ -549,12 +539,12 @@ fn production_wire_spec_result(
 
 fn production_wire_spec(
     provider_id: &str,
-    npm: &str,
+    transport: ProviderTransport,
     model_id: &str,
     endpoint: &str,
     extra_options: serde_json::Value,
 ) -> Spec {
-    production_wire_spec_result(provider_id, npm, model_id, endpoint, extra_options)
+    production_wire_spec_result(provider_id, transport, model_id, endpoint, extra_options)
         .expect("production replay spec resolves")
 }
 
@@ -577,7 +567,7 @@ fn openai_wire_spec(
     provider.insert("id".to_owned(), serde_json::json!(provider_id));
     provider.insert("name".to_owned(), serde_json::json!("OpenAI wire replay"));
     provider.insert("env".to_owned(), serde_json::json!([]));
-    provider.insert("npm".to_owned(), serde_json::json!("@ai-sdk/openai"));
+    provider.insert("transport".to_owned(), serde_json::json!("openai"));
     provider.insert(
         "models".to_owned(),
         serde_json::json!({
@@ -676,7 +666,12 @@ fn plugin_resolved_wire_spec(
     model_spec(&catalog, model, &Env::empty()).expect("plugin-provided Copilot spec resolves")
 }
 
-fn pinned_wire_spec(provider_id: &str, model_id: &str, endpoint: &str, expected_npm: &str) -> Spec {
+fn pinned_wire_spec(
+    provider_id: &str,
+    model_id: &str,
+    endpoint: &str,
+    expected_transport: ProviderTransport,
+) -> Spec {
     let document: zuno_llm::catalog::models_dev::CatalogDocument = serde_json::from_str(
         include_str!("../../../zuno-llm/tests/fixtures/models-dev-pinned.json"),
     )
@@ -694,7 +689,7 @@ fn pinned_wire_spec(provider_id: &str, model_id: &str, endpoint: &str, expected_
     let model = catalog
         .model(provider_id, model_id)
         .expect("pinned provider model resolves");
-    assert_eq!(model.api.npm, expected_npm);
+    assert_eq!(model.api.transport, Some(expected_transport));
     model_spec(&catalog, model, &Env::empty()).expect("pinned provider spec resolves")
 }
 
@@ -844,7 +839,7 @@ where
 
 struct RegistrationCase<'a> {
     registry_key: &'a str,
-    npm: &'a str,
+    transport: ProviderTransport,
     model_id: &'a str,
     cassette: &'a str,
     extra_options: serde_json::Value,
@@ -856,7 +851,7 @@ struct RegistrationCase<'a> {
 async fn replay_production_registration(case: RegistrationCase<'_>) {
     let RegistrationCase {
         registry_key,
-        npm,
+        transport,
         model_id,
         cassette,
         extra_options,
@@ -879,7 +874,7 @@ async fn replay_production_registration(case: RegistrationCase<'_>) {
             expected_body_key,
             expected_text,
         },
-        |endpoint| production_wire_spec(provider_id, npm, model_id, endpoint, extra_options),
+        |endpoint| production_wire_spec(provider_id, transport, model_id, endpoint, extra_options),
     )
     .await;
 }
@@ -888,7 +883,7 @@ async fn replay_production_registration(case: RegistrationCase<'_>) {
 async fn production_compatible_registration_dispatches_and_decodes_recorded_sse() {
     replay_production_registration(RegistrationCase {
         registry_key: COMPATIBLE_PROVIDER,
-        npm: "@ai-sdk/openai-compatible",
+        transport: ProviderTransport::OpenaiCompatible,
         model_id: "deepseek-chat",
         cassette: "openai-compatible-chat/deepseek-streams-text",
         extra_options: serde_json::json!({}),
@@ -901,10 +896,10 @@ async fn production_compatible_registration_dispatches_and_decodes_recorded_sse(
 
 #[test]
 fn every_todo_94_identity_reaches_its_profile_from_resolved_config() {
-    for (provider_id, npm) in named_compatible_cases() {
+    for (provider_id, transport) in named_compatible_cases() {
         let spec = production_wire_spec(
             provider_id,
-            npm,
+            transport,
             "selection-probe",
             "https://selection.test/v1",
             serde_json::json!({}),
@@ -930,15 +925,16 @@ fn every_todo_94_identity_reaches_its_profile_from_resolved_config() {
 
 #[test]
 fn an_unknown_transport_is_refused_from_resolved_config() {
-    let error = production_wire_spec_result(
-        "unknown-provider",
-        "@ai-sdk/not-implemented",
-        "unknown-model",
-        "https://unknown.test/v1",
-        serde_json::json!({}),
-    )
-    .expect_err("unknown transports must not fall through to the compatible factory");
-    assert!(error.contains("@ai-sdk/not-implemented"), "{error}");
+    let error = serde_json::from_value::<zuno_config::schema::Config>(serde_json::json!({
+        "provider": {
+            "unknown-provider": {
+                "transport": "not-implemented",
+                "models": {"unknown-model": {}}
+            }
+        }
+    }))
+    .expect_err("unknown transports must fail at the config boundary");
+    assert!(error.to_string().contains("not-implemented"), "{error}");
 }
 
 #[tokio::test]
@@ -956,7 +952,7 @@ async fn production_openrouter_keeps_router_identity_and_dispatches_recorded_sse
         |endpoint| {
             production_wire_spec(
                 "openrouter",
-                "@openrouter/ai-sdk-provider",
+                ProviderTransport::Openrouter,
                 "openai/gpt-4o-mini",
                 endpoint,
                 serde_json::json!({}),
@@ -981,7 +977,7 @@ async fn production_azure_selector_dispatches_to_responses() {
         |endpoint| {
             production_wire_spec(
                 "azure",
-                "@ai-sdk/azure",
+                ProviderTransport::OpenaiCompatible,
                 "deployment-a",
                 endpoint,
                 serde_json::json!({}),
@@ -1020,7 +1016,7 @@ async fn production_copilot_rule_dispatches_by_model_id() {
             |endpoint| {
                 production_wire_spec(
                     "github-copilot",
-                    "@ai-sdk/github-copilot",
+                    ProviderTransport::OpenaiCompatible,
                     model_id,
                     endpoint,
                     serde_json::json!({}),
@@ -1084,7 +1080,14 @@ async fn pinned_groq_transport_selects_compatible_factory_and_dispatches() {
             expected_body_key: "messages",
             expected_text: "Hello!",
         },
-        |endpoint| pinned_wire_spec("groq", "allam-2-7b", endpoint, "@ai-sdk/groq"),
+        |endpoint| {
+            pinned_wire_spec(
+                "groq",
+                "allam-2-7b",
+                endpoint,
+                ProviderTransport::OpenaiCompatible,
+            )
+        },
     )
     .await;
 }
@@ -1101,7 +1104,14 @@ async fn pinned_mistral_transport_selects_compatible_factory_and_dispatches() {
             expected_body_key: "messages",
             expected_text: "Hello!",
         },
-        |endpoint| pinned_wire_spec("mistral", "codestral-latest", endpoint, "@ai-sdk/mistral"),
+        |endpoint| {
+            pinned_wire_spec(
+                "mistral",
+                "codestral-latest",
+                endpoint,
+                ProviderTransport::OpenaiCompatible,
+            )
+        },
     )
     .await;
 }
@@ -1110,7 +1120,7 @@ async fn pinned_mistral_transport_selects_compatible_factory_and_dispatches() {
 async fn production_anthropic_registration_dispatches_and_decodes_recorded_sse() {
     replay_production_registration(RegistrationCase {
         registry_key: "anthropic",
-        npm: "@ai-sdk/anthropic",
+        transport: ProviderTransport::Anthropic,
         model_id: "claude-haiku-4-5-20251001",
         cassette: "anthropic-messages/streams-text",
         extra_options: serde_json::json!({"maxTokens": 20, "promptCache": false}),
@@ -1234,7 +1244,7 @@ async fn production_catalog_native_openai_honors_advertised_chat() {
 async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventstream() {
     replay_production_registration(RegistrationCase {
         registry_key: "amazon-bedrock",
-        npm: "@ai-sdk/amazon-bedrock",
+        transport: ProviderTransport::Bedrock,
         model_id: "us.amazon.nova-micro-v1:0",
         cassette: "bedrock-converse/streams-text",
         extra_options: serde_json::json!({
@@ -1253,7 +1263,7 @@ async fn production_bedrock_registration_dispatches_and_decodes_recorded_eventst
 async fn production_bedrock_mantle_registration_dispatches_and_decodes_recorded_eventstream() {
     replay_production_registration(RegistrationCase {
         registry_key: "amazon-bedrock/mantle",
-        npm: "@ai-sdk/amazon-bedrock/mantle",
+        transport: ProviderTransport::BedrockMantle,
         model_id: "openai.gpt-oss-120b",
         cassette: "bedrock-converse/streams-text",
         extra_options: serde_json::json!({
@@ -1272,7 +1282,7 @@ async fn production_bedrock_mantle_registration_dispatches_and_decodes_recorded_
 async fn production_google_registration_dispatches_and_decodes_recorded_gemini_sse() {
     replay_production_registration(RegistrationCase {
         registry_key: "google",
-        npm: "@ai-sdk/google",
+        transport: ProviderTransport::Google,
         model_id: "gemini-2.5-flash",
         cassette: "gemini/streams-text",
         extra_options: serde_json::json!({}),
@@ -1287,7 +1297,7 @@ async fn production_google_registration_dispatches_and_decodes_recorded_gemini_s
 async fn production_vertex_gemini_registration_dispatches_and_decodes_recorded_gemini_sse() {
     replay_production_registration(RegistrationCase {
         registry_key: "google-vertex",
-        npm: "@ai-sdk/google-vertex",
+        transport: ProviderTransport::GoogleVertex,
         model_id: "gemini-2.5-flash",
         cassette: "gemini/streams-text",
         extra_options: serde_json::json!({"project": "project-a", "location": "us-central1"}),
@@ -1302,7 +1312,7 @@ async fn production_vertex_gemini_registration_dispatches_and_decodes_recorded_g
 async fn production_vertex_anthropic_registration_dispatches_and_decodes_recorded_anthropic_sse() {
     replay_production_registration(RegistrationCase {
         registry_key: "google-vertex/anthropic",
-        npm: "@ai-sdk/google-vertex/anthropic",
+        transport: ProviderTransport::GoogleVertexAnthropic,
         model_id: "claude-haiku-4-5-20251001",
         cassette: "anthropic-messages/streams-text",
         extra_options: serde_json::json!({
@@ -1330,7 +1340,7 @@ fn forbidden_fetch() -> CatalogProvenance {
 fn self_specified_config() -> zuno_config::schema::Config {
     serde_json::from_str(
         r#"{"provider":{"private":{"name":"Private","id":"private","env":[],
-             "npm":"@ai-sdk/openai-compatible","api":"https://gateway.internal/v1",
+             "transport":"openai-compatible","api":"https://gateway.internal/v1",
              "models":{"house-model":{"id":"house-model","name":"House Model",
                "tool_call":true,"limit":{"context":100000,"output":10000},
                "cost":{"input":0,"output":0}}},
@@ -1357,7 +1367,7 @@ fn a_config_specified_model_selects_with_no_catalog_at_all() {
     assert_eq!(model, "house-model");
     assert_eq!(resolved.api.url, "https://gateway.internal/v1");
     assert!(
-        provider_factory_key(&resolved.provider_id, &resolved.api.npm).is_some(),
+        provider_factory_key(resolved.api.transport).is_some(),
         "the config's transport must survive resolution or the turn is refused later"
     );
 }
@@ -1717,8 +1727,8 @@ fn endpoint_catalog(api: Option<&str>, endpoint: Option<&str>, base_url: Option<
     }
     let mut provider = serde_json::Map::new();
     provider.insert(
-        "npm".to_owned(),
-        serde_json::json!("@ai-sdk/openai-compatible"),
+        "transport".to_owned(),
+        serde_json::json!("openai-compatible"),
     );
     if let Some(api) = api {
         provider.insert("api".to_owned(), serde_json::json!(api));
@@ -3839,7 +3849,7 @@ fn generation_catalog(
                 "id": "stub",
                 "name": "Generation fixture",
                 "env": [],
-                "npm": "@ai-sdk/openai-compatible",
+                "transport": "openai-compatible",
                 "options": provider_options,
                 "models": { model_id: serde_json::Value::Object(model) },
             }
@@ -3850,6 +3860,61 @@ fn generation_catalog(
         &zuno_llm::catalog::models_dev::CatalogDocument::new(),
         &ResolveInput::new().with_config(&config),
     )
+}
+
+#[test]
+fn declared_reasoning_variants_enable_selection_without_a_coarse_capability_flag() {
+    let model_id = "us.anthropic.claude-opus-5";
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "myopenai": {
+                "name": "My OpenAI",
+                "transport": "openai-compatible",
+                "options": {"baseURL": "https://gateway.example/v1"},
+                "models": {
+                    model_id: {
+                        "name": "Claude Opus 5",
+                        "variants": {
+                            "low": {"reasoningEffort": "low"},
+                            "medium": {"reasoningEffort": "medium"},
+                            "high": {"reasoningEffort": "high"},
+                            "xhigh": {"reasoningEffort": "xhigh"},
+                            "max": {"reasoningEffort": "max"}
+                        }
+                    }
+                }
+            }
+        }
+    }))
+    .expect("the user-shaped provider config parses");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let model = catalog
+        .model("myopenai", model_id)
+        .expect("the configured model resolves");
+
+    assert!(
+        !model.capabilities.reasoning,
+        "the fixture must reproduce the omitted coarse capability"
+    );
+    assert_eq!(
+        selectable_reasoning_efforts(model),
+        vec![
+            zuno_llm::effort::ReasoningEffort::Low,
+            zuno_llm::effort::ReasoningEffort::Medium,
+            zuno_llm::effort::ReasoningEffort::High,
+            zuno_llm::effort::ReasoningEffort::Xhigh,
+            zuno_llm::effort::ReasoningEffort::Max,
+        ]
+    );
+    assert_eq!(
+        session_reasoning_options(Some(zuno_llm::effort::ReasoningEffort::Xhigh), model)
+            .get("reasoningEffort"),
+        Some(&serde_json::json!("xhigh")),
+        "an explicitly declared level must reach the native provider request"
+    );
 }
 
 /// One agent from user-shaped config, through the real deserializer and merge.
@@ -3907,7 +3972,7 @@ fn generation_body(
         parameters: serde_json::json!({"type": "object", "properties": {}}),
     }]);
     request.parameters =
-        session_reasoning_options(turn_effort(None, agent, "stub", model_id), "stub", model);
+        session_reasoning_options(turn_effort(None, agent, "stub", model_id), model);
     provider.body_for(&request)
 }
 

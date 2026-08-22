@@ -13,8 +13,8 @@ expression: "theme_sample(&registry, name, Mode::Dark)"
 "text                      " fg=#e6e6e6 bg=reset mod=NONE
 "textMuted                 " fg=#9a9a9a bg=reset mod=NONE
 "background                " fg=reset bg=reset mod=NONE
-"backgroundPanel           " fg=reset bg=reset mod=NONE
-"backgroundElement         " fg=reset bg=reset mod=NONE
+"backgroundPanel           " fg=#242830 bg=reset mod=NONE
+"backgroundElement         " fg=#3a414c bg=reset mod=NONE
 "border                    " fg=#4d4d4d bg=reset mod=NONE
 "borderActive              " fg=#7a7a7a bg=reset mod=NONE
 "borderSubtle              " fg=#303030 bg=reset mod=NONE
@@ -26,7 +26,7 @@ expression: "theme_sample(&registry, name, Mode::Dark)"
 "diffHighlightRemoved      " fg=#ff0000 bg=reset mod=NONE
 "diffAddedBg               " fg=#12261a bg=reset mod=NONE
 "diffRemovedBg             " fg=#2a1416 bg=reset mod=NONE
-"diffContextBg             " fg=reset bg=reset mod=NONE
+"diffContextBg             " fg=#242830 bg=reset mod=NONE
 "diffLineNumber            " fg=#9a9a9a bg=reset mod=NONE
 "diffAddedLineNumberBg     " fg=#1a3324 bg=reset mod=NONE
 "diffRemovedLineNumberBg   " fg=#3a1c1f bg=reset mod=NONE
@@ -54,6 +54,6 @@ expression: "theme_sample(&registry, name, Mode::Dark)"
 "syntaxOperator            " fg=#00ffff bg=reset mod=NONE
 "syntaxPunctuation         " fg=#e6e6e6 bg=reset mod=NONE
 "selectedListItemText      " fg=#0d0d0d bg=reset mod=NONE
-"backgroundMenu            " fg=reset bg=reset mod=NONE
+"backgroundMenu            " fg=#3a414c bg=reset mod=NONE
 "thinkingOpacity 0.60      " fg=#9a9a9a bg=reset mod=NONE
 "selectedForeground        " fg=#0d0d0d bg=#00ffff mod=NONE

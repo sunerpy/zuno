@@ -25,6 +25,7 @@ ratatui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }
+terminal-colorsaurus = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tree-sitter = { workspace = true }

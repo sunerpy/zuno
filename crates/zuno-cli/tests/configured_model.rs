@@ -94,7 +94,7 @@ fn provider(label: &str, model: &str, base_url: &str) -> serde_json::Value {
         "name": label,
         "id": label,
         "env": [],
-        "npm": "@ai-sdk/openai-compatible",
+        "transport": "openai-compatible",
         "models": models,
         "options": {"apiKey": "route-probe", "baseURL": format!("{base_url}/v1")}
     })

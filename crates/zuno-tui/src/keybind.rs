@@ -1894,7 +1894,7 @@ pub const DEFINITIONS: &[Definition] = &[
     Definition {
         name: "messages_line_up",
         scope: "messages",
-        keys: "ctrl+alt+y",
+        keys: "up,ctrl+alt+y",
         command: "session.line.up",
         prevent_default: None,
         description: "Scroll messages up by one line",
@@ -1902,7 +1902,7 @@ pub const DEFINITIONS: &[Definition] = &[
     Definition {
         name: "messages_line_down",
         scope: "messages",
-        keys: "ctrl+alt+e",
+        keys: "down,ctrl+alt+e",
         command: "session.line.down",
         prevent_default: None,
         description: "Scroll messages down by one line",

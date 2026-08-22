@@ -86,8 +86,8 @@ variant_cycle	ctrl+t	variant.cycle		Cycle model variants
 variant_list	none	variant.list		List model variants
 messages_page_up	pageup,ctrl+alt+b	session.page.up		Scroll messages up by one page
 messages_page_down	pagedown,ctrl+alt+f	session.page.down		Scroll messages down by one page
-messages_line_up	ctrl+alt+y	session.line.up		Scroll messages up by one line
-messages_line_down	ctrl+alt+e	session.line.down		Scroll messages down by one line
+messages_line_up	up,ctrl+alt+y	session.line.up		Scroll messages up by one line
+messages_line_down	down,ctrl+alt+e	session.line.down		Scroll messages down by one line
 messages_half_page_up	ctrl+alt+u	session.half.page.up		Scroll messages up by half page
 messages_half_page_down	ctrl+alt+d	session.half.page.down		Scroll messages down by half page
 messages_first	ctrl+g,home	session.first		Navigate to first message

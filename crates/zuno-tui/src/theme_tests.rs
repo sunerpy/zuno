@@ -391,7 +391,7 @@ fn theme_system_without_terminal_capabilities_does_not_panic() {
 }
 
 #[test]
-fn theme_system_without_terminal_capabilities_uses_the_terminal_background() {
+fn theme_system_without_terminal_capabilities_keeps_a_readable_surface_hierarchy() {
     let mut registry = ThemeRegistry::new();
     assert_eq!(
         registry.refresh_system_theme(&FakePalette(None), None, Mode::Dark),
@@ -399,18 +399,20 @@ fn theme_system_without_terminal_capabilities_uses_the_terminal_background() {
     );
 
     let palette = registry.resolve(SYSTEM_THEME, Mode::Dark).palette;
-    for (name, color) in [
-        ("background", palette.background),
-        ("backgroundPanel", palette.background_panel),
-        ("backgroundElement", palette.background_element),
-        ("backgroundMenu", palette.background_menu),
-    ] {
-        assert_eq!(
-            Color::from(color),
-            Color::Reset,
-            "fallback system role {name} must preserve the terminal's own background"
-        );
-    }
+    assert_eq!(
+        Color::from(palette.background),
+        Color::Reset,
+        "the root canvas must preserve the terminal's own background"
+    );
+    assert_ne!(
+        palette.background_panel, palette.background,
+        "the sidebar and transcript surfaces must remain visible when OSC queries are unavailable"
+    );
+    assert_ne!(
+        palette.background_element, palette.background_panel,
+        "the composer must remain distinct from the surrounding panel"
+    );
+    assert_eq!(palette.background_menu, palette.background_element);
 }
 
 #[test]
@@ -683,18 +685,19 @@ fn theme_system_keeps_every_surface_legible_and_bordered() {
             );
         }
 
-        for (name, color) in [
-            ("background", palette.background),
-            ("backgroundPanel", palette.background_panel),
-            ("backgroundElement", palette.background_element),
-            ("backgroundMenu", palette.background_menu),
-        ] {
-            assert_eq!(
-                Color::from(color),
-                Color::Reset,
-                "fallback system role {name} must preserve the terminal background in {mode:?}"
-            );
-        }
+        assert_eq!(
+            Color::from(palette.background),
+            Color::Reset,
+            "fallback system root must preserve the terminal background in {mode:?}"
+        );
+        assert_ne!(
+            palette.background_panel, palette.background,
+            "fallback panel must be distinguishable from the root in {mode:?}"
+        );
+        assert_ne!(
+            palette.background_element, palette.background_panel,
+            "fallback element must be distinguishable from the panel in {mode:?}"
+        );
     }
 }
 

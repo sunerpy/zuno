@@ -272,13 +272,17 @@ fn app_every_mode_entering_the_terminal_enables_is_disabled_on_the_way_out() {
     let entering = body("enter_terminal");
     let leaving = body("restore_terminal");
 
-    let enabled: Vec<&str> = ["EnableBracketedPaste", "NarrowMouseCapture"]
-        .into_iter()
-        .filter(|command| entering.contains(command))
-        .collect();
+    let enabled: Vec<&str> = [
+        "EnableBracketedPaste",
+        "NarrowMouseCapture",
+        "AlternateScrollCapture",
+    ]
+    .into_iter()
+    .filter(|command| entering.contains(command))
+    .collect();
     assert_eq!(
         enabled.len(),
-        2,
+        3,
         "the scan did not find the commands it exists to pair, so it would pass \
          vacuously: {enabled:?}"
     );
@@ -366,6 +370,18 @@ fn app_mouse_reporting_asks_only_for_the_events_a_screen_consumes() {
         !without.contains("\u{1b}[?1000h"),
         "`mouse = false` still grabbed the pointer, so native selection stays broken for \
          the user who opted out: {without:?}"
+    );
+    assert!(
+        without.contains("\u{1b}[?1007h"),
+        "native-selection mode did not ask the terminal to translate wheel notches: {without:?}"
+    );
+    let mut restored = Vec::new();
+    assert!(restore_terminal(&mut restored, false).is_none());
+    assert!(
+        String::from_utf8(restored)
+            .expect("crossterm writes utf-8")
+            .contains("\u{1b}[?1007l"),
+        "alternate scroll was not restored on exit"
     );
 }
 

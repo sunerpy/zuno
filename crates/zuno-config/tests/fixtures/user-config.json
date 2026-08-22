@@ -123,7 +123,7 @@
         }
       },
       "name": "aws openai",
-      "npm": "@ai-sdk/openai",
+      "transport": "openai",
       "options": {
         "baseURL": "https://bedrock-mantle.us-east-2.api.aws/openai/v1",
         "chunkTimeout": 3000000,
@@ -869,7 +869,7 @@
         }
       },
       "name": "my openai",
-      "npm": "@ai-sdk/openai",
+      "transport": "openai",
       "options": {
         "baseURL": "https://openai-us.onethinker.top/api/v1",
         "chunkTimeout": 3000000,
@@ -895,7 +895,7 @@
         }
       },
       "name": "nwcdai",
-      "npm": "@ai-sdk/openai-compatible",
+      "transport": "openai-compatible",
       "options": {
         "baseURL": "http://192.168.143.247/v1"
       }

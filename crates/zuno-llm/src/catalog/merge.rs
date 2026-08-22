@@ -1,10 +1,8 @@
 //! Merging the user's `provider.*` config over the models.dev catalog.
 //!
-//! This is the port of `packages/opencode/src/provider/provider.ts:1425-1520`
-//! (extend the catalog from config) and `:1611-1658` (filter what survives). It is
-//! the longest file in this module because the merge is genuinely a long ladder of
-//! fallbacks, and every rung is observable: get one wrong and a user's model
-//! silently loses its context limit, its price, or its existence.
+//! models.dev is an input catalog, not Zuno's runtime provider registry. Package
+//! names from that source are translated to native [`ProviderTransport`] values
+//! here and do not travel into user configuration or provider construction.
 //!
 //! # The fallback ladders, verbatim
 //!
@@ -13,7 +11,7 @@
 //! | field | ladder | oracle |
 //! |---|---|---|
 //! | wire id | `config.id` → `E.api.id` → `K` | `:1438` |
-//! | npm | `config.provider.npm` → `provider.npm` → `E.api.npm` → catalog provider `npm` → `@ai-sdk/openai-compatible` | `:1439-1444` |
+//! | transport | model config → provider config → existing resolved model → imported catalog → `openai-compatible` |
 //! | url | `config.provider.api` → `provider.api` → `E.api.url` → catalog provider `api` → `""` | `:1455` |
 //! | name | `config.name` → (`K` when `config.id` renames) → `E.name` → `K` | `:1445-1449` |
 //! | toolcall | `config.tool_call` → `E` → **`true`** | `:1464` |
@@ -30,7 +28,7 @@
 //!
 //! # The deepseek interleaving special case
 //!
-//! `:1485-1487`: a model with **no** catalog entry, on `@ai-sdk/openai-compatible`,
+//! A model with **no** catalog entry, on the native `openai-compatible` transport,
 //! whose wire id contains `deepseek`, defaults to `{ field: "reasoning_content" }`.
 //! It is a genuine upstream quirk — DeepSeek-compatible endpoints put reasoning
 //! there — and it is gated on there being no existing entry, so it cannot override
@@ -50,6 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use zuno_config::schema::provider::{
     Modality as ConfigModality, ModelConfig, ModelStatus as ConfigModelStatus, ProviderConfig,
+    ProviderTransport,
 };
 
 use crate::catalog::models_dev::{
@@ -60,8 +59,51 @@ use crate::catalog::resolved::{
     ResolvedModel, ResolvedProvider,
 };
 
-/// The npm package a model falls back to when nothing names one — `:1444`.
-pub const DEFAULT_NPM: &str = "@ai-sdk/openai-compatible";
+/// Native transport a model falls back to when no source names one.
+pub const DEFAULT_TRANSPORT: ProviderTransport = ProviderTransport::OpenaiCompatible;
+
+/// models.dev provider/package pairs whose wire protocol is implemented by the
+/// native OpenAI-compatible provider.
+const CATALOG_COMPATIBLE_TRANSPORTS: &[(&str, &str)] = &[
+    ("alibaba", "@ai-sdk/alibaba"),
+    ("azure", "@ai-sdk/azure"),
+    ("cerebras", "@ai-sdk/cerebras"),
+    ("cohere", "@ai-sdk/cohere"),
+    ("deepinfra", "@ai-sdk/deepinfra"),
+    ("github-copilot", "@ai-sdk/github-copilot"),
+    ("gitlab", "gitlab-ai-provider"),
+    ("groq", "@ai-sdk/groq"),
+    ("mistral", "@ai-sdk/mistral"),
+    ("perplexity", "@ai-sdk/perplexity"),
+    ("togetherai", "@ai-sdk/togetherai"),
+    ("venice", "venice-ai-sdk-provider"),
+    ("vercel", "@ai-sdk/vercel"),
+    ("xai", "@ai-sdk/xai"),
+];
+
+/// Translate external models.dev package metadata into a native transport.
+fn catalog_transport(provider_id: &str, package: Option<&str>) -> Option<ProviderTransport> {
+    match package {
+        None => Some(DEFAULT_TRANSPORT),
+        Some("@ai-sdk/anthropic") => Some(ProviderTransport::Anthropic),
+        Some("@ai-sdk/amazon-bedrock") => Some(ProviderTransport::Bedrock),
+        Some("@ai-sdk/amazon-bedrock/mantle") => Some(ProviderTransport::BedrockMantle),
+        Some("@ai-sdk/google") => Some(ProviderTransport::Google),
+        Some("@ai-sdk/google-vertex") => Some(ProviderTransport::GoogleVertex),
+        Some("@ai-sdk/google-vertex/anthropic") => Some(ProviderTransport::GoogleVertexAnthropic),
+        Some("@ai-sdk/openai") => Some(ProviderTransport::Openai),
+        Some("@ai-sdk/openai-compatible") => Some(ProviderTransport::OpenaiCompatible),
+        Some("@openrouter/ai-sdk-provider") => Some(ProviderTransport::Openrouter),
+        Some(package)
+            if CATALOG_COMPATIBLE_TRANSPORTS
+                .iter()
+                .any(|&(identity, expected)| identity == provider_id && expected == package) =>
+        {
+            Some(ProviderTransport::OpenaiCompatible)
+        }
+        Some(_) => None,
+    }
+}
 
 /// The reasoning field DeepSeek-compatible endpoints use — `:1486`.
 const DEEPSEEK_REASONING_FIELD: &str = "reasoning_content";
@@ -140,7 +182,7 @@ fn mode_options(base: &ResolvedModel, body: &JsonMap) -> JsonMap {
         .iter()
         .map(|(key, value)| (snake_to_camel(key), value.clone()))
         .collect();
-    if base.api.npm != "@ai-sdk/openai" {
+    if base.api.transport != Some(ProviderTransport::Openai) {
         return options;
     }
     let mode = body
@@ -162,12 +204,11 @@ fn model_from_catalog(
     provider: &CatalogProvider,
     model: &CatalogModel,
 ) -> ResolvedModel {
-    let npm = model
+    let package = model
         .provider
         .as_ref()
         .and_then(|api| api.npm.clone())
-        .or_else(|| provider.npm.clone())
-        .unwrap_or_else(|| DEFAULT_NPM.to_owned());
+        .or_else(|| provider.npm.clone());
     let url = model
         .provider
         .as_ref()
@@ -183,7 +224,7 @@ fn model_from_catalog(
         status: model.status.unwrap_or(CatalogStatus::Active),
         api: ModelApi {
             id: model.id.clone(),
-            npm,
+            transport: catalog_transport(provider_id, package.as_deref()),
             url,
             endpoint: None,
         },
@@ -378,14 +419,18 @@ fn merge_model(
         .or_else(|| existing.map(|model| model.api.id.clone()))
         .unwrap_or_else(|| model_key.to_owned());
 
-    let api_npm = config
+    let api_transport = config
         .provider
         .as_ref()
-        .and_then(|api| api.npm.clone())
-        .or_else(|| provider_config.npm.clone())
-        .or_else(|| existing.map(|model| model.api.npm.clone()))
-        .or_else(|| catalog.and_then(|provider| provider.npm.clone()))
-        .unwrap_or_else(|| DEFAULT_NPM.to_owned());
+        .and_then(|api| api.transport)
+        .or(provider_config.transport)
+        .or_else(|| existing.and_then(|model| model.api.transport))
+        .or_else(|| {
+            catalog_transport(
+                provider_id,
+                catalog.and_then(|provider| provider.npm.as_deref()),
+            )
+        });
 
     let api_url = config
         .provider
@@ -442,7 +487,10 @@ fn merge_model(
             .or_else(|| existing_caps.map(|caps| caps.interleaved.clone()))
             .unwrap_or_else(|| {
                 // `:1485-1487` — only when the catalog has never seen this model.
-                if existing.is_none() && api_npm == DEFAULT_NPM && api_id.contains("deepseek") {
+                if existing.is_none()
+                    && api_transport == Some(DEFAULT_TRANSPORT)
+                    && api_id.contains("deepseek")
+                {
                     Interleaved::Field {
                         field: DEEPSEEK_REASONING_FIELD.to_owned(),
                     }
@@ -547,7 +595,7 @@ fn merge_model(
             .unwrap_or(CatalogStatus::Active),
         api: ModelApi {
             id: api_id,
-            npm: api_npm,
+            transport: api_transport,
             url: api_url,
             endpoint: existing.and_then(|model| model.api.endpoint),
         },
@@ -754,15 +802,15 @@ mod tests {
     }
 
     #[test]
-    fn the_npm_ladder_prefers_the_model_then_the_provider_then_the_catalog() {
+    fn the_transport_ladder_prefers_the_model_then_the_provider_then_the_catalog() {
         let catalog = catalog_provider();
         let existing = from_catalog("deepseek", &catalog);
         let mut outcome = MergeOutcome::default();
 
         // Model-level wins.
         let config = provider_config(
-            r#"{"npm":"@ai-sdk/provider-level",
-                "models":{"m":{"provider":{"npm":"@ai-sdk/model-level"}}}}"#,
+            r#"{"transport":"bedrock",
+                "models":{"m":{"provider":{"transport":"anthropic"}}}}"#,
         );
         let resolved = apply_config(
             "deepseek",
@@ -771,10 +819,13 @@ mod tests {
             Some(&catalog),
             &mut outcome,
         );
-        assert_eq!(resolved.models["m"].api.npm, "@ai-sdk/model-level");
+        assert_eq!(
+            resolved.models["m"].api.transport,
+            Some(ProviderTransport::Anthropic)
+        );
 
         // Provider-level next.
-        let config = provider_config(r#"{"npm":"@ai-sdk/provider-level","models":{"m":{}}}"#);
+        let config = provider_config(r#"{"transport":"bedrock","models":{"m":{}}}"#);
         let resolved = apply_config(
             "deepseek",
             &config,
@@ -782,7 +833,10 @@ mod tests {
             Some(&catalog),
             &mut outcome,
         );
-        assert_eq!(resolved.models["m"].api.npm, "@ai-sdk/provider-level");
+        assert_eq!(
+            resolved.models["m"].api.transport,
+            Some(ProviderTransport::Bedrock)
+        );
 
         // Then the catalog provider's.
         let config = provider_config(r#"{"models":{"m":{}}}"#);
@@ -793,11 +847,14 @@ mod tests {
             Some(&catalog),
             &mut outcome,
         );
-        assert_eq!(resolved.models["m"].api.npm, "@ai-sdk/openai-compatible");
+        assert_eq!(
+            resolved.models["m"].api.transport,
+            Some(ProviderTransport::OpenaiCompatible)
+        );
 
         // And with nothing anywhere, the documented default.
         let resolved = apply_config("acme", &config, None, None, &mut outcome);
-        assert_eq!(resolved.models["m"].api.npm, DEFAULT_NPM);
+        assert_eq!(resolved.models["m"].api.transport, Some(DEFAULT_TRANSPORT));
     }
 
     #[test]
@@ -830,7 +887,7 @@ mod tests {
     #[test]
     fn the_deepseek_interleaving_default_applies_only_to_unknown_models() {
         let mut outcome = MergeOutcome::default();
-        // Unknown model, compatible npm, deepseek in the wire id: the quirk fires.
+        // Unknown model, compatible transport, deepseek in the wire id: the quirk fires.
         let config = provider_config(r#"{"models":{"deepseek-r1":{}}}"#);
         let resolved = apply_config("gw", &config, None, None, &mut outcome);
         assert_eq!(
@@ -856,10 +913,9 @@ mod tests {
             "a known model keeps the catalog's answer"
         );
 
-        // And a different npm does not get the quirk.
-        let config = provider_config(
-            r#"{"models":{"deepseek-r1":{"provider":{"npm":"@ai-sdk/anthropic"}}}}"#,
-        );
+        // And a different transport does not get the quirk.
+        let config =
+            provider_config(r#"{"models":{"deepseek-r1":{"provider":{"transport":"anthropic"}}}}"#);
         let resolved = apply_config("gw2", &config, None, None, &mut outcome);
         assert_eq!(
             resolved.models["deepseek-r1"].capabilities.interleaved,

@@ -1363,6 +1363,7 @@ fn catalog() -> SessionCatalog {
         model: Some(String::from("prov/haiku")),
         agent: Some(String::from("build")),
         reasoning: false,
+        reasoning_efforts: Default::default(),
         effort: None,
     }
 }
@@ -1997,6 +1998,21 @@ fn session_up_on_an_empty_prompt_recalls_the_newest_persisted_prompt() {
         joined.contains("persisted across restart"),
         "Up left persisted history unreachable after restart:\n{joined}"
     );
+}
+
+#[test]
+fn session_up_on_an_empty_prompt_scrolls_a_long_transcript() {
+    let (mut screen, _shutdown) = scrollable(scroll_config(None, None));
+    let bottom = screen.transcript.content_height() - screen.transcript.viewport_height();
+    assert!(bottom > 0, "fixture is not scrollable");
+    screen.transcript.set_offset(bottom);
+
+    let (resolved, result) = dispatch_to_screen(&mut screen, "up");
+
+    assert_eq!(resolved, "messages_line_up");
+    assert!(result.redraw);
+    assert_eq!(screen.transcript.offset(), bottom - 1);
+    assert!(screen.editor.is_empty());
 }
 
 #[test]
@@ -6373,6 +6389,10 @@ fn reasoning_catalog() -> SessionCatalog {
     catalog.reasoning = true;
     for model in &mut catalog.models {
         model.reasoning = true;
+        catalog.reasoning_efforts.insert(
+            model.id.clone(),
+            zuno_llm::effort::ReasoningEffort::ALL.to_vec(),
+        );
     }
     catalog
 }
@@ -6428,6 +6448,48 @@ fn variant_cycle_steps_the_reasoning_level_and_shows_it_on_the_model_row() {
         )),
         "the chosen level is not shown on the model row:\n{joined}"
     );
+}
+
+/// Explicit model variants define the levels the interactive selector may offer.
+#[test]
+fn variant_cycle_uses_only_the_current_models_declared_levels() {
+    use zuno_llm::effort::ReasoningEffort;
+
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(4);
+    let mut catalog = reasoning_catalog();
+    catalog.reasoning_efforts.insert(
+        String::from("prov/haiku"),
+        vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ],
+    );
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(catalog)
+        .with_selection_sink(selections);
+
+    screen.handle_action(action("variant_cycle"), &press_none());
+    assert_eq!(screen.catalog.effort, Some(ReasoningEffort::Low));
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Effort(ReasoningEffort::Low))
+    );
+
+    for expected in [
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Xhigh,
+        ReasoningEffort::Max,
+        ReasoningEffort::Low,
+    ] {
+        screen.handle_action(action("variant_cycle"), &press_none());
+        assert_eq!(screen.catalog.effort, Some(expected));
+        assert_eq!(chosen.try_recv(), Ok(Selection::Effort(expected)));
+    }
 }
 
 /// On a model that does not reason, `ctrl+t` must change nothing visible.
@@ -6517,6 +6579,29 @@ fn choosing_a_model_without_reasoning_clears_the_level() {
         screen.catalog.effort, None,
         "the level survived onto a model whose request cannot carry it"
     );
+    assert_eq!(screen.status.effort(), None);
+}
+
+/// A reasoning model cannot inherit a level absent from its declared variants.
+#[test]
+fn choosing_a_reasoning_model_clears_an_unsupported_level() {
+    use zuno_llm::effort::ReasoningEffort;
+
+    let (sender, _shutdown) = terminal_event_channel();
+    let mut catalog = reasoning_catalog();
+    let next = catalog.models[1].id.clone();
+    catalog.reasoning_efforts.insert(
+        next.clone(),
+        vec![ReasoningEffort::Low, ReasoningEffort::High],
+    );
+    catalog.effort = Some(ReasoningEffort::Xhigh);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_catalog(catalog);
+    screen.status_mut().set_effort(Some(ReasoningEffort::Xhigh));
+
+    screen.adopt(crate::views::picker::MODEL_DIALOG_ID, &next);
+
+    assert!(screen.catalog.reasoning);
+    assert_eq!(screen.catalog.effort, None);
     assert_eq!(screen.status.effort(), None);
 }
 

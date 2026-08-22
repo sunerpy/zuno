@@ -378,6 +378,38 @@ impl crossterm::Command for NarrowMouseRelease {
     }
 }
 
+/// Ask the terminal to translate wheel notches into cursor keys on the alternate screen.
+///
+/// Unlike mouse reporting, DEC mode 1007 leaves drag selection owned by the terminal.
+/// [`SessionScreen`](crate::views::session::SessionScreen) promotes its message scope
+/// while the composer is empty, so the translated keys scroll the transcript.
+struct AlternateScrollCapture;
+
+impl crossterm::Command for AlternateScrollCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\u{1b}[?1007h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Restore the terminal's previous alternate-scroll behavior.
+struct AlternateScrollRelease;
+
+impl crossterm::Command for AlternateScrollRelease {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\u{1b}[?1007l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Whether the application has any consumer for this mouse event.
 ///
 /// The allow-list is deliberately narrow and deliberately duplicated from
@@ -423,6 +455,11 @@ fn enter_terminal(output: &mut impl io::Write, mouse_capture: bool) -> io::Resul
         let _ = execute!(output, LeaveAlternateScreen);
         return Err(error);
     }
+    if !mouse_capture && let Err(error) = execute!(output, AlternateScrollCapture) {
+        let _ = execute!(output, DisableBracketedPaste);
+        let _ = execute!(output, LeaveAlternateScreen);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -439,6 +476,9 @@ fn restore_terminal(output: &mut impl io::Write, mouse_capture: bool) -> Option<
         first_error.get_or_insert(error);
     }
     if mouse_capture && let Err(error) = execute!(output, NarrowMouseRelease) {
+        first_error.get_or_insert(error);
+    }
+    if !mouse_capture && let Err(error) = execute!(output, AlternateScrollRelease) {
         first_error.get_or_insert(error);
     }
     first_error

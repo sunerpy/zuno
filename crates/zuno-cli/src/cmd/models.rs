@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use zuno_config::schema::provider::ProviderTransport;
 use zuno_llm::catalog::resolved::{
     JsonMap, ModelApi, ModelCapabilities, ModelCost, ModelLimit, ResolvedModel,
 };
@@ -149,7 +150,7 @@ impl<'a> From<&'a ResolvedModel> for VerboseModel<'a> {
 struct VerboseApi<'a> {
     id: &'a str,
     url: &'a str,
-    npm: &'a str,
+    transport: Option<ProviderTransport>,
 }
 
 impl<'a> From<&'a ModelApi> for VerboseApi<'a> {
@@ -157,7 +158,7 @@ impl<'a> From<&'a ModelApi> for VerboseApi<'a> {
         Self {
             id: &api.id,
             url: &api.url,
-            npm: &api.npm,
+            transport: api.transport,
         }
     }
 }

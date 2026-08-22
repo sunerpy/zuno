@@ -14,6 +14,7 @@ use std::num::NonZeroU32;
 
 /// One entry of the `provider` map (`config/provider.ts:82-126`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Base API URL for the provider.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,9 +28,9 @@ pub struct ProviderConfig {
     /// Provider id override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// npm package implementing the provider.
+    /// Native request transport implemented by Zuno.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub npm: Option<String>,
+    pub transport: Option<ProviderTransport>,
     /// Models to keep, to the exclusion of the rest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub whitelist: Option<Vec<String>>,
@@ -42,6 +43,55 @@ pub struct ProviderConfig {
     /// Per-model configuration and overrides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<OrderedMap<ModelConfig>>,
+}
+
+/// Native provider transports implemented by the Rust workspace.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderTransport {
+    /// Anthropic Messages.
+    Anthropic,
+    /// AWS Bedrock Converse/Invoke transport.
+    Bedrock,
+    /// Bedrock through the Mantle OpenAI-compatible endpoint.
+    BedrockMantle,
+    /// Google Generative AI.
+    Google,
+    /// Google Vertex Gemini.
+    GoogleVertex,
+    /// Anthropic Messages through Google Vertex.
+    GoogleVertexAnthropic,
+    /// OpenAI native Responses/Chat transport.
+    Openai,
+    /// Generic OpenAI-compatible Chat/Responses transport.
+    #[default]
+    OpenaiCompatible,
+    /// OpenRouter's OpenAI-compatible transport and reasoning options.
+    Openrouter,
+}
+
+impl ProviderTransport {
+    /// Stable configuration spelling used in diagnostics and resolved model output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Bedrock => "bedrock",
+            Self::BedrockMantle => "bedrock-mantle",
+            Self::Google => "google",
+            Self::GoogleVertex => "google-vertex",
+            Self::GoogleVertexAnthropic => "google-vertex-anthropic",
+            Self::Openai => "openai",
+            Self::OpenaiCompatible => "openai-compatible",
+            Self::Openrouter => "openrouter",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Provider options (`config/provider.ts:90-124`).
@@ -196,13 +246,13 @@ pub struct ModelModalities {
     pub output: Option<Vec<Modality>>,
 }
 
-/// The npm package and API endpoint backing a single model
-/// (`config/provider.ts:64-66`).
+/// The native transport and API endpoint backing a single model.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelProvider {
-    /// npm package implementing the provider.
+    /// Native request transport implemented by Zuno.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub npm: Option<String>,
+    pub transport: Option<ProviderTransport>,
     /// API endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
@@ -266,7 +316,7 @@ pub struct ModelConfig {
     /// Lifecycle status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<ModelStatus>,
-    /// The npm package and API endpoint backing this model.
+    /// The native transport and API endpoint backing this model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ModelProvider>,
     /// Model options handed to the provider SDK.

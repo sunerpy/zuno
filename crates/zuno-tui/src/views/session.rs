@@ -61,6 +61,7 @@ use crossterm::event::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -720,6 +721,12 @@ pub struct SessionCatalog {
     /// model without reasoning gets a key that says why rather than one that relabels a
     /// control the request would not send.
     pub reasoning: bool,
+    /// Canonical reasoning levels available for each `provider/model`.
+    ///
+    /// Kept per model so switching rows immediately changes the cycle before the next
+    /// host rebuild. An absent entry falls back to the full scale only for a model whose
+    /// coarse `reasoning` flag is true, which preserves catalogs that expose no variants.
+    pub reasoning_efforts: BTreeMap<String, Vec<zuno_llm::effort::ReasoningEffort>>,
     /// The reasoning level in use, when one was chosen.
     pub effort: Option<zuno_llm::effort::ReasoningEffort>,
 }
@@ -2594,16 +2601,24 @@ impl SessionScreen {
     /// A model absent from the catalog list leaves both untouched: an unknown row is not
     /// evidence that reasoning went away.
     fn adopt_model_reasoning(&mut self, qualified: &str) {
-        let Some(entry) = self
+        let Some(reasoning) = self
             .catalog
             .models
             .iter()
             .find(|entry| entry.id == qualified)
+            .map(|entry| entry.reasoning)
         else {
             return;
         };
-        self.catalog.reasoning = entry.reasoning;
-        if !entry.reasoning {
+        self.catalog.reasoning = reasoning;
+        let supports_active = self.catalog.effort.is_none_or(|active| {
+            self.catalog
+                .reasoning_efforts
+                .get(qualified)
+                .filter(|levels| !levels.is_empty())
+                .map_or(reasoning, |levels| levels.contains(&active))
+        });
+        if !reasoning || !supports_active {
             self.catalog.effort = None;
             self.status.set_effort(None);
         }
@@ -2620,9 +2635,9 @@ impl SessionScreen {
     /// project has removed repeatedly. The toast names the model so the refusal is
     /// actionable: the answer is to switch models, not to press harder.
     ///
-    /// The cycle runs over [`ReasoningEffort::ALL`], weakest to strongest, and starts at
-    /// `Off` when no level is set yet — so the first press lands on the weakest level
-    /// rather than jumping into the middle of the scale.
+    /// The cycle runs over the current model's declared canonical variants, weakest to
+    /// strongest. A reasoning model with no declared variants falls back to
+    /// [`ReasoningEffort::ALL`]. Starting with no level selects the first available one.
     fn cycle_effort(&mut self, step: isize) -> EventResult {
         use zuno_llm::effort::ReasoningEffort;
         if !self.catalog.reasoning {
@@ -2638,7 +2653,14 @@ impl SessionScreen {
             }));
             return EventResult::REDRAW;
         }
-        let levels = ReasoningEffort::ALL;
+        let levels = self
+            .catalog
+            .model
+            .as_ref()
+            .and_then(|model| self.catalog.reasoning_efforts.get(model))
+            .filter(|levels| !levels.is_empty())
+            .map(Vec::as_slice)
+            .unwrap_or(&ReasoningEffort::ALL);
         let length = isize::try_from(levels.len()).unwrap_or(isize::MAX);
         let current = self
             .catalog
@@ -2666,6 +2688,14 @@ impl ActionComponent for SessionScreen {
     fn focused_scopes(&self) -> Vec<&'static str> {
         if self.autocomplete.is_open() {
             vec!["prompt.autocomplete"]
+        } else if self.editor.is_empty()
+            && self.transcript.content_height() > self.transcript.viewport_height()
+        {
+            // In native-selection mode, terminal alternate-scroll converts wheel notches
+            // to Up/Down keys. Promoting `messages` only for an empty composer makes those
+            // keys scroll the transcript without stealing vertical editing or history
+            // traversal from a prompt the user is actively composing.
+            vec!["messages"]
         } else if self.editor.cursor().line == 0
             || self.editor.cursor().line + 1 == self.editor.height()
         {

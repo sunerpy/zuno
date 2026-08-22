@@ -33,12 +33,14 @@
 //! (`index.ts:360-469`, driven by `src/context/theme.tsx:152-178`). Under `cargo
 //! test` there is no terminal, so the probe is [`TerminalPalette`] — the same
 //! trait-plus-fake shape `app::TerminalLifecycle` uses to make lifecycle tests
-//! TTY-free. [`EnvironmentPalette`] reads `COLORFGBG` without consuming terminal
-//! input. When it is absent, the built-in `system` theme preserves the terminal's
-//! default foreground and background.
+//! TTY-free. [`HostTerminalPalette`] queries OSC 10/11 before the TUI owns the input
+//! stream, then falls back to [`EnvironmentPalette`]'s `COLORFGBG` convention.
+//! When neither is available, the built-in `system` theme supplies a readable
+//! neutral surface hierarchy.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -907,6 +909,53 @@ impl TerminalPalette for EnvironmentPalette {
             default_foreground: Some(ansi_to_rgba(i64::from(foreground))),
             palette: ANSI_16.iter().copied().map(Some).collect(),
         })
+    }
+}
+
+/// The production probe for the terminal's foreground and background colours.
+///
+/// `terminal-colorsaurus` performs one bounded OSC 10/11 transaction, including
+/// raw-mode restoration and terminal-support detection. The CLI calls this before
+/// [`crate::app::TerminalSession`] starts, so its response bytes cannot race the
+/// normal crossterm event reader. `COLORFGBG` remains the fallback for terminals
+/// which deliberately decline OSC colour queries.
+#[derive(Debug, Clone, Copy)]
+pub struct HostTerminalPalette {
+    timeout: Duration,
+}
+
+impl Default for HostTerminalPalette {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_millis(350),
+        }
+    }
+}
+
+impl HostTerminalPalette {
+    /// Create a probe with a bounded OSC response wait.
+    #[must_use]
+    pub const fn with_timeout(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl TerminalPalette for HostTerminalPalette {
+    fn query(&self) -> Option<TerminalColors> {
+        let mut options = terminal_colorsaurus::QueryOptions::default();
+        options.timeout = self.timeout;
+        if let Ok(colors) = terminal_colorsaurus::color_palette(options) {
+            let rgba = |color: &terminal_colorsaurus::Color| {
+                let (r, g, b) = color.scale_to_8bit();
+                Rgba::opaque(r, g, b)
+            };
+            return Some(TerminalColors {
+                default_background: Some(rgba(&colors.background)),
+                default_foreground: Some(rgba(&colors.foreground)),
+                palette: ANSI_16.iter().copied().map(Some).collect(),
+            });
+        }
+        EnvironmentPalette.query()
     }
 }
 

@@ -19,7 +19,7 @@ pub(crate) fn provider_config(base_url: &str) -> String {
                 "name": "Test",
                 "id": "test",
                 "env": [],
-                "npm": "@ai-sdk/openai-compatible",
+                "transport": "openai-compatible",
                 "models": {
                     "test-model": {
                         "id": "test-model",

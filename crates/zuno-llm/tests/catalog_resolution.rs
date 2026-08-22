@@ -291,7 +291,7 @@ fn a_whitelist_narrows_and_a_blacklist_removes() {
 fn a_config_provider_the_catalog_has_never_heard_of_resolves() {
     let cfg = config(
         r#"{"provider":{"t26gateway":{
-             "name":"T26 Gateway","npm":"@ai-sdk/openai-compatible",
+             "name":"T26 Gateway","transport":"openai-compatible",
              "api":"https://gateway.example/v1",
              "options":{"apiKey":"sk-gw","baseURL":"https://gateway.example/v1"},
              "models":{
@@ -308,7 +308,10 @@ fn a_config_provider_the_catalog_has_never_heard_of_resolves() {
         .expect("the declared model resolved");
     assert_eq!(fast.name, "Fast");
     assert_eq!(fast.limit.context, 32_000.0);
-    assert_eq!(fast.api.npm, "@ai-sdk/openai-compatible");
+    assert_eq!(
+        fast.api.transport,
+        Some(zuno_config::schema::provider::ProviderTransport::OpenaiCompatible)
+    );
     assert_eq!(fast.api.url, "https://gateway.example/v1");
     let slow = catalog
         .model("t26gateway", "slow")

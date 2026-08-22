@@ -52,7 +52,9 @@ use zuno_tools::question::QuestionAsker;
 use zuno_tui::app::{App, CrosstermDrawTarget, CrosstermLifecycle, TerminalEvent, TerminalSession};
 use zuno_tui::config::{ResolveOptions, ResolvedTuiConfig};
 use zuno_tui::keybind::{KeyDispatcher, Keymap};
-use zuno_tui::theme::{EnvironmentPalette, Mode, SystemThemeOutcome, ThemeRegistry};
+use zuno_tui::theme::{
+    EnvironmentPalette, HostTerminalPalette, Mode, SYSTEM_THEME, SystemThemeOutcome, ThemeRegistry,
+};
 use zuno_tui::views::ViewContext;
 use zuno_tui::views::ambient::SessionTitle;
 use zuno_tui::views::dialog::DialogHost;
@@ -239,10 +241,14 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let history_notice = history.notice().map(str::to_owned);
 
     let mut themes = ThemeRegistry::new();
-    // `COLORFGBG` can refine the palette without consuming bytes from the same
-    // terminal input stream that carries an immediately typed prompt. When it is
-    // absent, the built-in `system` asset keeps terminal defaults visible.
-    let mode = match themes.refresh_system_theme(&EnvironmentPalette, None, Mode::Dark) {
+    // Only `system` needs an OSC round trip. Other themes read `COLORFGBG` without
+    // consuming input, which keeps a prompt typed as the first frame appears intact.
+    let system_outcome = if config.theme == SYSTEM_THEME {
+        themes.refresh_system_theme(&HostTerminalPalette::default(), None, Mode::Dark)
+    } else {
+        themes.refresh_system_theme(&EnvironmentPalette, None, Mode::Dark)
+    };
+    let mode = match system_outcome {
         SystemThemeOutcome::Derived(mode) => mode,
         SystemThemeOutcome::Unavailable => Mode::Dark,
     };
@@ -1044,8 +1050,12 @@ async fn session_catalog(
     // model through, so the picker and the `task` tool cannot disagree about which models
     // reason. An undeclared model is treated as not reasoning: that yields a key which
     // explains itself rather than one that sends a control the provider may reject.
-    let models = plan
-        .catalog_model_ids()
+    let model_ids = plan.catalog_model_ids();
+    let reasoning_efforts = model_ids
+        .iter()
+        .map(|qualified| (qualified.clone(), plan.model_reasoning_efforts(qualified)))
+        .collect();
+    let models = model_ids
         .into_iter()
         .map(|qualified| {
             let reasoning = plan.model_reasons(&qualified);
@@ -1084,6 +1094,7 @@ async fn session_catalog(
         model: Some(plan.qualified_model()),
         agent: Some(plan.agent_name().to_owned()),
         reasoning: plan.reasoning_supported(),
+        reasoning_efforts,
         effort: plan.effort(),
     }
 }
