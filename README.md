@@ -143,12 +143,17 @@ Zuno 的用户界面、默认路径、环境变量与扩展协议均使用 Zuno 
 ## 构建与开发
 
 ```sh
-cargo build --release
+make build
+./dist/zuno --version --long
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 make hooks
 ```
+
+`make build` 保留 Cargo 的 debug 构建，并在成功后将可直接运行的二进制原子投放到
+`dist/zuno`；原始 Cargo 产物仍位于 `target/debug/zuno`。`make release` 会用优化构建覆盖
+`dist/zuno`，其原始产物位于 `target/release/zuno`。
 
 `make hooks` 安装两个共享本地门禁：提交前运行格式化，推送前运行快速测试；完整 workspace
 测试仍由 CI 和显式 `make test` 执行。资源门禁另需显式启用，见

@@ -1213,6 +1213,40 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
     }
 }
 
+/// `make build` is the local handoff path: after Cargo succeeds, one stable
+/// executable must be available without knowing Cargo's target layout.
+#[test]
+fn make_build_stages_a_directly_runnable_binary_in_dist() {
+    let output = Command::new("make")
+        .current_dir(workspace_root())
+        .env_remove("CARGO_TARGET_DIR")
+        .args(["-n", "build"])
+        .output()
+        .expect("make must be runnable because CI uses the same Makefile");
+    assert!(
+        output.status.success(),
+        "make -n build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let commands = String::from_utf8(output.stdout).expect("make output is UTF-8");
+    let executable = if cfg!(windows) { "zuno.exe" } else { "zuno" };
+    for required in [
+        format!("target/debug/{executable}"),
+        format!("dist/{executable}.tmp"),
+        format!("dist/{executable}"),
+    ] {
+        assert!(
+            commands.contains(&required),
+            "`make build` does not stage `{required}`:\n{commands}"
+        );
+    }
+    assert!(
+        commands.contains("mv -f"),
+        "`make build` must publish the completed copy atomically:\n{commands}"
+    );
+}
+
 // ─── The committed cassette ─────────────────────────────────────────────────
 
 /// The smoke test replays a cassette committed under `packaging/smoke/cassettes/`

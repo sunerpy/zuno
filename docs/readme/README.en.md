@@ -149,12 +149,17 @@ identity.
 ## Development
 
 ```sh
-cargo build --release
+make build
+./dist/zuno --version --long
 cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --all --check
 make hooks
 ```
+
+`make build` retains Cargo's debug build and atomically stages a directly runnable binary at
+`dist/zuno`; Cargo's original remains at `target/debug/zuno`. `make release` replaces `dist/zuno`
+with the optimized build while retaining its original at `target/release/zuno`.
 
 `make hooks` installs commit-time formatting and a fast push-time test gate; the full workspace
 suite remains an explicit `make test` and CI gate. The resource gates need explicit opt-in — see

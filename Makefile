@@ -27,6 +27,10 @@ CLI_CRATE   := zuno-cli
 BINARY_NAME := zuno
 TARGET_DIR  := target
 DIST_DIR    := dist
+HOST_SUFFIX := $(if $(filter Windows_NT,$(OS)),.exe,)
+HOST_BINARY := $(BINARY_NAME)$(HOST_SUFFIX)
+CARGO_OUTPUT_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(TARGET_DIR))
+DIST_BINARY := $(DIST_DIR)/$(HOST_BINARY)
 
 # Set `OFFLINE=` on the command line to permit network access.
 OFFLINE ?= --offline
@@ -138,10 +142,19 @@ ci: metadata fmt-check lint test deny
 
 build:
 	$(CARGO) build -p $(CLI_CRATE) --bin $(BINARY_NAME) $(OFFLINE)
+	@mkdir -p "$(DIST_DIR)"
+	@rm -f "$(DIST_BINARY).tmp"
+	@cp "$(CARGO_OUTPUT_DIR)/debug/$(HOST_BINARY)" "$(DIST_BINARY).tmp"
+	@mv -f "$(DIST_BINARY).tmp" "$(DIST_BINARY)"
+	@ls -l "$(DIST_BINARY)"
 
 release:
 	$(CARGO) build --release -p $(CLI_CRATE) --bin $(BINARY_NAME) $(OFFLINE)
-	@ls -l $(TARGET_DIR)/release/$(BINARY_NAME)
+	@mkdir -p "$(DIST_DIR)"
+	@rm -f "$(DIST_BINARY).tmp"
+	@cp "$(CARGO_OUTPUT_DIR)/release/$(HOST_BINARY)" "$(DIST_BINARY).tmp"
+	@mv -f "$(DIST_BINARY).tmp" "$(DIST_BINARY)"
+	@ls -l "$(DIST_BINARY)"
 
 # Cross-compile one target. The two musl targets go through `cargo zigbuild`,
 # which is what makes them need no per-target C cross-toolchain: this workspace
@@ -225,8 +238,8 @@ help:
 	@echo "  deny            cargo deny check (skipped with a notice if absent)"
 	@echo ""
 	@echo "Build:"
-	@echo "  build           debug $(BINARY_NAME)"
-	@echo "  release         release $(BINARY_NAME)"
+	@echo "  build           debug $(BINARY_NAME) -> $(DIST_BINARY)"
+	@echo "  release         optimized $(BINARY_NAME) -> $(DIST_BINARY)"
 	@echo "  release-target  cross-build one target; TARGET=<triple> required"
 	@echo "  package         release-target + the release archive into $(DIST_DIR)/"
 	@echo ""
