@@ -43,8 +43,6 @@ With `mouse` absent or `false`, Zuno does not enable terminal mouse capture, so 
 
 The `system` theme queries the terminal's OSC 10/11 foreground and background colours before the TUI starts, then derives its text, panel, input, border, and syntax colours from that result. Terminals which do not support colour queries fall back to `COLORFGBG`; if neither source is available, Zuno keeps the terminal's root background and applies a neutral panel/input hierarchy so the interface does not collapse into one near-black surface.
 
-The `system` theme keeps the terminal's default foreground and background. It may use non-invasive environment color hints, but it does not query the terminal through stdin.
-
 ## Inspecting the result
 
 Use `zuno debug paths` to inspect resolved roots and `zuno debug config` to inspect the merged configuration. A validation error names every rejected top-level key; for example, putting `theme` in `zuno.json` is rejected because it belongs in `tui.json`.
