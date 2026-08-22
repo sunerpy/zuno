@@ -332,6 +332,19 @@ impl Skills {
         set
     }
 
+    /// Overlay non-disk skills while preserving discovery roots and warnings.
+    ///
+    /// The same last-one-wins insertion path is used, so a process/static extension
+    /// replacing a disk skill is observable exactly like one disk root replacing
+    /// another.
+    #[must_use]
+    pub fn with_overlay(mut self, skills: impl IntoIterator<Item = Skill>) -> Self {
+        for skill in skills {
+            self.insert(skill);
+        }
+        self
+    }
+
     /// `state.skills[name] = info` (`skill/index.ts:125-139`) — register a skill,
     /// warning when it displaces one.
     fn insert(&mut self, skill: Skill) {

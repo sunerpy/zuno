@@ -94,6 +94,9 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         catalog_models: Vec::new(),
         reasoning_efforts: std::collections::BTreeMap::new(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
+        agents: vec![agent.clone()],
+        extensions: zuno_extension::ResolvedExtensions::default(),
+        extension_generation: 0,
         instructions: zuno_config::LoadedInstructions::default(),
         delegation_facts: Arc::new(zuno_tools::task::FixedFacts::new()),
         vision_available: false,
@@ -1585,6 +1588,128 @@ fn an_explicit_session_is_reused_rather_than_created() {
     )
     .expect("continue the directory's most recent session");
     assert_eq!(continued.id, created.id);
+}
+
+#[test]
+fn recent_sessions_stay_with_the_current_directory_and_hide_children_and_archived_rows() {
+    fn insert(
+        connection: &mut zuno_db::Connection,
+        input: zuno_db::session::SessionCreate,
+    ) -> zuno_db::session::Session {
+        let transaction = connection.transaction().expect("open transaction");
+        let session = zuno_db::session::create(&transaction, &input)
+            .expect("create fixture session")
+            .into_session();
+        transaction.commit().expect("commit fixture session");
+        session
+    }
+
+    let mut connection =
+        zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    let plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &plan.project, now).expect("persist project");
+
+    let current = insert(
+        &mut connection,
+        zuno_db::session::SessionCreate::new(
+            "ses_current",
+            "current",
+            &plan.project.id,
+            "/workspace",
+            "/workspace",
+            "current",
+            crate::RUST_PACKAGE_VERSION,
+        )
+        .at(now),
+    );
+    let previous = insert(
+        &mut connection,
+        zuno_db::session::SessionCreate::new(
+            "ses_previous",
+            "previous",
+            &plan.project.id,
+            "/workspace",
+            "/workspace",
+            "previous",
+            crate::RUST_PACKAGE_VERSION,
+        )
+        .at(now - 1),
+    );
+    let mut child = zuno_db::session::SessionCreate::new(
+        "ses_child",
+        "child",
+        &plan.project.id,
+        "/workspace",
+        "/workspace",
+        "child",
+        crate::RUST_PACKAGE_VERSION,
+    )
+    .at(now + 1);
+    child.parent_id = Some(current.id.clone());
+    insert(&mut connection, child);
+    insert(
+        &mut connection,
+        zuno_db::session::SessionCreate::new(
+            "ses_elsewhere",
+            "elsewhere",
+            &plan.project.id,
+            "/workspace",
+            "/elsewhere",
+            "elsewhere",
+            crate::RUST_PACKAGE_VERSION,
+        )
+        .at(now + 2),
+    );
+    let archived = insert(
+        &mut connection,
+        zuno_db::session::SessionCreate::new(
+            "ses_archived",
+            "archived",
+            &plan.project.id,
+            "/workspace",
+            "/workspace",
+            "archived",
+            crate::RUST_PACKAGE_VERSION,
+        )
+        .at(now + 3),
+    );
+    connection
+        .execute(
+            "UPDATE session SET time_archived = ?1 WHERE id = ?2",
+            rusqlite::params![now + 4, archived.id],
+        )
+        .expect("archive fixture session");
+
+    let listed = recent_sessions(&connection, &current.id, 100).expect("list picker sessions");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![current.id.as_str(), previous.id.as_str()]
+    );
+    assert_eq!(
+        switchable_session(&connection, &current.id, &previous.id)
+            .expect("validate same-directory root"),
+        Some(previous)
+    );
+    assert!(
+        switchable_session(&connection, &current.id, "ses_child")
+            .expect("reject child")
+            .is_none()
+    );
+    assert!(
+        switchable_session(&connection, &current.id, "ses_elsewhere")
+            .expect("reject other directory")
+            .is_none()
+    );
+    assert!(
+        switchable_session(&connection, &current.id, &archived.id)
+            .expect("reject archived")
+            .is_none()
+    );
 }
 
 #[test]
@@ -3761,6 +3886,53 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
     assert!(
         read("serve.rs").contains("TurnHost::open_with_runtime_and_mcp"),
         "`zuno serve` must reach the constructor that takes a catalog"
+    );
+}
+
+#[test]
+fn every_extension_contribution_reaches_its_native_consumer() {
+    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let turn = std::fs::read_to_string(cmd.join("turn.rs")).expect("turn.rs is readable");
+    let tui = std::fs::read_to_string(cmd.join("tui.rs")).expect("tui.rs is readable");
+
+    for required in [
+        "zuno_extension::discover_static",
+        "zuno_extension::resolve_active",
+        "extensions.agents()",
+        "with_overlay(extensions.skills().iter().cloned())",
+        "zuno_extension::lifecycle_tools",
+        "default_profile_with_tools",
+        "plan.extensions.workflows()",
+        "plan.extensions.prompt_section()",
+    ] {
+        assert!(
+            turn.contains(required),
+            "`turn.rs` no longer wires extension capability `{required}` into a native consumer"
+        );
+    }
+
+    let memory_at = turn
+        .find("configure_resident_memory(\n            &mut plan.resolver,")
+        .expect("resident memory is assembled");
+    let extensions_at = turn
+        .find("append_prompt_section(\n            \"extensions\"")
+        .expect("extension provenance is assembled");
+    let instructions_at = turn
+        .find("announce_instructions(&mut plan.resolver")
+        .expect("instructions are assembled");
+    let skills_at = turn
+        .find("announce_skills(&mut plan.resolver")
+        .expect("skills are assembled");
+    assert!(
+        memory_at < extensions_at && extensions_at < instructions_at && instructions_at < skills_at,
+        "the durable prompt order must remain memory, extensions, instructions, skills"
+    );
+
+    assert!(
+        tui.contains("environment.extensions().composition_generation()")
+            && tui.contains("driver.host.extension_generation()")
+            && tui.contains("driver.remount.request(next)"),
+        "the long-lived TUI no longer recomposes after an extension lifecycle change"
     );
 }
 

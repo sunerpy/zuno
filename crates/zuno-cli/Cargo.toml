@@ -29,6 +29,7 @@ zuno-config = { workspace = true }
 zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
+zuno-extension = { workspace = true }
 zuno-goal = { workspace = true }
 zuno-harness = { workspace = true }
 zuno-llm = { workspace = true }

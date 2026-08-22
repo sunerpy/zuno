@@ -5084,6 +5084,7 @@ dependencies = [
  "zuno-db",
  "zuno-engine",
  "zuno-error",
+ "zuno-extension",
  "zuno-goal",
  "zuno-harness",
  "zuno-llm",
@@ -5181,6 +5182,24 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "walkdir",
+]
+
+[[package]]
+name = "zuno-extension"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "zuno-catalog",
+ "zuno-config",
+ "zuno-error",
+ "zuno-paths",
+ "zuno-tool",
 ]
 
 [[package]]

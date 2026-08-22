@@ -290,6 +290,21 @@ fn resuming_this_parents_own_child_reuses_it_rather_than_forking() {
 }
 
 #[tokio::test]
+async fn background_supervisor_reports_a_live_writer_until_it_finishes() {
+    let jobs = BackgroundJobSupervisor::default();
+    let (release, waiting) = tokio::sync::oneshot::channel();
+    jobs.spawn(async move {
+        let _released = waiting.await;
+    });
+    tokio::task::yield_now().await;
+
+    assert!(jobs.has_running_tasks());
+    release.send(()).expect("release background task");
+    jobs.wait_all().await;
+    assert!(!jobs.has_running_tasks());
+}
+
+#[tokio::test]
 async fn background_dispatch_returns_a_durable_job_before_the_child_finishes() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);

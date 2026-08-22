@@ -111,13 +111,25 @@ impl ZunoFlags {
 }
 
 /// The environment command handlers run under and the flags resolved from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct StartupEnvironment {
     resolved: Env,
     overrides: BTreeMap<&'static str, String>,
+    extensions: std::sync::Arc<zuno_extension::ExtensionRegistry>,
     /// All supported `ZUNO_*` values after CLI precedence is applied.
     pub flags: ZunoFlags,
 }
+
+impl PartialEq for StartupEnvironment {
+    fn eq(&self, other: &Self) -> bool {
+        self.resolved == other.resolved
+            && self.overrides == other.overrides
+            && self.flags == other.flags
+            && std::sync::Arc::ptr_eq(&self.extensions, &other.extensions)
+    }
+}
+
+impl Eq for StartupEnvironment {}
 
 impl StartupEnvironment {
     /// Applies CLI middleware precedence to a process snapshot.
@@ -141,6 +153,7 @@ impl StartupEnvironment {
         Self {
             resolved,
             overrides,
+            extensions: std::sync::Arc::new(zuno_extension::ExtensionRegistry::new()),
             flags,
         }
     }
@@ -156,6 +169,12 @@ impl StartupEnvironment {
         self.overrides
             .iter()
             .map(|(name, value)| (*name, value.as_str()))
+    }
+
+    /// Process-local extension definitions shared by every surface and child host.
+    #[must_use]
+    pub fn extensions(&self) -> &std::sync::Arc<zuno_extension::ExtensionRegistry> {
+        &self.extensions
     }
 }
 
@@ -219,5 +238,21 @@ mod tests {
         let snapshot = ZunoFlags::read(&env);
 
         assert!(!snapshot.exposure.experimental_plan_mode);
+    }
+
+    #[test]
+    fn clones_share_one_process_extension_registry_but_new_resolutions_do_not() {
+        let first = StartupEnvironment::resolve(&Env::empty(), &GlobalOptions::default());
+        let clone = first.clone();
+        let restarted = StartupEnvironment::resolve(&Env::empty(), &GlobalOptions::default());
+
+        assert!(std::sync::Arc::ptr_eq(
+            first.extensions(),
+            clone.extensions()
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            first.extensions(),
+            restarted.extensions()
+        ));
     }
 }

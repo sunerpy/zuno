@@ -55,6 +55,15 @@ impl BackgroundJobSupervisor {
             .push(tokio::spawn(task));
     }
 
+    /// Whether this host still owns a background task that can write session state.
+    pub(crate) fn has_running_tasks(&self) -> bool {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|task| !task.is_finished())
+    }
+
     /// Wait for every task this supervisor owns.
     pub(crate) async fn wait_all(&self) {
         loop {

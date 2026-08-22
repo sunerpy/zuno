@@ -45,6 +45,7 @@ zuno-config = { path = "crates/zuno-config" }
 zuno-db = { path = "crates/zuno-db" }
 zuno-engine = { path = "crates/zuno-engine" }
 zuno-error = { path = "crates/zuno-error" }
+zuno-extension = { path = "crates/zuno-extension" }
 zuno-goal = { path = "crates/zuno-goal" }
 zuno-harness = { path = "crates/zuno-harness" }
 zuno-llm = { path = "crates/zuno-llm" }

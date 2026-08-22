@@ -69,6 +69,9 @@ use tokio::sync::mpsc;
 /// The dialog id the skill browser reports under.
 pub const SKILL_DIALOG_ID: &str = "prompt_skills";
 
+/// The dialog id the session rename prompt reports under.
+pub const SESSION_RENAME_DIALOG_ID: &str = "session.rename";
+
 /// The id the `/undo` confirmation reports under.
 ///
 /// `/undo` restores the worktree to the boundary before the last completed turn, so it
@@ -604,6 +607,13 @@ pub struct SessionScreen {
     /// answer is routed. Cleared when the answer arrives, so a later outcome from some other
     /// dialog cannot be applied to a message the user is no longer looking at.
     message_menu: Option<usize>,
+    /// The session id and original title whose rename prompt is open.
+    ///
+    /// The list is gone by the time the prompt answers, so this is the durable identity
+    /// that connects the two stacked dialogs. The original title is retained only to
+    /// re-open the prompt after an empty submission without querying storage from the
+    /// view layer.
+    session_rename: Option<(String, String)>,
     /// The user's resolved keymap, for the keybinding reference.
     ///
     /// Optional because every view test builds a screen without one, and a help view
@@ -670,6 +680,10 @@ pub enum Selection {
     Agent(String),
     /// A different session to continue in.
     Session(String),
+    /// Rename a session after its prompt has supplied a non-empty title.
+    SessionRename { id: String, title: String },
+    /// Delete a session after the list has confirmed the destructive action.
+    SessionDelete(String),
     /// A different theme.
     Theme(String),
     /// A different reasoning level for subsequent turns.
@@ -710,6 +724,8 @@ pub struct SessionCatalog {
     pub agents: Vec<crate::views::picker::AgentEntry>,
     /// Recent sessions.
     pub sessions: Vec<crate::views::picker::SessionEntry>,
+    /// The session currently open, so its row is focused rather than looking switchable.
+    pub session: Option<String>,
     /// `provider/model` currently in use, so the picker opens on it.
     pub model: Option<String>,
     /// The agent currently in use.
@@ -771,6 +787,7 @@ impl SessionScreen {
             selections: None,
             theme_restore: None,
             message_menu: None,
+            session_rename: None,
             modal: None,
             scroller: Scroller::new(&context.config),
             started: Instant::now(),
@@ -2250,10 +2267,14 @@ impl SessionScreen {
         if self.catalog.sessions.is_empty() {
             return None;
         }
-        Some(Box::new(crate::views::picker::session_picker(
+        let mut picker = crate::views::picker::session_picker(
             self.context.clone(),
             self.catalog.sessions.clone(),
-        )))
+        );
+        if let Some(session) = &self.catalog.session {
+            picker = picker.selecting(session);
+        }
+        Some(Box::new(picker))
     }
 
     fn mcp_list(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
@@ -2449,7 +2470,16 @@ impl SessionScreen {
                 self.sidebar.ambient_mut().agent = Some(value.to_owned());
                 Selection::Agent(value.to_owned())
             }
-            crate::views::picker::SESSION_DIALOG_ID => Selection::Session(value.to_owned()),
+            crate::views::picker::SESSION_DIALOG_ID => {
+                if self.catalog.session.as_deref() == Some(value) {
+                    self.toasts.push(Toast::new(
+                        ToastLevel::Info,
+                        format!("session {value} is already active"),
+                    ));
+                    return EventResult::REDRAW;
+                }
+                Selection::Session(value.to_owned())
+            }
             // No [`Selection::Theme`] is sent, and that is the change. The variant stays
             // because the host still matches on it, but a theme is the view layer's own
             // state now: the palette on screen is already the chosen one — the picker's
@@ -2505,7 +2535,11 @@ impl SessionScreen {
         let notice = match &selection {
             Selection::Model(model) => format!("model set to {model} for the next turn"),
             Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
-            Selection::Session(id) => format!("session {id} selected"),
+            Selection::Session(id) => format!("switching to session {id}"),
+            Selection::SessionRename { id, title } => {
+                format!("renaming session {id} to {title}")
+            }
+            Selection::SessionDelete(id) => format!("deleting session {id}"),
             Selection::Theme(theme) => format!("theme {theme} selected"),
             Selection::Effort(effort) => {
                 format!("reasoning set to {effort} for the next turn")
@@ -2725,6 +2759,66 @@ impl ActionComponent for SessionScreen {
         outcome: &crate::views::dialog::DialogOutcome,
     ) -> EventResult {
         match outcome {
+            crate::views::dialog::DialogOutcome::Session(
+                crate::views::picker::SessionDialogAction::Rename { id, title },
+            ) => {
+                self.session_rename = Some((id.clone(), title.clone()));
+                self.requested
+                    .push(Box::new(crate::views::basics::PromptDialog::new(
+                        self.context.clone(),
+                        SESSION_RENAME_DIALOG_ID,
+                        "Rename session",
+                        title,
+                    )));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::Session(
+                crate::views::picker::SessionDialogAction::Delete { id, title },
+            ) => {
+                let (notice, level) = self.commit_selection(Selection::SessionDelete(id.clone()));
+                self.toasts.push(Toast::new(
+                    level,
+                    if level == ToastLevel::Success {
+                        format!("deleting session {title}")
+                    } else {
+                        notice
+                    },
+                ));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::Submitted { text, .. }
+                if dialog == SESSION_RENAME_DIALOG_ID =>
+            {
+                let Some((id, original_title)) = self.session_rename.take() else {
+                    return EventResult::IGNORED;
+                };
+                let title = text.trim();
+                if title.is_empty() {
+                    self.session_rename = Some((id, original_title.clone()));
+                    self.requested
+                        .push(Box::new(crate::views::basics::PromptDialog::new(
+                            self.context.clone(),
+                            SESSION_RENAME_DIALOG_ID,
+                            "Rename session",
+                            original_title,
+                        )));
+                    self.toasts
+                        .push(Toast::warning("session title cannot be empty"));
+                    return EventResult::REDRAW;
+                }
+                let (notice, level) = self.commit_selection(Selection::SessionRename {
+                    id,
+                    title: title.to_owned(),
+                });
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::Cancelled
+                if dialog == SESSION_RENAME_DIALOG_ID =>
+            {
+                self.session_rename = None;
+                EventResult::REDRAW
+            }
             // The confirmation is checked before the general `Selected` arm because
             // `adopt` routes on the dialog id and would report this one as unknown.
             crate::views::dialog::DialogOutcome::Selected { value, .. }

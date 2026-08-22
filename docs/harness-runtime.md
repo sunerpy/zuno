@@ -14,6 +14,35 @@ Zuno assembles an agent from a native harness profile. A profile is a set of bun
 
 Profile activation is transactional. Candidate components mount against a staging service view, duplicate component identifiers fail before mount, and no candidate service is visible outside the transaction until every component succeeds. Failure disposes candidates in reverse order. Successful replacement publishes the complete new profile atomically, then disposes the previous profile in reverse order.
 
+## Declarative extension packages
+
+Zuno also exposes one validated declarative package protocol for agents, slash-command workflows,
+and skills. It adapts DSH's lifecycle outcome without loading the Cordis/JavaScript ABI:
+
+- `extension_define` records an immutable package in the current process and worktree scope.
+- `extension_run` validates the complete active package set and activates it transactionally.
+- `extension_stop` removes its contributions while retaining the definition.
+- `extension_undefine` removes the definition.
+- `extension_inspect` projects static and process-local package state.
+
+The TUI detects an active-composition generation change after the tool turn, tears down the complete
+session composition, and resolves it again inside the same process before the next turn. This
+refreshes the agent catalog, command registry, skill catalog, prompt provenance, permissions, and
+tool definitions together. An inactive definition does not trigger a rebuild.
+
+Process-local definitions are held only by `StartupEnvironment`'s shared `ExtensionRegistry`; a new
+process starts with an empty registry. Static packages live at
+`.zuno/extensions/<id>/extension.json` or
+`~/.config/zuno/extensions/<id>/extension.json`, are loaded at composition startup, and require the
+directory name to match the package id. Dynamic and static packages use the same
+`zuno.extension/v1` schema and contribution merger. Duplicate package ids or duplicate
+agent/workflow/skill names across active extension packages fail instead of silently choosing a
+winner. An agent contribution cannot rename its map identity or mark itself disabled.
+
+Declarative packages do not evaluate JavaScript, load a foreign plugin ABI, or load Rust dynamic
+libraries. Executable tools, providers, drivers, approvals, and other typed services remain compiled
+Rust `Component` implementations mounted through a `HarnessProfile`.
+
 ## Native agents
 
 The built-in catalog separates primary modes, delegable specialists, and hidden engine agents:
@@ -38,8 +67,9 @@ Prompt assembly is ordered data, not string concatenation spread across the CLI.
 1. native or configured agent base prompt;
 2. generated agent policy;
 3. global and project memory;
-4. discovered instruction files;
-5. the available skill catalog.
+4. extension lifecycle guidance and the exact active package projection;
+5. discovered instruction files;
+6. the available skill catalog.
 
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 

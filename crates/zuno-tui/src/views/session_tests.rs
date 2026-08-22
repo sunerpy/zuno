@@ -1360,6 +1360,7 @@ fn catalog() -> SessionCatalog {
             description: String::from("read-only planning"),
         }],
         sessions: Vec::new(),
+        session: None,
         model: Some(String::from("prov/haiku")),
         agent: Some(String::from("build")),
         reasoning: false,
@@ -1439,6 +1440,178 @@ fn session_screen_says_so_when_a_picker_would_be_empty() {
     assert!(
         joined.contains("nothing to choose from"),
         "the refusal was silent:\n{joined}"
+    );
+}
+
+#[test]
+fn session_screen_opens_the_session_picker_and_forwards_a_switch() {
+    let (sender, _receiver) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(4);
+    let mut offered = catalog();
+    offered.sessions = vec![
+        crate::views::picker::SessionEntry {
+            id: String::from("ses_current"),
+            title: String::from("current work"),
+            when: String::from("10:00 AM"),
+        },
+        crate::views::picker::SessionEntry {
+            id: String::from("ses_previous"),
+            title: String::from("previous work"),
+            when: String::from("yesterday"),
+        },
+    ];
+    offered.session = Some(String::from("ses_current"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_catalog(offered);
+
+    let result = screen.handle_action(action("session_list"), &press_none());
+    assert!(result.redraw);
+    let dialogs = screen.drain_dialogs();
+    assert_eq!(
+        dialogs.len(),
+        1,
+        "the populated session picker did not open"
+    );
+    assert_eq!(dialogs[0].id(), crate::views::picker::SESSION_DIALOG_ID);
+
+    screen.apply_dialog_outcome(
+        crate::views::picker::SESSION_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: crate::views::picker::SESSION_DIALOG_ID,
+            value: String::from("ses_previous"),
+        },
+    );
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Session(String::from("ses_previous"))),
+        "the selected session never reached the host"
+    );
+    assert_eq!(
+        screen.catalog.session.as_deref(),
+        Some("ses_current"),
+        "the old screen claimed the switch before the host validated it"
+    );
+    assert!(
+        ActionComponent::drain_toasts(&mut screen)
+            .iter()
+            .any(|toast| toast.text().contains("switching to session")),
+        "the screen did not state that a full session switch was starting"
+    );
+}
+
+#[test]
+fn session_screen_selecting_the_current_session_is_a_visible_noop() {
+    let (sender, _receiver) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(1);
+    let mut offered = catalog();
+    offered.sessions = vec![crate::views::picker::SessionEntry {
+        id: String::from("ses_current"),
+        title: String::from("current work"),
+        when: String::from("now"),
+    }];
+    offered.session = Some(String::from("ses_current"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_catalog(offered);
+
+    screen.apply_dialog_outcome(
+        crate::views::picker::SESSION_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: crate::views::picker::SESSION_DIALOG_ID,
+            value: String::from("ses_current"),
+        },
+    );
+
+    assert!(
+        chosen.try_recv().is_err(),
+        "the active session was re-opened"
+    );
+    assert!(
+        ActionComponent::drain_toasts(&mut screen)
+            .iter()
+            .any(|toast| toast.text().contains("already active")),
+        "the no-op selection was silent"
+    );
+}
+
+#[test]
+fn session_screen_rename_request_opens_a_prefilled_prompt_and_forwards_the_new_title() {
+    let (sender, _receiver) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(2);
+    let mut offered = catalog();
+    offered.sessions = vec![crate::views::picker::SessionEntry {
+        id: String::from("ses_current"),
+        title: String::from("current work"),
+        when: String::from("now"),
+    }];
+    offered.session = Some(String::from("ses_current"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_catalog(offered);
+
+    let result = screen.apply_dialog_outcome(
+        crate::views::picker::SESSION_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Session(
+            crate::views::picker::SessionDialogAction::Rename {
+                id: String::from("ses_current"),
+                title: String::from("current work"),
+            },
+        ),
+    );
+    assert!(result.redraw);
+    let mut requested = screen.drain_dialogs();
+    assert_eq!(requested.len(), 1, "rename did not open its prompt");
+    let mut prompt = requested.pop().expect("one prompt");
+    assert_eq!(prompt.id(), SESSION_RENAME_DIALOG_ID);
+    let joined = prompt
+        .lines(60)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(
+        joined.contains("current work"),
+        "the existing title was not prefilled:\n{joined}"
+    );
+
+    screen.apply_dialog_outcome(
+        SESSION_RENAME_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Submitted {
+            dialog: SESSION_RENAME_DIALOG_ID,
+            text: String::from("renamed work"),
+        },
+    );
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::SessionRename {
+            id: String::from("ses_current"),
+            title: String::from("renamed work"),
+        })
+    );
+}
+
+#[test]
+fn session_screen_confirmed_delete_forwards_a_typed_session_delete() {
+    let (sender, _receiver) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(1);
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), sender).with_selection_sink(selections);
+
+    screen.apply_dialog_outcome(
+        crate::views::picker::SESSION_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Session(
+            crate::views::picker::SessionDialogAction::Delete {
+                id: String::from("ses_old"),
+                title: String::from("old work"),
+            },
+        ),
+    );
+
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::SessionDelete(String::from("ses_old")))
     );
 }
 

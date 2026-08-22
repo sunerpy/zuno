@@ -129,6 +129,8 @@ pub enum DialogOutcome {
     Permission(crate::views::permission::PermissionDecision),
     /// A question was answered, one label list per question.
     Question(Vec<Vec<String>>),
+    /// The session list requested an operation on its highlighted row.
+    Session(crate::views::picker::SessionDialogAction),
     /// The MCP dialog requested an explicit lifecycle target.
     McpToggle(crate::views::picker::McpToggleRequest),
 }

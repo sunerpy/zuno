@@ -1312,6 +1312,17 @@ impl<'pool> Store<'pool> {
             .transaction(|transaction| touch_at(transaction, id, millis))
     }
 
+    /// See [`set_title`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`set_title`] returns, plus [`DbError::Open`] if no connection
+    /// could be obtained.
+    pub fn set_title(&self, id: &str, title: &str) -> Result<i64, DbError> {
+        self.pool
+            .transaction(|transaction| set_title(transaction, id, title))
+    }
+
     pub fn switch_agent_at(
         &self,
         id: &str,

@@ -16,6 +16,8 @@ This ledger records reviewed upstream behavior. It does not promise API compatib
 | Durable subagent delivery and parent wake | Durable inbox/jobs plus `reportDelivery: nextStep | quiet`, `task`, and `job` tests | Preserve job/session id separation and wake through admitted input. |
 | Consumer-owned concurrent web search | Batch `web_search` over a single-query provider with cancellation and deterministic merge tests | Keep concurrency and presentation outside providers. |
 | Goal continuation after transient failure | Persistent exponential backoff, restart recovery, typed failure policy, and CLI integration test | Continue strengthening coverage; never replay uncertain tool side effects. |
+| Dynamic Cordis package lifecycle | `zuno-extension` process registry, typed lifecycle tools, active-composition generation, and TUI rebuild | `adapt`: preserve define/run/stop/undefine and restart-loss semantics; reject JavaScript/Cordis ABI compatibility. |
+| Static profile/bundle loading | `zuno.extension/v1` manifests under config-root `extensions/<id>/extension.json` | `adapt`: use the same validated agent/workflow/skill package as the dynamic path; compiled services remain Rust profiles. |
 
 ## dsh-v0.1.1-rc.1
 

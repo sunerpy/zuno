@@ -30,7 +30,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use zuno_testkit::{MockProvider, Scenario, ScriptedEnv};
+use zuno_testkit::{DbChoice, MockProvider, Scenario, ScriptedEnv};
 
 /// The recorded conversation, chosen because todo 88's harness replays the same one.
 const CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
@@ -63,11 +63,24 @@ const REPLY_FRAGMENT: &str = "sunny";
 /// Wall-clock budget. Everything the run talks to is loopback or local disk.
 const BUDGET: Duration = Duration::from_secs(60);
 
+/// The picker does not talk to a provider; a local first frame and dialog should
+/// appear well before the full provider-turn budget.
+const PICKER_BUDGET: Duration = Duration::from_secs(15);
+
 /// Viewport rows, wide enough that the transcript is not the tightest constraint.
 const VIEWPORT_ROWS: u16 = 40;
 
 /// Viewport columns. See [`REPLY_FRAGMENT`] for why the width still matters.
 const VIEWPORT_COLUMNS: u16 = 120;
+
+const PICKER_FIRST_ID: &str = "ses_picker_first";
+const PICKER_SECOND_ID: &str = "ses_picker_second";
+// Single-span markers matter here: ratatui's diff renderer can move the cursor
+// across spaces in a title, so `"First conversation"` is not guaranteed to be
+// contiguous in the raw PTY byte stream even though the screen shows it exactly.
+const PICKER_FIRST_TITLE: &str = "PickerFirstMarker";
+const PICKER_SECOND_TITLE: &str = "PickerSecondMarker";
+const PICKER_RENAMED_TITLE: &str = "PickerRenamedMarker";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
@@ -268,7 +281,7 @@ fn run_under_pty(
     let mut text = String::new();
     let mut saw_wanted = false;
     let mut typed = submission == Submission::Flag;
-    while started.elapsed() < BUDGET {
+    while started.elapsed() < PICKER_BUDGET {
         match received.recv_timeout(Duration::from_millis(250)) {
             Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -291,6 +304,339 @@ fn run_under_pty(
         }
     }
 
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(Transcript { text, saw_wanted })
+}
+
+fn seed_session_picker(env: &ScriptedEnv) {
+    let pool = session_picker_pool(env);
+    let mut connection = pool.open_connection().expect("picker connection");
+    zuno_db::migration::apply(&mut connection).expect("picker migrations");
+    let directory = env.working_dir().to_string_lossy().into_owned();
+    connection
+        .execute(
+            "INSERT INTO project \
+             (id, worktree, vcs, time_created, time_updated, sandboxes) \
+             VALUES (?1, ?2, 'git', ?3, ?3, '[]')",
+            rusqlite::params!["project-picker", directory, 1_787_381_000_000_i64],
+        )
+        .expect("picker project");
+    let transaction = connection.transaction().expect("picker transaction");
+    for (id, slug, title, time) in [
+        (
+            PICKER_FIRST_ID,
+            "picker-first",
+            PICKER_FIRST_TITLE,
+            1_787_381_100_000_i64,
+        ),
+        (
+            PICKER_SECOND_ID,
+            "picker-second",
+            PICKER_SECOND_TITLE,
+            1_787_381_200_000_i64,
+        ),
+    ] {
+        let mut input = zuno_db::session::SessionCreate::new(
+            id,
+            slug,
+            "project-picker",
+            &directory,
+            &directory,
+            title,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .at(time);
+        input.agent = Some("build".to_owned());
+        input.model = Some(zuno_db::session::model_reference("test", "test-model"));
+        zuno_db::session::create(&transaction, &input).expect("picker session");
+    }
+    transaction.commit().expect("picker sessions commit");
+}
+
+fn session_picker_pool(env: &ScriptedEnv) -> zuno_db::Pool {
+    let variables = env.env_vars();
+    let database = PathBuf::from(
+        variables
+            .get("ZUNO_DB")
+            .expect("the picker fixture uses a file database"),
+    );
+    zuno_db::Pool::open(&zuno_paths::DbLocation::File(database)).expect("picker database opens")
+}
+
+fn run_session_picker_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::Error> {
+    let script = which::which("script").map_err(|_| {
+        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
+    })?;
+    let command = format!(
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto -s {PICKER_SECOND_ID}",
+        shell_quote(&binary().to_string_lossy())
+    );
+    let mut child = Command::new(&script)
+        .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(variables(env, "http://127.0.0.1:9"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("picker stdout was not piped"))?;
+    let (chunks, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if chunks.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut command_sent = false;
+    let mut submit_sent_at = None;
+    let mut saw_wanted = false;
+    while started.elapsed() < BUDGET {
+        match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if text.contains(PICKER_FIRST_TITLE)
+            && text.contains(PICKER_SECOND_TITLE)
+            && text.contains("ctrl+r")
+            && text.contains("ctrl+d")
+            && text.contains("delete twice")
+        {
+            saw_wanted = true;
+            break;
+        }
+        if !command_sent && text.contains("ask anything, or / for commands") {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
+            stdin.write_all(b"/session\r")?;
+            stdin.flush()?;
+            command_sent = true;
+            submit_sent_at = Some(Instant::now());
+        } else if submit_sent_at
+            .is_some_and(|submitted| submitted.elapsed() >= Duration::from_millis(500))
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
+            stdin.write_all(b"\r")?;
+            stdin.flush()?;
+            submit_sent_at = None;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(Transcript { text, saw_wanted })
+}
+
+#[derive(Clone, Copy)]
+enum SessionPickerAction {
+    SwitchToPrevious,
+    RenameCurrent,
+    DeleteCurrent,
+}
+
+impl SessionPickerAction {
+    const fn expected_session(self) -> &'static str {
+        match self {
+            Self::SwitchToPrevious | Self::DeleteCurrent => PICKER_FIRST_ID,
+            Self::RenameCurrent => PICKER_SECOND_ID,
+        }
+    }
+}
+
+fn run_session_picker_action_under_pty(
+    env: &ScriptedEnv,
+    action: SessionPickerAction,
+) -> Result<Transcript, std::io::Error> {
+    let script = which::which("script").map_err(|_| {
+        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
+    })?;
+    let command = format!(
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto -s {PICKER_SECOND_ID}",
+        shell_quote(&binary().to_string_lossy())
+    );
+    let mut child = Command::new(&script)
+        .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(variables(env, "http://127.0.0.1:9"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("picker stdout was not piped"))?;
+    let (chunks, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if chunks.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let pool = session_picker_pool(env);
+    let store = zuno_db::session::Store::new(&pool);
+    let picker_directory = env.working_dir().to_string_lossy().into_owned();
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut command_sent = false;
+    let mut command_sent_at = None;
+    let mut command_submit_sent = false;
+    let mut action_sent = false;
+    let mut action_sent_at = None;
+    let mut confirmation_seen = false;
+    let mut second_step_sent = false;
+    let mut applied_at = None;
+    let mut exit_sent = false;
+    let mut saw_wanted = false;
+    while started.elapsed() < PICKER_BUDGET {
+        match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        let applied = match action {
+            SessionPickerAction::SwitchToPrevious => second_step_sent,
+            SessionPickerAction::RenameCurrent => store
+                .find(PICKER_SECOND_ID)
+                .expect("read renamed session")
+                .is_some_and(|session| session.title == PICKER_RENAMED_TITLE),
+            SessionPickerAction::DeleteCurrent => {
+                let mut query =
+                    zuno_db::session::ListQuery::directory(picker_directory.clone()).active_only();
+                query.roots = true;
+                matches!(
+                    store.list(&query).expect("list sessions after deletion").as_slice(),
+                    [session] if session.id == PICKER_FIRST_ID
+                )
+            }
+        };
+        if applied {
+            applied_at.get_or_insert_with(Instant::now);
+        }
+        if !exit_sent
+            && applied_at.is_some_and(|applied| applied.elapsed() >= Duration::from_secs(1))
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
+            stdin.write_all(b"\x03")?;
+            stdin.flush()?;
+            exit_sent = true;
+        }
+        let expected_hint = format!("resume this session: zuno -s {}", action.expected_session());
+        if exit_sent && text.contains(&expected_hint) {
+            let entered = text.matches("\u{1b}[?1049h").count();
+            let left = text.matches("\u{1b}[?1049l").count();
+            saw_wanted = applied && entered == 1 && left == 1;
+            break;
+        }
+        if !command_sent && text.contains("ask anything, or / for commands") {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
+            stdin.write_all(b"/session\r")?;
+            stdin.flush()?;
+            command_sent = true;
+            command_sent_at = Some(Instant::now());
+        } else if command_sent
+            && !command_submit_sent
+            && command_sent_at.is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
+            stdin.write_all(b"\r")?;
+            stdin.flush()?;
+            command_submit_sent = true;
+        } else if command_submit_sent
+            && !action_sent
+            && text.contains(PICKER_FIRST_TITLE)
+            && text.contains(PICKER_SECOND_TITLE)
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
+            match action {
+                SessionPickerAction::SwitchToPrevious => {
+                    stdin.write_all(b"\x1b[B\r")?;
+                    second_step_sent = true;
+                }
+                SessionPickerAction::RenameCurrent => stdin.write_all(b"\x12")?,
+                SessionPickerAction::DeleteCurrent => stdin.write_all(b"\x04")?,
+            }
+            stdin.flush()?;
+            action_sent = true;
+            action_sent_at = Some(Instant::now());
+        } else if action_sent
+            && !second_step_sent
+            && !matches!(action, SessionPickerAction::SwitchToPrevious)
+        {
+            let ready = match action {
+                SessionPickerAction::SwitchToPrevious => false,
+                SessionPickerAction::RenameCurrent => {
+                    text.contains("Rename session")
+                        || action_sent_at
+                            .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
+                }
+                SessionPickerAction::DeleteCurrent => {
+                    let seen = text.contains("confirm deletion");
+                    confirmation_seen |= seen;
+                    confirmation_seen
+                        || action_sent_at
+                            .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
+                }
+            };
+            if ready {
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
+                match action {
+                    SessionPickerAction::SwitchToPrevious => {}
+                    SessionPickerAction::RenameCurrent => {
+                        stdin.write_all(&vec![0x7f; PICKER_SECOND_TITLE.len()])?;
+                        stdin.write_all(PICKER_RENAMED_TITLE.as_bytes())?;
+                        stdin.write_all(b"\r")?;
+                    }
+                    SessionPickerAction::DeleteCurrent => stdin.write_all(b"\x04")?,
+                }
+                stdin.flush()?;
+                second_step_sent = true;
+            }
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
     Ok(Transcript { text, saw_wanted })
@@ -395,4 +741,79 @@ async fn a_submitted_prompt_drives_a_provider_request_and_renders_the_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_prompt_typed_into_the_pty_drives_the_same_turn_as_the_flag() {
     one_turn_through(Submission::Typed).await;
+}
+
+#[test]
+fn session_picker_lists_other_active_sessions_from_the_same_directory() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    seed_session_picker(&env);
+
+    let transcript =
+        run_session_picker_under_pty(&env).expect("the real TUI session picker runs under a PTY");
+
+    assert!(
+        transcript.saw_wanted,
+        "`/session` did not show both persisted root sessions plus the rename and two-press \
+         delete hints\n\
+         transcript:\n{}",
+        transcript.text
+    );
+}
+
+#[test]
+fn session_picker_switches_without_leaving_the_terminal_session() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    seed_session_picker(&env);
+
+    let transcript =
+        run_session_picker_action_under_pty(&env, SessionPickerAction::SwitchToPrevious)
+            .expect("the real TUI switches sessions under a PTY");
+
+    assert!(
+        transcript.saw_wanted,
+        "selecting another session either did not switch or left and re-entered the alternate \
+         screen\ntranscript:\n{}",
+        transcript.text
+    );
+}
+
+#[test]
+fn session_picker_renames_the_current_session_through_the_real_tui() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    seed_session_picker(&env);
+
+    let transcript = run_session_picker_action_under_pty(&env, SessionPickerAction::RenameCurrent)
+        .expect("the real TUI renames a session under a PTY");
+
+    assert!(
+        transcript.saw_wanted,
+        "Ctrl+R did not persist the new title without leaving and re-entering the alternate \
+         screen\ntranscript:\n{}",
+        transcript.text
+    );
+}
+
+#[test]
+fn session_picker_deletes_the_current_session_without_reopening_the_terminal() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    seed_session_picker(&env);
+
+    let transcript = run_session_picker_action_under_pty(&env, SessionPickerAction::DeleteCurrent)
+        .expect("the real TUI deletes a session under a PTY");
+
+    assert!(
+        transcript.saw_wanted,
+        "two Ctrl+D presses did not delete the current session and continue in the remaining one \
+         without leaving and re-entering the alternate screen\n\
+         transcript:\n{}",
+        transcript.text
+    );
 }

@@ -915,9 +915,152 @@ pub struct SessionEntry {
     pub when: String,
 }
 
+/// A row operation emitted by the session list.
+///
+/// The dialog sends the id and the title it actually displayed. The id remains the
+/// durable identity consumed by the host; the title lets the next modal be pre-filled
+/// without putting a database read in the view layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionDialogAction {
+    /// Open the rename prompt for this session.
+    Rename { id: String, title: String },
+    /// Delete this session after the list's second-keypress confirmation.
+    Delete { id: String, title: String },
+}
+
+/// The session picker plus row actions that do not belong on generic lists.
+///
+/// Rename and delete are deliberately wrapped around [`SelectDialog`] rather than
+/// added to it: a model row cannot be renamed, an agent row cannot be deleted, and a
+/// generic list that silently accepted those actions would make the active key scopes
+/// part of every picker's API.
+pub struct SessionDialog {
+    select: SelectDialog,
+    delete_confirmation: Option<String>,
+}
+
+impl SessionDialog {
+    fn new(select: SelectDialog) -> Self {
+        Self {
+            select,
+            delete_confirmation: None,
+        }
+    }
+
+    /// Start with the cursor on the session whose id is `value`.
+    #[must_use]
+    pub fn selecting(mut self, value: &str) -> Self {
+        self.select = self.select.selecting(value);
+        self
+    }
+
+    /// The highlighted row index.
+    #[must_use]
+    pub const fn cursor(&self) -> usize {
+        self.select.cursor()
+    }
+
+    fn selected_action(&self, delete: bool) -> Option<SessionDialogAction> {
+        let item = self.select.selected()?;
+        Some(if delete {
+            SessionDialogAction::Delete {
+                id: item.value.clone(),
+                title: item.label.clone(),
+            }
+        } else {
+            SessionDialogAction::Rename {
+                id: item.value.clone(),
+                title: item.label.clone(),
+            }
+        })
+    }
+}
+
+impl Dialog for SessionDialog {
+    fn id(&self) -> &'static str {
+        self.select.id()
+    }
+
+    fn title(&self) -> String {
+        self.select.title()
+    }
+
+    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        let armed = self.delete_confirmation.as_deref();
+        let selected = self.select.selected().map(|item| item.value.as_str());
+        let selected_row = (armed == selected && armed.is_some()).then(|| {
+            self.select
+                .cursor
+                .saturating_sub(self.select.window_start())
+        });
+        let mut lines = self.select.lines(width);
+        if let Some(row) = selected_row
+            && row < lines.len()
+        {
+            lines[row] = padded(
+                " > Press ctrl+d again to confirm deletion",
+                width,
+                self.select.context.selected(),
+            );
+        }
+        lines
+    }
+
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        // Session-specific operations come first because the dialog footer keeps whole
+        // pairs from the head until the next one no longer fits. Putting generic
+        // navigation first made ordinary narrow terminals show move/page/search while
+        // silently hiding the only discoverability for rename and destructive delete.
+        // These two pairs fit together at the 40-column supported minimum.
+        vec![
+            ("ctrl+r", "rename"),
+            ("ctrl+d", "delete twice"),
+            ("enter", "select"),
+            ("↑↓", "move"),
+            ("type", "search"),
+            ("pgup/pgdn", "page"),
+            ("esc", "cancel"),
+        ]
+    }
+
+    fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
+        match action.name {
+            "session_rename" => match self.selected_action(false) {
+                Some(request) => DialogStep::Resolved(DialogOutcome::Session(request)),
+                None => DialogStep::Ignored,
+            },
+            "session_delete" => {
+                let Some(item) = self.select.selected().cloned() else {
+                    self.delete_confirmation = None;
+                    return DialogStep::Ignored;
+                };
+                if self.delete_confirmation.as_deref() == Some(item.value.as_str()) {
+                    self.delete_confirmation = None;
+                    DialogStep::Resolved(DialogOutcome::Session(SessionDialogAction::Delete {
+                        id: item.value,
+                        title: item.label,
+                    }))
+                } else {
+                    self.delete_confirmation = Some(item.value);
+                    DialogStep::Redraw
+                }
+            }
+            _ => {
+                self.delete_confirmation = None;
+                self.select.handle_action(action, event)
+            }
+        }
+    }
+
+    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+        self.delete_confirmation = None;
+        self.select.handle_typed(key)
+    }
+}
+
 /// The session picker.
 #[must_use]
-pub fn session_picker(context: ViewContext, sessions: Vec<SessionEntry>) -> SelectDialog {
+pub fn session_picker(context: ViewContext, sessions: Vec<SessionEntry>) -> SessionDialog {
     let items = sessions
         .into_iter()
         .map(|session| {
@@ -926,7 +1069,12 @@ pub fn session_picker(context: ViewContext, sessions: Vec<SessionEntry>) -> Sele
                 .valued(session.id)
         })
         .collect();
-    SelectDialog::new(SESSION_DIALOG_ID, "Sessions", context, items)
+    SessionDialog::new(SelectDialog::new(
+        SESSION_DIALOG_ID,
+        "Sessions",
+        context,
+        items,
+    ))
 }
 
 /// A model, as the picker shows it.

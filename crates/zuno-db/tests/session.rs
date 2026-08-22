@@ -526,6 +526,26 @@ fn staging_revert_requires_a_real_boundary_message() {
 }
 
 #[test]
+fn setting_a_session_title_updates_the_row_and_its_activity_time() {
+    let pool = pool();
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft("ses_a", "prj_a", WORKTREE, "old title").at(1))
+        .expect("create");
+
+    let updated = store.set_title("ses_a", "new title").expect("rename");
+    let renamed = store.get("ses_a").expect("session");
+
+    assert_eq!(renamed.title, "new title");
+    assert_eq!(renamed.time_updated, updated);
+    assert!(updated > 1);
+}
+
+#[test]
 fn session_path_matches_the_oracles_relative_computation() {
     assert_eq!(
         session_path(Path::new(WORKTREE), Path::new("/srv/app/pkg/core")),

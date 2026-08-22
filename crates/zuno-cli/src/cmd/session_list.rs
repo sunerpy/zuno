@@ -208,7 +208,7 @@ fn activity(entry: &ListedSession) -> Result<String, String> {
 
 /// `Locale.todayTimeOrDateTime` (`util/locale.ts`): a bare clock today, clock
 /// plus date otherwise.
-fn today_time_or_date_time(milliseconds: i64) -> Result<String, String> {
+pub(super) fn today_time_or_date_time(milliseconds: i64) -> Result<String, String> {
     let seconds = milliseconds.div_euclid(1_000);
     let nanos = u32::try_from(milliseconds.rem_euclid(1_000)).map_err(|error| error.to_string())?
         * 1_000_000;

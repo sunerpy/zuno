@@ -49,6 +49,9 @@ Zuno adapts:
 
 - Cordis plugins become Rust components and typed services;
 - `cordis.yml` composition becomes `HarnessProfile` plus Zuno config;
+- Cordis' define/run/stop/undefine lifecycle becomes validated
+  `zuno.extension/v1` agent/workflow/skill packages, with process-local and static lifetimes but no
+  JavaScript ABI;
 - worker-thread orchestration becomes Tokio tasks with durable SQLite coordination.
 
 ### Codex
@@ -84,6 +87,8 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | area | decision | Zuno implementation |
 | --- | --- | --- |
 | Everything is a plugin | adopt | `Component`, typed services, `ProfileBundle`, transactional `HarnessProfile` |
+| Agent-authored temporary extensions | adapt | Process-local immutable package registry plus `extension_define/run/stop/undefine/inspect`; active host refreshes before the next turn |
+| Restart-persistent extension bundles | adapt | Static `.zuno/extensions/<id>/extension.json` packages using the same schema and merger |
 | Capability roles | adopt | interface/provider/consumer ownership in separate crates or modules |
 | Model-visible means logged | adopt | durable inbox, tool results, retry notices, `session.prompt.assembled` |
 | Stable client projections | adopt | cursor replay plus snapshots shared by TUI/server/ACP/future GUI |

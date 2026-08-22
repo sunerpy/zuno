@@ -20,7 +20,7 @@ pub const NAME: &str = "customize-zuno";
 pub const LOCATION: &str = "<built-in>";
 
 /// Model-facing trigger for the native configuration skill.
-pub const DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration: zuno.json, zuno.jsonc, files under .zuno/, or files under ~/.config/zuno/. Also use when creating or fixing Zuno agents, subagents, commands, skills, MCP servers, web search, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
+pub const DESCRIPTION: &str = "Use ONLY when the user is editing or creating Zuno's own configuration or extensions: zuno.json, zuno.jsonc, files under .zuno/, files under ~/.config/zuno/, or process-local extension packages. Also use when creating or fixing Zuno agents, subagents, workflows, commands, skills, MCP servers, web search, or permission rules. Do not use for the user's own application code, or for any project that is not configuring Zuno itself.";
 
 /// The native configuration guide embedded in the binary.
 pub const CONTENT: &str = include_str!("customize-zuno.md");

@@ -61,6 +61,19 @@ The TUI favors dense, keyboard-first operation:
   the composer is empty;
 - no empty LSP status or setup prompt; the sidebar adds LSP only for configured
   services or real diagnostics;
+- `/session` lists active root sessions from the current durable database and
+  exact working directory. Selecting another session is admitted only between
+  turns and remounts the complete session composition, including transcript
+  replay, permissions, cancellation ownership, LSP/MCP workers, and snapshot
+  history. The physical terminal activation remains mounted throughout, so a
+  switch never leaves and re-enters the alternate screen;
+- the same session list owns row actions: `Ctrl+R` opens a pre-filled rename
+  prompt, while `Ctrl+D` must be pressed twice on the same row before deletion.
+  Both actions are revalidated by the host and use the transactional session
+  store; deleting the current session remounts the most recent remaining session
+  in that directory, or creates a new one when none remains. A current session
+  with background subagents still running is refused rather than deleting state
+  those tasks can still write;
 - warning and error notices wrap inside the viewport and remain visible long
   enough to inspect or select;
 - no blocking network, LSP, or provider work in the render loop.

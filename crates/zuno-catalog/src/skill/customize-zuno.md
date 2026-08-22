@@ -16,11 +16,14 @@ top-level keys fail startup.
 
 ## Applying changes
 
-Config is loaded once when Zuno starts and is not hot-reloaded. After
-saving changes to `zuno.json`, an agent file, a skill, or any other
-config-time file, **tell the user to quit and restart Zuno** for
-the changes to take effect. The running session will keep using the
-already-loaded config until then.
+Disk configuration is loaded when a Zuno composition starts and is not watched.
+After saving `zuno.json`, an agent file, a skill, a static extension manifest,
+or another config-time file, **tell the user to quit and restart Zuno**.
+
+Process-local extension packages are the deliberate exception. The model may
+define and activate one through the `extension_*` tools. The TUI rebuilds its
+host inside the same process before the next turn, and the package disappears
+when that process exits.
 
 ## Where files live
 
@@ -34,6 +37,8 @@ already-loaded config until then.
 | Global commands               | `~/.config/zuno/command(s)/<name>.md`                                                                                     |
 | Project skills                | `.zuno/skill(s)/<name>/SKILL.md`                                                                                          |
 | Global skills                 | `~/.config/zuno/skill(s)/<name>/SKILL.md`                                                                                 |
+| Project static extensions     | `.zuno/extensions/<id>/extension.json`                                                                                    |
+| Global static extensions      | `~/.config/zuno/extensions/<id>/extension.json`                                                                           |
 | External skills (auto-loaded) | `~/.claude/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md`                                                    |
 
 Configs from each scope are deep-merged. Project overrides global. Unknown
@@ -171,6 +176,64 @@ zuno models myopenai --verbose
 Credentials are stored separately from `zuno.json`. Inline
 `provider.<id>.options.apiKey` is supported, but the credential store avoids
 putting secrets in source control and configuration backups.
+
+## Extension packages
+
+Use an extension package when an agent needs to create an agent, slash-command
+workflow, or skill as one validated unit.
+
+The same `zuno.extension/v1` manifest has two lifetimes:
+
+- Process-local: call `extension_define`, then `extension_run`. It never writes
+  disk, is scoped to the current worktree, and disappears when Zuno exits.
+- Static: write `.zuno/extensions/<id>/extension.json` (or the global equivalent)
+  and restart Zuno. Static packages are active on every composition.
+
+Lifecycle tools:
+
+- `extension_inspect`: list static and process-local packages and their states.
+- `extension_define`: record one immutable process-local package, inactive.
+- `extension_run`: validate the complete active set and activate transactionally.
+- `extension_stop`: deactivate while retaining the definition.
+- `extension_undefine`: remove the process-local definition.
+
+Example:
+
+```json
+{
+  "apiVersion": "zuno.extension/v1",
+  "id": "release-review",
+  "description": "Review a release candidate",
+  "agents": {
+    "release-reviewer": {
+      "description": "Review release safety",
+      "mode": "subagent",
+      "prompt": "Inspect release integrity, rollback, and authorization."
+    }
+  },
+  "workflows": {
+    "release-review": {
+      "description": "Run the release review workflow",
+      "prompt": "Review this release candidate. $ARGUMENTS"
+    }
+  },
+  "skills": [
+    {
+      "name": "release-safety",
+      "description": "Use when reviewing a release or deployment.",
+      "content": "Check immutable inputs, rollback evidence, and production gates."
+    }
+  ]
+}
+```
+
+The static directory name must equal `id`. Two active extension packages may
+not claim the same agent, workflow, or skill name. These packages are
+declarative: they do not evaluate JavaScript, load a foreign plugin ABI, or load
+Rust dynamic libraries. An agent contribution's map key is its fixed identity;
+it cannot carry a second `name` or set `disable: true`. A custom `AgentDriver`,
+executable tool, provider, or other typed service remains a compiled Rust
+`Component` in a `HarnessProfile`.
 
 ## Skills
 

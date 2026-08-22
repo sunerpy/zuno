@@ -33,7 +33,19 @@ fn list(environment: &StartupEnvironment) -> Result<(), String> {
         &zuno_config::discovery::DiscoveryOptions::new(&directory, worktree, env.clone()),
     )
     .map_err(|error| error.report())?;
-    let agents = agent::load(&directory, worktree, env).map_err(|error| error.to_string())?;
+    let extension_scope = zuno_extension::Scope::new(worktree.unwrap_or(directory.as_path()));
+    let static_extensions = zuno_extension::discover_static(&directory, worktree, env)
+        .map_err(|error| error.to_string())?;
+    let extensions = zuno_extension::resolve_active(
+        &extension_scope,
+        &static_extensions,
+        environment.extensions(),
+    )
+    .map_err(|error| error.to_string())?;
+    let loaded = agent::load_map(&directory, worktree, env).map_err(|error| error.to_string())?;
+    let merged = agent::merge_agent_maps(&loaded.agents, extensions.agents())
+        .map_err(|error| error.to_string())?;
+    let agents = agent::list(&merged, &loaded.origins);
     let dynamic = DynamicRules::resolve(&directory, worktree, env, &config);
 
     for entry in agents {

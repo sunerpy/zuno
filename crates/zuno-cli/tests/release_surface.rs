@@ -76,7 +76,7 @@ const SMOKE_CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
 /// an addition, which is exactly how `zuno-process` and `zuno-reaping-fixture` entered
 /// the workspace unremarked; the exact roster is asserted against `crates.expected`
 /// by [`the_workspace_roster_matches_the_declared_crate_list`].
-const MINIMUM_CRATES: usize = 36;
+const MINIMUM_CRATES: usize = 37;
 const MINIMUM_SOURCE_FILES: usize = 300;
 const MINIMUM_GRAPH_PACKAGES: usize = 100;
 

@@ -7,6 +7,7 @@ zuno-config
 zuno-db
 zuno-engine
 zuno-error
+zuno-extension
 zuno-goal
 zuno-harness
 zuno-llm

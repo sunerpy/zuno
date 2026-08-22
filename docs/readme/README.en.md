@@ -87,7 +87,7 @@ may be attempted by the model in a later turn; uncertain side effects require au
 inspection. Authentication, cancellation, and permanent configuration failures pause or block.
 
 `build`, `plan`, `deep`, and the specialist agents share one native catalog. The final model prompt
-is assembled as agent, policy, memory, instruction, and skill sections, then persisted as
+is assembled as agent, policy, memory, extension, instruction, and skill sections, then persisted as
 `session.prompt.assembled` with order, source, content digests, and the actual post-hook text. See
 [the Harness Runtime guide](../harness-runtime.md).
 
@@ -108,6 +108,17 @@ permission:
 Inspect trust boundaries, permission checks, durable state, and failure behavior.
 Return findings with exact file locations.
 ```
+
+An agent may also declare a `zuno.extension/v1` package containing agents, slash-command workflows,
+and skills. `extension_define` records an immutable definition only in the current process,
+`extension_run` activates it, and `extension_stop`, `extension_undefine`, and
+`extension_inspect` manage its lifecycle. The TUI recomposes the next turn inside the same process;
+exiting Zuno loses process-local definitions.
+
+For restart-persistent loading, write the same manifest to
+`.zuno/extensions/<id>/extension.json` (or
+`~/.config/zuno/extensions/<id>/extension.json`) and restart. Both lifetimes use one validator and
+collision checker. They do not evaluate JavaScript/Cordis plugins or load Rust dynamic libraries.
 
 A native workflow does not modify the default loop. Implement `AgentDriver`, select a
 model-visible `ToolManifest`, contribute any native tools, and activate the result as one

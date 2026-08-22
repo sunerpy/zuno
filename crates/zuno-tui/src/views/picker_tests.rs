@@ -3,12 +3,12 @@
 use super::*;
 use crate::app::render_offscreen;
 use crate::keybind::ActionComponent;
-use crate::views::dialog::{DialogHost, ObservedBase};
+use crate::views::dialog::{Dialog, DialogHost, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
 use crossterm::event::KeyCode;
 
-fn render(dialog: SelectDialog, width: u16, height: u16) -> Vec<String> {
+fn render(dialog: impl Dialog + 'static, width: u16, height: u16) -> Vec<String> {
     let context = ViewContext::defaults();
     let mut host = DialogHost::new(
         context.clone(),
@@ -89,6 +89,58 @@ fn views_session_picker_renders_offscreen() {
     assert!(
         joined.contains("> Port"),
         "the cursor marker is missing:\n{joined}"
+    );
+}
+
+#[test]
+fn views_session_picker_keeps_management_hints_visible_at_narrow_width() {
+    let joined = render(session_picker(ViewContext::defaults(), sessions()), 40, 8).join("\n");
+
+    assert!(
+        joined.contains("ctrl+r rename"),
+        "the narrow session footer hid the rename shortcut:\n{joined}"
+    );
+    assert!(
+        joined.contains("ctrl+d delete twice"),
+        "the narrow session footer hid the two-press delete contract:\n{joined}"
+    );
+}
+
+#[test]
+fn views_session_picker_rename_emits_the_highlighted_session_as_a_typed_action() {
+    let mut dialog = session_picker(ViewContext::defaults(), sessions());
+    dialog.handle_action(action("dialog.select.next"), &press(KeyCode::Down));
+
+    assert_eq!(
+        dialog.handle_action(action("session_rename"), &press(KeyCode::Char('r'))),
+        DialogStep::Resolved(DialogOutcome::Session(SessionDialogAction::Rename {
+            id: String::from("ses_2"),
+            title: String::from("Theme resolution"),
+        }))
+    );
+}
+
+#[test]
+fn views_session_picker_delete_requires_the_same_action_twice_on_the_same_row() {
+    let mut dialog = session_picker(ViewContext::defaults(), sessions());
+
+    assert_eq!(
+        dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
+        DialogStep::Redraw,
+        "the first delete press must only arm confirmation"
+    );
+    dialog.handle_action(action("dialog.select.next"), &press(KeyCode::Down));
+    assert_eq!(
+        dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
+        DialogStep::Redraw,
+        "moving to another row must clear the earlier confirmation"
+    );
+    assert_eq!(
+        dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
+        DialogStep::Resolved(DialogOutcome::Session(SessionDialogAction::Delete {
+            id: String::from("ses_2"),
+            title: String::from("Theme resolution"),
+        }))
     );
 }
 

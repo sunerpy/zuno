@@ -136,7 +136,10 @@ pub(crate) struct TurnPlan {
     directory: PathBuf,
     project: zuno_paths::project::ResolvedProject,
     config: zuno_config::schema::Config,
+    agents: Vec<zuno_catalog::agent::Agent>,
     agent: zuno_catalog::agent::Agent,
+    extensions: zuno_extension::ResolvedExtensions,
+    extension_generation: u64,
     provider_id: String,
     model_id: String,
     credential: Option<Credential>,
@@ -229,6 +232,18 @@ impl TurnPlan {
             // instruction. This is the path both the TUI and `zuno run` take, which
             // made it the one place a config error reached a user unactionable.
             .map_err(|error| error.report())?;
+        let extension_scope =
+            zuno_extension::Scope::new(worktree.as_deref().unwrap_or(directory.as_path()));
+        let static_extensions =
+            zuno_extension::discover_static(&directory, worktree.as_deref(), env)
+                .map_err(to_string)?;
+        let extensions = zuno_extension::resolve_active(
+            &extension_scope,
+            &static_extensions,
+            environment.extensions(),
+        )
+        .map_err(to_string)?;
+        let extension_generation = environment.extensions().composition_generation();
         let goal_retry_policy = resolve_goal_retry_policy(&config)?;
         let credentials = zuno_auth::AuthStore::resolve(&layout, env)
             .all()
@@ -249,12 +264,17 @@ impl TurnPlan {
             .with_experimental_models(env.flag(ZUNO_ENABLE_EXPERIMENTAL_MODELS));
         let catalog = Catalog::resolve(loaded.document(), &input);
 
-        let agents =
-            zuno_catalog::agent::load(&directory, worktree.as_deref(), env).map_err(to_string)?;
+        let loaded_agents = zuno_catalog::agent::load_map(&directory, worktree.as_deref(), env)
+            .map_err(to_string)?;
+        let merged_agents =
+            zuno_catalog::agent::merge_agent_maps(&loaded_agents.agents, extensions.agents())
+                .map_err(to_string)?;
+        let agents = zuno_catalog::agent::list(&merged_agents, &loaded_agents.origins);
         let agent_name = options.agent.as_deref().unwrap_or(DEFAULT_AGENT);
         let agent = agents
-            .into_iter()
+            .iter()
             .find(|entry| entry.name == agent_name)
+            .cloned()
             .ok_or_else(|| format!("Agent not found: {agent_name}"))?;
         let requested_model = options
             .model
@@ -345,11 +365,21 @@ impl TurnPlan {
                 env,
                 &config,
             ))
-            .await,
+            .await
+            .with_overlay(extensions.skills().iter().cloned()),
         );
         let runtime = HarnessRuntime::new("profile");
+        let extension_tools = zuno_extension::lifecycle_tools(
+            extension_scope.clone(),
+            static_extensions.clone(),
+            Arc::clone(environment.extensions()),
+        );
+        let extension_contributions =
+            zuno_harness::ToolContributions::new(extension_tools).map_err(to_string)?;
         runtime
-            .activate_profile(zuno_harness::default_profile())
+            .activate_profile(zuno_harness::default_profile_with_tools(
+                extension_contributions,
+            ))
             .await
             .map_err(to_string)?;
         let instructions =
@@ -366,7 +396,10 @@ impl TurnPlan {
             directory,
             project,
             config,
+            agents,
             agent,
+            extensions,
+            extension_generation,
             credential: resolved_credential(
                 catalog.provider(&provider_id),
                 credentials.get(&provider_id),
@@ -416,6 +449,16 @@ impl TurnPlan {
     /// The agent that will answer.
     pub(crate) fn agent_name(&self) -> &str {
         &self.agent.name
+    }
+
+    /// Every resolved agent, including active static and process extensions.
+    pub(crate) fn agents(&self) -> &[zuno_catalog::agent::Agent] {
+        &self.agents
+    }
+
+    /// The exact skill set shared by prompt assembly and the `skill` tool.
+    pub(crate) fn skills(&self) -> &zuno_catalog::skill::Skills {
+        &self.skills
     }
 
     /// Every `provider/model` the catalog offers, in the order `zuno models` prints them.
@@ -694,7 +737,7 @@ pub(crate) struct TurnHost {
     runtime: HarnessRuntime,
     profile_id: String,
     driver: Arc<dyn AgentDriver>,
-    _database: Arc<zuno_db::pool::Pool>,
+    database: Arc<zuno_db::pool::Pool>,
     connection: rusqlite::Connection,
     inbox: zuno_db::inbox::SessionInbox,
     providers: ProviderRegistry,
@@ -722,6 +765,7 @@ pub(crate) struct TurnHost {
     agent: String,
     provider_id: String,
     model_id: String,
+    extension_generation: u64,
     /// The reasoning level this host resolved with.
     ///
     /// Held here because the host is the source of truth every rebuild path already
@@ -957,12 +1001,17 @@ impl TurnHost {
                 .map_err(to_string)?,
             None => discovered_commands,
         };
+        let extension_commands = zuno_catalog::command::merge_command_maps(
+            &configured_commands,
+            plan.extensions.workflows(),
+        )
+        .map_err(to_string)?;
         let mcp_prompts = mcp
             .as_ref()
             .map_or_else(Vec::new, zuno_mcp::Catalog::prompts);
         let commands = zuno_catalog::command::Registry::build(
             &zuno_catalog::command::Sources::new(&command_worktree)
-                .with_config(Some(&configured_commands))
+                .with_config(Some(&extension_commands))
                 .with_mcp_prompts(&mcp_prompts),
         );
         configure_resident_memory(
@@ -971,6 +1020,11 @@ impl TurnHost {
             zuno_tools::ScopePaths::discover(memory_root),
         )?;
         let mut notes = plan.notes;
+        plan.resolver.append_prompt_section(
+            "extensions",
+            "zuno-extension::active-packages",
+            plan.extensions.prompt_section(),
+        )?;
         announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes)?;
         announce_skills(&mut plan.resolver, &plan.skills, &mut notes)?;
         let background_jobs = super::child_turn::BackgroundJobSupervisor::default();
@@ -1046,7 +1100,7 @@ impl TurnHost {
             runtime,
             profile_id,
             driver,
-            _database: database,
+            database,
             connection,
             inbox,
             providers,
@@ -1058,6 +1112,7 @@ impl TurnHost {
             agent: plan.agent.name,
             provider_id: plan.provider_id,
             model_id: plan.model_id,
+            extension_generation: plan.extension_generation,
             effort: plan.effort,
             internals: plan.internals,
             compaction_config: plan.config.compaction.clone().unwrap_or_default(),
@@ -1085,6 +1140,55 @@ impl TurnHost {
     /// The session every turn this host drives belongs to.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Recent active root sessions in the directory this host is already running in.
+    ///
+    /// The current row supplies the directory rather than the process cwd. That keeps a
+    /// TUI resumed with `--session` scoped to the session it actually opened, and it
+    /// prevents a picker selection from crossing into a different configuration,
+    /// worktree, LSP, or snapshot composition.
+    pub(super) fn recent_sessions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<zuno_db::session::Session>, zuno_error::DbError> {
+        recent_sessions(&self.connection, &self.session_id, limit)
+    }
+
+    /// Resolve one picker target while rechecking the provider's scope rules.
+    ///
+    /// A picker result is an internal message, but it is still stale input by the time
+    /// the host consumes it: another process may have archived the row, and a future
+    /// client could send an identifier that was never offered. Revalidate the target at
+    /// the consumer boundary so session switching cannot cross a directory or enter a
+    /// child/archived session merely because the view was out of date.
+    pub(super) fn switchable_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<zuno_db::session::Session>, zuno_error::DbError> {
+        switchable_session(&self.connection, &self.session_id, session_id)
+    }
+
+    /// Rename a session through the same transactional store used by every other surface.
+    pub(super) fn rename_session(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<i64, zuno_error::DbError> {
+        zuno_db::session::Store::new(&self.database).set_title(session_id, title)
+    }
+
+    /// Delete a session and its complete child subtree through the durable store.
+    pub(super) fn delete_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<String>, zuno_error::DbError> {
+        zuno_db::session::Store::new(&self.database).remove(session_id)
+    }
+
+    /// Whether deleting this host's session would race a background subagent write.
+    pub(super) fn has_running_background_tasks(&self) -> bool {
+        self.background_jobs.has_running_tasks()
     }
 
     /// The active harness profile that assembled this session.
@@ -1158,6 +1262,11 @@ impl TurnHost {
 
     pub(crate) fn qualified_model(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
+    }
+
+    /// Active extension revision this host was assembled against.
+    pub(crate) const fn extension_generation(&self) -> u64 {
+        self.extension_generation
     }
 
     /// The reasoning level this host resolved with.
@@ -3012,6 +3121,32 @@ fn resolve_session(
     let creation = zuno_db::session::create(&transaction, &input).map_err(to_string)?;
     transaction.commit().map_err(to_string)?;
     Ok(creation.into_session())
+}
+
+fn recent_sessions(
+    connection: &rusqlite::Connection,
+    current_session_id: &str,
+    limit: u32,
+) -> Result<Vec<zuno_db::session::Session>, zuno_error::DbError> {
+    let current = zuno_db::session::get(connection, current_session_id)?;
+    let mut query = zuno_db::session::ListQuery::directory(current.directory)
+        .active_only()
+        .with_limit(limit);
+    query.roots = true;
+    zuno_db::session::list(connection, &query)
+}
+
+fn switchable_session(
+    connection: &rusqlite::Connection,
+    current_session_id: &str,
+    target_session_id: &str,
+) -> Result<Option<zuno_db::session::Session>, zuno_error::DbError> {
+    let current = zuno_db::session::get(connection, current_session_id)?;
+    let target = zuno_db::session::get(connection, target_session_id)?;
+    if target.directory != current.directory || !target.is_root() || target.is_archived() {
+        return Ok(None);
+    }
+    Ok(Some(target))
 }
 
 struct UserMessageInput<'a> {

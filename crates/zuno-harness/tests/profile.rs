@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use zuno_engine::driver::{AgentDriver, DefaultAgentDriver};
-use zuno_harness::{ToolContributions, ToolManifest, default_profile, profile, profile_with_tools};
+use zuno_harness::{
+    ToolContributions, ToolManifest, default_profile, default_profile_with_tools, profile,
+    profile_with_tools,
+};
 use zuno_runtime::HarnessRuntime;
 use zuno_tool::erase;
 use zuno_tools::invalid::InvalidTool;
@@ -73,6 +76,24 @@ async fn a_profile_publishes_native_tool_contributions() {
         ))
         .await
         .expect("custom profile activates");
+
+    let tools = runtime
+        .service::<ToolContributions>()
+        .expect("tool contributions");
+    assert_eq!(tools.tools().len(), 1);
+    assert!(Arc::ptr_eq(&tools.tools()[0], &contributed));
+}
+
+#[tokio::test]
+async fn the_default_profile_can_mount_process_owned_tool_contributions() {
+    let runtime = HarnessRuntime::new("profile");
+    let contributed = erase(InvalidTool::new());
+    runtime
+        .activate_profile(default_profile_with_tools(
+            ToolContributions::new([Arc::clone(&contributed)]).expect("unique tools"),
+        ))
+        .await
+        .expect("default profile with contributions activates");
 
     let tools = runtime
         .service::<ToolContributions>()

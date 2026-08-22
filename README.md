@@ -87,7 +87,7 @@ SQLite 中的 deadline 恢复，人工输入优先。工具失败作为 tool res
 必须先核对权威状态。认证、取消与永久配置错误分别暂停或阻断。
 
 `build`、`plan`、`deep` 与各专用 Agent 都来自同一个原生 catalog。最终发给模型的 prompt
-按 agent、策略、memory、instructions、skills 分段组装，并在请求前以
+按 agent、策略、memory、extensions、instructions、skills 分段组装，并在请求前以
 `session.prompt.assembled` 持久化其顺序、来源、内容摘要和 hook 后的实际文本。完整生命周期、
 恢复矩阵和配置见 [docs/harness-runtime.md](docs/harness-runtime.md)。
 
@@ -108,6 +108,17 @@ permission:
 Inspect trust boundaries, permission checks, durable state, and failure behavior.
 Return findings with exact file locations.
 ```
+
+Agent 也可以通过模型工具动态声明一个 `zuno.extension/v1` 包，其中包含 Agent、slash-command
+Workflow 和 Skill。`extension_define` 只在当前进程内记录不可变定义，
+`extension_run` 激活；`extension_stop`、`extension_undefine` 和
+`extension_inspect` 管理生命周期。TUI 会在该轮结束后于同一进程内重组下一轮，退出 Zuno
+后动态定义即丢失。
+
+需要跨重启保留时，把同一清单写到
+`.zuno/extensions/<id>/extension.json`（全局路径为
+`~/.config/zuno/extensions/<id>/extension.json`）并重启。两种加载方式共用验证与冲突检查；
+不会执行 JavaScript/Cordis ABI，也不会加载 Rust 动态库。
 
 原生 workflow 不需要修改默认循环。实现 `AgentDriver`，选择模型可见的 `ToolManifest`，按需
 加入原生工具，再把它们组成一个事务化 Profile：

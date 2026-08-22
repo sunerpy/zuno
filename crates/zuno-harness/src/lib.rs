@@ -188,5 +188,21 @@ pub fn profile_with_tools(
 /// The standard interactive Zuno harness.
 #[must_use]
 pub fn default_profile() -> HarnessProfile {
-    profile("default", Arc::new(DefaultAgentDriver), ToolManifest::all())
+    default_profile_with_tools(ToolContributions::default())
+}
+
+/// The standard interactive harness plus native process-owned tool contributions.
+///
+/// This is the composition seam for capabilities whose provider is created by the
+/// hosting process rather than compiled into `zuno-harness`. They still mount as a
+/// typed profile service and therefore use the same transactional activation as a
+/// custom harness.
+#[must_use]
+pub fn default_profile_with_tools(contributions: ToolContributions) -> HarnessProfile {
+    profile_with_tools(
+        "default",
+        Arc::new(DefaultAgentDriver),
+        ToolManifest::all(),
+        contributions,
+    )
 }

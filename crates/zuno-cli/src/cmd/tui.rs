@@ -28,19 +28,22 @@
 //! submission while a turn is running a visible refusal in the transcript rather
 //! than a silently queued turn.
 //!
-//! # Everything that can fail is resolved before raw mode
+//! # The initial composition is resolved before raw mode
 //!
 //! [`super::turn::TurnPlan::resolve`] and [`super::turn::TurnHost::open`] both run
 //! before [`zuno_tui::app::TerminalSession::start`]. An error printed into a raw-mode
 //! alternate screen that is about to be torn down is an error nobody reads.
+//! Session changes remount that composition while the same terminal session remains
+//! active; if a remount fails, unwinding restores the terminal before the error is
+//! reported.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, watch};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender, event_channel};
@@ -204,6 +207,61 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         );
     }
 
+    let mut options = TurnOptions {
+        directory: None,
+        model: args.model.clone(),
+        agent: args.agent.clone(),
+        session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
+        title: None,
+        effort: None,
+    };
+    let mut launch_prompt = args.prompt.clone();
+    let mut terminal = None;
+
+    loop {
+        match execute_once(
+            args,
+            environment,
+            options,
+            launch_prompt.take(),
+            &mut terminal,
+        )? {
+            TuiRunOutcome::Exit(session_id) => {
+                // The resume command belongs in the primary screen's scrollback. Keep the
+                // terminal mounted across composition changes, but restore it before this
+                // final line exactly as a one-composition run does.
+                drop(terminal.take());
+                println!("{}", resume_hint(&session_id));
+                return Ok(());
+            }
+            TuiRunOutcome::Remount(next) => options = next,
+        }
+    }
+}
+
+enum TuiRunOutcome {
+    Exit(String),
+    Remount(TurnOptions),
+}
+
+/// The physical terminal activation shared by every session composition in one run.
+///
+/// A session switch still rebuilds all session-scoped services, projections and workers,
+/// but dropping this guard only on final exit keeps raw mode and the alternate screen
+/// continuous. The old complete frame remains visible while the replacement resolves,
+/// then the new app paints over it in one frame.
+struct MountedTerminal {
+    lifecycle: Arc<CrosstermLifecycle>,
+    _session: TerminalSession,
+}
+
+fn execute_once(
+    args: &TuiArgs,
+    environment: &StartupEnvironment,
+    options: TurnOptions,
+    launch_prompt: Option<String>,
+    terminal: &mut Option<MountedTerminal>,
+) -> Result<TuiRunOutcome, String> {
     let (terminal_sender, terminal_receiver) = zuno_tui::app::terminal_event_channel();
     let (engine_sender, engine_receiver) = event_channel();
     let (prompt_sender, prompt_receiver) = mpsc::channel(PROMPT_CHANNEL_CAPACITY);
@@ -213,14 +271,6 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .enable_all()
         .build()
         .map_err(to_string)?;
-    let options = TurnOptions {
-        directory: None,
-        model: args.model.clone(),
-        agent: args.agent.clone(),
-        session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
-        title: None,
-        effort: None,
-    };
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
     let layout = zuno_paths::Layout::resolve(environment.resolved());
     let snapshot_store = zuno_snapshot::Store::open(
@@ -298,7 +348,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     // Read before `TurnHost::open` consumes the plan, and before raw mode, so a slow
     // skill scan cannot delay the first frame of an already-entered alternate screen.
     let facts = runtime.block_on(SessionFacts::resolve(&plan, environment));
-    let catalog = runtime.block_on(session_catalog(&plan, environment));
+    let mut catalog = runtime.block_on(session_catalog(&plan, environment));
     let broker = Arc::new(PermissionBroker::new(terminal_sender.clone()));
     let question_broker = Arc::new(QuestionBroker::new(terminal_sender.clone()));
     let question: Arc<dyn QuestionAsker> = Arc::clone(&question_broker) as Arc<dyn QuestionAsker>;
@@ -318,6 +368,8 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         SessionRunRegistry::new(),
         Some(mcp_catalog.clone()),
     )?;
+    catalog.sessions = session_entries(&host)?;
+    catalog.session = Some(host.session_id().to_owned());
     // Seeded from the row the host already read, so a session resumed with `-s` shows its
     // name on frame one instead of waiting for a turn that will never re-title it — the
     // generator declines outright once a session is named.
@@ -428,13 +480,11 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
             .transcript_mut()
             .push(Message::notice(format!("warning: {notice}")));
     }
-    if let Some(prompt) = args
-        .prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|prompt| !prompt.is_empty())
-    {
-        screen.submit_prompt(prompt);
+    if let Some(prompt) = launch_prompt {
+        let prompt = prompt.trim();
+        if !prompt.is_empty() {
+            screen.submit_prompt(prompt);
+        }
     }
     // The waker is what makes a toast expire on its deadline rather than at the next
     // event. It is the terminal channel that already exists, not a new one; see
@@ -446,7 +496,13 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .with_question(QuestionBridge::new(context, question_broker));
     let root = KeyDispatcher::new(keymap, scopes(), Box::new(bridge));
 
-    let lifecycle = Arc::new(CrosstermLifecycle::new(config.mouse));
+    // Mouse capture is terminal-scoped rather than session-scoped. Session switching is
+    // admitted only inside the same exact directory, so every remount resolves the same
+    // merged TUI configuration and reuses the activation created by the first one.
+    let lifecycle = terminal.as_ref().map_or_else(
+        || Arc::new(CrosstermLifecycle::new(config.mouse)),
+        |mounted| Arc::clone(&mounted.lifecycle),
+    );
     let target = CrosstermDrawTarget::new().map_err(to_string)?;
     let (mut app, owner) = App::new(
         Box::new(root),
@@ -462,8 +518,17 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     ));
     let editor_wake = terminal_sender.clone();
     let mcp_wake = terminal_sender.clone();
+    let session_shutdown = terminal_sender.clone();
+    let remount = CompositionRemount::default();
+    let driver_remount = remount.clone();
 
-    let session = TerminalSession::start(lifecycle).map_err(to_string)?;
+    if terminal.is_none() {
+        let session = TerminalSession::start(lifecycle.clone()).map_err(to_string)?;
+        *terminal = Some(MountedTerminal {
+            lifecycle,
+            _session: session,
+        });
+    }
     let outcome = runtime.block_on(async move {
         let input = tokio::spawn(zuno_tui::app::forward_terminal_input(
             terminal_sender,
@@ -479,6 +544,8 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
                 mcp_catalog,
                 mcp_dirty: Arc::clone(&mcp_dirty),
                 snapshots: SnapshotHistory::new(snapshot_store),
+                remount: driver_remount,
+                shutdown: session_shutdown,
             },
             prompt_receiver,
             selection_receiver,
@@ -533,9 +600,11 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         history.abort();
         outcome
     });
-    drop(session);
-    println!("{}", resume_hint(&resumed_session));
-    outcome.map_err(to_string)
+    outcome.map_err(to_string)?;
+    if let Some(next) = remount.take() {
+        return Ok(TuiRunOutcome::Remount(next));
+    }
+    Ok(TuiRunOutcome::Exit(resumed_session))
 }
 
 /// The flag that reopens an existing session, as `command.rs` declares it.
@@ -757,7 +826,6 @@ impl SessionFacts {
     /// because a placeholder would be indistinguishable from a fact that failed to
     /// load — the one ambiguity a surface like this must not have.
     async fn resolve(plan: &TurnPlan, environment: &StartupEnvironment) -> Self {
-        let env = environment.resolved();
         let directory = plan.directory();
         let worktree = plan.worktree();
         let config = plan.config();
@@ -794,11 +862,8 @@ impl SessionFacts {
             .unwrap_or_default();
         mcp.sort_by(|left, right| left.name.cmp(&right.name));
 
-        let options = zuno_catalog::skill::discovery::SkillOptions::from_config(
-            directory, worktree, env, config,
-        );
-        let skills = zuno_catalog::skill::load(&options)
-            .await
+        let skills = plan
+            .skills()
             .sorted()
             .into_iter()
             .map(|skill| zuno_tui::views::ambient::SkillSummary {
@@ -1043,9 +1108,8 @@ async fn forward_cancellations(
 /// is precisely how the surfaces came to disagree.
 async fn session_catalog(
     plan: &TurnPlan,
-    environment: &StartupEnvironment,
+    _environment: &StartupEnvironment,
 ) -> zuno_tui::views::session::SessionCatalog {
-    let env = environment.resolved();
     // Reasoning support per row comes from the same `FixedFacts` a delegation resolves a
     // model through, so the picker and the `task` tool cannot disagree about which models
     // reason. An undeclared model is treated as not reasoning: that yields a key which
@@ -1068,35 +1132,43 @@ async fn session_catalog(
     // filter is what stops them disagreeing about what "the agents" are. A subagent is
     // reachable only by delegation and `hidden` is its author asking not to be offered, so
     // neither is a valid choice for the session's own agent.
-    let agents = zuno_catalog::agent::load(plan.directory(), plan.worktree(), env)
-        .map(|agents| {
-            agents
-                .into_iter()
-                .filter(|agent| {
-                    !matches!(agent.mode, zuno_catalog::agent::AgentMode::Subagent)
-                        && agent.hidden != Some(true)
-                })
-                .map(|agent| zuno_tui::views::picker::AgentEntry {
-                    name: agent.name,
-                    description: agent.description.unwrap_or_default(),
-                })
-                .collect()
+    let agents = plan
+        .agents()
+        .iter()
+        .filter(|agent| {
+            !matches!(agent.mode, zuno_catalog::agent::AgentMode::Subagent)
+                && agent.hidden != Some(true)
         })
-        .unwrap_or_default();
+        .map(|agent| zuno_tui::views::picker::AgentEntry {
+            name: agent.name.clone(),
+            description: agent.description.clone().unwrap_or_default(),
+        })
+        .collect();
     zuno_tui::views::session::SessionCatalog {
         models,
         agents,
-        // Sessions are deliberately absent: the picker would list them, and this task
-        // cannot switch session without discarding the turn it may be running. An empty
-        // list makes the key report "nothing to choose from" rather than open a surface
-        // whose selection would be silently ignored.
         sessions: Vec::new(),
+        session: None,
         model: Some(plan.qualified_model()),
         agent: Some(plan.agent_name().to_owned()),
         reasoning: plan.reasoning_supported(),
         reasoning_efforts,
         effort: plan.effort(),
     }
+}
+
+fn session_entries(host: &TurnHost) -> Result<Vec<zuno_tui::views::picker::SessionEntry>, String> {
+    host.recent_sessions(zuno_db::session::UPSTREAM_LIST_LIMIT)
+        .map_err(to_string)?
+        .into_iter()
+        .map(|session| {
+            Ok(zuno_tui::views::picker::SessionEntry {
+                id: session.id,
+                title: session.title,
+                when: super::session_list::today_time_or_date_time(session.time_updated)?,
+            })
+        })
+        .collect()
 }
 
 /// Split one `provider/model` line into the entry the picker groups by.
@@ -1121,16 +1193,18 @@ fn model_entry(qualified: &str, reasoning: bool) -> zuno_tui::views::picker::Mod
     }
 }
 
-/// Rebuild the turn host whenever the user picks a different model or agent.
+/// Apply a picker choice at the boundary between turns.
 ///
-/// A new host rather than a mutated one, and that is the safety argument rather than a
-/// convenience: a host wires exactly one provider credential, so moving it to another
-/// provider's model in place would present that credential to a different vendor's
-/// endpoint. Going back through [`TurnPlan::resolve`] and [`TurnHost::open`] — the same
-/// path the launch takes — re-resolves the credential, the tool set and the token window
-/// together, so there is no combination reachable here that a launch could not produce.
+/// Model, agent, and effort changes rebuild only the turn host. A session change remounts
+/// the whole TUI composition: transcript replay, cancellation ownership, permission
+/// attribution, LSP/MCP workers, snapshot history, and the exit hint all belong to the
+/// selected session and must move together. The physical terminal activation is retained
+/// by [`MountedTerminal`], so this complete replacement does not flash the primary screen.
 ///
-/// The session id is carried over, so the conversation continues rather than restarting.
+/// A new host rather than a mutated one is the credential-safety argument: moving a live
+/// host to another provider's model in place could present one provider's credential to
+/// another endpoint. Going back through [`TurnPlan::resolve`] and [`TurnHost::open`] keeps
+/// every rebuilt combination reachable from an ordinary launch.
 ///
 /// A failure leaves the previous host in place and says so on the transcript's own
 /// channel. The alternative — tearing down a working host on a bad pick — would lose the
@@ -1144,11 +1218,17 @@ struct TurnRebuild<'a> {
     mcp_catalog: &'a zuno_mcp::Catalog,
 }
 
+enum SelectionOutcome {
+    Rebuilt(TurnEventSender),
+    Remount(TurnOptions),
+    Unchanged,
+}
+
 async fn apply_selection(
     selection: zuno_tui::views::session::Selection,
     host: &mut TurnHost,
     rebuild: &TurnRebuild<'_>,
-) -> Option<TurnEventSender> {
+) -> SelectionOutcome {
     let mut next = rebuild.options.clone();
     next.session = SessionChoice::Existing(host.session_id().to_owned());
     // Seeded from the live host, not from the launch options, for the reason
@@ -1167,10 +1247,195 @@ async fn apply_selection(
         // shape. That is also what makes a level chosen here survive a later model
         // switch, and what silently drops it when the new model does not reason.
         zuno_tui::views::session::Selection::Effort(effort) => next.effort = Some(effort),
-        // A theme is the view layer's own business and a session change is not something
-        // this task can honour without discarding the turn it may be running.
-        zuno_tui::views::session::Selection::Session(_)
-        | zuno_tui::views::session::Selection::Theme(_) => return None,
+        zuno_tui::views::session::Selection::Session(session_id) => {
+            if session_id == host.session_id() {
+                return SelectionOutcome::Unchanged;
+            }
+            let target = match host.switchable_session(&session_id) {
+                Ok(Some(target)) => target,
+                Ok(None) => {
+                    let _reported = rebuild
+                        .events
+                        .publish(TurnEvent::Provider {
+                            step: 0,
+                            event: StreamEvent::StatusDetail {
+                                detail: format!(
+                                    "warning: session {session_id} is no longer switchable here"
+                                ),
+                            },
+                        })
+                        .await;
+                    return SelectionOutcome::Unchanged;
+                }
+                Err(error) => {
+                    let _reported = rebuild
+                        .events
+                        .publish(TurnEvent::Provider {
+                            step: 0,
+                            event: StreamEvent::StatusDetail {
+                                detail: format!(
+                                    "warning: could not validate session {session_id}: {error}"
+                                ),
+                            },
+                        })
+                        .await;
+                    return SelectionOutcome::Unchanged;
+                }
+            };
+            next.directory = Some(PathBuf::from(target.directory));
+            next.session = SessionChoice::Existing(target.id);
+            return SelectionOutcome::Remount(next);
+        }
+        zuno_tui::views::session::Selection::SessionRename { id, title } => {
+            let title = title.trim();
+            if title.is_empty() {
+                let _reported = rebuild
+                    .events
+                    .publish(TurnEvent::Provider {
+                        step: 0,
+                        event: StreamEvent::StatusDetail {
+                            detail: String::from("warning: session title cannot be empty"),
+                        },
+                    })
+                    .await;
+                return SelectionOutcome::Unchanged;
+            }
+            let target = match host.switchable_session(&id) {
+                Ok(Some(target)) => target,
+                Ok(None) => {
+                    let _reported = rebuild
+                        .events
+                        .publish(TurnEvent::Provider {
+                            step: 0,
+                            event: StreamEvent::StatusDetail {
+                                detail: format!("warning: session {id} is no longer editable here"),
+                            },
+                        })
+                        .await;
+                    return SelectionOutcome::Unchanged;
+                }
+                Err(error) => {
+                    let _reported = rebuild
+                        .events
+                        .publish(TurnEvent::Provider {
+                            step: 0,
+                            event: StreamEvent::StatusDetail {
+                                detail: format!(
+                                    "warning: could not validate session {id}: {error}"
+                                ),
+                            },
+                        })
+                        .await;
+                    return SelectionOutcome::Unchanged;
+                }
+            };
+            if let Err(error) = host.rename_session(&id, title) {
+                let _reported = rebuild
+                    .events
+                    .publish(TurnEvent::Provider {
+                        step: 0,
+                        event: StreamEvent::StatusDetail {
+                            detail: format!("warning: could not rename session {id}: {error}"),
+                        },
+                    })
+                    .await;
+                return SelectionOutcome::Unchanged;
+            }
+            next.directory = Some(PathBuf::from(target.directory));
+            return SelectionOutcome::Remount(next);
+        }
+        zuno_tui::views::session::Selection::SessionDelete(id) => {
+            let target = match host.switchable_session(&id) {
+                Ok(Some(target)) => target,
+                Ok(None) => {
+                    let _reported = rebuild
+                        .events
+                        .publish(TurnEvent::Provider {
+                            step: 0,
+                            event: StreamEvent::StatusDetail {
+                                detail: format!(
+                                    "warning: session {id} is no longer deletable here"
+                                ),
+                            },
+                        })
+                        .await;
+                    return SelectionOutcome::Unchanged;
+                }
+                Err(error) => {
+                    let _reported = rebuild
+                        .events
+                        .publish(TurnEvent::Provider {
+                            step: 0,
+                            event: StreamEvent::StatusDetail {
+                                detail: format!(
+                                    "warning: could not validate session {id}: {error}"
+                                ),
+                            },
+                        })
+                        .await;
+                    return SelectionOutcome::Unchanged;
+                }
+            };
+            let deleting_current = id == host.session_id();
+            if deleting_current && host.has_running_background_tasks() {
+                let _reported = rebuild
+                    .events
+                    .publish(TurnEvent::Provider {
+                        step: 0,
+                        event: StreamEvent::StatusDetail {
+                            detail: format!(
+                                "warning: session {id} still has background subagents running; \
+                                 wait for them to finish before deleting it"
+                            ),
+                        },
+                    })
+                    .await;
+                return SelectionOutcome::Unchanged;
+            }
+            let replacement = if deleting_current {
+                match host.recent_sessions(zuno_db::session::UPSTREAM_LIST_LIMIT) {
+                    Ok(sessions) => sessions.into_iter().find(|session| session.id != id),
+                    Err(error) => {
+                        let _reported = rebuild
+                            .events
+                            .publish(TurnEvent::Provider {
+                                step: 0,
+                                event: StreamEvent::StatusDetail {
+                                    detail: format!(
+                                        "warning: could not choose a session after deleting {id}: {error}"
+                                    ),
+                                },
+                            })
+                            .await;
+                        return SelectionOutcome::Unchanged;
+                    }
+                }
+            } else {
+                None
+            };
+            if let Err(error) = host.delete_session(&id) {
+                let _reported = rebuild
+                    .events
+                    .publish(TurnEvent::Provider {
+                        step: 0,
+                        event: StreamEvent::StatusDetail {
+                            detail: format!("warning: could not delete session {id}: {error}"),
+                        },
+                    })
+                    .await;
+                return SelectionOutcome::Unchanged;
+            }
+            next.directory = Some(PathBuf::from(target.directory));
+            if deleting_current {
+                next.session = replacement.map_or(SessionChoice::New, |session| {
+                    SessionChoice::Existing(session.id)
+                });
+                next.title = None;
+            }
+            return SelectionOutcome::Remount(next);
+        }
+        // A theme is owned and applied entirely by the view layer.
+        zuno_tui::views::session::Selection::Theme(_) => return SelectionOutcome::Unchanged,
     }
     let rebuilt = async {
         let plan = TurnPlan::resolve(&next, rebuild.environment).await?;
@@ -1187,7 +1452,7 @@ async fn apply_selection(
     match rebuilt {
         Ok(replacement) => {
             *host = replacement;
-            Some(rebuild.events.clone())
+            SelectionOutcome::Rebuilt(rebuild.events.clone())
         }
         Err(message) => {
             let _reported = rebuild
@@ -1195,11 +1460,11 @@ async fn apply_selection(
                 .publish(TurnEvent::Provider {
                     step: 0,
                     event: StreamEvent::StatusDetail {
-                        detail: format!("warning: keeping the previous model: {message}"),
+                        detail: format!("warning: keeping the current turn host: {message}"),
                     },
                 })
                 .await;
-            None
+            SelectionOutcome::Unchanged
         }
     }
 }
@@ -1213,6 +1478,27 @@ struct TurnDriver {
     mcp_catalog: zuno_mcp::Catalog,
     mcp_dirty: Arc<AtomicBool>,
     snapshots: SnapshotHistory,
+    remount: CompositionRemount,
+    shutdown: mpsc::Sender<TerminalEvent>,
+}
+
+#[derive(Clone, Default)]
+struct CompositionRemount(Arc<Mutex<Option<TurnOptions>>>);
+
+impl CompositionRemount {
+    fn request(&self, options: TurnOptions) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(options);
+    }
+
+    fn take(&self) -> Option<TurnOptions> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
 }
 
 struct SnapshotHistory {
@@ -1273,14 +1559,20 @@ async fn drive_turns(
                     events: &events,
                     mcp_catalog: &driver.mcp_catalog,
                 };
-                if let Some(rebuilt) = apply_selection(
+                match apply_selection(
                     selection,
                     &mut driver.host,
                     &rebuild,
                 )
                 .await
                 {
-                    events = rebuilt;
+                    SelectionOutcome::Rebuilt(rebuilt) => events = rebuilt,
+                    SelectionOutcome::Remount(next) => {
+                        driver.remount.request(next);
+                        let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
+                        return;
+                    }
+                    SelectionOutcome::Unchanged => {}
                 }
                 continue;
             }
@@ -1299,6 +1591,16 @@ async fn drive_turns(
             &mut driver.snapshots,
         )
         .await;
+        if environment.extensions().composition_generation() != driver.host.extension_generation() {
+            let mut next = driver.options.clone();
+            next.session = SessionChoice::Existing(driver.host.session_id().to_owned());
+            next.model = Some(driver.host.qualified_model());
+            next.agent = Some(driver.host.agent_name().to_owned());
+            next.effort = driver.host.effort();
+            driver.remount.request(next);
+            let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
+            return;
+        }
     }
 }
 
