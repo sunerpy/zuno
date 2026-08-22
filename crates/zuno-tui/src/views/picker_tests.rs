@@ -121,7 +121,7 @@ fn views_session_picker_rename_emits_the_highlighted_session_as_a_typed_action()
 }
 
 #[test]
-fn views_session_picker_delete_requires_the_same_action_twice_on_the_same_row() {
+fn views_session_picker_delete_emits_without_closing_so_another_row_can_follow() {
     let mut dialog = session_picker(ViewContext::defaults(), sessions());
 
     assert_eq!(
@@ -137,10 +137,15 @@ fn views_session_picker_delete_requires_the_same_action_twice_on_the_same_row() 
     );
     assert_eq!(
         dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
-        DialogStep::Resolved(DialogOutcome::Session(SessionDialogAction::Delete {
+        DialogStep::Emitted(DialogOutcome::Session(SessionDialogAction::Delete {
             id: String::from("ses_2"),
             title: String::from("Theme resolution"),
         }))
+    );
+    assert_eq!(
+        dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
+        DialogStep::Redraw,
+        "the emitted delete must leave the session picker ready to arm another deletion"
     );
 }
 

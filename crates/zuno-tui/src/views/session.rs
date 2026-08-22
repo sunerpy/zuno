@@ -2263,7 +2263,12 @@ impl SessionScreen {
         Some(Box::new(picker))
     }
 
-    fn session_picker(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+    /// Build the session picker from the screen's current projection.
+    ///
+    /// Client hosts use this after a session-deletion remount so the refreshed list is
+    /// already open on the replacement composition. Keeping construction here prevents
+    /// clients from duplicating the active-row and empty-catalog rules.
+    pub fn session_picker(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
         if self.catalog.sessions.is_empty() {
             return None;
         }

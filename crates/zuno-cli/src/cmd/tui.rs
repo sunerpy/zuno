@@ -217,6 +217,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     };
     let mut launch_prompt = args.prompt.clone();
     let mut terminal = None;
+    let mut initial_dialog = None;
 
     loop {
         match execute_once(
@@ -224,6 +225,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
             environment,
             options,
             launch_prompt.take(),
+            initial_dialog.take(),
             &mut terminal,
         )? {
             TuiRunOutcome::Exit(session_id) => {
@@ -234,14 +236,43 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
                 println!("{}", resume_hint(&session_id));
                 return Ok(());
             }
-            TuiRunOutcome::Remount(next) => options = next,
+            TuiRunOutcome::Remount(next) => {
+                options = next.options;
+                initial_dialog = next.initial_dialog;
+            }
         }
     }
 }
 
 enum TuiRunOutcome {
     Exit(String),
-    Remount(TurnOptions),
+    Remount(RemountRequest),
+}
+
+#[derive(Clone, Copy)]
+enum RemountDialog {
+    Sessions,
+}
+
+struct RemountRequest {
+    options: TurnOptions,
+    initial_dialog: Option<RemountDialog>,
+}
+
+impl RemountRequest {
+    fn plain(options: TurnOptions) -> Self {
+        Self {
+            options,
+            initial_dialog: None,
+        }
+    }
+
+    fn reopening_sessions(options: TurnOptions) -> Self {
+        Self {
+            options,
+            initial_dialog: Some(RemountDialog::Sessions),
+        }
+    }
 }
 
 /// The physical terminal activation shared by every session composition in one run.
@@ -260,6 +291,7 @@ fn execute_once(
     environment: &StartupEnvironment,
     options: TurnOptions,
     launch_prompt: Option<String>,
+    initial_dialog: Option<RemountDialog>,
     terminal: &mut Option<MountedTerminal>,
 ) -> Result<TuiRunOutcome, String> {
     let (terminal_sender, terminal_receiver) = zuno_tui::app::terminal_event_channel();
@@ -490,8 +522,15 @@ fn execute_once(
     // event. It is the terminal channel that already exists, not a new one; see
     // `zuno_tui::views::toast` for why one deadline and one wake was chosen over giving
     // the redraw scheduler a fourth tier.
-    let dialogs =
+    let initial_dialog = match initial_dialog {
+        Some(RemountDialog::Sessions) => screen.session_picker(),
+        None => None,
+    };
+    let mut dialogs =
         DialogHost::new(context.clone(), Box::new(screen)).with_waker(terminal_sender.clone());
+    if let Some(dialog) = initial_dialog {
+        dialogs.open(dialog);
+    }
     let bridge = PermissionBridge::new(context.clone(), broker, dialogs)
         .with_question(QuestionBridge::new(context, question_broker));
     let root = KeyDispatcher::new(keymap, scopes(), Box::new(bridge));
@@ -1220,7 +1259,7 @@ struct TurnRebuild<'a> {
 
 enum SelectionOutcome {
     Rebuilt(TurnEventSender),
-    Remount(TurnOptions),
+    Remount(RemountRequest),
     Unchanged,
 }
 
@@ -1284,7 +1323,7 @@ async fn apply_selection(
             };
             next.directory = Some(PathBuf::from(target.directory));
             next.session = SessionChoice::Existing(target.id);
-            return SelectionOutcome::Remount(next);
+            return SelectionOutcome::Remount(RemountRequest::plain(next));
         }
         zuno_tui::views::session::Selection::SessionRename { id, title } => {
             let title = title.trim();
@@ -1342,7 +1381,7 @@ async fn apply_selection(
                 return SelectionOutcome::Unchanged;
             }
             next.directory = Some(PathBuf::from(target.directory));
-            return SelectionOutcome::Remount(next);
+            return SelectionOutcome::Remount(RemountRequest::plain(next));
         }
         zuno_tui::views::session::Selection::SessionDelete(id) => {
             let target = match host.switchable_session(&id) {
@@ -1432,7 +1471,7 @@ async fn apply_selection(
                 });
                 next.title = None;
             }
-            return SelectionOutcome::Remount(next);
+            return SelectionOutcome::Remount(RemountRequest::reopening_sessions(next));
         }
         // A theme is owned and applied entirely by the view layer.
         zuno_tui::views::session::Selection::Theme(_) => return SelectionOutcome::Unchanged,
@@ -1483,17 +1522,17 @@ struct TurnDriver {
 }
 
 #[derive(Clone, Default)]
-struct CompositionRemount(Arc<Mutex<Option<TurnOptions>>>);
+struct CompositionRemount(Arc<Mutex<Option<RemountRequest>>>);
 
 impl CompositionRemount {
-    fn request(&self, options: TurnOptions) {
+    fn request(&self, request: RemountRequest) {
         *self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(options);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
     }
 
-    fn take(&self) -> Option<TurnOptions> {
+    fn take(&self) -> Option<RemountRequest> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1567,8 +1606,8 @@ async fn drive_turns(
                 .await
                 {
                     SelectionOutcome::Rebuilt(rebuilt) => events = rebuilt,
-                    SelectionOutcome::Remount(next) => {
-                        driver.remount.request(next);
+                    SelectionOutcome::Remount(request) => {
+                        driver.remount.request(request);
                         let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
                         return;
                     }
@@ -1597,7 +1636,7 @@ async fn drive_turns(
             next.model = Some(driver.host.qualified_model());
             next.agent = Some(driver.host.agent_name().to_owned());
             next.effort = driver.host.effort();
-            driver.remount.request(next);
+            driver.remount.request(RemountRequest::plain(next));
             let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
             return;
         }

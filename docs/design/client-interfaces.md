@@ -71,9 +71,11 @@ The TUI favors dense, keyboard-first operation:
   prompt, while `Ctrl+D` must be pressed twice on the same row before deletion.
   Both actions are revalidated by the host and use the transactional session
   store; deleting the current session remounts the most recent remaining session
-  in that directory, or creates a new one when none remains. A current session
-  with background subagents still running is refused rather than deleting state
-  those tasks can still write;
+  in that directory, or creates a new one when none remains. A successful delete
+  reopens the refreshed session list on that replacement so users can delete
+  several sessions without invoking `/session` again; a refused delete leaves
+  the existing list mounted. A current session with background subagents still
+  running is refused rather than deleting state those tasks can still write;
 - warning and error notices wrap inside the viewport and remain visible long
   enough to inspect or select;
 - no blocking network, LSP, or provider work in the render loop.

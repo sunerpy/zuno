@@ -3931,7 +3931,7 @@ fn every_extension_contribution_reaches_its_native_consumer() {
     assert!(
         tui.contains("environment.extensions().composition_generation()")
             && tui.contains("driver.host.extension_generation()")
-            && tui.contains("driver.remount.request(next)"),
+            && tui.contains("driver.remount.request(RemountRequest::plain(next))"),
         "the long-lived TUI no longer recomposes after an extension lifecycle change"
     );
 }

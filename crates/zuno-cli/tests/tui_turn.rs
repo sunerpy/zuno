@@ -75,11 +75,13 @@ const VIEWPORT_COLUMNS: u16 = 120;
 
 const PICKER_FIRST_ID: &str = "ses_picker_first";
 const PICKER_SECOND_ID: &str = "ses_picker_second";
+const PICKER_THIRD_ID: &str = "ses_picker_third";
 // Single-span markers matter here: ratatui's diff renderer can move the cursor
 // across spaces in a title, so `"First conversation"` is not guaranteed to be
 // contiguous in the raw PTY byte stream even though the screen shows it exactly.
 const PICKER_FIRST_TITLE: &str = "PickerFirstMarker";
 const PICKER_SECOND_TITLE: &str = "PickerSecondMarker";
+const PICKER_THIRD_TITLE: &str = "PickerThirdMarker";
 const PICKER_RENAMED_TITLE: &str = "PickerRenamedMarker";
 
 fn binary() -> PathBuf {
@@ -281,7 +283,7 @@ fn run_under_pty(
     let mut text = String::new();
     let mut saw_wanted = false;
     let mut typed = submission == Submission::Flag;
-    while started.elapsed() < PICKER_BUDGET {
+    while started.elapsed() < BUDGET {
         match received.recv_timeout(Duration::from_millis(250)) {
             Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -354,6 +356,27 @@ fn seed_session_picker(env: &ScriptedEnv) {
     transaction.commit().expect("picker sessions commit");
 }
 
+fn seed_third_session(env: &ScriptedEnv) {
+    let pool = session_picker_pool(env);
+    let mut connection = pool.open_connection().expect("picker connection");
+    let directory = env.working_dir().to_string_lossy().into_owned();
+    let transaction = connection.transaction().expect("picker transaction");
+    let mut input = zuno_db::session::SessionCreate::new(
+        PICKER_THIRD_ID,
+        "picker-third",
+        "project-picker",
+        &directory,
+        &directory,
+        PICKER_THIRD_TITLE,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .at(1_787_381_050_000_i64);
+    input.agent = Some("build".to_owned());
+    input.model = Some(zuno_db::session::model_reference("test", "test-model"));
+    zuno_db::session::create(&transaction, &input).expect("third picker session");
+    transaction.commit().expect("third picker session commit");
+}
+
 fn session_picker_pool(env: &ScriptedEnv) -> zuno_db::Pool {
     let variables = env.env_vars();
     let database = PathBuf::from(
@@ -405,7 +428,7 @@ fn run_session_picker_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io
     let mut command_sent = false;
     let mut submit_sent_at = None;
     let mut saw_wanted = false;
-    while started.elapsed() < BUDGET {
+    while started.elapsed() < PICKER_BUDGET {
         match received.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -450,13 +473,12 @@ fn run_session_picker_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io
 enum SessionPickerAction {
     SwitchToPrevious,
     RenameCurrent,
-    DeleteCurrent,
 }
 
 impl SessionPickerAction {
     const fn expected_session(self) -> &'static str {
         match self {
-            Self::SwitchToPrevious | Self::DeleteCurrent => PICKER_FIRST_ID,
+            Self::SwitchToPrevious => PICKER_FIRST_ID,
             Self::RenameCurrent => PICKER_SECOND_ID,
         }
     }
@@ -503,7 +525,6 @@ fn run_session_picker_action_under_pty(
 
     let pool = session_picker_pool(env);
     let store = zuno_db::session::Store::new(&pool);
-    let picker_directory = env.working_dir().to_string_lossy().into_owned();
     let started = Instant::now();
     let mut text = String::new();
     let mut command_sent = false;
@@ -511,7 +532,6 @@ fn run_session_picker_action_under_pty(
     let mut command_submit_sent = false;
     let mut action_sent = false;
     let mut action_sent_at = None;
-    let mut confirmation_seen = false;
     let mut second_step_sent = false;
     let mut applied_at = None;
     let mut exit_sent = false;
@@ -528,15 +548,6 @@ fn run_session_picker_action_under_pty(
                 .find(PICKER_SECOND_ID)
                 .expect("read renamed session")
                 .is_some_and(|session| session.title == PICKER_RENAMED_TITLE),
-            SessionPickerAction::DeleteCurrent => {
-                let mut query =
-                    zuno_db::session::ListQuery::directory(picker_directory.clone()).active_only();
-                query.roots = true;
-                matches!(
-                    store.list(&query).expect("list sessions after deletion").as_slice(),
-                    [session] if session.id == PICKER_FIRST_ID
-                )
-            }
         };
         if applied {
             applied_at.get_or_insert_with(Instant::now);
@@ -594,26 +605,18 @@ fn run_session_picker_action_under_pty(
                     second_step_sent = true;
                 }
                 SessionPickerAction::RenameCurrent => stdin.write_all(b"\x12")?,
-                SessionPickerAction::DeleteCurrent => stdin.write_all(b"\x04")?,
             }
             stdin.flush()?;
             action_sent = true;
             action_sent_at = Some(Instant::now());
         } else if action_sent
             && !second_step_sent
-            && !matches!(action, SessionPickerAction::SwitchToPrevious)
+            && matches!(action, SessionPickerAction::RenameCurrent)
         {
             let ready = match action {
                 SessionPickerAction::SwitchToPrevious => false,
                 SessionPickerAction::RenameCurrent => {
                     text.contains("Rename session")
-                        || action_sent_at
-                            .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
-                }
-                SessionPickerAction::DeleteCurrent => {
-                    let seen = text.contains("confirm deletion");
-                    confirmation_seen |= seen;
-                    confirmation_seen
                         || action_sent_at
                             .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
                 }
@@ -630,13 +633,166 @@ fn run_session_picker_action_under_pty(
                         stdin.write_all(PICKER_RENAMED_TITLE.as_bytes())?;
                         stdin.write_all(b"\r")?;
                     }
-                    SessionPickerAction::DeleteCurrent => stdin.write_all(b"\x04")?,
                 }
                 stdin.flush()?;
                 second_step_sent = true;
             }
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(Transcript { text, saw_wanted })
+}
+
+fn run_consecutive_session_deletes_under_pty(
+    env: &ScriptedEnv,
+) -> Result<Transcript, std::io::Error> {
+    let script = which::which("script").map_err(|_| {
+        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
+    })?;
+    let command = format!(
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto -s {PICKER_SECOND_ID}",
+        shell_quote(&binary().to_string_lossy())
+    );
+    let mut child = Command::new(&script)
+        .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(variables(env, "http://127.0.0.1:9"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("picker stdout was not piped"))?;
+    let (chunks, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if chunks.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let pool = session_picker_pool(env);
+    let store = zuno_db::session::Store::new(&pool);
+    let directory = env.working_dir().to_string_lossy().into_owned();
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut command_sent = false;
+    let mut command_sent_at = None;
+    let mut command_submit_sent = false;
+    let mut first_arm_sent = false;
+    let mut first_confirm_sent = false;
+    let mut first_title_count_before_remount = 0;
+    let mut second_arm_sent = false;
+    let mut second_confirmation_count = 0;
+    let mut second_confirm_sent = false;
+    let mut third_title_count_before_remount = 0;
+    let mut exit_sent = false;
+    let mut saw_wanted = false;
+
+    while started.elapsed() < PICKER_BUDGET {
+        let disconnected = match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => {
+                text.push_str(&String::from_utf8_lossy(&chunk));
+                false
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => true,
+        };
+
+        let first_deleted = store
+            .find(PICKER_SECOND_ID)
+            .expect("read the first deleted session")
+            .is_none();
+        let mut query = zuno_db::session::ListQuery::directory(directory.clone()).active_only();
+        query.roots = true;
+        let remaining = store
+            .list(&query)
+            .expect("list sessions after consecutive deletion");
+        let both_deleted =
+            matches!(remaining.as_slice(), [session] if session.id == PICKER_THIRD_ID);
+
+        if text.contains(&format!("resume this session: zuno -s {PICKER_THIRD_ID}")) {
+            let entered = text.matches("\u{1b}[?1049h").count();
+            let left = text.matches("\u{1b}[?1049l").count();
+            saw_wanted = both_deleted && entered == 1 && left == 1;
+            if saw_wanted {
+                break;
+            }
+        }
+        if disconnected {
+            break;
+        }
+
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("picker stdin was not piped"))?;
+        if !command_sent && text.contains("ask anything, or / for commands") {
+            stdin.write_all(b"/session\r")?;
+            stdin.flush()?;
+            command_sent = true;
+            command_sent_at = Some(Instant::now());
+        } else if command_sent
+            && !command_submit_sent
+            && command_sent_at.is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
+        {
+            stdin.write_all(b"\r")?;
+            stdin.flush()?;
+            command_submit_sent = true;
+        } else if command_submit_sent
+            && !first_arm_sent
+            && text.contains(PICKER_FIRST_TITLE)
+            && text.contains(PICKER_SECOND_TITLE)
+            && text.contains(PICKER_THIRD_TITLE)
+        {
+            stdin.write_all(b"\x04")?;
+            stdin.flush()?;
+            first_arm_sent = true;
+        } else if first_arm_sent && !first_confirm_sent && text.contains("deletion") {
+            first_title_count_before_remount = text.matches(PICKER_FIRST_TITLE).count();
+            stdin.write_all(b"\x04")?;
+            stdin.flush()?;
+            first_confirm_sent = true;
+        } else if first_confirm_sent
+            && first_deleted
+            && !second_arm_sent
+            && text.matches(PICKER_FIRST_TITLE).count() > first_title_count_before_remount
+        {
+            second_confirmation_count = text.matches("deletion").count();
+            stdin.write_all(b"\x04")?;
+            stdin.flush()?;
+            second_arm_sent = true;
+        } else if second_arm_sent
+            && !second_confirm_sent
+            && text.matches("deletion").count() > second_confirmation_count
+        {
+            third_title_count_before_remount = text.matches(PICKER_THIRD_TITLE).count();
+            stdin.write_all(b"\x04")?;
+            stdin.flush()?;
+            second_confirm_sent = true;
+        } else if second_confirm_sent
+            && both_deleted
+            && !exit_sent
+            && text.matches(PICKER_THIRD_TITLE).count() > third_title_count_before_remount
+        {
+            // The final picker render proves it was reopened after the second deletion.
+            stdin.write_all(b"\x03")?;
+            stdin.flush()?;
+            exit_sent = true;
+        }
+    }
+
     let _ = child.kill();
     let _ = child.wait();
     Ok(Transcript { text, saw_wanted })
@@ -800,19 +956,20 @@ fn session_picker_renames_the_current_session_through_the_real_tui() {
 }
 
 #[test]
-fn session_picker_deletes_the_current_session_without_reopening_the_terminal() {
+fn session_picker_stays_open_for_consecutive_deletes() {
     let env = ScriptedEnv::new()
         .expect("isolated environment")
         .with_db(DbChoice::TempFile);
     seed_session_picker(&env);
+    seed_third_session(&env);
 
-    let transcript = run_session_picker_action_under_pty(&env, SessionPickerAction::DeleteCurrent)
-        .expect("the real TUI deletes a session under a PTY");
+    let transcript = run_consecutive_session_deletes_under_pty(&env)
+        .expect("the real TUI deletes consecutive sessions under a PTY");
 
     assert!(
         transcript.saw_wanted,
-        "two Ctrl+D presses did not delete the current session and continue in the remaining one \
-         without leaving and re-entering the alternate screen\n\
+        "the session picker did not remain available for a second two-press deletion without \
+         another `/session` command, or the terminal session was reopened\n\
          transcript:\n{}",
         transcript.text
     );

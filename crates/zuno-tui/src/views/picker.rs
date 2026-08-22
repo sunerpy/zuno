@@ -1036,7 +1036,11 @@ impl Dialog for SessionDialog {
                 };
                 if self.delete_confirmation.as_deref() == Some(item.value.as_str()) {
                     self.delete_confirmation = None;
-                    DialogStep::Resolved(DialogOutcome::Session(SessionDialogAction::Delete {
+                    // Deletion is executed by the runtime host. Keep the picker mounted
+                    // while that happens so a successful composition remount can replace it
+                    // with the refreshed list instead of exposing the transcript between
+                    // consecutive deletes. A refusal likewise leaves the same list available.
+                    DialogStep::Emitted(DialogOutcome::Session(SessionDialogAction::Delete {
                         id: item.value,
                         title: item.label,
                     }))
