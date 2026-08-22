@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::app::render_offscreen;
-use crate::views::message::TokenUsage;
+use crate::views::message::{TokenUsage, UsageState};
 use crate::views::testkit::rows;
 
 fn ambient() -> Ambient {
@@ -21,6 +21,7 @@ fn ambient() -> Ambient {
             cache_read: 800,
             cache_write: 200,
         },
+        usage_state: UsageState::Known,
         context_used: Some(64),
         lsp: vec![
             Service::new("rust-analyzer", Health::Ready).detailed("/config/workspace/zuno"),

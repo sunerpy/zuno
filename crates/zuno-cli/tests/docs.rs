@@ -239,7 +239,9 @@ fn database_docs_describe_a_hard_pre_release_format_cut() {
     for required in [
         "unsupported pre-release format",
         "without modification",
-        "The 40 migrations",
+        "no incremental database migration",
+        "zuno_schema",
+        "never deletes or rewrites",
     ] {
         assert!(
             text.contains(required),

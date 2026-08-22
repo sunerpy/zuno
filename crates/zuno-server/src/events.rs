@@ -164,6 +164,10 @@ impl EventService {
 
 fn turn_event(event: &TurnEvent) -> NewEvent {
     let (event_type, properties) = match event {
+        TurnEvent::SessionMaterialized { session_id, title } => (
+            "session.materialized",
+            object(json!({"sessionID": session_id, "title": title})),
+        ),
         TurnEvent::TurnStarted { session_id } => {
             ("turn.started", object(json!({"sessionID": session_id})))
         }

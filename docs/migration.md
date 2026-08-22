@@ -47,89 +47,28 @@ database it opened. See
 
 ## Opening an existing Zuno database
 
-Three states are recognized:
+Zuno is unreleased and intentionally has no incremental database migration
+chain. Two states are recognized:
 
-1. **Empty file.** The current schema is created and the journal is pre-filled
-   with every migration id.
-2. **A database with a `session` table and a `migration` journal.** Only
-   migrations whose id is not recorded are run, each in its own transaction.
-3. **Any existing session database without Zuno's `migration` journal.** It is
-   refused without modification as an unsupported pre-release format.
+1. **Empty file.** The complete current schema and one `zuno_schema` format
+   marker are created atomically.
+2. **Non-empty file.** The format marker must equal
+   `zuno_db::migration::CURRENT_FORMAT`; otherwise the unsupported pre-release format
+   is refused without modification.
 
-A non-empty database with no `session` table is refused outright:
+There is no ALTER, backfill, downgrade, or best-effort compatibility path. A
+schema change bumps the format and development databases are rebuilt. This keeps
+the current schema as the only source of truth and avoids carrying unreleased
+history into the product.
 
-```text
-database is not empty and has no session table
-```
-
-### Before schema migration
-
-Migration is forward-only. There is no downgrade. Copy the file first:
+When a format is rejected, preserve the file if its data matters, then select a
+new database path or remove the old development database yourself:
 
 ```sh
-cp "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db" "${XDG_DATA_HOME:-$HOME/.local/share}/zuno/zuno.db.backup"
+ZUNO_DB=/tmp/zuno-current.db zuno
 ```
 
-The migration journal is forward-only. If it contains an id above this binary's
-known ceiling, Zuno refuses to open the database and names both the ceiling and
-the observed id. Keep the backup before allowing any version to migrate the file.
-
-## The 40 migrations
-
-Generated from `zuno_db::migration::MIGRATION_IDS`, in execution order.
-`CURRENT_VERSION` equals this list's length; the documentation gate asserts that,
-so adding a migration without documenting it fails.
-
-<!-- generated:BEGIN migration-journal -->
-| # | migration id |
-|---:|---|
-| 1 | `20260127222353_familiar_lady_ursula` |
-| 2 | `20260211171708_add_project_commands` |
-| 3 | `20260213144116_wakeful_the_professor` |
-| 4 | `20260225215848_workspace` |
-| 5 | `20260227213759_add_session_workspace_id` |
-| 6 | `20260228203230_blue_harpoon` |
-| 7 | `20260303231226_add_workspace_fields` |
-| 8 | `20260309230000_move_org_to_state` |
-| 9 | `20260312043431_session_message_cursor` |
-| 10 | `20260323234822_events` |
-| 11 | `20260410174513_workspace-name` |
-| 12 | `20260413175956_chief_energizer` |
-| 13 | `20260423070820_add_icon_url_override` |
-| 14 | `20260427172553_slow_nightmare` |
-| 15 | `20260428004200_add_session_path` |
-| 16 | `20260501142318_next_venus` |
-| 17 | `20260504145000_add_sync_owner` |
-| 18 | `20260507164347_add_workspace_time` |
-| 19 | `20260510033149_session_usage` |
-| 20 | `20260511000411_data_migration_state` |
-| 21 | `20260511173437_session-metadata` |
-| 22 | `20260601010001_normalize_storage_paths` |
-| 23 | `20260601202201_amazing_prowler` |
-| 24 | `20260602002951_lowly_union_jack` |
-| 25 | `20260602182828_add_project_directories` |
-| 26 | `20260603001617_session_message_projection_indexes` |
-| 27 | `20260603040000_session_message_projection_order` |
-| 28 | `20260603141458_session_input_inbox` |
-| 29 | `20260603160727_jittery_ezekiel_stane` |
-| 30 | `20260604172448_event_sourced_session_input` |
-| 31 | `20260605003541_add_session_context_snapshot` |
-| 32 | `20260605042240_add_context_epoch_agent` |
-| 33 | `20260611035744_credential` |
-| 34 | `20260611192811_lush_chimera` |
-| 35 | `20260612174303_project_dir_strategy` |
-| 36 | `20260622142730_simplify_session_context_epoch` |
-| 37 | `20260622170816_reset_v2_session_state` |
-| 38 | `20260622202450_simplify_session_input` |
-| 39 | `20260821160000_agent_job` |
-| 40 | `20260822170000_generalize_agent_job_subject` |
-<!-- generated:END migration-journal -->
-
-Regenerate with:
-
-```sh
-ZUNO_DOCS_REGENERATE=1 cargo test -p zuno-cli --test docs
-```
+Zuno never deletes or rewrites a rejected database automatically.
 
 ## Provider configuration
 

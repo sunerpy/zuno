@@ -311,6 +311,101 @@ fn run_under_pty(
     Ok(Transcript { text, saw_wanted })
 }
 
+/// Open and leave the real welcome screen without submitting model input.
+///
+/// The process is allowed to initialize its project, configuration and client
+/// projections. The assertion below is intentionally against the database after a
+/// graceful Ctrl+C exit: none of those read-only startup effects may materialize the
+/// prepared session identity.
+fn run_empty_welcome_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::Error> {
+    let script = which::which("script").map_err(|_| {
+        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
+    })?;
+    let command = format!(
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto",
+        shell_quote(&binary().to_string_lossy())
+    );
+    let mut child = Command::new(&script)
+        .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(variables(env, "http://127.0.0.1:9"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("welcome stdout was not piped"))?;
+    let (chunks, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if chunks.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut first_frame = false;
+    let mut exit_sent = false;
+    let mut graceful_exit = false;
+    while started.elapsed() < PICKER_BUDGET {
+        match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                graceful_exit = exit_sent;
+                break;
+            }
+        }
+        if !exit_sent && text.contains("ask anything, or / for commands") {
+            first_frame = true;
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("welcome stdin was not piped"))?;
+            stdin.write_all(b"\x03")?;
+            stdin.flush()?;
+            exit_sent = true;
+        }
+        if exit_sent && child.try_wait()?.is_some() {
+            graceful_exit = true;
+            while let Ok(chunk) = received.recv_timeout(Duration::from_millis(50)) {
+                text.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            break;
+        }
+    }
+    if child.try_wait()?.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+
+    let pool = session_picker_pool(env);
+    let store = zuno_db::session::Store::new(&pool);
+    let mut query =
+        zuno_db::session::ListQuery::directory(env.working_dir().to_string_lossy().into_owned())
+            .active_only();
+    query.roots = true;
+    let sessions = store
+        .list(&query)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let saw_wanted = first_frame
+        && graceful_exit
+        && sessions.is_empty()
+        && !text.contains("resume this session:");
+    Ok(Transcript { text, saw_wanted })
+}
+
 fn seed_session_picker(env: &ScriptedEnv) {
     let pool = session_picker_pool(env);
     let mut connection = pool.open_connection().expect("picker connection");
@@ -699,7 +794,6 @@ fn run_consecutive_session_deletes_under_pty(
     let mut third_title_count_before_remount = 0;
     let mut exit_sent = false;
     let mut saw_wanted = false;
-    let mut launched_session_id = None;
 
     while started.elapsed() < PICKER_BUDGET {
         let disconnected = match received.recv_timeout(Duration::from_millis(100)) {
@@ -716,34 +810,21 @@ fn run_consecutive_session_deletes_under_pty(
         let remaining = store
             .list(&query)
             .expect("list sessions after consecutive deletion");
-        if launched_session_id.is_none() {
-            launched_session_id = remaining
-                .iter()
-                .find(|session| {
-                    !matches!(
-                        session.id.as_str(),
-                        PICKER_FIRST_ID | PICKER_SECOND_ID | PICKER_THIRD_ID
-                    )
-                })
-                .map(|session| session.id.clone());
-        }
-        let first_deleted = launched_session_id.as_deref().is_some_and(|id| {
-            store
-                .find(id)
-                .expect("read the newly launched session")
-                .is_none()
-        });
+        let first_deleted = store
+            .find(PICKER_SECOND_ID)
+            .expect("read the initially selected session")
+            .is_none();
         let both_deleted = first_deleted
             && matches!(
                 remaining.as_slice(),
-                [first, third]
-                    if first.id == PICKER_FIRST_ID && third.id == PICKER_THIRD_ID
+                [third] if third.id == PICKER_THIRD_ID
             );
 
-        if text.contains(&format!("resume this session: zuno -s {PICKER_FIRST_ID}")) {
+        if exit_sent && text.contains("\u{1b}[?1049l") {
             let entered = text.matches("\u{1b}[?1049h").count();
             let left = text.matches("\u{1b}[?1049l").count();
-            saw_wanted = both_deleted && entered == 1 && left == 1;
+            saw_wanted =
+                both_deleted && entered == 1 && left == 1 && !text.contains("resume this session:");
             if saw_wanted {
                 break;
             }
@@ -915,6 +996,23 @@ async fn a_submitted_prompt_drives_a_provider_request_and_renders_the_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_prompt_typed_into_the_pty_drives_the_same_turn_as_the_flag() {
     one_turn_through(Submission::Typed).await;
+}
+
+#[test]
+fn opening_and_leaving_the_welcome_screen_creates_no_session() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+
+    let transcript = run_empty_welcome_under_pty(&env)
+        .expect("the empty welcome screen starts and exits under a PTY");
+
+    assert!(
+        transcript.saw_wanted,
+        "opening and leaving the welcome screen either created a durable session, printed an \
+         unusable resume hint, or failed to exit cleanly\ntranscript:\n{}",
+        transcript.text
+    );
 }
 
 #[test]

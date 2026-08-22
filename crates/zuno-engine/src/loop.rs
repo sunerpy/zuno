@@ -32,7 +32,8 @@ use zuno_db::{Connection, open, session};
 use zuno_error::{DbError, ProviderError};
 use zuno_llm::cache::{CacheViolation, DynamicContext, McpToolStatus, PreparedTurn, PromptCache};
 use zuno_llm::event::{
-    FinishReason, Message, RequestContentBlock, Role, StreamEvent, ThoughtSignature,
+    FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
+    ThoughtSignature,
 };
 use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
@@ -108,6 +109,11 @@ impl TurnEventSender {
 /// Every interface-observable transition of one turn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
+    /// A prepared interactive session acquired its durable row with the first input.
+    SessionMaterialized {
+        session_id: String,
+        title: String,
+    },
     TurnStarted {
         session_id: String,
     },
@@ -334,8 +340,8 @@ impl TurnError {
             },
             Self::Database(
                 DbError::Open { .. }
-                | DbError::Migration { .. }
-                | DbError::MigrationTooNew { .. }
+                | DbError::Schema { .. }
+                | DbError::SchemaMismatch { .. }
                 | DbError::Query { .. }
                 | DbError::NotFound { .. }
                 | DbError::Decode { .. },
@@ -566,6 +572,8 @@ pub struct RunTurnRequest {
     pub session_id: String,
     pub turn_id: String,
     pub dynamic_context: DynamicContext,
+    /// Model context ceiling used to interpret the latest prompt occupancy.
+    pub context_limit: Option<u64>,
 }
 
 impl RunTurnRequest {
@@ -580,7 +588,15 @@ impl RunTurnRequest {
             session_id: session_id.into(),
             turn_id: turn_id.into(),
             dynamic_context,
+            context_limit: None,
         }
+    }
+
+    /// Attach the active model's context ceiling.
+    #[must_use]
+    pub fn with_context_limit(mut self, context_limit: u64) -> Self {
+        self.context_limit = (context_limit > 0).then_some(context_limit);
+        self
     }
 }
 
@@ -667,6 +683,7 @@ struct StepAccumulator {
     output_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
     cache_write_input_tokens: Option<u64>,
+    prompt_accounting: Option<PromptAccounting>,
 }
 
 impl StepAccumulator {
@@ -687,6 +704,7 @@ impl StepAccumulator {
             output_tokens: None,
             cache_read_input_tokens: None,
             cache_write_input_tokens: None,
+            prompt_accounting: None,
         }
     }
 
@@ -775,14 +793,13 @@ impl StepAccumulator {
                 output_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
-                // Not applied here for the reason given in `stream.rs`: these four are
-                // persisted verbatim as the provider's own report.
-                accounting: _,
+                accounting,
             } => {
                 self.input_tokens = *input_tokens;
                 self.output_tokens = *output_tokens;
                 self.cache_read_input_tokens = *cache_read_input_tokens;
                 self.cache_write_input_tokens = *cache_write_input_tokens;
+                self.prompt_accounting = Some(*accounting);
             }
             StreamEvent::NativeToolCall {
                 request_id,
@@ -841,6 +858,7 @@ impl StepAccumulator {
         self.output_tokens = None;
         self.cache_read_input_tokens = None;
         self.cache_write_input_tokens = None;
+        self.prompt_accounting = None;
     }
 
     fn provider_reasoning_capsules(&self) -> impl Iterator<Item = &RequestContentBlock> {
@@ -2304,7 +2322,13 @@ fn checkpoint_assistant(
     }
     update_usage(&mut assistant.data, accumulator);
 
-    let store = MessageStore::new(connection);
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(open::map_error)?;
+    let store = MessageStore::new(&transaction);
+    let previous = store
+        .find_message(&assistant.id)?
+        .map(|message| session::MessageUsage::from_data(&message.data));
     store.put_message_at(assistant, completed)?;
     if !accumulator.text.is_empty() {
         let text = PartRecord::from_json(
@@ -2364,6 +2388,16 @@ fn checkpoint_assistant(
         )?;
         store.put_part_at(&tool, completed)?;
     }
+    session::reconcile_usage(
+        &transaction,
+        &request.session_id,
+        previous,
+        session::MessageUsage::from_data(&assistant.data),
+        request
+            .context_limit
+            .and_then(|limit| i64::try_from(limit).ok()),
+    )?;
+    transaction.commit().map_err(open::map_error)?;
     Ok(())
 }
 
@@ -2388,6 +2422,14 @@ fn update_usage(data: &mut Map<String, Value>, accumulator: &StepAccumulator) {
             "write".to_owned(),
             Value::from(accumulator.cache_write_input_tokens.unwrap_or(0)),
         );
+    }
+    if let Some(accounting) = accumulator.prompt_accounting {
+        tokens.insert(
+            "accounting".to_owned(),
+            Value::String(accounting.as_str().to_owned()),
+        );
+    } else {
+        tokens.remove("accounting");
     }
 }
 

@@ -56,6 +56,7 @@ use crate::open;
 use crate::pool::Pool;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
+use serde_json::{Map, Value as JsonValue};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zuno_error::DbError;
@@ -86,8 +87,10 @@ pub const UPSTREAM_LIST_LIMIT: u32 = 100;
 const COLUMNS: &str = "id, project_id, workspace_id, parent_id, slug, directory, path, title, \
      version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, \
      metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, \
-     tokens_cache_write, revert, permission, agent, model, time_created, time_updated, \
+     tokens_cache_write, tokens_last_prompt, tokens_context_limit, tokens_accounting, \
+     tokens_known, revert, permission, agent, model, time_created, time_updated, \
      time_compacting, time_archived";
+pub(crate) const COLUMN_COUNT: usize = 33;
 
 /// One row of the `session` table.
 ///
@@ -124,10 +127,8 @@ pub struct Session {
     pub summary: Option<Summary>,
     /// Opaque JSON blob of caller metadata, carried through unparsed.
     pub metadata: Option<String>,
-    /// Accumulated cost in dollars.
-    pub cost: f64,
-    /// Accumulated token usage.
-    pub tokens: Tokens,
+    /// Durable provider usage projection.
+    pub usage: SessionUsage,
     /// Opaque JSON revert marker, carried through unparsed.
     pub revert: Option<String>,
     /// Opaque JSON permission ruleset, carried through unparsed.
@@ -183,6 +184,131 @@ pub struct Tokens {
     pub cache_read: i64,
     /// Tokens written into the provider's prompt cache.
     pub cache_write: i64,
+}
+
+/// How a provider's prompt figure relates to its cache counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenAccounting {
+    /// The provider's input count already includes cache reads and writes.
+    CacheInsideInput,
+    /// Cache reads and writes sit beside the provider's input count.
+    CacheBesideInput,
+}
+
+impl TokenAccounting {
+    /// Stable persisted spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CacheInsideInput => "cache-inside-input",
+            Self::CacheBesideInput => "cache-beside-input",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cache-inside-input" => Some(Self::CacheInsideInput),
+            "cache-beside-input" => Some(Self::CacheBesideInput),
+            _ => None,
+        }
+    }
+
+    fn prompt_total(self, tokens: Tokens) -> i64 {
+        match self {
+            Self::CacheInsideInput => tokens.input,
+            Self::CacheBesideInput => tokens
+                .input
+                .saturating_add(tokens.cache_read)
+                .saturating_add(tokens.cache_write),
+        }
+    }
+
+    fn normalized(self, tokens: Tokens) -> Tokens {
+        let input = match self {
+            Self::CacheInsideInput => tokens
+                .input
+                .saturating_sub(tokens.cache_read)
+                .saturating_sub(tokens.cache_write)
+                .max(0),
+            Self::CacheBesideInput => tokens.input,
+        };
+        Tokens { input, ..tokens }
+    }
+}
+
+/// Frontend-neutral durable usage for one session.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SessionUsage {
+    /// Accumulated provider cost in dollars.
+    pub cost: f64,
+    /// Disjoint token buckets. Cache tokens are counted outside `input`.
+    pub tokens: Tokens,
+    /// Whole prompt sent by the most recent provider request.
+    pub last_prompt_tokens: Option<i64>,
+    /// Context ceiling used for the most recent request.
+    pub context_limit: Option<i64>,
+    /// Accounting mode reported by the most recent request.
+    pub accounting: Option<TokenAccounting>,
+    /// Whether every assistant token snapshot in this session can be normalized.
+    pub known: bool,
+}
+
+/// One assistant message's usage snapshot, before it is folded into a session.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MessageUsage {
+    /// Cost stored on the assistant message.
+    pub cost: f64,
+    /// Provider-reported token buckets.
+    pub tokens: Tokens,
+    /// Provider accounting mode, absent when no reliable usage event arrived.
+    pub accounting: Option<TokenAccounting>,
+}
+
+impl MessageUsage {
+    /// Decode the assistant message JSON written by the engine.
+    #[must_use]
+    pub fn from_data(data: &Map<String, JsonValue>) -> Self {
+        let tokens = data.get("tokens").and_then(JsonValue::as_object);
+        let cache = tokens
+            .and_then(|tokens| tokens.get("cache"))
+            .and_then(JsonValue::as_object);
+        Self {
+            cost: data.get("cost").and_then(JsonValue::as_f64).unwrap_or(0.0),
+            tokens: Tokens {
+                input: json_i64(tokens.and_then(|tokens| tokens.get("input"))),
+                output: json_i64(tokens.and_then(|tokens| tokens.get("output"))),
+                reasoning: json_i64(tokens.and_then(|tokens| tokens.get("reasoning"))),
+                cache_read: json_i64(cache.and_then(|cache| cache.get("read"))),
+                cache_write: json_i64(cache.and_then(|cache| cache.get("write"))),
+            },
+            accounting: tokens
+                .and_then(|tokens| tokens.get("accounting"))
+                .and_then(JsonValue::as_str)
+                .and_then(TokenAccounting::parse),
+        }
+    }
+
+    fn normalized(self) -> Option<Tokens> {
+        self.accounting
+            .map(|accounting| accounting.normalized(self.tokens))
+    }
+
+    fn last_prompt_tokens(self) -> Option<i64> {
+        self.accounting
+            .map(|accounting| accounting.prompt_total(self.tokens))
+    }
+}
+
+fn json_i64(value: Option<&JsonValue>) -> i64 {
+    value
+        .and_then(JsonValue::as_i64)
+        .or_else(|| {
+            value
+                .and_then(JsonValue::as_u64)
+                .and_then(|value| i64::try_from(value).ok())
+        })
+        .unwrap_or(0)
+        .max(0)
 }
 
 /// The diff summary attached to a compacted or reverted session.
@@ -737,6 +863,189 @@ pub fn touch_at(transaction: &Transaction<'_>, id: &str, millis: i64) -> Result<
         });
     }
     Ok(millis)
+}
+
+/// Reconcile one assistant message's old and new usage snapshots into its session.
+///
+/// The message upsert and this call must share a transaction. Replaying the same
+/// checkpoint then reads the just-persisted snapshot as `previous`, making every delta
+/// zero instead of charging the session twice. When any assistant message lacks an
+/// accounting mode, cumulative token usage remains explicitly unknown; the latest prompt
+/// may still be reported when the current message itself is known.
+///
+/// # Errors
+///
+/// [`DbError::NotFound`] when `session_id` names no session. [`DbError::Query`] when
+/// SQLite cannot inspect or update the projection.
+pub fn reconcile_usage(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    previous: Option<MessageUsage>,
+    current: MessageUsage,
+    context_limit: Option<i64>,
+) -> Result<(), DbError> {
+    let was_known = transaction
+        .query_row(
+            "SELECT tokens_known FROM session WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(open::map_error)?
+        .ok_or_else(|| DbError::NotFound {
+            table: TABLE.to_owned(),
+            id: session_id.to_owned(),
+        })?;
+    let all_known = transaction
+        .query_row(
+            "SELECT
+               EXISTS (
+                 SELECT 1 FROM message
+                 WHERE session_id = ?1
+                   AND json_extract(data, '$.role') = 'assistant'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM message
+                 WHERE session_id = ?1
+                   AND json_extract(data, '$.role') = 'assistant'
+                   AND (
+                     json_extract(data, '$.tokens.accounting') IS NULL
+                     OR json_extract(data, '$.tokens.accounting')
+                        NOT IN ('cache-inside-input', 'cache-beside-input')
+                   )
+               )",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(open::map_error)?;
+
+    let accounting = current.accounting.map(TokenAccounting::as_str);
+    let last_prompt = current.last_prompt_tokens();
+    let context_limit = context_limit.filter(|value| *value > 0);
+
+    if all_known && was_known {
+        let old = previous
+            .and_then(MessageUsage::normalized)
+            .unwrap_or_default();
+        let new = current.normalized().unwrap_or_default();
+        transaction
+            .execute(
+                "UPDATE session
+                 SET cost = max(0.0, cost + ?2 - ?3),
+                     tokens_input = max(0, tokens_input + ?4 - ?5),
+                     tokens_output = max(0, tokens_output + ?6 - ?7),
+                     tokens_reasoning = max(0, tokens_reasoning + ?8 - ?9),
+                     tokens_cache_read = max(0, tokens_cache_read + ?10 - ?11),
+                     tokens_cache_write = max(0, tokens_cache_write + ?12 - ?13),
+                     tokens_last_prompt = ?14,
+                     tokens_context_limit = coalesce(?15, tokens_context_limit),
+                     tokens_accounting = ?16,
+                     tokens_known = 1
+                 WHERE id = ?1",
+                params![
+                    session_id,
+                    current.cost,
+                    previous.map_or(0.0, |usage| usage.cost),
+                    new.input,
+                    old.input,
+                    new.output,
+                    old.output,
+                    new.reasoning,
+                    old.reasoning,
+                    new.cache_read,
+                    old.cache_read,
+                    new.cache_write,
+                    old.cache_write,
+                    last_prompt,
+                    context_limit,
+                    accounting,
+                ],
+            )
+            .map_err(open::map_error)?;
+        return Ok(());
+    }
+
+    if all_known {
+        transaction
+            .execute(
+                "UPDATE session
+                 SET cost = coalesce((
+                       SELECT sum(coalesce(json_extract(message.data, '$.cost'), 0))
+                       FROM message
+                       WHERE message.session_id = session.id
+                         AND json_extract(message.data, '$.role') = 'assistant'
+                     ), 0),
+                     tokens_input = coalesce((
+                       SELECT sum(CASE json_extract(message.data, '$.tokens.accounting')
+                         WHEN 'cache-inside-input' THEN max(
+                           coalesce(json_extract(message.data, '$.tokens.input'), 0)
+                           - coalesce(json_extract(message.data, '$.tokens.cache.read'), 0)
+                           - coalesce(json_extract(message.data, '$.tokens.cache.write'), 0),
+                           0
+                         )
+                         WHEN 'cache-beside-input' THEN
+                           coalesce(json_extract(message.data, '$.tokens.input'), 0)
+                         ELSE 0
+                       END)
+                       FROM message
+                       WHERE message.session_id = session.id
+                         AND json_extract(message.data, '$.role') = 'assistant'
+                     ), 0),
+                     tokens_output = coalesce((
+                       SELECT sum(coalesce(json_extract(message.data, '$.tokens.output'), 0))
+                       FROM message
+                       WHERE message.session_id = session.id
+                         AND json_extract(message.data, '$.role') = 'assistant'
+                     ), 0),
+                     tokens_reasoning = coalesce((
+                       SELECT sum(coalesce(json_extract(message.data, '$.tokens.reasoning'), 0))
+                       FROM message
+                       WHERE message.session_id = session.id
+                         AND json_extract(message.data, '$.role') = 'assistant'
+                     ), 0),
+                     tokens_cache_read = coalesce((
+                       SELECT sum(coalesce(json_extract(message.data, '$.tokens.cache.read'), 0))
+                       FROM message
+                       WHERE message.session_id = session.id
+                         AND json_extract(message.data, '$.role') = 'assistant'
+                     ), 0),
+                     tokens_cache_write = coalesce((
+                       SELECT sum(coalesce(json_extract(message.data, '$.tokens.cache.write'), 0))
+                       FROM message
+                       WHERE message.session_id = session.id
+                         AND json_extract(message.data, '$.role') = 'assistant'
+                     ), 0),
+                     tokens_last_prompt = ?2,
+                     tokens_context_limit = coalesce(?3, tokens_context_limit),
+                     tokens_accounting = ?4,
+                     tokens_known = 1
+                 WHERE id = ?1",
+                params![session_id, last_prompt, context_limit, accounting],
+            )
+            .map_err(open::map_error)?;
+        return Ok(());
+    }
+
+    transaction
+        .execute(
+            "UPDATE session
+             SET cost = max(0.0, cost + ?2 - ?3),
+                 tokens_last_prompt = ?4,
+                 tokens_context_limit = coalesce(?5, tokens_context_limit),
+                 tokens_accounting = ?6,
+                 tokens_known = 0
+             WHERE id = ?1",
+            params![
+                session_id,
+                current.cost,
+                previous.map_or(0.0, |usage| usage.cost),
+                last_prompt,
+                context_limit,
+                accounting,
+            ],
+        )
+        .map_err(open::map_error)?;
+    Ok(())
 }
 
 /// Replace a session's title, returning the millisecond it was updated at.
@@ -1562,22 +1871,31 @@ pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
         share_url: row.get(9)?,
         summary,
         metadata: row.get(14)?,
-        cost: row.get(15)?,
-        tokens: Tokens {
-            input: row.get(16)?,
-            output: row.get(17)?,
-            reasoning: row.get(18)?,
-            cache_read: row.get(19)?,
-            cache_write: row.get(20)?,
+        usage: SessionUsage {
+            cost: row.get(15)?,
+            tokens: Tokens {
+                input: row.get(16)?,
+                output: row.get(17)?,
+                reasoning: row.get(18)?,
+                cache_read: row.get(19)?,
+                cache_write: row.get(20)?,
+            },
+            last_prompt_tokens: row.get(21)?,
+            context_limit: row.get(22)?,
+            accounting: row
+                .get::<_, Option<String>>(23)?
+                .as_deref()
+                .and_then(TokenAccounting::parse),
+            known: row.get(24)?,
         },
-        revert: row.get(21)?,
-        permission: row.get(22)?,
-        agent: row.get(23)?,
-        model: row.get(24)?,
-        time_created: row.get(25)?,
-        time_updated: row.get(26)?,
-        time_compacting: row.get(27)?,
-        time_archived: row.get(28)?,
+        revert: row.get(25)?,
+        permission: row.get(26)?,
+        agent: row.get(27)?,
+        model: row.get(28)?,
+        time_created: row.get(29)?,
+        time_updated: row.get(30)?,
+        time_compacting: row.get(31)?,
+        time_archived: row.get(32)?,
     })
 }
 

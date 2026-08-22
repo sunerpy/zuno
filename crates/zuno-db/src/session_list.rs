@@ -364,8 +364,8 @@ pub fn session_info(session: Session) -> SessionInfo {
         model: opaque(session.model.as_deref()),
         version: session.version,
         summary: session.summary.map(summary_info),
-        cost: session.cost,
-        tokens: token_usage(session.tokens),
+        cost: session.usage.cost,
+        tokens: token_usage(session.usage.tokens),
         share: session.share_url.map(|url| ShareInfo { url }),
         metadata: opaque(session.metadata.as_deref()),
         revert: opaque(session.revert.as_deref()),
@@ -534,23 +534,23 @@ pub fn to_json(listed: &[ListedSession]) -> Result<Json, DbError> {
     })
 }
 
-/// Decode one composed row: the 29 session columns, then three project columns,
+/// Decode one composed row: the session projection, then three project columns,
 /// then the message count.
 fn decode(row: &Row<'_>) -> rusqlite::Result<ListedSession> {
     let session = crate::session::from_row(row)?;
-    let project_id: Option<String> = row.get(29)?;
+    let project_id: Option<String> = row.get(crate::session::COLUMN_COUNT)?;
     let project = project_id.map(|id| {
         Ok::<ProjectInfo, rusqlite::Error>(ProjectInfo {
             id,
-            name: row.get(30)?,
-            worktree: row.get(31)?,
+            name: row.get(crate::session::COLUMN_COUNT + 1)?,
+            worktree: row.get(crate::session::COLUMN_COUNT + 2)?,
         })
     });
     let project = match project {
         Some(result) => Some(result?),
         None => None,
     };
-    let messages: i64 = row.get(32)?;
+    let messages: i64 = row.get(crate::session::COLUMN_COUNT + 3)?;
 
     Ok(ListedSession {
         info: GlobalInfo {

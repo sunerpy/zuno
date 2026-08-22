@@ -72,6 +72,13 @@ The TUI favors dense, keyboard-first operation:
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
   row loaded;
+- the welcome screen owns only a prepared process identity. It creates no durable
+  session until the first model-bound submission commits the session and user
+  message together. `session.materialized` updates the in-place session catalog,
+  so `/session` sees the new row without remounting;
+- cumulative token and context usage comes from the durable `SessionUsage`
+  projection on resume. A history whose provider accounting cannot be recovered
+  displays an unavailable marker rather than a fabricated zero;
 - no empty LSP status or setup prompt; the sidebar adds LSP only for configured
   services or real diagnostics;
 - `/session` lists active root sessions from the current durable database and

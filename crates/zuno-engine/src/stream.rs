@@ -9,9 +9,9 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 use zuno_db::message::{MessageStore, PartRecord, now_millis};
-use zuno_db::{Connection, open};
+use zuno_db::{Connection, open, session};
 use zuno_error::{DbError, ProviderError};
-use zuno_llm::event::{FinishReason, StreamEvent, ThoughtSignature};
+use zuno_llm::event::{FinishReason, PromptAccounting, StreamEvent, ThoughtSignature};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
 
 /// Dirty delta bytes accumulated before live text/reasoning is upserted.
@@ -32,6 +32,8 @@ pub struct ProjectionContext {
     pub agent: String,
     /// Cost added by this provider step.
     pub cost: f64,
+    /// Active model context ceiling.
+    pub context_limit: Option<u64>,
 }
 
 impl ProjectionContext {
@@ -51,6 +53,7 @@ impl ProjectionContext {
             created_at,
             agent: agent.into(),
             cost: 0.0,
+            context_limit: None,
         }
     }
 
@@ -58,6 +61,13 @@ impl ProjectionContext {
     #[must_use]
     pub fn with_cost(mut self, cost: f64) -> Self {
         self.cost = cost;
+        self
+    }
+
+    /// Attach the model context ceiling used by this step.
+    #[must_use]
+    pub fn with_context_limit(mut self, context_limit: u64) -> Self {
+        self.context_limit = (context_limit > 0).then_some(context_limit);
         self
     }
 }
@@ -222,6 +232,7 @@ where
     effects: &'effects mut Effects,
     snapshot_before: Option<String>,
     usage: StepUsage,
+    accounting: Option<PromptAccounting>,
     text: Option<TextBuffer>,
     reasoning: Option<ReasoningBuffer>,
     tools: HashMap<String, StoredTool>,
@@ -253,6 +264,7 @@ where
             effects,
             snapshot_before,
             usage: StepUsage::default(),
+            accounting: None,
             text: None,
             reasoning: None,
             tools: HashMap::new(),
@@ -348,14 +360,7 @@ where
                 output_tokens,
                 cache_read_input_tokens,
                 cache_write_input_tokens,
-                // Deliberately not applied: the `tokens` object this builds is the
-                // oracle's persisted shape, and it records each figure as the provider
-                // reported it. Re-deriving one here would change a stored value and
-                // diverge from `session/prompt.ts`'s own arithmetic, which
-                // `prelude::measured_tokens` mirrors. Consumers that need a single
-                // comparable number normalise with `PromptAccounting` at the point of
-                // display — see `zuno_tui::views::message::TokenUsage`.
-                accounting: _,
+                accounting,
             } => {
                 if let Some(value) = input_tokens {
                     self.usage.input = value;
@@ -369,6 +374,7 @@ where
                 if let Some(value) = cache_write_input_tokens {
                     self.usage.cache_write = value;
                 }
+                self.accounting = Some(accounting);
             }
             StreamEvent::Compaction {
                 trigger,
@@ -847,6 +853,7 @@ where
         self.last_tool_id = None;
         self.dirty_delta_bytes = 0;
         self.usage = StepUsage::default();
+        self.accounting = None;
 
         let part_id = self.next_part_id("retry");
         let now = now_millis();
@@ -945,8 +952,13 @@ where
         reason: FinishReason,
         now: i64,
     ) -> Result<(), ProjectionError> {
-        let store = MessageStore::new(self.connection);
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(open::map_error)?;
+        let store = MessageStore::new(&transaction);
         let mut message = store.message(&self.context.message_id)?;
+        let previous = session::MessageUsage::from_data(&message.data);
         message
             .data
             .insert("finish".to_owned(), Value::String(reason.to_string()));
@@ -976,9 +988,20 @@ where
                     "read": self.usage.cache_read,
                     "write": self.usage.cache_write,
                 },
+                "accounting": self.accounting.map(PromptAccounting::as_str),
             }),
         );
         store.put_message_at(&message, now)?;
+        session::reconcile_usage(
+            &transaction,
+            &self.context.session_id,
+            Some(previous),
+            session::MessageUsage::from_data(&message.data),
+            self.context
+                .context_limit
+                .and_then(|limit| i64::try_from(limit).ok()),
+        )?;
+        transaction.commit().map_err(open::map_error)?;
         self.stats.total_writes = self.stats.total_writes.saturating_add(1);
         Ok(())
     }

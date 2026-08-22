@@ -1007,6 +1007,33 @@ impl SessionScreen {
         }
     }
 
+    fn observe_session_materialized(&mut self, event: &AppEvent) -> EventResult {
+        let AppEvent::Engine(zuno_engine::r#loop::TurnEvent::SessionMaterialized {
+            session_id,
+            title,
+        }) = event
+        else {
+            return EventResult::IGNORED;
+        };
+        self.catalog.session = Some(session_id.clone());
+        if !self
+            .catalog
+            .sessions
+            .iter()
+            .any(|session| session.id == *session_id)
+        {
+            self.catalog.sessions.insert(
+                0,
+                crate::views::picker::SessionEntry {
+                    id: session_id.clone(),
+                    title: title.clone(),
+                    when: String::from("now"),
+                },
+            );
+        }
+        EventResult::REDRAW
+    }
+
     /// Take language-server reports from `reports` as they arrive.
     ///
     /// Optional for the same reason the other two sinks are: a screen with no host has
@@ -1518,6 +1545,7 @@ impl Component for SessionScreen {
         let ambient = self.sidebar.ambient_mut();
         ambient.title = title;
         ambient.tokens = self.transcript.transcript().tokens();
+        ambient.usage_state = self.transcript.transcript().usage_state();
         ambient.context_used = self.transcript.transcript().context_used();
         let loaded_skills = self.transcript.loaded_skills();
         for skill in &mut ambient.skills {
@@ -1622,6 +1650,7 @@ impl Component for SessionScreen {
         // verdict the user is waiting for sitting in a channel forever.
         self.observe_edits(event);
         wheel
+            .merge(self.observe_session_materialized(event))
             .merge(self.observe_session_title())
             .merge(self.observe_mcp())
             .merge(self.drain_editor_results())

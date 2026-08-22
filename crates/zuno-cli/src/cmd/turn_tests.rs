@@ -1475,18 +1475,27 @@ fn an_empty_catalog_with_no_request_still_explains_the_policy() {
 }
 
 #[test]
-fn new_session_and_user_message_are_persisted_together() {
+fn new_session_is_lazy_and_first_user_message_commits_with_it() {
     let mut connection =
         zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
     zuno_db::migration::apply(&mut connection).expect("apply schema");
     let plan = plan("/workspace", SessionChoice::New);
     let now = 1_780_000_000_000;
     ensure_project(&connection, &plan.project, now).expect("persist project");
-    let session = resolve_session(&mut connection, &plan, now).expect("create session");
-    persist_user_message(
-        &connection,
+    let prepared = prepare_turn_host(&connection, &plan, now).expect("prepare session");
+    let session_id = prepared.identity.id().to_owned();
+    assert!(!prepared.identity.is_materialized());
+    let before: i64 = connection
+        .query_row("SELECT count(*) FROM session", [], |row| row.get(0))
+        .expect("count sessions before input");
+    assert_eq!(
+        before, 0,
+        "opening the welcome screen must not create a row"
+    );
+
+    let (message, parts) = prepare_user_message(
         UserMessageInput {
-            session_id: &session.id,
+            session_id: &session_id,
             agent: "build",
             provider_id: "provider",
             model_id: "model",
@@ -1494,12 +1503,37 @@ fn new_session_and_user_message_are_persisted_together() {
             message_id: None,
             now,
         },
+        None,
     )
-    .expect("persist prompt");
+    .expect("prepare prompt");
+    let SessionMaterializer::Pending(mut input) = prepared.materializer else {
+        panic!("a new session must remain pending");
+    };
+    input.time = Some(now);
+    let transaction = connection
+        .transaction()
+        .expect("start first-input transaction");
+    zuno_db::session::create(&transaction, &input).expect("create session in transaction");
+    zuno_db::inbox::admit_and_promote_in(
+        &transaction,
+        zuno_db::inbox::NewSessionInput::new(
+            format!("inp_{}", message.id),
+            &session_id,
+            json!({
+                "message": message.to_json(),
+                "parts": parts.iter().map(zuno_db::message::PartRecord::to_json).collect::<Vec<_>>(),
+            }),
+            zuno_db::inbox::InputDelivery::NextStep,
+            now,
+        ),
+    )
+    .expect("record durable input");
+    persist_prepared_user_message(&transaction, &message, &parts).expect("persist prompt");
+    transaction.commit().expect("commit session and prompt");
 
     let store = zuno_db::message::MessageStore::new(&connection);
     let messages = store
-        .messages_for_session(&session.id)
+        .messages_for_session(&session_id)
         .expect("load messages");
     assert_eq!(messages.len(), 1);
     let grouped = store
@@ -1510,6 +1544,14 @@ fn new_session_and_user_message_are_persisted_together() {
         .expect("parts grouped under the message");
     assert_eq!(parts.len(), 1);
     assert_eq!(parts[0].data["text"], "hello");
+    let promoted: i64 = connection
+        .query_row(
+            "SELECT promoted_seq FROM session_input WHERE session_id = ?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .expect("the direct prompt is durably admitted and promoted");
+    assert!(promoted > 0);
 }
 
 /// The two tables that name a model do not name it the same way, and only a test
@@ -1725,7 +1767,7 @@ fn recent_sessions_stay_with_the_current_directory_and_hide_children_and_archive
         )
         .expect("archive fixture session");
 
-    let listed = recent_sessions(&connection, &current.id, 100).expect("list picker sessions");
+    let listed = recent_sessions(&connection, "/workspace", 100).expect("list picker sessions");
     assert_eq!(
         listed
             .iter()
@@ -1734,22 +1776,22 @@ fn recent_sessions_stay_with_the_current_directory_and_hide_children_and_archive
         vec![current.id.as_str(), previous.id.as_str()]
     );
     assert_eq!(
-        switchable_session(&connection, &current.id, &previous.id)
+        switchable_session(&connection, "/workspace", &previous.id)
             .expect("validate same-directory root"),
         Some(previous)
     );
     assert!(
-        switchable_session(&connection, &current.id, "ses_child")
+        switchable_session(&connection, "/workspace", "ses_child")
             .expect("reject child")
             .is_none()
     );
     assert!(
-        switchable_session(&connection, &current.id, "ses_elsewhere")
+        switchable_session(&connection, "/workspace", "ses_elsewhere")
             .expect("reject other directory")
             .is_none()
     );
     assert!(
-        switchable_session(&connection, &current.id, &archived.id)
+        switchable_session(&connection, "/workspace", &archived.id)
             .expect("reject archived")
             .is_none()
     );

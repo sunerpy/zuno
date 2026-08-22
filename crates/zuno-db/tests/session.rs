@@ -9,10 +9,12 @@
 //! populated, records row counts before and after, and asserts the counts
 //! rather than the absence of an error.
 
+use serde_json::json;
 use std::path::Path;
+use zuno_db::message::{MessageRecord, MessageStore};
 use zuno_db::session::{
-    ArchivedFilter, Creation, ListQuery, ListScope, SessionCreate, SessionSort, SortDirection,
-    Store, session_path,
+    ArchivedFilter, Creation, ListQuery, ListScope, MessageUsage, SessionCreate, SessionSort,
+    SortDirection, Store, TokenAccounting, session_path,
 };
 use zuno_db::{Connection, Pool, migration, session};
 use zuno_error::DbError;
@@ -277,9 +279,10 @@ fn create_writes_every_column_the_caller_supplied() {
     assert_eq!(session.permission.as_deref(), Some(r#"[{"edit":"allow"}]"#));
     assert_eq!(session.time_created, 1_700);
     assert_eq!(session.time_updated, 1_700);
-    assert_eq!(session.cost, 0.0);
-    assert_eq!(session.tokens.input, 0);
-    assert_eq!(session.tokens.cache_write, 0);
+    assert_eq!(session.usage.cost, 0.0);
+    assert_eq!(session.usage.tokens.input, 0);
+    assert_eq!(session.usage.tokens.cache_write, 0);
+    assert!(!session.usage.known);
     assert_eq!(session.summary, None);
     assert_eq!(session.share_url, None);
     assert!(session.is_root());
@@ -316,6 +319,155 @@ fn create_stores_the_empty_string_for_a_session_at_the_worktree_root() {
         "SELECT count(*) FROM session WHERE path IS NULL",
     );
     assert_eq!(nulls, 0);
+}
+
+#[test]
+fn assistant_usage_reconciliation_is_normalized_and_idempotent() {
+    let pool = pool();
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft("ses_usage", "prj_a", WORKTREE, "usage"))
+        .expect("create the session");
+
+    let checkpoint = |input: i64, output: i64, read: i64, write: i64| {
+        MessageRecord::from_json(json!({
+            "id": "msg_usage",
+            "sessionID": "ses_usage",
+            "role": "assistant",
+            "time": {"created": 10},
+            "cost": 0.25,
+            "tokens": {
+                "input": input,
+                "output": output,
+                "reasoning": 3,
+                "cache": {"read": read, "write": write},
+                "accounting": "cache-inside-input"
+            }
+        }))
+        .expect("valid assistant message")
+    };
+
+    for message in [checkpoint(100, 20, 15, 10), checkpoint(100, 20, 15, 10)] {
+        pool.transaction(|transaction| {
+            let messages = MessageStore::new(transaction);
+            let previous = messages
+                .find_message("msg_usage")?
+                .map(|stored| MessageUsage::from_data(&stored.data));
+            messages.put_message_at(&message, 20)?;
+            session::reconcile_usage(
+                transaction,
+                "ses_usage",
+                previous,
+                MessageUsage::from_data(&message.data),
+                Some(128_000),
+            )
+        })
+        .expect("reconcile checkpoint");
+    }
+
+    let usage = store.get("ses_usage").expect("read usage").usage;
+    assert!(usage.known);
+    assert_eq!(usage.accounting, Some(TokenAccounting::CacheInsideInput));
+    assert_eq!(usage.tokens.input, 75);
+    assert_eq!(usage.tokens.output, 20);
+    assert_eq!(usage.tokens.reasoning, 3);
+    assert_eq!(usage.tokens.cache_read, 15);
+    assert_eq!(usage.tokens.cache_write, 10);
+    assert_eq!(usage.last_prompt_tokens, Some(100));
+    assert_eq!(usage.context_limit, Some(128_000));
+    assert_eq!(usage.cost, 0.25);
+
+    let replacement = checkpoint(140, 30, 20, 10);
+    pool.transaction(|transaction| {
+        let messages = MessageStore::new(transaction);
+        let previous = messages
+            .find_message("msg_usage")?
+            .map(|stored| MessageUsage::from_data(&stored.data));
+        messages.put_message_at(&replacement, 30)?;
+        session::reconcile_usage(
+            transaction,
+            "ses_usage",
+            previous,
+            MessageUsage::from_data(&replacement.data),
+            Some(128_000),
+        )
+    })
+    .expect("reconcile replacement");
+
+    let usage = store.get("ses_usage").expect("read replacement").usage;
+    assert_eq!(usage.tokens.input, 110);
+    assert_eq!(usage.tokens.output, 30);
+    assert_eq!(usage.tokens.cache_read, 20);
+    assert_eq!(usage.tokens.cache_write, 10);
+    assert_eq!(usage.last_prompt_tokens, Some(140));
+    assert_eq!(usage.cost, 0.25);
+}
+
+#[test]
+fn assistant_usage_without_accounting_keeps_the_session_unknown() {
+    let pool = pool();
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft("ses_unknown", "prj_a", WORKTREE, "unknown"))
+        .expect("create the session");
+
+    let unclassified = MessageRecord::from_json(json!({
+        "id": "msg_unclassified",
+        "sessionID": "ses_unknown",
+        "role": "assistant",
+        "time": {"created": 1},
+        "cost": 0.0,
+        "tokens": {
+            "input": 100,
+            "output": 20,
+            "reasoning": 0,
+            "cache": {"read": 50, "write": 0}
+        }
+    }))
+    .expect("unclassified message");
+    MessageStore::new(&pool.get().expect("connection"))
+        .put_message_at(&unclassified, 1)
+        .expect("insert unclassified message");
+
+    let current = MessageRecord::from_json(json!({
+        "id": "msg_current",
+        "sessionID": "ses_unknown",
+        "role": "assistant",
+        "time": {"created": 2},
+        "cost": 0.0,
+        "tokens": {
+            "input": 40,
+            "output": 10,
+            "reasoning": 0,
+            "cache": {"read": 5, "write": 0},
+            "accounting": "cache-beside-input"
+        }
+    }))
+    .expect("current message");
+    pool.transaction(|transaction| {
+        MessageStore::new(transaction).put_message_at(&current, 2)?;
+        session::reconcile_usage(
+            transaction,
+            "ses_unknown",
+            None,
+            MessageUsage::from_data(&current.data),
+            Some(200_000),
+        )
+    })
+    .expect("reconcile known tail");
+
+    let usage = store.get("ses_unknown").expect("read usage").usage;
+    assert!(!usage.known);
+    assert_eq!(usage.last_prompt_tokens, Some(45));
+    assert_eq!(usage.context_limit, Some(200_000));
 }
 
 #[test]

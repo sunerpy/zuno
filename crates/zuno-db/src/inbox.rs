@@ -231,6 +231,31 @@ pub(crate) fn admit_in(
     })
 }
 
+/// Admit and immediately promote one driver-owned input in the caller's transaction.
+///
+/// Interactive prompts use this together with the `session` and user-message inserts.
+/// The durable FIFO therefore records the input before execution, while the immediate
+/// promotion prevents the already-persisted user message from being injected a second
+/// time by a later driver step.
+///
+/// # Errors
+///
+/// The same validation, event-log, encoding, and SQLite errors as [`SessionInbox::admit`]
+/// and [`SessionInbox::promote_id`].
+pub fn admit_and_promote_in(
+    transaction: &Transaction<'_>,
+    input: NewSessionInput,
+) -> Result<SessionInput, DbError> {
+    validate_input(&input)?;
+    let session_id = input.session_id.clone();
+    let admitted = admit_in(transaction, input)?;
+    promote_selected(transaction, &session_id, Some(admitted))?.ok_or_else(|| {
+        query_error(std::io::Error::other(
+            "newly admitted input was not promotable",
+        ))
+    })
+}
+
 fn select_next(
     transaction: &Transaction<'_>,
     session_id: &str,

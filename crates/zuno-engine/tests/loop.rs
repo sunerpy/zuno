@@ -2000,6 +2000,17 @@ async fn loop_records_token_usage_that_arrives_after_the_finish_reason() {
         cache.get("write").and_then(serde_json::Value::as_u64),
         Some(64)
     );
+    assert_eq!(
+        tokens.get("accounting").and_then(serde_json::Value::as_str),
+        Some("cache-inside-input")
+    );
+    let session = zuno_db::session::get(&connection, SESSION_ID).expect("read session usage");
+    assert!(session.usage.known);
+    assert_eq!(session.usage.tokens.input, 3_122);
+    assert_eq!(session.usage.tokens.output, 186);
+    assert_eq!(session.usage.tokens.cache_read, 1_024);
+    assert_eq!(session.usage.tokens.cache_write, 64);
+    assert_eq!(session.usage.last_prompt_tokens, Some(4_210));
 }
 
 #[tokio::test]

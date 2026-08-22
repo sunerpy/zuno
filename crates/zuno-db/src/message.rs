@@ -661,20 +661,29 @@ impl<'conn> MessageStore<'conn> {
     /// [`DbError::NotFound`] when no such row exists, [`DbError::Decode`] when
     /// its blob does not parse or carries an unknown `role`.
     pub fn message(&self, id: &str) -> Result<MessageRecord, DbError> {
-        let record = self
-            .prepare(
-                "SELECT id, session_id, time_created, time_updated, data FROM message WHERE id = ?1",
-            )?
-            .query_row([id], |row| Ok(MessageRecord::from_row(row)))
-            .optional()
-            .map_err(map_error)?;
-        match record {
-            Some(result) => result,
-            None => Err(DbError::NotFound {
-                table: MESSAGE_TABLE.to_owned(),
-                id: id.to_owned(),
-            }),
-        }
+        self.find_message(id)?.ok_or_else(|| DbError::NotFound {
+            table: MESSAGE_TABLE.to_owned(),
+            id: id.to_owned(),
+        })
+    }
+
+    /// One message by id, or `None` when it does not exist.
+    ///
+    /// This is the read-before-upsert seam used by idempotent session usage
+    /// reconciliation: a repeated assistant checkpoint compares against the exact JSON
+    /// already stored under the same message id.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Decode`] when the blob does not parse or carries an unknown role.
+    pub fn find_message(&self, id: &str) -> Result<Option<MessageRecord>, DbError> {
+        self.prepare(
+            "SELECT id, session_id, time_created, time_updated, data FROM message WHERE id = ?1",
+        )?
+        .query_row([id], |row| Ok(MessageRecord::from_row(row)))
+        .optional()
+        .map_err(map_error)?
+        .transpose()
     }
 
     /// One part by id.

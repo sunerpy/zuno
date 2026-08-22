@@ -555,6 +555,8 @@ pub struct Transcript {
     /// running total free to disagree with the strip's, and two token figures on one
     /// screen that differ is worse than either alone.
     tokens: TokenUsage,
+    /// Whether cumulative usage is known, unavailable, or not reported yet.
+    usage_state: UsageState,
     /// The whole prompt the most recent request sent.
     ///
     /// Separate from [`Self::tokens`], and replaced rather than accumulated, because the
@@ -656,6 +658,32 @@ impl Transcript {
     #[must_use]
     pub const fn tokens(&self) -> TokenUsage {
         self.tokens
+    }
+
+    /// Whether the cumulative token projection is usable.
+    #[must_use]
+    pub const fn usage_state(&self) -> UsageState {
+        self.usage_state
+    }
+
+    /// Restore durable usage before replaying an existing session.
+    pub fn restore_usage(
+        &mut self,
+        tokens: TokenUsage,
+        last_prompt_tokens: Option<u64>,
+        context_limit: Option<u64>,
+        known: bool,
+    ) {
+        self.tokens = tokens;
+        self.last_prompt_tokens = last_prompt_tokens.unwrap_or_default();
+        if let Some(context_limit) = context_limit {
+            self.context_limit = context_limit;
+        }
+        self.usage_state = if known {
+            UsageState::Known
+        } else {
+            UsageState::Unavailable
+        };
     }
 
     /// State the model's context ceiling, so a percentage can be computed.
@@ -960,6 +988,7 @@ impl Transcript {
                 cache_write_input_tokens,
                 accounting,
             } => {
+                self.usage_state = UsageState::Known;
                 let input = input_tokens.unwrap_or_default();
                 let cache_read = cache_read_input_tokens.unwrap_or_default();
                 let cache_write = cache_write_input_tokens.unwrap_or_default();
@@ -2744,6 +2773,18 @@ pub struct TokenUsage {
     pub cache_write: u64,
 }
 
+/// Availability of the durable session usage projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageState {
+    /// No provider report has arrived in a new session.
+    #[default]
+    NotReported,
+    /// Every stored assistant snapshot can be normalized.
+    Known,
+    /// Historical snapshots lack enough accounting information to be reliable.
+    Unavailable,
+}
+
 impl TokenUsage {
     /// Whether anything has been counted yet.
     #[must_use]
@@ -2958,6 +2999,11 @@ impl StatusView {
     #[must_use]
     pub const fn usage(&self) -> TokenUsage {
         self.usage
+    }
+
+    /// Restore the session-cumulative usage before the first live event.
+    pub const fn restore_usage(&mut self, usage: TokenUsage) {
+        self.usage = usage;
     }
 
     /// Replace the palette and settings, for a live theme change.

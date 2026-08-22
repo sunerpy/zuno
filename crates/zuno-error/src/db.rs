@@ -21,20 +21,22 @@ pub enum DbError {
         source: BoxSource,
     },
 
-    /// A schema migration failed. `version` is the migration that failed, so a
-    /// repair path knows where the schema actually stopped.
-    #[error("migration to schema version {version} failed")]
-    Migration {
-        version: u32,
+    /// Creating or validating the current schema failed.
+    #[error("database schema format {format} failed")]
+    Schema {
+        format: u32,
         #[source]
         source: BoxSource,
     },
 
-    /// The journal was written by a binary with a newer migration set.
+    /// The file belongs to another unreleased schema format.
     #[error(
-        "database migration journal is newer than this binary (known ceiling {ceiling}, observed {observed})"
+        "database uses an unsupported pre-release schema format (expected {expected}, observed {observed:?}); rebuild the Zuno database"
     )]
-    MigrationTooNew { ceiling: String, observed: String },
+    SchemaMismatch {
+        expected: u32,
+        observed: Option<u32>,
+    },
 
     /// A statement failed to execute.
     #[error("database statement failed")]
@@ -80,8 +82,8 @@ impl DbError {
         match self {
             Self::Busy { retry_after } => *retry_after,
             Self::Open { .. }
-            | Self::Migration { .. }
-            | Self::MigrationTooNew { .. }
+            | Self::Schema { .. }
+            | Self::SchemaMismatch { .. }
             | Self::Query { .. }
             | Self::NotFound { .. }
             | Self::Decode { .. } => None,
@@ -96,8 +98,8 @@ impl Recoverable for DbError {
                 after: *retry_after,
             },
             Self::Open { .. }
-            | Self::Migration { .. }
-            | Self::MigrationTooNew { .. }
+            | Self::Schema { .. }
+            | Self::SchemaMismatch { .. }
             | Self::Query { .. }
             | Self::NotFound { .. }
             | Self::Decode { .. } => Recovery::Fail,
@@ -116,9 +118,13 @@ mod tests {
                 path: PathBuf::from("zuno.db"),
                 source: Box::new(std::io::Error::other("permission denied")),
             },
-            DbError::Migration {
-                version: 7,
+            DbError::Schema {
+                format: 7,
                 source: Box::new(std::io::Error::other("no such column")),
+            },
+            DbError::SchemaMismatch {
+                expected: 7,
+                observed: Some(6),
             },
             DbError::Query {
                 source: Box::new(std::io::Error::other("syntax error")),
@@ -156,33 +162,28 @@ mod tests {
     }
 
     #[test]
-    fn migration_names_the_version_that_failed() {
-        let e = DbError::Migration {
-            version: 7,
+    fn schema_names_the_format_that_failed() {
+        let e = DbError::Schema {
+            format: 7,
             source: Box::new(std::io::Error::other("no such column")),
         };
-        assert_eq!(e.to_string(), "migration to schema version 7 failed");
-        let DbError::Migration { version, .. } = &e else {
-            panic!("constructed a Migration, matched something else");
+        assert_eq!(e.to_string(), "database schema format 7 failed");
+        let DbError::Schema { format, .. } = &e else {
+            panic!("constructed a Schema, matched something else");
         };
-        assert_eq!(*version, 7);
+        assert_eq!(*format, 7);
     }
 
     #[test]
-    fn migration_too_new_names_the_known_ceiling_and_observed_id() {
-        let e = DbError::MigrationTooNew {
-            ceiling: "20260622202450_simplify_session_input".to_owned(),
-            observed: "99999999999999_future_migration".to_owned(),
+    fn schema_mismatch_names_expected_and_observed_formats() {
+        let e = DbError::SchemaMismatch {
+            expected: 7,
+            observed: Some(9),
         };
         let message = e.to_string();
-        assert!(
-            message.contains("20260622202450_simplify_session_input"),
-            "{message}"
-        );
-        assert!(
-            message.contains("99999999999999_future_migration"),
-            "{message}"
-        );
+        assert!(message.contains("expected 7"), "{message}");
+        assert!(message.contains("Some(9)"), "{message}");
+        assert!(message.contains("rebuild"), "{message}");
         assert!(!e.is_retryable());
     }
 

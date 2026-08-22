@@ -10,17 +10,6 @@ fn create_rust_database(path: &Path) {
     migration::apply(&mut connection).expect("apply Rust schema");
 }
 
-fn journal_ids(connection: &Connection) -> Vec<String> {
-    let mut statement = connection
-        .prepare("SELECT id FROM migration ORDER BY rowid")
-        .expect("prepare migration journal query");
-    statement
-        .query_map([], |row| row.get(0))
-        .expect("query migration journal")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read migration journal")
-}
-
 fn row_count(connection: &Connection, table: &str) -> i64 {
     connection
         .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
@@ -56,23 +45,21 @@ fn schema_part_session_id_is_indexed_but_is_not_a_foreign_key() {
 }
 
 #[test]
-fn schema_prefills_every_current_migration_id_in_generated_order() {
+fn schema_records_exactly_one_current_format() {
     let dir = temp_dir();
     let path = dir.path().join("opencode.db");
     create_rust_database(&path);
     let connection = Connection::open(path).expect("open schema database");
 
-    let ids = journal_ids(&connection);
-    assert_eq!(ids, migration::MIGRATION_IDS);
-    assert_eq!(ids.len(), 40);
-    assert_eq!(
-        ids.first().map(String::as_str),
-        Some("20260127222353_familiar_lady_ursula")
-    );
-    assert_eq!(
-        ids.last().map(String::as_str),
-        Some("20260822170000_generalize_agent_job_subject")
-    );
+    let format: u32 = connection
+        .query_row(
+            "SELECT format FROM zuno_schema WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read schema format");
+    assert_eq!(format, migration::CURRENT_FORMAT);
+    assert_eq!(row_count(&connection, "zuno_schema"), 1);
 }
 
 #[test]

@@ -80,6 +80,12 @@ Before the provider request, the loop persists `session.prompt.assembled`. The e
 
 Every model-visible external input is admitted to the session event log and durable inbox in one SQLite transaction before execution is attempted. The inbox is the source of truth across active turns, idle sessions, process restarts, and competing drivers.
 
+An interactive `SessionChoice::New` is prepared without inserting a `session` row. The
+process-local identity is stable across model, agent, MCP, and theme changes, but opening,
+browsing, or leaving the welcome screen creates no durable session. The first model-bound
+submission inserts the session and its user message in one transaction, then emits
+`session.materialized` for clients. Existing and continued sessions still hydrate immediately.
+
 Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt. A malformed input records a session error and does not strand later queue entries.
 
 User prompts and subagent reports share this protocol:
@@ -88,6 +94,13 @@ User prompts and subagent reports share this protocol:
 - If the report misses the final safe point, the wake coordinator waits for the active lease to end and starts another turn while the input is still pending.
 - An idle parent is claimed and driven immediately.
 - A restarted process recovers pending reports from the durable inbox.
+
+Assistant checkpoints reconcile message usage and the session usage projection in the same
+transaction. Repeated checkpoints subtract the previous message snapshot before adding the new
+one. Provider accounting is persisted with each snapshot so cache tokens are counted exactly once;
+stored assistant rows without a reliable accounting mode remain explicitly unavailable instead of
+being reported as zero. The projection stores cumulative disjoint token buckets, the latest whole prompt,
+the context limit, and the latest accounting mode.
 
 ## Durable goal recovery
 

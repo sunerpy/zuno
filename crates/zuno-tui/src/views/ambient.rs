@@ -152,6 +152,8 @@ pub struct Ambient {
     pub model: Option<String>,
     /// Token accounting, folded by the transcript and handed over each frame.
     pub tokens: crate::views::message::TokenUsage,
+    /// Whether those token figures are durable, unavailable, or not reported yet.
+    pub usage_state: crate::views::message::UsageState,
     /// How full the context window is, when the model declares one.
     pub context_used: Option<u64>,
     /// Language servers.
@@ -661,7 +663,9 @@ impl SidebarView {
 
         let tokens = &self.ambient.tokens;
         lines.push(self.heading("Context", "", None, width));
-        if tokens.is_empty() {
+        if self.ambient.usage_state == crate::views::message::UsageState::Unavailable {
+            lines.push(padded("  — usage unavailable", width, self.context.muted()));
+        } else if self.ambient.usage_state == crate::views::message::UsageState::NotReported {
             lines.push(padded(
                 "  no usage reported yet",
                 width,

@@ -241,6 +241,9 @@ fn write_retry_notice(
 
 fn event_json(event: TurnEvent) -> Value {
     match event {
+        TurnEvent::SessionMaterialized { session_id, title } => {
+            json!({"type":"session_materialized","sessionID":session_id,"title":title})
+        }
         TurnEvent::TurnStarted { session_id } => {
             json!({"type":"turn_started","sessionID":session_id})
         }

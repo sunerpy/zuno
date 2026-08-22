@@ -172,6 +172,10 @@ CREATE TABLE `session` (
   `tokens_reasoning` integer DEFAULT 0 NOT NULL,
   `tokens_cache_read` integer DEFAULT 0 NOT NULL,
   `tokens_cache_write` integer DEFAULT 0 NOT NULL,
+  `tokens_last_prompt` integer,
+  `tokens_context_limit` integer,
+  `tokens_accounting` text,
+  `tokens_known` integer DEFAULT 0 NOT NULL,
   `revert` text,
   `permission` text,
   `agent` text,
@@ -260,12 +264,12 @@ CREATE INDEX `todo_session_idx` ON `todo` (`session_id`);
 
 /// Create every application table and explicit index in the current schema.
 ///
-/// The caller owns the transaction so schema creation and journal seeding can
+/// The caller owns the transaction so schema creation and format marking can
 /// commit atomically.
 ///
 /// # Errors
 ///
-/// [`DbError::Migration`] if SQLite rejects any DDL statement.
+/// [`DbError::Schema`] if SQLite rejects any DDL statement.
 pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
     transaction
         .execute_batch(SCHEMA_SQL)

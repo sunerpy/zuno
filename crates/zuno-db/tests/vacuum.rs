@@ -487,7 +487,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
     // Read from `sqlite_master`, not from a list in this test: the plan's
     // milestone text and todo 82 disagreed about how many tables exist, and the
     // schema is the only authority. `schema::TABLE_COUNT` is the application tables
-    // `schema::up` creates; `migration::apply` adds its own bookkeeping table.
+    // `schema::up` creates; format initialization adds its one marker table.
     let names: Vec<&str> = summary
         .tables
         .iter()
@@ -505,7 +505,6 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "event",
             "event_sequence",
             "message",
-            "migration",
             "part",
             "permission",
             "project",
@@ -517,6 +516,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "session_share",
             "todo",
             "workspace",
+            "zuno_schema",
         ],
         "the reported inventory must be the schema's, in name order"
     );

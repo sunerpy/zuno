@@ -1050,6 +1050,39 @@ fn views_transcript_folds_provider_token_usage_for_the_ambient_panel() {
 }
 
 #[test]
+fn views_transcript_restores_durable_usage_and_marks_unknown_history() {
+    let mut transcript = crate::views::message::Transcript::new();
+    transcript.restore_usage(
+        crate::views::message::TokenUsage {
+            input: 900,
+            output: 100,
+            cache_read: 200,
+            cache_write: 0,
+        },
+        Some(1_100),
+        Some(10_000),
+        true,
+    );
+    assert_eq!(
+        transcript.usage_state(),
+        crate::views::message::UsageState::Known
+    );
+    assert_eq!(transcript.tokens().total(), 1_200);
+    assert_eq!(transcript.context_used(), Some(11));
+
+    transcript.restore_usage(
+        crate::views::message::TokenUsage::default(),
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        transcript.usage_state(),
+        crate::views::message::UsageState::Unavailable
+    );
+}
+
+#[test]
 fn views_transcript_counts_a_cached_token_once_whichever_convention_the_provider_uses() {
     // Two providers reporting the *same* request, in their own conventions: a 1,200-token
     // prompt of which 80 came from cache. OpenAI puts the 80 inside its 1,200; Anthropic

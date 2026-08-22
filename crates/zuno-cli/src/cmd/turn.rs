@@ -28,8 +28,10 @@
 //! That is the whole reason one driver can serve both.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -90,6 +92,8 @@ pub(crate) enum SessionChoice {
     Continue,
     /// Reuse this exact session.
     Existing(String),
+    /// Rebuild a not-yet-persisted session without changing its process identity.
+    Prepared(PreparedSessionIdentity),
 }
 
 impl SessionChoice {
@@ -105,6 +109,79 @@ impl SessionChoice {
             (None, false) => Self::New,
         }
     }
+}
+
+/// Stable process identity for a session whose database row may not exist yet.
+#[derive(Clone)]
+pub(crate) struct PreparedSessionIdentity {
+    id: String,
+    materialized: Arc<AtomicBool>,
+}
+
+impl PreparedSessionIdentity {
+    fn pending(id: String) -> Self {
+        Self {
+            id,
+            materialized: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn existing(id: String) -> Self {
+        Self {
+            id,
+            materialized: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// The stable id used by every session-scoped component in this process.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Whether the identity has a durable `session` row.
+    pub(crate) fn is_materialized(&self) -> bool {
+        self.materialized.load(Ordering::Acquire)
+    }
+
+    fn mark_materialized(&self) {
+        self.materialized.store(true, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for PreparedSessionIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSessionIdentity")
+            .field("id", &self.id)
+            .field("materialized", &self.is_materialized())
+            .finish()
+    }
+}
+
+impl PartialEq for PreparedSessionIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for PreparedSessionIdentity {}
+
+#[derive(Debug)]
+enum SessionMaterializer {
+    Existing,
+    Pending(zuno_db::session::SessionCreate),
+}
+
+/// Session facts resolved before a [`TurnHost`] is assembled.
+///
+/// Existing sessions carry their durable row immediately. A new TUI session carries only
+/// a prepared insert until the first model-bound input is persisted.
+struct PreparedTurnHost {
+    identity: PreparedSessionIdentity,
+    title: String,
+    directory: String,
+    usage: zuno_db::session::SessionUsage,
+    materializer: SessionMaterializer,
 }
 
 /// What a surface asks for, before anything has been resolved.
@@ -755,6 +832,10 @@ pub(crate) struct TurnHost {
     resolver: Resolver,
     dispatcher: ToolRegistryDispatcher,
     session_id: String,
+    session_identity: PreparedSessionIdentity,
+    session_directory: String,
+    session_usage: zuno_db::session::SessionUsage,
+    session_materializer: SessionMaterializer,
     /// The title the session already carried when this host opened it.
     ///
     /// A snapshot, deliberately not kept current: the only writer is the prelude, and a
@@ -972,12 +1053,12 @@ impl TurnHost {
         zuno_db::migration::apply(&mut connection).map_err(to_string)?;
         let now = zuno_db::message::now_millis();
         ensure_project(&connection, &plan.project, now)?;
-        let session = resolve_session(&mut connection, &plan, now)?;
+        let prepared = prepare_turn_host(&connection, &plan, now)?;
         let profile_runtime = plan.runtime;
         let profile_id = profile_runtime
             .active_profile_id()
             .ok_or_else(|| "profile runtime has no active profile".to_owned())?;
-        let runtime = profile_runtime.child(format!("session:{}", session.id));
+        let runtime = profile_runtime.child(format!("session:{}", prepared.identity.id()));
         let driver = runtime
             .service::<dyn AgentDriver>()
             .ok_or_else(|| "profile did not register an agent driver".to_owned())?;
@@ -990,14 +1071,23 @@ impl TurnHost {
         let todo_store = Arc::clone(&database);
         let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
         let goal_store = Arc::new(GoalStore::open_default().map_err(to_string)?);
-        let goal_projection = GoalProjection::new(worktree.as_deref(), &session.id)
-            .ok_or_else(|| format!("session id `{}` cannot name a goal projection", session.id))?;
+        let goal_projection = GoalProjection::new(worktree.as_deref(), prepared.identity.id())
+            .ok_or_else(|| {
+                format!(
+                    "session id `{}` cannot name a goal projection",
+                    prepared.identity.id()
+                )
+            })?;
         let goal_continuation = GoalContinuation::new(Arc::clone(&goal_store), runs.clone())
             .with_retry_policy(plan.goal_retry_policy);
-        let active_goal = goal_store
-            .goal(&session.id)
-            .map_err(to_string)?
-            .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
+        let active_goal = if prepared.identity.is_materialized() {
+            goal_store
+                .goal(prepared.identity.id())
+                .map_err(to_string)?
+                .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active)
+        } else {
+            false
+        };
 
         let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
         let command_worktree = memory_root.to_string_lossy();
@@ -1125,8 +1215,12 @@ impl TurnHost {
             credential: presented,
             resolver: plan.resolver,
             dispatcher,
-            session_id: session.id,
-            session_title: session.title,
+            session_id: prepared.identity.id().to_owned(),
+            session_identity: prepared.identity,
+            session_directory: prepared.directory,
+            session_usage: prepared.usage,
+            session_materializer: prepared.materializer,
+            session_title: prepared.title,
             agent: plan.agent.name,
             provider_id: plan.provider_id,
             model_id: plan.model_id,
@@ -1161,6 +1255,30 @@ impl TurnHost {
         &self.session_id
     }
 
+    /// Stable identity used by the TUI's exit handoff and rebuild paths.
+    pub(crate) fn session_identity(&self) -> PreparedSessionIdentity {
+        self.session_identity.clone()
+    }
+
+    /// Session choice that preserves a pending identity across a host rebuild.
+    pub(crate) fn rebuild_session_choice(&self) -> SessionChoice {
+        if self.session_identity.is_materialized() {
+            SessionChoice::Existing(self.session_id.clone())
+        } else {
+            SessionChoice::Prepared(self.session_identity.clone())
+        }
+    }
+
+    /// Whether this host already has a durable session row.
+    pub(crate) fn is_session_materialized(&self) -> bool {
+        self.session_identity.is_materialized()
+    }
+
+    /// Durable usage restored with an existing session.
+    pub(crate) const fn session_usage(&self) -> zuno_db::session::SessionUsage {
+        self.session_usage
+    }
+
     /// Recent active root sessions in the directory this host is already running in.
     ///
     /// The current row supplies the directory rather than the process cwd. That keeps a
@@ -1171,7 +1289,7 @@ impl TurnHost {
         &self,
         limit: u32,
     ) -> Result<Vec<zuno_db::session::Session>, zuno_error::DbError> {
-        recent_sessions(&self.connection, &self.session_id, limit)
+        recent_sessions(&self.connection, &self.session_directory, limit)
     }
 
     /// Resolve one picker target while rechecking the provider's scope rules.
@@ -1185,7 +1303,7 @@ impl TurnHost {
         &self,
         session_id: &str,
     ) -> Result<Option<zuno_db::session::Session>, zuno_error::DbError> {
-        switchable_session(&self.connection, &self.session_id, session_id)
+        switchable_session(&self.connection, &self.session_directory, session_id)
     }
 
     /// Rename a session through the same transactional store used by every other surface.
@@ -1252,6 +1370,9 @@ impl TurnHost {
     /// decides whether to spend a request, so a title this answers `None` for is exactly
     /// a title the prelude is about to write.
     pub(crate) fn session_title(&self) -> Option<&str> {
+        if !self.is_session_materialized() {
+            return None;
+        }
         if zuno_db::session::is_default_title(&self.session_title) {
             return None;
         }
@@ -1279,6 +1400,9 @@ impl TurnHost {
     pub(crate) fn resumed_history(
         &self,
     ) -> Result<Vec<zuno_db::message::MessageWithParts>, zuno_error::DbError> {
+        if !self.is_session_materialized() {
+            return Ok(Vec::new());
+        }
         zuno_engine::r#loop::hydrate_retained_history(&self.connection, &self.session_id)
     }
 
@@ -1389,7 +1513,6 @@ impl TurnHost {
         content: &[RequestContentBlock],
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.recover_background_reports().await?;
         let guard = self
             .runs
             .begin_turn(self.session_id.clone())
@@ -1404,7 +1527,6 @@ impl TurnHost {
         arguments: &str,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.recover_background_reports().await?;
         let resolved = match self
             .commands
             .resolve(command, arguments)
@@ -1436,7 +1558,6 @@ impl TurnHost {
         message_id: Option<&str>,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.recover_background_reports().await?;
         let guard = self
             .runs
             .begin_turn(self.session_id.clone())
@@ -1478,14 +1599,38 @@ impl TurnHost {
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        let latest = zuno_db::message::MessageStore::new(&self.connection)
+            .latest_time_created(&self.session_id)
+            .map_err(to_string)?;
+        let (message, parts) = prepare_user_message(
+            UserMessageInput {
+                session_id: &self.session_id,
+                agent: &self.agent,
+                provider_id: &self.provider_id,
+                model_id: &self.model_id,
+                text: prompt,
+                message_id,
+                now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
+            },
+            content,
+        )?;
+        let materialized = self.persist_user_input(&message, &parts)?;
+        if materialized {
+            events
+                .publish(TurnEvent::SessionMaterialized {
+                    session_id: self.session_id.clone(),
+                    title: self.session_title.clone(),
+                })
+                .await
+                .map_err(to_string)?;
+        }
+        self.recover_background_reports().await?;
         self.goal_projection
             .ingest(&self.goal_store)
             .map_err(to_string)?;
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
-        let result = self
-            .drive_input_unaccounted(prompt, message_id, content, guard, events.clone())
-            .await;
+        let result = self.drive_input_unaccounted(guard, events.clone()).await;
         match result {
             Ok(outcome) => {
                 self.last_turn_completed = outcome
@@ -1503,32 +1648,9 @@ impl TurnHost {
 
     async fn drive_input_unaccounted(
         &mut self,
-        prompt: &str,
-        message_id: Option<&str>,
-        content: Option<&[RequestContentBlock]>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
-        let latest = zuno_db::message::MessageStore::new(&self.connection)
-            .latest_time_created(&self.session_id)
-            .map_err(TurnError::Database)
-            .map_err(TurnFailure::Engine)?;
-        let (message, parts) = prepare_user_message(
-            UserMessageInput {
-                session_id: &self.session_id,
-                agent: &self.agent,
-                provider_id: &self.provider_id,
-                model_id: &self.model_id,
-                text: prompt,
-                message_id,
-                now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
-            },
-            content,
-        )
-        .map_err(TurnFailure::host)?;
-        persist_prepared_user_message(&self.connection, &message, &parts)
-            .map_err(TurnError::Database)
-            .map_err(TurnFailure::Engine)?;
         let outcome = self.run_prelude().await?;
         report_prelude(&events, &self.notes, &outcome)
             .await
@@ -1539,6 +1661,46 @@ impl TurnHost {
         let dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
         self.execute_turn_unaccounted(dynamic_context, guard, events)
             .await
+    }
+
+    fn persist_user_input(
+        &mut self,
+        message: &zuno_db::message::MessageRecord,
+        parts: &[zuno_db::message::PartRecord],
+    ) -> Result<bool, String> {
+        let durable_input = zuno_db::inbox::NewSessionInput::new(
+            format!("inp_{}", message.id),
+            self.session_id.clone(),
+            json!({
+                "message": message.to_json(),
+                "parts": parts.iter().map(zuno_db::message::PartRecord::to_json).collect::<Vec<_>>(),
+            }),
+            zuno_db::inbox::InputDelivery::NextStep,
+            message.time_created,
+        );
+        match &self.session_materializer {
+            SessionMaterializer::Existing => {
+                let transaction = self.connection.unchecked_transaction().map_err(to_string)?;
+                zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
+                    .map_err(to_string)?;
+                persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+                transaction.commit().map_err(to_string)?;
+                Ok(false)
+            }
+            SessionMaterializer::Pending(input) => {
+                let mut input = input.clone();
+                input.time = Some(message.time_created);
+                let transaction = self.connection.transaction().map_err(to_string)?;
+                zuno_db::session::create(&transaction, &input).map_err(to_string)?;
+                zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
+                    .map_err(to_string)?;
+                persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+                transaction.commit().map_err(to_string)?;
+                self.session_materializer = SessionMaterializer::Existing;
+                self.session_identity.mark_materialized();
+                Ok(true)
+            }
+        }
     }
 
     pub(crate) async fn continue_goal_if_idle(
@@ -1665,7 +1827,8 @@ impl TurnHost {
                     self.session_id.clone(),
                     Uuid::new_v4().simple().to_string(),
                     dynamic_context,
-                ),
+                )
+                .with_context_limit(self.window.context),
                 context,
                 events.clone(),
             )
@@ -3151,17 +3314,18 @@ fn ensure_project(
     Ok(())
 }
 
-fn resolve_session(
-    connection: &mut rusqlite::Connection,
+fn prepare_turn_host(
+    connection: &rusqlite::Connection,
     plan: &TurnPlan,
     now: i64,
-) -> Result<zuno_db::session::Session, String> {
+) -> Result<PreparedTurnHost, String> {
     match &plan.session {
         SessionChoice::Existing(session_id) => {
-            return zuno_db::session::get(connection, session_id).map_err(to_string);
+            let session = zuno_db::session::get(connection, session_id).map_err(to_string)?;
+            return Ok(prepared_existing_session(session));
         }
         SessionChoice::Continue => {
-            return zuno_db::session::list(
+            let session = zuno_db::session::list(
                 connection,
                 &zuno_db::session::ListQuery::directory(plan.directory.to_string_lossy())
                     .active_only()
@@ -3170,23 +3334,34 @@ fn resolve_session(
             .map_err(to_string)?
             .into_iter()
             .next()
-            .ok_or_else(|| "no session found to continue in the current directory".to_owned());
+            .ok_or_else(|| "no session found to continue in the current directory".to_owned())?;
+            return Ok(prepared_existing_session(session));
         }
-        SessionChoice::New => {}
+        SessionChoice::Prepared(identity) if identity.is_materialized() => {
+            let session = zuno_db::session::get(connection, identity.id()).map_err(to_string)?;
+            return Ok(prepared_existing_session(session));
+        }
+        SessionChoice::New | SessionChoice::Prepared(_) => {}
     }
 
-    let session_id = prefixed_id("ses");
+    let identity = match &plan.session {
+        SessionChoice::Prepared(identity) => identity.clone(),
+        SessionChoice::New => PreparedSessionIdentity::pending(prefixed_id("ses")),
+        SessionChoice::Continue | SessionChoice::Existing(_) => {
+            unreachable!("existing choices returned above")
+        }
+    };
     let title = plan
         .title
         .clone()
         .unwrap_or_else(|| "New session".to_owned());
     let mut input = zuno_db::session::SessionCreate::new(
-        &session_id,
+        identity.id(),
         Uuid::new_v4().simple().to_string(),
         &plan.project.id,
         plan.project.directory.to_string_lossy().into_owned(),
         plan.directory.to_string_lossy().into_owned(),
-        title,
+        title.clone(),
         crate::RUST_PACKAGE_VERSION,
     )
     .at(now);
@@ -3195,19 +3370,52 @@ fn resolve_session(
         &plan.provider_id,
         &plan.model_id,
     ));
-    let transaction = connection.transaction().map_err(to_string)?;
-    let creation = zuno_db::session::create(&transaction, &input).map_err(to_string)?;
-    transaction.commit().map_err(to_string)?;
-    Ok(creation.into_session())
+    Ok(PreparedTurnHost {
+        identity,
+        title,
+        directory: plan.directory.to_string_lossy().into_owned(),
+        usage: zuno_db::session::SessionUsage::default(),
+        materializer: SessionMaterializer::Pending(input),
+    })
+}
+
+fn prepared_existing_session(session: zuno_db::session::Session) -> PreparedTurnHost {
+    PreparedTurnHost {
+        identity: PreparedSessionIdentity::existing(session.id),
+        title: session.title,
+        directory: session.directory,
+        usage: session.usage,
+        materializer: SessionMaterializer::Existing,
+    }
+}
+
+#[cfg(test)]
+fn resolve_session(
+    connection: &mut rusqlite::Connection,
+    plan: &TurnPlan,
+    now: i64,
+) -> Result<zuno_db::session::Session, String> {
+    let prepared = prepare_turn_host(connection, plan, now)?;
+    match prepared.materializer {
+        SessionMaterializer::Existing => {
+            zuno_db::session::get(connection, prepared.identity.id()).map_err(to_string)
+        }
+        SessionMaterializer::Pending(mut input) => {
+            input.time = Some(now);
+            let transaction = connection.transaction().map_err(to_string)?;
+            let creation = zuno_db::session::create(&transaction, &input).map_err(to_string)?;
+            transaction.commit().map_err(to_string)?;
+            Ok(creation.into_session())
+        }
+    }
 }
 
 fn recent_sessions(
     connection: &rusqlite::Connection,
-    current_session_id: &str,
+    directory: &str,
     limit: u32,
 ) -> Result<Vec<zuno_db::session::Session>, zuno_error::DbError> {
-    let current = zuno_db::session::get(connection, current_session_id)?;
-    let mut query = zuno_db::session::ListQuery::directory(current.directory)
+    let mut query = zuno_db::session::ListQuery::directory(directory)
         .active_only()
         .with_limit(limit);
     query.roots = true;
@@ -3216,12 +3424,11 @@ fn recent_sessions(
 
 fn switchable_session(
     connection: &rusqlite::Connection,
-    current_session_id: &str,
+    directory: &str,
     target_session_id: &str,
 ) -> Result<Option<zuno_db::session::Session>, zuno_error::DbError> {
-    let current = zuno_db::session::get(connection, current_session_id)?;
     let target = zuno_db::session::get(connection, target_session_id)?;
-    if target.directory != current.directory || !target.is_root() || target.is_archived() {
+    if target.directory != directory || !target.is_root() || target.is_archived() {
         return Ok(None);
     }
     Ok(Some(target))

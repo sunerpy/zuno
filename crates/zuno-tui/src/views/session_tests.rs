@@ -1444,6 +1444,21 @@ fn session_screen_says_so_when_a_picker_would_be_empty() {
 }
 
 #[test]
+fn session_materialization_makes_the_new_session_discoverable_without_a_remount() {
+    let (mut screen, _shutdown) = screen();
+    *screen.catalog_mut() = catalog();
+    screen.handle_event(&AppEvent::Engine(TurnEvent::SessionMaterialized {
+        session_id: String::from("ses_new"),
+        title: String::from("New session"),
+    }));
+
+    assert_eq!(screen.catalog.session.as_deref(), Some("ses_new"));
+    assert_eq!(screen.catalog.sessions.len(), 1);
+    assert_eq!(screen.catalog.sessions[0].id, "ses_new");
+    assert_eq!(screen.catalog.sessions[0].when, "now");
+}
+
+#[test]
 fn session_screen_opens_the_session_picker_and_forwards_a_switch() {
     let (sender, _receiver) = terminal_event_channel();
     let (selections, mut chosen) = mpsc::channel(4);

@@ -228,12 +228,14 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
             initial_dialog.take(),
             &mut terminal,
         )? {
-            TuiRunOutcome::Exit(session_id) => {
+            TuiRunOutcome::Exit(identity) => {
                 // The resume command belongs in the primary screen's scrollback. Keep the
                 // terminal mounted across composition changes, but restore it before this
                 // final line exactly as a one-composition run does.
                 drop(terminal.take());
-                println!("{}", resume_hint(&session_id));
+                if identity.is_materialized() {
+                    println!("{}", resume_hint(identity.id()));
+                }
                 return Ok(());
             }
             TuiRunOutcome::Remount(next) => {
@@ -245,7 +247,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
 }
 
 enum TuiRunOutcome {
-    Exit(String),
+    Exit(super::turn::PreparedSessionIdentity),
     Remount(RemountRequest),
 }
 
@@ -401,7 +403,9 @@ fn execute_once(
         Some(mcp_catalog.clone()),
     )?;
     catalog.sessions = session_entries(&host)?;
-    catalog.session = Some(host.session_id().to_owned());
+    catalog.session = host
+        .is_session_materialized()
+        .then(|| host.session_id().to_owned());
     // Seeded from the row the host already read, so a session resumed with `-s` shows its
     // name on frame one instead of waiting for a turn that will never re-title it — the
     // generator declines outright once a session is named.
@@ -413,7 +417,7 @@ fn execute_once(
     // Copied before the host is moved into the turn driver. The id is what the hint
     // printed after teardown has to name, and by then the host is gone — a driver task
     // owns it and is aborted, not joined, so nothing survives to be asked.
-    let resumed_session = host.session_id().to_owned();
+    let exit_identity = host.session_identity();
     let slash_commands = host
         .commands()
         .map(|command| CatalogCommand::new(command.name.clone(), command.description.clone()))
@@ -461,6 +465,26 @@ fn execute_once(
         host.tool_count(),
         RuntimeIdentity::resolve(host.session_id(), host.profile_id(), environment.resolved()),
     );
+    if host.is_session_materialized() {
+        let usage = host.session_usage();
+        let tokens = zuno_tui::views::message::TokenUsage {
+            input: u64::try_from(usage.tokens.input).unwrap_or_default(),
+            output: u64::try_from(usage.tokens.output).unwrap_or_default(),
+            cache_read: u64::try_from(usage.tokens.cache_read).unwrap_or_default(),
+            cache_write: u64::try_from(usage.tokens.cache_write).unwrap_or_default(),
+        };
+        screen.transcript_mut().transcript_mut().restore_usage(
+            tokens,
+            usage
+                .last_prompt_tokens
+                .and_then(|value| u64::try_from(value).ok()),
+            usage
+                .context_limit
+                .and_then(|value| u64::try_from(value).ok()),
+            usage.known,
+        );
+        screen.status_mut().restore_usage(tokens);
+    }
     // Before every notice below, and that order is load-bearing in both directions.
     //
     // Before, because `Transcript::replay` only acts on an empty transcript — a guard that
@@ -643,7 +667,7 @@ fn execute_once(
     if let Some(next) = remount.take() {
         return Ok(TuiRunOutcome::Remount(next));
     }
-    Ok(TuiRunOutcome::Exit(resumed_session))
+    Ok(TuiRunOutcome::Exit(exit_identity))
 }
 
 /// The flag that reopens an existing session, as `command.rs` declares it.
@@ -672,11 +696,9 @@ const RESUME_FLAG: &str = "-s";
 /// user's scrollback, which is the only place a command they may want tomorrow is any
 /// use.
 ///
-/// Unconditional because every TUI session has a persisted row by the time the screen
-/// opens: `resolve_session` either found one, continued one, or inserted one before
-/// `TurnHost` was returned, so there is no state in which the id names nothing. A
-/// session with no messages is still resumable — reopening it is how a user gets back
-/// to a prompt they abandoned.
+/// Called only after [`PreparedSessionIdentity::is_materialized`] proves the stable
+/// process-local id now names a durable row. A welcome screen that never submitted model
+/// input deliberately has no row and therefore no resume command to print.
 fn resume_hint(session_id: &str) -> String {
     format!("resume this session: zuno {RESUME_FLAG} {session_id}")
 }
@@ -1270,7 +1292,7 @@ async fn apply_selection(
     rebuild: &TurnRebuild<'_>,
 ) -> SelectionOutcome {
     let mut next = rebuild.options.clone();
-    next.session = SessionChoice::Existing(host.session_id().to_owned());
+    next.session = host.rebuild_session_choice();
     // Seeded from the live host, not from the launch options, for the reason
     // `refresh_mcp_host` does the same: the host is what the previous selection actually
     // produced. Reading the launch options alone made each pick discard the one before
@@ -1647,7 +1669,7 @@ async fn drive_turns(
         .await;
         if environment.extensions().composition_generation() != driver.host.extension_generation() {
             let mut next = driver.options.clone();
-            next.session = SessionChoice::Existing(driver.host.session_id().to_owned());
+            next.session = driver.host.rebuild_session_choice();
             next.model = Some(driver.host.qualified_model());
             next.agent = Some(driver.host.agent_name().to_owned());
             next.effort = driver.host.effort();
@@ -1664,7 +1686,7 @@ async fn refresh_mcp_host(
     events: &TurnEventSender,
 ) -> Option<TurnEventSender> {
     let mut next = driver.options.clone();
-    next.session = SessionChoice::Existing(driver.host.session_id().to_owned());
+    next.session = driver.host.rebuild_session_choice();
     next.model = Some(driver.host.qualified_model());
     next.agent = Some(driver.host.agent_name().to_owned());
     let rebuilt = async {
