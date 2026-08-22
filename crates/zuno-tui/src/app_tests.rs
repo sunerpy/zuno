@@ -1840,6 +1840,20 @@ async fn app_the_input_producer_returns_once_its_consumer_is_gone() {
         .expect("the producer must not panic");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_the_input_producer_stops_explicitly_while_its_consumer_is_still_live() {
+    let (sender, _receiver) = terminal_event_channel();
+    let control = Arc::new(TerminalInputControl::new());
+    let producer = tokio::spawn(forward_terminal_input(sender, Arc::clone(&control)));
+
+    control.stop();
+
+    tokio::time::timeout(INPUT_POLL_INTERVAL * 4, producer)
+        .await
+        .expect("an explicit stop must settle the producer within a few polls")
+        .expect("the producer must not panic");
+}
+
 /// Counts terminal events by kind, so a wake can be told from a keystroke.
 ///
 /// [`EventRecorder`] counts every terminal event together, which cannot distinguish "the

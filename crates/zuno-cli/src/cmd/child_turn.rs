@@ -8,10 +8,12 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -41,52 +43,71 @@ use crate::environment::StartupEnvironment;
 /// `subagent_depth`, which is single digits.
 const MAX_ANCESTRY_WALK: u32 = 64;
 
-type ChangeHook = Arc<dyn Fn() + Send + Sync>;
-type SharedChangeHook = Arc<Mutex<Option<ChangeHook>>>;
+/// One process-local generation shared by every host observing the same work.
+#[derive(Debug, Clone)]
+pub(crate) struct ChangeNotifier {
+    sender: watch::Sender<u64>,
+}
 
-/// Owns background tasks started by one turn host.
+impl Default for ChangeNotifier {
+    fn default() -> Self {
+        let (sender, _receiver) = watch::channel(0);
+        Self { sender }
+    }
+}
+
+impl ChangeNotifier {
+    pub(crate) fn changed(&self) {
+        self.sender.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.sender.subscribe()
+    }
+}
+
+/// Owns background tasks started in one workspace process.
 ///
-/// Waiting is part of host shutdown, so one-shot runtimes cannot discard a job after
-/// returning its id but before committing its terminal state.
-#[derive(Clone)]
+/// A host only borrows this owner. Session switches therefore cannot detach a task,
+/// while the process surface can cancel or drain the complete set before its Tokio
+/// runtime disappears.
+#[derive(Debug, Clone)]
 pub(crate) struct BackgroundJobSupervisor {
     tasks: Arc<Mutex<Vec<ManagedJob>>>,
-    changed: SharedChangeHook,
+    next_task: Arc<AtomicU64>,
+    waiter: Arc<tokio::sync::Mutex<()>>,
+    changed: ChangeNotifier,
 }
 
 impl Default for BackgroundJobSupervisor {
     fn default() -> Self {
         Self {
             tasks: Arc::new(Mutex::new(Vec::new())),
-            changed: Arc::new(Mutex::new(None)),
+            next_task: Arc::new(AtomicU64::new(0)),
+            waiter: Arc::new(tokio::sync::Mutex::new(())),
+            changed: ChangeNotifier::default(),
         }
     }
 }
 
+#[derive(Debug)]
 struct ManagedJob {
+    internal_id: u64,
     id: String,
     parent_session_id: String,
     cancellation: CancellationToken,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl BackgroundJobSupervisor {
-    pub(crate) fn set_change_hook(&self, changed: ChangeHook) {
-        *self
-            .changed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(changed);
+    pub(crate) fn notifier(&self) -> ChangeNotifier {
+        self.changed.clone()
     }
 
     fn notify_changed(&self) {
-        if let Some(changed) = self
-            .changed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-        {
-            changed();
-        }
+        self.changed.changed();
     }
 
     pub(crate) fn spawn(
@@ -96,26 +117,46 @@ impl BackgroundJobSupervisor {
         cancellation: CancellationToken,
         task: impl Future<Output = ()> + Send + 'static,
     ) {
-        let changed = self
-            .changed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let internal_id = self.next_task.fetch_add(1, Ordering::Relaxed);
+        let changed = self.changed.clone();
         self.tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(ManagedJob {
+                internal_id,
                 id: id.into(),
                 parent_session_id: parent_session_id.into(),
                 cancellation,
-                task: tokio::spawn(async move {
+                task: Some(tokio::spawn(async move {
                     task.await;
-                    if let Some(changed) = changed {
-                        changed();
-                    }
-                }),
+                    changed.changed();
+                })),
             });
         self.notify_changed();
+    }
+
+    /// Adopt an already-spawned task and make cancellation abort-and-join it.
+    pub(crate) fn supervise_handle(
+        &self,
+        id: impl Into<String>,
+        parent_session_id: impl Into<String>,
+        cancellation: CancellationToken,
+        mut task: JoinHandle<()>,
+    ) {
+        let task_cancellation = cancellation.clone();
+        self.spawn(id, parent_session_id, cancellation, async move {
+            tokio::select! {
+                outcome = &mut task => {
+                    if let Err(error) = outcome {
+                        tracing::error!(%error, "owned background task panicked");
+                    }
+                }
+                () = task_cancellation.cancelled() => {
+                    task.abort();
+                    let _cancelled = task.await;
+                }
+            }
+        });
     }
 
     /// Request cancellation without replaying or directly settling the job.
@@ -127,7 +168,7 @@ impl BackgroundJobSupervisor {
         let Some(job) = tasks.iter().find(|job| {
             job.id == job_id
                 && job.parent_session_id == parent_session_id
-                && !job.task.is_finished()
+                && job.task.as_ref().is_none_or(|task| !task.is_finished())
         }) else {
             return false;
         };
@@ -135,33 +176,53 @@ impl BackgroundJobSupervisor {
         true
     }
 
-    /// Whether this host still owns a background task that can write session state.
-    pub(crate) fn has_running_tasks(&self) -> bool {
+    /// Request cancellation for every task without claiming it has stopped yet.
+    pub(crate) fn cancel_all(&self) {
+        let tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for job in tasks
+            .iter()
+            .filter(|job| job.task.as_ref().is_none_or(|task| !task.is_finished()))
+        {
+            job.cancellation.cancel();
+        }
+    }
+
+    /// Whether this process still owns a task that can write one session's state.
+    pub(crate) fn has_running_tasks(&self, parent_session_id: &str) -> bool {
         self.tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .any(|job| !job.task.is_finished())
+            .filter(|job| job.parent_session_id == parent_session_id)
+            .any(|job| job.task.as_ref().is_none_or(|task| !task.is_finished()))
     }
 
     /// Wait for every task this supervisor owns.
     pub(crate) async fn wait_all(&self) {
+        let _waiter = self.waiter.lock().await;
         loop {
-            let tasks = {
+            let next = {
                 let mut tasks = self
                     .tasks
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                std::mem::take(&mut *tasks)
+                tasks
+                    .iter_mut()
+                    .find_map(|job| job.task.take().map(|task| (job.internal_id, task)))
             };
-            if tasks.is_empty() {
+            let Some((internal_id, task)) = next else {
                 return;
+            };
+            if let Err(error) = task.await {
+                tracing::error!(%error, "background subagent task panicked");
             }
-            for job in tasks {
-                if let Err(error) = job.task.await {
-                    tracing::error!(%error, "background subagent task panicked");
-                }
-            }
+            self.tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|job| job.internal_id != internal_id);
         }
     }
 }
@@ -405,6 +466,7 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             session: SessionChoice::Existing(session_id.to_owned()),
             title: request.description.clone(),
             effort: request.effort,
+            extension_composition: super::turn::ExtensionComposition::Active,
         };
         let plan = TurnPlan::resolve(&options, &self.environment).await?;
         let mut host = TurnHost::open_with_runtime_mcp_and_database(
@@ -415,7 +477,9 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             self.runs.clone(),
             self.mcp.clone(),
             Arc::clone(&self.database),
-        )?;
+        )
+        .await?;
+        host.activate_extension_composition()?;
         let guard = self
             .runs
             .begin_turn(session_id.to_owned())
@@ -433,8 +497,8 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
                 }
             }
         };
-        host.shutdown().await;
-        outcome?;
+        let shutdown = host.shutdown().await;
+        super::turn::finish_with_shutdown(outcome, shutdown)?;
         child_answer(&self.database, session_id)
     }
 }
@@ -474,6 +538,7 @@ impl PendingInputDriver for ParentReportDriver {
             session: SessionChoice::Existing(input.session_id.clone()),
             title: None,
             effort: self.effort,
+            extension_composition: super::turn::ExtensionComposition::Active,
         };
         let plan = TurnPlan::resolve(&options, &self.environment).await?;
         let mut host = TurnHost::open_with_runtime_mcp_and_database(
@@ -484,18 +549,19 @@ impl PendingInputDriver for ParentReportDriver {
             self.runs.clone(),
             self.mcp.clone(),
             Arc::clone(&self.database),
-        )?;
+        )
+        .await?;
+        host.activate_extension_composition()?;
         let promoted = self
             .inbox
             .promote_id(&input.session_id, &input.id)
             .map_err(to_string)?;
         if promoted.is_none() {
-            host.shutdown().await;
-            return Ok(());
+            return host.shutdown().await;
         }
         let outcome = drive_and_drain(&mut host, &text, Some(input.id.as_str()), Some(guard)).await;
-        host.shutdown().await;
-        outcome
+        let shutdown = host.shutdown().await;
+        super::turn::finish_with_shutdown(outcome, shutdown)
     }
 }
 

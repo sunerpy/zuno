@@ -361,7 +361,6 @@ async fn run_scenario(
         })],
         rules,
         Arc::new(AllowAll),
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     );
     let resolver = Resolver;
@@ -468,7 +467,6 @@ async fn parallel_safe_calls_overlap_but_persist_and_emit_in_model_order() {
             action: PermissionAction::Allow,
         }],
         Arc::new(AllowAll),
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     );
     let resolver = Resolver;
@@ -585,7 +583,6 @@ async fn dispatch_loop_rejects_namespaced_or_historical_tool_aliases() {
             action: PermissionAction::Allow,
         }],
         Arc::new(AllowAll),
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     );
     let resolver = Resolver;
@@ -656,7 +653,6 @@ async fn dispatch_loop_reports_a_tool_timeout_without_replaying_the_call() {
             action: PermissionAction::Allow,
         }],
         Arc::new(AllowAll),
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     );
     let resolver = Resolver;
@@ -746,7 +742,6 @@ async fn dispatch_loop_keeps_only_the_latest_failure_recovery_for_each_tool() {
             action: PermissionAction::Allow,
         }],
         Arc::new(AllowAll),
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     );
     let resolver = Resolver;
@@ -855,7 +850,6 @@ async fn dispatch_loop_carries_every_written_path_from_the_tool_onto_the_event()
             action: PermissionAction::Allow,
         }],
         Arc::new(AllowAll),
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     );
     let resolver = Resolver;

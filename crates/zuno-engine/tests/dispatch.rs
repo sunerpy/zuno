@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -152,20 +152,36 @@ impl Tool for ArgumentCapturingTool {
     }
 }
 
-struct DetachedTool {
+struct BlockingDropTool {
     started: Arc<Notify>,
-    release: Arc<Notify>,
-    completed: Arc<Notify>,
+    drop_entered: Arc<AtomicUsize>,
+    drop_release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+struct BlockingDropGuard {
+    drop_entered: Arc<AtomicUsize>,
+    drop_release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Drop for BlockingDropGuard {
+    fn drop(&mut self) {
+        self.drop_entered.store(1, Ordering::SeqCst);
+        let (released, changed) = &*self.drop_release;
+        let mut released = released.lock().expect("drop release lock");
+        while !*released {
+            released = changed.wait(released).expect("drop release wait");
+        }
+    }
 }
 
 #[async_trait]
-impl Tool for DetachedTool {
+impl Tool for BlockingDropTool {
     fn id(&self) -> &str {
         "bash"
     }
 
     fn description(&self) -> &str {
-        "Wait until the test releases this tool."
+        "Block until the invocation is cancelled."
     }
 
     fn raw_parameters_schema(&self) -> Value {
@@ -177,10 +193,12 @@ impl Tool for DetachedTool {
     }
 
     async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let _guard = BlockingDropGuard {
+            drop_entered: Arc::clone(&self.drop_entered),
+            drop_release: Arc::clone(&self.drop_release),
+        };
         self.started.notify_one();
-        self.release.notified().await;
-        self.completed.notify_one();
-        Ok(ToolOutput::text("bash", "finished"))
+        std::future::pending().await
     }
 }
 
@@ -227,9 +245,8 @@ fn dispatcher(
     tools: Vec<Arc<dyn Tool>>,
     rules: Vec<Rule>,
     approver: Arc<dyn PermissionAsker>,
-    background: InterruptSignal,
 ) -> ToolRegistryDispatcher {
-    ToolRegistryDispatcher::new(tools, rules, approver, background, McpToolStatus::Ready)
+    ToolRegistryDispatcher::new(tools, rules, approver, McpToolStatus::Ready)
 }
 
 #[derive(Default)]
@@ -295,7 +312,6 @@ async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         vec![allow_all_rule(), deny_rule("bash", "rm -rf /")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     )
     .with_hooks(Arc::new(AllowingHooks));
@@ -347,7 +363,6 @@ async fn production_dispatch_rewrites_arguments_before_permission_and_execution(
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         vec![deny_rule("bash", "original")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     )
     .with_hooks(Arc::new(MutatingHooks));
@@ -375,7 +390,6 @@ async fn a_plugin_allow_resolves_an_ask_without_prompting() {
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         Vec::new(),
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     )
     .with_hooks(Arc::new(AllowingHooks));
@@ -411,7 +425,6 @@ async fn the_intent_reaches_the_permission_layer_but_not_the_tool() {
         })],
         Vec::new(),
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
-        InterruptSignal::new(),
     );
 
     let result = dispatcher
@@ -451,7 +464,6 @@ async fn dispatch_rejects_unregistered_tool_aliases_without_running_the_native_t
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         vec![allow_all_rule()],
         Arc::new(RecordingApprover::default()),
-        InterruptSignal::new(),
     );
 
     for (index, alias) in ["Bash", "functions.bash"].into_iter().enumerate() {
@@ -493,7 +505,6 @@ async fn dispatch_unknown_tool_returns_ranked_suggestion_and_available_list() {
         ],
         vec![allow_all_rule()],
         Arc::new(RecordingApprover::default()),
-        InterruptSignal::new(),
     );
 
     let result = dispatcher
@@ -528,7 +539,6 @@ async fn dispatch_malformed_json_synthesizes_error_without_running_tool() {
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         vec![allow_all_rule()],
         Arc::new(RecordingApprover::default()),
-        InterruptSignal::new(),
     );
     let mut malformed = request(
         &dispatcher,
@@ -563,7 +573,6 @@ async fn dispatch_schema_error_is_a_result_and_does_not_run_tool() {
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         vec![allow_all_rule()],
         Arc::new(RecordingApprover::default()),
-        InterruptSignal::new(),
     );
 
     let result = dispatcher
@@ -593,7 +602,6 @@ async fn dispatch_denial_is_an_error_result_and_a_later_call_still_runs() {
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         vec![allow_all_rule(), deny_rule("bash", "rm -rf /")],
         Arc::new(RecordingApprover::default()),
-        InterruptSignal::new(),
     );
 
     let denied = dispatcher
@@ -632,7 +640,6 @@ async fn dispatch_waits_for_argument_derived_permission_before_execution() {
         ))],
         Vec::new(),
         approver.clone(),
-        InterruptSignal::new(),
     ));
     let task = {
         let dispatcher = Arc::clone(&dispatcher);
@@ -670,7 +677,6 @@ async fn dispatch_passes_argument_pattern_to_permission_approver() {
         ))],
         Vec::new(),
         approver.clone(),
-        InterruptSignal::new(),
     );
 
     let result = dispatcher
@@ -689,55 +695,55 @@ async fn dispatch_passes_argument_pattern_to_permission_approver() {
     assert_eq!(asks[0].patterns, ["git push origin main"]);
 }
 
-#[tokio::test]
-async fn dispatch_background_signal_waits_for_grace_then_detaches_running_tool() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_interrupt_joins_the_cancelled_tool_before_returning() {
     let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let completed = Arc::new(Notify::new());
-    let background = InterruptSignal::new();
+    let drop_entered = Arc::new(AtomicUsize::new(0));
+    let drop_release = Arc::new((Mutex::new(false), Condvar::new()));
     let dispatcher = Arc::new(dispatcher(
-        vec![Arc::new(DetachedTool {
+        vec![Arc::new(BlockingDropTool {
             started: Arc::clone(&started),
-            release: Arc::clone(&release),
-            completed: Arc::clone(&completed),
+            drop_entered: Arc::clone(&drop_entered),
+            drop_release: Arc::clone(&drop_release),
         })],
         vec![allow_all_rule()],
         Arc::new(RecordingApprover::default()),
-        background.clone(),
     ));
-    let began = Instant::now();
+    let call = request(
+        &dispatcher,
+        "call_interrupt",
+        "bash",
+        json!({ "command": "wait", "intent": "wait" }),
+    );
+    let interrupt = call.interrupt.clone();
     let task = {
         let dispatcher = Arc::clone(&dispatcher);
-        tokio::spawn(async move {
-            dispatcher
-                .dispatch(request(
-                    &dispatcher,
-                    "call_background",
-                    "bash",
-                    json!({ "command": "sleep", "intent": "wait" }),
-                ))
-                .await
-        })
+        tokio::spawn(async move { dispatcher.dispatch(call).await })
     };
 
     started.notified().await;
-    background.fire();
-    let result = tokio::time::timeout(Duration::from_secs(2), task)
-        .await
-        .expect("dispatch must detach after the grace period")
-        .expect("dispatch task");
+    interrupt.fire();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while drop_entered.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled tool future reaches Drop");
+    let returned_before_drop_finished = task.is_finished();
+    {
+        let (released, changed) = &*drop_release;
+        *released.lock().expect("drop release lock") = true;
+        changed.notify_all();
+    }
+    let result = task.await.expect("dispatch task");
 
-    assert!(!result.is_error, "{}", result.output.output);
-    assert!(result.output.output.contains("background"));
     assert!(
-        began.elapsed() >= Duration::from_millis(700),
-        "the dispatcher skipped the grace period"
+        !returned_before_drop_finished,
+        "dispatch reported interruption while the cancelled tool future was still live"
     );
-
-    release.notify_waiters();
-    tokio::time::timeout(Duration::from_secs(1), completed.notified())
-        .await
-        .expect("detached tool must keep running");
+    assert!(result.is_error);
+    assert!(result.output.output.contains("interrupted"));
 }
 
 #[test]
@@ -752,7 +758,6 @@ fn available_tools_omits_unconditionally_denied_entries() {
         ],
         vec![deny_rule("bash", "*")],
         Arc::new(RecordingApprover::default()),
-        InterruptSignal::new(),
     );
 
     let available = dispatcher.available_tools();
@@ -811,7 +816,6 @@ async fn dispatch_hands_the_model_every_cause_beneath_a_failure() {
         vec![Arc::new(NestedFailureTool)],
         Vec::new(),
         Arc::new(RecordingApprover::default()),
-        InterruptSignal::new(),
     );
 
     let result = dispatcher

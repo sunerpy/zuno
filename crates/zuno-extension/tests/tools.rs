@@ -55,18 +55,19 @@ async fn model_tools_define_then_activate_without_writing_static_state() {
         registry.dynamic_statuses(&scope)[0].state,
         DynamicState::Defined
     );
-    let before = registry.composition_generation();
+    let before = registry.active_revision(&scope);
 
     let activated = run
         .invoke(json!({"id": "temporary"}), context("call_run"))
         .await
         .expect("activation succeeds");
 
-    assert!(activated.output.contains("next turn"));
-    assert!(registry.composition_generation() > before);
+    assert!(activated.output.contains("scheduled"));
+    assert_eq!(registry.active_revision(&scope), before);
+    assert!(registry.desired_revision(&scope) > before);
     assert_eq!(
         registry.dynamic_statuses(&scope)[0].state,
-        DynamicState::Running
+        DynamicState::PendingRun
     );
 }
 

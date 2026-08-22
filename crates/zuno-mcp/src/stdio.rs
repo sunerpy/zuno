@@ -179,6 +179,7 @@ struct Inner {
 struct BackgroundTasks {
     reader: Option<JoinHandle<()>>,
     refresh: Option<JoinHandle<()>>,
+    stderr: Option<JoinHandle<()>>,
 }
 
 impl Drop for Inner {
@@ -193,6 +194,9 @@ impl Drop for Inner {
             task.abort();
         }
         if let Some(task) = tasks.refresh.take() {
+            task.abort();
+        }
+        if let Some(task) = tasks.stderr.take() {
             task.abort();
         }
     }
@@ -245,11 +249,15 @@ impl StdioClient {
             server: server.clone(),
             source: Box::new(io::Error::other("spawned MCP child has no stdout")),
         })?;
-        if let Some(stderr) = child.stderr.take() {
-            spawn_stderr_reader(server.clone(), stderr);
-        }
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stderr| spawn_stderr_reader(server.clone(), stderr));
         let process = ProcessControl::new(server.clone(), child);
         let client = Self::from_io(server, stdout, stdin, timeout, Some(process));
+        if let Some(stderr) = stderr {
+            lock(&client.inner.tasks).stderr = Some(stderr);
+        }
 
         let initialized = match client.initialize().await {
             Ok(initialized) => initialized,
@@ -401,15 +409,22 @@ impl StdioClient {
             process.close().await;
         }
 
-        let (reader, refresh) = {
+        let (reader, refresh, stderr) = {
             let mut tasks = lock(&self.inner.tasks);
-            (tasks.reader.take(), tasks.refresh.take())
+            (
+                tasks.reader.take(),
+                tasks.refresh.take(),
+                tasks.stderr.take(),
+            )
         };
         if let Some(task) = refresh {
             task.abort();
             let _result = task.await;
         }
         if let Some(task) = reader {
+            finish_task(task, TASK_SHUTDOWN_GRACE).await;
+        }
+        if let Some(task) = stderr {
             finish_task(task, TASK_SHUTDOWN_GRACE).await;
         }
     }
@@ -890,7 +905,10 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     normalized
 }
 
-fn spawn_stderr_reader(server: String, stderr: tokio::process::ChildStderr) {
+fn spawn_stderr_reader<R>(server: String, stderr: R) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
@@ -911,7 +929,7 @@ fn spawn_stderr_reader(server: String, stderr: tokio::process::ChildStderr) {
                 }
             }
         }
-    });
+    })
 }
 
 async fn finish_task(mut task: JoinHandle<()>, grace: Duration) {
@@ -990,6 +1008,22 @@ mod tests {
             .write_all(&bytes)
             .await
             .expect("write fake-server response");
+    }
+
+    #[tokio::test]
+    async fn stderr_drain_returns_an_owned_task_that_can_be_joined() {
+        let (mut writer, reader) = duplex(256);
+        let task = spawn_stderr_reader("fake".to_owned(), reader);
+        writer
+            .write_all(b"diagnostic\n")
+            .await
+            .expect("write stderr fixture");
+        drop(writer);
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("stderr drain reaches EOF")
+            .expect("stderr task does not panic");
     }
 
     #[tokio::test]

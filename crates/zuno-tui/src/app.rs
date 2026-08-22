@@ -920,6 +920,7 @@ struct TerminalInputState {
     resumed: u64,
     producer_attached: bool,
     producer_seen: bool,
+    stopped: bool,
 }
 
 /// Coordinates the one physical TTY reader with terminal ownership transitions.
@@ -974,6 +975,18 @@ impl TerminalInputControl {
         epoch
     }
 
+    /// Ask the physical input producer to stop and wake any paused wait immediately.
+    ///
+    /// The caller still joins the producer task. This signal only gives the loop an
+    /// authoritative exit path that does not depend on dropping the TUI's receiver.
+    pub fn stop(&self) {
+        self.state.send_modify(|state| state.stopped = true);
+    }
+
+    fn stopped(&self) -> bool {
+        self.state.borrow().stopped
+    }
+
     async fn wait_for_pause(&self, epoch: u64) -> Result<(), &'static str> {
         let mut state = self.state.subscribe();
         tokio::time::timeout(INPUT_PAUSE_TIMEOUT, async {
@@ -1019,7 +1032,7 @@ impl TerminalInputControl {
         let mut state = self.state.subscribe();
         loop {
             let snapshot = *state.borrow_and_update();
-            if snapshot.resumed >= epoch {
+            if snapshot.stopped || snapshot.resumed >= epoch {
                 return;
             }
             #[cfg(test)]
@@ -1081,7 +1094,7 @@ async fn forward_terminal_input_from(
     control: Arc<TerminalInputControl>,
 ) {
     let _attached = control.attach();
-    while !sender.is_closed() {
+    while !sender.is_closed() && !control.stopped() {
         if pause_input_if_requested(&sender, &control).await.is_err() {
             return;
         }
@@ -1089,12 +1102,18 @@ async fn forward_terminal_input_from(
         match tokio::task::spawn_blocking(move || polling.poll(INPUT_POLL_INTERVAL)).await {
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
+                if control.stopped() {
+                    return;
+                }
                 if pause_input_if_requested(&sender, &control).await.is_err() {
                     return;
                 }
                 continue;
             }
             Ok(Err(_)) | Err(_) => return,
+        }
+        if control.stopped() {
+            return;
         }
         if pause_input_if_requested(&sender, &control).await.is_err() {
             return;
@@ -1103,6 +1122,9 @@ async fn forward_terminal_input_from(
         let Ok(Ok(event)) = tokio::task::spawn_blocking(move || reading.read()).await else {
             return;
         };
+        if control.stopped() {
+            return;
+        }
         // Dropped before the queue, not after: the send below is awaited on a bounded
         // channel, so an event nothing can act on does not just cost a dispatch — it
         // occupies a slot a keystroke is waiting for.
@@ -1132,6 +1154,9 @@ async fn pause_input_if_requested(
     sender: &mpsc::Sender<TerminalEvent>,
     control: &TerminalInputControl,
 ) -> Result<(), ()> {
+    if control.stopped() {
+        return Err(());
+    }
     let Some(epoch) = control.pending_pause() else {
         return Ok(());
     };
@@ -1143,7 +1168,7 @@ async fn pause_input_if_requested(
         .await
         .map_err(|_| ())?;
     control.wait_for_resume(epoch).await;
-    Ok(())
+    (!control.stopped()).then_some(()).ok_or(())
 }
 
 /// A TUI event-loop failure.

@@ -13,7 +13,12 @@ mod static_loading;
 mod tools;
 
 pub use manifest::{API_VERSION, Package, SkillDefinition, WorkflowDefinition};
-pub use registry::{DynamicState, ExtensionRegistry, PackageStatus, Scope};
-pub use resolve::{PackageOrigin, ResolvedExtensions, ResolvedPackage, resolve_active};
+pub use registry::{
+    CompositionLease, DynamicState, ExtensionRegistry, ExtensionTransaction, PackageStatus,
+    PreparedTransition, RegistryError, Scope, StageOutcome,
+};
+pub use resolve::{
+    PackageOrigin, ResolvedExtensions, ResolvedPackage, resolve_active, resolve_desired,
+};
 pub use static_loading::{STATIC_DIRECTORY, STATIC_MANIFEST, StaticPackage, discover_static};
 pub use tools::lifecycle_tools;

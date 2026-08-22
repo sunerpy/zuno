@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt as _};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use zuno_lsp::manager::Manager;
 use zuno_tui::views::lsp::{Diagnostic, PendingEditReader, Report, Severity};
 
@@ -229,18 +229,39 @@ pub(super) async fn check_edits(
     pending: PendingEditReader,
     mut signals: mpsc::Receiver<()>,
     reports: mpsc::Sender<Report>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let Some(probe) = probe else {
         // Drained rather than dropped, so the set does not grow for the lifetime of a
         // session nobody is checking. No truncation notice here and that is deliberate:
         // with no server enabled — the default — nothing was going to be checked anyway,
         // so saying a subset went unchecked would be a row per turn about nothing.
-        while signals.recv().await.is_some() {
-            let _discarded = pending.take();
+        loop {
+            tokio::select! {
+                signal = signals.recv() => match signal {
+                    Some(()) => {
+                        let _discarded = pending.take();
+                    }
+                    None => return,
+                },
+                changed = shutdown.changed() => {
+                    let _changed = changed;
+                    return;
+                }
+            }
         }
-        return;
     };
-    while signals.recv().await.is_some() {
+    loop {
+        let signalled = tokio::select! {
+            signal = signals.recv() => signal.is_some(),
+            changed = shutdown.changed() => {
+                let _changed = changed;
+                false
+            }
+        };
+        if !signalled {
+            break;
+        }
         // Everything waiting, not the one batch a message carried. A nudge lost to a full
         // capacity-one channel therefore costs nothing: this drain finds what it would
         // have carried, which is the whole reason the paths do not travel as messages.

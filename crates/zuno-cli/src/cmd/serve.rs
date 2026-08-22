@@ -26,6 +26,12 @@ struct ServerSessionMutationExecutor {
     environment: StartupEnvironment,
     requests: RequestBroker,
     runs: SessionRunRegistry,
+    /// Serializes host acquisition with extension transition reservation.
+    ///
+    /// Turns themselves remain concurrent. Only the short composition boundary is
+    /// serialized so a request cannot acquire the old revision after a candidate has
+    /// reserved it and before that candidate commits.
+    composition_gate: Arc<tokio::sync::Mutex<()>>,
     /// The one MCP catalog every session on this server shares.
     ///
     /// A host is built per request here, so building a *catalog* per request would
@@ -38,58 +44,146 @@ struct ServerSessionMutationExecutor {
 
 impl ServerSessionMutationExecutor {
     fn new(
+        environment: StartupEnvironment,
         requests: RequestBroker,
         runs: SessionRunRegistry,
         mcp: Option<zuno_mcp::Catalog>,
     ) -> Self {
         Self {
-            environment: StartupEnvironment::resolve(
-                &zuno_paths::Env::from_process(),
-                &crate::command::GlobalOptions::default(),
-            ),
+            environment,
             requests,
             runs,
+            composition_gate: Arc::new(tokio::sync::Mutex::new(())),
             mcp,
         }
     }
 
-    /// Open a host for one request.
-    ///
-    /// Takes `self` by value rather than the executor's four fields as arguments: the
-    /// environment, the request broker, the run registry and the MCP catalog all
-    /// belong to the executor, and unpacking them at each call site only to pass them
-    /// back in is what pushed this past the argument limit when MCP was added.
-    async fn open(
-        self,
-        session_id: String,
-        directory: std::path::PathBuf,
-        agent: Option<String>,
-        model: Option<zuno_server::SessionModelSelection>,
-    ) -> Result<TurnHost, String> {
-        let options = TurnOptions {
-            directory: Some(directory),
-            model: model.map(|model| format!("{}/{}", model.provider_id, model.model_id)),
-            agent,
-            session: SessionChoice::Existing(session_id.clone()),
-            title: None,
-            effort: None,
-        };
-        let plan = TurnPlan::resolve(&options, &self.environment).await?;
+    async fn open_active(&self, spec: &ServerHostSpec) -> Result<TurnHost, String> {
+        let _composition = self.composition_gate.lock().await;
+        let plan = TurnPlan::resolve(
+            &spec.options(super::turn::ExtensionComposition::Active),
+            &self.environment,
+        )
+        .await?;
+        self.open_plan(plan, spec).await
+    }
+
+    async fn open_plan(&self, plan: TurnPlan, spec: &ServerHostSpec) -> Result<TurnHost, String> {
         let approval: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
             requests: self.requests.clone(),
-            session_id,
+            session_id: spec.session_id.clone(),
         });
         let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker {
-            requests: self.requests,
+            requests: self.requests.clone(),
         });
-        TurnHost::open_with_runtime_and_mcp(
+        let mut host = TurnHost::open_with_runtime_and_mcp(
             plan,
             &self.environment,
             approval,
             Some(question),
-            self.runs,
-            self.mcp,
+            self.runs.clone(),
+            self.mcp.clone(),
         )
+        .await?;
+        if let Err(error) = host.activate_extension_composition() {
+            let shutdown = host.shutdown().await;
+            return Err(match shutdown {
+                Ok(()) => error,
+                Err(shutdown) => {
+                    format!("{error}; candidate host shutdown also failed: {shutdown}")
+                }
+            });
+        }
+        Ok(host)
+    }
+
+    /// Publish a staged extension mutation once all request hosts on the old revision
+    /// have stopped. A live peer defers the transition; its own shutdown will retry.
+    async fn reconcile_extensions(
+        &self,
+        spec: &ServerHostSpec,
+        scope: &zuno_extension::Scope,
+    ) -> Result<(), String> {
+        let _composition = self.composition_gate.lock().await;
+        let prepared =
+            match reserve_pending_extension_transition(self.environment.extensions(), scope)? {
+                PendingExtensionReservation::None | PendingExtensionReservation::Deferred => {
+                    return Ok(());
+                }
+                PendingExtensionReservation::Reserved(prepared) => prepared,
+            };
+        let mut plan = match TurnPlan::resolve(
+            &spec.options(super::turn::ExtensionComposition::Desired),
+            &self.environment,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                return match prepared.abort() {
+                    Ok(()) => Err(error),
+                    Err(abort) => Err(format!(
+                        "{error}; prepared extension transition abort also failed: {abort}"
+                    )),
+                };
+            }
+        };
+        plan.use_prepared_extension_transition(prepared)?;
+        let mut candidate = self.open_plan(plan, spec).await?;
+        candidate.shutdown().await
+    }
+}
+
+#[derive(Clone)]
+struct ServerHostSpec {
+    session_id: String,
+    directory: std::path::PathBuf,
+    agent: Option<String>,
+    model: Option<zuno_server::SessionModelSelection>,
+}
+
+impl ServerHostSpec {
+    fn options(&self, extension_composition: super::turn::ExtensionComposition) -> TurnOptions {
+        TurnOptions {
+            directory: Some(self.directory.clone()),
+            model: self
+                .model
+                .as_ref()
+                .map(|model| format!("{}/{}", model.provider_id, model.model_id)),
+            agent: self.agent.clone(),
+            session: SessionChoice::Existing(self.session_id.clone()),
+            title: None,
+            effort: None,
+            extension_composition,
+        }
+    }
+}
+
+enum PendingExtensionReservation {
+    None,
+    Deferred,
+    Reserved(zuno_extension::PreparedTransition),
+}
+
+fn reserve_pending_extension_transition(
+    registry: &Arc<zuno_extension::ExtensionRegistry>,
+    scope: &zuno_extension::Scope,
+) -> Result<PendingExtensionReservation, String> {
+    let Some(transaction) = registry.pending_transaction(scope) else {
+        return Ok(PendingExtensionReservation::None);
+    };
+    match registry.begin_transition(&transaction) {
+        Ok(prepared) => Ok(PendingExtensionReservation::Reserved(prepared)),
+        Err(
+            zuno_extension::RegistryError::ActiveConsumers { .. }
+            | zuno_extension::RegistryError::TransitionReserved,
+        ) => Ok(PendingExtensionReservation::Deferred),
+        Err(zuno_extension::RegistryError::TransactionMismatch { .. })
+            if registry.pending_transaction(scope).as_ref() != Some(&transaction) =>
+        {
+            Ok(PendingExtensionReservation::Deferred)
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -185,14 +279,13 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
     ) -> SessionMutationFuture {
         let executor = self.clone();
         Box::pin(async move {
-            let mut host = executor
-                .open(
-                    request.session_id,
-                    request.directory,
-                    request.agent,
-                    request.model,
-                )
-                .await?;
+            let spec = ServerHostSpec {
+                session_id: request.session_id.clone(),
+                directory: request.directory,
+                agent: request.agent,
+                model: request.model,
+            };
+            let mut host = executor.open_active(&spec).await?;
             let outcome = async {
                 host.drive_with_message_id_and_guard(
                     &request.prompt,
@@ -208,8 +301,14 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
                 Ok(())
             }
             .await;
-            host.shutdown().await;
-            outcome
+            let extension_scope = host.extension_scope().clone();
+            let shutdown = host.shutdown().await;
+            let reconciliation = if shutdown.is_ok() {
+                executor.reconcile_extensions(&spec, &extension_scope).await
+            } else {
+                Ok(())
+            };
+            finish_server_mutation(outcome, shutdown, reconciliation)
         })
     }
 
@@ -221,29 +320,55 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
     ) -> SessionMutationFuture {
         let executor = self.clone();
         Box::pin(async move {
-            let mut host = executor
-                .open(
-                    request.session_id,
-                    request.directory,
-                    request.agent,
-                    request.model,
-                )
-                .await?;
-            let outcome = host.compact(request.automatic).await;
-            drop(guard);
-            let outcome = match outcome {
-                Ok(()) => {
-                    while host
-                        .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
-                        .await?
-                    {}
-                    Ok(())
-                }
-                Err(error) => Err(error),
+            let spec = ServerHostSpec {
+                session_id: request.session_id,
+                directory: request.directory,
+                agent: request.agent,
+                model: request.model,
             };
-            host.shutdown().await;
-            outcome
+            let mut host = executor.open_active(&spec).await?;
+            let outcome = async {
+                host.compact(request.automatic).await?;
+                drop(guard);
+                while host
+                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
+                    .await?
+                {}
+                Ok(())
+            }
+            .await;
+            let extension_scope = host.extension_scope().clone();
+            let shutdown = host.shutdown().await;
+            let reconciliation = if shutdown.is_ok() {
+                executor.reconcile_extensions(&spec, &extension_scope).await
+            } else {
+                Ok(())
+            };
+            finish_server_mutation(outcome, shutdown, reconciliation)
         })
+    }
+}
+
+fn finish_server_mutation(
+    outcome: Result<(), String>,
+    shutdown: Result<(), String>,
+    reconciliation: Result<(), String>,
+) -> Result<(), String> {
+    let mut failures = outcome.err().into_iter().collect::<Vec<_>>();
+    failures.extend(
+        shutdown
+            .err()
+            .map(|error| format!("turn host shutdown failed: {error}")),
+    );
+    failures.extend(
+        reconciliation
+            .err()
+            .map(|error| format!("extension reconciliation failed: {error}")),
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -305,6 +430,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             }
         }
         let mutations = Arc::new(ServerSessionMutationExecutor::new(
+            environment.clone(),
             requests,
             services.runs.clone(),
             mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
@@ -321,6 +447,8 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .flush()
             .map_err(|error| error.to_string())?;
         let result = server.serve().await.map_err(|error| error.to_string());
+        environment.cancel_background_jobs();
+        environment.wait_background_jobs().await;
         if let Some(mcp) = mcp {
             mcp.shutdown().await;
         }
@@ -334,7 +462,14 @@ fn server_readiness_message(address: std::net::SocketAddr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::server_readiness_message;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::{
+        PendingExtensionReservation, reserve_pending_extension_transition, server_readiness_message,
+    };
 
     #[test]
     fn readiness_message_presents_zunos_identity() {
@@ -343,5 +478,51 @@ mod tests {
             server_readiness_message(address),
             "Zuno server listening on http://127.0.0.1:4096"
         );
+    }
+
+    #[test]
+    fn pending_server_extension_waits_for_every_old_host_before_reserving() {
+        let registry = Arc::new(zuno_extension::ExtensionRegistry::new());
+        let scope = zuno_extension::Scope::new(Path::new("/workspace"));
+        let package = serde_json::from_value(json!({
+            "apiVersion": zuno_extension::API_VERSION,
+            "id": "review",
+            "description": "review extension",
+            "workflows": {
+                "review": {
+                    "description": "review",
+                    "prompt": "Review the change."
+                }
+            }
+        }))
+        .expect("valid extension");
+        registry.define(&scope, package).expect("define");
+        registry
+            .stage_run(&scope, "review", &[])
+            .expect("stage activation");
+        let old_host = registry
+            .acquire_active(&scope, registry.active_revision(&scope))
+            .expect("old host lease");
+
+        assert!(matches!(
+            reserve_pending_extension_transition(&registry, &scope)
+                .expect("live consumers defer instead of failing"),
+            PendingExtensionReservation::Deferred
+        ));
+
+        drop(old_host);
+        let PendingExtensionReservation::Reserved(prepared) =
+            reserve_pending_extension_transition(&registry, &scope)
+                .expect("last host reserves the transition")
+        else {
+            panic!("quiescent registry must reserve its candidate");
+        };
+        assert!(
+            registry
+                .acquire_active(&scope, registry.active_revision(&scope))
+                .is_err(),
+            "a late old host must not enter while candidate preparation is reserved"
+        );
+        prepared.abort().expect("candidate fixture aborts cleanly");
     }
 }

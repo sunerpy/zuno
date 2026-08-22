@@ -1,6 +1,7 @@
 //! What both surfaces must be able to trust about the shared composition root.
 
 use super::*;
+use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::run_turn;
 
 use crate::cmd::tool_runtime;
@@ -119,15 +120,9 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         vcs: None,
     };
     let agent = agent("build");
-    let runtime = zuno_runtime::HarnessRuntime::new("test-profile");
-    futures::executor::block_on(
-        runtime.mount(zuno_engine::driver::AgentDriverComponent::new(Arc::new(
-            zuno_engine::driver::DefaultAgentDriver,
-        ))),
-    )
-    .expect("default test driver mounts");
+    let extension_scope = zuno_extension::Scope::new(&directory);
     TurnPlan {
-        runtime,
+        profile: zuno_harness::default_profile(),
         resolver: Resolver {
             requested_agent: agent.name.clone(),
             system_prompt: String::new(),
@@ -144,7 +139,10 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
         agents: vec![agent.clone()],
         extensions: zuno_extension::ResolvedExtensions::default(),
-        extension_generation: 0,
+        extension_scope,
+        extension_revision: 0,
+        extension_transaction: None,
+        extension_prepared: None,
         instructions: zuno_config::LoadedInstructions::default(),
         delegation_facts: Arc::new(zuno_tools::task::FixedFacts::new()),
         vision_available: false,
@@ -169,6 +167,79 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         },
         notes: Vec::new(),
     }
+}
+
+#[tokio::test]
+async fn prepared_extension_aborts_cleanly_when_session_preparation_fails() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let environment = crate::environment::StartupEnvironment::resolve(
+        &Env::empty(),
+        &crate::GlobalOptions::default(),
+    );
+    let scope = zuno_extension::Scope::new(directory.path());
+    let package = serde_json::from_value(serde_json::json!({
+        "apiVersion": zuno_extension::API_VERSION,
+        "id": "review",
+        "description": "review extension",
+        "workflows": {
+            "review": {
+                "description": "review",
+                "prompt": "Review the change."
+            }
+        }
+    }))
+    .expect("valid extension");
+    environment
+        .extensions()
+        .define(&scope, package)
+        .expect("define");
+    let transaction = match environment
+        .extensions()
+        .stage_run(&scope, "review", &[])
+        .expect("stage")
+    {
+        zuno_extension::StageOutcome::Pending(transaction) => transaction,
+        zuno_extension::StageOutcome::Unchanged { .. } => panic!("activation must stage"),
+    };
+    let prepared = environment
+        .extensions()
+        .begin_transition(&transaction)
+        .expect("reserve");
+    let mut candidate = plan(
+        directory.path().to_str().expect("utf-8 workspace"),
+        SessionChoice::Existing("ses_missing".to_owned()),
+    );
+    candidate.extension_scope = scope.clone();
+    candidate.extension_revision = transaction.revision();
+    candidate.extension_transaction = Some(transaction);
+    candidate
+        .use_prepared_extension_transition(prepared)
+        .expect("attach reservation");
+    let database =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+
+    let opened = TurnHost::open_with_runtime_mcp_and_database(
+        candidate,
+        &environment,
+        Arc::new(zuno_tool::AllowAll),
+        None,
+        SessionRunRegistry::new(),
+        None,
+        database,
+    )
+    .await;
+    assert!(opened.is_err(), "missing session prevents host preparation");
+
+    assert_eq!(
+        environment.extensions().dynamic_statuses(&scope)[0].state,
+        zuno_extension::DynamicState::Defined,
+        "a side-effect-free preparation failure must abort, not poison, the transition"
+    );
+    assert!(environment.extensions().uncertainty(&scope).is_none());
+    assert_eq!(
+        environment.extensions().desired_revision(&scope),
+        environment.extensions().active_revision(&scope)
+    );
 }
 
 #[test]
@@ -415,6 +486,13 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
         paths,
     )
     .expect("inject memory");
+    resolver
+        .append_prompt_section(
+            "extensions",
+            "zuno-extension::active-packages",
+            zuno_extension::ResolvedExtensions::default().prompt_section(),
+        )
+        .expect("inject extension provenance");
     announce_instructions(&mut resolver, &loaded, &mut notes).expect("inject instructions");
     announce_skills(&mut resolver, &skills, &mut notes).expect("inject skills");
 
@@ -432,6 +510,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             "agent.base",
             "memory.global",
             "memory.project",
+            "extensions",
             "instructions.0",
             "skills.policy",
             "skills.catalog",
@@ -447,10 +526,14 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     );
     assert_eq!(
         assembly.sections()[3].source(),
+        "zuno-extension::active-packages"
+    );
+    assert_eq!(
+        assembly.sections()[4].source(),
         repo.join("AGENTS.md").display().to_string()
     );
-    assert_eq!(assembly.sections()[4].source(), "zuno skill trigger policy");
-    assert_eq!(assembly.sections()[5].source(), "discovered skills");
+    assert_eq!(assembly.sections()[5].source(), "zuno skill trigger policy");
+    assert_eq!(assembly.sections()[6].source(), "discovered skills");
     assert_eq!(resolver.system_prompt, assembly.render());
     assert!(notes.is_empty(), "{notes:?}");
 }
@@ -3210,7 +3293,6 @@ async fn run_compatible_turn(
         Vec::new(),
         Vec::new(),
         Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
-        interrupt.clone(),
         McpToolStatus::Ready,
     );
     let (sender, receiver) = zuno_engine::r#loop::event_channel();
@@ -4178,6 +4260,7 @@ fn every_extension_contribution_reaches_its_native_consumer() {
     for required in [
         "zuno_extension::discover_static",
         "zuno_extension::resolve_active",
+        "zuno_extension::resolve_desired",
         "extensions.agents()",
         "with_overlay(extensions.skills().iter().cloned())",
         "zuno_extension::lifecycle_tools",
@@ -4191,28 +4274,21 @@ fn every_extension_contribution_reaches_its_native_consumer() {
         );
     }
 
-    let memory_at = turn
-        .find("configure_resident_memory(&mut plan.resolver, &plan.config, memory_paths.clone())?;")
-        .expect("resident memory is assembled");
-    let extensions_at = turn
-        .find("append_prompt_section(\n            \"extensions\"")
-        .expect("extension provenance is assembled");
-    let instructions_at = turn
-        .find("announce_instructions(&mut plan.resolver")
-        .expect("instructions are assembled");
-    let skills_at = turn
-        .find("announce_skills(&mut plan.resolver")
-        .expect("skills are assembled");
     assert!(
-        memory_at < extensions_at && extensions_at < instructions_at && instructions_at < skills_at,
-        "the durable prompt order must remain memory, extensions, instructions, skills"
-    );
-
-    assert!(
-        tui.contains("environment.extensions().composition_generation()")
-            && tui.contains("driver.host.extension_generation()")
+        tui.contains(".desired_revision(driver.host.extension_scope())")
+            && tui.contains("driver.host.extension_revision()")
+            && tui.contains(
+                "next.extension_composition = super::turn::ExtensionComposition::Desired"
+            )
             && tui.contains("driver.remount.request(RemountRequest::plain(next))"),
-        "the long-lived TUI no longer recomposes after an extension lifecycle change"
+        "the long-lived TUI no longer prepares a desired extension composition after a lifecycle \
+         change"
+    );
+    assert!(
+        turn.contains(".begin_transition(&transaction)")
+            && turn.contains(".acquire_active(&plan.extension_scope, plan.extension_revision)")
+            && turn.contains("profile_runtime.activate_profile(profile).await"),
+        "extension composition ownership is no longer coupled to profile startup"
     );
 }
 

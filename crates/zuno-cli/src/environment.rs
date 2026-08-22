@@ -16,6 +16,7 @@ use zuno_pty::BackgroundExecutionService;
 use zuno_tools::exposure::ExposureFlags;
 
 use crate::GlobalOptions;
+use crate::cmd::child_turn::BackgroundJobSupervisor;
 
 /// The non-`ZUNO_*` marker inherited by child agents.
 pub const AGENT: &str = "AGENT";
@@ -121,6 +122,7 @@ pub struct StartupEnvironment {
     overrides: BTreeMap<&'static str, String>,
     extensions: std::sync::Arc<zuno_extension::ExtensionRegistry>,
     background_executions: Arc<Mutex<HashMap<PathBuf, Weak<BackgroundExecutionService>>>>,
+    background_jobs: Arc<Mutex<HashMap<PathBuf, BackgroundJobSupervisor>>>,
     /// All supported `ZUNO_*` values after CLI precedence is applied.
     pub flags: ZunoFlags,
 }
@@ -132,6 +134,7 @@ impl PartialEq for StartupEnvironment {
             && self.flags == other.flags
             && std::sync::Arc::ptr_eq(&self.extensions, &other.extensions)
             && Arc::ptr_eq(&self.background_executions, &other.background_executions)
+            && Arc::ptr_eq(&self.background_jobs, &other.background_jobs)
     }
 }
 
@@ -161,6 +164,7 @@ impl StartupEnvironment {
             overrides,
             extensions: std::sync::Arc::new(zuno_extension::ExtensionRegistry::new()),
             background_executions: Arc::new(Mutex::new(HashMap::new())),
+            background_jobs: Arc::new(Mutex::new(HashMap::new())),
             flags,
         }
     }
@@ -210,6 +214,50 @@ impl StartupEnvironment {
         )?);
         services.insert(key, Arc::downgrade(&service));
         Ok(service)
+    }
+
+    /// Process owner for durable child and product-agent jobs in one workspace.
+    ///
+    /// Unlike the weak background-terminal cache, this map keeps a strong owner:
+    /// dropping a session host or remounting the TUI must not detach a Tokio task
+    /// that can still commit durable job or inbox state.
+    pub(crate) fn background_jobs(&self, directory: &Path) -> BackgroundJobSupervisor {
+        let mut supervisors = self
+            .background_jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        supervisors
+            .entry(directory.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
+    /// Request cancellation for all process-owned delegated work.
+    pub(crate) fn cancel_background_jobs(&self) {
+        let supervisors = self
+            .background_jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for supervisor in supervisors {
+            supervisor.cancel_all();
+        }
+    }
+
+    /// Join all delegated work before the command's Tokio runtime is dropped.
+    pub(crate) async fn wait_background_jobs(&self) {
+        let supervisors = self
+            .background_jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for supervisor in supervisors {
+            supervisor.wait_all().await;
+        }
     }
 }
 
@@ -297,5 +345,40 @@ mod tests {
             &first.background_executions,
             &restarted.background_executions
         ));
+        assert!(Arc::ptr_eq(&first.background_jobs, &clone.background_jobs));
+        assert!(!Arc::ptr_eq(
+            &first.background_jobs,
+            &restarted.background_jobs
+        ));
+    }
+
+    #[tokio::test]
+    async fn clones_share_workspace_background_jobs_but_new_processes_do_not() {
+        let first = StartupEnvironment::resolve(&Env::empty(), &GlobalOptions::default());
+        let clone = first.clone();
+        let restarted = StartupEnvironment::resolve(&Env::empty(), &GlobalOptions::default());
+        let directory = Path::new("/workspace");
+        let jobs = first.background_jobs(directory);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = cancellation.clone();
+        jobs.spawn("job_test", "ses_test", cancellation, async move {
+            cancelled.cancelled().await;
+        });
+        tokio::task::yield_now().await;
+
+        assert!(
+            clone
+                .background_jobs(directory)
+                .has_running_tasks("ses_test")
+        );
+        assert!(
+            !restarted
+                .background_jobs(directory)
+                .has_running_tasks("ses_test")
+        );
+
+        clone.background_jobs(directory).cancel_all();
+        clone.background_jobs(directory).wait_all().await;
+        assert!(!jobs.has_running_tasks("ses_test"));
     }
 }

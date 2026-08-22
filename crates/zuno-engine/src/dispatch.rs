@@ -6,7 +6,6 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -19,24 +18,15 @@ use zuno_tool::{
 };
 
 use crate::hooks::{NoopHooks, PermissionHookDecision, ToolHooks};
-use crate::interrupt::BackgroundToolSignal;
 use crate::r#loop::{
     AvailableTools, DispatchRequest, PreparedToolDispatch, ToolDispatchResult, ToolDispatcher,
 };
-
-/// Time afforded to a tool to finish normally after a background request.
-///
-/// This matches the reference runtime's handoff window. A short grace avoids
-/// reporting a call as detached when it was already about to finish, while still
-/// returning control promptly for a genuinely long-running command.
-pub const BACKGROUND_GRACE_PERIOD: Duration = Duration::from_millis(750);
 
 /// Executable tools plus the policy collaborators needed at the dispatch boundary.
 pub struct ToolRegistryDispatcher {
     tools: Vec<Arc<dyn Tool>>,
     rules: Arc<[Rule]>,
     approval: Arc<dyn PermissionAsker>,
-    background_tool: BackgroundToolSignal,
     mcp_status: McpToolStatus,
     hooks: Arc<dyn ToolHooks>,
 }
@@ -51,7 +41,6 @@ impl ToolRegistryDispatcher {
         tools: Vec<Arc<dyn Tool>>,
         rules: Vec<Rule>,
         approval: Arc<dyn PermissionAsker>,
-        background_tool: BackgroundToolSignal,
         mcp_status: McpToolStatus,
     ) -> Self {
         let rules: Arc<[Rule]> = rules.into();
@@ -59,7 +48,6 @@ impl ToolRegistryDispatcher {
             tools,
             rules,
             approval,
-            background_tool,
             mcp_status,
             hooks: Arc::new(NoopHooks),
         }
@@ -201,29 +189,15 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         let call_id = request.call.id;
         let hook_args = request.call.input;
         let hooks = Arc::clone(&self.hooks);
-        let background_tool = self.background_tool.clone();
         PreparedToolDispatch::new(Box::pin(async move {
-            let background_epoch = background_tool.epoch();
-            let _reset_applied = background_tool.reset_if_epoch(background_epoch);
             let mut execution = tokio::spawn(async move { tool.invoke(args, context).await });
 
             let mut result = tokio::select! {
                 biased;
                 joined = &mut execution => joined_result(&tool_name, replay_policy, joined),
-                () = background_tool.notified() => {
-                    match tokio::time::timeout(BACKGROUND_GRACE_PERIOD, &mut execution).await {
-                        Ok(joined) => joined_result(&tool_name, replay_policy, joined),
-                        Err(_) => ToolDispatchResult::success(ToolOutput::text(
-                            format!("{tool_name} running in background"),
-                            format!(
-                                "Tool `{tool_name}` is still running in the background after the {}ms grace period.",
-                                BACKGROUND_GRACE_PERIOD.as_millis()
-                            ),
-                        )),
-                    }
-                }
                 () = interrupt.notified() => {
                     execution.abort();
+                    let _cancelled = execution.await;
                     error_result(
                         &tool_name,
                         format!("Tool `{tool_name}` was interrupted before it completed."),
@@ -638,6 +612,8 @@ fn error_result(tool: &str, message: String) -> ToolDispatchResult {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]

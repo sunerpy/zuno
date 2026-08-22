@@ -551,6 +551,28 @@ async fn an_explicit_stop_failure_becomes_uncertain() {
 }
 
 #[tokio::test]
+async fn repeated_shutdown_preserves_an_uncertain_outcome() {
+    let runtime = HarnessRuntime::new("root");
+    runtime.mount(FailingStop).await.expect("component mounts");
+    runtime
+        .unmount("failing-stop")
+        .await
+        .expect_err("first stop is uncertain");
+    let before = runtime.snapshot();
+
+    let error = runtime
+        .shutdown()
+        .await
+        .expect_err("uncertainty cannot be upgraded to closed");
+
+    assert!(error.to_string().contains("stop rejected"));
+    let after = runtime.snapshot();
+    assert_eq!(after.state, LifecycleState::Uncertain);
+    assert_eq!(after.components, before.components);
+    assert_eq!(after.diagnostics, before.diagnostics);
+}
+
+#[tokio::test]
 async fn profile_replacement_reprepares_cross_bundle_dependencies() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let runtime = HarnessRuntime::new("root");
@@ -658,6 +680,81 @@ async fn parent_shutdown_closes_children_before_parent_components() {
     assert_eq!(child.snapshot().state, LifecycleState::Closed);
     assert_eq!(root.mount(FailingStop).await, Err(RuntimeError::Closed));
     root.shutdown().await.expect("repeated shutdown is a no-op");
+}
+
+#[tokio::test]
+async fn parent_recomposition_rejects_live_child_consumers() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let root = HarnessRuntime::new("root");
+    root.mount(greeting("provider", "old", &log))
+        .await
+        .expect("parent provider");
+    let child = root.child("child");
+    child
+        .mount(summary("consumer", &log))
+        .await
+        .expect("child consumer");
+    let before = log.lock().expect("lifecycle log").clone();
+
+    let error = root
+        .replace(greeting("provider", "new", &log))
+        .await
+        .expect_err("a live child would retain the old provider");
+
+    assert!(error.to_string().contains("live child scope"));
+    assert_eq!(
+        root.service::<dyn Greeting>().expect("old provider").text(),
+        "old"
+    );
+    assert_eq!(
+        child
+            .service::<dyn Summary>()
+            .expect("old child consumer")
+            .greeting(),
+        "old"
+    );
+    assert_eq!(*log.lock().expect("lifecycle log"), before);
+
+    child.shutdown().await.expect("child stops");
+    root.replace(greeting("provider", "new", &log))
+        .await
+        .expect("parent may replace after child quiesces");
+    assert_eq!(
+        root.service::<dyn Greeting>().expect("new provider").text(),
+        "new"
+    );
+}
+
+#[tokio::test]
+async fn an_uncertain_child_keeps_its_parent_uncertain() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let root = HarnessRuntime::new("root");
+    root.mount(greeting("parent", "parent", &log))
+        .await
+        .expect("parent mounts");
+    let child = root.child("child");
+    child.mount(FailingStop).await.expect("child mounts");
+
+    let error = root
+        .shutdown()
+        .await
+        .expect_err("the descendant did not prove quiescence");
+
+    assert!(error.to_string().contains("stop rejected"));
+    assert_eq!(child.snapshot().state, LifecycleState::Uncertain);
+    let parent = root.snapshot();
+    assert_eq!(parent.state, LifecycleState::Uncertain);
+    assert!(parent.components.is_empty());
+    assert!(
+        parent
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("stop rejected"))
+    );
+    assert_eq!(
+        *log.lock().expect("lifecycle log"),
+        ["start:parent", "stop:parent"]
+    );
 }
 
 #[tokio::test]

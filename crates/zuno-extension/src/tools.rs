@@ -8,7 +8,7 @@ use zuno_error::ToolError;
 use zuno_tool::{Tool, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool, erase};
 
 use crate::{
-    DynamicState, ExtensionRegistry, Package, PackageOrigin, Scope, StaticPackage, resolve_active,
+    ExtensionRegistry, Package, PackageOrigin, Scope, StageOutcome, StaticPackage, resolve_active,
 };
 
 /// Lifecycle tools for one workspace and one process registry.
@@ -90,18 +90,16 @@ impl TypedTool for InspectTool {
         let mut statuses = active
             .packages()
             .iter()
-            .map(|entry| {
-                let source = match &entry.origin {
-                    PackageOrigin::Static { manifest } => {
-                        json!({"lifetime": "static", "manifest": manifest})
-                    }
-                    PackageOrigin::Process => json!({"lifetime": "process"}),
-                };
+            .filter_map(|entry| match &entry.origin {
+                PackageOrigin::Static { manifest } => Some((entry, manifest)),
+                PackageOrigin::Process => None,
+            })
+            .map(|(entry, manifest)| {
                 json!({
                     "id": entry.package.id,
                     "description": entry.package.description,
                     "state": "running",
-                    "source": source,
+                    "source": {"lifetime": "static", "manifest": manifest},
                     "agents": entry.package.agents.keys().collect::<Vec<_>>(),
                     "workflows": entry.package.workflows.keys().collect::<Vec<_>>(),
                     "skills": entry.package.skills.iter().map(|skill| &skill.name).collect::<Vec<_>>()
@@ -109,9 +107,6 @@ impl TypedTool for InspectTool {
             })
             .collect::<Vec<_>>();
         for status in self.registry.dynamic_statuses(&self.scope) {
-            if status.state == DynamicState::Running {
-                continue;
-            }
             statuses.push(json!({
                 "id": status.id,
                 "description": status.description,
@@ -242,18 +237,26 @@ impl TypedTool for RunTool {
     }
 
     async fn run(&self, params: IdParams, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        self.registry
-            .run_with_static(&self.scope, &params.id, &self.static_packages)
+        let outcome = self
+            .registry
+            .stage_run(&self.scope, &params.id, &self.static_packages)
             .map_err(|error| failed(self.id(), error))?;
-        Ok(ToolOutput::text(
-            "Extension running",
+        let pending = outcome.is_pending();
+        let body = if pending {
             format!(
-                "Activated process-local package `{}`. Its agents, workflows, and \
-                 skills are available after the host refreshes for the next turn.",
-                params.id
-            ),
-        )
-        .with_metadata("package", Value::String(params.id)))
+                "Activation of process-local package `{}` is scheduled as composition revision \
+                 {}. It becomes active only after the current host stops and the replacement \
+                 starts successfully.",
+                params.id,
+                outcome.revision()
+            )
+        } else {
+            format!("Process-local package `{}` is already running.", params.id)
+        };
+        Ok(ToolOutput::text("Extension activation scheduled", body)
+            .with_metadata("package", Value::String(params.id))
+            .with_metadata("revision", json!(outcome.revision()))
+            .with_metadata("pending", json!(pending)))
     }
 }
 
@@ -282,18 +285,28 @@ impl TypedTool for StopTool {
     }
 
     async fn run(&self, params: IdParams, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        self.registry
-            .stop(&self.scope, &params.id)
+        let outcome = self
+            .registry
+            .stage_stop(&self.scope, &params.id)
             .map_err(|error| failed(self.id(), error))?;
-        Ok(ToolOutput::text(
-            "Extension stopped",
+        let pending = matches!(outcome, StageOutcome::Pending(_));
+        let body = if pending {
             format!(
-                "Stopped process-local package `{}`. Its definition remains available \
-                 to `extension_inspect` and can be run again.",
+                "Deactivation of process-local package `{}` is scheduled as composition revision \
+                 {}. Its contributions remain active until the old host stops cleanly.",
+                params.id,
+                outcome.revision()
+            )
+        } else {
+            format!(
+                "Process-local package `{}` is inactive; its definition remains available.",
                 params.id
-            ),
-        )
-        .with_metadata("package", Value::String(params.id)))
+            )
+        };
+        Ok(ToolOutput::text("Extension deactivation scheduled", body)
+            .with_metadata("package", Value::String(params.id))
+            .with_metadata("revision", json!(outcome.revision()))
+            .with_metadata("pending", json!(pending)))
     }
 }
 
@@ -322,17 +335,28 @@ impl TypedTool for UndefineTool {
     }
 
     async fn run(&self, params: IdParams, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        self.registry
-            .undefine(&self.scope, &params.id)
+        let outcome = self
+            .registry
+            .stage_undefine(&self.scope, &params.id)
             .map_err(|error| failed(self.id(), error))?;
-        Ok(ToolOutput::text(
-            "Extension undefined",
+        let pending = outcome.is_pending();
+        let body = if pending {
             format!(
-                "Removed process-local package `{}` from this Zuno process.",
+                "Removal of process-local package `{}` is scheduled as composition revision {}. \
+                 The definition is removed only after its active owner stops cleanly.",
+                params.id,
+                outcome.revision()
+            )
+        } else {
+            format!(
+                "Removed inactive process-local package `{}` from this Zuno process.",
                 params.id
-            ),
-        )
-        .with_metadata("package", Value::String(params.id)))
+            )
+        };
+        Ok(ToolOutput::text("Extension removal scheduled", body)
+            .with_metadata("package", Value::String(params.id))
+            .with_metadata("revision", json!(outcome.revision()))
+            .with_metadata("pending", json!(pending)))
     }
 }
 

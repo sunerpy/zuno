@@ -1,8 +1,12 @@
+use std::future::pending;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use zuno_agent::reflection::{
-    CommandOutcome, CompactionMode, ReflectionConfig, ReflectionFork, TranscriptEvent,
-    TurnDelivery, TurnTranscript,
+    CommandOutcome, CompactionMode, ReflectionConfig, ReflectionError, ReflectionFork,
+    ReflectionRequest, ReflectionRunner, ReflectionTools, TranscriptEvent, TurnDelivery,
+    TurnTranscript,
 };
 
 use super::support::{
@@ -12,6 +16,33 @@ use super::support::{
 
 fn neutral_transcript() -> TurnTranscript {
     TurnTranscript::new(vec![TranscriptEvent::user("Keep going.")])
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+struct BlockingRunner {
+    entered: Arc<tokio::sync::Notify>,
+    dropped: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ReflectionRunner for BlockingRunner {
+    async fn review(
+        &self,
+        _request: ReflectionRequest,
+        _tools: ReflectionTools,
+    ) -> Result<(), ReflectionError> {
+        let _drop = DropFlag(Arc::clone(&self.dropped));
+        self.entered.notify_one();
+        pending::<()>().await;
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -137,6 +168,39 @@ async fn panicking_fork_leaves_the_main_turn_result_untouched() {
     // Then
     assert_eq!(main_result, "answer already delivered");
     assert_eq!(memory.call_count(), 0);
+}
+
+#[tokio::test]
+async fn aborting_the_returned_task_cancels_the_nested_review() {
+    let memory = MemoryProbe::default();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let fork = ReflectionFork::new(
+        ReflectionConfig {
+            enabled: true,
+            turn_interval: 1,
+        },
+        Arc::new(BlockingRunner {
+            entered: Arc::clone(&entered),
+            dropped: Arc::clone(&dropped),
+        }),
+        Arc::new(memory),
+    );
+    let task = fork
+        .spawn_after_turn(delivered(neutral_transcript()))
+        .expect("reflection starts");
+    entered.notified().await;
+
+    task.abort();
+    let _cancelled = task.await;
+
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while !dropped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("aborting the owner must drop the review future");
 }
 
 #[tokio::test]

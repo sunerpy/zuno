@@ -9,7 +9,9 @@
 
 use super::*;
 use crate::command::GlobalOptions;
+use std::future::pending;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use zuno_paths::{DbLocation, Env};
 use zuno_tools::task::ReportDelivery;
 
@@ -311,10 +313,64 @@ async fn background_supervisor_reports_a_live_writer_until_it_finishes() {
     );
     tokio::task::yield_now().await;
 
-    assert!(jobs.has_running_tasks());
+    assert!(jobs.has_running_tasks("ses_test"));
     release.send(()).expect("release background task");
     jobs.wait_all().await;
-    assert!(!jobs.has_running_tasks());
+    assert!(!jobs.has_running_tasks("ses_test"));
+}
+
+#[tokio::test]
+async fn background_supervisor_cancels_every_owned_task_before_waiting() {
+    let jobs = BackgroundJobSupervisor::default();
+    for (job, session) in [("job_one", "ses_one"), ("job_two", "ses_two")] {
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        jobs.spawn(job, session, cancellation, async move {
+            cancelled.cancelled().await;
+        });
+    }
+    tokio::task::yield_now().await;
+
+    jobs.cancel_all();
+    jobs.wait_all().await;
+
+    assert!(!jobs.has_running_tasks("ses_one"));
+    assert!(!jobs.has_running_tasks("ses_two"));
+}
+
+struct TaskDropFlag(Arc<AtomicBool>);
+
+impl Drop for TaskDropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[tokio::test]
+async fn supervised_handle_is_aborted_and_joined_on_process_shutdown() {
+    let jobs = BackgroundJobSupervisor::default();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let task_entered = Arc::clone(&entered);
+    let task_dropped = Arc::clone(&dropped);
+    let task = tokio::spawn(async move {
+        let _drop = TaskDropFlag(task_dropped);
+        task_entered.notify_one();
+        pending::<()>().await;
+    });
+    jobs.supervise_handle(
+        "reflection_test",
+        "ses_test",
+        CancellationToken::new(),
+        task,
+    );
+    entered.notified().await;
+
+    jobs.cancel_all();
+    jobs.wait_all().await;
+
+    assert!(dropped.load(Ordering::Acquire));
+    assert!(!jobs.has_running_tasks("ses_test"));
 }
 
 #[tokio::test]
@@ -421,7 +477,7 @@ async fn cancelling_a_native_background_job_keeps_the_host_alive_and_settles_can
 
     let job = fixture.host.job_store.get(&job_id).expect("cancelled job");
     assert_eq!(job.status, zuno_db::job::JobStatus::Cancelled);
-    assert!(!fixture.jobs.has_running_tasks());
+    assert!(!fixture.jobs.has_running_tasks("ses_owner"));
     let reports = fixture.wake.reports.lock().expect("wake reports");
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].prompt["status"], "cancelled");

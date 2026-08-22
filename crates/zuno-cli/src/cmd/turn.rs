@@ -50,7 +50,6 @@ use zuno_config::schema::provider::ProviderTransport;
 use zuno_engine::compaction::{CompactionState, TokenWindow};
 use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::driver::AgentDriver;
-use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest,
     ToolConcurrencyLimit, ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender,
@@ -220,18 +219,31 @@ pub(crate) struct TurnOptions {
     /// default in place and keeps the request byte-identical to a build without this
     /// field.
     pub(crate) effort: Option<zuno_llm::effort::ReasoningEffort>,
+    /// Whether this host consumes the committed extension composition or the one
+    /// pending transaction prepared for a quiescent replacement.
+    pub(crate) extension_composition: ExtensionComposition,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExtensionComposition {
+    #[default]
+    Active,
+    Desired,
 }
 
 /// Everything resolved from configuration, with no handle open yet.
 pub(crate) struct TurnPlan {
-    runtime: HarnessRuntime,
+    profile: zuno_runtime::HarnessProfile,
     directory: PathBuf,
     project: zuno_paths::project::ResolvedProject,
     config: zuno_config::schema::Config,
     agents: Vec<zuno_catalog::agent::Agent>,
     agent: zuno_catalog::agent::Agent,
     extensions: zuno_extension::ResolvedExtensions,
-    extension_generation: u64,
+    extension_scope: zuno_extension::Scope,
+    extension_revision: u64,
+    extension_transaction: Option<zuno_extension::ExtensionTransaction>,
+    extension_prepared: Option<zuno_extension::PreparedTransition>,
     provider_id: String,
     model_id: String,
     auth_store: AuthStore,
@@ -295,6 +307,45 @@ pub(crate) struct TurnPlan {
 }
 
 impl TurnPlan {
+    /// Attach the reservation acquired by a surface-level transition coordinator.
+    ///
+    /// Server request assembly uses this to hold the old composition closed while
+    /// configuration and the candidate profile are prepared. TUI replacement can
+    /// continue to reserve inside [`TurnHost::open_with_runtime_and_mcp`] because it
+    /// already owns the only foreground host.
+    pub(crate) fn use_prepared_extension_transition(
+        &mut self,
+        prepared: zuno_extension::PreparedTransition,
+    ) -> Result<(), String> {
+        let transaction = self.extension_transaction.as_ref().ok_or_else(|| {
+            "turn plan has no pending extension transaction for the reservation".to_owned()
+        })?;
+        if transaction.scope() != prepared.scope() || transaction.revision() != prepared.revision()
+        {
+            return Err(format!(
+                "prepared extension transition {} does not match planned revision {}",
+                prepared.revision(),
+                transaction.revision()
+            ));
+        }
+        self.extension_transaction = None;
+        self.extension_prepared = Some(prepared);
+        Ok(())
+    }
+
+    fn abort_extension_candidate(
+        &mut self,
+        registry: &zuno_extension::ExtensionRegistry,
+    ) -> Result<(), String> {
+        if let Some(prepared) = self.extension_prepared.take() {
+            return prepared.abort().map_err(to_string);
+        }
+        if let Some(transaction) = self.extension_transaction.take() {
+            return registry.abort(&transaction).map_err(to_string);
+        }
+        Ok(())
+    }
+
     /// Resolve configuration, credentials, the catalog and the agent.
     ///
     /// # Errors
@@ -331,13 +382,34 @@ impl TurnPlan {
         let static_extensions =
             zuno_extension::discover_static(&directory, worktree.as_deref(), env)
                 .map_err(to_string)?;
-        let extensions = zuno_extension::resolve_active(
-            &extension_scope,
-            &static_extensions,
-            environment.extensions(),
-        )
-        .map_err(to_string)?;
-        let extension_generation = environment.extensions().composition_generation();
+        let (extensions, extension_revision, extension_transaction) =
+            match options.extension_composition {
+                ExtensionComposition::Active => (
+                    zuno_extension::resolve_active(
+                        &extension_scope,
+                        &static_extensions,
+                        environment.extensions(),
+                    )
+                    .map_err(to_string)?,
+                    environment.extensions().active_revision(&extension_scope),
+                    None,
+                ),
+                ExtensionComposition::Desired => {
+                    let transaction = environment
+                        .extensions()
+                        .pending_transaction(&extension_scope);
+                    (
+                        zuno_extension::resolve_desired(
+                            &extension_scope,
+                            &static_extensions,
+                            environment.extensions(),
+                        )
+                        .map_err(to_string)?,
+                        environment.extensions().desired_revision(&extension_scope),
+                        transaction,
+                    )
+                }
+            };
         let goal_retry_policy = resolve_goal_retry_policy(&config)?;
         let auth_store = AuthStore::resolve(&layout, env);
         let credentials = auth_store.all().map_err(to_string)?.entries;
@@ -464,7 +536,6 @@ impl TurnPlan {
             .await
             .with_overlay(extensions.skills().iter().cloned()),
         );
-        let runtime = HarnessRuntime::new("profile");
         let extension_tools = zuno_extension::lifecycle_tools(
             extension_scope.clone(),
             static_extensions.clone(),
@@ -472,12 +543,7 @@ impl TurnPlan {
         );
         let extension_contributions =
             zuno_harness::ToolContributions::new(extension_tools).map_err(to_string)?;
-        runtime
-            .activate_profile(zuno_harness::default_profile_with_tools(
-                extension_contributions,
-            ))
-            .await
-            .map_err(to_string)?;
+        let profile = zuno_harness::default_profile_with_tools(extension_contributions);
         let instructions =
             zuno_config::Instructions::discover(&zuno_config::InstructionOptions::from_config(
                 directory.as_path(),
@@ -488,14 +554,17 @@ impl TurnPlan {
             .load()
             .await;
         Ok(Self {
-            runtime,
+            profile,
             directory,
             project,
             config,
             agents,
             agent,
             extensions,
-            extension_generation,
+            extension_scope,
+            extension_revision,
+            extension_transaction,
+            extension_prepared: None,
             auth_store,
             credential: resolved_credential(
                 catalog.provider(&provider_id),
@@ -896,7 +965,6 @@ fn internal_prompt(name: &str) -> Result<String, String> {
 pub(crate) struct TurnHost {
     profile_runtime: HarnessRuntime,
     runtime: HarnessRuntime,
-    profile_id: String,
     driver: Arc<dyn AgentDriver>,
     database: Arc<zuno_db::pool::Pool>,
     connection: rusqlite::Connection,
@@ -931,7 +999,9 @@ pub(crate) struct TurnHost {
     agent: String,
     provider_id: String,
     model_id: String,
-    extension_generation: u64,
+    extension_scope: zuno_extension::Scope,
+    extension_revision: u64,
+    extension_ownership: Option<ExtensionOwnership>,
     /// The reasoning level this host resolved with.
     ///
     /// Held here because the host is the source of truth every rebuild path already
@@ -955,9 +1025,33 @@ pub(crate) struct TurnHost {
     background_reports_recovered: bool,
     last_turn_completed: bool,
     title_sink: Option<Arc<dyn SessionTitleSink>>,
-    work_changes: WorkStateNotifier,
+    work_changes: super::child_turn::ChangeNotifier,
     memory: Option<Arc<MemoryService>>,
     reflection: Option<ReflectionFork>,
+}
+
+enum ExtensionOwnership {
+    Active(zuno_extension::CompositionLease),
+    Prepared(zuno_extension::PreparedTransition),
+}
+
+impl ExtensionOwnership {
+    fn release_after_clean_failure(self) -> Result<(), String> {
+        match self {
+            Self::Active(lease) => {
+                drop(lease);
+                Ok(())
+            }
+            Self::Prepared(transition) => transition.abort().map_err(to_string),
+        }
+    }
+
+    fn mark_uncertain(self, message: String) {
+        match self {
+            Self::Active(lease) => lease.mark_uncertain(message),
+            Self::Prepared(transition) => transition.mark_uncertain(message),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1037,31 +1131,9 @@ pub(crate) trait SessionTitleSink: Send + Sync {
     fn publish(&self, title: &str);
 }
 
-#[derive(Clone)]
-struct WorkStateNotifier {
-    sender: tokio::sync::watch::Sender<u64>,
-}
-
-impl WorkStateNotifier {
-    fn new() -> Self {
-        let (sender, _receiver) = tokio::sync::watch::channel(0);
-        Self { sender }
-    }
-
+impl MemoryObserver for super::child_turn::ChangeNotifier {
     fn changed(&self) {
-        self.sender.send_modify(|generation| {
-            *generation = generation.wrapping_add(1);
-        });
-    }
-
-    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.sender.subscribe()
-    }
-}
-
-impl MemoryObserver for WorkStateNotifier {
-    fn changed(&self) {
-        Self::changed(self);
+        self.changed();
     }
 }
 
@@ -1408,7 +1480,7 @@ impl TurnHost {
     /// it — which is how the same configuration produced MCP tools in the TUI and none
     /// headlessly. It is gone rather than deprecated: a constructor that silently
     /// drops a capability is one a future caller reaches for again.
-    pub(crate) fn open_with_mcp(
+    pub(crate) async fn open_with_mcp(
         plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
@@ -1422,6 +1494,7 @@ impl TurnHost {
             SessionRunRegistry::new(),
             mcp,
         )
+        .await
     }
 
     /// The full constructor. **Every** surface reaches this one.
@@ -1431,15 +1504,26 @@ impl TurnHost {
     /// `zuno serve` came to advertise fewer tools than `zuno tui` from identical
     /// configuration, with no error on either path. A surface that genuinely wants no
     /// MCP passes `None` here and says so at its own call site.
-    pub(crate) fn open_with_runtime_and_mcp(
-        plan: TurnPlan,
+    pub(crate) async fn open_with_runtime_and_mcp(
+        mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
         question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
         runs: SessionRunRegistry,
         mcp: Option<zuno_mcp::Catalog>,
     ) -> Result<Self, String> {
-        let database = Arc::new(zuno_db::pool::Pool::open_default().map_err(to_string)?);
+        let database = match zuno_db::pool::Pool::open_default() {
+            Ok(database) => Arc::new(database),
+            Err(error) => {
+                let error = to_string(error);
+                return match plan.abort_extension_candidate(environment.extensions()) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!(
+                        "{error}; extension candidate abort also failed: {cleanup}"
+                    )),
+                };
+            }
+        };
         Self::open_with_runtime_mcp_and_database(
             plan,
             environment,
@@ -1449,9 +1533,10 @@ impl TurnHost {
             mcp,
             database,
         )
+        .await
     }
 
-    pub(super) fn open_with_runtime_mcp_and_database(
+    pub(super) async fn open_with_runtime_mcp_and_database(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
@@ -1460,6 +1545,23 @@ impl TurnHost {
         mcp: Option<zuno_mcp::Catalog>,
         database: Arc<zuno_db::pool::Pool>,
     ) -> Result<Self, String> {
+        let mut extension_ownership = Some(match plan.extension_prepared.take() {
+            Some(prepared) => ExtensionOwnership::Prepared(prepared),
+            None => match plan.extension_transaction.take() {
+                Some(transaction) => ExtensionOwnership::Prepared(
+                    environment
+                        .extensions()
+                        .begin_transition(&transaction)
+                        .map_err(to_string)?,
+                ),
+                None => ExtensionOwnership::Active(
+                    environment
+                        .extensions()
+                        .acquire_active(&plan.extension_scope, plan.extension_revision)
+                        .map_err(to_string)?,
+                ),
+            },
+        });
         let env = environment.resolved();
         let worktree = plan
             .project
@@ -1473,268 +1575,338 @@ impl TurnHost {
             Some(plan.auth_store.clone()),
         );
 
-        let mut connection = database.open_connection().map_err(to_string)?;
-        zuno_db::migration::apply(&mut connection).map_err(to_string)?;
-        let now = zuno_db::message::now_millis();
-        ensure_project(&connection, &plan.project, now)?;
-        let prepared = prepare_turn_host(&connection, &plan, now)?;
-        let profile_runtime = plan.runtime;
-        let profile_id = profile_runtime
-            .active_profile_id()
-            .ok_or_else(|| "profile runtime has no active profile".to_owned())?;
-        let runtime = profile_runtime.child(format!("session:{}", prepared.identity.id()));
-        let driver = runtime
-            .service::<dyn AgentDriver>()
-            .ok_or_else(|| "profile did not register an agent driver".to_owned())?;
-        let tool_manifest = runtime
-            .service::<zuno_harness::ToolManifest>()
-            .ok_or_else(|| "profile did not register a tool manifest".to_owned())?;
-        let tool_contributions = runtime
-            .service::<zuno_harness::ToolContributions>()
-            .ok_or_else(|| "profile did not register tool contributions".to_owned())?;
-        let todo_store = Arc::clone(&database);
-        let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
-        let goal_store = Arc::new(GoalStore::open_default().map_err(to_string)?);
-        let goal_projection = GoalProjection::new(worktree.as_deref(), prepared.identity.id())
-            .ok_or_else(|| {
-                format!(
-                    "session id `{}` cannot name a goal projection",
-                    prepared.identity.id()
-                )
-            })?;
-        let goal_continuation = GoalContinuation::new(Arc::clone(&goal_store), runs.clone())
-            .with_retry_policy(plan.goal_retry_policy);
-        let active_goal = if prepared.identity.is_materialized() {
-            goal_store
-                .goal(prepared.identity.id())
-                .map_err(to_string)?
-                .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active)
-        } else {
-            false
+        let prepared_session = (|| -> Result<_, String> {
+            let mut connection = database.open_connection().map_err(to_string)?;
+            zuno_db::migration::apply(&mut connection).map_err(to_string)?;
+            let now = zuno_db::message::now_millis();
+            ensure_project(&connection, &plan.project, now)?;
+            let prepared = prepare_turn_host(&connection, &plan, now)?;
+            Ok((connection, prepared))
+        })();
+        let (connection, prepared) = match prepared_session {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let ownership = extension_ownership
+                    .take()
+                    .expect("extension ownership exists before session preparation");
+                return match ownership.release_after_clean_failure() {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(format!(
+                        "{error}; extension transition abort also failed: {cleanup}"
+                    )),
+                };
+            }
         };
-
-        let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
-        let command_worktree = memory_root.to_string_lossy();
-        let discovered_commands =
-            zuno_catalog::command::load_map(&plan.directory, worktree.as_deref(), env)
-                .map_err(to_string)?;
-        let configured_commands = match plan.config.command.as_ref() {
-            Some(config) => zuno_catalog::command::merge_command_maps(&discovered_commands, config)
-                .map_err(to_string)?,
-            None => discovered_commands,
-        };
-        let extension_commands = zuno_catalog::command::merge_command_maps(
-            &configured_commands,
-            plan.extensions.workflows(),
-        )
-        .map_err(to_string)?;
-        let mcp_prompts = mcp
-            .as_ref()
-            .map_or_else(Vec::new, zuno_mcp::Catalog::prompts);
-        let commands = zuno_catalog::command::Registry::build(
-            &zuno_catalog::command::Sources::new(&command_worktree)
-                .with_config(Some(&extension_commands))
-                .with_mcp_prompts(&mcp_prompts),
-        );
-        let memory_settings = plan.config.resolved_memory();
-        let memory_paths = ScopePaths::discover(memory_root);
-        configure_resident_memory(&mut plan.resolver, &plan.config, memory_paths.clone())?;
-        let work_changes = WorkStateNotifier::new();
-        let memory = if memory_settings.enabled {
-            let promotion = match memory_settings.promotion {
-                zuno_config::schema::MemoryPromotion::Review => PromotionPolicy::Review,
-                zuno_config::schema::MemoryPromotion::HighConfidence => {
-                    PromotionPolicy::HighConfidence {
-                        threshold: (memory_settings.auto_confidence * 10_000.0).round() as u16,
-                    }
+        let profile_runtime = HarnessRuntime::new("profile");
+        let profile = plan.profile;
+        if let Err(error) = profile_runtime.activate_profile(profile).await {
+            let shutdown = profile_runtime.shutdown().await;
+            let ownership = extension_ownership
+                .take()
+                .expect("extension ownership exists before host assembly");
+            return match shutdown {
+                Ok(()) => match ownership.release_after_clean_failure() {
+                    Ok(()) => Err(to_string(error)),
+                    Err(cleanup) => Err(format!(
+                        "{error}; extension transition abort also failed: {cleanup}"
+                    )),
+                },
+                Err(shutdown) => {
+                    ownership.mark_uncertain(format!(
+                        "profile activation failed ({error}) and cleanup was not authoritative \
+                         ({shutdown})"
+                    ));
+                    Err(format!(
+                        "profile activation failed: {error}; profile cleanup failed: {shutdown}"
+                    ))
                 }
-                zuno_config::schema::MemoryPromotion::Automatic => PromotionPolicy::Automatic,
             };
-            let service = Arc::new(
-                MemoryService::new(
-                    Arc::clone(&database),
-                    memory_paths,
-                    ScopeLimits::new(
-                        memory_settings.global_char_limit,
-                        memory_settings.project_char_limit,
-                    ),
-                    promotion,
-                )
-                .with_observer(Arc::new(work_changes.clone())),
+        }
+        let assembled = (|| -> Result<Self, String> {
+            let _profile_id = profile_runtime
+                .active_profile_id()
+                .ok_or_else(|| "profile runtime has no active profile".to_owned())?;
+            let runtime = profile_runtime.child(format!("session:{}", prepared.identity.id()));
+            let driver = runtime
+                .service::<dyn AgentDriver>()
+                .ok_or_else(|| "profile did not register an agent driver".to_owned())?;
+            let tool_manifest = runtime
+                .service::<zuno_harness::ToolManifest>()
+                .ok_or_else(|| "profile did not register a tool manifest".to_owned())?;
+            let tool_contributions = runtime
+                .service::<zuno_harness::ToolContributions>()
+                .ok_or_else(|| "profile did not register tool contributions".to_owned())?;
+            let todo_store = Arc::clone(&database);
+            let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
+            let goal_store = Arc::new(GoalStore::open_default().map_err(to_string)?);
+            let goal_projection = GoalProjection::new(worktree.as_deref(), prepared.identity.id())
+                .ok_or_else(|| {
+                    format!(
+                        "session id `{}` cannot name a goal projection",
+                        prepared.identity.id()
+                    )
+                })?;
+            let goal_continuation = GoalContinuation::new(Arc::clone(&goal_store), runs.clone())
+                .with_retry_policy(plan.goal_retry_policy);
+            let active_goal = if prepared.identity.is_materialized() {
+                goal_store
+                    .goal(prepared.identity.id())
+                    .map_err(to_string)?
+                    .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active)
+            } else {
+                false
+            };
+
+            let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
+            let command_worktree = memory_root.to_string_lossy();
+            let discovered_commands =
+                zuno_catalog::command::load_map(&plan.directory, worktree.as_deref(), env)
+                    .map_err(to_string)?;
+            let configured_commands = match plan.config.command.as_ref() {
+                Some(config) => {
+                    zuno_catalog::command::merge_command_maps(&discovered_commands, config)
+                        .map_err(to_string)?
+                }
+                None => discovered_commands,
+            };
+            let extension_commands = zuno_catalog::command::merge_command_maps(
+                &configured_commands,
+                plan.extensions.workflows(),
+            )
+            .map_err(to_string)?;
+            let mcp_prompts = mcp
+                .as_ref()
+                .map_or_else(Vec::new, zuno_mcp::Catalog::prompts);
+            let commands = zuno_catalog::command::Registry::build(
+                &zuno_catalog::command::Sources::new(&command_worktree)
+                    .with_config(Some(&extension_commands))
+                    .with_mcp_prompts(&mcp_prompts),
             );
-            service.reconcile().map_err(to_string)?;
-            Some(service)
-        } else {
-            None
-        };
-        let memory_tool = memory
-            .as_ref()
-            .filter(|_| memory_settings.tool)
-            .map(|service| erase(zuno_tools::MemoryTool::new(Arc::clone(service))));
-        let mut notes = plan.notes;
-        let reflection = match (memory.as_ref(), plan.reflection_model.take()) {
-            (Some(service), Some(model)) => match providers.resolve(model.provider.clone()) {
-                Ok(provider) => Some(ReflectionFork::new(
-                    ReflectionConfig {
-                        enabled: memory_settings.reflection,
-                        turn_interval: memory_settings.nudge_interval,
-                    },
-                    Arc::new(ProviderReflectionRunner {
-                        provider,
-                        model,
-                        events: zuno_db::event_log::SessionEventLog::new(Arc::clone(&database)),
-                    }),
-                    erase(zuno_tools::MemoryTool::reflection(Arc::clone(service))),
-                )),
-                Err(error) => {
-                    notes.push(format!(
+            let memory_settings = plan.config.resolved_memory();
+            let memory_paths = ScopePaths::discover(memory_root);
+            configure_resident_memory(&mut plan.resolver, &plan.config, memory_paths.clone())?;
+            let background_jobs = environment.background_jobs(&plan.directory);
+            let work_changes = background_jobs.notifier();
+            let memory = if memory_settings.enabled {
+                let promotion = match memory_settings.promotion {
+                    zuno_config::schema::MemoryPromotion::Review => PromotionPolicy::Review,
+                    zuno_config::schema::MemoryPromotion::HighConfidence => {
+                        PromotionPolicy::HighConfidence {
+                            threshold: (memory_settings.auto_confidence * 10_000.0).round() as u16,
+                        }
+                    }
+                    zuno_config::schema::MemoryPromotion::Automatic => PromotionPolicy::Automatic,
+                };
+                let service = Arc::new(
+                    MemoryService::new(
+                        Arc::clone(&database),
+                        memory_paths,
+                        ScopeLimits::new(
+                            memory_settings.global_char_limit,
+                            memory_settings.project_char_limit,
+                        ),
+                        promotion,
+                    )
+                    .with_observer(Arc::new(work_changes.clone())),
+                );
+                service.reconcile().map_err(to_string)?;
+                Some(service)
+            } else {
+                None
+            };
+            let memory_tool = memory
+                .as_ref()
+                .filter(|_| memory_settings.tool)
+                .map(|service| erase(zuno_tools::MemoryTool::new(Arc::clone(service))));
+            let mut notes = plan.notes;
+            let reflection = match (memory.as_ref(), plan.reflection_model.take()) {
+                (Some(service), Some(model)) => match providers.resolve(model.provider.clone()) {
+                    Ok(provider) => Some(ReflectionFork::new(
+                        ReflectionConfig {
+                            enabled: memory_settings.reflection,
+                            turn_interval: memory_settings.nudge_interval,
+                        },
+                        Arc::new(ProviderReflectionRunner {
+                            provider,
+                            model,
+                            events: zuno_db::event_log::SessionEventLog::new(Arc::clone(&database)),
+                        }),
+                        erase(zuno_tools::MemoryTool::reflection(Arc::clone(service))),
+                    )),
+                    Err(error) => {
+                        notes.push(format!(
                         "memory reflection disabled: small-model provider could not start ({error})"
                     ));
-                    None
-                }
-            },
-            _ => None,
-        };
-        plan.resolver.append_prompt_section(
-            "extensions",
-            "zuno-extension::active-packages",
-            plan.extensions.prompt_section(),
-        )?;
-        announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes)?;
-        announce_skills(&mut plan.resolver, &plan.skills, &mut notes)?;
-        let background_jobs = super::child_turn::BackgroundJobSupervisor::default();
-        let job_changes = work_changes.clone();
-        background_jobs.set_change_hook(Arc::new(move || job_changes.changed()));
-        let child_host =
-            super::child_turn::ChildSessionHost::new(super::child_turn::ChildSessionContext {
-                database: Arc::clone(&database),
-                environment: environment.clone(),
-                directory: plan.directory.clone(),
-                approval: Arc::clone(&approval),
-                question: question.clone(),
-                runs: runs.clone(),
-                mcp: mcp.clone(),
-                parent_agent: plan.agent.name.clone(),
-                parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
-                parent_effort: plan.effort,
-                supervisor: background_jobs.clone(),
-            })?;
-        let product_agents = super::product_agent::NativeProductAgentHost::new(
-            &plan.config,
-            env,
-            plan.directory.clone(),
-            Arc::clone(&database),
-            child_host.wake_handle(),
-            background_jobs.clone(),
-        )?;
-        let background_executions = environment
-            .background_executions(&plan.directory)
-            .map_err(to_string)?;
-
-        let runtime_tools = super::tool_runtime::assemble(
-            &plan.directory,
-            worktree.as_deref(),
-            env,
-            &plan.config,
-            &plan.agent,
-            super::tool_runtime::ToolSelection {
-                provider_id: &plan.provider_id,
-                model_id: &plan.model_id,
-                manifest: tool_manifest,
-                contributions: tool_contributions,
-                question,
-                background_executions: Arc::clone(&background_executions),
-                todo_store,
-                goal_store: Arc::clone(&goal_store),
-                mcp_loader: mcp.map(|catalog| {
-                    Arc::new(catalog.loader()) as Arc<dyn zuno_tools::registry::McpToolLoader>
-                }),
-                skills: Arc::clone(&plan.skills),
-                delegation: super::tool_runtime::Delegation {
-                    host: Arc::new(child_host.clone()),
-                    facts: Arc::clone(&plan.delegation_facts)
-                        as Arc<dyn zuno_tools::task::ProviderFacts>,
-                    session_model: zuno_agent::model_policy::ModelChoice::new(format!(
-                        "{}/{}",
-                        plan.provider_id, plan.model_id
-                    )),
-                    limits: zuno_tools::task::DelegationLimits {
-                        subagent_depth: plan
-                            .config
-                            .subagent_depth
-                            .unwrap_or(zuno_tools::task::DEFAULT_SUBAGENT_DEPTH),
-                    },
-                    vision_available: plan.vision_available,
+                        None
+                    }
                 },
-                product_agents: Arc::new(product_agents.clone()),
-                job_controller: Arc::new(background_jobs.clone()),
-                memory: memory_tool,
-            },
-        )?;
-        // Joins the notes so shadowing reaches whatever surface is watching: the
-        // headless runs print them, and the TUI draws them in the transcript. This is
-        // what replaces the registry's own `eprintln!` without going quiet.
-        notes.extend(
-            runtime_tools
-                .suppressions
-                .iter()
-                .map(|suppression| format!("warning: {suppression}")),
-        );
-        let dispatcher = ToolRegistryDispatcher::new(
-            runtime_tools.tools,
-            runtime_tools.rules,
-            approval,
-            InterruptSignal::new(),
-            McpToolStatus::Ready,
-        );
-        let tool_concurrency =
-            ToolConcurrencyLimit::new(plan.config.resolved_concurrency().tool_calls)
-                .expect("configuration validates tool concurrency");
-        Ok(Self {
-            profile_runtime,
-            runtime,
-            profile_id,
-            driver,
-            database,
-            connection,
-            inbox,
-            providers,
-            credential: presented,
-            resolver: plan.resolver,
-            dispatcher,
-            tool_concurrency,
-            session_id: prepared.identity.id().to_owned(),
-            session_identity: prepared.identity,
-            session_directory: prepared.directory,
-            session_usage: prepared.usage,
-            session_materializer: prepared.materializer,
-            session_title: prepared.title,
-            agent: plan.agent.name,
-            provider_id: plan.provider_id,
-            model_id: plan.model_id,
-            extension_generation: plan.extension_generation,
-            effort: plan.effort,
-            internals: plan.internals,
-            compaction_config: plan.config.compaction.clone().unwrap_or_default(),
-            compaction_state: CompactionState::default(),
-            window: plan.window,
-            notes,
-            commands,
-            goal_store,
-            goal_projection,
-            goal_continuation,
-            runs,
-            background_jobs,
-            background_executions,
-            background_reports: child_host,
-            product_agents,
-            background_reports_recovered: false,
-            last_turn_completed: active_goal,
-            title_sink: None,
-            work_changes,
-            memory,
-            reflection,
-        })
+                _ => None,
+            };
+            plan.resolver.append_prompt_section(
+                "extensions",
+                "zuno-extension::active-packages",
+                plan.extensions.prompt_section(),
+            )?;
+            announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes)?;
+            announce_skills(&mut plan.resolver, &plan.skills, &mut notes)?;
+            let child_host =
+                super::child_turn::ChildSessionHost::new(super::child_turn::ChildSessionContext {
+                    database: Arc::clone(&database),
+                    environment: environment.clone(),
+                    directory: plan.directory.clone(),
+                    approval: Arc::clone(&approval),
+                    question: question.clone(),
+                    runs: runs.clone(),
+                    mcp: mcp.clone(),
+                    parent_agent: plan.agent.name.clone(),
+                    parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
+                    parent_effort: plan.effort,
+                    supervisor: background_jobs.clone(),
+                })?;
+            let product_agents = super::product_agent::NativeProductAgentHost::new(
+                &plan.config,
+                env,
+                plan.directory.clone(),
+                Arc::clone(&database),
+                child_host.wake_handle(),
+                background_jobs.clone(),
+            )?;
+            let background_executions = environment
+                .background_executions(&plan.directory)
+                .map_err(to_string)?;
+
+            let runtime_tools = super::tool_runtime::assemble(
+                &plan.directory,
+                worktree.as_deref(),
+                env,
+                &plan.config,
+                &plan.agent,
+                super::tool_runtime::ToolSelection {
+                    provider_id: &plan.provider_id,
+                    model_id: &plan.model_id,
+                    manifest: tool_manifest,
+                    contributions: tool_contributions,
+                    question,
+                    background_executions: Arc::clone(&background_executions),
+                    todo_store,
+                    goal_store: Arc::clone(&goal_store),
+                    mcp_loader: mcp.map(|catalog| {
+                        Arc::new(catalog.loader()) as Arc<dyn zuno_tools::registry::McpToolLoader>
+                    }),
+                    skills: Arc::clone(&plan.skills),
+                    delegation: super::tool_runtime::Delegation {
+                        host: Arc::new(child_host.clone()),
+                        facts: Arc::clone(&plan.delegation_facts)
+                            as Arc<dyn zuno_tools::task::ProviderFacts>,
+                        session_model: zuno_agent::model_policy::ModelChoice::new(format!(
+                            "{}/{}",
+                            plan.provider_id, plan.model_id
+                        )),
+                        limits: zuno_tools::task::DelegationLimits {
+                            subagent_depth: plan
+                                .config
+                                .subagent_depth
+                                .unwrap_or(zuno_tools::task::DEFAULT_SUBAGENT_DEPTH),
+                        },
+                        vision_available: plan.vision_available,
+                    },
+                    product_agents: Arc::new(product_agents.clone()),
+                    job_controller: Arc::new(background_jobs.clone()),
+                    memory: memory_tool,
+                },
+            )?;
+            // Joins the notes so shadowing reaches whatever surface is watching: the
+            // headless runs print them, and the TUI draws them in the transcript. This is
+            // what replaces the registry's own `eprintln!` without going quiet.
+            notes.extend(
+                runtime_tools
+                    .suppressions
+                    .iter()
+                    .map(|suppression| format!("warning: {suppression}")),
+            );
+            let dispatcher = ToolRegistryDispatcher::new(
+                runtime_tools.tools,
+                runtime_tools.rules,
+                approval,
+                McpToolStatus::Ready,
+            );
+            let tool_concurrency =
+                ToolConcurrencyLimit::new(plan.config.resolved_concurrency().tool_calls)
+                    .expect("configuration validates tool concurrency");
+            Ok(Self {
+                profile_runtime: profile_runtime.clone(),
+                runtime,
+                driver,
+                database,
+                connection,
+                inbox,
+                providers,
+                credential: presented,
+                resolver: plan.resolver,
+                dispatcher,
+                tool_concurrency,
+                session_id: prepared.identity.id().to_owned(),
+                session_identity: prepared.identity,
+                session_directory: prepared.directory,
+                session_usage: prepared.usage,
+                session_materializer: prepared.materializer,
+                session_title: prepared.title,
+                agent: plan.agent.name,
+                provider_id: plan.provider_id,
+                model_id: plan.model_id,
+                extension_scope: plan.extension_scope,
+                extension_revision: plan.extension_revision,
+                extension_ownership: extension_ownership.take(),
+                effort: plan.effort,
+                internals: plan.internals,
+                compaction_config: plan.config.compaction.clone().unwrap_or_default(),
+                compaction_state: CompactionState::default(),
+                window: plan.window,
+                notes,
+                commands,
+                goal_store,
+                goal_projection,
+                goal_continuation,
+                runs,
+                background_jobs,
+                background_executions,
+                background_reports: child_host,
+                product_agents,
+                background_reports_recovered: false,
+                last_turn_completed: active_goal,
+                title_sink: None,
+                work_changes,
+                memory,
+                reflection,
+            })
+        })();
+        match assembled {
+            Ok(host) => Ok(host),
+            Err(error) => {
+                let shutdown = profile_runtime.shutdown().await;
+                let ownership = extension_ownership
+                    .take()
+                    .expect("failed host assembly retains extension ownership");
+                match shutdown {
+                    Ok(()) => match ownership.release_after_clean_failure() {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(format!(
+                            "{error}; extension transition abort also failed: {cleanup}"
+                        )),
+                    },
+                    Err(shutdown) => {
+                        ownership.mark_uncertain(format!(
+                            "turn host assembly failed ({error}) and profile cleanup was not \
+                             authoritative ({shutdown})"
+                        ));
+                        Err(format!(
+                            "{error}; profile cleanup after host assembly failure also failed: \
+                             {shutdown}"
+                        ))
+                    }
+                }
+            }
+        }
     }
 
     /// Report generated session names to `sink` as well as to the transcript.
@@ -1817,7 +1989,7 @@ impl TurnHost {
 
     /// Whether deleting this host's session would race a background subagent write.
     pub(super) fn has_running_background_tasks(&self) -> bool {
-        self.background_jobs.has_running_tasks()
+        self.background_jobs.has_running_tasks(&self.session_id)
     }
 
     pub(super) fn background_executions(&self) -> Arc<zuno_pty::BackgroundExecutionService> {
@@ -1979,8 +2151,8 @@ impl TurnHost {
     }
 
     /// The active harness profile that assembled this session.
-    pub(crate) fn profile_id(&self) -> &str {
-        &self.profile_id
+    pub(crate) fn lifecycle_snapshots(&self) -> [zuno_runtime::RuntimeSnapshot; 2] {
+        [self.profile_runtime.snapshot(), self.runtime.snapshot()]
     }
 
     /// The name a resumed session already had, or [`None`] for one never named.
@@ -2057,9 +2229,38 @@ impl TurnHost {
         format!("{}/{}", self.provider_id, self.model_id)
     }
 
-    /// Active extension revision this host was assembled against.
-    pub(crate) const fn extension_generation(&self) -> u64 {
-        self.extension_generation
+    /// Extension revision this host was assembled against.
+    pub(crate) const fn extension_revision(&self) -> u64 {
+        self.extension_revision
+    }
+
+    pub(crate) fn extension_scope(&self) -> &zuno_extension::Scope {
+        &self.extension_scope
+    }
+
+    /// Publish a desired extension composition only after the old owner is gone.
+    pub(crate) fn activate_extension_composition(&mut self) -> Result<(), String> {
+        let Some(ownership) = self.extension_ownership.take() else {
+            return Err("turn host has no extension composition ownership".to_owned());
+        };
+        self.extension_ownership = Some(match ownership {
+            ExtensionOwnership::Active(lease) => ExtensionOwnership::Active(lease),
+            ExtensionOwnership::Prepared(transition) => {
+                ExtensionOwnership::Active(transition.commit().map_err(to_string)?)
+            }
+        });
+        Ok(())
+    }
+
+    fn require_active_extension_composition(&self) -> Result<(), String> {
+        match self.extension_ownership {
+            Some(ExtensionOwnership::Active(_)) => Ok(()),
+            Some(ExtensionOwnership::Prepared(_)) => Err(
+                "turn host cannot run before its prepared extension composition is committed"
+                    .to_owned(),
+            ),
+            None => Err("turn host extension composition is already released".to_owned()),
+        }
     }
 
     /// The reasoning level this host resolved with.
@@ -2081,16 +2282,36 @@ impl TurnHost {
         self.runs.control(self.session_id.clone())
     }
 
-    pub(crate) async fn shutdown(&mut self) {
-        self.background_jobs.wait_all().await;
-        self.runtime
-            .shutdown()
-            .await
-            .expect("session runtime shutdown is infallible");
-        self.profile_runtime
-            .shutdown()
-            .await
-            .expect("profile runtime shutdown is infallible");
+    pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
+        let session = self.runtime.shutdown().await.map_err(to_string);
+        let profile = self.profile_runtime.shutdown().await.map_err(to_string);
+        let outcome = match (session, profile) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(session), Ok(())) => Err(format!("session runtime shutdown failed: {session}")),
+            (Ok(()), Err(profile)) => Err(format!("profile runtime shutdown failed: {profile}")),
+            (Err(session), Err(profile)) => Err(format!(
+                "session runtime shutdown failed: {session}; profile runtime shutdown failed: \
+                 {profile}"
+            )),
+        };
+        match outcome {
+            Ok(()) => match self.extension_ownership.take() {
+                Some(ExtensionOwnership::Active(lease)) => {
+                    drop(lease);
+                    Ok(())
+                }
+                Some(ExtensionOwnership::Prepared(transition)) => {
+                    transition.abort().map_err(to_string)
+                }
+                None => Ok(()),
+            },
+            Err(error) => {
+                if let Some(ownership) = self.extension_ownership.take() {
+                    ownership.mark_uncertain(error.clone());
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Persist `prompt` as the user's message and run one turn over it.
@@ -2222,6 +2443,7 @@ impl TurnHost {
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.require_active_extension_composition()?;
         let latest = zuno_db::message::MessageStore::new(&self.connection)
             .latest_time_created(&self.session_id)
             .map_err(to_string)?;
@@ -2332,6 +2554,7 @@ impl TurnHost {
         queued_input: QueuedUserInput,
         events: TurnEventSender,
     ) -> Result<bool, String> {
+        self.require_active_extension_composition()?;
         if !self.last_turn_completed {
             return Ok(false);
         }
@@ -2596,11 +2819,19 @@ impl TurnHost {
             Arc::new(AllowAll),
             Arc::new(NeverInterrupted),
         );
-        let _ = reflection.spawn_after_turn(ReflectionTurn::new(
+        let task = reflection.spawn_after_turn(ReflectionTurn::new(
             TurnDelivery::new(true, false),
             transcript,
             context,
         ));
+        if let Some(task) = task {
+            self.background_jobs.supervise_handle(
+                format!("reflection_{assistant_message_id}"),
+                self.session_id.clone(),
+                tokio_util::sync::CancellationToken::new(),
+                task,
+            );
+        }
     }
 
     fn finish_goal_error(
@@ -2667,6 +2898,7 @@ impl TurnHost {
     }
 
     pub(crate) async fn compact(&mut self, automatic: bool) -> Result<(), String> {
+        self.require_active_extension_composition()?;
         self.goal_projection
             .ingest(&self.goal_store)
             .map_err(to_string)?;
@@ -4275,6 +4507,20 @@ pub(super) fn prefixed_id(prefix: &str) -> String {
 
 fn to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+pub(super) fn finish_with_shutdown<T>(
+    outcome: Result<T, String>,
+    shutdown: Result<(), String>,
+) -> Result<T, String> {
+    match (outcome, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(error), Err(shutdown)) => {
+            Err(format!("{error}; host shutdown also failed: {shutdown}"))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 mod agent;
-mod child_turn;
+pub(crate) mod child_turn;
 mod completion;
 mod db;
 mod db_maint;

@@ -237,6 +237,26 @@ pub trait ReflectionRunner: Send + Sync {
     ) -> Result<(), ReflectionError>;
 }
 
+struct AbortTaskOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortTaskOnDrop {
+    fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self(Some(handle))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Schedules best-effort, post-delivery reflection tasks.
 pub struct ReflectionFork {
     config: ReflectionConfig,
@@ -294,7 +314,10 @@ impl ReflectionFork {
 
         Some(runtime.spawn(async move {
             let review = tokio::spawn(async move { runner.review(request, tools).await });
-            match review.await {
+            let mut abort = AbortTaskOnDrop::new(review.abort_handle());
+            let outcome = review.await;
+            abort.disarm();
+            match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::warn!(error = %error, "background reflection failed");

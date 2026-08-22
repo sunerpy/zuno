@@ -33,6 +33,7 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
         session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
         title: args.title.clone(),
         effort: None,
+        extension_composition: super::turn::ExtensionComposition::Active,
     };
     let runtime = runtime()?;
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
@@ -47,12 +48,13 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
         Some(mcp) => runtime.block_on(mcp.connect()),
         None => Vec::new(),
     };
-    let mut host = TurnHost::open_with_mcp(
+    let mut host = runtime.block_on(TurnHost::open_with_mcp(
         plan,
         environment,
         Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
         mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
-    )?;
+    ))?;
+    host.activate_extension_composition()?;
     host.push_notes(mcp_notes);
 
     let (sender, receiver) = event_channel();
@@ -76,11 +78,12 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
             render_events(receiver, args.format)
         )
     });
-    runtime.block_on(host.shutdown());
+    let shutdown = runtime.block_on(host.shutdown());
+    runtime.block_on(environment.wait_background_jobs());
     if let Some(mcp) = mcp {
         runtime.block_on(mcp.shutdown());
     }
-    outcome?;
+    super::turn::finish_with_shutdown(outcome, shutdown)?;
     rendered?;
     Ok(())
 }

@@ -5090,6 +5090,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "which",
+ "wiremock",
  "zuno-agent",
  "zuno-auth",
  "zuno-catalog",

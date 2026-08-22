@@ -108,6 +108,8 @@ const SELECTION_CHANNEL_CAPACITY: usize = 8;
 
 const EDITOR_CHANNEL_CAPACITY: usize = 1;
 
+const WORKER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How many submitted prompts may be waiting to be written down.
 ///
 /// A user cannot submit faster than a turn accepts, and `PROMPT_CHANNEL_CAPACITY` is
@@ -215,36 +217,70 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
         title: None,
         effort: None,
+        extension_composition: super::turn::ExtensionComposition::Active,
     };
     let mut launch_prompt = args.prompt.clone();
     let mut terminal = None;
     let mut initial_dialog = None;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(to_string)?;
 
     loop {
         match execute_once(
             args,
             environment,
+            &runtime,
             options,
             launch_prompt.take(),
             initial_dialog.take(),
             &mut terminal,
-        )? {
-            TuiRunOutcome::Exit(identity) => {
+        ) {
+            Err(error) => {
+                drop(terminal.take());
+                return match shutdown_tui_background_jobs(&runtime, environment) {
+                    Ok(()) => Err(error),
+                    Err(shutdown) => Err(format!(
+                        "{error}; background job shutdown also failed: {shutdown}"
+                    )),
+                };
+            }
+            Ok(TuiRunOutcome::Exit(identity)) => {
                 // The resume command belongs in the primary screen's scrollback. Keep the
                 // terminal mounted across composition changes, but restore it before this
                 // final line exactly as a one-composition run does.
                 drop(terminal.take());
+                shutdown_tui_background_jobs(&runtime, environment)?;
                 if identity.is_materialized() {
                     println!("{}", resume_hint(identity.id()));
                 }
                 return Ok(());
             }
-            TuiRunOutcome::Remount(next) => {
+            Ok(TuiRunOutcome::Remount(next)) => {
                 options = next.options;
                 initial_dialog = next.initial_dialog;
             }
         }
     }
+}
+
+fn shutdown_tui_background_jobs(
+    runtime: &tokio::runtime::Runtime,
+    environment: &StartupEnvironment,
+) -> Result<(), String> {
+    environment.cancel_background_jobs();
+    runtime.block_on(async {
+        tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, environment.wait_background_jobs())
+            .await
+            .map_err(|_| {
+                format!(
+                    "background jobs did not stop within {} seconds",
+                    WORKER_SHUTDOWN_TIMEOUT.as_secs()
+                )
+            })
+    })
 }
 
 enum TuiRunOutcome {
@@ -292,6 +328,7 @@ struct MountedTerminal {
 fn execute_once(
     args: &TuiArgs,
     environment: &StartupEnvironment,
+    runtime: &tokio::runtime::Runtime,
     options: TurnOptions,
     launch_prompt: Option<String>,
     initial_dialog: Option<RemountDialog>,
@@ -301,11 +338,6 @@ fn execute_once(
     let (engine_sender, engine_receiver) = event_channel();
     let (prompt_sender, prompt_receiver) = mpsc::channel(PROMPT_CHANNEL_CAPACITY);
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(to_string)?;
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
     let concurrency = plan.config().resolved_concurrency();
     let layout = zuno_paths::Layout::resolve(environment.resolved());
@@ -394,16 +426,26 @@ fn execute_once(
         Arc::clone(&broker) as Arc<dyn PermissionAsker>
     };
     let driver_approval = Arc::clone(&approval);
-    let driver_options = options.clone();
+    let mut driver_options = options.clone();
     let driver_environment = environment.clone();
-    let mut host = TurnHost::open_with_runtime_and_mcp(
+    let mut host = runtime.block_on(TurnHost::open_with_runtime_and_mcp(
         plan,
         environment,
         approval,
         Some(Arc::clone(&question)),
         SessionRunRegistry::new(),
         Some(mcp_catalog.clone()),
-    )?;
+    ))?;
+    if let Err(error) = host.activate_extension_composition() {
+        let shutdown = runtime.block_on(host.shutdown());
+        return Err(match shutdown {
+            Ok(()) => error,
+            Err(shutdown) => {
+                format!("{error}; candidate host shutdown also failed: {shutdown}")
+            }
+        });
+    }
+    driver_options.extension_composition = super::turn::ExtensionComposition::Active;
     catalog.sessions = session_entries(&host)?;
     catalog.session = host
         .is_session_materialized()
@@ -470,7 +512,7 @@ fn execute_once(
     facts.describe(
         &mut screen,
         host.tool_count(),
-        RuntimeIdentity::resolve(host.session_id(), host.profile_id(), environment.resolved()),
+        RuntimeIdentity::resolve(&host, environment.resolved()),
     );
     if host.is_session_materialized() {
         let usage = host.session_usage();
@@ -601,11 +643,13 @@ fn execute_once(
         });
     }
     let outcome = runtime.block_on(async move {
-        let input = tokio::spawn(zuno_tui::app::forward_terminal_input(
+        let (worker_shutdown, worker_shutdown_source) = watch::channel(false);
+        let input_shutdown = Arc::clone(&input_control);
+        let mut input = tokio::spawn(zuno_tui::app::forward_terminal_input(
             terminal_sender,
             input_control,
         ));
-        let turns = tokio::spawn(drive_turns(
+        let mut turns = tokio::spawn(drive_turns(
             TurnDriver {
                 host,
                 options: driver_options,
@@ -624,25 +668,37 @@ fn execute_once(
             selection_receiver,
             driver_environment,
             engine_sender,
+            worker_shutdown_source.clone(),
         ));
-        let mcp = tokio::spawn(drive_mcp_lifecycle(
-            mcp_controller,
-            mcp_toggle_receiver,
-            initial_mcp_targets,
-            NonZeroUsize::new(usize::from(concurrency.mcp_connections))
+        let mut mcp = tokio::spawn(drive_mcp_lifecycle(McpLifecycleWorker {
+            controller: mcp_controller,
+            requests: mcp_toggle_receiver,
+            initial: initial_mcp_targets,
+            concurrency: NonZeroUsize::new(usize::from(concurrency.mcp_connections))
                 .expect("configuration validates MCP concurrency"),
-            mcp_projection,
-            mcp_dirty,
-            mcp_wake,
-        ));
-        let checks = tokio::spawn(super::tui_lsp::check_edits(
+            projection: mcp_projection,
+            dirty: mcp_dirty,
+            wake: mcp_wake,
+            shutdown: worker_shutdown_source.clone(),
+        }));
+        let mut checks = tokio::spawn(super::tui_lsp::check_edits(
             probe,
             edit_reader,
             edit_receiver,
             report_sender,
+            worker_shutdown_source.clone(),
         ));
-        let cancels = tokio::spawn(forward_cancellations(control, cancel_receiver));
-        let history = tokio::spawn(record_prompt_history(history_path, history_receiver));
+        let shutdown_control = control.clone();
+        let mut cancels = tokio::spawn(forward_cancellations(
+            control,
+            cancel_receiver,
+            worker_shutdown_source.clone(),
+        ));
+        let mut history = tokio::spawn(record_prompt_history(
+            history_path,
+            history_receiver,
+            worker_shutdown_source,
+        ));
         let (editor_shutdown, editor_shutdown_source) = watch::channel(false);
         let mut editor = tokio::spawn(drive_external_editor(
             editor_lease,
@@ -652,34 +708,91 @@ fn execute_once(
             editor_wake,
             editor_shutdown_source,
         ));
-        let outcome = app.run().await;
+        let outcome = app.run().await.map_err(to_string);
+        let _stopping = worker_shutdown.send(true);
+        let _aborted = shutdown_control.abort();
         let _stopping = editor_shutdown.send(true);
-        if tokio::time::timeout(std::time::Duration::from_secs(3), &mut editor)
-            .await
-            .is_err()
-        {
-            editor.abort();
-            let _cancelled = tokio::time::timeout(std::time::Duration::from_secs(3), editor).await;
-        }
-        input.abort();
-        turns.abort();
-        checks.abort();
-        cancels.abort();
-        mcp.abort();
-        // Aborted with the rest rather than awaited, because the sender lives inside the
-        // render tree that several `Arc`s outlive here — the channel never closes, so a
-        // wait would be a hang and a timed wait would tax every exit. The cost is one
-        // narrow race: a prompt submitted in the instant before quitting may not have
-        // been appended. `try_send` wakes this task immediately and an append is a single
-        // write, so what is lost is a recall, never the turn, which has already run.
-        history.abort();
-        outcome
+        input_shutdown.stop();
+        let (
+            editor_shutdown,
+            input_shutdown,
+            cancellation_shutdown,
+            history_shutdown,
+            turn_shutdown,
+            mcp_shutdown,
+            lsp_shutdown,
+        ) = tokio::join!(
+            await_worker("external editor", &mut editor),
+            await_worker("terminal input", &mut input),
+            await_worker("cancellation forwarder", &mut cancels),
+            await_worker("prompt history", &mut history),
+            await_turn_driver(&mut turns),
+            await_worker("MCP lifecycle", &mut mcp),
+            await_worker("LSP diagnostics", &mut checks),
+        );
+        finish_tui_shutdown(
+            outcome,
+            [
+                editor_shutdown,
+                input_shutdown,
+                cancellation_shutdown,
+                history_shutdown,
+                turn_shutdown,
+                mcp_shutdown,
+                lsp_shutdown,
+            ],
+        )
     });
-    outcome.map_err(to_string)?;
+    outcome?;
     if let Some(next) = remount.take() {
         return Ok(TuiRunOutcome::Remount(next));
     }
     Ok(TuiRunOutcome::Exit(exit_identity))
+}
+
+async fn await_turn_driver(
+    worker: &mut tokio::task::JoinHandle<Result<(), String>>,
+) -> Result<(), String> {
+    match tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, &mut *worker).await {
+        Ok(joined) => {
+            joined.map_err(|error| format!("turn driver shutdown task failed: {error}"))?
+        }
+        Err(_elapsed) => {
+            worker.abort();
+            let _cancelled = worker.await;
+            Err(format!(
+                "turn driver did not reach quiescence within {} seconds",
+                WORKER_SHUTDOWN_TIMEOUT.as_secs()
+            ))
+        }
+    }
+}
+
+async fn await_worker(name: &str, worker: &mut tokio::task::JoinHandle<()>) -> Result<(), String> {
+    match tokio::time::timeout(WORKER_SHUTDOWN_TIMEOUT, &mut *worker).await {
+        Ok(joined) => joined.map_err(|error| format!("{name} shutdown task failed: {error}")),
+        Err(_elapsed) => {
+            worker.abort();
+            let _cancelled = worker.await;
+            Err(format!(
+                "{name} did not reach quiescence within {} seconds",
+                WORKER_SHUTDOWN_TIMEOUT.as_secs()
+            ))
+        }
+    }
+}
+
+fn finish_tui_shutdown<const N: usize>(
+    outcome: Result<(), String>,
+    shutdowns: [Result<(), String>; N],
+) -> Result<(), String> {
+    let mut failures = outcome.err().into_iter().collect::<Vec<_>>();
+    failures.extend(shutdowns.into_iter().filter_map(Result::err));
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// The flag that reopens an existing session, as `command.rs` declares it.
@@ -782,24 +895,49 @@ fn prompt_history_path(layout: &zuno_paths::Layout) -> PathBuf {
 /// more thing racing the loop for `UiState`. Only the first failure is reported; the
 /// cause is almost always permissions or a full disk, and one line per submitted
 /// prompt would bury the log it is written to.
-async fn record_prompt_history(path: PathBuf, mut records: mpsc::Receiver<String>) {
+async fn record_prompt_history(
+    path: PathBuf,
+    mut records: mpsc::Receiver<String>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut reported = false;
-    while let Some(entry) = records.recv().await {
-        let Some(line) = zuno_tui::views::editor::PromptHistory::encode(&entry) else {
-            continue;
-        };
-        let target = path.clone();
-        let written = tokio::task::spawn_blocking(move || append_line(&target, &line)).await;
-        if let Ok(Err(error)) = written
-            && !reported
-        {
-            reported = true;
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "failed to append to the prompt history; later failures are not repeated"
-            );
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    records.close();
+                    while let Some(entry) = records.recv().await {
+                        append_prompt_history_entry(&path, entry, &mut reported).await;
+                    }
+                    return;
+                }
+            }
+            entry = records.recv() => {
+                let Some(entry) = entry else {
+                    return;
+                };
+                append_prompt_history_entry(&path, entry, &mut reported).await;
+            }
         }
+    }
+}
+
+async fn append_prompt_history_entry(path: &Path, entry: String, reported: &mut bool) {
+    let Some(line) = zuno_tui::views::editor::PromptHistory::encode(&entry) else {
+        return;
+    };
+    let target = path.to_path_buf();
+    let written = tokio::task::spawn_blocking(move || append_line(&target, &line)).await;
+    if let Ok(Err(error)) = written
+        && !*reported
+    {
+        *reported = true;
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "failed to append to the prompt history; later failures are not repeated"
+        );
     }
 }
 
@@ -1038,18 +1176,79 @@ impl RuntimeIdentity {
     /// `WezTerm`), while the latter names its termcap entry (`xterm-256color`), and
     /// several unrelated emulators report the same `TERM`. Neither is guaranteed, so an
     /// absent value is omitted rather than guessed.
-    fn resolve(session: &str, profile_id: &str, env: &zuno_paths::Env) -> Self {
-        use zuno_tui::views::ambient::{Health, Service};
+    fn resolve(host: &TurnHost, env: &zuno_paths::Env) -> Self {
         Self {
-            session: session.to_owned(),
-            harness: vec![
-                Service::new(profile_id.to_owned(), Health::Ready).detailed("active profile"),
-            ],
+            session: host.session_id().to_owned(),
+            harness: lifecycle_services(&host.lifecycle_snapshots()),
             terminal: env
                 .value("TERM_PROGRAM")
                 .or_else(|| env.value("TERM"))
                 .map(str::to_owned),
         }
+    }
+}
+
+fn lifecycle_services(
+    snapshots: &[zuno_runtime::RuntimeSnapshot],
+) -> Vec<zuno_tui::views::ambient::Service> {
+    use zuno_runtime::LifecycleState;
+    use zuno_tui::views::ambient::{Health, Service};
+
+    fn health(state: LifecycleState, runtime: bool) -> Health {
+        match state {
+            LifecycleState::Active => Health::Ready,
+            LifecycleState::Preparing | LifecycleState::Stopping => Health::Pending,
+            LifecycleState::Stopped if runtime => Health::Ready,
+            LifecycleState::Stopped | LifecycleState::Closed => Health::Disabled,
+            LifecycleState::Failed | LifecycleState::Uncertain => Health::Faulted,
+        }
+    }
+
+    let mut services = Vec::new();
+    for runtime in snapshots {
+        let profile = runtime.profile_id.as_deref().map_or_else(
+            || "scope".to_owned(),
+            |profile| format!("profile {profile}"),
+        );
+        services.push(
+            Service::new(
+                format!("runtime {}", runtime.name),
+                health(runtime.state, true),
+            )
+            .detailed(format!("{} · {}", lifecycle_state(runtime.state), profile)),
+        );
+        services.extend(runtime.components.iter().map(|component| {
+            Service::new(component.id.clone(), health(component.state, false)).detailed(format!(
+                "{} · effects {} · provides {} · requires {}",
+                lifecycle_state(component.state),
+                component.effects.len(),
+                component.provides.len(),
+                component.requires.len()
+            ))
+        }));
+        services.extend(runtime.diagnostics.iter().map(|diagnostic| {
+            Service::new(
+                format!("{}:{}", diagnostic.component_id, diagnostic.effect_id),
+                Health::Faulted,
+            )
+            .detailed(format!(
+                "{} {} · {}",
+                diagnostic.phase, diagnostic.kind, diagnostic.message
+            ))
+        }));
+    }
+    services
+}
+
+const fn lifecycle_state(state: zuno_runtime::LifecycleState) -> &'static str {
+    match state {
+        zuno_runtime::LifecycleState::Preparing => "preparing",
+        zuno_runtime::LifecycleState::Active => "active",
+        zuno_runtime::LifecycleState::Stopping => "stopping",
+        zuno_runtime::LifecycleState::Stopped => "stopped",
+        zuno_runtime::LifecycleState::Failed => "failed",
+        zuno_runtime::LifecycleState::Uncertain => "uncertain",
+        zuno_runtime::LifecycleState::Closed => "closed",
     }
 }
 
@@ -1151,9 +1350,24 @@ fn mcp_enabled(server: &zuno_config::schema::mcp::McpServerConfig) -> bool {
 async fn forward_cancellations(
     control: zuno_engine::status::SessionControl,
     mut cancels: mpsc::Receiver<()>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
-    while cancels.recv().await.is_some() {
-        let _aborted = control.abort();
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    cancels.close();
+                    return;
+                }
+            }
+            cancellation = cancels.recv() => {
+                let Some(()) = cancellation else {
+                    return;
+                };
+                let _aborted = control.abort();
+            }
+        }
     }
 }
 
@@ -1292,9 +1506,37 @@ struct TurnRebuild<'a> {
     mcp_catalog: &'a zuno_mcp::Catalog,
 }
 
+trait HostLifecycle {
+    fn shutdown_host(&mut self) -> BoxFuture<'_, Result<(), String>>;
+}
+
+impl HostLifecycle for TurnHost {
+    fn shutdown_host(&mut self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(self.shutdown())
+    }
+}
+
+/// Stop the previous owner before constructing the replacement.
+///
+/// [`TurnPlan`] is the side-effect-free preparation result. The closure performs the
+/// actual start, so no candidate worker, route, watcher, or provider can overlap the
+/// old host's cleanup.
+async fn replace_host<H, Start, Started>(current: &mut H, start: Start) -> Result<(), String>
+where
+    H: HostLifecycle,
+    Start: FnOnce() -> Started,
+    Started: std::future::Future<Output = Result<H, String>>,
+{
+    current.shutdown_host().await?;
+    let candidate = start().await?;
+    *current = candidate;
+    Ok(())
+}
+
 enum SelectionOutcome {
     Rebuilt(TurnEventSender),
     Remount(RemountRequest),
+    Shutdown(String),
     Unchanged,
 }
 
@@ -1312,6 +1554,7 @@ async fn apply_selection(
     next.model = Some(host.qualified_model());
     next.agent = Some(host.agent_name().to_owned());
     next.effort = host.effort();
+    next.extension_composition = super::turn::ExtensionComposition::Active;
     match selection {
         zuno_tui::views::session::Selection::Model(model) => next.model = Some(model),
         zuno_tui::views::session::Selection::Agent(agent) => next.agent = Some(agent),
@@ -1570,23 +1813,8 @@ async fn apply_selection(
         // A theme is owned and applied entirely by the view layer.
         zuno_tui::views::session::Selection::Theme(_) => return SelectionOutcome::Unchanged,
     }
-    let rebuilt = async {
-        let plan = TurnPlan::resolve(&next, rebuild.environment).await?;
-        TurnHost::open_with_runtime_and_mcp(
-            plan,
-            rebuild.environment,
-            Arc::clone(rebuild.approval),
-            Some(Arc::clone(rebuild.question)),
-            SessionRunRegistry::new(),
-            Some(rebuild.mcp_catalog.clone()),
-        )
-    }
-    .await;
-    match rebuilt {
-        Ok(replacement) => {
-            *host = replacement;
-            SelectionOutcome::Rebuilt(rebuild.events.clone())
-        }
+    let plan = match TurnPlan::resolve(&next, rebuild.environment).await {
+        Ok(plan) => plan,
         Err(message) => {
             let _reported = rebuild
                 .events
@@ -1597,8 +1825,26 @@ async fn apply_selection(
                     },
                 })
                 .await;
-            SelectionOutcome::Unchanged
+            return SelectionOutcome::Unchanged;
         }
+    };
+    match replace_host(host, || async move {
+        TurnHost::open_with_runtime_and_mcp(
+            plan,
+            rebuild.environment,
+            Arc::clone(rebuild.approval),
+            Some(Arc::clone(rebuild.question)),
+            SessionRunRegistry::new(),
+            Some(rebuild.mcp_catalog.clone()),
+        )
+        .await
+    })
+    .await
+    {
+        Ok(()) => SelectionOutcome::Rebuilt(rebuild.events.clone()),
+        Err(message) => SelectionOutcome::Shutdown(format!(
+            "turn host replacement could not establish a quiescent composition: {message}"
+        )),
     }
 }
 
@@ -1675,9 +1921,10 @@ async fn drive_turns(
     mut selections: mpsc::Receiver<zuno_tui::views::session::Selection>,
     environment: StartupEnvironment,
     mut events: TurnEventSender,
-) {
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), String> {
     let mut work_changes = driver.host.work_state_changes();
-    loop {
+    'driver: loop {
         let queued = if prompts.is_empty() && selections.is_empty() {
             zuno_goal::QueuedUserInput::Absent
         } else {
@@ -1710,10 +1957,10 @@ async fn drive_turns(
             biased;
             prompt = prompts.recv() => match prompt {
                 Some(prompt) => prompt,
-                None => return,
+                None => break 'driver,
             },
             selection = selections.recv() => {
-                let Some(selection) = selection else { return };
+                let Some(selection) = selection else { break 'driver };
                 let rebuild = TurnRebuild {
                     options: &driver.options,
                     environment: &environment,
@@ -1736,7 +1983,18 @@ async fn drive_turns(
                     SelectionOutcome::Remount(request) => {
                         driver.remount.request(request);
                         let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
-                        return;
+                        break 'driver;
+                    }
+                    SelectionOutcome::Shutdown(message) => {
+                        report_turn_failure(&events, message.clone()).await;
+                        let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
+                        let shutdown = driver.host.shutdown().await;
+                        return match shutdown {
+                            Ok(()) => Err(message),
+                            Err(error) => Err(format!(
+                                "{message}; final turn host shutdown also failed: {error}"
+                            )),
+                        };
                     }
                     SelectionOutcome::Unchanged => {}
                 }
@@ -1749,6 +2007,10 @@ async fn drive_turns(
                 .await;
                 work_changes.borrow_and_update();
                 continue;
+            },
+            changed = shutdown.changed() => {
+                let _changed = changed;
+                break 'driver;
             },
             changed = work_changes.changed() => {
                 if changed.is_err() {
@@ -1765,11 +2027,25 @@ async fn drive_turns(
                 continue;
             }
         };
-        if driver.mcp_dirty.swap(false, Ordering::AcqRel)
-            && let Some(rebuilt) = refresh_mcp_host(&mut driver, &environment, &events).await
-        {
-            events = rebuilt;
-            work_changes = driver.host.work_state_changes();
+        if driver.mcp_dirty.swap(false, Ordering::AcqRel) {
+            match refresh_mcp_host(&mut driver, &environment, &events).await {
+                Ok(Some(rebuilt)) => {
+                    events = rebuilt;
+                    work_changes = driver.host.work_state_changes();
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    report_turn_failure(&events, message.clone()).await;
+                    let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
+                    let shutdown = driver.host.shutdown().await;
+                    return match shutdown {
+                        Ok(()) => Err(message),
+                        Err(error) => Err(format!(
+                            "{message}; final turn host shutdown also failed: {error}"
+                        )),
+                    };
+                }
+            }
         }
         drive_one(
             &mut driver.host,
@@ -1788,17 +2064,23 @@ async fn drive_turns(
         )
         .await;
         work_changes.borrow_and_update();
-        if environment.extensions().composition_generation() != driver.host.extension_generation() {
+        if environment
+            .extensions()
+            .desired_revision(driver.host.extension_scope())
+            != driver.host.extension_revision()
+        {
             let mut next = driver.options.clone();
             next.session = driver.host.rebuild_session_choice();
             next.model = Some(driver.host.qualified_model());
             next.agent = Some(driver.host.agent_name().to_owned());
             next.effort = driver.host.effort();
+            next.extension_composition = super::turn::ExtensionComposition::Desired;
             driver.remount.request(RemountRequest::plain(next));
             let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
-            return;
+            break 'driver;
         }
     }
+    driver.host.shutdown().await
 }
 
 async fn refresh_work_state(
@@ -1834,28 +2116,14 @@ async fn refresh_mcp_host(
     driver: &mut TurnDriver,
     environment: &StartupEnvironment,
     events: &TurnEventSender,
-) -> Option<TurnEventSender> {
+) -> Result<Option<TurnEventSender>, String> {
     let mut next = driver.options.clone();
     next.session = driver.host.rebuild_session_choice();
     next.model = Some(driver.host.qualified_model());
     next.agent = Some(driver.host.agent_name().to_owned());
-    let rebuilt = async {
-        let plan = TurnPlan::resolve(&next, environment).await?;
-        TurnHost::open_with_runtime_and_mcp(
-            plan,
-            environment,
-            Arc::clone(&driver.approval),
-            Some(Arc::clone(&driver.question)),
-            SessionRunRegistry::new(),
-            Some(driver.mcp_catalog.clone()),
-        )
-    }
-    .await;
-    match rebuilt {
-        Ok(replacement) => {
-            driver.host = replacement;
-            Some(events.clone())
-        }
+    next.extension_composition = super::turn::ExtensionComposition::Active;
+    let plan = match TurnPlan::resolve(&next, environment).await {
+        Ok(plan) => plan,
         Err(message) => {
             driver.mcp_dirty.store(true, Ordering::Release);
             let _reported = events
@@ -1866,9 +2134,28 @@ async fn refresh_mcp_host(
                     },
                 })
                 .await;
-            None
+            return Ok(None);
         }
-    }
+    };
+    let approval = Arc::clone(&driver.approval);
+    let question = Arc::clone(&driver.question);
+    let mcp_catalog = driver.mcp_catalog.clone();
+    replace_host(&mut driver.host, || async move {
+        TurnHost::open_with_runtime_and_mcp(
+            plan,
+            environment,
+            approval,
+            Some(question),
+            SessionRunRegistry::new(),
+            Some(mcp_catalog),
+        )
+        .await
+    })
+    .await
+    .map(|()| Some(events.clone()))
+    .map_err(|error| {
+        format!("MCP host refresh could not establish a quiescent composition: {error}")
+    })
 }
 
 fn project_mcp_snapshots(snapshots: &[zuno_mcp::McpServerSnapshot]) -> Vec<McpServer> {
@@ -1892,18 +2179,31 @@ fn project_mcp_snapshots(snapshots: &[zuno_mcp::McpServerSnapshot]) -> Vec<McpSe
         .collect()
 }
 
-async fn drive_mcp_lifecycle(
+struct McpLifecycleWorker {
     controller: zuno_mcp::McpServerController,
-    mut requests: mpsc::Receiver<McpToggleRequest>,
+    requests: mpsc::Receiver<McpToggleRequest>,
     initial: Vec<McpToggleRequest>,
     concurrency: NonZeroUsize,
     projection: McpProjection,
     dirty: Arc<AtomicBool>,
     wake: mpsc::Sender<TerminalEvent>,
-) {
+    shutdown: watch::Receiver<bool>,
+}
+
+async fn drive_mcp_lifecycle(worker: McpLifecycleWorker) {
     type ToggleResult = Result<zuno_mcp::McpServerSnapshot, zuno_mcp::McpLifecycleError>;
     type ToggleFuture = BoxFuture<'static, (String, ToggleResult)>;
 
+    let McpLifecycleWorker {
+        controller,
+        mut requests,
+        initial,
+        concurrency,
+        projection,
+        dirty,
+        wake,
+        mut shutdown,
+    } = worker;
     let mut changes = controller.subscribe();
     let mut pending = VecDeque::from(initial);
     let mut active = FuturesUnordered::<ToggleFuture>::new();
@@ -1932,7 +2232,7 @@ async fn drive_mcp_lifecycle(
         }
 
         if !requests_open && pending.is_empty() && active.is_empty() {
-            return;
+            break;
         }
         tokio::select! {
             change = changes.recv() => match change {
@@ -1941,7 +2241,7 @@ async fn drive_mcp_lifecycle(
                     dirty.store(true, Ordering::Release);
                     let _nudged = wake.try_send(TerminalEvent::Wake);
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             result = active.next(), if !active.is_empty() => {
                 let (server, _completed) = result.expect("guarded active MCP operation");
@@ -1954,8 +2254,26 @@ async fn drive_mcp_lifecycle(
                 Some(request) => pending.push_back(request),
                 None => requests_open = false,
             },
+            changed = shutdown.changed() => {
+                let _changed = changed;
+                break;
+            },
         }
     }
+    let servers = controller
+        .snapshots()
+        .into_iter()
+        .map(|snapshot| snapshot.server)
+        .collect::<Vec<_>>();
+    futures::stream::iter(servers.into_iter().map(|server| {
+        let controller = controller.clone();
+        async move {
+            let _result = controller.set_enabled(&server, false).await;
+        }
+    }))
+    .buffered(concurrency.get())
+    .collect::<Vec<_>>()
+    .await;
 }
 
 async fn drive_one(
@@ -2178,6 +2496,32 @@ mod tests {
     use zuno_tui::keybind::{Chord, Resolution};
 
     use super::*;
+
+    #[tokio::test]
+    async fn prompt_history_shutdown_closes_the_live_sender_and_drains_queued_entries() {
+        let directory = tempfile::tempdir().expect("history fixture");
+        let path = directory.path().join("prompt-history.jsonl");
+        let (records, receiver) = mpsc::channel(4);
+        let (shutdown, shutdown_source) = watch::channel(false);
+        records
+            .send("persist before exit".to_owned())
+            .await
+            .expect("history worker is live");
+        let worker = tokio::spawn(record_prompt_history(
+            path.clone(),
+            receiver,
+            shutdown_source,
+        ));
+
+        shutdown.send(true).expect("history worker observes exit");
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("history worker must stop even while the sender remains live")
+            .expect("history worker must not panic");
+
+        let persisted = fs::read_to_string(path).expect("queued history is flushed");
+        assert!(persisted.contains("persist before exit"));
+    }
 
     struct BlockingMcpConnector {
         started: AtomicUsize,
@@ -3178,15 +3522,17 @@ mod tests {
         let observed_dirty = Arc::clone(&dirty);
         let (requests, request_source) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
         let (wake, mut wake_source) = zuno_tui::app::terminal_event_channel();
-        let worker = tokio::spawn(drive_mcp_lifecycle(
+        let (_shutdown, shutdown_source) = watch::channel(false);
+        let worker = tokio::spawn(drive_mcp_lifecycle(McpLifecycleWorker {
             controller,
-            request_source,
-            Vec::new(),
-            NonZeroUsize::MIN,
+            requests: request_source,
+            initial: Vec::new(),
+            concurrency: NonZeroUsize::MIN,
             projection,
             dirty,
             wake,
-        ));
+            shutdown: shutdown_source,
+        }));
 
         requests
             .send(McpToggleRequest {
@@ -3236,10 +3582,11 @@ mod tests {
         let (requests, request_source) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
         drop(requests);
         let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
-        let worker = tokio::spawn(drive_mcp_lifecycle(
+        let (_shutdown, shutdown_source) = watch::channel(false);
+        let worker = tokio::spawn(drive_mcp_lifecycle(McpLifecycleWorker {
             controller,
-            request_source,
-            vec![
+            requests: request_source,
+            initial: vec![
                 McpToggleRequest {
                     server: "alpha".to_owned(),
                     desired_enabled: true,
@@ -3249,11 +3596,12 @@ mod tests {
                     desired_enabled: true,
                 },
             ],
-            NonZeroUsize::new(2).expect("non-zero"),
+            concurrency: NonZeroUsize::new(2).expect("non-zero"),
             projection,
-            Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(false)),
             wake,
-        ));
+            shutdown: shutdown_source,
+        }));
 
         connector.wait_for_started(2).await;
         assert_eq!(
@@ -3279,10 +3627,11 @@ mod tests {
         let (requests, request_source) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
         drop(requests);
         let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
-        let worker = tokio::spawn(drive_mcp_lifecycle(
+        let (_shutdown, shutdown_source) = watch::channel(false);
+        let worker = tokio::spawn(drive_mcp_lifecycle(McpLifecycleWorker {
             controller,
-            request_source,
-            vec![
+            requests: request_source,
+            initial: vec![
                 McpToggleRequest {
                     server: "same".to_owned(),
                     desired_enabled: true,
@@ -3296,11 +3645,12 @@ mod tests {
                     desired_enabled: true,
                 },
             ],
-            NonZeroUsize::new(8).expect("non-zero"),
+            concurrency: NonZeroUsize::new(8).expect("non-zero"),
             projection,
-            Arc::new(AtomicBool::new(false)),
+            dirty: Arc::new(AtomicBool::new(false)),
             wake,
-        ));
+            shutdown: shutdown_source,
+        }));
 
         connector.wait_for_started(1).await;
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -3495,5 +3845,183 @@ mod tests {
             entry.id, "anyapi/openai/gpt",
             "the value the rebuild re-resolves must be the line verbatim"
         );
+    }
+
+    #[test]
+    fn runtime_inventory_projects_components_and_cleanup_failures() {
+        use zuno_runtime::{
+            ComponentSnapshot, LifecycleDiagnostic, LifecycleFailureKind, LifecyclePhase,
+            LifecycleState, RuntimeSnapshot,
+        };
+        use zuno_tui::views::ambient::Health;
+
+        let services = lifecycle_services(&[RuntimeSnapshot {
+            name: "profile".to_owned(),
+            state: LifecycleState::Uncertain,
+            profile_id: Some("default".to_owned()),
+            components: vec![ComponentSnapshot {
+                id: "zuno.tools".to_owned(),
+                state: LifecycleState::Active,
+                effects: vec!["watch".to_owned()],
+                provides: vec!["tools".to_owned()],
+                requires: Vec::new(),
+            }],
+            diagnostics: vec![LifecycleDiagnostic {
+                component_id: "zuno.mcp".to_owned(),
+                effect_id: "remote".to_owned(),
+                phase: LifecyclePhase::Stop,
+                kind: LifecycleFailureKind::TimedOut,
+                message: "close timed out".to_owned(),
+            }],
+        }]);
+
+        assert_eq!(services[0].health, Health::Faulted);
+        assert_eq!(services[1].name, "zuno.tools");
+        assert_eq!(services[1].health, Health::Ready);
+        assert!(services[1].detail.contains("effects 1"));
+        assert_eq!(services[2].health, Health::Faulted);
+        assert!(services[2].detail.contains("close timed out"));
+    }
+
+    struct FakeLifecycleHost {
+        name: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+        fail_shutdown: bool,
+    }
+
+    impl HostLifecycle for FakeLifecycleHost {
+        fn shutdown_host(&mut self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.log
+                    .lock()
+                    .expect("lifecycle log")
+                    .push(format!("stop:{}", self.name));
+                if self.fail_shutdown {
+                    Err(format!("{} uncertain", self.name))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn host_replacement_stops_the_old_host_before_installing_the_candidate() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut current = FakeLifecycleHost {
+            name: "old",
+            log: Arc::clone(&log),
+            fail_shutdown: false,
+        };
+        let candidate_log = Arc::clone(&log);
+        replace_host(&mut current, || async move {
+            candidate_log
+                .lock()
+                .expect("lifecycle log")
+                .push("start:new".to_owned());
+            Ok(FakeLifecycleHost {
+                name: "new",
+                log: candidate_log,
+                fail_shutdown: false,
+            })
+        })
+        .await
+        .expect("replacement succeeds");
+
+        assert_eq!(current.name, "new");
+        assert_eq!(
+            *log.lock().expect("lifecycle log"),
+            ["stop:old", "start:new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_old_host_shutdown_never_starts_the_candidate() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut current = FakeLifecycleHost {
+            name: "old",
+            log: Arc::clone(&log),
+            fail_shutdown: true,
+        };
+        let candidate_log = Arc::clone(&log);
+        let error = replace_host(&mut current, || async move {
+            candidate_log
+                .lock()
+                .expect("lifecycle log")
+                .push("start:new".to_owned());
+            Ok(FakeLifecycleHost {
+                name: "new",
+                log: candidate_log,
+                fail_shutdown: false,
+            })
+        })
+        .await
+        .expect_err("uncertain old host blocks replacement");
+
+        assert!(error.contains("old uncertain"));
+        assert_eq!(current.name, "old");
+        assert_eq!(*log.lock().expect("lifecycle log"), ["stop:old"]);
+    }
+
+    struct LeasedHost {
+        lease: Option<zuno_extension::CompositionLease>,
+    }
+
+    impl HostLifecycle for LeasedHost {
+        fn shutdown_host(&mut self) -> BoxFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.lease.take();
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_commit_happens_only_after_the_old_host_releases_its_lease() {
+        let registry = Arc::new(zuno_extension::ExtensionRegistry::new());
+        let scope = zuno_extension::Scope::new(std::path::Path::new("/workspace"));
+        let package = serde_json::from_value(serde_json::json!({
+            "apiVersion": zuno_extension::API_VERSION,
+            "id": "review",
+            "description": "review workflow",
+            "workflows": {
+                "review": {
+                    "description": "review",
+                    "prompt": "Review the change."
+                }
+            }
+        }))
+        .expect("valid extension package");
+        registry.define(&scope, package).expect("define");
+        let transaction = match registry.stage_run(&scope, "review", &[]).expect("stage") {
+            zuno_extension::StageOutcome::Pending(transaction) => transaction,
+            zuno_extension::StageOutcome::Unchanged { .. } => panic!("run must change"),
+        };
+        let mut current = LeasedHost {
+            lease: Some(
+                registry
+                    .acquire_active(&scope, registry.active_revision(&scope))
+                    .expect("old host lease"),
+            ),
+        };
+        let candidate_registry = Arc::clone(&registry);
+        let candidate_transaction = transaction.clone();
+
+        replace_host(&mut current, || async move {
+            let lease = candidate_registry
+                .begin_transition(&candidate_transaction)
+                .map_err(|error| error.to_string())?
+                .commit()
+                .map_err(|error| error.to_string())?;
+            Ok(LeasedHost { lease: Some(lease) })
+        })
+        .await
+        .expect("quiescent replacement");
+
+        assert_eq!(
+            registry.dynamic_statuses(&scope)[0].state,
+            zuno_extension::DynamicState::Running
+        );
+        assert_eq!(registry.active_revision(&scope), transaction.revision());
     }
 }

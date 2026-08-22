@@ -112,6 +112,15 @@ pub fn resolve_active(
     resolve_active_packages(static_packages, registry.running(scope))
 }
 
+/// Resolve the prepared composition without publishing it as active.
+pub fn resolve_desired(
+    scope: &Scope,
+    static_packages: &[StaticPackage],
+    registry: &ExtensionRegistry,
+) -> Result<ResolvedExtensions, ResolveError> {
+    resolve_active_packages(static_packages, registry.desired(scope))
+}
+
 pub(crate) fn resolve_active_packages(
     static_packages: &[StaticPackage],
     dynamic_packages: impl IntoIterator<Item = Package>,

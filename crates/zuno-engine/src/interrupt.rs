@@ -1,5 +1,5 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
@@ -21,23 +21,6 @@ pub enum SoftInterruptSource {
     User,
     System,
     BackgroundTask,
-}
-
-/// A soft-interrupt queue that synchronous callers can access without a Tokio runtime.
-pub type SoftInterruptQueue = Arc<Mutex<Vec<SoftInterruptMessage>>>;
-
-/// The graceful-shutdown role used by the turn loop.
-pub type GracefulShutdownSignal = InterruptSignal;
-
-/// The role that asks the active tool to detach into the background.
-pub type BackgroundToolSignal = InterruptSignal;
-
-/// Independent interruption channels owned by an engine instance.
-#[derive(Clone, Default)]
-pub struct EngineInterrupts {
-    pub graceful_shutdown: GracefulShutdownSignal,
-    pub background_tool: BackgroundToolSignal,
-    pub soft_interrupts: SoftInterruptQueue,
 }
 
 /// A reset-safe interruption signal readable by sync code and awaitable by async code.
@@ -261,19 +244,5 @@ mod tests {
 
         assert!(signal.same_instance(&cloned));
         assert!(!signal.same_instance(&independent));
-    }
-
-    #[test]
-    fn interrupt_roles_start_independent_and_empty() {
-        let signals = EngineInterrupts::default();
-
-        assert!(!signals.graceful_shutdown.is_set());
-        assert!(!signals.background_tool.is_set());
-        assert!(
-            !signals
-                .graceful_shutdown
-                .same_instance(&signals.background_tool)
-        );
-        assert!(signals.soft_interrupts.lock().unwrap().is_empty());
     }
 }

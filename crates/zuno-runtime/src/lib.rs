@@ -846,6 +846,9 @@ impl HarnessRuntime {
     }
 
     async fn transition_to(&self, candidate: CompositionDefinition) -> Result<(), RuntimeError> {
+        if let Some((scope, state)) = first_non_quiescent_descendant(&self.inner) {
+            return Err(RuntimeError::LiveChildScope { scope, state });
+        }
         let previous_definition = {
             let mut state = self.inner.state.lock().expect("runtime state poisoned");
             let previous = state.definition.clone();
@@ -1032,6 +1035,45 @@ impl HarnessRuntime {
     }
 }
 
+fn first_non_quiescent_descendant(
+    inner: &Arc<HarnessRuntimeInner>,
+) -> Option<(String, LifecycleState)> {
+    let children = inner
+        .state
+        .lock()
+        .expect("runtime state poisoned")
+        .children
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect::<Vec<_>>();
+    for child in children {
+        let (name, phase, has_active) = {
+            let state = child.state.lock().expect("runtime state poisoned");
+            (
+                child.scope.name().to_owned(),
+                state.phase,
+                !state.active.is_empty(),
+            )
+        };
+        if has_active
+            || matches!(
+                phase,
+                LifecycleState::Preparing
+                    | LifecycleState::Active
+                    | LifecycleState::Stopping
+                    | LifecycleState::Failed
+                    | LifecycleState::Uncertain
+            )
+        {
+            return Some((name, phase));
+        }
+        if let Some(descendant) = first_non_quiescent_descendant(&child) {
+            return Some(descendant);
+        }
+    }
+    None
+}
+
 async fn prepare_composition(
     scope: &Scope,
     previous: &CompositionDefinition,
@@ -1169,27 +1211,42 @@ async fn stop_components(
 
 fn shutdown_inner(inner: Arc<HarnessRuntimeInner>) -> BoxFuture<'static, Vec<LifecycleDiagnostic>> {
     Box::pin(async move {
-        let children = {
+        let (children, previous_phase, previous_diagnostics) = {
             let mut state = inner.state.lock().expect("runtime state poisoned");
             if state.phase == LifecycleState::Closed {
                 return Vec::new();
             }
-            state.phase = LifecycleState::Stopping;
-            state.components = state
-                .active
-                .iter()
-                .map(|component| component.snapshot(LifecycleState::Stopping))
-                .collect();
-            std::mem::take(&mut state.children)
+            let previous_phase = state.phase;
+            let previous_diagnostics = if matches!(
+                previous_phase,
+                LifecycleState::Failed | LifecycleState::Uncertain
+            ) {
+                state.diagnostics.clone()
+            } else {
+                Vec::new()
+            };
+            if previous_diagnostics.is_empty() {
+                state.phase = LifecycleState::Stopping;
+                state.components = state
+                    .active
+                    .iter()
+                    .map(|component| component.snapshot(LifecycleState::Stopping))
+                    .collect();
+            }
+            (
+                std::mem::take(&mut state.children),
+                previous_phase,
+                previous_diagnostics,
+            )
         };
 
-        let mut diagnostics = Vec::new();
+        let mut new_diagnostics = Vec::new();
         for child in children
             .into_iter()
             .rev()
             .filter_map(|child| child.upgrade())
         {
-            diagnostics.extend(shutdown_inner(child).await);
+            new_diagnostics.extend(shutdown_inner(child).await);
         }
 
         inner.scope.clear();
@@ -1198,20 +1255,31 @@ fn shutdown_inner(inner: Arc<HarnessRuntimeInner>) -> BoxFuture<'static, Vec<Lif
             std::mem::take(&mut state.active)
         };
         let local_failures = stop_components(active, inner.options.stop_timeout).await;
-        diagnostics.extend(local_failures.iter().cloned());
+        new_diagnostics.extend(local_failures.iter().cloned());
 
         let mut state = inner.state.lock().expect("runtime state poisoned");
         state.definition = CompositionDefinition::default();
-        if local_failures.is_empty() {
+        if matches!(
+            previous_phase,
+            LifecycleState::Failed | LifecycleState::Uncertain
+        ) {
+            state.phase = previous_phase;
+        } else if new_diagnostics.is_empty() {
             state.phase = LifecycleState::Closed;
             state.components.clear();
         } else {
             state.phase = LifecycleState::Uncertain;
-            for component in &mut state.components {
-                component.state = LifecycleState::Uncertain;
+            if local_failures.is_empty() {
+                state.components.clear();
+            } else {
+                for component in &mut state.components {
+                    component.state = LifecycleState::Uncertain;
+                }
             }
         }
-        state.diagnostics.extend(local_failures);
+        state.diagnostics.extend(new_diagnostics.iter().cloned());
+        let mut diagnostics = previous_diagnostics;
+        diagnostics.extend(new_diagnostics);
         diagnostics
     })
 }
@@ -1353,6 +1421,12 @@ pub enum RuntimeError {
     /// Failed and uncertain runtimes reject further mutations.
     #[error("runtime scope is {0} and cannot accept composition changes")]
     NotOperational(LifecycleState),
+    /// Parent recomposition cannot leave a child component bound to stale services.
+    #[error("live child scope `{scope}` is {state}; stop it before recomposing its parent")]
+    LiveChildScope {
+        scope: String,
+        state: LifecycleState,
+    },
     /// A closed runtime cannot accept more components.
     #[error("runtime scope is closed")]
     Closed,

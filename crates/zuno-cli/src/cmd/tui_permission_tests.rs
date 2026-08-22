@@ -316,7 +316,6 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
         vec![Arc::new(DispatchBash)],
         Vec::new(),
         Arc::clone(&broker) as Arc<dyn PermissionAsker>,
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     ));
     let available_tools = dispatcher.available_tools().definitions.into();
@@ -389,7 +388,6 @@ async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscr
         vec![Arc::new(DispatchEdit)],
         Vec::new(),
         Arc::clone(&broker) as Arc<dyn PermissionAsker>,
-        InterruptSignal::new(),
         McpToolStatus::Ready,
     ));
     let available_tools = dispatcher.available_tools().definitions.into();

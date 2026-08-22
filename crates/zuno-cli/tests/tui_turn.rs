@@ -27,9 +27,13 @@ use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use wiremock::matchers::{body_partial_json, header, method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use zuno_testkit::{DbChoice, MockProvider, Scenario, ScriptedEnv};
 
 /// The recorded conversation, chosen because todo 88's harness replays the same one.
@@ -84,6 +88,19 @@ const PICKER_SECOND_TITLE: &str = "PickerSecondMarker";
 const PICKER_THIRD_TITLE: &str = "PickerThirdMarker";
 const PICKER_RENAMED_TITLE: &str = "PickerRenamedMarker";
 
+#[derive(Clone)]
+struct FlagResponder {
+    seen: Arc<AtomicBool>,
+    response: ResponseTemplate,
+}
+
+impl Respond for FlagResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.seen.store(true, Ordering::Release);
+        self.response.clone()
+    }
+}
+
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_zuno"))
 }
@@ -99,7 +116,11 @@ fn binary() -> PathBuf {
 /// key that used to be here was the same URL by another name, and it is what hid todo
 /// 109 — the binary could not dial a provider configured the documented way.
 fn provider_config(base_url: &str) -> String {
-    serde_json::json!({
+    provider_config_with_mcp(base_url, None)
+}
+
+fn provider_config_with_mcp(base_url: &str, mcp_url: Option<&str>) -> String {
+    let mut config = serde_json::json!({
         "formatter": false,
         "lsp": false,
         "provider": {
@@ -128,8 +149,17 @@ fn provider_config(base_url: &str) -> String {
                 }
             }
         }
-    })
-    .to_string()
+    });
+    if let Some(mcp_url) = mcp_url {
+        config["mcp"] = serde_json::json!({
+            "lifecycle-fixture": {
+                "type": "remote",
+                "url": mcp_url,
+                "oauth": false
+            }
+        });
+    }
+    config.to_string()
 }
 
 fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
@@ -318,6 +348,14 @@ fn run_under_pty(
 /// graceful Ctrl+C exit: none of those read-only startup effects may materialize the
 /// prepared session identity.
 fn run_empty_welcome_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::Error> {
+    run_empty_welcome_under_pty_with_mcp(env, None, None)
+}
+
+fn run_empty_welcome_under_pty_with_mcp(
+    env: &ScriptedEnv,
+    mcp_url: Option<&str>,
+    exit_ready: Option<&AtomicBool>,
+) -> Result<Transcript, std::io::Error> {
     let script = which::which("script").map_err(|_| {
         std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
     })?;
@@ -325,11 +363,16 @@ fn run_empty_welcome_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io:
         "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto",
         shell_quote(&binary().to_string_lossy())
     );
+    let mut process_environment = variables(env, "http://127.0.0.1:9");
+    process_environment.insert(
+        "ZUNO_CONFIG_CONTENT".to_owned(),
+        provider_config_with_mcp("http://127.0.0.1:9", mcp_url),
+    );
     let mut child = Command::new(&script)
         .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
         .current_dir(env.working_dir())
         .env_clear()
-        .envs(variables(env, "http://127.0.0.1:9"))
+        .envs(process_environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -367,7 +410,10 @@ fn run_empty_welcome_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io:
                 break;
             }
         }
-        if !exit_sent && text.contains("ask anything, or / for commands") {
+        if !exit_sent
+            && text.contains("ask anything, or / for commands")
+            && exit_ready.is_none_or(|ready| ready.load(Ordering::Acquire))
+        {
             first_frame = true;
             let stdin = child
                 .stdin
@@ -1011,6 +1057,96 @@ fn opening_and_leaving_the_welcome_screen_creates_no_session() {
         transcript.saw_wanted,
         "opening and leaving the welcome screen either created a durable session, printed an \
          unusable resume hint, or failed to exit cleanly\ntranscript:\n{}",
+        transcript.text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leaving_the_tui_closes_an_initialized_remote_mcp_session() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            serde_json::json!({"method": "initialize"}),
+        ))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("initialize body");
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .insert_header("mcp-session-id", "tui-lifecycle-session")
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "lifecycle-fixture", "version": "1.0.0"}
+                    }
+                }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            serde_json::json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tools_seen = Arc::new(AtomicBool::new(false));
+    let tools_response_seen = Arc::clone(&tools_seen);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            serde_json::json!({"method": "tools/list"}),
+        ))
+        .respond_with(move |request: &Request| {
+            tools_response_seen.store(true, Ordering::Release);
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("tools/list body");
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"tools": []}
+                }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let delete_seen = Arc::new(AtomicBool::new(false));
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .and(header("mcp-session-id", "tui-lifecycle-session"))
+        .respond_with(FlagResponder {
+            seen: Arc::clone(&delete_seen),
+            response: ResponseTemplate::new(200),
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let mcp_url = format!("{}/mcp", server.uri());
+    let ready = Arc::clone(&tools_seen);
+    let transcript = tokio::task::spawn_blocking(move || {
+        run_empty_welcome_under_pty_with_mcp(&env, Some(&mcp_url), Some(&ready))
+    })
+    .await
+    .expect("PTY task")
+    .expect("TUI exits");
+
+    server.verify().await;
+    assert!(
+        transcript.saw_wanted && delete_seen.load(Ordering::Acquire),
+        "TUI exit did not complete the remote MCP DELETE shutdown contract\ntranscript:\n{}",
         transcript.text
     );
 }

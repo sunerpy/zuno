@@ -184,7 +184,14 @@ async fn tui_lsp_check_edits_drains_its_inlet_when_there_is_no_probe() {
     let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
     let reader = pending.reader();
     let (reports, mut report_receiver) = mpsc::channel(4);
-    let task = tokio::spawn(check_edits(None, reader, edit_receiver, reports));
+    let (_shutdown, shutdown_source) = watch::channel(false);
+    let task = tokio::spawn(check_edits(
+        None,
+        reader,
+        edit_receiver,
+        reports,
+        shutdown_source,
+    ));
     for _ in 0..4 {
         pending.merge([String::from("src/lib.rs")]);
     }
@@ -235,7 +242,14 @@ async fn tui_lsp_no_report_is_lost_when_a_turn_writes_more_files_than_the_channe
     let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
     let reader = pending.reader();
     let (reports, mut report_receiver) = mpsc::channel(REPORT_CHANNEL_CAPACITY);
-    let _task = tokio::spawn(check_edits(Some(probe), reader, edit_receiver, reports));
+    let (_shutdown, shutdown_source) = watch::channel(false);
+    let _task = tokio::spawn(check_edits(
+        Some(probe),
+        reader,
+        edit_receiver,
+        reports,
+        shutdown_source,
+    ));
     pending.merge(names.clone());
     // Closes the signal channel, so the task ends after this batch and the drain below
     // terminates on its own rather than on a timeout.
@@ -300,7 +314,14 @@ async fn tui_lsp_a_truncated_check_says_so_on_screen_and_not_only_in_the_log() {
     let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
     let reader = pending.reader();
     let (reports, mut report_receiver) = mpsc::channel(REPORT_CHANNEL_CAPACITY);
-    let _task = tokio::spawn(check_edits(Some(probe), reader, edit_receiver, reports));
+    let (_shutdown, shutdown_source) = watch::channel(false);
+    let _task = tokio::spawn(check_edits(
+        Some(probe),
+        reader,
+        edit_receiver,
+        reports,
+        shutdown_source,
+    ));
 
     pending.merge(std::iter::once(String::from("real.txt")).chain(
         // Names, not files: these are refused before anything looks at the disk.
@@ -463,7 +484,14 @@ async fn tui_lsp_check_edits_skips_a_path_that_is_not_a_file() {
     let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
     let reader = pending.reader();
     let (reports, mut report_receiver) = mpsc::channel(4);
-    let task = tokio::spawn(check_edits(Some(probe), reader, edit_receiver, reports));
+    let (_shutdown, shutdown_source) = watch::channel(false);
+    let task = tokio::spawn(check_edits(
+        Some(probe),
+        reader,
+        edit_receiver,
+        reports,
+        shutdown_source,
+    ));
     pending.merge([String::from("does/not/exist.rs")]);
     drop(pending);
     tokio::time::timeout(std::time::Duration::from_secs(20), task)
@@ -516,7 +544,14 @@ async fn tui_lsp_reports_a_real_diagnostic_from_a_real_language_server() {
     let pending = zuno_tui::views::lsp::PendingEdits::new(wake_sender);
     let reader = pending.reader();
     let (reports, mut report_receiver) = mpsc::channel(4);
-    let task = tokio::spawn(check_edits(Some(probe), reader, edit_receiver, reports));
+    let (_shutdown, shutdown_source) = watch::channel(false);
+    let task = tokio::spawn(check_edits(
+        Some(probe),
+        reader,
+        edit_receiver,
+        reports,
+        shutdown_source,
+    ));
     pending.merge([String::from("src/lib.rs")]);
     drop(pending);
 
