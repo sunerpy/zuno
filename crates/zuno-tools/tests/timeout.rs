@@ -1,12 +1,10 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zuno_pty::{BackgroundExecutionId, BackgroundExecutionService, BackgroundExecutionStatus};
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
 use zuno_tools::shell::{ShellParams, ShellTool};
-use zuno_tools::timeout::{
-    BackgroundManager, BackgroundTaskStatus, LocalBackgroundManager, MAX_FOREGROUND_TIMEOUT_MS,
-    normalize_foreground_timeout,
-};
+use zuno_tools::timeout::{MAX_FOREGROUND_TIMEOUT_MS, normalize_foreground_timeout};
 
 fn context() -> ToolContext {
     ToolContext::new(
@@ -44,7 +42,9 @@ fn timeout_policy_defaults_to_120_seconds_and_caps_requests_at_600_seconds() {
 async fn timeout_policy_promotes_a_live_process_to_a_reachable_background_task() {
     let workspace = tempfile::tempdir().expect("workspace");
     let background_dir = tempfile::tempdir().expect("background dir");
-    let manager = Arc::new(LocalBackgroundManager::new(background_dir.path()));
+    let service = Arc::new(
+        BackgroundExecutionService::open(background_dir.path()).expect("background service"),
+    );
     let pid_file = workspace.path().join("promoted.pid");
     let marker = workspace.path().join("promoted.done");
     let command = format!(
@@ -54,7 +54,7 @@ async fn timeout_policy_promotes_a_live_process_to_a_reachable_background_task()
     );
     let tool = ShellTool::new(workspace.path())
         .expect("shell tool")
-        .with_background_manager(manager.clone());
+        .with_background_executions(service.clone());
 
     let output = tool
         .run(params(command, Some(40)), context())
@@ -72,19 +72,21 @@ async fn timeout_policy_promotes_a_live_process_to_a_reachable_background_task()
     let task_id = output.metadata["task_id"]
         .as_str()
         .expect("task id metadata");
-    let initial = manager.task(task_id).expect("reachable promoted task");
-    assert_eq!(initial.handle.task_id, task_id);
-    assert!(initial.handle.output_file.exists());
-    assert!(initial.handle.status_file.exists());
+    let task_id = BackgroundExecutionId::parse(task_id).expect("valid task id");
+    let initial = service.get(&task_id).expect("reachable promoted task");
+    assert_eq!(initial.id, task_id);
+    assert!(initial.output_file.exists());
+    assert!(initial.status_file.exists());
 
-    let completed = wait_for_task(&manager, task_id).await;
-    assert_eq!(completed.status, BackgroundTaskStatus::Completed);
+    let completed = wait_for_task(&service, &task_id).await;
+    assert_eq!(completed.status, BackgroundExecutionStatus::Completed);
     assert_eq!(
-        completed.result.expect("completed output").output,
-        "finished"
+        String::from_utf8(service.complete_output(&task_id).expect("completed output"))
+            .expect("UTF-8 output"),
+        "finished",
     );
     assert_eq!(
-        std::fs::read_to_string(completed.handle.output_file).expect("background output file"),
+        std::fs::read_to_string(completed.output_file).expect("background output file"),
         "finished"
     );
     assert!(marker.exists());
@@ -96,12 +98,14 @@ async fn timeout_policy_promotes_a_live_process_to_a_reachable_background_task()
 async fn timeout_policy_hard_ceiling_still_terminates_the_process_group() {
     let workspace = tempfile::tempdir().expect("workspace");
     let background_dir = tempfile::tempdir().expect("background dir");
-    let manager = Arc::new(LocalBackgroundManager::new(background_dir.path()));
+    let service = Arc::new(
+        BackgroundExecutionService::open(background_dir.path()).expect("background service"),
+    );
     let pid_file = workspace.path().join("ceiling.pid");
     let command = format!("printf '%s' \"$$\" > '{}'; sleep 30", pid_file.display());
     let tool = ShellTool::new(workspace.path())
         .expect("shell tool")
-        .with_background_manager(manager.clone())
+        .with_background_executions(service.clone())
         .with_hard_ceiling(Duration::from_millis(120));
     let started = Instant::now();
 
@@ -113,14 +117,16 @@ async fn timeout_policy_hard_ceiling_still_terminates_the_process_group() {
     let task_id = error.metadata["task_id"]
         .as_str()
         .expect("promoted task id");
+    let task_id = BackgroundExecutionId::parse(task_id).expect("valid task id");
     let pid = wait_for_pid(&pid_file).await;
-    let failed = wait_for_task(&manager, task_id).await;
-    assert_eq!(failed.status, BackgroundTaskStatus::Failed);
+    let failed = wait_for_task(&service, &task_id).await;
+    assert_eq!(failed.status, BackgroundExecutionStatus::Failed);
+    assert!(failed.timed_out);
     assert!(
         failed
             .error
             .as_deref()
-            .is_some_and(|message| message.contains("timed out")),
+            .is_some_and(|message| message.contains("hard ceiling")),
         "{:?}",
         failed.error
     );
@@ -130,20 +136,14 @@ async fn timeout_policy_hard_ceiling_still_terminates_the_process_group() {
 
 #[cfg(unix)]
 async fn wait_for_task(
-    manager: &LocalBackgroundManager,
-    task_id: &str,
-) -> zuno_tools::timeout::BackgroundTaskSnapshot {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let snapshot = manager.task(task_id).expect("registered task");
-            if snapshot.status != BackgroundTaskStatus::Running {
-                return snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("background task must settle")
+    service: &BackgroundExecutionService,
+    task_id: &BackgroundExecutionId,
+) -> zuno_pty::BackgroundExecutionInfo {
+    tokio::time::timeout(Duration::from_secs(2), service.wait(task_id, None))
+        .await
+        .expect("background task must settle")
+        .expect("registered task")
+        .info
 }
 
 /// The child creates the pid file and writes to it as two separate steps, so waiting only for

@@ -458,9 +458,9 @@ mod production_round_trip {
     use zuno_db::{Connection, migration, open};
     use zuno_engine::interrupt::InterruptSignal;
     use zuno_engine::r#loop::{
-        AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
-        RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnEvent, event_channel,
-        project_history_owned, run_turn,
+        AgentModelResolver, AvailableTools, DispatchRequest, PreparedToolDispatch, ResolvedAgent,
+        ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnEvent,
+        event_channel, project_history_owned, run_turn,
     };
     use zuno_error::ProviderError;
     use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -524,8 +524,10 @@ mod production_round_trip {
             AvailableTools::new(Vec::new(), McpToolStatus::Ready)
         }
 
-        async fn dispatch(&self, _request: DispatchRequest) -> ToolDispatchResult {
-            ToolDispatchResult::error(zuno_tool::ToolOutput::text("none", "no tools"))
+        async fn prepare(&self, _request: DispatchRequest) -> PreparedToolDispatch {
+            PreparedToolDispatch::ready(ToolDispatchResult::error(zuno_tool::ToolOutput::text(
+                "none", "no tools",
+            )))
         }
     }
 

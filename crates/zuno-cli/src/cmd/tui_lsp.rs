@@ -28,6 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::stream::{self, StreamExt as _};
 use tokio::sync::mpsc;
 use zuno_lsp::manager::Manager;
 use zuno_tui::views::lsp::{Diagnostic, PendingEditReader, Report, Severity};
@@ -62,44 +63,45 @@ async fn report(
     reports: &mpsc::Sender<Report>,
     wake: &mpsc::Sender<zuno_tui::app::TerminalEvent>,
 ) -> bool {
-    for path in paths {
-        let display = path
-            .strip_prefix(workspace)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
-        let report = if manager.has_server(&path) {
-            // `touch_file` before `diagnostics`: a server that has never seen the file has
-            // nothing to say about it, and the empty answer would be indistinguishable from
-            // a clean one.
-            if let Err(error) = manager.touch_file(&path).await {
-                tracing::debug!(%error, path = %path.display(), "lsp could not open the file");
-                Report::unchecked(display)
-            } else {
-                let server = manager
-                    .status()
-                    .await
-                    .into_iter()
-                    .find(|status| path.starts_with(&status.root))
-                    .map_or_else(|| String::from("lsp"), |status| status.id);
-                match manager.diagnostics(&path).await {
-                    Ok(diagnostics) => {
-                        Report::checked(display, server, diagnostics.iter().map(convert).collect())
-                    }
-                    Err(error) => {
-                        tracing::debug!(%error, path = %path.display(), "lsp diagnostics failed");
-                        Report::unchecked(display)
-                    }
-                }
-            }
-        } else {
-            Report::unchecked(display)
-        };
+    let checks = stream::iter(paths.into_iter().map(|path| {
+        let manager = Arc::clone(manager);
+        let workspace = workspace.to_path_buf();
+        async move { check_path(&manager, &workspace, path).await }
+    }))
+    .buffered(manager.request_concurrency().get());
+    tokio::pin!(checks);
+    while let Some(report) = checks.next().await {
         if !deliver(report, reports, wake).await {
             return false;
         }
     }
     true
+}
+
+async fn check_path(manager: &Manager, workspace: &Path, path: PathBuf) -> Report {
+    let display = path
+        .strip_prefix(workspace)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .into_owned();
+    if !manager.has_server(&path) {
+        return Report::unchecked(display);
+    }
+    match manager.diagnostics(&path).await {
+        Ok(diagnostics) => {
+            let server = manager
+                .status()
+                .await
+                .into_iter()
+                .find(|status| path.starts_with(&status.root))
+                .map_or_else(|| String::from("lsp"), |status| status.id);
+            Report::checked(display, server, diagnostics.iter().map(convert).collect())
+        }
+        Err(error) => {
+            tracing::debug!(%error, path = %path.display(), "lsp diagnostics failed");
+            Report::unchecked(display)
+        }
+    }
 }
 
 /// Hand one report over, waiting for room, and nudge the loop to read it.
@@ -206,6 +208,10 @@ impl Probe {
                 workspace,
                 Arc::new(registry),
                 zuno_lsp::manager::RestartPolicy::default(),
+                std::num::NonZeroUsize::new(usize::from(
+                    config.resolved_concurrency().lsp_requests,
+                ))
+                .expect("configuration validates LSP concurrency"),
             )),
             workspace: workspace.to_path_buf(),
             wake,

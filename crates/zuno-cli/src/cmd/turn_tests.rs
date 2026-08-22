@@ -4,6 +4,7 @@ use super::*;
 use zuno_engine::r#loop::run_turn;
 
 use crate::cmd::tool_runtime;
+use std::path::Path;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use zuno_catalog::agent::{Agent, AgentMode, AgentSource};
 use zuno_llm::sse::StreamIdleTimeout;
@@ -60,6 +61,13 @@ fn test_delegation() -> tool_runtime::Delegation {
         limits: zuno_tools::task::DelegationLimits::default(),
         vision_available: false,
     }
+}
+
+fn test_background_executions(directory: &Path) -> Arc<zuno_pty::BackgroundExecutionService> {
+    Arc::new(
+        zuno_pty::BackgroundExecutionService::open(directory.join(".background"))
+            .expect("test background execution service"),
+    )
 }
 
 #[derive(Debug, Default)]
@@ -2602,6 +2610,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             manifest: Arc::new(zuno_harness::ToolManifest::all()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
+            background_executions: test_background_executions(directory.path()),
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
@@ -3409,6 +3418,7 @@ mod production_registry {
                 manifest: Arc::new(zuno_harness::ToolManifest::all()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
+                background_executions: test_background_executions(directory.path()),
                 todo_store: Arc::new(
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),
@@ -3616,6 +3626,7 @@ mod production_registry {
                 manifest: Arc::new(zuno_harness::ToolManifest::all()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
+                background_executions: test_background_executions(directory.path()),
                 todo_store: Arc::new(
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),

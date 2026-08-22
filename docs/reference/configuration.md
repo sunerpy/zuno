@@ -77,6 +77,30 @@ Instances inherit the Zuno process environment, working directory, and the produ
 
 Dangerous modes `dangerouslyBypassApprovals` and `bypassPermissions` are accepted only when written explicitly. Tool names must be unique and cannot collide with native tools. See [Codex and Claude Code product agents](../design/product-agents.md) for protocol, job, cancellation, and TUI behavior.
 
+## Concurrency
+
+Independent runtime work has three bounded controls:
+
+```json
+{
+  "concurrency": {
+    "tool_calls": 8,
+    "mcp_connections": 8,
+    "lsp_requests": 4
+  }
+}
+```
+
+- `tool_calls` limits model-issued calls that explicitly declare themselves safe
+  to overlap. Permission prompts and argument preparation remain ordered.
+- `mcp_connections` limits simultaneous lifecycle operations across different
+  MCP servers. One server's operations remain serialized.
+- `lsp_requests` is the shared cap for language-server startup and request fan-out
+  across servers.
+
+Each field accepts `1..=64`; omission uses the values above. Set a field to `1`
+to restore serial behavior for that layer.
+
 ## Inspecting the result
 
 Use `zuno debug paths` to inspect resolved roots and `zuno debug config` to inspect the merged configuration. A validation error names every rejected top-level key; for example, putting `theme` in `zuno.json` is rejected because it belongs in `tui.json`.

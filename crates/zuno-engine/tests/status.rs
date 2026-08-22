@@ -8,8 +8,8 @@ use zuno_db::message::{MessageRecord, MessageStore, PartRecord};
 use zuno_db::{Connection, migration, open};
 use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::{
-    AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
-    RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnEvent, TurnOutcome,
+    AgentModelResolver, AvailableTools, DispatchRequest, PreparedToolDispatch, ResolvedAgent,
+    ResolvedModel, RunTurnRequest, ToolDispatcher, TurnContext, TurnEvent, TurnOutcome,
     event_channel, run_turn,
 };
 use zuno_engine::status::{SessionRunRegistry, SessionStatus, SoftInterruptAction};
@@ -337,7 +337,7 @@ impl ToolDispatcher for NoopDispatcher {
         AvailableTools::new(Vec::new(), McpToolStatus::Ready)
     }
 
-    async fn dispatch(&self, _request: DispatchRequest) -> ToolDispatchResult {
+    async fn prepare(&self, _request: DispatchRequest) -> PreparedToolDispatch {
         panic!("the hanging provider never dispatches a tool")
     }
 }

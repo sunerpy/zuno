@@ -134,6 +134,53 @@ Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherite
 
 The loop never mechanically replays a call. It persists the failed tool result and gives it to the model in the next step, including timeouts that might have completed an external side effect before their response was lost. A later recovery turn receives a hidden, SQL-derived notice naming the retry attempt. A `Safe` failure may be attempted again after backoff; a `Never` failure requires authoritative inspection of the worktree or external state before the model decides whether another mutation is appropriate.
 
+Tool overlap is a separate declaration from replay safety.
+`ToolConcurrencyPolicy::Exclusive` is the default; only implementations that
+declare `ParallelSafe` or `IsolatedBackground` may overlap. The dispatcher still
+resolves tools, validates arguments, runs hooks, and asks permissions in model
+order. It then executes consecutive non-exclusive calls under the configured
+bound and persists results in original call order, regardless of physical
+completion order. Shell, writes, unknown extension tools, and MCP tools without an
+explicit safety declaration remain exclusive.
+
+MCP lifecycle operations use the same bounded pattern across different servers,
+while operations for one server remain generation-serialized. LSP startup and
+requests may overlap across servers under one global semaphore; protocol ordering
+inside one client remains unchanged. Setting any bound to `1` restores serial
+behavior.
+
+```json
+{
+  "concurrency": {
+    "tool_calls": 8,
+    "mcp_connections": 8,
+    "lsp_requests": 4
+  }
+}
+```
+
+Every value is validated in `1..=64`.
+
+## Background command execution
+
+`bash` registers a command with the process-owned
+`BackgroundExecutionService` before spawning it. Explicit background mode and a
+foreground attention timeout therefore retain one execution identity and one
+process tree; neither path adopts a detached task or starts a second command.
+The service keeps a bounded 2 MiB live tail, persists complete output separately,
+and records status under `.zuno/background`.
+
+The `bg` tool supports `list`, `output`, `wait`, and `cancel` for executions owned
+by the current session. The complete tool has `ToolReplayPolicy::Never` because
+one action cancels a process tree. Cancellation reaches descendants through the
+shared process containment layer. A hard process ceiling records failure; a
+process restart converts a previously running row to `uncertain` and never
+replays it.
+
+`StartupEnvironment` shares one service per workspace across parent sessions,
+child turns, and in-process session switches. Client projections and `/ps` use
+that same service rather than maintaining a second process list.
+
 ## Background subagents and product agents
 
 `task` creates a distinct `job_*` identifier for each background run while retaining a separate child session identifier for conversational continuation.

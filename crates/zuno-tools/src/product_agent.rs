@@ -13,7 +13,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zuno_error::ToolError;
 use zuno_tool::{
-    PermissionAsk, ToolContext, ToolOutput, ToolReplayPolicy, ToolUiIntent, TypedTool,
+    PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, ToolUiIntent,
+    TypedTool,
 };
 
 use crate::task::ReportDelivery;
@@ -132,6 +133,10 @@ impl TypedTool for ProductAgentTool {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Never
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::IsolatedBackground
     }
 
     fn ui_intent(&self) -> ToolUiIntent {

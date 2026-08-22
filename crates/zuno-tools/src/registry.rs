@@ -71,6 +71,7 @@ pub enum BuiltinSlot {
     Invalid,
     Question,
     Shell,
+    Background,
     Read,
     Glob,
     Grep,
@@ -96,6 +97,7 @@ impl BuiltinSlot {
             Self::Invalid => "invalid",
             Self::Question => "question",
             Self::Shell => "bash",
+            Self::Background => "bg",
             Self::Read => "read",
             Self::Glob => "glob",
             Self::Grep => "grep",
@@ -130,10 +132,11 @@ impl BuiltinSlot {
 }
 
 /// The exact built-in order used before custom and MCP tools are appended.
-pub const BUILTIN_ORDER: [BuiltinSlot; 18] = [
+pub const BUILTIN_ORDER: [BuiltinSlot; 19] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
     BuiltinSlot::Shell,
+    BuiltinSlot::Background,
     BuiltinSlot::Read,
     BuiltinSlot::Glob,
     BuiltinSlot::Grep,

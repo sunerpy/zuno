@@ -18,7 +18,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use zuno_error::{BoxSource, ToolError};
 use zuno_tool::{
-    InterruptHandle, PermissionAsk, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool,
+    InterruptHandle, PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput,
+    ToolReplayPolicy, TypedTool,
 };
 
 pub use provider::{
@@ -270,6 +271,10 @@ impl TypedTool for WebSearchTool {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Safe
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::ParallelSafe
     }
 
     async fn run(

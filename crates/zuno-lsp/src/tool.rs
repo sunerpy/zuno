@@ -8,7 +8,10 @@ use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zuno_error::ToolError;
-use zuno_tool::{PermissionAsk, Tool, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool, erase};
+use zuno_tool::{
+    PermissionAsk, Tool, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy,
+    TypedTool, erase,
+};
 
 const DESCRIPTION: &str = "Interact with language servers for definitions, references, hover information, symbols, implementations, and call hierarchies.";
 
@@ -125,6 +128,10 @@ impl TypedTool for LspTool {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Safe
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::ParallelSafe
     }
 
     async fn run(&self, params: LspParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -291,6 +298,7 @@ mod tests {
             "/tmp",
             registry,
             crate::RestartPolicy::default(),
+            std::num::NonZeroUsize::new(4).expect("non-zero"),
         ));
         let tool = LspTool::new(manager, "/tmp", "/tmp").erased();
         let definition = tool.definition();

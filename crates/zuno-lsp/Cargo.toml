@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
 zuno-catalog = { workspace = true }
 zuno-error = { workspace = true }
 zuno-process = { workspace = true }

@@ -45,8 +45,8 @@ use zuno_engine::driver::AgentDriver;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest,
-    ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender, TurnOutcome,
-    TurnRecovery,
+    ToolConcurrencyLimit, ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender,
+    TurnOutcome, TurnRecovery,
 };
 use zuno_engine::prelude::{
     CompactionSkipped, InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome,
@@ -169,7 +169,7 @@ impl Eq for PreparedSessionIdentity {}
 #[derive(Debug)]
 enum SessionMaterializer {
     Existing,
-    Pending(zuno_db::session::SessionCreate),
+    Pending(Box<zuno_db::session::SessionCreate>),
 }
 
 /// Session facts resolved before a [`TurnHost`] is assembled.
@@ -831,6 +831,7 @@ pub(crate) struct TurnHost {
     credential: Option<String>,
     resolver: Resolver,
     dispatcher: ToolRegistryDispatcher,
+    tool_concurrency: ToolConcurrencyLimit,
     session_id: String,
     session_identity: PreparedSessionIdentity,
     session_directory: String,
@@ -1148,6 +1149,9 @@ impl TurnHost {
             child_host.wake_handle(),
             background_jobs.clone(),
         )?;
+        let background_executions = environment
+            .background_executions(&plan.directory)
+            .map_err(to_string)?;
 
         let runtime_tools = super::tool_runtime::assemble(
             &plan.directory,
@@ -1161,6 +1165,7 @@ impl TurnHost {
                 manifest: tool_manifest,
                 contributions: tool_contributions,
                 question,
+                background_executions: Arc::clone(&background_executions),
                 todo_store,
                 goal_store: Arc::clone(&goal_store),
                 mcp_loader: mcp.map(|catalog| {
@@ -1203,6 +1208,9 @@ impl TurnHost {
             InterruptSignal::new(),
             McpToolStatus::Ready,
         );
+        let tool_concurrency =
+            ToolConcurrencyLimit::new(plan.config.resolved_concurrency().tool_calls)
+                .expect("configuration validates tool concurrency");
         Ok(Self {
             profile_runtime,
             runtime,
@@ -1215,6 +1223,7 @@ impl TurnHost {
             credential: presented,
             resolver: plan.resolver,
             dispatcher,
+            tool_concurrency,
             session_id: prepared.identity.id().to_owned(),
             session_identity: prepared.identity,
             session_directory: prepared.directory,
@@ -1819,7 +1828,8 @@ impl TurnHost {
             &self.dispatcher,
             guard.interrupt_signal(),
         )
-        .with_live_inputs(guard, &self.inbox);
+        .with_live_inputs(guard, &self.inbox)
+        .with_tool_concurrency(self.tool_concurrency);
         let outcome = self
             .driver
             .drive(
@@ -3375,7 +3385,7 @@ fn prepare_turn_host(
         title,
         directory: plan.directory.to_string_lossy().into_owned(),
         usage: zuno_db::session::SessionUsage::default(),
-        materializer: SessionMaterializer::Pending(input),
+        materializer: SessionMaterializer::Pending(Box::new(input)),
     })
 }
 

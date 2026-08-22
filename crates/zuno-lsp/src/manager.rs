@@ -2,16 +2,19 @@
 
 use crate::client::{Client, ClientError, Diagnostic, Position};
 use crate::registry::{RegistryError, ServerRegistry, ServerSpec};
+use futures::stream::{self, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, watch};
 use tokio::time::Instant;
 use url::Url;
 
@@ -167,6 +170,8 @@ struct ManagerInner {
     workspace: PathBuf,
     registry: Arc<ServerRegistry>,
     policy: RestartPolicy,
+    request_concurrency: NonZeroUsize,
+    request_slots: Arc<Semaphore>,
     servers: RwLock<BTreeMap<String, Arc<ManagedServer>>>,
     events: broadcast::Sender<ManagerEvent>,
 }
@@ -194,6 +199,7 @@ impl Manager {
         workspace: impl Into<PathBuf>,
         registry: Arc<ServerRegistry>,
         policy: RestartPolicy,
+        request_concurrency: NonZeroUsize,
     ) -> Self {
         let (events, _) = broadcast::channel(64);
         Self {
@@ -201,10 +207,18 @@ impl Manager {
                 workspace: workspace.into(),
                 registry,
                 policy,
+                request_concurrency,
+                request_slots: Arc::new(Semaphore::new(request_concurrency.get())),
                 servers: RwLock::new(BTreeMap::new()),
                 events,
             }),
         }
+    }
+
+    /// Global cap shared by server startup and request fan-out.
+    #[must_use]
+    pub fn request_concurrency(&self) -> NonZeroUsize {
+        self.inner.request_concurrency
     }
 
     /// Receive subsequent lifecycle events.
@@ -236,14 +250,23 @@ impl Manager {
     /// Open or refresh `file` on every matching server.
     pub async fn touch_file(&self, file: &Path) -> Result<(), ManagerError> {
         let clients = self.clients_for(file).await?;
-        for client in clients {
-            client
-                .open_or_change(file)
-                .await
-                .map_err(|source| ManagerError::Request {
-                    server_id: client.server_id().to_owned(),
-                    source,
-                })?;
+        let results = stream::iter(clients.into_iter().map(|client| {
+            let manager = self.clone();
+            let file = file.to_path_buf();
+            async move {
+                let server_id = client.server_id().to_owned();
+                manager
+                    .with_request_slot(client.open_or_change(&file))
+                    .await
+                    .map(|_| ())
+                    .map_err(|source| ManagerError::Request { server_id, source })
+            }
+        }))
+        .buffered(self.request_concurrency().get())
+        .collect::<Vec<_>>()
+        .await;
+        for result in results {
+            result?;
         }
         Ok(())
     }
@@ -251,28 +274,40 @@ impl Manager {
     /// Open a file and wait for fresh diagnostics from every matching server.
     pub async fn diagnostics(&self, file: &Path) -> Result<Vec<Diagnostic>, ManagerError> {
         let clients = self.clients_for(file).await?;
-        let mut diagnostics = Vec::new();
-        for client in clients {
-            let (_version, epoch) =
-                client
-                    .open_or_change(file)
+        let results = stream::iter(clients.into_iter().map(|client| {
+            let manager = self.clone();
+            let file = file.to_path_buf();
+            async move {
+                let server_id = client.server_id().to_owned();
+                manager
+                    .with_request_slot(async {
+                        let (_version, epoch) =
+                            client.open_or_change(&file).await.map_err(|source| {
+                                ManagerError::Request {
+                                    server_id: server_id.clone(),
+                                    source,
+                                }
+                            })?;
+                        match client.wait_for_diagnostics(&file, epoch).await {
+                            Ok(items) => Ok(items),
+                            Err(ClientError::Timeout { .. }) => {
+                                Ok(client.diagnostics_for(&file).await)
+                            }
+                            Err(source) => Err(ManagerError::Request {
+                                server_id: server_id.clone(),
+                                source,
+                            }),
+                        }
+                    })
                     .await
-                    .map_err(|source| ManagerError::Request {
-                        server_id: client.server_id().to_owned(),
-                        source,
-                    })?;
-            match client.wait_for_diagnostics(file, epoch).await {
-                Ok(items) => diagnostics.extend(items),
-                Err(ClientError::Timeout { .. }) => {
-                    diagnostics.extend(client.diagnostics_for(file).await);
-                }
-                Err(source) => {
-                    return Err(ManagerError::Request {
-                        server_id: client.server_id().to_owned(),
-                        source,
-                    });
-                }
             }
+        }))
+        .buffered(self.request_concurrency().get())
+        .collect::<Vec<_>>()
+        .await;
+        let mut diagnostics = Vec::new();
+        for result in results {
+            diagnostics.extend(result?);
         }
         deduplicate_diagnostics(&mut diagnostics);
         Ok(diagnostics)
@@ -281,14 +316,22 @@ impl Manager {
     /// Close `file` on all live matching clients.
     pub async fn close_file(&self, file: &Path) -> Result<(), ManagerError> {
         let clients = self.connected_clients_for(file).await;
-        for client in clients {
-            client
-                .close_document(file)
-                .await
-                .map_err(|source| ManagerError::Request {
-                    server_id: client.server_id().to_owned(),
-                    source,
-                })?;
+        let results = stream::iter(clients.into_iter().map(|client| {
+            let manager = self.clone();
+            let file = file.to_path_buf();
+            async move {
+                let server_id = client.server_id().to_owned();
+                manager
+                    .with_request_slot(client.close_document(&file))
+                    .await
+                    .map_err(|source| ManagerError::Request { server_id, source })
+            }
+        }))
+        .buffered(self.request_concurrency().get())
+        .collect::<Vec<_>>()
+        .await;
+        for result in results {
+            result?;
         }
         Ok(())
     }
@@ -303,24 +346,32 @@ impl Manager {
     ) -> Result<Vec<Value>, ManagerError> {
         let clients = self.clients_for(file).await?;
         let uri = file_uri(file)?;
-        let mut output = Vec::new();
-        for client in clients {
-            let mut params = json!({
-                "textDocument": { "uri": uri },
-                "position": position
-            });
-            if let (Some(target), Some(source)) = (params.as_object_mut(), extra.as_object()) {
-                target.extend(source.clone());
-            }
-            let result =
-                client
-                    .request(method, params)
+        let results = stream::iter(clients.into_iter().map(|client| {
+            let manager = self.clone();
+            let uri = uri.clone();
+            let extra = extra.clone();
+            let method = method.to_owned();
+            async move {
+                let server_id = client.server_id().to_owned();
+                let mut params = json!({
+                    "textDocument": { "uri": uri },
+                    "position": position
+                });
+                if let (Some(target), Some(source)) = (params.as_object_mut(), extra.as_object()) {
+                    target.extend(source.clone());
+                }
+                manager
+                    .with_request_slot(client.request(&method, params))
                     .await
-                    .map_err(|source| ManagerError::Request {
-                        server_id: client.server_id().to_owned(),
-                        source,
-                    })?;
-            flatten_result(result, &mut output);
+                    .map_err(|source| ManagerError::Request { server_id, source })
+            }
+        }))
+        .buffered(self.request_concurrency().get())
+        .collect::<Vec<_>>()
+        .await;
+        let mut output = Vec::new();
+        for result in results {
+            flatten_result(result?, &mut output);
         }
         Ok(output)
     }
@@ -334,16 +385,25 @@ impl Manager {
     /// Request workspace symbols from every already-started client.
     pub async fn workspace_symbols(&self, query: &str) -> Result<Vec<Value>, ManagerError> {
         let clients = self.connected_clients().await;
+        let results = stream::iter(clients.into_iter().map(|client| {
+            let manager = self.clone();
+            let query = query.to_owned();
+            async move {
+                let server_id = client.server_id().to_owned();
+                manager
+                    .with_request_slot(
+                        client.request("workspace/symbol", json!({ "query": query })),
+                    )
+                    .await
+                    .map_err(|source| ManagerError::Request { server_id, source })
+            }
+        }))
+        .buffered(self.request_concurrency().get())
+        .collect::<Vec<_>>()
+        .await;
         let mut output = Vec::new();
-        for client in clients {
-            let result = client
-                .request("workspace/symbol", json!({ "query": query }))
-                .await
-                .map_err(|source| ManagerError::Request {
-                    server_id: client.server_id().to_owned(),
-                    source,
-                })?;
-            flatten_result(result, &mut output);
+        for result in results {
+            flatten_result(result?, &mut output);
         }
         output.retain(|symbol| {
             symbol
@@ -364,29 +424,49 @@ impl Manager {
     ) -> Result<Vec<Value>, ManagerError> {
         let clients = self.clients_for(file).await?;
         let uri = file_uri(file)?;
+        let results = stream::iter(clients.into_iter().map(|client| {
+            let manager = self.clone();
+            let uri = uri.clone();
+            let direction = direction.to_owned();
+            async move {
+                let server_id = client.server_id().to_owned();
+                manager
+                    .with_request_slot(async {
+                        let prepared = client
+                            .request(
+                                "textDocument/prepareCallHierarchy",
+                                json!({
+                                    "textDocument": { "uri": uri },
+                                    "position": position
+                                }),
+                            )
+                            .await
+                            .map_err(|source| ManagerError::Request {
+                                server_id: server_id.clone(),
+                                source,
+                            })?;
+                        let Some(item) =
+                            prepared.as_array().and_then(|items| items.first()).cloned()
+                        else {
+                            return Ok(Value::Null);
+                        };
+                        client
+                            .request(&direction, json!({ "item": item }))
+                            .await
+                            .map_err(|source| ManagerError::Request {
+                                server_id: server_id.clone(),
+                                source,
+                            })
+                    })
+                    .await
+            }
+        }))
+        .buffered(self.request_concurrency().get())
+        .collect::<Vec<_>>()
+        .await;
         let mut output = Vec::new();
-        for client in clients {
-            let prepared = client
-                .request(
-                    "textDocument/prepareCallHierarchy",
-                    json!({ "textDocument": { "uri": uri }, "position": position }),
-                )
-                .await
-                .map_err(|source| ManagerError::Request {
-                    server_id: client.server_id().to_owned(),
-                    source,
-                })?;
-            let Some(item) = prepared.as_array().and_then(|items| items.first()).cloned() else {
-                continue;
-            };
-            let result = client
-                .request(direction, json!({ "item": item }))
-                .await
-                .map_err(|source| ManagerError::Request {
-                    server_id: client.server_id().to_owned(),
-                    source,
-                })?;
-            flatten_result(result, &mut output);
+        for result in results {
+            flatten_result(result?, &mut output);
         }
         Ok(output)
     }
@@ -434,16 +514,26 @@ impl Manager {
     ) -> Result<Vec<Value>, ManagerError> {
         let clients = self.clients_for(file).await?;
         let uri = file_uri(file)?;
+        let results = stream::iter(clients.into_iter().map(|client| {
+            let manager = self.clone();
+            let uri = uri.clone();
+            let method = method.to_owned();
+            async move {
+                let server_id = client.server_id().to_owned();
+                manager
+                    .with_request_slot(
+                        client.request(&method, json!({ "textDocument": { "uri": uri } })),
+                    )
+                    .await
+                    .map_err(|source| ManagerError::Request { server_id, source })
+            }
+        }))
+        .buffered(self.request_concurrency().get())
+        .collect::<Vec<_>>()
+        .await;
         let mut output = Vec::new();
-        for client in clients {
-            let result = client
-                .request(method, json!({ "textDocument": { "uri": uri } }))
-                .await
-                .map_err(|source| ManagerError::Request {
-                    server_id: client.server_id().to_owned(),
-                    source,
-                })?;
-            flatten_result(result, &mut output);
+        for result in results {
+            flatten_result(result?, &mut output);
         }
         Ok(output)
     }
@@ -460,10 +550,23 @@ impl Manager {
                 path: file.to_path_buf(),
             });
         }
-        let mut clients = Vec::new();
-        for (spec, root) in matches {
-            let server = self.ensure_supervisor(spec, root).await;
-            clients.push(wait_for_client(&server).await?);
+        let results = stream::iter(matches.into_iter().map(|(spec, root)| {
+            let manager = self.clone();
+            async move {
+                manager
+                    .with_request_slot(async {
+                        let server = manager.ensure_supervisor(spec, root).await;
+                        wait_for_client(&server).await
+                    })
+                    .await
+            }
+        }))
+        .buffered(self.request_concurrency().get())
+        .collect::<Vec<_>>()
+        .await;
+        let mut clients = Vec::with_capacity(results.len());
+        for result in results {
+            clients.push(result?);
         }
         Ok(clients)
     }
@@ -536,6 +639,19 @@ impl Manager {
             receiver,
         ));
         server
+    }
+
+    async fn with_request_slot<F, T>(&self, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let _permit = self
+            .inner
+            .request_slots
+            .acquire()
+            .await
+            .expect("LSP request semaphore is never closed");
+        future.await
     }
 }
 
@@ -896,6 +1012,231 @@ while True:
         .expect("write test language server");
     }
 
+    fn write_barrier_server(path: &Path) {
+        fs::write(
+            path,
+            r#"import json, pathlib, sys, time
+server_id = sys.argv[1]
+barrier = pathlib.Path(sys.argv[2])
+def read():
+    size = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b'\r\n', b'\n'):
+            break
+        if line.lower().startswith(b'content-length:'):
+            size = int(line.split(b':', 1)[1].strip())
+    return json.loads(sys.stdin.buffer.read(size))
+def send(value):
+    body = json.dumps(value, separators=(',', ':')).encode()
+    sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
+    sys.stdout.buffer.flush()
+def wait_for(name):
+    while not (barrier / name).exists():
+        time.sleep(0.005)
+while True:
+    message = read()
+    if message is None:
+        break
+    method = message.get('method')
+    if method == 'initialize':
+        (barrier / (server_id + '.initialize')).touch()
+        wait_for('release.initialize')
+        send({'jsonrpc':'2.0','id':message['id'],'result':{'capabilities':{}}})
+    elif method == 'workspace/symbol':
+        (barrier / (server_id + '.request')).touch()
+        wait_for('release.request')
+        send({'jsonrpc':'2.0','id':message['id'],'result':[{
+            'name': server_id, 'kind': 12,
+            'location': {'uri':'file:///fixture','range':{
+                'start':{'line':0,'character':0},'end':{'line':0,'character':1}
+            }}
+        }]})
+    elif 'id' in message:
+        send({'jsonrpc':'2.0','id':message['id'],'result':None})
+"#,
+        )
+        .expect("write barrier language server");
+    }
+
+    fn barrier_manager(
+        temp: &tempfile::TempDir,
+        concurrency: usize,
+    ) -> (Manager, PathBuf, PathBuf) {
+        let script = temp.path().join("barrier_server.py");
+        let barrier = temp.path().join("barrier");
+        let source = temp.path().join("file.mine");
+        fs::create_dir_all(&barrier).expect("create barrier directory");
+        fs::write(&source, "content\n").expect("write source file");
+        write_barrier_server(&script);
+        let config: LspConfig = serde_json::from_value(json!({
+            "one": {
+                "command": [
+                    "python3",
+                    script.to_string_lossy(),
+                    "one",
+                    barrier.to_string_lossy()
+                ],
+                "extensions": [".mine"]
+            },
+            "two": {
+                "command": [
+                    "python3",
+                    script.to_string_lossy(),
+                    "two",
+                    barrier.to_string_lossy()
+                ],
+                "extensions": [".mine"]
+            }
+        }))
+        .expect("custom LSP config");
+        let registry = Arc::new(ServerRegistry::offline(&ResolvedLsp::resolve(Some(
+            &config,
+        ))));
+        (
+            Manager::new(
+                temp.path(),
+                registry,
+                RestartPolicy::default(),
+                NonZeroUsize::new(concurrency).expect("non-zero concurrency"),
+            ),
+            source,
+            barrier,
+        )
+    }
+
+    async fn wait_for_marker_count(barrier: &Path, suffix: &str, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let observed = fs::read_dir(barrier)
+                    .expect("read barrier directory")
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.ends_with(suffix))
+                    })
+                    .count();
+                if observed >= count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("only part of the `{suffix}` barrier was reached"));
+    }
+
+    fn marker_count(barrier: &Path, suffix: &str) -> usize {
+        fs::read_dir(barrier)
+            .expect("read barrier directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(suffix))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn different_servers_start_and_answer_requests_concurrently_in_stable_order() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let (manager, source, barrier) = barrier_manager(&temp, 2);
+
+        let starting = {
+            let manager = manager.clone();
+            let source = source.clone();
+            tokio::spawn(async move { manager.touch_file(&source).await })
+        };
+        wait_for_marker_count(&barrier, ".initialize", 2).await;
+        fs::write(barrier.join("release.initialize"), []).expect("release initialization");
+        starting
+            .await
+            .expect("startup task")
+            .expect("both servers start");
+
+        let requesting = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.workspace_symbols("needle").await })
+        };
+        wait_for_marker_count(&barrier, ".request", 2).await;
+        fs::write(barrier.join("release.request"), []).expect("release requests");
+        let symbols = requesting
+            .await
+            .expect("request task")
+            .expect("both requests complete");
+
+        assert_eq!(
+            symbols
+                .iter()
+                .filter_map(|symbol| symbol["name"].as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"],
+            "concurrent fan-out must preserve registry order"
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrency_one_restores_serial_lsp_startup_and_requests() {
+        if which::which("python3").is_err() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let (manager, source, barrier) = barrier_manager(&temp, 1);
+
+        let starting = {
+            let manager = manager.clone();
+            let source = source.clone();
+            tokio::spawn(async move { manager.touch_file(&source).await })
+        };
+        wait_for_marker_count(&barrier, ".initialize", 1).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            marker_count(&barrier, ".initialize"),
+            1,
+            "the second server started while the only slot was occupied"
+        );
+        fs::write(barrier.join("release.initialize"), []).expect("release initialization");
+        starting
+            .await
+            .expect("startup task")
+            .expect("serial startup completes");
+
+        let requesting = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.workspace_symbols("needle").await })
+        };
+        wait_for_marker_count(&barrier, ".request", 1).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            marker_count(&barrier, ".request"),
+            1,
+            "the second request started while the only slot was occupied"
+        );
+        fs::write(barrier.join("release.request"), []).expect("release requests");
+        let symbols = requesting
+            .await
+            .expect("request task")
+            .expect("serial requests complete");
+        assert_eq!(
+            symbols
+                .iter()
+                .filter_map(|symbol| symbol["name"].as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        manager.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_killed_server_publishes_degraded_before_restarting() {
         if which::which("python3").is_err() {
@@ -925,6 +1266,7 @@ while True:
                 maximum_restarts: 2,
                 stable_after: Duration::from_secs(10),
             },
+            NonZeroUsize::new(4).expect("non-zero"),
         );
         let mut events = manager.subscribe();
         manager

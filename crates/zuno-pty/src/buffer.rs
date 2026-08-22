@@ -108,6 +108,28 @@ impl ScrollbackBuffer {
         }
     }
 
+    /// Restores a retained tail whose absolute output length is already known.
+    ///
+    /// Background executions persist their complete output to disk but retain only
+    /// this ring in memory. After a process restart they read at most `limit` bytes
+    /// from the file's tail and use its file length as `total_written`; this
+    /// constructor preserves the absolute cursor space without allocating the
+    /// discarded prefix.
+    #[must_use]
+    pub fn restore_tail(limit: usize, total_written: u64, retained_tail: &[u8]) -> Self {
+        let mut buffer = Self::with_limit(limit);
+        let tail = if retained_tail.len() > buffer.limit {
+            &retained_tail[retained_tail.len() - buffer.limit..]
+        } else {
+            retained_tail
+        };
+        buffer.push(tail);
+        let missing = total_written.saturating_sub(buffer.end_cursor);
+        buffer.start_cursor = buffer.start_cursor.saturating_add(missing);
+        buffer.end_cursor = buffer.end_cursor.saturating_add(missing);
+        buffer
+    }
+
     /// Appends one chunk, discarding whatever oldest bytes no longer fit.
     ///
     /// Never allocates beyond [`Self::limit`], and never blocks or fails, so the
@@ -454,6 +476,17 @@ mod tests {
         buffer.push(b"abc");
         assert_eq!(buffer.limit(), 1);
         assert_eq!(buffer.to_bytes(), b"c");
+    }
+
+    #[test]
+    fn a_restored_tail_keeps_absolute_cursors_without_loading_the_prefix() {
+        let buffer = ScrollbackBuffer::restore_tail(8, 100, b"23456789");
+
+        assert_eq!(buffer.to_bytes(), b"23456789");
+        assert_eq!(buffer.start_cursor(), 92);
+        assert_eq!(buffer.end_cursor(), 100);
+        assert_eq!(buffer.discarded(), 92);
+        assert_eq!(buffer.replay(ReplayCursor::From(96)).bytes, b"6789");
     }
 
     #[test]

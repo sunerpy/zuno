@@ -7,8 +7,12 @@
 //! inspect the value without racing another test.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 
 use zuno_paths::Env;
+use zuno_pty::BackgroundExecutionService;
 use zuno_tools::exposure::ExposureFlags;
 
 use crate::GlobalOptions;
@@ -116,6 +120,7 @@ pub struct StartupEnvironment {
     resolved: Env,
     overrides: BTreeMap<&'static str, String>,
     extensions: std::sync::Arc<zuno_extension::ExtensionRegistry>,
+    background_executions: Arc<Mutex<HashMap<PathBuf, Weak<BackgroundExecutionService>>>>,
     /// All supported `ZUNO_*` values after CLI precedence is applied.
     pub flags: ZunoFlags,
 }
@@ -126,6 +131,7 @@ impl PartialEq for StartupEnvironment {
             && self.overrides == other.overrides
             && self.flags == other.flags
             && std::sync::Arc::ptr_eq(&self.extensions, &other.extensions)
+            && Arc::ptr_eq(&self.background_executions, &other.background_executions)
     }
 }
 
@@ -154,6 +160,7 @@ impl StartupEnvironment {
             resolved,
             overrides,
             extensions: std::sync::Arc::new(zuno_extension::ExtensionRegistry::new()),
+            background_executions: Arc::new(Mutex::new(HashMap::new())),
             flags,
         }
     }
@@ -175,6 +182,34 @@ impl StartupEnvironment {
     #[must_use]
     pub fn extensions(&self) -> &std::sync::Arc<zuno_extension::ExtensionRegistry> {
         &self.extensions
+    }
+
+    /// Process-owned background execution service shared by every session in one
+    /// workspace.
+    ///
+    /// Session switches and child hosts clone [`StartupEnvironment`], so resolving
+    /// the service here keeps already-running commands alive and observable instead
+    /// of binding them to whichever [`crate::cmd::turn::TurnHost`] happened to
+    /// launch them.
+    pub fn background_executions(
+        &self,
+        directory: &Path,
+    ) -> Result<Arc<BackgroundExecutionService>, zuno_pty::BackgroundExecutionError> {
+        let key = directory.to_path_buf();
+        let mut services = self
+            .background_executions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(service) = services.get(&key).and_then(Weak::upgrade) {
+            return Ok(service);
+        }
+        let service = Arc::new(BackgroundExecutionService::open(
+            directory
+                .join(zuno_paths::PROJECT_DIRECTORY)
+                .join("background"),
+        )?);
+        services.insert(key, Arc::downgrade(&service));
+        Ok(service)
     }
 }
 
@@ -253,6 +288,14 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(
             first.extensions(),
             restarted.extensions()
+        ));
+        assert!(Arc::ptr_eq(
+            &first.background_executions,
+            &clone.background_executions
+        ));
+        assert!(!Arc::ptr_eq(
+            &first.background_executions,
+            &restarted.background_executions
         ));
     }
 }

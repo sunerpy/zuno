@@ -256,6 +256,11 @@
     "preserve_recent_tokens": 20000,
     "reserved": 8000
   },
+  "concurrency": {
+    "tool_calls": 8,
+    "mcp_connections": 8,
+    "lsp_requests": 4
+  },
   "memory": {
     "resident": true,
     "tool": true,

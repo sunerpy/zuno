@@ -83,7 +83,12 @@ async fn rust_diagnostics(
     config: &LspConfig,
 ) -> Result<Vec<Diagnostic>, ManagerError> {
     let registry = Arc::new(ServerRegistry::offline(&ResolvedLsp::resolve(Some(config))));
-    let manager = Manager::new(workspace, registry, RestartPolicy::default());
+    let manager = Manager::new(
+        workspace,
+        registry,
+        RestartPolicy::default(),
+        std::num::NonZeroUsize::new(4).expect("non-zero"),
+    );
     let diagnostics = manager.diagnostics(source).await;
     manager.shutdown().await;
     diagnostics

@@ -187,6 +187,47 @@ fn memory_character_caps_must_be_positive() {
 }
 
 #[test]
+fn concurrency_defaults_and_overrides_are_fully_resolved() {
+    assert_eq!(
+        Config::default().resolved_concurrency(),
+        ResolvedConcurrencyConfig {
+            tool_calls: 8,
+            mcp_connections: 8,
+            lsp_requests: 4,
+        }
+    );
+    let config =
+        parse(r#"{"concurrency":{"tool_calls":1,"mcp_connections":16,"lsp_requests":64}}"#)
+            .expect("bounded concurrency parses");
+    assert_eq!(
+        config.resolved_concurrency(),
+        ResolvedConcurrencyConfig {
+            tool_calls: 1,
+            mcp_connections: 16,
+            lsp_requests: 64,
+        }
+    );
+}
+
+#[test]
+fn every_concurrency_limit_is_between_one_and_sixty_four() {
+    for field in ["tool_calls", "mcp_connections", "lsp_requests"] {
+        for bad in [json!(0), json!(65), json!(-1)] {
+            let mut value = json!({"concurrency": {}});
+            value["concurrency"][field] = bad;
+            let error = parse_value(value).expect_err("out-of-range concurrency must be rejected");
+            assert_eq!(issue_path(&error), format!("concurrency.{field}"));
+            assert!(
+                issue_detail(&error).contains("between 1 and 64")
+                    || issue_detail(&error).contains("invalid value"),
+                "{}",
+                issue_detail(&error)
+            );
+        }
+    }
+}
+
+#[test]
 fn product_agents_default_off_and_validate_native_permission_modes() {
     let config = parse(
         r#"{

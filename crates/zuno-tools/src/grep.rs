@@ -18,7 +18,9 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use zuno_error::ToolError;
 use zuno_search::GrepRequest;
-use zuno_tool::{PermissionAsk, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
+use zuno_tool::{
+    PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool,
+};
 
 /// The description the model reads, verbatim from `tool/grep.txt`.
 pub const DESCRIPTION: &str = include_str!("description/grep.txt");
@@ -73,6 +75,10 @@ impl TypedTool for GrepTool {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Safe
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::ParallelSafe
     }
 
     async fn run(&self, params: GrepParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {

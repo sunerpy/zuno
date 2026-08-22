@@ -13,7 +13,9 @@ use serde::Deserialize;
 use serde_json::json;
 use zuno_error::ToolError;
 use zuno_search::GlobRequest;
-use zuno_tool::{PermissionAsk, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
+use zuno_tool::{
+    PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool,
+};
 
 /// The description the model reads, verbatim from `tool/glob.txt`.
 pub const DESCRIPTION: &str = include_str!("description/glob.txt");
@@ -60,6 +62,10 @@ impl TypedTool for GlobTool {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Safe
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::ParallelSafe
     }
 
     async fn run(&self, params: GlobParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {

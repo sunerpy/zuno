@@ -38,7 +38,8 @@ use crate::schema::product_agent::ProductAgentConfig;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
 /// A free-form JSON object.
@@ -80,6 +81,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "goal",
     "tool_output",
     "compaction",
+    "concurrency",
     "memory",
     "experimental",
 ];
@@ -196,6 +198,9 @@ pub struct Config {
     /// Context-compaction behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
+    /// Bounded concurrency for independent runtime capabilities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<ConcurrencyConfig>,
     /// Persistent resident-memory configuration. Absent defaults to enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
@@ -211,6 +216,15 @@ impl Config {
         self.memory
             .as_ref()
             .map_or_else(ResolvedMemoryConfig::default, MemoryConfig::resolved)
+    }
+
+    /// Resolve bounded runtime concurrency with native defaults.
+    #[must_use]
+    pub fn resolved_concurrency(&self) -> ResolvedConcurrencyConfig {
+        self.concurrency.as_ref().map_or_else(
+            ResolvedConcurrencyConfig::default,
+            ConcurrencyConfig::resolved,
+        )
     }
 }
 
@@ -433,6 +447,93 @@ pub struct CompactionConfig {
     /// Token buffer left free so compaction itself cannot overflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u32>,
+}
+
+/// Small positive concurrency bound accepted at every runtime boundary.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ConcurrencyLimit(#[schemars(range(min = 1, max = 64))] u8);
+
+impl ConcurrencyLimit {
+    /// The validated integer value.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ConcurrencyLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        if (1..=64).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(serde::de::Error::custom(
+                "concurrency limit must be between 1 and 64",
+            ))
+        }
+    }
+}
+
+impl fmt::Display for ConcurrencyLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Optional per-layer concurrency overrides.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConcurrencyConfig {
+    /// Maximum independent model-issued tool calls executing at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<ConcurrencyLimit>,
+    /// Maximum MCP servers connecting or disconnecting at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_connections: Option<ConcurrencyLimit>,
+    /// Maximum independent LSP servers or file requests executing at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lsp_requests: Option<ConcurrencyLimit>,
+}
+
+impl ConcurrencyConfig {
+    /// Fill absent values with the native runtime defaults.
+    #[must_use]
+    pub fn resolved(&self) -> ResolvedConcurrencyConfig {
+        let defaults = ResolvedConcurrencyConfig::default();
+        ResolvedConcurrencyConfig {
+            tool_calls: self
+                .tool_calls
+                .map_or(defaults.tool_calls, ConcurrencyLimit::get),
+            mcp_connections: self
+                .mcp_connections
+                .map_or(defaults.mcp_connections, ConcurrencyLimit::get),
+            lsp_requests: self
+                .lsp_requests
+                .map_or(defaults.lsp_requests, ConcurrencyLimit::get),
+        }
+    }
+}
+
+/// Fully defaulted concurrency settings consumed by composition roots.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedConcurrencyConfig {
+    pub tool_calls: u8,
+    pub mcp_connections: u8,
+    pub lsp_requests: u8,
+}
+
+impl Default for ResolvedConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            tool_calls: 8,
+            mcp_connections: 8,
+            lsp_requests: 4,
+        }
+    }
 }
 
 /// Default characters available to cross-project agent notes.

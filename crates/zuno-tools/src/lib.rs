@@ -18,9 +18,10 @@
 //!
 //! [`shell`] parses Bash and PowerShell syntax before execution so compound commands
 //! are authorized as their individual command resources. Cancellation and the hard
-//! ceiling terminate the entire spawned process group. A foreground timeout instead
-//! hands the live command to [`timeout::BackgroundManager`], and [`output_policy`]
-//! persists oversized output before requiring explicit context-cost acceptance.
+//! ceiling terminate the entire spawned process group. Every command is registered
+//! with [`zuno_pty::BackgroundExecutionService`] before spawn; a foreground timeout
+//! detaches from that same execution, and [`output_policy`] persists oversized
+//! output before requiring explicit context-cost acceptance.
 //! [`risk`] adds a deterministic destructive-command tripwire before any foreground
 //! or background spawn. This is **not a sandbox**: shell commands retain the user's
 //! full filesystem, network, and credentials. A confinement layer is a named future
@@ -103,6 +104,7 @@
 
 pub mod apply_patch;
 pub mod batch;
+pub mod bg;
 pub mod diff;
 pub mod edit;
 pub mod format;
@@ -114,6 +116,7 @@ pub mod timeout;
 pub mod write;
 
 pub use batch::{ExecuteParams, ExecuteTool, MAX_SUBCALLS, TOTAL_OUTPUT_BYTES};
+pub use bg::{BackgroundAction, BackgroundParams, BackgroundTool, WIRE_ID as BG_WIRE_ID};
 pub use format::{
     Availability, DEFINITIONS as FORMATTER_DEFINITIONS, Definition as FormatterDefinition,
     FailureKind, FormatFailure, FormatOutcome, Formatters, ProgramLocator, SystemPrograms,

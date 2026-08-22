@@ -13,12 +13,13 @@
 //! [`run_turn`] entry point rather than copying its state machine.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU8, NonZeroU32};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::future::BoxFuture;
+use futures::{StreamExt, stream};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -37,7 +38,9 @@ use zuno_llm::event::{
 };
 use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
-use zuno_tool::{ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent};
+use zuno_tool::{
+    ToolConcurrencyPolicy, ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
+};
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
@@ -560,10 +563,69 @@ impl ToolDispatchResult {
 }
 
 /// Todo 33's single dispatch choke point.
+pub struct PreparedToolDispatch {
+    execution: BoxFuture<'static, ToolDispatchResult>,
+}
+
+impl PreparedToolDispatch {
+    /// Stage an owned execution future after validation and permission checks.
+    #[must_use]
+    pub fn new(execution: BoxFuture<'static, ToolDispatchResult>) -> Self {
+        Self { execution }
+    }
+
+    /// Stage a result that was fully decided during preparation.
+    #[must_use]
+    pub fn ready(result: ToolDispatchResult) -> Self {
+        Self::new(Box::pin(async move { result }))
+    }
+
+    /// Execute the already-authorized call.
+    pub async fn execute(self) -> ToolDispatchResult {
+        self.execution.await
+    }
+}
+
+/// Validated bound for independent calls in one assistant step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolConcurrencyLimit(NonZeroU8);
+
+impl ToolConcurrencyLimit {
+    pub const SERIAL: Self = Self(NonZeroU8::MIN);
+
+    /// Accept only the configuration contract shared by tools, MCP, and LSP.
+    #[must_use]
+    pub const fn new(value: u8) -> Option<Self> {
+        match NonZeroU8::new(value) {
+            Some(value) if value.get() <= 64 => Some(Self(value)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0.get() as usize
+    }
+}
+
+/// The engine-facing tool boundary.
+///
+/// Preparation is deliberately separate from execution: hooks, argument
+/// validation, and permission prompts run in model order, while only calls whose
+/// tools explicitly opt into a non-exclusive policy may execute concurrently.
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
     fn available_tools(&self) -> AvailableTools;
-    async fn dispatch(&self, request: DispatchRequest) -> ToolDispatchResult;
+
+    fn concurrency_policy(&self, _request: &DispatchRequest) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::Exclusive
+    }
+
+    async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch;
+
+    async fn dispatch(&self, request: DispatchRequest) -> ToolDispatchResult {
+        self.prepare(request).await.execute().await
+    }
 }
 
 /// Stable caller-owned identity and volatile suffix for one run.
@@ -609,6 +671,7 @@ pub struct TurnContext<'a> {
     interrupt: &'a InterruptSignal,
     hooks: Arc<dyn TurnHooks>,
     live_inputs: Option<LiveInputs<'a>>,
+    tool_concurrency: ToolConcurrencyLimit,
 }
 
 struct LiveInputs<'a> {
@@ -633,6 +696,7 @@ impl<'a> TurnContext<'a> {
             interrupt,
             hooks: Arc::new(NoopHooks),
             live_inputs: None,
+            tool_concurrency: ToolConcurrencyLimit::SERIAL,
         }
     }
 
@@ -646,6 +710,13 @@ impl<'a> TurnContext<'a> {
     #[must_use]
     pub fn with_live_inputs(mut self, guard: &'a SessionRunGuard, inbox: &'a SessionInbox) -> Self {
         self.live_inputs = Some(LiveInputs { guard, inbox });
+        self
+    }
+
+    /// Bound explicitly parallel-safe calls in one assistant step.
+    #[must_use]
+    pub fn with_tool_concurrency(mut self, limit: ToolConcurrencyLimit) -> Self {
+        self.tool_concurrency = limit;
         self
     }
 }
@@ -1274,78 +1345,132 @@ pub async fn run_turn(
 
         let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
         if !injected.skip_remaining_tools {
-            for (call_index, call) in accumulator.calls.iter().cloned().enumerate() {
-                let ui_intent = tool_ui_intent(&locked_tools, &call.name);
-                events
-                    .send(TurnEvent::ToolDispatchStarted {
-                        step,
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        ui_intent,
-                    })
-                    .await?;
-                let dispatch = context
-                    .dispatcher
-                    .dispatch(DispatchRequest {
-                        call: call.clone(),
-                        session_id: request.session_id.clone(),
-                        message_id: assistant_id.clone(),
-                        agent: agent.name.clone(),
-                        available_tools: Arc::clone(&locked_tools),
-                        interrupt: context.interrupt.clone(),
-                    })
-                    .await;
-                if let Some(recovery) = dispatch.recovery.clone() {
-                    unresolved_tool_failures.insert(recovery.tool.clone(), recovery);
-                } else {
-                    unresolved_tool_failures.remove(&call.name);
-                }
-                persist_tool_result(
-                    context.connection,
+            let mut next_call = 0;
+            while next_call < accumulator.calls.len() && !injected.skip_remaining_tools {
+                let first_request = dispatch_request(
+                    accumulator.calls[next_call].clone(),
                     &request,
-                    ToolResultIdentity {
-                        step,
-                        call_index,
-                        message_id: &assistant_id,
-                        call: &call,
-                        ui_intent,
-                    },
-                    &dispatch,
-                )?;
-                events
-                    .send(TurnEvent::ToolDispatchCompleted {
-                        step,
-                        call_id: call.id.clone(),
-                        name: call.name,
-                        title: dispatch.output.title.clone(),
-                        output: dispatch.output.output.clone(),
-                        diff: dispatch
-                            .output
-                            .metadata
-                            .get("diff")
-                            .and_then(serde_json::Value::as_str)
-                            .filter(|patch| !patch.is_empty())
-                            .map(str::to_owned),
-                        written_paths: dispatch
-                            .output
-                            .written_paths()
-                            .into_iter()
-                            .map(str::to_owned)
-                            .collect(),
-                        is_error: dispatch.is_error,
-                    })
-                    .await?;
-                events
-                    .send(TurnEvent::ToolResultAppended {
-                        step,
-                        call_id: call.id,
-                        is_error: dispatch.is_error,
-                    })
-                    .await?;
-                injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
-                if injected.skip_remaining_tools {
-                    break;
+                    &assistant_id,
+                    &agent.name,
+                    &locked_tools,
+                    context.interrupt,
+                );
+                let first_policy = context.dispatcher.concurrency_policy(&first_request);
+                let mut group_end = next_call.saturating_add(1);
+                if first_policy != ToolConcurrencyPolicy::Exclusive {
+                    while group_end < accumulator.calls.len() {
+                        let candidate = dispatch_request(
+                            accumulator.calls[group_end].clone(),
+                            &request,
+                            &assistant_id,
+                            &agent.name,
+                            &locked_tools,
+                            context.interrupt,
+                        );
+                        if context.dispatcher.concurrency_policy(&candidate)
+                            == ToolConcurrencyPolicy::Exclusive
+                        {
+                            break;
+                        }
+                        group_end = group_end.saturating_add(1);
+                    }
                 }
+
+                let mut prepared = Vec::with_capacity(group_end.saturating_sub(next_call));
+                for call_index in next_call..group_end {
+                    let call = accumulator.calls[call_index].clone();
+                    let ui_intent = tool_ui_intent(&locked_tools, &call.name);
+                    events
+                        .send(TurnEvent::ToolDispatchStarted {
+                            step,
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            ui_intent,
+                        })
+                        .await?;
+                    let dispatch = context
+                        .dispatcher
+                        .prepare(dispatch_request(
+                            call.clone(),
+                            &request,
+                            &assistant_id,
+                            &agent.name,
+                            &locked_tools,
+                            context.interrupt,
+                        ))
+                        .await;
+                    prepared.push((call_index, call, ui_intent, dispatch));
+                }
+
+                let completed = if first_policy == ToolConcurrencyPolicy::Exclusive {
+                    let (call_index, call, ui_intent, dispatch) =
+                        prepared.pop().expect("exclusive group contains one call");
+                    vec![(call_index, call, ui_intent, dispatch.execute().await)]
+                } else {
+                    stream::iter(prepared.into_iter().map(
+                        |(call_index, call, ui_intent, dispatch)| async move {
+                            (call_index, call, ui_intent, dispatch.execute().await)
+                        },
+                    ))
+                    .buffered(context.tool_concurrency.get())
+                    .collect::<Vec<_>>()
+                    .await
+                };
+
+                // A completed parallel group is an indivisible durable unit: every
+                // execution result is appended in model order before an urgent inbox
+                // item may prevent the next group from starting.
+                for (call_index, call, ui_intent, dispatch) in completed {
+                    if let Some(recovery) = dispatch.recovery.clone() {
+                        unresolved_tool_failures.insert(recovery.tool.clone(), recovery);
+                    } else {
+                        unresolved_tool_failures.remove(&call.name);
+                    }
+                    persist_tool_result(
+                        context.connection,
+                        &request,
+                        ToolResultIdentity {
+                            step,
+                            call_index,
+                            message_id: &assistant_id,
+                            call: &call,
+                            ui_intent,
+                        },
+                        &dispatch,
+                    )?;
+                    events
+                        .send(TurnEvent::ToolDispatchCompleted {
+                            step,
+                            call_id: call.id.clone(),
+                            name: call.name,
+                            title: dispatch.output.title.clone(),
+                            output: dispatch.output.output.clone(),
+                            diff: dispatch
+                                .output
+                                .metadata
+                                .get("diff")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|patch| !patch.is_empty())
+                                .map(str::to_owned),
+                            written_paths: dispatch
+                                .output
+                                .written_paths()
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect(),
+                            is_error: dispatch.is_error,
+                        })
+                        .await?;
+                    events
+                        .send(TurnEvent::ToolResultAppended {
+                            step,
+                            call_id: call.id,
+                            is_error: dispatch.is_error,
+                        })
+                        .await?;
+                    injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
+                }
+                next_call = group_end;
             }
         }
         injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
@@ -1372,6 +1497,24 @@ pub async fn run_turn(
             steps,
             unresolved_tool_failures: unresolved_tool_failures.into_values().collect(),
         });
+    }
+}
+
+fn dispatch_request(
+    call: ToolCall,
+    request: &RunTurnRequest,
+    message_id: &str,
+    agent: &str,
+    available_tools: &Arc<[ToolDefinition]>,
+    interrupt: &InterruptSignal,
+) -> DispatchRequest {
+    DispatchRequest {
+        call,
+        session_id: request.session_id.clone(),
+        message_id: message_id.to_owned(),
+        agent: agent.to_owned(),
+        available_tools: Arc::clone(available_tools),
+        interrupt: interrupt.clone(),
     }
 }
 

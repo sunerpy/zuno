@@ -21,9 +21,10 @@ use zuno_engine::compaction::{
 };
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
-    AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
-    RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError, TurnEvent,
-    TurnOutcome, event_channel, hydrate_retained_history, project_history_owned_with_ids, run_turn,
+    AgentModelResolver, AvailableTools, DispatchRequest, PreparedToolDispatch, ResolvedAgent,
+    ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError,
+    TurnEvent, TurnOutcome, event_channel, hydrate_retained_history,
+    project_history_owned_with_ids, run_turn,
 };
 use zuno_error::ProviderError;
 use zuno_llm::cache::{CacheTracker, DynamicContext, LockedTools, McpToolStatus};
@@ -492,7 +493,12 @@ fn live_lsp_manager(project: &Path) -> Manager {
     let registry = Arc::new(ServerRegistry::offline(&ResolvedLsp::resolve(Some(
         &config,
     ))));
-    Manager::new(project, registry, RestartPolicy::default())
+    Manager::new(
+        project,
+        registry,
+        RestartPolicy::default(),
+        std::num::NonZeroUsize::new(4).expect("non-zero"),
+    )
 }
 
 async fn start_real_memory_drivers(
@@ -669,10 +675,13 @@ impl ToolDispatcher for LargeOutputDispatcher {
         )
     }
 
-    async fn dispatch(&self, request: DispatchRequest) -> ToolDispatchResult {
+    async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
         assert_eq!(request.call.name, "get_weather");
         self.calls.fetch_add(1, Ordering::SeqCst);
-        ToolDispatchResult::success(ToolOutput::text("weather fixture", self.output.clone()))
+        PreparedToolDispatch::ready(ToolDispatchResult::success(ToolOutput::text(
+            "weather fixture",
+            self.output.clone(),
+        )))
     }
 }
 

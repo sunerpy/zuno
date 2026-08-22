@@ -1,28 +1,28 @@
 use crate::output_policy::OutputPolicy;
 use crate::risk::{GateOutcome, Justification, RiskContext, assess_and_gate};
 use crate::timeout::{
-    BackgroundAdoption, BackgroundManager, ForegroundTask, LocalBackgroundManager,
-    background_started_output, normalize_foreground_timeout, wait_or_promote,
+    background_started_output, normalize_foreground_timeout, timeout_promoted_output,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt as _;
-use tokio::process::{Child, Command};
+use std::time::Duration;
 use tree_sitter::{Node, Parser};
 use zuno_error::ToolError;
+use zuno_pty::{
+    BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionService,
+    BackgroundExecutionStatus,
+};
 use zuno_tool::{OutputLimits, PermissionAsk, Tool, ToolContext, ToolOutput, ToolOutputStore};
 
 const TOOL_ID: &str = "bash";
 const BACKGROUND_DIRECTORY: &str = "background";
-const TERMINATE_GRACE: Duration = Duration::from_millis(200);
 /// The description the model reads.
 pub const DESCRIPTION: &str = include_str!("description/bash.txt");
 
@@ -140,7 +140,7 @@ pub struct ShellTool {
     output_store: ToolOutputStore,
     output_limits: OutputLimits,
     hard_ceiling: Duration,
-    background_manager: Arc<dyn BackgroundManager>,
+    background_executions: Arc<BackgroundExecutionService>,
 }
 
 impl ShellTool {
@@ -156,11 +156,14 @@ impl ShellTool {
                 .join(zuno_paths::PROJECT_DIRECTORY)
                 .join(zuno_paths::TOOL_OUTPUT_DIRECTORY),
         );
-        let background_manager = Arc::new(LocalBackgroundManager::new(
-            workspace
-                .join(zuno_paths::PROJECT_DIRECTORY)
-                .join(BACKGROUND_DIRECTORY),
-        ));
+        let background_executions = Arc::new(
+            BackgroundExecutionService::open(
+                workspace
+                    .join(zuno_paths::PROJECT_DIRECTORY)
+                    .join(BACKGROUND_DIRECTORY),
+            )
+            .map_err(io::Error::other)?,
+        );
         Ok(Self {
             workspace,
             shell,
@@ -168,7 +171,7 @@ impl ShellTool {
             output_store,
             output_limits: OutputLimits::default(),
             hard_ceiling: crate::timeout::DEFAULT_HARD_CEILING,
-            background_manager,
+            background_executions,
         })
     }
 
@@ -197,8 +200,8 @@ impl ShellTool {
     }
 
     #[must_use]
-    pub fn with_background_manager(mut self, manager: Arc<dyn BackgroundManager>) -> Self {
-        self.background_manager = manager;
+    pub fn with_background_executions(mut self, service: Arc<BackgroundExecutionService>) -> Self {
+        self.background_executions = service;
         self
     }
 
@@ -258,44 +261,43 @@ impl ShellTool {
             return Err(interrupted());
         }
         let env = self.environment(&cwd, &ctx).await?;
-        let child = self.spawn(&params.command, &cwd, &env)?;
-        let pid = child.id();
         let command = params.command.clone();
-        let session_id = ctx.session_id.clone();
         let foreground_timeout_ms = normalize_foreground_timeout(params.timeout);
-        let execution = ChildExecution {
-            command: command.clone(),
-            session_id: session_id.clone(),
-            ctx,
-            output_policy: OutputPolicy::new(self.output_store.clone(), self.output_limits),
-            hard_ceiling: self.hard_ceiling,
-            foreground_timeout_ms,
-            accept_large_output,
-        };
-        let work = tokio::spawn(async move { complete_child(child, execution).await });
+        let execution = self
+            .background_executions
+            .start(self.execution_input(&command, &cwd, env, &ctx))
+            .map_err(failed)?;
 
         if params.background {
-            let handle = self.background_manager.adopt(BackgroundAdoption {
-                tool_name: TOOL_ID.to_owned(),
-                display_name: command.clone(),
-                session_id,
-                work,
-            })?;
-            return Ok(background_started_output(command, pid, handle));
+            return Ok(background_started_output(command, &execution));
         }
 
-        wait_or_promote(
-            self.background_manager.as_ref(),
-            ForegroundTask {
-                tool_name: TOOL_ID.to_owned(),
-                display_name: command,
-                session_id,
+        let foreground_timeout = Duration::from_millis(foreground_timeout_ms);
+        let wait_timeout = (foreground_timeout < self.hard_ceiling).then_some(foreground_timeout);
+        let waited = tokio::select! {
+            result = self.background_executions.wait(&execution.id, wait_timeout) => {
+                result.map_err(failed)?
+            }
+            () = ctx.interrupt.notified() => {
+                let _cancelled = self.background_executions.cancel(&execution.id);
+                let _settled = self.background_executions.wait(&execution.id, None).await;
+                return Err(interrupted());
+            }
+        };
+        if waited.timed_out {
+            return Ok(timeout_promoted_output(
+                command,
                 foreground_timeout_ms,
-                hard_ceiling: self.hard_ceiling,
-                work,
-            },
+                &waited.info,
+            ));
+        }
+        self.completed_output(
+            &command,
+            foreground_timeout_ms,
+            waited.info,
+            &ctx.session_id,
+            accept_large_output,
         )
-        .await
     }
 
     fn syntax(&self) -> ShellSyntax {
@@ -405,40 +407,95 @@ impl ShellTool {
         Ok(env)
     }
 
-    fn spawn(
+    fn execution_input(
         &self,
         command: &str,
         cwd: &Path,
-        env: &BTreeMap<String, String>,
-    ) -> Result<Child, ToolError> {
-        let mut process = Command::new(&self.shell.path);
-        match self.shell.kind {
-            ShellKind::PowerShell => {
-                process.args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    command,
-                ]);
+        env: BTreeMap<String, String>,
+        ctx: &ToolContext,
+    ) -> BackgroundExecutionInput {
+        let arguments = match self.shell.kind {
+            ShellKind::PowerShell => vec![
+                OsString::from("-NoLogo"),
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-Command"),
+                OsString::from(command),
+            ],
+            ShellKind::Cmd => vec![OsString::from("/c"), OsString::from(command)],
+            ShellKind::Posix => vec![OsString::from("-lc"), OsString::from(command)],
+        };
+        BackgroundExecutionInput {
+            program: self.shell.path.as_os_str().to_owned(),
+            arguments,
+            cwd: cwd.to_owned(),
+            environment: env
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            session_id: ctx.session_id.clone(),
+            title: command.to_owned(),
+            command: command.to_owned(),
+            hard_ceiling: self.hard_ceiling,
+        }
+    }
+
+    fn completed_output(
+        &self,
+        command: &str,
+        foreground_timeout_ms: u64,
+        execution: BackgroundExecutionInfo,
+        session_id: &str,
+        accept_large_output: bool,
+    ) -> Result<ToolOutput, ToolError> {
+        match execution.status {
+            BackgroundExecutionStatus::Completed => {}
+            BackgroundExecutionStatus::Cancelled => return Err(interrupted()),
+            BackgroundExecutionStatus::Failed if execution.timed_out => {
+                return Err(ToolError::Timeout {
+                    tool: TOOL_ID.to_owned(),
+                    elapsed: self.hard_ceiling,
+                });
             }
-            ShellKind::Cmd => {
-                process.args(["/c", command]);
+            BackgroundExecutionStatus::Failed | BackgroundExecutionStatus::Uncertain => {
+                return Err(failed(io::Error::other(execution.error.unwrap_or_else(
+                    || {
+                        format!(
+                            "background execution {} ended as {}",
+                            execution.id,
+                            execution.status.as_str()
+                        )
+                    },
+                ))));
             }
-            ShellKind::Posix => {
-                process.args(["-lc", command]);
+            BackgroundExecutionStatus::Running => {
+                return Err(failed(io::Error::other(format!(
+                    "background execution {} returned from a terminal wait while still running",
+                    execution.id
+                ))));
             }
         }
-        process
-            .current_dir(cwd)
-            .envs(env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        process.process_group(0);
-        process.spawn().map_err(failed)
+
+        let bytes = self
+            .background_executions
+            .complete_output(&execution.id)
+            .map_err(failed)?;
+        let mut full = String::from_utf8_lossy(&bytes).into_owned();
+        if full.is_empty() {
+            full = "(no output)".to_owned();
+        }
+        let output = ToolOutput::text(command, full)
+            .with_metadata("exit", json!(execution.exit_code))
+            .with_metadata("truncated", false)
+            .with_metadata("background", false)
+            .with_metadata("task_id", execution.id.as_str())
+            .with_metadata("timeout", json!(foreground_timeout_ms));
+        OutputPolicy::new(self.output_store.clone(), self.output_limits)
+            .apply(TOOL_ID, session_id, output, accept_large_output)
+            .map_err(|error| ToolError::Failed {
+                tool: TOOL_ID.to_owned(),
+                source: Box::new(error),
+            })
     }
 }
 
@@ -794,178 +851,6 @@ fn is_dynamic_path(path: &str) -> bool {
         || path.contains('*')
         || path.contains('?')
         || path.contains('[')
-}
-
-struct ChildExecution {
-    command: String,
-    session_id: String,
-    ctx: ToolContext,
-    output_policy: OutputPolicy,
-    hard_ceiling: Duration,
-    foreground_timeout_ms: u64,
-    accept_large_output: bool,
-}
-
-async fn complete_child(
-    mut child: Child,
-    execution: ChildExecution,
-) -> Result<ToolOutput, ToolError> {
-    let mut process_tree = ProcessTreeGuard::new(child.id());
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_task = tokio::spawn(read_pipe(stdout));
-    let stderr_task = tokio::spawn(read_pipe(stderr));
-    let started = Instant::now();
-
-    let status = tokio::select! {
-        result = child.wait() => Some(result.map_err(failed)?),
-        () = execution.ctx.interrupt.notified() => {
-            terminate_process_tree(&mut child).await;
-            let _status = child.wait().await;
-            None
-        }
-        () = tokio::time::sleep(execution.hard_ceiling) => {
-            terminate_process_tree(&mut child).await;
-            let _status = child.wait().await;
-            process_tree.disarm();
-            let _stdout = join_pipe(stdout_task).await;
-            let _stderr = join_pipe(stderr_task).await;
-            return Err(ToolError::Timeout {
-                tool: TOOL_ID.to_owned(),
-                elapsed: started.elapsed(),
-            });
-        }
-    };
-
-    let stdout = join_pipe(stdout_task).await?;
-    let stderr = join_pipe(stderr_task).await?;
-    if status.is_none() {
-        process_tree.disarm();
-        return Err(interrupted());
-    }
-    process_tree.disarm();
-    let status = status.expect("checked above");
-    let mut full = String::from_utf8_lossy(&stdout).into_owned();
-    full.push_str(&String::from_utf8_lossy(&stderr));
-    if full.is_empty() {
-        full = "(no output)".to_owned();
-    }
-    let output = ToolOutput::text(&execution.command, full)
-        .with_metadata("exit", json!(status.code()))
-        .with_metadata("truncated", false)
-        .with_metadata("background", false)
-        .with_metadata("timeout", json!(execution.foreground_timeout_ms));
-    execution
-        .output_policy
-        .apply(
-            TOOL_ID,
-            &execution.session_id,
-            output,
-            execution.accept_large_output,
-        )
-        .map_err(|error| ToolError::Failed {
-            tool: TOOL_ID.to_owned(),
-            source: Box::new(error),
-        })
-}
-
-struct ProcessTreeGuard {
-    pid: Option<u32>,
-}
-
-impl ProcessTreeGuard {
-    fn new(pid: Option<u32>) -> Self {
-        Self { pid }
-    }
-
-    fn disarm(&mut self) {
-        self.pid = None;
-    }
-}
-
-impl Drop for ProcessTreeGuard {
-    fn drop(&mut self) {
-        let Some(pid) = self.pid else {
-            return;
-        };
-        #[cfg(unix)]
-        {
-            let _status = std::process::Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pid}")])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        #[cfg(windows)]
-        {
-            let _status = std::process::Command::new("taskkill")
-                .args(["/pid", &pid.to_string(), "/f", "/t"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
-}
-
-async fn read_pipe(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> io::Result<Vec<u8>> {
-    let Some(mut pipe) = pipe else {
-        return Ok(Vec::new());
-    };
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-async fn join_pipe(
-    task: tokio::task::JoinHandle<io::Result<Vec<u8>>>,
-) -> Result<Vec<u8>, ToolError> {
-    task.await
-        .map_err(|error| failed(io::Error::other(error)))?
-        .map_err(failed)
-}
-
-#[cfg(unix)]
-async fn terminate_process_tree(child: &mut Child) {
-    let Some(pid) = child.id() else {
-        return;
-    };
-    let group = format!("-{pid}");
-    let terminated = Command::new("kill")
-        .args(["-TERM", "--", &group])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|status| status.success());
-    if !terminated {
-        let _result = child.start_kill();
-    }
-    tokio::time::sleep(TERMINATE_GRACE).await;
-    let _status = Command::new("kill")
-        .args(["-KILL", "--", &group])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    let _result = child.start_kill();
-}
-
-#[cfg(windows)]
-async fn terminate_process_tree(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        let _status = Command::new("taskkill")
-            .args(["/pid", &pid.to_string(), "/f", "/t"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-    let _result = child.start_kill();
 }
 
 fn discover_shell(configured: Option<&Path>) -> io::Result<SelectedShell> {

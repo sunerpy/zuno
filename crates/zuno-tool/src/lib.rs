@@ -133,6 +133,23 @@ pub enum ToolReplayPolicy {
     Safe,
 }
 
+/// Whether separate model-issued calls may overlap in one assistant step.
+///
+/// This policy is independent from [`ToolReplayPolicy`]. A read-only tool may be
+/// safe to retry but still require exclusive access to a process or protocol
+/// stream, while an isolated child execution may overlap yet remain unsafe to
+/// replay after an uncertain outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ToolConcurrencyPolicy {
+    /// Run after every earlier call settles and before any later call starts.
+    #[default]
+    Exclusive,
+    /// Calls are read-only or otherwise explicitly safe to execute concurrently.
+    ParallelSafe,
+    /// The tool owns an isolated child execution or durable background job.
+    IsolatedBackground,
+}
+
 /// An executable tool, erased to a trait object for the registry.
 ///
 /// Object-safe: `#[async_trait]` boxes the returned future so `Arc<dyn Tool>` works.
@@ -151,6 +168,11 @@ pub trait Tool: Send + Sync {
     /// Whether an identical call may be retried after a typed transient failure.
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Never
+    }
+
+    /// Whether separate model-issued calls may overlap in one assistant step.
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::Exclusive
     }
 
     /// Stable client presentation intent.
@@ -303,6 +325,11 @@ pub trait TypedTool: Send + Sync + 'static {
         ToolReplayPolicy::Never
     }
 
+    /// Whether separate model-issued calls may overlap in one assistant step.
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::Exclusive
+    }
+
     /// Stable client presentation intent.
     fn ui_intent(&self) -> ToolUiIntent {
         ToolUiIntent::Generic
@@ -333,6 +360,10 @@ impl<T: TypedTool> Tool for Typed<T> {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         self.0.replay_policy()
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        self.0.concurrency_policy()
     }
 
     fn ui_intent(&self) -> ToolUiIntent {

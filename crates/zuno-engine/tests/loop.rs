@@ -13,10 +13,10 @@ use zuno_db::{Connection, migration, open};
 use zuno_engine::hooks::TurnHooks;
 use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::{
-    AgentModelResolver, AvailableTools, DispatchRequest, ResolvedAgent, ResolvedModel,
-    RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError, TurnEvent,
-    TurnOutcome, event_channel, hydrate_retained_history, project_history, project_history_owned,
-    retained_history, run_turn,
+    AgentModelResolver, AvailableTools, DispatchRequest, PreparedToolDispatch, ResolvedAgent,
+    ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError,
+    TurnEvent, TurnOutcome, event_channel, hydrate_retained_history, project_history,
+    project_history_owned, retained_history, run_turn,
 };
 use zuno_engine::prompt::PromptAssembly;
 use zuno_engine::status::SessionRunRegistry;
@@ -192,7 +192,7 @@ impl ToolDispatcher for FakeDispatcher {
         )
     }
 
-    async fn dispatch(&self, request: DispatchRequest) -> ToolDispatchResult {
+    async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
         self.calls
             .lock()
             .expect("dispatch lock")
@@ -200,7 +200,7 @@ impl ToolDispatcher for FakeDispatcher {
         let text = request.call.input["text"]
             .as_str()
             .unwrap_or("missing text");
-        ToolDispatchResult::success(ToolOutput::text("echo", text))
+        PreparedToolDispatch::ready(ToolDispatchResult::success(ToolOutput::text("echo", text)))
     }
 }
 

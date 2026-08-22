@@ -23,6 +23,7 @@ base64 = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 crossterm = { workspace = true }
+futures = { workspace = true }
 zuno-agent = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-catalog = { workspace = true }
@@ -48,6 +49,7 @@ zuno-provider-bedrock = { workspace = true }
 zuno-provider-compatible = { workspace = true }
 zuno-provider-google = { workspace = true }
 zuno-provider-openai = { workspace = true }
+zuno-pty = { workspace = true }
 zuno-runtime = { workspace = true }
 zuno-search = { workspace = true }
 zuno-server = { workspace = true }
@@ -74,7 +76,6 @@ tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-futures = { workspace = true }
 portable-pty = { workspace = true }
 zuno-testkit = { workspace = true }
 serde_json = { workspace = true }

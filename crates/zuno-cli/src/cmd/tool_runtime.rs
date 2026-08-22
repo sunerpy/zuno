@@ -21,7 +21,7 @@
 //!
 //! # Which built-ins are registered, and why the list is short of the slot table
 //!
-//! [`zuno_tools::registry::BUILTIN_ORDER`] has seventeen positions. This module
+//! [`zuno_tools::registry::BUILTIN_ORDER`] is the canonical native slot order. This module
 //! registers the ones whose implementation needs nothing but the workspace, the
 //! database, and the collaborators [`ToolSelection`] carries. `plan_exit` needs a
 //! live user to answer, `lsp` has no implementation in `zuno-tools` at all, and
@@ -80,6 +80,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) manifest: Arc<zuno_harness::ToolManifest>,
     pub(crate) contributions: Arc<zuno_harness::ToolContributions>,
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
+    pub(crate) background_executions: Arc<zuno_pty::BackgroundExecutionService>,
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
@@ -153,7 +154,9 @@ pub(crate) fn assemble(
         worktree: worktree.map_or_else(|| directory.to_path_buf(), Path::to_path_buf),
     };
     let tooling = SearchTooling::with_backend(scope, zuno_search::Backend::from_env());
-    let shell = zuno_tools::shell::ShellTool::new(directory).map_err(to_string)?;
+    let shell = zuno_tools::shell::ShellTool::new(directory)
+        .map_err(to_string)?
+        .with_background_executions(Arc::clone(&selection.background_executions));
     if selection.manifest.contains(BuiltinSlot::Question)
         && let Some(asker) = selection.question
     {
@@ -191,6 +194,12 @@ pub(crate) fn assemble(
             erase(zuno_tools::invalid::InvalidTool::new()),
         ),
         (BuiltinSlot::Shell, Arc::new(shell) as Arc<dyn Tool>),
+        (
+            BuiltinSlot::Background,
+            erase(zuno_tools::BackgroundTool::new(Arc::clone(
+                &selection.background_executions,
+            ))),
+        ),
         (
             BuiltinSlot::Glob,
             erase(zuno_tools::GlobTool::new(tooling.clone())),

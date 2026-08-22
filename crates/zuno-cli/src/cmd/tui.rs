@@ -37,14 +37,15 @@
 //! active; if a remount fails, unwinding restores the terminal before the error is
 //! reported.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::future::Future;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::IsTerminal as _;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures::future::BoxFuture;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, watch};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender, event_channel};
 use zuno_engine::status::SessionRunRegistry;
@@ -306,6 +307,7 @@ fn execute_once(
         .build()
         .map_err(to_string)?;
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+    let concurrency = plan.config().resolved_concurrency();
     let layout = zuno_paths::Layout::resolve(environment.resolved());
     let snapshot_store = zuno_snapshot::Store::open(
         zuno_snapshot::Location::discover_in(layout.snapshot_root(), plan.directory())
@@ -619,6 +621,8 @@ fn execute_once(
             mcp_controller,
             mcp_toggle_receiver,
             initial_mcp_targets,
+            NonZeroUsize::new(usize::from(concurrency.mcp_connections))
+                .expect("configuration validates MCP concurrency"),
             mcp_projection,
             mcp_dirty,
             mcp_wake,
@@ -1746,32 +1750,44 @@ async fn drive_mcp_lifecycle(
     controller: zuno_mcp::McpServerController,
     mut requests: mpsc::Receiver<McpToggleRequest>,
     initial: Vec<McpToggleRequest>,
+    concurrency: NonZeroUsize,
     projection: McpProjection,
     dirty: Arc<AtomicBool>,
     wake: mpsc::Sender<TerminalEvent>,
 ) {
-    type ToggleFuture = Pin<
-        Box<
-            dyn Future<Output = Result<zuno_mcp::McpServerSnapshot, zuno_mcp::McpLifecycleError>>
-                + Send,
-        >,
-    >;
+    type ToggleResult = Result<zuno_mcp::McpServerSnapshot, zuno_mcp::McpLifecycleError>;
+    type ToggleFuture = BoxFuture<'static, (String, ToggleResult)>;
 
     let mut changes = controller.subscribe();
-    let mut initial = VecDeque::from(initial);
-    let mut active: Option<ToggleFuture> = None;
+    let mut pending = VecDeque::from(initial);
+    let mut active = FuturesUnordered::<ToggleFuture>::new();
+    let mut active_servers = BTreeSet::new();
+    let mut requests_open = true;
     loop {
-        if active.is_none()
-            && let Some(request) = initial.pop_front()
-        {
+        while active.len() < concurrency.get() {
+            let Some(index) = pending
+                .iter()
+                .position(|request| !active_servers.contains(&request.server))
+            else {
+                break;
+            };
+            let request = pending
+                .remove(index)
+                .expect("eligible pending MCP request exists");
             let controller = controller.clone();
-            active = Some(Box::pin(async move {
-                controller
-                    .set_enabled(&request.server, request.desired_enabled)
-                    .await
+            let server = request.server.clone();
+            active_servers.insert(server.clone());
+            active.push(Box::pin(async move {
+                let result = controller
+                    .set_enabled(&server, request.desired_enabled)
+                    .await;
+                (server, result)
             }));
         }
 
+        if !requests_open && pending.is_empty() && active.is_empty() {
+            return;
+        }
         tokio::select! {
             change = changes.recv() => match change {
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -1781,23 +1797,16 @@ async fn drive_mcp_lifecycle(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
-            result = async { active.as_mut().expect("guarded active MCP operation").await }, if active.is_some() => {
-                let _completed = result;
-                active = None;
+            result = active.next(), if !active.is_empty() => {
+                let (server, _completed) = result.expect("guarded active MCP operation");
+                active_servers.remove(&server);
                 projection.replace(project_mcp_snapshots(&controller.snapshots()));
                 dirty.store(true, Ordering::Release);
                 let _nudged = wake.try_send(TerminalEvent::Wake);
             },
-            request = requests.recv(), if active.is_none() && initial.is_empty() => match request {
-                Some(request) => {
-                    let controller = controller.clone();
-                    active = Some(Box::pin(async move {
-                        controller
-                            .set_enabled(&request.server, request.desired_enabled)
-                            .await
-                    }));
-                }
-                None => return,
+            request = requests.recv(), if requests_open => match request {
+                Some(request) => pending.push_back(request),
+                None => requests_open = false,
             },
         }
     }
@@ -2007,10 +2016,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::io::{Read as _, Write};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
     use std::thread::JoinHandle;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[cfg(target_os = "linux")]
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -2020,6 +2029,92 @@ mod tests {
     use zuno_tui::keybind::{Chord, Resolution};
 
     use super::*;
+
+    struct BlockingMcpConnector {
+        started: AtomicUsize,
+        active: AtomicUsize,
+        maximum_active: AtomicUsize,
+        changed: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for BlockingMcpConnector {
+        fn default() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                maximum_active: AtomicUsize::new(0),
+                changed: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl BlockingMcpConnector {
+        async fn wait_for_started(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let notified = self.changed.notified();
+                    if self.started.load(Ordering::Acquire) >= count {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "only {} MCP connects started",
+                    self.started.load(Ordering::Acquire)
+                )
+            });
+        }
+
+        fn release_one(&self) {
+            self.release.add_permits(1);
+        }
+
+        fn release_all(&self, count: usize) {
+            self.release.add_permits(count);
+        }
+
+        fn maximum_active(&self) -> usize {
+            self.maximum_active.load(Ordering::Acquire)
+        }
+
+        fn record_maximum(&self, active: usize) {
+            let mut observed = self.maximum_active.load(Ordering::Acquire);
+            while active > observed {
+                match self.maximum_active.compare_exchange_weak(
+                    observed,
+                    active,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(current) => observed = current,
+                }
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zuno_mcp::McpConnector for BlockingMcpConnector {
+        async fn connect(&self, _server: &str) -> Result<zuno_mcp::McpConnectOutcome, String> {
+            self.started.fetch_add(1, Ordering::AcqRel);
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.record_maximum(active);
+            self.changed.notify_waiters();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("test MCP release semaphore stays open");
+            permit.forget();
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            Ok(zuno_mcp::McpConnectOutcome::NeedsAuth)
+        }
+    }
 
     struct LeaseObservingEditor {
         transcript: zuno_testkit::TerminalTranscript,
@@ -2938,6 +3033,7 @@ mod tests {
             controller,
             request_source,
             Vec::new(),
+            NonZeroUsize::MIN,
             projection,
             dirty,
             wake,
@@ -2975,6 +3071,100 @@ mod tests {
         worker
             .await
             .expect("worker exits after request channel closes");
+    }
+
+    #[tokio::test]
+    async fn mcp_worker_overlaps_different_servers_up_to_the_configured_limit() {
+        let connector = Arc::new(BlockingMcpConnector::default());
+        let catalog = zuno_mcp::Catalog::new(["alpha", "beta"]);
+        let controller = zuno_mcp::McpServerController::with_connector(
+            catalog,
+            ["alpha", "beta"],
+            Arc::clone(&connector),
+            zuno_mcp::McpLifecycleOptions::default(),
+        );
+        let projection = McpProjection::new(project_mcp_snapshots(&controller.snapshots()));
+        let (requests, request_source) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
+        drop(requests);
+        let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
+        let worker = tokio::spawn(drive_mcp_lifecycle(
+            controller,
+            request_source,
+            vec![
+                McpToggleRequest {
+                    server: "alpha".to_owned(),
+                    desired_enabled: true,
+                },
+                McpToggleRequest {
+                    server: "beta".to_owned(),
+                    desired_enabled: true,
+                },
+            ],
+            NonZeroUsize::new(2).expect("non-zero"),
+            projection,
+            Arc::new(AtomicBool::new(false)),
+            wake,
+        ));
+
+        connector.wait_for_started(2).await;
+        assert_eq!(
+            connector.maximum_active(),
+            2,
+            "different MCP servers did not overlap"
+        );
+        connector.release_all(2);
+        worker.await.expect("MCP worker exits");
+    }
+
+    #[tokio::test]
+    async fn mcp_worker_serializes_repeated_operations_for_one_server() {
+        let connector = Arc::new(BlockingMcpConnector::default());
+        let catalog = zuno_mcp::Catalog::new(["same"]);
+        let controller = zuno_mcp::McpServerController::with_connector(
+            catalog,
+            ["same"],
+            Arc::clone(&connector),
+            zuno_mcp::McpLifecycleOptions::default(),
+        );
+        let projection = McpProjection::new(project_mcp_snapshots(&controller.snapshots()));
+        let (requests, request_source) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
+        drop(requests);
+        let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
+        let worker = tokio::spawn(drive_mcp_lifecycle(
+            controller,
+            request_source,
+            vec![
+                McpToggleRequest {
+                    server: "same".to_owned(),
+                    desired_enabled: true,
+                },
+                McpToggleRequest {
+                    server: "same".to_owned(),
+                    desired_enabled: false,
+                },
+                McpToggleRequest {
+                    server: "same".to_owned(),
+                    desired_enabled: true,
+                },
+            ],
+            NonZeroUsize::new(8).expect("non-zero"),
+            projection,
+            Arc::new(AtomicBool::new(false)),
+            wake,
+        ));
+
+        connector.wait_for_started(1).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            connector.started.load(Ordering::Acquire),
+            1,
+            "a second operation for the same MCP server started concurrently"
+        );
+        connector.release_one();
+        connector.wait_for_started(2).await;
+        assert_eq!(connector.maximum_active(), 1);
+        connector.release_one();
+        worker.await.expect("MCP worker exits");
     }
 
     #[tokio::test]

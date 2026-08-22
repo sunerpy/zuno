@@ -23,13 +23,15 @@
 //! ticket cache admit unbounded growth from a client that connects and never
 //! reads.
 //!
-//! # Synchronous by construction
+//! # PTY operations stay synchronous
 //!
-//! Every method here is a plain `fn`. The underlying pty read and child wait are
-//! blocking with no async form, so each session owns two OS threads and publishes
-//! through non-blocking `try_send`. Nothing in this crate needs a Tokio runtime to
-//! exist, which is what lets a CLI use it as directly as the server does.
+//! Every [`PtyService`] operation is a plain `fn`. The underlying pty read and child
+//! wait are blocking with no async form, so each session owns two OS threads and
+//! publishes through non-blocking `try_send`. The separate
+//! [`BackgroundExecutionService`] owns non-interactive Tokio child processes and
+//! offers async wait/cancellation without changing the PTY contract.
 
+pub mod background;
 pub mod buffer;
 pub mod retention;
 pub mod session;
@@ -42,6 +44,12 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tokio::sync::broadcast;
 
+pub use crate::background::{
+    BackgroundExecutionError, BackgroundExecutionEvent, BackgroundExecutionId,
+    BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionOutput,
+    BackgroundExecutionProjection, BackgroundExecutionService, BackgroundExecutionStatus,
+    BackgroundWaitOutcome,
+};
 pub use crate::buffer::{BUFFER_LIMIT, Replay, ReplayCursor, ScrollbackBuffer};
 pub use crate::retention::EXITED_LIMIT;
 pub use crate::session::{

@@ -30,8 +30,10 @@
 //! server must not make `zuno run` unusable.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
+use futures::stream::{self, StreamExt as _};
 use zuno_config::schema::Config;
 use zuno_config::schema::mcp::McpServerConfig;
 
@@ -53,6 +55,7 @@ pub(crate) struct McpRuntime {
     catalog: zuno_mcp::Catalog,
     controller: zuno_mcp::McpServerController,
     enabled: Vec<String>,
+    concurrency: NonZeroUsize,
 }
 
 impl McpRuntime {
@@ -87,41 +90,46 @@ impl McpRuntime {
             catalog,
             controller,
             enabled,
+            concurrency: NonZeroUsize::new(usize::from(
+                config.resolved_concurrency().mcp_connections,
+            ))
+            .expect("configuration validates MCP concurrency"),
         })
     }
 
     /// Connect every enabled server, returning one note per server that did not.
     ///
-    /// Sequential rather than joined: [`zuno_mcp::McpServerController`] serialises one
-    /// operation per server anyway, and a stdio server that spawns a subprocess is
-    /// better started in a declared order than a racing one when a failure has to be
-    /// attributed to a name.
     pub(crate) async fn connect(&self) -> Vec<String> {
-        let mut notes = Vec::new();
-        for server in &self.enabled {
-            match self.controller.set_enabled(server, true).await {
+        let results = stream::iter(self.enabled.iter().cloned().map(|server| {
+            let controller = self.controller.clone();
+            async move {
+                let result = controller.set_enabled(&server, true).await;
+                (server, result)
+            }
+        }))
+        .buffered(self.concurrency.get())
+        .collect::<Vec<_>>()
+        .await;
+        results
+            .into_iter()
+            .filter_map(|(server, result)| match result {
                 Ok(snapshot) => match snapshot.state {
                     zuno_mcp::McpServerState::Failed { error }
                     | zuno_mcp::McpServerState::NeedsClientRegistration { error } => {
-                        notes.push(format!("warning: MCP server `{server}` failed: {error}"));
+                        Some(format!("warning: MCP server `{server}` failed: {error}"))
                     }
-                    zuno_mcp::McpServerState::NeedsAuth => {
-                        notes.push(format!(
-                            "warning: MCP server `{server}` needs authorization completed \
-                             before its tools are available; run `zuno mcp` to authorize it"
-                        ));
-                    }
+                    zuno_mcp::McpServerState::NeedsAuth => Some(format!(
+                        "warning: MCP server `{server}` needs authorization completed \
+                         before its tools are available; run `zuno mcp` to authorize it"
+                    )),
                     zuno_mcp::McpServerState::Connected
                     | zuno_mcp::McpServerState::Connecting
                     | zuno_mcp::McpServerState::Disconnecting
-                    | zuno_mcp::McpServerState::Disabled => {}
+                    | zuno_mcp::McpServerState::Disabled => None,
                 },
-                Err(error) => {
-                    notes.push(format!("warning: MCP server `{server}` failed: {error}"));
-                }
-            }
-        }
-        notes
+                Err(error) => Some(format!("warning: MCP server `{server}` failed: {error}")),
+            })
+            .collect()
     }
 
     /// The catalog to hand a host.
@@ -137,8 +145,14 @@ impl McpRuntime {
     /// [`zuno_mcp::McpConnection::close`] deletes it. A headless surface has an exit
     /// it can await, so it awaits.
     pub(crate) async fn shutdown(self) {
-        for server in &self.enabled {
-            let _result = self.controller.set_enabled(server, false).await;
-        }
+        stream::iter(self.enabled.into_iter().map(|server| {
+            let controller = self.controller.clone();
+            async move {
+                let _result = controller.set_enabled(&server, false).await;
+            }
+        }))
+        .buffered(self.concurrency.get())
+        .collect::<Vec<_>>()
+        .await;
     }
 }

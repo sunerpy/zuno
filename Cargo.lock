@@ -5114,6 +5114,7 @@ dependencies = [
  "zuno-provider-compatible",
  "zuno-provider-google",
  "zuno-provider-openai",
+ "zuno-pty",
  "zuno-runtime",
  "zuno-search",
  "zuno-server",
@@ -5277,6 +5278,7 @@ name = "zuno-lsp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "schemars",
  "serde",
  "serde_json",
@@ -5707,6 +5709,7 @@ dependencies = [
  "zuno-network",
  "zuno-paths",
  "zuno-permission",
+ "zuno-pty",
  "zuno-search",
  "zuno-testkit",
  "zuno-tool",

@@ -12,8 +12,8 @@ use zuno_db::{Connection, migration, open};
 use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
-    AgentModelResolver, ResolvedAgent, ResolvedModel, RunTurnRequest, ToolFailureRecovery,
-    TurnContext, TurnEvent, TurnOutcome, event_channel, run_turn,
+    AgentModelResolver, ResolvedAgent, ResolvedModel, RunTurnRequest, ToolConcurrencyLimit,
+    ToolFailureRecovery, TurnContext, TurnEvent, TurnOutcome, event_channel, run_turn,
 };
 use zuno_error::{ProviderError, ToolError};
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -22,7 +22,7 @@ use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
 use zuno_permission::{PermissionAction, Rule};
-use zuno_tool::{AllowAll, Tool, ToolContext, ToolOutput, ToolReplayPolicy};
+use zuno_tool::{AllowAll, Tool, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy};
 
 const SESSION_ID: &str = "ses_dispatch_loop";
 
@@ -117,6 +117,59 @@ impl Tool for SequentialTool {
         tokio::time::sleep(Duration::from_millis(10)).await;
         self.active.fetch_sub(1, Ordering::SeqCst);
         Ok(ToolOutput::text("bash", format!("ran {command}")))
+    }
+}
+
+#[derive(Default)]
+struct ParallelState {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    completed: Mutex<Vec<String>>,
+}
+
+struct ParallelTool {
+    state: Arc<ParallelState>,
+}
+
+#[async_trait]
+impl Tool for ParallelTool {
+    fn id(&self) -> &str {
+        "parallel"
+    }
+
+    fn description(&self) -> &str {
+        "A read-only operation that may overlap with peers."
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::ParallelSafe
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let active = self.state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.state.max_active.fetch_max(active, Ordering::SeqCst);
+        let command = args["command"].as_str().expect("command string");
+        let delay = match command {
+            "first" => 30,
+            "second" => 20,
+            _ => 10,
+        };
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        self.state
+            .completed
+            .lock()
+            .expect("completed lock")
+            .push(command.to_owned());
+        self.state.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("parallel", format!("completed {command}")))
     }
 }
 
@@ -390,6 +443,89 @@ async fn dispatch_loop_runs_three_calls_sequentially_with_complete_transitions()
     assert_eq!(statuses, ["completed", "completed", "completed"]);
     assert_eq!(order, ["first", "second", "third"]);
     eprintln!("HAPPY_QA transcript={transcript:?} persisted={statuses:?} order={order:?}");
+}
+
+#[tokio::test]
+async fn parallel_safe_calls_overlap_but_persist_and_emit_in_model_order() {
+    let mut connection = seeded();
+    let calls = [
+        ("call-one", "first"),
+        ("call-two", "second"),
+        ("call-three", "third"),
+    ];
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "parallel", &calls,
+    )));
+    let providers = registry(provider);
+    let state = Arc::new(ParallelState::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(ParallelTool {
+            state: Arc::clone(&state),
+        })],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        InterruptSignal::new(),
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-parallel-safe", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_tool_concurrency(ToolConcurrencyLimit::new(3).expect("valid limit")),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(outcome, Ok(TurnOutcome::Completed { .. })));
+    assert_eq!(state.max_active.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *state.completed.lock().expect("completed lock"),
+        ["third", "second", "first"],
+        "shorter calls should physically settle first"
+    );
+    assert_eq!(
+        lifecycle(&events),
+        [
+            "call-one:running",
+            "call-two:running",
+            "call-three:running",
+            "call-one:completed",
+            "call-one:result:ok",
+            "call-two:completed",
+            "call-two:result:ok",
+            "call-three:completed",
+            "call-three:result:ok",
+        ],
+        "durable and client-visible order must remain the provider's call order"
+    );
+    let outputs = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate turn")
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .filter(|part| part.kind == PartKind::Tool)
+        .map(|part| {
+            part.data["state"]["output"]
+                .as_str()
+                .expect("tool output")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outputs,
+        ["completed first", "completed second", "completed third"]
+    );
 }
 
 #[tokio::test]

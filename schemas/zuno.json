@@ -283,6 +283,53 @@
       },
       "type": "object"
     },
+    "ConcurrencyConfig": {
+      "additionalProperties": false,
+      "description": "Optional per-layer concurrency overrides.",
+      "properties": {
+        "lsp_requests": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrencyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum independent LSP servers or file requests executing at once."
+        },
+        "mcp_connections": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrencyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum MCP servers connecting or disconnecting at once."
+        },
+        "tool_calls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrencyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum independent model-issued tool calls executing at once."
+        }
+      },
+      "type": "object"
+    },
+    "ConcurrencyLimit": {
+      "description": "Small positive concurrency bound accepted at every runtime boundary.",
+      "format": "uint8",
+      "maximum": 64,
+      "minimum": 1,
+      "type": "integer"
+    },
     "EnterpriseConfig": {
       "description": "Enterprise deployment settings (`config/config.ts:134-136`).",
       "properties": {
@@ -2209,6 +2256,17 @@
         }
       ],
       "description": "Context-compaction behaviour."
+    },
+    "concurrency": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConcurrencyConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Bounded concurrency for independent runtime capabilities."
     },
     "default_agent": {
       "description": "Agent to use when none is named. Must be a primary agent.",

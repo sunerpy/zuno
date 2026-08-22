@@ -74,6 +74,63 @@ where
     guarded_argv_for_mode(program, arguments, SUPERVISE_FOREGROUND_MODE)
 }
 
+/// Terminates one process and every descendant contained in its process group.
+///
+/// Callers must launch the process as a process-group leader on Unix. Zuno's
+/// resident process hosts do that at spawn time; on Windows the operating system
+/// does not expose the same primitive, so `taskkill /T` is used.
+///
+/// A graceful signal is followed by a bounded hard kill. The function is
+/// intentionally idempotent: asking to stop an already-exited process succeeds.
+pub fn terminate_process_tree(pid: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let Some(process) = rustix::process::Pid::from_raw(pid as i32) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process id must be positive",
+            ));
+        };
+        for signal in [rustix::process::Signal::TERM, rustix::process::Signal::KILL] {
+            match rustix::process::kill_process_group(process, signal) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if signal == rustix::process::Signal::TERM {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+        match rustix::process::kill_process(process, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/pid", &pid.to_string(), "/f", "/t"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            // `taskkill` uses a non-zero status for a process that already exited.
+            // Checking again makes cancellation idempotent without hiding a live
+            // process that genuinely refused termination.
+            if windows_process_exists(pid) {
+                Err(io::Error::other(format!(
+                    "taskkill failed for process tree {pid} with status {status}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 fn guarded_argv_for_mode<I, S>(
     program: impl AsRef<OsStr>,
     arguments: I,

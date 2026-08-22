@@ -14,13 +14,15 @@ use zuno_llm::cache::McpToolStatus;
 use zuno_permission::visibility::{is_tool_visible, permission_key};
 use zuno_permission::{PermissionAction, Rule, evaluate};
 use zuno_tool::{
-    ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, PermissionAsk, PermissionAsker, Tool, ToolContext,
-    ToolDefinition, ToolOutput, ToolReplayPolicy,
+    ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, PermissionAsk, PermissionAsker, Tool,
+    ToolConcurrencyPolicy, ToolContext, ToolDefinition, ToolOutput, ToolReplayPolicy,
 };
 
 use crate::hooks::{NoopHooks, PermissionHookDecision, ToolHooks};
 use crate::interrupt::BackgroundToolSignal;
-use crate::r#loop::{AvailableTools, DispatchRequest, ToolDispatchResult, ToolDispatcher};
+use crate::r#loop::{
+    AvailableTools, DispatchRequest, PreparedToolDispatch, ToolDispatchResult, ToolDispatcher,
+};
 
 /// Time afforded to a tool to finish normally after a background request.
 ///
@@ -91,7 +93,20 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         AvailableTools::new(self.visible_definitions(), self.mcp_status)
     }
 
-    async fn dispatch(&self, mut request: DispatchRequest) -> ToolDispatchResult {
+    fn concurrency_policy(&self, request: &DispatchRequest) -> ToolConcurrencyPolicy {
+        self.tool(&request.call.name)
+            .filter(|_| {
+                request
+                    .available_tools
+                    .iter()
+                    .any(|definition| definition.id == request.call.name)
+            })
+            .map_or(ToolConcurrencyPolicy::Exclusive, |tool| {
+                tool.concurrency_policy()
+            })
+    }
+
+    async fn prepare(&self, mut request: DispatchRequest) -> PreparedToolDispatch {
         let requested_name = request.call.name.clone();
         let resolved_name = requested_name.as_str();
         let available = available_names(&request.available_tools);
@@ -102,7 +117,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                 .iter()
                 .any(|definition| definition.id == resolved_name)
         }) else {
-            return unknown_tool_result(&requested_name, &available);
+            return PreparedToolDispatch::ready(unknown_tool_result(&requested_name, &available));
         };
         let replay_policy = tool.replay_policy();
 
@@ -116,25 +131,25 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             )
             .await
         {
-            return error_result(resolved_name, error);
+            return PreparedToolDispatch::ready(error_result(resolved_name, error));
         }
 
         if let Some(input_error) = &request.call.input_error {
-            return error_result(
+            return PreparedToolDispatch::ready(error_result(
                 resolved_name,
                 format!(
                     "Malformed arguments for tool `{resolved_name}`: {input_error}. Raw input: {}",
                     request.call.raw_input
                 ),
-            );
+            ));
         }
 
         let definition = tool.definition();
         if let Err(error) = validate_arguments(&definition.parameters, &request.call.input) {
-            return error_result(
+            return PreparedToolDispatch::ready(error_result(
                 resolved_name,
                 format!("Invalid arguments for tool `{resolved_name}`: {error}"),
-            );
+            ));
         }
 
         let ask = permission_ask(resolved_name, &request.call.input);
@@ -148,24 +163,27 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         );
         let plugin_permission = match self.hooks.permission(&permission_request).await {
             Ok(decision) => decision,
-            Err(error) => return error_result(resolved_name, error),
+            Err(error) => {
+                return PreparedToolDispatch::ready(error_result(resolved_name, error));
+            }
         };
         if plugin_permission == PermissionHookDecision::Deny {
-            return error_result(
+            return PreparedToolDispatch::ready(error_result(
                 resolved_name,
                 format!("Tool `{resolved_name}` was denied by a plugin."),
-            );
+            ));
         }
         let permission = Arc::new(RulePermissionAsker::new(
             Arc::clone(&self.rules),
             Arc::clone(&self.approval),
         ));
         if let Err(error) = permission.gate(resolved_name, ask, plugin_permission).await {
-            return tool_error_result(resolved_name, replay_policy, &error);
+            return PreparedToolDispatch::ready(tool_error_result(
+                resolved_name,
+                replay_policy,
+                &error,
+            ));
         }
-
-        let background_epoch = self.background_tool.epoch();
-        let _reset_applied = self.background_tool.reset_if_epoch(background_epoch);
 
         let interrupt = request.interrupt.clone();
         let permission: Arc<dyn PermissionAsker> = permission;
@@ -179,45 +197,53 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         );
         let args = request.call.input.clone();
         let tool_name = resolved_name.to_owned();
-        let mut execution = tokio::spawn(async move { tool.invoke(args, context).await });
+        let session_id = request.session_id;
+        let call_id = request.call.id;
+        let hook_args = request.call.input;
+        let hooks = Arc::clone(&self.hooks);
+        let background_tool = self.background_tool.clone();
+        PreparedToolDispatch::new(Box::pin(async move {
+            let background_epoch = background_tool.epoch();
+            let _reset_applied = background_tool.reset_if_epoch(background_epoch);
+            let mut execution = tokio::spawn(async move { tool.invoke(args, context).await });
 
-        let mut result = tokio::select! {
-            biased;
-            joined = &mut execution => joined_result(&tool_name, replay_policy, joined),
-            () = self.background_tool.notified() => {
-                match tokio::time::timeout(BACKGROUND_GRACE_PERIOD, &mut execution).await {
-                    Ok(joined) => joined_result(&tool_name, replay_policy, joined),
-                    Err(_) => ToolDispatchResult::success(ToolOutput::text(
-                        format!("{tool_name} running in background"),
-                        format!(
-                            "Tool `{tool_name}` is still running in the background after the {}ms grace period.",
-                            BACKGROUND_GRACE_PERIOD.as_millis()
-                        ),
-                    )),
+            let mut result = tokio::select! {
+                biased;
+                joined = &mut execution => joined_result(&tool_name, replay_policy, joined),
+                () = background_tool.notified() => {
+                    match tokio::time::timeout(BACKGROUND_GRACE_PERIOD, &mut execution).await {
+                        Ok(joined) => joined_result(&tool_name, replay_policy, joined),
+                        Err(_) => ToolDispatchResult::success(ToolOutput::text(
+                            format!("{tool_name} running in background"),
+                            format!(
+                                "Tool `{tool_name}` is still running in the background after the {}ms grace period.",
+                                BACKGROUND_GRACE_PERIOD.as_millis()
+                            ),
+                        )),
+                    }
                 }
-            }
-            () = interrupt.notified() => {
-                execution.abort();
-                error_result(
+                () = interrupt.notified() => {
+                    execution.abort();
+                    error_result(
+                        &tool_name,
+                        format!("Tool `{tool_name}` was interrupted before it completed."),
+                    )
+                }
+            };
+            if let Err(error) = hooks
+                .after(
                     &tool_name,
-                    format!("Tool `{tool_name}` was interrupted before it completed."),
+                    &session_id,
+                    &call_id,
+                    &hook_args,
+                    &mut result.output,
                 )
+                .await
+            {
+                return error_result(&tool_name, error);
             }
-        };
-        if let Err(error) = self
-            .hooks
-            .after(
-                resolved_name,
-                &request.session_id,
-                &request.call.id,
-                &request.call.input,
-                &mut result.output,
-            )
-            .await
-        {
-            return error_result(resolved_name, error);
-        }
-        result
+            result
+        }))
     }
 }
 

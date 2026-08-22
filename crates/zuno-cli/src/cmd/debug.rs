@@ -268,7 +268,15 @@ fn snapshot(command: &DebugSnapshotCommand, context: &Context) -> Result<(), Str
 fn lsp(command: &DebugLspCommand, context: &Context) -> Result<(), String> {
     let resolved = ResolvedLsp::resolve(context.config.lsp.as_ref());
     let registry = Arc::new(ServerRegistry::offline(&resolved));
-    let manager = Manager::new(&context.directory, registry, RestartPolicy::default());
+    let manager = Manager::new(
+        &context.directory,
+        registry,
+        RestartPolicy::default(),
+        std::num::NonZeroUsize::new(usize::from(
+            context.config.resolved_concurrency().lsp_requests,
+        ))
+        .expect("configuration validates LSP concurrency"),
+    );
     let runtime = runtime()?;
     runtime.block_on(async {
         let result: Result<serde_json::Value, String> = match command {
