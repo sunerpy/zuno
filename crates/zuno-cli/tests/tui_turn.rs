@@ -651,7 +651,7 @@ fn run_consecutive_session_deletes_under_pty(
         std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
     })?;
     let command = format!(
-        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto -s {PICKER_SECOND_ID}",
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto",
         shell_quote(&binary().to_string_lossy())
     );
     let mut child = Command::new(&script)
@@ -699,6 +699,7 @@ fn run_consecutive_session_deletes_under_pty(
     let mut third_title_count_before_remount = 0;
     let mut exit_sent = false;
     let mut saw_wanted = false;
+    let mut launched_session_id = None;
 
     while started.elapsed() < PICKER_BUDGET {
         let disconnected = match received.recv_timeout(Duration::from_millis(100)) {
@@ -710,19 +711,36 @@ fn run_consecutive_session_deletes_under_pty(
             Err(mpsc::RecvTimeoutError::Disconnected) => true,
         };
 
-        let first_deleted = store
-            .find(PICKER_SECOND_ID)
-            .expect("read the first deleted session")
-            .is_none();
         let mut query = zuno_db::session::ListQuery::directory(directory.clone()).active_only();
         query.roots = true;
         let remaining = store
             .list(&query)
             .expect("list sessions after consecutive deletion");
-        let both_deleted =
-            matches!(remaining.as_slice(), [session] if session.id == PICKER_THIRD_ID);
+        if launched_session_id.is_none() {
+            launched_session_id = remaining
+                .iter()
+                .find(|session| {
+                    !matches!(
+                        session.id.as_str(),
+                        PICKER_FIRST_ID | PICKER_SECOND_ID | PICKER_THIRD_ID
+                    )
+                })
+                .map(|session| session.id.clone());
+        }
+        let first_deleted = launched_session_id.as_deref().is_some_and(|id| {
+            store
+                .find(id)
+                .expect("read the newly launched session")
+                .is_none()
+        });
+        let both_deleted = first_deleted
+            && matches!(
+                remaining.as_slice(),
+                [first, third]
+                    if first.id == PICKER_FIRST_ID && third.id == PICKER_THIRD_ID
+            );
 
-        if text.contains(&format!("resume this session: zuno -s {PICKER_THIRD_ID}")) {
+        if text.contains(&format!("resume this session: zuno -s {PICKER_FIRST_ID}")) {
             let entered = text.matches("\u{1b}[?1049h").count();
             let left = text.matches("\u{1b}[?1049l").count();
             saw_wanted = both_deleted && entered == 1 && left == 1;
