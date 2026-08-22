@@ -6,7 +6,7 @@ use crate::r#loop::{
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::sync::Arc;
-use zuno_runtime::{Component, MountContext, RuntimeError};
+use zuno_runtime::{Component, PrepareContext, RuntimeError};
 
 /// Stable component id used by profiles that replace the active driver.
 pub const AGENT_DRIVER_COMPONENT_ID: &str = "agent-driver";
@@ -63,7 +63,7 @@ impl Component for AgentDriverComponent {
         AGENT_DRIVER_COMPONENT_ID
     }
 
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError> {
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
         context.provide::<dyn AgentDriver>(Arc::clone(&self.driver))
     }
 }

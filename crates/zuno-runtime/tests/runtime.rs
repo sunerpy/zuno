@@ -1,9 +1,14 @@
 use async_trait::async_trait;
+use std::future::pending;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Notify;
 use zuno_runtime::{
-    Component, HarnessProfile, HarnessRuntime, MountContext, ProfileBundle, RuntimeError,
+    Component, EffectError, HarnessProfile, HarnessRuntime, LifecycleFailureKind, LifecyclePhase,
+    LifecycleState, PrepareContext, ProfileBundle, RuntimeError, RuntimeOptions,
 };
+
+type Log = Arc<Mutex<Vec<String>>>;
 
 trait Greeting: Send + Sync {
     fn text(&self) -> &'static str;
@@ -14,65 +19,6 @@ struct GreetingService(&'static str);
 impl Greeting for GreetingService {
     fn text(&self) -> &'static str {
         self.0
-    }
-}
-
-struct GreetingComponent {
-    id: &'static str,
-    value: &'static str,
-    cleanup: Arc<Mutex<Vec<String>>>,
-}
-
-#[async_trait]
-impl Component for GreetingComponent {
-    fn id(&self) -> &str {
-        self.id
-    }
-
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError> {
-        context.provide::<dyn Greeting>(Arc::new(GreetingService(self.value)))?;
-        let id = self.id.to_owned();
-        let cleanup = Arc::clone(&self.cleanup);
-        context.on_close(move || async move {
-            cleanup.lock().expect("cleanup log").push(id);
-        });
-        Ok(())
-    }
-}
-
-struct FailingComponent {
-    id: &'static str,
-    cleanup: Arc<Mutex<Vec<String>>>,
-}
-
-#[async_trait]
-impl Component for FailingComponent {
-    fn id(&self) -> &str {
-        self.id
-    }
-
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError> {
-        context.provide::<dyn Greeting>(Arc::new(GreetingService("candidate")))?;
-        let id = self.id.to_owned();
-        let cleanup = Arc::clone(&self.cleanup);
-        context.on_close(move || async move {
-            cleanup.lock().expect("cleanup log").push(id);
-        });
-        Err(RuntimeError::Component("candidate rejected".to_owned()))
-    }
-}
-
-struct RequiresGreeting;
-
-#[async_trait]
-impl Component for RequiresGreeting {
-    fn id(&self) -> &str {
-        "consumer"
-    }
-
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError> {
-        let _greeting = context.require::<dyn Greeting>()?;
-        Ok(())
     }
 }
 
@@ -88,309 +34,602 @@ impl Summary for SummaryService {
     }
 }
 
+struct GreetingComponent {
+    id: &'static str,
+    value: &'static str,
+    log: Log,
+}
+
+#[async_trait]
+impl Component for GreetingComponent {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide::<dyn Greeting>(Arc::new(GreetingService(self.value)))?;
+        let id = self.id.to_owned();
+        let start_log = Arc::clone(&self.log);
+        context.effect("lifecycle", move || async move {
+            start_log
+                .lock()
+                .expect("lifecycle log")
+                .push(format!("start:{id}"));
+            let stop_id = id.clone();
+            let stop_log = Arc::clone(&start_log);
+            Ok::<_, EffectError>(move || async move {
+                stop_log
+                    .lock()
+                    .expect("lifecycle log")
+                    .push(format!("stop:{stop_id}"));
+                Ok(())
+            })
+        })
+    }
+}
+
 struct SummaryComponent {
-    cleanup: Arc<Mutex<Vec<String>>>,
+    id: &'static str,
+    log: Log,
 }
 
 #[async_trait]
 impl Component for SummaryComponent {
     fn id(&self) -> &str {
-        "summary"
+        self.id
     }
 
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError> {
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
         let greeting = context.require::<dyn Greeting>()?;
         context.provide::<dyn Summary>(Arc::new(SummaryService(greeting.text())))?;
-        let cleanup = Arc::clone(&self.cleanup);
-        context.on_close(move || async move {
-            cleanup
+        let id = self.id.to_owned();
+        let start_log = Arc::clone(&self.log);
+        context.effect("lifecycle", move || async move {
+            start_log
                 .lock()
-                .expect("cleanup log")
-                .push("summary".to_owned());
-        });
-        Ok(())
+                .expect("lifecycle log")
+                .push(format!("start:{id}"));
+            let stop_id = id.clone();
+            let stop_log = Arc::clone(&start_log);
+            Ok::<_, EffectError>(move || async move {
+                stop_log
+                    .lock()
+                    .expect("lifecycle log")
+                    .push(format!("stop:{stop_id}"));
+                Ok(())
+            })
+        })
     }
 }
 
-struct GateComponent {
-    started: Arc<Notify>,
-    release: Arc<Notify>,
-    cleanup: Arc<Mutex<Vec<String>>>,
+struct FailingPrepare {
+    started: Arc<Mutex<bool>>,
 }
 
 #[async_trait]
-impl Component for GateComponent {
+impl Component for FailingPrepare {
     fn id(&self) -> &str {
-        "gate"
+        "failing-prepare"
     }
 
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError> {
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
         let started = Arc::clone(&self.started);
-        let release = Arc::clone(&self.release);
-        let cleanup = Arc::clone(&self.cleanup);
-        context.on_close(move || async move {
-            cleanup.lock().expect("cleanup log").push("gate".to_owned());
-        });
-        started.notify_one();
-        release.notified().await;
+        context.effect("must-not-start", move || async move {
+            *started.lock().expect("started flag") = true;
+            Ok::<_, EffectError>(|| async { Ok(()) })
+        })?;
+        Err(RuntimeError::Component("candidate rejected".to_owned()))
+    }
+}
+
+struct BlockingPrepare {
+    prepared: Arc<Notify>,
+    release: Arc<Notify>,
+    started: Arc<Mutex<bool>>,
+}
+
+#[async_trait]
+impl Component for BlockingPrepare {
+    fn id(&self) -> &str {
+        "blocking-prepare"
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide::<dyn Greeting>(Arc::new(GreetingService("candidate")))?;
+        let started = Arc::clone(&self.started);
+        context.effect("deferred", move || async move {
+            *started.lock().expect("started flag") = true;
+            Ok::<_, EffectError>(|| async { Ok(()) })
+        })?;
+        self.prepared.notify_one();
+        self.release.notified().await;
         Ok(())
     }
 }
 
+struct BlockingStart {
+    start_entered: Arc<Notify>,
+    start_release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Component for BlockingStart {
+    fn id(&self) -> &str {
+        "blocking-start"
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide::<dyn Greeting>(Arc::new(GreetingService("candidate")))?;
+        let entered = Arc::clone(&self.start_entered);
+        let release = Arc::clone(&self.start_release);
+        context.effect("blocking", move || async move {
+            entered.notify_one();
+            release.notified().await;
+            Ok::<_, EffectError>(|| async { Ok(()) })
+        })
+    }
+}
+
+struct FailingStart {
+    id: &'static str,
+}
+
+#[async_trait]
+impl Component for FailingStart {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide::<dyn Greeting>(Arc::new(GreetingService("candidate")))?;
+        context.effect("start", || async {
+            Err::<fn() -> std::future::Ready<Result<(), EffectError>>, _>(EffectError::new(
+                "start rejected",
+            ))
+        })
+    }
+}
+
+struct BlockingStop {
+    stop_entered: Arc<Notify>,
+    stop_release: Arc<Notify>,
+}
+
+#[async_trait]
+impl Component for BlockingStop {
+    fn id(&self) -> &str {
+        "blocking-stop"
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide::<dyn Greeting>(Arc::new(GreetingService("blocking")))?;
+        let entered = Arc::clone(&self.stop_entered);
+        let release = Arc::clone(&self.stop_release);
+        context.effect("worker", move || async move {
+            Ok::<_, EffectError>(move || async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        })
+    }
+}
+
+struct HangingStop;
+
+#[async_trait]
+impl Component for HangingStop {
+    fn id(&self) -> &str {
+        "hanging-stop"
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide::<dyn Greeting>(Arc::new(GreetingService("hanging")))?;
+        context.effect("worker", || async {
+            Ok::<_, EffectError>(|| async {
+                pending::<()>().await;
+                Ok(())
+            })
+        })
+    }
+}
+
+struct FailingStop;
+
+#[async_trait]
+impl Component for FailingStop {
+    fn id(&self) -> &str {
+        "failing-stop"
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide::<dyn Greeting>(Arc::new(GreetingService("failing")))?;
+        context.effect("worker", || async {
+            Ok::<_, EffectError>(|| async { Err(EffectError::new("stop rejected")) })
+        })
+    }
+}
+
+fn greeting(id: &'static str, value: &'static str, log: &Log) -> GreetingComponent {
+    GreetingComponent {
+        id,
+        value,
+        log: Arc::clone(log),
+    }
+}
+
+fn summary(id: &'static str, log: &Log) -> SummaryComponent {
+    SummaryComponent {
+        id,
+        log: Arc::clone(log),
+    }
+}
+
 #[tokio::test]
-async fn mounted_component_exposes_a_typed_trait_service() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+async fn prepare_is_side_effect_free_and_candidate_services_stay_hidden() {
+    let prepared = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let started = Arc::new(Mutex::new(false));
     let runtime = HarnessRuntime::new("root");
+    let preparing = {
+        let runtime = runtime.clone();
+        let component = BlockingPrepare {
+            prepared: Arc::clone(&prepared),
+            release: Arc::clone(&release),
+            started: Arc::clone(&started),
+        };
+        tokio::spawn(async move { runtime.mount(component).await })
+    };
 
-    runtime
-        .mount(GreetingComponent {
-            id: "greeting",
-            value: "hello",
-            cleanup,
-        })
+    prepared.notified().await;
+    assert!(!*started.lock().expect("started flag"));
+    assert!(runtime.service::<dyn Greeting>().is_none());
+    assert_eq!(runtime.snapshot().state, LifecycleState::Preparing);
+
+    release.notify_one();
+    preparing
         .await
+        .expect("mount task")
         .expect("component mounts");
-
+    assert!(*started.lock().expect("started flag"));
     assert_eq!(
-        runtime
-            .service::<dyn Greeting>()
-            .expect("greeting service")
-            .text(),
-        "hello"
+        runtime.service::<dyn Greeting>().expect("service").text(),
+        "candidate"
     );
 }
 
 #[tokio::test]
-async fn child_scope_shadows_then_reveals_its_parent_service() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
-    let root = HarnessRuntime::new("root");
-    root.mount(GreetingComponent {
-        id: "root-greeting",
-        value: "root",
-        cleanup: Arc::clone(&cleanup),
-    })
-    .await
-    .expect("root component mounts");
-    let child = root.child("session");
-    child
-        .mount(GreetingComponent {
-            id: "session-greeting",
-            value: "session",
-            cleanup,
-        })
-        .await
-        .expect("child component mounts");
-
-    assert_eq!(
-        child
-            .service::<dyn Greeting>()
-            .expect("child service")
-            .text(),
-        "session"
-    );
-    child
-        .unmount("session-greeting")
-        .await
-        .expect("child component unmounts");
-    assert_eq!(
-        child
-            .service::<dyn Greeting>()
-            .expect("parent service is visible again")
-            .text(),
-        "root"
-    );
-}
-
-#[tokio::test]
-async fn failed_mount_rolls_back_staged_services_and_effects() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+async fn a_prepare_failure_drops_unstarted_effects() {
+    let started = Arc::new(Mutex::new(false));
     let runtime = HarnessRuntime::new("root");
 
     let error = runtime
-        .mount(FailingComponent {
-            id: "candidate",
-            cleanup: Arc::clone(&cleanup),
+        .mount(FailingPrepare {
+            started: Arc::clone(&started),
         })
         .await
-        .expect_err("candidate must fail");
+        .expect_err("prepare must fail");
 
     assert_eq!(
         error,
         RuntimeError::Component("candidate rejected".to_owned())
     );
+    assert!(!*started.lock().expect("started flag"));
     assert!(runtime.service::<dyn Greeting>().is_none());
-    assert_eq!(*cleanup.lock().expect("cleanup log"), ["candidate"]);
+    assert_eq!(runtime.snapshot().state, LifecycleState::Stopped);
 }
 
 #[tokio::test]
-async fn failed_replace_leaves_the_previous_component_live() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+async fn candidate_services_are_not_published_until_effect_start_finishes() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
     let runtime = HarnessRuntime::new("root");
-    runtime
-        .mount(GreetingComponent {
-            id: "greeting",
-            value: "old",
-            cleanup: Arc::clone(&cleanup),
-        })
-        .await
-        .expect("old component mounts");
+    let mounting = {
+        let runtime = runtime.clone();
+        let component = BlockingStart {
+            start_entered: Arc::clone(&entered),
+            start_release: Arc::clone(&release),
+        };
+        tokio::spawn(async move { runtime.mount(component).await })
+    };
 
-    runtime
-        .replace(FailingComponent {
-            id: "greeting",
-            cleanup: Arc::clone(&cleanup),
-        })
-        .await
-        .expect_err("candidate replacement must fail");
+    entered.notified().await;
+    assert!(runtime.service::<dyn Greeting>().is_none());
+    assert_eq!(runtime.snapshot().state, LifecycleState::Preparing);
 
+    release.notify_one();
+    mounting.await.expect("mount task").expect("mount succeeds");
     assert_eq!(
-        runtime
-            .service::<dyn Greeting>()
-            .expect("old service remains")
-            .text(),
-        "old"
-    );
-    assert_eq!(*cleanup.lock().expect("cleanup log"), ["greeting"]);
-}
-
-#[tokio::test]
-async fn shutdown_cleans_components_in_reverse_mount_order_and_closes_the_scope() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
-    let runtime = HarnessRuntime::new("root");
-    for id in ["first", "second", "third"] {
-        runtime
-            .mount(GreetingComponent {
-                id,
-                value: id,
-                cleanup: Arc::clone(&cleanup),
-            })
-            .await
-            .expect("component mounts");
-    }
-
-    runtime.shutdown().await.expect("runtime shuts down");
-
-    assert_eq!(
-        *cleanup.lock().expect("cleanup log"),
-        ["third", "second", "first"]
-    );
-    assert_eq!(
-        runtime.mount(RequiresGreeting).await,
-        Err(RuntimeError::Closed)
+        runtime.service::<dyn Greeting>().expect("service").text(),
+        "candidate"
     );
 }
 
 #[tokio::test]
-async fn missing_required_service_fails_at_mount_time() {
-    let runtime = HarnessRuntime::new("root");
-
-    let error = runtime
-        .mount(RequiresGreeting)
-        .await
-        .expect_err("missing service must reject the component");
-
-    assert!(matches!(error, RuntimeError::MissingService(name) if name.contains("Greeting")));
-}
-
-#[tokio::test]
-async fn successful_replace_publishes_the_candidate_then_cleans_the_previous_component() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+async fn replacement_stops_the_old_effect_before_starting_the_candidate() {
+    let log = Arc::new(Mutex::new(Vec::new()));
     let runtime = HarnessRuntime::new("root");
     runtime
-        .mount(GreetingComponent {
-            id: "greeting",
-            value: "old",
-            cleanup: Arc::clone(&cleanup),
-        })
+        .mount(greeting("greeting", "old", &log))
         .await
-        .expect("old component mounts");
-
+        .expect("old mounts");
     runtime
-        .replace(GreetingComponent {
-            id: "greeting",
-            value: "new",
-            cleanup: Arc::clone(&cleanup),
-        })
+        .replace(greeting("greeting", "new", &log))
         .await
         .expect("replacement mounts");
 
     assert_eq!(
-        runtime
-            .service::<dyn Greeting>()
-            .expect("new service is live")
-            .text(),
-        "new"
+        *log.lock().expect("lifecycle log"),
+        ["start:greeting", "stop:greeting", "start:greeting"]
     );
-    assert_eq!(*cleanup.lock().expect("cleanup log"), ["greeting"]);
-    runtime.shutdown().await.expect("runtime shuts down");
     assert_eq!(
-        *cleanup.lock().expect("cleanup log"),
-        ["greeting", "greeting"]
+        runtime.service::<dyn Greeting>().expect("service").text(),
+        "new"
     );
 }
 
 #[tokio::test]
-async fn unmount_reveals_the_previous_provider_in_the_same_scope() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+async fn a_failed_candidate_start_restores_the_previous_composition() {
+    let log = Arc::new(Mutex::new(Vec::new()));
     let runtime = HarnessRuntime::new("root");
-    for (id, value) in [("first", "one"), ("second", "two")] {
+    runtime
+        .mount(greeting("greeting", "old", &log))
+        .await
+        .expect("old mounts");
+
+    let error = runtime
+        .replace(FailingStart { id: "greeting" })
+        .await
+        .expect_err("candidate start fails");
+
+    assert!(error.to_string().contains("start rejected"));
+    assert_eq!(
+        runtime.service::<dyn Greeting>().expect("restored").text(),
+        "old"
+    );
+    assert_eq!(
+        *log.lock().expect("lifecycle log"),
+        ["start:greeting", "stop:greeting", "start:greeting"]
+    );
+    assert_eq!(runtime.snapshot().state, LifecycleState::Active);
+}
+
+#[tokio::test]
+async fn replacement_reprepares_consumers_against_the_new_provider() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let runtime = HarnessRuntime::new("root");
+    runtime
+        .mount(greeting("greeting", "old", &log))
+        .await
+        .expect("provider mounts");
+    runtime
+        .mount(summary("summary", &log))
+        .await
+        .expect("consumer mounts");
+    assert_eq!(
         runtime
-            .mount(GreetingComponent {
-                id,
-                value,
-                cleanup: Arc::clone(&cleanup),
-            })
-            .await
-            .expect("component mounts");
-    }
+            .service::<dyn Summary>()
+            .expect("summary")
+            .greeting(),
+        "old"
+    );
+
+    runtime
+        .replace(greeting("greeting", "new", &log))
+        .await
+        .expect("provider replaces");
 
     assert_eq!(
         runtime
-            .service::<dyn Greeting>()
-            .expect("latest provider")
-            .text(),
-        "two"
+            .service::<dyn Summary>()
+            .expect("summary")
+            .greeting(),
+        "new"
     );
-    runtime.unmount("second").await.expect("provider unmounts");
+    assert_eq!(
+        *log.lock().expect("lifecycle log"),
+        [
+            "start:greeting",
+            "stop:greeting",
+            "start:greeting",
+            "start:summary",
+            "stop:summary",
+            "stop:greeting",
+            "start:greeting",
+            "start:summary",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unmount_reprepares_consumers_against_the_revealed_provider() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let runtime = HarnessRuntime::new("root");
+    runtime
+        .mount(greeting("first", "one", &log))
+        .await
+        .expect("first provider");
+    runtime
+        .mount(greeting("second", "two", &log))
+        .await
+        .expect("second provider");
+    runtime
+        .mount(summary("summary", &log))
+        .await
+        .expect("consumer");
     assert_eq!(
         runtime
-            .service::<dyn Greeting>()
-            .expect("previous provider")
-            .text(),
+            .service::<dyn Summary>()
+            .expect("summary")
+            .greeting(),
+        "two"
+    );
+
+    runtime.unmount("second").await.expect("second unmounts");
+
+    assert_eq!(
+        runtime
+            .service::<dyn Summary>()
+            .expect("summary")
+            .greeting(),
         "one"
     );
 }
 
 #[tokio::test]
-async fn duplicate_component_ids_fail_before_the_candidate_mounts() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+async fn stop_waits_for_quiescence_and_projects_stopping_state() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
     let runtime = HarnessRuntime::new("root");
     runtime
-        .mount(GreetingComponent {
-            id: "greeting",
-            value: "old",
-            cleanup: Arc::clone(&cleanup),
+        .mount(BlockingStop {
+            stop_entered: Arc::clone(&entered),
+            stop_release: Arc::clone(&release),
         })
         .await
-        .expect("first component mounts");
+        .expect("component mounts");
+    let stopping = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.unmount("blocking-stop").await })
+    };
+
+    entered.notified().await;
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.state, LifecycleState::Stopping);
+    assert_eq!(snapshot.components[0].state, LifecycleState::Stopping);
+    assert!(runtime.service::<dyn Greeting>().is_none());
+    assert!(!stopping.is_finished());
+
+    release.notify_one();
+    stopping
+        .await
+        .expect("unmount task")
+        .expect("component stops");
+    assert_eq!(runtime.snapshot().state, LifecycleState::Stopped);
+}
+
+#[tokio::test]
+async fn a_hanging_stop_is_bounded_and_becomes_uncertain() {
+    let runtime = HarnessRuntime::with_options(
+        "root",
+        RuntimeOptions::default().with_stop_timeout(Duration::from_millis(25)),
+    );
+    runtime.mount(HangingStop).await.expect("component mounts");
 
     let error = runtime
-        .mount(GreetingComponent {
-            id: "greeting",
-            value: "new",
-            cleanup,
-        })
+        .unmount("hanging-stop")
         .await
-        .expect_err("duplicate component id must fail");
+        .expect_err("timeout is not a successful unmount");
 
+    assert!(error.to_string().contains("timed out"));
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.state, LifecycleState::Uncertain);
+    assert_eq!(snapshot.components[0].state, LifecycleState::Uncertain);
+    assert_eq!(snapshot.diagnostics.len(), 1);
+    assert_eq!(snapshot.diagnostics[0].kind, LifecycleFailureKind::TimedOut);
+    assert_eq!(snapshot.diagnostics[0].phase, LifecyclePhase::Stop);
+    assert!(runtime.service::<dyn Greeting>().is_none());
+}
+
+#[tokio::test]
+async fn an_explicit_stop_failure_becomes_uncertain() {
+    let runtime = HarnessRuntime::new("root");
+    runtime.mount(FailingStop).await.expect("component mounts");
+
+    let error = runtime
+        .unmount("failing-stop")
+        .await
+        .expect_err("failed disposer is not stopped");
+
+    assert!(error.to_string().contains("stop rejected"));
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.state, LifecycleState::Uncertain);
     assert_eq!(
-        error,
-        RuntimeError::DuplicateComponent("greeting".to_owned())
+        snapshot.diagnostics[0].kind,
+        LifecycleFailureKind::Uncertain
     );
+}
+
+#[tokio::test]
+async fn profile_replacement_reprepares_cross_bundle_dependencies() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let runtime = HarnessRuntime::new("root");
+    runtime
+        .activate_profile(
+            HarnessProfile::new("old")
+                .with_bundle(
+                    ProfileBundle::new("provider")
+                        .with_component(greeting("greeting", "old", &log)),
+                )
+                .with_bundle(
+                    ProfileBundle::new("consumer").with_component(summary("summary", &log)),
+                ),
+        )
+        .await
+        .expect("old profile");
+    assert_eq!(
+        runtime
+            .service::<dyn Summary>()
+            .expect("summary")
+            .greeting(),
+        "old"
+    );
+
+    runtime
+        .activate_profile(
+            HarnessProfile::new("new")
+                .with_bundle(
+                    ProfileBundle::new("provider")
+                        .with_component(greeting("greeting", "new", &log)),
+                )
+                .with_bundle(
+                    ProfileBundle::new("consumer").with_component(summary("summary", &log)),
+                ),
+        )
+        .await
+        .expect("new profile");
+
+    assert_eq!(runtime.active_profile_id().as_deref(), Some("new"));
+    assert_eq!(
+        runtime
+            .service::<dyn Summary>()
+            .expect("summary")
+            .greeting(),
+        "new"
+    );
+}
+
+#[tokio::test]
+async fn failed_profile_prepare_keeps_the_previous_profile_live() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(Mutex::new(false));
+    let runtime = HarnessRuntime::new("root");
+    runtime
+        .activate_profile(HarnessProfile::new("old").with_bundle(
+            ProfileBundle::new("core").with_component(greeting("greeting", "old", &log)),
+        ))
+        .await
+        .expect("old profile");
+
+    runtime
+        .activate_profile(
+            HarnessProfile::new("candidate").with_bundle(
+                ProfileBundle::new("core")
+                    .with_component(greeting("candidate", "new", &log))
+                    .with_component(FailingPrepare {
+                        started: Arc::clone(&started),
+                    }),
+            ),
+        )
+        .await
+        .expect_err("candidate profile prepare fails");
+
+    assert!(!*started.lock().expect("started flag"));
+    assert_eq!(runtime.active_profile_id().as_deref(), Some("old"));
     assert_eq!(
         runtime
             .service::<dyn Greeting>()
-            .expect("first provider remains")
+            .expect("old greeting")
             .text(),
         "old"
     );
@@ -398,255 +637,68 @@ async fn duplicate_component_ids_fail_before_the_candidate_mounts() {
 
 #[tokio::test]
 async fn parent_shutdown_closes_children_before_parent_components() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::new(Mutex::new(Vec::new()));
     let root = HarnessRuntime::new("root");
-    root.mount(GreetingComponent {
-        id: "parent",
-        value: "parent",
-        cleanup: Arc::clone(&cleanup),
-    })
-    .await
-    .expect("parent mounts");
+    root.mount(greeting("parent", "parent", &log))
+        .await
+        .expect("parent mounts");
     let child = root.child("child");
     child
-        .mount(GreetingComponent {
-            id: "child",
-            value: "child",
-            cleanup: Arc::clone(&cleanup),
-        })
+        .mount(greeting("child", "child", &log))
         .await
         .expect("child mounts");
 
     root.shutdown().await.expect("root shuts down");
 
-    assert_eq!(*cleanup.lock().expect("cleanup log"), ["child", "parent"]);
-    assert!(root.service::<dyn Greeting>().is_none());
-    assert!(child.service::<dyn Greeting>().is_none());
     assert_eq!(
-        child.mount(RequiresGreeting).await,
-        Err(RuntimeError::Closed)
+        *log.lock().expect("lifecycle log"),
+        ["start:parent", "start:child", "stop:child", "stop:parent"]
     );
+    assert_eq!(root.snapshot().state, LifecycleState::Closed);
+    assert_eq!(child.snapshot().state, LifecycleState::Closed);
+    assert_eq!(root.mount(FailingStop).await, Err(RuntimeError::Closed));
+    root.shutdown().await.expect("repeated shutdown is a no-op");
 }
 
 #[tokio::test]
-async fn dynamically_selected_components_use_the_same_lifecycle() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
-    let runtime = HarnessRuntime::new("root");
-    let component: Arc<dyn Component> = Arc::new(GreetingComponent {
-        id: "dynamic",
-        value: "dynamic",
-        cleanup,
-    });
-
-    runtime
-        .mount_shared(component)
-        .await
-        .expect("dynamic component mounts");
-
-    assert_eq!(
-        runtime
-            .service::<dyn Greeting>()
-            .expect("dynamic provider")
-            .text(),
-        "dynamic"
-    );
-}
-
-#[tokio::test]
-async fn a_profile_stages_cross_bundle_dependencies_without_exposing_partial_services() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+async fn duplicate_component_ids_fail_before_prepare() {
+    let log = Arc::new(Mutex::new(Vec::new()));
     let runtime = HarnessRuntime::new("root");
     runtime
-        .activate_profile(HarnessProfile::new("old").with_bundle(
-            ProfileBundle::new("core").with_component(GreetingComponent {
-                id: "greeting",
-                value: "old",
-                cleanup: Arc::clone(&cleanup),
-            }),
-        ))
+        .mount(greeting("same", "one", &log))
         .await
-        .expect("old profile activates");
-
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let started_wait = started.notified();
-    let candidate = HarnessProfile::new("new")
-        .with_bundle(
-            ProfileBundle::new("core").with_component(GreetingComponent {
-                id: "greeting",
-                value: "new",
-                cleanup: Arc::clone(&cleanup),
-            }),
-        )
-        .with_bundle(
-            ProfileBundle::new("features")
-                .with_component(SummaryComponent {
-                    cleanup: Arc::clone(&cleanup),
-                })
-                .with_component(GateComponent {
-                    started: Arc::clone(&started),
-                    release: Arc::clone(&release),
-                    cleanup: Arc::clone(&cleanup),
-                }),
-        );
-    let activating = {
-        let runtime = runtime.clone();
-        tokio::spawn(async move { runtime.activate_profile(candidate).await })
-    };
-    started_wait.await;
-
-    assert_eq!(
-        runtime
-            .service::<dyn Greeting>()
-            .expect("old greeting stays visible while staging")
-            .text(),
-        "old"
-    );
-    assert!(
-        runtime.service::<dyn Summary>().is_none(),
-        "candidate-only services are not published before commit"
-    );
-
-    release.notify_one();
-    activating
-        .await
-        .expect("activation task")
-        .expect("candidate activates");
-    assert_eq!(
-        runtime
-            .service::<dyn Greeting>()
-            .expect("new greeting")
-            .text(),
-        "new"
-    );
-    assert_eq!(
-        runtime
-            .service::<dyn Summary>()
-            .expect("summary resolved the candidate greeting")
-            .greeting(),
-        "new"
-    );
-    assert_eq!(runtime.active_profile_id().as_deref(), Some("new"));
-    assert_eq!(*cleanup.lock().expect("cleanup log"), ["greeting"]);
-}
-
-#[tokio::test]
-async fn a_failed_profile_rolls_back_every_candidate_and_keeps_the_previous_profile() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
-    let runtime = HarnessRuntime::new("root");
-    runtime
-        .activate_profile(HarnessProfile::new("old").with_bundle(
-            ProfileBundle::new("core").with_component(GreetingComponent {
-                id: "greeting",
-                value: "old",
-                cleanup: Arc::clone(&cleanup),
-            }),
-        ))
-        .await
-        .expect("old profile activates");
+        .expect("first mounts");
 
     let error = runtime
-        .activate_profile(
-            HarnessProfile::new("candidate").with_bundle(
-                ProfileBundle::new("core")
-                    .with_component(GreetingComponent {
-                        id: "candidate-greeting",
-                        value: "new",
-                        cleanup: Arc::clone(&cleanup),
-                    })
-                    .with_component(FailingComponent {
-                        id: "candidate-failure",
-                        cleanup: Arc::clone(&cleanup),
-                    }),
-            ),
-        )
+        .mount(greeting("same", "two", &log))
         .await
-        .expect_err("candidate profile fails");
+        .expect_err("duplicate id fails");
 
+    assert_eq!(error, RuntimeError::DuplicateComponent("same".to_owned()));
     assert_eq!(
-        error,
-        RuntimeError::Component("candidate rejected".to_owned())
-    );
-    assert_eq!(runtime.active_profile_id().as_deref(), Some("old"));
-    assert_eq!(
-        runtime
-            .service::<dyn Greeting>()
-            .expect("old greeting remains")
-            .text(),
-        "old"
-    );
-    assert_eq!(
-        *cleanup.lock().expect("cleanup log"),
-        ["candidate-failure", "candidate-greeting"]
+        runtime.service::<dyn Greeting>().expect("first").text(),
+        "one"
     );
 }
 
 #[tokio::test]
-async fn profile_replacement_cleans_the_previous_profile_in_reverse_component_order() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
+async fn duplicate_profile_component_ids_fail_without_starting_effects() {
+    let log = Arc::new(Mutex::new(Vec::new()));
     let runtime = HarnessRuntime::new("root");
-    runtime
-        .activate_profile(
-            HarnessProfile::new("old").with_bundle(
-                ProfileBundle::new("core")
-                    .with_component(GreetingComponent {
-                        id: "first",
-                        value: "first",
-                        cleanup: Arc::clone(&cleanup),
-                    })
-                    .with_component(GreetingComponent {
-                        id: "second",
-                        value: "second",
-                        cleanup: Arc::clone(&cleanup),
-                    }),
-            ),
-        )
-        .await
-        .expect("old profile activates");
 
-    runtime
-        .activate_profile(HarnessProfile::new("new").with_bundle(
-            ProfileBundle::new("core").with_component(GreetingComponent {
-                id: "next",
-                value: "next",
-                cleanup: Arc::clone(&cleanup),
-            }),
-        ))
-        .await
-        .expect("new profile activates");
-
-    assert_eq!(
-        runtime
-            .service::<dyn Greeting>()
-            .expect("new profile service")
-            .text(),
-        "next"
-    );
-    assert_eq!(*cleanup.lock().expect("cleanup log"), ["second", "first"]);
-}
-
-#[tokio::test]
-async fn duplicate_component_ids_across_bundles_fail_before_mounting_any_candidate() {
-    let cleanup = Arc::new(Mutex::new(Vec::new()));
-    let runtime = HarnessRuntime::new("root");
     let error = runtime
         .activate_profile(
             HarnessProfile::new("duplicate")
-                .with_bundle(ProfileBundle::new("one").with_component(GreetingComponent {
-                    id: "same",
-                    value: "one",
-                    cleanup: Arc::clone(&cleanup),
-                }))
-                .with_bundle(ProfileBundle::new("two").with_component(GreetingComponent {
-                    id: "same",
-                    value: "two",
-                    cleanup: Arc::clone(&cleanup),
-                })),
+                .with_bundle(
+                    ProfileBundle::new("one").with_component(greeting("same", "one", &log)),
+                )
+                .with_bundle(
+                    ProfileBundle::new("two").with_component(greeting("same", "two", &log)),
+                ),
         )
         .await
-        .expect_err("duplicate component ids fail");
+        .expect_err("duplicate ids fail");
 
     assert_eq!(error, RuntimeError::DuplicateComponent("same".to_owned()));
-    assert!(runtime.service::<dyn Greeting>().is_none());
-    assert!(cleanup.lock().expect("cleanup log").is_empty());
+    assert!(log.lock().expect("lifecycle log").is_empty());
 }

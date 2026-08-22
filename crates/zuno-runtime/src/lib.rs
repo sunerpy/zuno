@@ -1,29 +1,188 @@
 //! Scoped, transactional component assembly for Zuno harnesses.
 //!
-//! The runtime is independent of the agent loop. Components contribute typed
-//! services and cleanup effects; profiles decide which components to mount.
+//! Components prepare typed services and deferred effects without changing the
+//! outside world. The runtime stops the previous composition completely before
+//! starting a candidate, publishes services only after every effect starts, and
+//! records any cleanup outcome that cannot be proven stopped.
 
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::any::{Any, TypeId, type_name};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
-type ErasedService = Arc<dyn Any + Send + Sync>;
-type Cleanup = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
+const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A component that contributes services and effects to one harness scope.
+type ErasedService = Arc<dyn Any + Send + Sync>;
+type EffectStart = Box<dyn FnOnce() -> BoxFuture<'static, Result<EffectStop, EffectError>> + Send>;
+type EffectStop = Box<dyn FnOnce() -> BoxFuture<'static, Result<(), EffectError>> + Send>;
+
+/// A component that contributes typed services and deferred effects to one scope.
+///
+/// `prepare` must be side-effect free. Work that spawns, binds, subscribes, or
+/// otherwise changes the outside world is registered through
+/// [`PrepareContext::effect`] and starts only after the complete candidate has
+/// prepared successfully.
 #[async_trait]
 pub trait Component: Send + Sync {
-    /// Stable identity used for replacement and diagnostics.
+    /// Stable identity used for replacement, dependency ownership, and diagnostics.
     fn id(&self) -> &str;
 
-    /// Stage this component's services and effects.
+    /// Prepare this component's services and deferred effects.
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError>;
+}
+
+/// Runtime lifecycle tuning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeOptions {
+    stop_timeout: Duration,
+}
+
+impl RuntimeOptions {
+    /// Set the maximum wait for one effect disposer.
     ///
-    /// Nothing becomes visible until this method returns successfully.
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError>;
+    /// # Panics
+    ///
+    /// Panics when `timeout` is zero because a zero cleanup deadline cannot prove
+    /// that any asynchronous resource reached quiescence.
+    #[must_use]
+    pub fn with_stop_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "effect stop timeout must be positive");
+        self.stop_timeout = timeout;
+        self
+    }
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            stop_timeout: DEFAULT_STOP_TIMEOUT,
+        }
+    }
+}
+
+/// A deferred effect's start or stop failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct EffectError {
+    message: String,
+}
+
+impl EffectError {
+    /// Create one scrubbed lifecycle error.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Observable state of a runtime or component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleState {
+    /// Candidate definitions are being prepared or their deferred effects are starting.
+    Preparing,
+    /// Services are published and effects are live.
+    Active,
+    /// Services have been withdrawn and effects are being stopped.
+    Stopping,
+    /// The scope contains no active component.
+    Stopped,
+    /// A deterministic lifecycle operation failed without an unknown side effect.
+    Failed,
+    /// The runtime cannot prove whether a side effect remains live.
+    Uncertain,
+    /// The scope has completed shutdown and cannot be mounted again.
+    Closed,
+}
+
+impl fmt::Display for LifecycleState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Preparing => "preparing",
+            Self::Active => "active",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
+            Self::Closed => "closed",
+        })
+    }
+}
+
+/// Lifecycle phase that produced a diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecyclePhase {
+    Prepare,
+    Start,
+    Stop,
+    Restore,
+}
+
+impl fmt::Display for LifecyclePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Prepare => "prepare",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restore => "restore",
+        })
+    }
+}
+
+/// Typed lifecycle failure classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleFailureKind {
+    Rejected,
+    Failed,
+    TimedOut,
+    Uncertain,
+}
+
+impl fmt::Display for LifecycleFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed out",
+            Self::Uncertain => "uncertain",
+        })
+    }
+}
+
+/// One lifecycle failure retained for clients and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleDiagnostic {
+    pub component_id: String,
+    pub effect_id: String,
+    pub phase: LifecyclePhase,
+    pub kind: LifecycleFailureKind,
+    pub message: String,
+}
+
+/// Frontend-neutral component inventory entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentSnapshot {
+    pub id: String,
+    pub state: LifecycleState,
+    pub effects: Vec<String>,
+    pub provides: Vec<String>,
+    pub requires: Vec<String>,
+}
+
+/// Frontend-neutral runtime inventory and lifecycle diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    pub name: String,
+    pub state: LifecycleState,
+    pub profile_id: Option<String>,
+    pub components: Vec<ComponentSnapshot>,
+    pub diagnostics: Vec<LifecycleDiagnostic>,
 }
 
 /// An ordered group of components distributed as one profile unit.
@@ -76,7 +235,7 @@ impl HarnessProfile {
         }
     }
 
-    /// Append one bundle in mount order.
+    /// Append one bundle in preparation order.
     #[must_use]
     pub fn with_bundle(mut self, bundle: ProfileBundle) -> Self {
         self.bundles.push(bundle);
@@ -87,7 +246,14 @@ impl HarnessProfile {
 #[derive(Clone)]
 struct StagedService {
     key: TypeId,
+    name: &'static str,
     value: ErasedService,
+}
+
+#[derive(Clone)]
+struct OwnedService {
+    owner: String,
+    service: StagedService,
 }
 
 struct ServiceEntry {
@@ -140,28 +306,14 @@ impl Scope {
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        let local = {
-            let state = self.inner.state.lock().expect("scope state poisoned");
-            state
-                .services
-                .get(&TypeId::of::<T>())
-                .and_then(|entries| entries.last())
-                .map(|entry| Arc::clone(&entry.value))
-        };
-
-        if let Some(value) = local {
-            return decode_service::<T>(&value);
-        }
-
-        self.inner.parent.as_ref().and_then(|parent| {
-            Scope {
-                inner: Arc::clone(parent),
-            }
-            .service::<T>()
-        })
+        self.service_with_owner::<T>(&HashSet::new())
+            .map(|(_, service)| service)
     }
 
-    fn service_excluding_local<T>(&self, hidden_owners: &HashSet<String>) -> Option<Arc<T>>
+    fn service_with_owner<T>(
+        &self,
+        hidden_local_owners: &HashSet<String>,
+    ) -> Option<(String, Arc<T>)>
     where
         T: ?Sized + Send + Sync + 'static,
     {
@@ -171,62 +323,28 @@ impl Scope {
                 entries
                     .iter()
                     .rev()
-                    .find(|entry| !hidden_owners.contains(&entry.owner))
-                    .map(|entry| Arc::clone(&entry.value))
+                    .find(|entry| !hidden_local_owners.contains(&entry.owner))
+                    .map(|entry| (entry.owner.clone(), Arc::clone(&entry.value)))
             })
         };
-
-        if let Some(value) = local {
-            return decode_service::<T>(&value);
+        if let Some((owner, value)) = local {
+            return decode_service::<T>(&value).map(|service| (owner, service));
         }
-
         self.inner.parent.as_ref().and_then(|parent| {
             Scope {
                 inner: Arc::clone(parent),
             }
-            .service::<T>()
+            .service_with_owner::<T>(&HashSet::new())
         })
     }
 
-    fn install(&self, owner: &str, services: Vec<StagedService>) {
+    fn replace_all(&self, components: Vec<(String, Vec<StagedService>)>) {
         let mut state = self.inner.state.lock().expect("scope state poisoned");
-        for service in services {
-            state
-                .services
-                .entry(service.key)
-                .or_default()
-                .push(ServiceEntry {
-                    owner: owner.to_owned(),
-                    value: service.value,
-                });
-        }
-    }
-
-    fn replace(&self, owner: &str, services: Vec<StagedService>) {
-        let mut state = self.inner.state.lock().expect("scope state poisoned");
-        remove_owner(&mut state.services, owner);
-        for service in services {
-            state
-                .services
-                .entry(service.key)
-                .or_default()
-                .push(ServiceEntry {
-                    owner: owner.to_owned(),
-                    value: service.value,
-                });
-        }
-    }
-
-    fn replace_profile(
-        &self,
-        previous_owners: &HashSet<String>,
-        components: Vec<(String, Vec<StagedService>)>,
-    ) {
-        let mut state = self.inner.state.lock().expect("scope state poisoned");
-        let mut candidate = HashMap::<TypeId, Vec<ServiceEntry>>::new();
+        state.services.clear();
         for (owner, services) in components {
             for service in services {
-                candidate
+                state
+                    .services
                     .entry(service.key)
                     .or_default()
                     .push(ServiceEntry {
@@ -235,31 +353,6 @@ impl Scope {
                     });
             }
         }
-
-        let keys = state
-            .services
-            .keys()
-            .copied()
-            .chain(candidate.keys().copied())
-            .collect::<HashSet<_>>();
-        for key in keys {
-            let entries = state.services.entry(key).or_default();
-            let insertion = entries
-                .iter()
-                .position(|entry| previous_owners.contains(&entry.owner))
-                .unwrap_or(0);
-            entries.retain(|entry| !previous_owners.contains(&entry.owner));
-            if let Some(replacements) = candidate.remove(&key) {
-                let insertion = insertion.min(entries.len());
-                entries.splice(insertion..insertion, replacements);
-            }
-        }
-        state.services.retain(|_, entries| !entries.is_empty());
-    }
-
-    fn remove(&self, owner: &str) {
-        let mut state = self.inner.state.lock().expect("scope state poisoned");
-        remove_owner(&mut state.services, owner);
     }
 
     fn clear(&self) {
@@ -270,13 +363,6 @@ impl Scope {
             .services
             .clear();
     }
-}
-
-fn remove_owner(services: &mut HashMap<TypeId, Vec<ServiceEntry>>, owner: &str) {
-    services.retain(|_, entries| {
-        entries.retain(|entry| entry.owner != owner);
-        !entries.is_empty()
-    });
 }
 
 fn erase_service<T>(service: Arc<T>) -> ErasedService
@@ -293,31 +379,48 @@ where
     service.downcast_ref::<Arc<T>>().cloned()
 }
 
-/// The staging context passed to one component mount.
-pub struct MountContext {
-    scope: Scope,
-    candidate_services: Vec<StagedService>,
-    hidden_owners: Arc<HashSet<String>>,
-    services: Vec<StagedService>,
-    cleanups: Vec<Cleanup>,
+struct PreparedEffect {
+    id: String,
+    start: EffectStart,
 }
 
-impl MountContext {
-    fn new(scope: Scope) -> Self {
-        Self::with_candidate(scope, Vec::new(), Arc::new(HashSet::new()))
-    }
+struct ActiveEffect {
+    id: String,
+    stop: EffectStop,
+}
 
-    fn with_candidate(
+#[derive(Clone)]
+struct Requirement {
+    owner: String,
+    service: &'static str,
+}
+
+/// Side-effect-free context passed to one component preparation.
+pub struct PrepareContext {
+    component_id: String,
+    scope: Scope,
+    candidate_services: Vec<OwnedService>,
+    hidden_owners: Arc<HashSet<String>>,
+    services: Vec<StagedService>,
+    effects: Vec<PreparedEffect>,
+    requirements: Vec<Requirement>,
+}
+
+impl PrepareContext {
+    fn new(
+        component_id: String,
         scope: Scope,
-        candidate_services: Vec<StagedService>,
+        candidate_services: Vec<OwnedService>,
         hidden_owners: Arc<HashSet<String>>,
     ) -> Self {
         Self {
+            component_id,
             scope,
             candidate_services,
             hidden_owners,
             services: Vec::new(),
-            cleanups: Vec::new(),
+            effects: Vec::new(),
+            requirements: Vec::new(),
         }
     }
 
@@ -335,94 +438,211 @@ impl MountContext {
         }
         self.services.push(StagedService {
             key,
+            name,
             value: erase_service(service),
         });
         Ok(())
     }
 
-    /// Resolve one staged or already-mounted service.
-    #[must_use]
-    pub fn service<T>(&self) -> Option<Arc<T>>
+    /// Resolve and record one required service.
+    pub fn require<T>(&mut self) -> Result<Arc<T>, RuntimeError>
     where
         T: ?Sized + Send + Sync + 'static,
     {
-        self.services
+        let key = TypeId::of::<T>();
+        let name = type_name::<T>();
+        let own = self
+            .services
             .iter()
             .rev()
-            .find(|service| service.key == TypeId::of::<T>())
-            .and_then(|service| decode_service::<T>(&service.value))
-            .or_else(|| {
-                self.candidate_services
-                    .iter()
-                    .rev()
-                    .find(|service| service.key == TypeId::of::<T>())
-                    .and_then(|service| decode_service::<T>(&service.value))
-            })
-            .or_else(|| self.scope.service_excluding_local::<T>(&self.hidden_owners))
+            .find(|service| service.key == key)
+            .and_then(|service| {
+                decode_service::<T>(&service.value).map(|value| (self.component_id.clone(), value))
+            });
+        let candidate = own.or_else(|| {
+            self.candidate_services
+                .iter()
+                .rev()
+                .find(|service| service.service.key == key)
+                .and_then(|service| {
+                    decode_service::<T>(&service.service.value)
+                        .map(|value| (service.owner.clone(), value))
+                })
+        });
+        let resolved = candidate.or_else(|| {
+            self.scope
+                .service_with_owner::<T>(self.hidden_owners.as_ref())
+        });
+        let (owner, service) = resolved.ok_or(RuntimeError::MissingService(name))?;
+        self.requirements.push(Requirement {
+            owner,
+            service: name,
+        });
+        Ok(service)
     }
 
-    /// Resolve a required service or return a typed load-time error.
-    pub fn require<T>(&self) -> Result<Arc<T>, RuntimeError>
+    /// Register a deferred side effect.
+    ///
+    /// `start` runs only after every candidate component has prepared. It must
+    /// either return the exact disposer for the acquired resource or return an
+    /// error without leaving a live resource.
+    pub fn effect<Start, StartFuture, Stop, StopFuture>(
+        &mut self,
+        id: impl Into<String>,
+        start: Start,
+    ) -> Result<(), RuntimeError>
     where
-        T: ?Sized + Send + Sync + 'static,
+        Start: FnOnce() -> StartFuture + Send + 'static,
+        StartFuture: Future<Output = Result<Stop, EffectError>> + Send + 'static,
+        Stop: FnOnce() -> StopFuture + Send + 'static,
+        StopFuture: Future<Output = Result<(), EffectError>> + Send + 'static,
     {
-        self.service::<T>()
-            .ok_or(RuntimeError::MissingService(type_name::<T>()))
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(RuntimeError::EmptyEffectId(self.component_id.clone()));
+        }
+        if self.effects.iter().any(|effect| effect.id == id) {
+            return Err(RuntimeError::DuplicateEffect {
+                component: self.component_id.clone(),
+                effect: id,
+            });
+        }
+        self.effects.push(PreparedEffect {
+            id,
+            start: Box::new(move || {
+                Box::pin(async move {
+                    let stop = start().await?;
+                    let stop: EffectStop =
+                        Box::new(move || -> BoxFuture<'static, Result<(), EffectError>> {
+                            Box::pin(stop())
+                        });
+                    Ok(stop)
+                })
+            }),
+        });
+        Ok(())
     }
 
-    /// Register cleanup that runs on rollback, replacement, or shutdown.
-    pub fn on_close<F, Fut>(&mut self, cleanup: F)
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.cleanups.push(Box::new(move || Box::pin(cleanup())));
-    }
-
-    fn into_parts(self) -> (Vec<StagedService>, Vec<Cleanup>) {
-        (self.services, self.cleanups)
-    }
-
-    async fn rollback(self) {
-        run_cleanups(self.cleanups).await;
+    fn into_parts(self) -> (Vec<StagedService>, Vec<PreparedEffect>, Vec<Requirement>) {
+        (self.services, self.effects, self.requirements)
     }
 }
 
-struct MountedComponent {
+#[derive(Clone)]
+struct ComponentDefinition {
     id: String,
-    cleanups: Vec<Cleanup>,
+    component: Arc<dyn Component>,
 }
 
-struct MountedProfile {
+#[derive(Clone)]
+struct ProfileDefinition {
     id: String,
-    component_ids: Vec<String>,
-    components: Vec<MountedComponent>,
+    components: Vec<ComponentDefinition>,
 }
 
-impl MountedProfile {
-    fn owner_ids(&self) -> HashSet<String> {
-        self.component_ids.iter().cloned().collect()
-    }
+#[derive(Clone, Default)]
+struct CompositionDefinition {
+    profile: Option<ProfileDefinition>,
+    mounts: Vec<ComponentDefinition>,
+}
 
-    fn owns(&self, component_id: &str) -> bool {
-        self.component_ids
+impl CompositionDefinition {
+    fn components(&self) -> Vec<ComponentDefinition> {
+        self.profile
             .iter()
-            .any(|candidate| candidate == component_id)
+            .flat_map(|profile| profile.components.iter().cloned())
+            .chain(self.mounts.iter().cloned())
+            .collect()
+    }
+
+    fn component_ids(&self) -> HashSet<String> {
+        self.components()
+            .into_iter()
+            .map(|component| component.id)
+            .collect()
+    }
+
+    fn profile_id(&self) -> Option<String> {
+        self.profile.as_ref().map(|profile| profile.id.clone())
     }
 }
 
-#[derive(Default)]
+struct PreparedComponent {
+    definition: ComponentDefinition,
+    services: Vec<StagedService>,
+    effects: Vec<PreparedEffect>,
+    requirements: Vec<Requirement>,
+}
+
+struct PreparedComposition {
+    definition: CompositionDefinition,
+    components: Vec<PreparedComponent>,
+}
+
+struct ActiveComponent {
+    definition: ComponentDefinition,
+    effects: Vec<ActiveEffect>,
+    provides: Vec<&'static str>,
+    requirements: Vec<Requirement>,
+}
+
+impl ActiveComponent {
+    fn snapshot(&self, state: LifecycleState) -> ComponentSnapshot {
+        ComponentSnapshot {
+            id: self.definition.id.clone(),
+            state,
+            effects: self
+                .effects
+                .iter()
+                .map(|effect| effect.id.clone())
+                .collect(),
+            provides: self
+                .provides
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            requires: self
+                .requirements
+                .iter()
+                .map(|requirement| format!("{} <- {}", requirement.service, requirement.owner))
+                .collect(),
+        }
+    }
+}
+
+struct StartedComposition {
+    definition: CompositionDefinition,
+    active: Vec<ActiveComponent>,
+    services: Vec<(String, Vec<StagedService>)>,
+}
+
 struct RuntimeState {
-    closed: bool,
-    profile: Option<MountedProfile>,
-    mounts: Vec<MountedComponent>,
+    phase: LifecycleState,
+    definition: CompositionDefinition,
+    active: Vec<ActiveComponent>,
+    components: Vec<ComponentSnapshot>,
+    diagnostics: Vec<LifecycleDiagnostic>,
     children: Vec<Weak<HarnessRuntimeInner>>,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            phase: LifecycleState::Stopped,
+            definition: CompositionDefinition::default(),
+            active: Vec::new(),
+            components: Vec::new(),
+            diagnostics: Vec::new(),
+            children: Vec::new(),
+        }
+    }
 }
 
 struct HarnessRuntimeInner {
     scope: Scope,
     operation: Arc<AsyncMutex<()>>,
     state: StdMutex<RuntimeState>,
+    options: RuntimeOptions,
 }
 
 /// One independently configurable harness runtime.
@@ -432,14 +652,21 @@ pub struct HarnessRuntime {
 }
 
 impl HarnessRuntime {
-    /// Create one empty root runtime.
+    /// Create one empty root runtime with default lifecycle timeouts.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
+        Self::with_options(name, RuntimeOptions::default())
+    }
+
+    /// Create one empty root runtime with explicit lifecycle options.
+    #[must_use]
+    pub fn with_options(name: impl Into<String>, options: RuntimeOptions) -> Self {
         Self {
             inner: Arc::new(HarnessRuntimeInner {
                 scope: Scope::root(name.into()),
                 operation: Arc::new(AsyncMutex::new(())),
                 state: StdMutex::new(RuntimeState::default()),
+                options,
             }),
         }
     }
@@ -450,6 +677,19 @@ impl HarnessRuntime {
         self.inner.scope.name()
     }
 
+    /// Return a stable inventory and the latest lifecycle diagnostics.
+    #[must_use]
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        let state = self.inner.state.lock().expect("runtime state poisoned");
+        RuntimeSnapshot {
+            name: self.name().to_owned(),
+            state: state.phase,
+            profile_id: state.definition.profile_id(),
+            components: state.components.clone(),
+            diagnostics: state.diagnostics.clone(),
+        }
+    }
+
     /// Create an isolated child scope that inherits parent services.
     ///
     /// Shutting down the parent also shuts down all live children in reverse
@@ -458,14 +698,19 @@ impl HarnessRuntime {
     pub fn child(&self, name: impl Into<String>) -> Self {
         let scope = self.inner.scope.child(name.into());
         let mut parent = self.inner.state.lock().expect("runtime state poisoned");
-        let closed = parent.closed;
+        let closed = parent.phase == LifecycleState::Closed;
         let child = Arc::new(HarnessRuntimeInner {
             scope,
             operation: Arc::clone(&self.inner.operation),
             state: StdMutex::new(RuntimeState {
-                closed,
+                phase: if closed {
+                    LifecycleState::Closed
+                } else {
+                    LifecycleState::Stopped
+                },
                 ..RuntimeState::default()
             }),
+            options: self.inner.options,
         });
         if !closed {
             parent.children.push(Arc::downgrade(&child));
@@ -490,91 +735,35 @@ impl HarnessRuntime {
             .state
             .lock()
             .expect("runtime state poisoned")
-            .profile
-            .as_ref()
-            .map(|profile| profile.id.clone())
+            .definition
+            .profile_id()
     }
 
-    /// Stage and atomically activate one complete harness profile.
+    /// Prepare and activate one complete harness profile.
     ///
-    /// Components mount in bundle order and may require services staged by earlier
-    /// components. The previous profile remains visible until every candidate
-    /// component succeeds.
+    /// Existing local mounts are re-prepared against the candidate profile so a
+    /// provider change reconnects consumers before services become visible.
     pub async fn activate_profile(&self, profile: HarnessProfile) -> Result<(), RuntimeError> {
         let _operation = self.inner.operation.lock().await;
         let profile = validate_profile(profile)?;
-        let previous_owners = {
-            let state = self.inner.state.lock().expect("runtime state poisoned");
-            if state.closed {
-                return Err(RuntimeError::Closed);
-            }
-            if state.profile.is_none() && !state.mounts.is_empty() {
-                return Err(RuntimeError::ProfileAfterComponents);
-            }
-            for component_id in &profile.component_ids {
-                if state
-                    .mounts
-                    .iter()
-                    .any(|mounted| &mounted.id == component_id)
-                {
-                    return Err(RuntimeError::DuplicateComponent(component_id.clone()));
-                }
-            }
-            state
-                .profile
-                .as_ref()
-                .map_or_else(HashSet::new, MountedProfile::owner_ids)
-        };
-
-        let hidden_owners = Arc::new(previous_owners.clone());
-        let mut candidate_services = Vec::new();
-        let mut component_services = Vec::new();
-        let mut mounted_components = Vec::new();
-        for (component_id, component) in profile.components {
-            let mut context = MountContext::with_candidate(
-                self.inner.scope.clone(),
-                candidate_services.clone(),
-                Arc::clone(&hidden_owners),
-            );
-            if let Err(error) = component.mount(&mut context).await {
-                context.rollback().await;
-                cleanup_components(mounted_components).await;
-                return Err(error);
-            }
-            let (services, cleanups) = context.into_parts();
-            candidate_services.extend(services.iter().cloned());
-            component_services.push((component_id.clone(), services));
-            mounted_components.push(MountedComponent {
-                id: component_id,
-                cleanups,
-            });
-        }
-
-        self.inner
-            .scope
-            .replace_profile(&previous_owners, component_services);
-        let component_ids = mounted_components
+        let mut candidate = self.current_definition()?;
+        let mount_ids = candidate
+            .mounts
             .iter()
-            .map(|component| component.id.clone())
-            .collect();
-        let previous = self
-            .inner
-            .state
-            .lock()
-            .expect("runtime state poisoned")
-            .profile
-            .replace(MountedProfile {
-                id: profile.id,
-                component_ids,
-                components: mounted_components,
-            });
-        if let Some(previous) = previous {
-            cleanup_components(previous.components).await;
+            .map(|component| component.id.as_str())
+            .collect::<HashSet<_>>();
+        if let Some(duplicate) = profile
+            .components
+            .iter()
+            .find(|component| mount_ids.contains(component.id.as_str()))
+        {
+            return Err(RuntimeError::DuplicateComponent(duplicate.id.clone()));
         }
-        Ok(())
+        candidate.profile = Some(profile);
+        self.transition_to(candidate).await
     }
 
-    /// Mount a new component transactionally.
+    /// Add one component and recompose the local scope transactionally.
     pub async fn mount<C>(&self, component: C) -> Result<(), RuntimeError>
     where
         C: Component + 'static,
@@ -582,46 +771,19 @@ impl HarnessRuntime {
         self.mount_shared(Arc::new(component)).await
     }
 
-    /// Mount a dynamically selected component transactionally.
+    /// Add one dynamically selected component.
     pub async fn mount_shared(&self, component: Arc<dyn Component>) -> Result<(), RuntimeError> {
         let _operation = self.inner.operation.lock().await;
-        self.mount_locked(component).await
-    }
-
-    async fn mount_locked(&self, component: Arc<dyn Component>) -> Result<(), RuntimeError> {
         let id = validate_component_id(component.id())?;
-        {
-            let state = self.inner.state.lock().expect("runtime state poisoned");
-            if state.closed {
-                return Err(RuntimeError::Closed);
-            }
-            if state.mounts.iter().any(|mounted| mounted.id == id)
-                || state
-                    .profile
-                    .as_ref()
-                    .is_some_and(|profile| profile.owns(&id))
-            {
-                return Err(RuntimeError::DuplicateComponent(id));
-            }
+        let mut candidate = self.current_definition()?;
+        if candidate.component_ids().contains(&id) {
+            return Err(RuntimeError::DuplicateComponent(id));
         }
-
-        let mut context = MountContext::new(self.inner.scope.clone());
-        if let Err(error) = component.mount(&mut context).await {
-            context.rollback().await;
-            return Err(error);
-        }
-        let (services, cleanups) = context.into_parts();
-        self.inner.scope.install(&id, services);
-        self.inner
-            .state
-            .lock()
-            .expect("runtime state poisoned")
-            .mounts
-            .push(MountedComponent { id, cleanups });
-        Ok(())
+        candidate.mounts.push(ComponentDefinition { id, component });
+        self.transition_to(candidate).await
     }
 
-    /// Replace an existing component without exposing a partial candidate.
+    /// Replace a local component and re-prepare all consumers in this scope.
     pub async fn replace<C>(&self, component: C) -> Result<(), RuntimeError>
     where
         C: Component + 'static,
@@ -629,78 +791,449 @@ impl HarnessRuntime {
         self.replace_shared(Arc::new(component)).await
     }
 
-    /// Replace an existing dynamically selected component.
+    /// Replace one dynamically selected local component.
     pub async fn replace_shared(&self, component: Arc<dyn Component>) -> Result<(), RuntimeError> {
         let _operation = self.inner.operation.lock().await;
         let id = validate_component_id(component.id())?;
-        let position = {
-            let state = self.inner.state.lock().expect("runtime state poisoned");
-            if state.closed {
-                return Err(RuntimeError::Closed);
-            }
-            state
-                .mounts
-                .iter()
-                .position(|mounted| mounted.id == id)
-                .ok_or_else(|| RuntimeError::ComponentNotMounted(id.clone()))?
-        };
-
-        let mut context = MountContext::new(self.inner.scope.clone());
-        if let Err(error) = component.mount(&mut context).await {
-            context.rollback().await;
-            return Err(error);
-        }
-        let (services, cleanups) = context.into_parts();
-        self.inner.scope.replace(&id, services);
-        let previous = {
-            let mut state = self.inner.state.lock().expect("runtime state poisoned");
-            std::mem::replace(
-                &mut state.mounts[position],
-                MountedComponent { id, cleanups },
-            )
-        };
-        run_cleanups(previous.cleanups).await;
-        Ok(())
+        let mut candidate = self.current_definition()?;
+        let position = candidate
+            .mounts
+            .iter()
+            .position(|mounted| mounted.id == id)
+            .ok_or_else(|| RuntimeError::ComponentNotMounted(id.clone()))?;
+        candidate.mounts[position] = ComponentDefinition { id, component };
+        self.transition_to(candidate).await
     }
 
-    /// Unmount one component and reveal any service it shadowed.
+    /// Remove one local component and re-prepare consumers against revealed services.
     pub async fn unmount(&self, id: &str) -> Result<(), RuntimeError> {
         let _operation = self.inner.operation.lock().await;
-        let mounted = {
-            let mut state = self.inner.state.lock().expect("runtime state poisoned");
-            if state.closed {
-                return Err(RuntimeError::Closed);
-            }
-            let position = state
-                .mounts
-                .iter()
-                .position(|mounted| mounted.id == id)
-                .ok_or_else(|| RuntimeError::ComponentNotMounted(id.to_owned()))?;
-            state.mounts.remove(position)
-        };
-        self.inner.scope.remove(id);
-        run_cleanups(mounted.cleanups).await;
-        Ok(())
+        let mut candidate = self.current_definition()?;
+        let position = candidate
+            .mounts
+            .iter()
+            .position(|mounted| mounted.id == id)
+            .ok_or_else(|| RuntimeError::ComponentNotMounted(id.to_owned()))?;
+        candidate.mounts.remove(position);
+        self.transition_to(candidate).await
     }
 
     /// Close this runtime and its descendants.
     ///
-    /// Children close in reverse creation order, then local components close
-    /// in reverse mount order. Repeated shutdown calls are no-ops.
+    /// Children close in reverse creation order, then local components close in
+    /// reverse preparation order. A successful repeated shutdown is a no-op.
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
         let _operation = self.inner.operation.lock().await;
-        shutdown_locked(Arc::clone(&self.inner)).await;
-        Ok(())
+        let failures = shutdown_inner(Arc::clone(&self.inner)).await;
+        failures
+            .into_iter()
+            .next()
+            .map_or(Ok(()), |diagnostic| Err(lifecycle_error(diagnostic)))
+    }
+
+    fn current_definition(&self) -> Result<CompositionDefinition, RuntimeError> {
+        let state = self.inner.state.lock().expect("runtime state poisoned");
+        match state.phase {
+            LifecycleState::Closed => Err(RuntimeError::Closed),
+            LifecycleState::Failed | LifecycleState::Uncertain => {
+                Err(RuntimeError::NotOperational(state.phase))
+            }
+            LifecycleState::Preparing
+            | LifecycleState::Stopping
+            | LifecycleState::Active
+            | LifecycleState::Stopped => Ok(state.definition.clone()),
+        }
+    }
+
+    async fn transition_to(&self, candidate: CompositionDefinition) -> Result<(), RuntimeError> {
+        let previous_definition = {
+            let mut state = self.inner.state.lock().expect("runtime state poisoned");
+            let previous = state.definition.clone();
+            state.phase = LifecycleState::Preparing;
+            state.components = definition_snapshots(&candidate, LifecycleState::Preparing);
+            previous
+        };
+
+        let prepared =
+            match prepare_composition(&self.inner.scope, &previous_definition, candidate).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.restore_stable_projection();
+                    return Err(error);
+                }
+            };
+
+        let previous_active = {
+            let mut state = self.inner.state.lock().expect("runtime state poisoned");
+            state.phase = LifecycleState::Stopping;
+            state.components = state
+                .active
+                .iter()
+                .map(|component| component.snapshot(LifecycleState::Stopping))
+                .collect();
+            self.inner.scope.clear();
+            std::mem::take(&mut state.active)
+        };
+        let previous_snapshots = previous_active
+            .iter()
+            .map(|component| component.snapshot(LifecycleState::Uncertain))
+            .collect::<Vec<_>>();
+        let stop_failures = stop_components(previous_active, self.inner.options.stop_timeout).await;
+        if !stop_failures.is_empty() {
+            self.set_unresolved(previous_snapshots, stop_failures.clone());
+            return Err(lifecycle_error(stop_failures[0].clone()));
+        }
+
+        {
+            let mut state = self.inner.state.lock().expect("runtime state poisoned");
+            state.phase = LifecycleState::Preparing;
+            state.components =
+                definition_snapshots(&prepared.definition, LifecycleState::Preparing);
+        }
+        match start_composition(prepared, self.inner.options.stop_timeout).await {
+            Ok(started) => {
+                self.publish(started);
+                Ok(())
+            }
+            Err(failure) if !failure.cleanup_failures.is_empty() => {
+                let snapshots =
+                    definition_snapshots(&failure.definition, LifecycleState::Uncertain);
+                let mut diagnostics = vec![failure.diagnostic.clone()];
+                diagnostics.extend(failure.cleanup_failures);
+                self.set_unresolved(snapshots, diagnostics);
+                Err(lifecycle_error(failure.diagnostic))
+            }
+            Err(failure) => {
+                let candidate_error = lifecycle_error(failure.diagnostic.clone());
+                let restore = prepare_composition(
+                    &self.inner.scope,
+                    &CompositionDefinition::default(),
+                    previous_definition.clone(),
+                )
+                .await;
+                let restored = match restore {
+                    Ok(prepared) => {
+                        start_composition(prepared, self.inner.options.stop_timeout).await
+                    }
+                    Err(error) => {
+                        self.set_failed(
+                            &previous_definition,
+                            vec![
+                                failure.diagnostic,
+                                LifecycleDiagnostic {
+                                    component_id: String::from("<composition>"),
+                                    effect_id: String::new(),
+                                    phase: LifecyclePhase::Restore,
+                                    kind: LifecycleFailureKind::Failed,
+                                    message: error.to_string(),
+                                },
+                            ],
+                        );
+                        return Err(RuntimeError::RestoreFailed {
+                            candidate: Box::new(candidate_error),
+                            restore: Box::new(error),
+                        });
+                    }
+                };
+                match restored {
+                    Ok(started) => {
+                        self.publish_with_diagnostic(started, failure.diagnostic);
+                        Err(candidate_error)
+                    }
+                    Err(restore_failure) => {
+                        let mut diagnostics = vec![failure.diagnostic];
+                        diagnostics.push(LifecycleDiagnostic {
+                            component_id: restore_failure.diagnostic.component_id.clone(),
+                            effect_id: restore_failure.diagnostic.effect_id.clone(),
+                            phase: LifecyclePhase::Restore,
+                            kind: restore_failure.diagnostic.kind,
+                            message: restore_failure.diagnostic.message.clone(),
+                        });
+                        diagnostics.extend(restore_failure.cleanup_failures);
+                        self.set_failed(&previous_definition, diagnostics);
+                        Err(RuntimeError::RestoreFailed {
+                            candidate: Box::new(candidate_error),
+                            restore: Box::new(lifecycle_error(restore_failure.diagnostic)),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    fn publish(&self, started: StartedComposition) {
+        self.publish_inner(started, None);
+    }
+
+    fn publish_with_diagnostic(
+        &self,
+        started: StartedComposition,
+        diagnostic: LifecycleDiagnostic,
+    ) {
+        self.publish_inner(started, Some(diagnostic));
+    }
+
+    fn publish_inner(&self, started: StartedComposition, diagnostic: Option<LifecycleDiagnostic>) {
+        self.inner.scope.replace_all(started.services);
+        let mut state = self.inner.state.lock().expect("runtime state poisoned");
+        state.definition = started.definition;
+        state.components = started
+            .active
+            .iter()
+            .map(|component| component.snapshot(LifecycleState::Active))
+            .collect();
+        state.phase = if state.components.is_empty() {
+            LifecycleState::Stopped
+        } else {
+            LifecycleState::Active
+        };
+        state.active = started.active;
+        if let Some(diagnostic) = diagnostic {
+            state.diagnostics.push(diagnostic);
+        }
+    }
+
+    fn restore_stable_projection(&self) {
+        let mut state = self.inner.state.lock().expect("runtime state poisoned");
+        state.components = state
+            .active
+            .iter()
+            .map(|component| component.snapshot(LifecycleState::Active))
+            .collect();
+        state.phase = if state.active.is_empty() {
+            LifecycleState::Stopped
+        } else {
+            LifecycleState::Active
+        };
+    }
+
+    fn set_unresolved(
+        &self,
+        components: Vec<ComponentSnapshot>,
+        diagnostics: Vec<LifecycleDiagnostic>,
+    ) {
+        let mut state = self.inner.state.lock().expect("runtime state poisoned");
+        state.active.clear();
+        state.components = components;
+        state.phase = LifecycleState::Uncertain;
+        state.diagnostics.extend(diagnostics);
+    }
+
+    fn set_failed(
+        &self,
+        definition: &CompositionDefinition,
+        diagnostics: Vec<LifecycleDiagnostic>,
+    ) {
+        let mut state = self.inner.state.lock().expect("runtime state poisoned");
+        state.active.clear();
+        state.components = definition_snapshots(definition, LifecycleState::Failed);
+        state.phase = LifecycleState::Failed;
+        state.diagnostics.extend(diagnostics);
     }
 }
 
-struct ValidatedProfile {
-    id: String,
-    component_ids: Vec<String>,
-    components: Vec<(String, Arc<dyn Component>)>,
+async fn prepare_composition(
+    scope: &Scope,
+    previous: &CompositionDefinition,
+    definition: CompositionDefinition,
+) -> Result<PreparedComposition, RuntimeError> {
+    let hidden_owners = Arc::new(previous.component_ids());
+    let mut candidate_services = Vec::<OwnedService>::new();
+    let mut prepared = Vec::new();
+    for component in definition.components() {
+        let mut context = PrepareContext::new(
+            component.id.clone(),
+            scope.clone(),
+            candidate_services.clone(),
+            Arc::clone(&hidden_owners),
+        );
+        component.component.prepare(&mut context).await?;
+        let (services, effects, requirements) = context.into_parts();
+        candidate_services.extend(services.iter().cloned().map(|service| OwnedService {
+            owner: component.id.clone(),
+            service,
+        }));
+        prepared.push(PreparedComponent {
+            definition: component,
+            services,
+            effects,
+            requirements,
+        });
+    }
+    Ok(PreparedComposition {
+        definition,
+        components: prepared,
+    })
 }
 
-fn validate_profile(profile: HarnessProfile) -> Result<ValidatedProfile, RuntimeError> {
+struct StartFailure {
+    definition: CompositionDefinition,
+    diagnostic: LifecycleDiagnostic,
+    cleanup_failures: Vec<LifecycleDiagnostic>,
+}
+
+async fn start_composition(
+    prepared: PreparedComposition,
+    stop_timeout: Duration,
+) -> Result<StartedComposition, StartFailure> {
+    let definition = prepared.definition;
+    let mut active = Vec::<ActiveComponent>::new();
+    let mut services = Vec::new();
+    for component in prepared.components {
+        let PreparedComponent {
+            definition: component_definition,
+            services: component_services,
+            effects,
+            requirements,
+        } = component;
+        let mut active_effects = Vec::new();
+        for effect in effects {
+            let effect_id = effect.id.clone();
+            match (effect.start)().await {
+                Ok(stop) => active_effects.push(ActiveEffect {
+                    id: effect.id,
+                    stop,
+                }),
+                Err(error) => {
+                    active.push(ActiveComponent {
+                        definition: component_definition.clone(),
+                        effects: active_effects,
+                        provides: component_services
+                            .iter()
+                            .map(|service| service.name)
+                            .collect(),
+                        requirements: requirements.clone(),
+                    });
+                    let cleanup_failures = stop_components(active, stop_timeout).await;
+                    return Err(StartFailure {
+                        definition,
+                        diagnostic: LifecycleDiagnostic {
+                            component_id: component_definition.id,
+                            effect_id,
+                            phase: LifecyclePhase::Start,
+                            kind: LifecycleFailureKind::Failed,
+                            message: error.to_string(),
+                        },
+                        cleanup_failures,
+                    });
+                }
+            }
+        }
+        services.push((component_definition.id.clone(), component_services.clone()));
+        active.push(ActiveComponent {
+            definition: component_definition,
+            effects: active_effects,
+            provides: component_services
+                .iter()
+                .map(|service| service.name)
+                .collect(),
+            requirements,
+        });
+    }
+    Ok(StartedComposition {
+        definition,
+        active,
+        services,
+    })
+}
+
+async fn stop_components(
+    mut components: Vec<ActiveComponent>,
+    timeout: Duration,
+) -> Vec<LifecycleDiagnostic> {
+    let mut diagnostics = Vec::new();
+    while let Some(mut component) = components.pop() {
+        while let Some(effect) = component.effects.pop() {
+            let effect_id = effect.id;
+            match tokio::time::timeout(timeout, (effect.stop)()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => diagnostics.push(LifecycleDiagnostic {
+                    component_id: component.definition.id.clone(),
+                    effect_id,
+                    phase: LifecyclePhase::Stop,
+                    kind: LifecycleFailureKind::Uncertain,
+                    message: error.to_string(),
+                }),
+                Err(_elapsed) => diagnostics.push(LifecycleDiagnostic {
+                    component_id: component.definition.id.clone(),
+                    effect_id,
+                    phase: LifecyclePhase::Stop,
+                    kind: LifecycleFailureKind::TimedOut,
+                    message: format!("effect stop timed out after {} ms", timeout.as_millis()),
+                }),
+            }
+        }
+    }
+    diagnostics
+}
+
+fn shutdown_inner(inner: Arc<HarnessRuntimeInner>) -> BoxFuture<'static, Vec<LifecycleDiagnostic>> {
+    Box::pin(async move {
+        let children = {
+            let mut state = inner.state.lock().expect("runtime state poisoned");
+            if state.phase == LifecycleState::Closed {
+                return Vec::new();
+            }
+            state.phase = LifecycleState::Stopping;
+            state.components = state
+                .active
+                .iter()
+                .map(|component| component.snapshot(LifecycleState::Stopping))
+                .collect();
+            std::mem::take(&mut state.children)
+        };
+
+        let mut diagnostics = Vec::new();
+        for child in children
+            .into_iter()
+            .rev()
+            .filter_map(|child| child.upgrade())
+        {
+            diagnostics.extend(shutdown_inner(child).await);
+        }
+
+        inner.scope.clear();
+        let active = {
+            let mut state = inner.state.lock().expect("runtime state poisoned");
+            std::mem::take(&mut state.active)
+        };
+        let local_failures = stop_components(active, inner.options.stop_timeout).await;
+        diagnostics.extend(local_failures.iter().cloned());
+
+        let mut state = inner.state.lock().expect("runtime state poisoned");
+        state.definition = CompositionDefinition::default();
+        if local_failures.is_empty() {
+            state.phase = LifecycleState::Closed;
+            state.components.clear();
+        } else {
+            state.phase = LifecycleState::Uncertain;
+            for component in &mut state.components {
+                component.state = LifecycleState::Uncertain;
+            }
+        }
+        state.diagnostics.extend(local_failures);
+        diagnostics
+    })
+}
+
+fn definition_snapshots(
+    definition: &CompositionDefinition,
+    state: LifecycleState,
+) -> Vec<ComponentSnapshot> {
+    definition
+        .components()
+        .into_iter()
+        .map(|component| ComponentSnapshot {
+            id: component.id,
+            state,
+            effects: Vec::new(),
+            provides: Vec::new(),
+            requires: Vec::new(),
+        })
+        .collect()
+}
+
+fn validate_profile(profile: HarnessProfile) -> Result<ProfileDefinition, RuntimeError> {
     let id = profile.id.trim();
     if id.is_empty() {
         return Err(RuntimeError::EmptyProfileId);
@@ -728,12 +1261,14 @@ fn validate_profile(profile: HarnessProfile) -> Result<ValidatedProfile, Runtime
             if !component_ids.insert(component_id.clone()) {
                 return Err(RuntimeError::DuplicateComponent(component_id));
             }
-            components.push((component_id, component));
+            components.push(ComponentDefinition {
+                id: component_id,
+                component,
+            });
         }
     }
-    Ok(ValidatedProfile {
+    Ok(ProfileDefinition {
         id: id.to_owned(),
-        component_ids: component_ids.into_iter().collect(),
         components,
     })
 }
@@ -746,44 +1281,13 @@ fn validate_component_id(id: &str) -> Result<String, RuntimeError> {
     }
 }
 
-fn shutdown_locked(inner: Arc<HarnessRuntimeInner>) -> BoxFuture<'static, ()> {
-    Box::pin(async move {
-        let (profile, mounts, children) = {
-            let mut state = inner.state.lock().expect("runtime state poisoned");
-            if state.closed {
-                return;
-            }
-            state.closed = true;
-            let profile = state.profile.take();
-            let mounts = std::mem::take(&mut state.mounts);
-            let children = std::mem::take(&mut state.children);
-            (profile, mounts, children)
-        };
-        inner.scope.clear();
-
-        for child in children
-            .into_iter()
-            .rev()
-            .filter_map(|child| child.upgrade())
-        {
-            shutdown_locked(child).await;
-        }
-        cleanup_components(mounts).await;
-        if let Some(profile) = profile {
-            cleanup_components(profile.components).await;
-        }
-    })
-}
-
-async fn cleanup_components(mut components: Vec<MountedComponent>) {
-    while let Some(component) = components.pop() {
-        run_cleanups(component.cleanups).await;
-    }
-}
-
-async fn run_cleanups(mut cleanups: Vec<Cleanup>) {
-    while let Some(cleanup) = cleanups.pop() {
-        cleanup().await;
+fn lifecycle_error(diagnostic: LifecycleDiagnostic) -> RuntimeError {
+    RuntimeError::Lifecycle {
+        component: diagnostic.component_id,
+        effect: diagnostic.effect_id,
+        phase: diagnostic.phase,
+        kind: diagnostic.kind,
+        message: diagnostic.message,
     }
 }
 
@@ -799,10 +1303,16 @@ pub enum RuntimeError {
     /// One component tried to register the same typed service twice.
     #[error("service `{0}` is already staged by this component")]
     DuplicateService(&'static str),
+    /// One component registered the same effect id twice.
+    #[error("component `{component}` registered effect `{effect}` more than once")]
+    DuplicateEffect { component: String, effect: String },
+    /// An effect identifier was empty.
+    #[error("component `{0}` registered an empty effect id")]
+    EmptyEffectId(String),
     /// A component id was mounted twice.
     #[error("component `{0}` is already mounted")]
     DuplicateComponent(String),
-    /// Replacement or unmount named no mounted component.
+    /// Replacement or unmount named no local mounted component.
     #[error("component `{0}` is not mounted")]
     ComponentNotMounted(String),
     /// A component id must be non-empty.
@@ -823,9 +1333,26 @@ pub enum RuntimeError {
     /// Bundle ids are unique within a profile.
     #[error("bundle `{0}` is declared more than once")]
     DuplicateBundle(String),
-    /// Profiles establish the foundation before local component overrides.
-    #[error("a profile must be activated before local components are mounted")]
-    ProfileAfterComponents,
+    /// A lifecycle operation failed or its outcome became uncertain.
+    #[error("component `{component}` effect `{effect}` {phase} {kind}: {message}")]
+    Lifecycle {
+        component: String,
+        effect: String,
+        phase: LifecyclePhase,
+        kind: LifecycleFailureKind,
+        message: String,
+    },
+    /// Candidate activation failed and the previous composition could not be restored.
+    #[error(
+        "candidate activation failed ({candidate}); previous composition restore failed ({restore})"
+    )]
+    RestoreFailed {
+        candidate: Box<RuntimeError>,
+        restore: Box<RuntimeError>,
+    },
+    /// Failed and uncertain runtimes reject further mutations.
+    #[error("runtime scope is {0} and cannot accept composition changes")]
+    NotOperational(LifecycleState),
     /// A closed runtime cannot accept more components.
     #[error("runtime scope is closed")]
     Closed,

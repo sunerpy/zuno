@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
 use zuno_engine::driver::{AgentDriver, AgentDriverComponent, DefaultAgentDriver};
-use zuno_runtime::{Component, HarnessProfile, MountContext, ProfileBundle, RuntimeError};
+use zuno_runtime::{Component, HarnessProfile, PrepareContext, ProfileBundle, RuntimeError};
 use zuno_tools::registry::{BUILTIN_ORDER, BuiltinSlot, CustomTool};
 
 const CORE_BUNDLE_ID: &str = "zuno.core";
@@ -131,7 +131,7 @@ impl Component for ToolManifestComponent {
         TOOL_MANIFEST_COMPONENT_ID
     }
 
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError> {
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
         context.provide(Arc::clone(&self.manifest))
     }
 }
@@ -154,7 +154,7 @@ impl Component for ToolContributionsComponent {
         TOOL_CONTRIBUTIONS_COMPONENT_ID
     }
 
-    async fn mount(&self, context: &mut MountContext) -> Result<(), RuntimeError> {
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
         context.provide(Arc::clone(&self.contributions))
     }
 }
