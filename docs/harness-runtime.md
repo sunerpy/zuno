@@ -4,7 +4,10 @@ Zuno assembles an agent from a native harness profile. A profile is a set of bun
 
 ## Runtime model
 
-- `Component` is the lifecycle unit. Mounting a component returns its typed service contributions and an asynchronous disposer.
+- `Component` is the lifecycle unit. `prepare` is side-effect-free: it stages typed
+  services, requirements, and deferred effects in a `PrepareContext`.
+- An effect starts only after the complete candidate composition has prepared. Its
+  start returns the exact asynchronous disposer that must prove quiescence.
 - `ProfileBundle` groups components that are installed and replaced together.
 - `HarnessProfile` is the complete composition selected for a session.
 - `HarnessRuntime` owns `Profile`, `Session`, `Agent`, and `Turn` scopes. A child scope inherits services and may override them locally.
@@ -12,7 +15,26 @@ Zuno assembles an agent from a native harness profile. A profile is a set of bun
 - `ToolManifest` is the profile's model-visible tool surface. The registry filters all built-ins, including automatically assembled file tools, through this manifest.
 - `ToolContributions` carries native `Tool` implementations owned by the profile. Contributions are assembled after built-ins and before MCP tools, pass through the same visibility rules, and may intentionally replace a built-in by wire id.
 
-Profile activation is transactional. Candidate components mount against a staging service view, duplicate component identifiers fail before mount, and no candidate service is visible outside the transaction until every component succeeds. Failure disposes candidates in reverse order. Successful replacement publishes the complete new profile atomically, then disposes the previous profile in reverse order.
+Profile activation is transactional and exclusive-resource safe. Candidate
+components prepare against a staging service view, duplicate identifiers and
+missing requirements fail before any effect starts, and no candidate service is
+visible outside the transaction. Replacement first withdraws local services and
+stops the old composition in reverse order. Only a proven-clean stop permits the
+candidate effects to start and their services to publish atomically. Candidate
+startup failure cleans the partial candidate and restores the previous definition
+through a fresh prepare/start cycle.
+
+Cleanup failure or timeout is never reported as success. The runtime becomes
+`Failed` or `Uncertain`, retains typed lifecycle diagnostics, and refuses a second
+composition that could overlap the unresolved resource. Repeated shutdown
+preserves that terminal outcome. Parent shutdown closes child scopes first; parent
+recomposition rejects a still-live child consumer rather than silently leaving it
+bound to stale services.
+
+`RuntimeSnapshot` and `ComponentSnapshot` expose lifecycle state, effect ids,
+provided/required service types, and scrubbed diagnostics without coupling a
+client to the runtime implementation. The TUI projects this inventory today; the
+same value is available to future server, ACP, and GUI surfaces.
 
 ## Declarative extension packages
 
@@ -20,15 +42,27 @@ Zuno also exposes one validated declarative package protocol for agents, slash-c
 and skills. It adapts DSH's lifecycle outcome without loading the Cordis/JavaScript ABI:
 
 - `extension_define` records an immutable package in the current process and worktree scope.
-- `extension_run` validates the complete active package set and activates it transactionally.
-- `extension_stop` removes its contributions while retaining the definition.
-- `extension_undefine` removes the definition.
+- `extension_run` validates the desired package set and stages a pending revision.
+- `extension_stop` stages removal of contributions while retaining the definition.
+- `extension_undefine` removes an inactive definition immediately or stages removal
+  of a running definition.
 - `extension_inspect` projects static and process-local package state.
 
-The TUI detects an active-composition generation change after the tool turn, tears down the complete
-session composition, and resolves it again inside the same process before the next turn. This
-refreshes the agent catalog, command registry, skill catalog, prompt provenance, permissions, and
-tool definitions together. An inactive definition does not trigger a rebuild.
+Staging never changes the committed catalog. Every live host owns a
+`CompositionLease` for one workspace-local revision. A transition can reserve the
+pending revision only after all old leases are gone; reservation blocks late old
+consumers. The candidate host then starts against the desired catalog and commits
+the exact transaction. Only that commit publishes `Running` and advances the
+active revision.
+
+The TUI performs this transition as an in-process remount. The server serializes
+host acquisition with transition reservation and lets the last old request host
+publish the candidate. Both paths rebuild the agent catalog, command registry,
+skill catalog, prompt provenance, permissions, and tool definitions together.
+Clean candidate preparation/start failure explicitly aborts the transaction and
+restores the prior registry state. A cleanup result that cannot prove quiescence
+marks the workspace composition `Uncertain` and prevents further mutation until
+the process is restarted.
 
 Process-local definitions are held only by `StartupEnvironment`'s shared `ExtensionRegistry`; a new
 process starts with an empty registry. Static packages live at
@@ -282,7 +316,13 @@ let profile = zuno_harness::profile_with_tools(
 runtime.activate_profile(profile).await?;
 ```
 
-Registrations are effects: every component must return the exact cleanup needed to undo its contribution. Deployment choices belong in profile configuration rather than hardcoded branches in the agent loop.
+Registrations are effects: a component registers each acquisition in
+`PrepareContext`, and the runtime owns the returned disposer. Tokio tasks are
+cancelled and joined, process trees are terminated and reaped, protocol sessions
+are closed before transports disappear, and registration handles remove exactly
+what they added. `Drop` is only a last-resort safety net and does not prove a
+successful unload. Deployment choices belong in profile configuration rather than
+hardcoded branches in the agent loop.
 
 ## Client surfaces
 

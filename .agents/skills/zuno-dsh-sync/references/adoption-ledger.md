@@ -33,6 +33,14 @@ projections, durable reflection events, candidate review, and at-most-once file
 application/undo. No upstream commit was added, so the baseline remains
 `dsh-v0.1.1-rc.2`.
 
+The native lifecycle-kernel review was classified `adapt` against the same pinned
+release. Zuno now uses side-effect-free component preparation, owned deferred
+effects, fallible/uncertain cleanup, child-first shutdown, old-before-new profile
+replacement, scope-local extension transactions, active-consumer leases, and
+frontend-neutral lifecycle snapshots. It deliberately does not embed Cordis or
+load executable JavaScript/Rust plugins in-process. The upstream delta remained
+empty, so the baseline is unchanged.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

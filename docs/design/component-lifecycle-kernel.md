@@ -1,6 +1,6 @@
 # Native Component Lifecycle Kernel
 
-Status: implementation plan, 2026-08-22.
+Status: implemented foundation, 2026-08-22.
 
 ## Decision
 
@@ -206,6 +206,39 @@ is scoped by workspace rather than global to the process.
 Executable extension support is deferred until the lifecycle kernel and an
 isolated plugin host both pass the acceptance tests below.
 
+## Implemented result
+
+The native foundation and critical product boundaries are now in place:
+
+- `Component::prepare`, `PrepareContext`, deferred effects, reverse asynchronous
+  cleanup, timeout handling, restoration, and lifecycle snapshots replace the old
+  mount/closure API without a compatibility facade.
+- Parent shutdown is child-first. Parent recomposition refuses a live child scope;
+  it does not claim an atomic transition while a stale consumer remains.
+- `TurnHost` profile activation is side-effect-free until open, shutdown is
+  fallible, and model/agent/MCP replacement stops the old host before starting the
+  candidate.
+- TUI input, turn, MCP, LSP, editor, cancellation, and history workers have
+  explicit stop paths and are joined under bounded deadlines. Session remount
+  keeps the terminal but not the old host.
+- Background child/product jobs are owned by a process/workspace supervisor, so
+  remount cannot detach a task that still writes durable state. Final command exit
+  cancels and joins the supervisor.
+- Reflection's nested review task is cancelled with its returned owner. Tool
+  interruption joins the cancelled invocation. The obsolete unowned tool-detach
+  signal was removed in favor of `BackgroundExecutionService`.
+- MCP remote shutdown reaches protocol `DELETE`; local stdio readers, refresh,
+  stderr, and child supervision have explicit owners.
+- Dynamic extensions separate committed and desired state, use scope-local
+  revisions and active-consumer leases, and commit only after a reserved candidate
+  host starts. TUI and server entry paths both use that transaction.
+- Runtime/component state and cleanup diagnostics are projected through
+  frontend-neutral snapshot values.
+
+This does not introduce executable third-party plugins. Declarative extension
+packages remain data, and a future executable host must be process- or WASI-
+isolated and satisfy the same disposal tests before registration.
+
 ## TDD and acceptance matrix
 
 Tests are added before the behavior they require.
@@ -235,7 +268,8 @@ Tests are added before the behavior they require.
 - session remount closes the old host before the next composition starts;
 - TUI LSP shutdown reaches `Manager::shutdown`;
 - TUI MCP shutdown closes remote sessions rather than only dropping transports;
-- background jobs cannot outlive the host that owns their write authority.
+- background jobs cannot outlive the process/workspace supervisor that owns their
+  write authority.
 
 ### Extensions
 
@@ -274,5 +308,5 @@ assertions alone are not acceptance.
 5. Critical product resource adapters and lifecycle projection.
 6. Architecture documentation, DSH adoption ledger, full gates.
 
-Each step is a separate logical commit. Existing user-owned `.omo/notepads`
-changes remain outside every commit.
+Delivery uses logical commits. Existing user-owned `.omo/notepads` changes remain
+outside every commit.

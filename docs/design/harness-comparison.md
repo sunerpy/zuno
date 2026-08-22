@@ -34,7 +34,12 @@ The release sequence reinforces four rules for Zuno:
 
 ### DeepSeek Harness
 
-The strongest idea is "everything is a plugin." In Zuno the concrete ABI is a native Rust `Component`: it mounts typed services, returns an exact disposer, and participates in transactional `HarnessProfile` replacement. A complete capability has an interface, one or more providers, and a consumer. Session events own durable facts; live events only wake active work. Model-visible input must be logged.
+The strongest idea is "everything is a plugin." In Zuno the concrete ABI is a
+native Rust `Component`: it prepares typed services and deferred effects, receives
+an exact asynchronous disposer for every started effect, and participates in
+transactional `HarnessProfile` replacement. A complete capability has an
+interface, one or more providers, and a consumer. Session events own durable
+facts; live events only wake active work. Model-visible input must be logged.
 
 Zuno adopts:
 
@@ -50,8 +55,9 @@ Zuno adapts:
 - Cordis plugins become Rust components and typed services;
 - `cordis.yml` composition becomes `HarnessProfile` plus Zuno config;
 - Cordis' define/run/stop/undefine lifecycle becomes validated
-  `zuno.extension/v1` agent/workflow/skill packages, with process-local and static lifetimes but no
-  JavaScript ABI;
+  `zuno.extension/v1` agent/workflow/skill packages with committed versus desired
+  revisions, active-consumer leases, exclusive transition reservations,
+  process-local and static lifetimes, and no JavaScript ABI;
 - worker-thread orchestration becomes Tokio tasks with durable SQLite coordination.
 - product-owned Codex and Claude Code subagents become native Rust protocol
   providers, static Zuno tools, and durable `ProductAgent` jobs rather than a
@@ -89,8 +95,8 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 
 | area | decision | Zuno implementation |
 | --- | --- | --- |
-| Everything is a plugin | adopt | `Component`, typed services, `ProfileBundle`, transactional `HarnessProfile` |
-| Agent-authored temporary extensions | adapt | Process-local immutable package registry plus `extension_define/run/stop/undefine/inspect`; active host refreshes before the next turn |
+| Everything is a plugin | adopt | Side-effect-free `Component::prepare`, typed services, deferred `EffectScope`, lifecycle diagnostics, `ProfileBundle`, transactional `HarnessProfile` |
+| Agent-authored temporary extensions | adapt | Process-local immutable package registry plus `extension_define/run/stop/undefine/inspect`; committed/desired revisions publish only after old host leases are quiescent and the candidate starts |
 | Restart-persistent extension bundles | adapt | Static `.zuno/extensions/<id>/extension.json` packages using the same schema and merger |
 | Capability roles | adopt | interface/provider/consumer ownership in separate crates or modules |
 | Model-visible means logged | adopt | durable inbox, tool results, retry notices, `session.prompt.assembled` |
