@@ -5754,7 +5754,9 @@ dependencies = [
  "zuno-llm",
  "zuno-observability",
  "zuno-permission",
+ "zuno-pty",
  "zuno-tool",
+ "zuno-types",
 ]
 
 [[package]]

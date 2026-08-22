@@ -146,7 +146,7 @@ impl Summary {
 /// the render layer to learn twenty-one strings is a worse trade than a scan. It is the
 /// same technique [`crate::views::views_tests`] already uses for the colour and keybind
 /// disciplines.
-pub const SUMMARISED: [&str; 22] = [
+pub const SUMMARISED: [&str; 23] = [
     // The 17 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
@@ -171,6 +171,7 @@ pub const SUMMARISED: [&str; 22] = [
     "get_goal",
     "create_goal",
     "update_goal",
+    "bg",
 ];
 
 /// What `name` should say about itself, given the arguments the model wrote.
@@ -271,6 +272,13 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
             }))
         }
         "job" => text("jobID").map(Summary::tail),
+        "bg" => {
+            let action = text("action")?;
+            Some(Summary::tail(match text("taskID") {
+                Some(id) => format!("{action} {id}"),
+                None => action,
+            }))
+        }
         // The count plus the first item. A bare count says nothing about the plan, and the
         // whole list is not a summary — it is the thing being summarised.
         "todowrite" => {
@@ -443,11 +451,16 @@ pub fn output_budget(name: &str, display: ToolDisplay) -> OutputBudget {
 /// *colour* decision, and keeping it beside the icon table means the two cannot drift
 /// into disagreeing about which states are terminal.
 #[must_use]
-pub fn status_style(status: crate::views::message::ToolStatus, context: &ViewContext) -> Style {
+pub fn status_style(
+    status: crate::views::message::ToolStatus,
+    intent: zuno_tool::ToolUiIntent,
+    context: &ViewContext,
+) -> Style {
     use crate::views::message::ToolStatus;
     match status {
         ToolStatus::Error => context.error(),
-        ToolStatus::Completed => context.success(),
+        ToolStatus::Completed if intent == zuno_tool::ToolUiIntent::Subagent => context.secondary(),
+        ToolStatus::Completed => context.accent(),
         // Muted while in flight: an unfinished call has not earned the reader's attention
         // yet, and the spinner on the row is already saying it is alive.
         ToolStatus::Pending | ToolStatus::Running => context.muted(),

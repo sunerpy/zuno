@@ -374,41 +374,6 @@ const fn content_bounds(area: Rect, sidebar: bool) -> Rect {
     }
 }
 
-/// The widest the composer ever gets.
-///
-/// The complaint was that the input box took the whole frame, and a box the width of the frame
-/// has no edges: what a reader sees is a horizontal band, which is why no amount of background
-/// contrast made it read as a box. Eighty columns is the same measure prose has been set to for
-/// a century, it is what the transcript keeps beside the panel at
-/// [`crate::views::SIDEBAR_MIN_WIDTH`] (120 less the panel and its gap), and on a 120-column
-/// pane it leaves twenty columns of air on each side — enough to be air rather than a rounding
-/// error.
-///
-/// # It applies in a used session too, and the reasoning that said otherwise was half right
-///
-/// This used to narrow the composer only while the transcript was empty, on three grounds. The
-/// second of them — that a composer centred on the *frame* would sit off the transcript's own
-/// axis once the ambient panel split the body — was correct, and was the reason the whole
-/// narrowing was abandoned mid-conversation rather than the reason it should be. It is answered
-/// by [`content_bounds`], which reserves the full-height sidebar before the prompt, status and
-/// transcript are laid out. The box is therefore centred on the transcript's own axis and stops
-/// before the panel. That was the reported defect: at 120 columns the composer and the strip ran
-/// edge to edge underneath a sidebar that occupies the last forty columns including its gap.
-///
-/// The first ground — that mid-conversation the composer is where a pasted diff goes, so
-/// rationing its columns evicts the one region whose content the user supplies — is superseded
-/// on the horizontal axis and still stands on the vertical one. A pasted block wraps; it does
-/// not need the panel's columns to be readable, and [`PROMPT_MAX_SHARE`] keeps rationing rows.
-/// The third — that the welcome arrangement is a separate composition — remains true of the
-/// *tail*, which is still empty-only, but a width rule does not have to follow a row rule.
-///
-/// Eighty columns is the same measure prose has been set to for a century, it is exactly what
-/// the transcript keeps beside the panel at [`crate::views::SIDEBAR_MIN_WIDTH`] (120 less the
-/// panel and its gap), and that equality is now load-bearing rather than incidental: at 120
-/// columns the body is 80 wide, so the composer fills it and the two regions share an axis by
-/// arithmetic rather than by coincidence.
-const COMPOSER_MAX_COLS: u16 = 80;
-
 /// The glyphs that close the composer's left and right edges.
 ///
 /// Half blocks rather than `│`, because they are the crate's existing vocabulary for "this
@@ -420,29 +385,17 @@ const COMPOSER_MAX_COLS: u16 = 80;
 const COMPOSER_LEFT_RULE: &str = "▌";
 const COMPOSER_RIGHT_RULE: &str = "▐";
 
-/// Centre the composer inside a band that already belongs to the left content column.
+/// Give the composer the left content column with one column of breathing room per side.
 ///
 /// [`Component::render`] applies [`content_bounds`] before its vertical split, so `bounds`
-/// cannot include sidebar or gap columns. This function has one job after that split: cap the
-/// input measure and centre it inside the transcript column.
-///
-/// The narrowing is a `min`, never a `clamp`. [`u16::clamp`] **panics when its minimum exceeds
-/// its maximum** — the hazard [`prompt_rows`] documents at length — and on the 20-column pane a
-/// real terminal reaches, [`COMPOSER_MAX_COLS`] is four times the frame. Taking the smaller of
-/// the two orders them by construction, so a narrow pane degrades to the full width rather than
-/// to a slit or an abort.
-///
-/// Centred within `bounds` and not within the frame, which is what keeps the box on the
-/// transcript's own axis once [`content_bounds`] has taken the panel's columns away.
+/// cannot include sidebar or gap columns. Narrow panes keep every column; otherwise the two
+/// outside columns carry the focus rules without imposing an arbitrary prose-width cap on user
+/// input.
 const fn composer_region(bounds: Rect) -> Rect {
-    let width = if bounds.width < COMPOSER_MAX_COLS {
-        bounds.width
-    } else {
-        COMPOSER_MAX_COLS
-    };
+    let margin = if bounds.width > 2 { 1 } else { 0 };
     Rect {
-        x: bounds.x + (bounds.width - width) / 2,
-        width,
+        x: bounds.x + margin,
+        width: bounds.width.saturating_sub(margin.saturating_mul(2)),
         ..bounds
     }
 }
@@ -530,6 +483,9 @@ enum PointerGesture {
         row: u16,
         dragged: bool,
     },
+    Sidebar {
+        dragged: bool,
+    },
     Scrollbar {
         anchor: usize,
     },
@@ -538,6 +494,9 @@ enum PointerGesture {
 /// The transcript, the status strip and the prompt as one screen.
 pub struct SessionScreen {
     transcript: TranscriptView,
+    transcript_full: bool,
+    summary_offset: usize,
+    detailed_offset: usize,
     scrollbar: ScrollbarView,
     scrollbar_visible: bool,
     scrollbar_area: Option<Rect>,
@@ -588,6 +547,8 @@ pub struct SessionScreen {
     /// shape the permission bridge uses: a receiver awaited here would stop the one loop
     /// that consumes terminal input, engine events and the lease wake.
     reports: Option<mpsc::Receiver<crate::views::lsp::Report>>,
+    background_executions: Option<Arc<zuno_pty::BackgroundExecutionService>>,
+    background_session: Option<String>,
     /// Where the files a finished turn wrote are handed over for checking.
     edits: Option<crate::views::lsp::PendingEdits>,
     /// The files the running turn has written so far.
@@ -765,8 +726,13 @@ impl SessionScreen {
     #[must_use]
     pub fn new(context: ViewContext, shutdown: mpsc::Sender<TerminalEvent>) -> Self {
         let slash = SlashRouter::default();
+        let mut transcript = TranscriptView::new(context.clone());
+        transcript.set_activity_display(crate::views::message::ActivityDisplay::Summary);
         Self {
-            transcript: TranscriptView::new(context.clone()),
+            transcript,
+            transcript_full: false,
+            summary_offset: 0,
+            detailed_offset: 0,
             scrollbar: ScrollbarView::new(context.clone()),
             scrollbar_visible: true,
             scrollbar_area: None,
@@ -791,6 +757,8 @@ impl SessionScreen {
             debug: crate::views::diagnostics::DebugFacts::default(),
             cancels: None,
             reports: None,
+            background_executions: None,
+            background_session: None,
             edits: None,
             touched: Vec::new(),
             submissions: Vec::new(),
@@ -1016,6 +984,7 @@ impl SessionScreen {
             return EventResult::IGNORED;
         };
         self.catalog.session = Some(session_id.clone());
+        self.background_session = Some(session_id.clone());
         if !self
             .catalog
             .sessions
@@ -1163,6 +1132,44 @@ impl SessionScreen {
         &mut self.transcript
     }
 
+    #[must_use]
+    pub fn with_background_executions(
+        mut self,
+        service: Arc<zuno_pty::BackgroundExecutionService>,
+        session_id: impl Into<String>,
+    ) -> Self {
+        self.background_executions = Some(service);
+        self.background_session = Some(session_id.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn transcript_full(&self) -> bool {
+        self.transcript_full
+    }
+
+    fn toggle_transcript(&mut self) -> EventResult {
+        if self.transcript_full {
+            self.detailed_offset = self.transcript.offset();
+            self.transcript
+                .set_activity_display(crate::views::message::ActivityDisplay::Summary);
+            self.transcript.set_offset(self.summary_offset);
+            self.transcript_full = false;
+        } else {
+            self.summary_offset = self.transcript.offset();
+            let following = self.transcript.is_following();
+            self.transcript
+                .set_activity_display(crate::views::message::ActivityDisplay::Detailed);
+            self.transcript.set_offset(self.detailed_offset);
+            if following {
+                self.transcript.follow();
+            }
+            self.transcript_full = true;
+        }
+        self.sidebar.clear_selection();
+        EventResult::REDRAW
+    }
+
     /// The welcome screen, for the host that resolves the facts it states.
     pub const fn welcome_mut(&mut self) -> &mut crate::views::welcome::WelcomeView {
         &mut self.welcome
@@ -1265,6 +1272,13 @@ impl SessionScreen {
                     )
                     .with_labels("Restore", "Keep"),
                 ));
+            }
+            SlashSubmission::Host(HostCommand::Stop(None)) => {
+                let dialog = self.background_view();
+                self.request(dialog);
+            }
+            SlashSubmission::Host(HostCommand::Stop(Some(execution_id))) => {
+                self.cancel_background(&execution_id);
             }
             SlashSubmission::Host(command) => {
                 self.submit_to_driver(text, PromptSubmission::Host(command));
@@ -1448,6 +1462,50 @@ impl Component for SessionScreen {
             .iter()
             .map(crate::views::picker::McpServer::service)
             .collect();
+        if self.transcript_full {
+            self.sidebar.forget_hit_targets();
+            crate::views::fill(frame.buffer_mut(), area, self.context.surface());
+            let [header, body, footer] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            ratatui::widgets::Widget::render(
+                ratatui::widgets::Paragraph::new(crate::views::padded(
+                    " Full transcript",
+                    header.width,
+                    self.context.title(),
+                )),
+                header,
+                frame.buffer_mut(),
+            );
+            let (main, scrollbar) = if self.scrollbar_visible && body.width > 1 {
+                let [main, scrollbar] =
+                    Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(body);
+                (main, Some(scrollbar))
+            } else {
+                (body, None)
+            };
+            self.scrollbar_area = scrollbar;
+            self.transcript.render(frame, main);
+            if let Some(scrollbar) = scrollbar {
+                self.scrollbar.total = self.transcript.content_height();
+                self.scrollbar.viewport = self.transcript.viewport_height();
+                self.scrollbar.offset = self.transcript.offset();
+                self.scrollbar.render(frame, scrollbar);
+            }
+            ratatui::widgets::Widget::render(
+                ratatui::widgets::Paragraph::new(crate::views::padded(
+                    " Ctrl+T / Esc back · scroll to inspect durable history and live activity",
+                    footer.width,
+                    self.context.muted(),
+                )),
+                footer,
+                frame.buffer_mut(),
+            );
+            return;
+        }
         let empty = !self.transcript.transcript().conversation_started();
         // Split the whole frame first. The transcript, prompt, status and info row now share
         // one left column, so none of those bands can run underneath the sidebar.
@@ -1621,7 +1679,9 @@ impl Component for SessionScreen {
         // to the editor and resolves to no action at all. That is the point: before
         // bracketed paste was enabled the same paste arrived as individual keys, and
         // every newline among them resolved to `input_submit`.
-        if let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Paste(text))) = event {
+        if !self.transcript_full
+            && let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Paste(text))) = event
+        {
             return self.paste(text);
         }
         // A printable key resolves to no action, so the dispatcher forwards it here
@@ -1630,6 +1690,7 @@ impl Component for SessionScreen {
         // same seam the reject box uses.
         if let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(key))) = event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && !self.transcript_full
             && let Some(character) = typed_character(key)
         {
             self.editor.insert_char(character);
@@ -1941,7 +2002,7 @@ impl SessionScreen {
     /// reporting (`?1003`) remains disabled, so moving the pointer without a held button
     /// still costs no channel traffic.
     fn handle_mouse(&mut self, mouse: &MouseEvent, now_ms: u64) -> EventResult {
-        let notches = match mouse.kind {
+        let notches: f64 = match mouse.kind {
             MouseEventKind::ScrollUp => -1.0,
             MouseEventKind::ScrollDown => 1.0,
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -1953,17 +2014,32 @@ impl SessionScreen {
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                 return self.end_pointer(mouse.column, mouse.row);
             }
-            // Horizontal wheels, other buttons and free pointer movement: the transcript has
-            // one axis, and a screen that claimed the rest would stop a later surface from
-            // seeing them.
+            MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
+                return self.copy_pointer_selection(mouse.column, mouse.row);
+            }
+            // Horizontal wheels and free pointer movement have no consumer.
             _ => return EventResult::IGNORED,
         };
+        if self.sidebar.contains(mouse.column, mouse.row) {
+            let rows = if notches.is_sign_negative() { -3 } else { 3 };
+            return if self.sidebar.scroll_lines(rows) {
+                EventResult::REDRAW
+            } else {
+                EventResult::IGNORED
+            };
+        }
         self.scroll_transcript(notches, now_ms)
     }
 
     fn begin_pointer(&mut self, column: u16, row: u16) -> EventResult {
         if self.sidebar.click(column, row) {
             self.transcript.clear_selection();
+            self.sidebar.clear_selection();
+            return EventResult::REDRAW;
+        }
+        if self.sidebar.begin_selection(column, row) {
+            self.transcript.clear_selection();
+            self.pointer = Some(PointerGesture::Sidebar { dragged: false });
             return EventResult::REDRAW;
         }
         if let Some(area) = self
@@ -1971,11 +2047,13 @@ impl SessionScreen {
             .filter(|area| rect_contains(*area, column, row))
         {
             self.transcript.clear_selection();
+            self.sidebar.clear_selection();
             let anchor = self.scrollbar.drag_anchor(row, area);
             self.pointer = Some(PointerGesture::Scrollbar { anchor });
             return self.drag_scrollbar(row, area, anchor);
         }
         if self.transcript.begin_selection(column, row) {
+            self.sidebar.clear_selection();
             self.pointer = Some(PointerGesture::Transcript {
                 column,
                 row,
@@ -2011,6 +2089,13 @@ impl SessionScreen {
                 });
                 EventResult::REDRAW
             }
+            Some(PointerGesture::Sidebar { .. }) => {
+                if !self.sidebar.update_selection(column, row) {
+                    return EventResult::IGNORED;
+                }
+                self.pointer = Some(PointerGesture::Sidebar { dragged: true });
+                EventResult::REDRAW
+            }
             None => EventResult::IGNORED,
         }
     }
@@ -2030,14 +2115,38 @@ impl SessionScreen {
             }) => {
                 let _ = self.transcript.update_selection(column, row);
                 if dragged {
-                    EventResult::REDRAW
+                    match self.transcript.selected_text() {
+                        Some(text) => self.copy(text),
+                        None => EventResult::REDRAW,
+                    }
                 } else {
                     self.transcript.clear_selection();
                     self.handle_click(start_column, start_row)
                 }
             }
+            Some(PointerGesture::Sidebar { dragged }) => {
+                let _ = self.sidebar.update_selection(column, row);
+                if dragged {
+                    match self.sidebar.selected_text() {
+                        Some(text) => self.copy(text),
+                        None => EventResult::REDRAW,
+                    }
+                } else {
+                    self.sidebar.clear_selection();
+                    EventResult::REDRAW
+                }
+            }
             None => EventResult::IGNORED,
         }
+    }
+
+    fn copy_pointer_selection(&mut self, column: u16, row: u16) -> EventResult {
+        let selected = if self.sidebar.contains(column, row) {
+            self.sidebar.selected_text()
+        } else {
+            self.transcript.selected_text()
+        };
+        selected.map_or(EventResult::IGNORED, |text| self.copy(text))
     }
 
     fn drag_scrollbar(&mut self, row: u16, area: Rect, anchor: usize) -> EventResult {
@@ -2321,6 +2430,7 @@ impl SessionScreen {
             "agent_cycle" => self.cycle_agent(1),
             "agent_cycle_reverse" => self.cycle_agent(-1),
             "variant_cycle" => self.cycle_effort(1),
+            "messages_transcript" => self.toggle_transcript(),
             "session_list" => self.request(self.session_picker()),
             // Two statements because opening the theme picker also records the theme to
             // put back on escape, which needs `&mut self` while `request` does too.
@@ -2329,6 +2439,7 @@ impl SessionScreen {
                 self.request(dialog)
             }
             "session_child_first" => self.request(self.subagent_view()),
+            "ps_view" => self.request(self.background_view()),
             "mcp_list" => self.request(self.mcp_list()),
             "status_view" => self.request(self.status_panel()),
             "debug_view" => self.request(self.debug_panel()),
@@ -2464,6 +2575,40 @@ impl SessionScreen {
             self.context.clone(),
             crate::views::subagent::delegations(self.transcript.transcript().messages()),
         )))
+    }
+
+    fn background_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        Some(Box::new(crate::views::background::BackgroundView::new(
+            self.context.clone(),
+            Arc::clone(self.background_executions.as_ref()?),
+            self.background_session.clone().unwrap_or_default(),
+        )))
+    }
+
+    fn cancel_background(&mut self, execution_id: &str) -> EventResult {
+        let outcome = (|| {
+            let service = self
+                .background_executions
+                .as_ref()
+                .ok_or_else(|| "background execution service is unavailable".to_owned())?;
+            let id = zuno_pty::BackgroundExecutionId::parse(execution_id.to_owned())
+                .map_err(|error| error.to_string())?;
+            let info = service.get(&id).map_err(|error| error.to_string())?;
+            if self.background_session.as_deref() != Some(info.session_id.as_str()) {
+                return Err(format!(
+                    "background execution `{execution_id}` is not owned by this session"
+                ));
+            }
+            service.cancel(&id).map_err(|error| error.to_string())
+        })();
+        self.toasts.push(match outcome {
+            Ok(true) => Toast::success(format!("stopping background terminal {execution_id}")),
+            Ok(false) => Toast::warning(format!(
+                "background terminal {execution_id} is already settled"
+            )),
+            Err(error) => Toast::error(error),
+        });
+        EventResult::REDRAW
     }
 
     /// `§8.7`'s status census, with the MCP group read live at open time.
@@ -3064,6 +3209,9 @@ impl ActionComponent for SessionScreen {
                 self.toasts.push(Toast::new(level, notice));
                 EventResult::REDRAW
             }
+            crate::views::dialog::DialogOutcome::BackgroundCancel { execution_id } => {
+                self.cancel_background(execution_id)
+            }
             _ => EventResult::IGNORED,
         }
     }
@@ -3085,6 +3233,17 @@ impl ActionComponent for SessionScreen {
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
+        if self.transcript_full {
+            if matches!(action.name, "messages_transcript" | "session_interrupt") {
+                return self.toggle_transcript();
+            }
+            if action.name == "messages_copy"
+                && let Some(text) = self.transcript.selected_text()
+            {
+                return self.copy(text);
+            }
+            return self.handle_view_action(action);
+        }
         if self.autocomplete.is_open() {
             let autocomplete_action = match action.name {
                 "prompt.autocomplete.prev"
@@ -3157,7 +3316,8 @@ pub fn scopes() -> Vec<String> {
     [
         // `input` and `prompt` first, so a chord the editor claims wins over an
         // application-wide one on the same keys.
-        "input", "prompt",
+        "input",
+        "prompt",
         // `history` stays after `input` in the static chain, preserving the rule above that
         // editor bindings win ordinary collisions. Its complete scope is only `up` and
         // `down`, so registering it cannot consume a typeable character. At a buffer's
@@ -3178,20 +3338,33 @@ pub fn scopes() -> Vec<String> {
         // `Pending`, the `e` then matched nothing, fell through to the editor and was
         // inserted — `ctrl+x e` left `beforee` in the prompt, and the contained-editor
         // stack behind it could not be opened by any means.
-        "editor", "messages", "model", "agent", "session", "theme", "sidebar", "mcp", "tool",
-        "display", "tips", "command", "help",
+        "editor",
+        "messages",
+        "model",
+        "agent",
+        "session",
+        "theme",
+        "sidebar",
+        "mcp",
+        "tool",
+        "display",
+        "tips",
+        "command",
+        "help",
+        "background",
         // `status` and `debug` cost no typeable character, which is the question this list
         // exists to answer. Each is a one-row scope — `status_view` on `<leader>s` and an
         // unbound `debug_view` — so neither can claim a bare letter the way `diff` below
         // does, and no other row in the table spells `<leader>s`.
-        "status", "debug",
+        "status",
+        "debug",
         // `variant` costs no typeable character either: the complete scope is
-        // `variant_cycle` on `ctrl+t` plus an unbound `variant_list`, and a control chord
+        // `variant_cycle` on `alt+t` plus an unbound `variant_list`, and a modified chord
         // is not something text entry produces. Unregistered, `ctrl+t` was the same dead
         // key `editor` above describes — the table advertised "Cycle model variants" and
         // no scope claimed the chord, so it resolved to `Unmatched` and fell through to
         // the editor, which inserts nothing for it. `views/slash.rs:267` recorded the
-        // scope's shape while nothing was reaching it.
+        // scope's shape while nothing was reaching it. `ctrl+t` belongs to `transcript`.
         "variant",
         // `diff` after `input` and `messages`, and only for `diff_open`'s sake. The scope
         // also carries the viewer's own bare characters — `q`, `n`, `p`, `d`, `v`, `s`,

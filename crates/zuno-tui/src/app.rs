@@ -414,7 +414,8 @@ impl crossterm::Command for AlternateScrollRelease {
 /// it would otherwise delay a keystroke.
 ///
 /// A left press begins either a click, a transcript selection, or a scrollbar drag. The
-/// matching drag and release events are therefore consumers too.
+/// matching drag and release events are therefore consumers too. A right press copies the
+/// application-owned selection without relying on a terminal context menu.
 const fn is_consumable_mouse(kind: crossterm::event::MouseEventKind) -> bool {
     matches!(
         kind,
@@ -423,6 +424,7 @@ const fn is_consumable_mouse(kind: crossterm::event::MouseEventKind) -> bool {
             | crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
             | crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left)
             | crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+            | crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right)
     )
 }
 

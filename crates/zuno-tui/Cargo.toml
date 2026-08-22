@@ -20,7 +20,9 @@ zuno-engine = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-observability = { workspace = true }
 zuno-permission = { workspace = true }
+zuno-pty = { workspace = true }
 zuno-tool = { workspace = true }
+zuno-types = { workspace = true }
 pulldown-cmark = { workspace = true }
 ratatui = { workspace = true }
 serde = { workspace = true }

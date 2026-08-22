@@ -440,6 +440,8 @@ fn execute_once(
     // the channel and end the checker task.
     let edit_reader = pending_edits.reader();
     let (history_sender, history_receiver) = mpsc::channel(PROMPT_HISTORY_CHANNEL_CAPACITY);
+    let background_executions = host.background_executions();
+    let background_session = host.session_id().to_owned();
     let probe = super::tui_lsp::Probe::resolve(
         &lsp_config,
         lsp_workspace.as_path(),
@@ -458,6 +460,7 @@ fn execute_once(
         .with_edit_sink(pending_edits)
         .with_prompt_history(history.into_entries(), history_sender)
         .with_external_editor(editor_sender, editor_result_receiver)
+        .with_background_executions(background_executions, background_session)
         // A clone rather than a borrow: `KeyDispatcher` takes the keymap by value below,
         // and the keybinding reference has to list what the *user's* keymap resolved
         // rather than the shipped defaults.
@@ -1948,6 +1951,9 @@ async fn restore_snapshot(
     let (source, restore) = match command {
         HostCommand::Undo => (&mut snapshots.undo, zuno_snapshot::TurnRestore::Undo),
         HostCommand::Redo => (&mut snapshots.redo, zuno_snapshot::TurnRestore::Redo),
+        HostCommand::Stop(_) => {
+            return Err("background stop must be handled by the TUI background service".to_owned());
+        }
     };
     let Some(checkpoint) = source.last().cloned() else {
         return Err(format!("nothing to {}", restore_name(restore)));

@@ -126,7 +126,10 @@ fn views_every_view_source_reaches_the_palette_through_the_context() {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        if matches!(name, "scroll.rs" | "external.rs" | "slash.rs") {
+        if matches!(
+            name,
+            "scroll.rs" | "external.rs" | "slash.rs" | "selection.rs"
+        ) {
             continue;
         }
         if !source.contains("ViewContext") && !source.contains("context.") {

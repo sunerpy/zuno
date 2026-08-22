@@ -1868,7 +1868,7 @@ pub const DEFINITIONS: &[Definition] = &[
     Definition {
         name: "variant_cycle",
         scope: "variant",
-        keys: "ctrl+t",
+        keys: "alt+t",
         command: "variant.cycle",
         prevent_default: None,
         description: "Cycle model variants",
@@ -2008,6 +2008,14 @@ pub const DEFINITIONS: &[Definition] = &[
         command: "session.toggle.actions",
         prevent_default: None,
         description: "Toggle tool details visibility",
+    },
+    Definition {
+        name: "messages_transcript",
+        scope: "messages",
+        keys: "ctrl+t",
+        command: "session.transcript",
+        prevent_default: None,
+        description: "Toggle full activity transcript",
     },
     Definition {
         name: "display_thinking",
@@ -2688,11 +2696,29 @@ pub const DEFINITIONS: &[Definition] = &[
 /// Kept outside [`DEFINITIONS`] so the mechanically extracted compatibility table
 /// remains auditable row-for-row. These still pass through the same parser, conflict
 /// detection, user overrides, and action dispatcher as every upstream binding.
-pub const LOCAL_DEFINITIONS: &[Definition] = &[Definition {
-    name: "subagent_cancel",
-    scope: "dialog.subagent",
-    keys: "x",
-    command: "subagent.cancel",
-    prevent_default: None,
-    description: "Confirm cancellation of the selected subagent job",
-}];
+pub const LOCAL_DEFINITIONS: &[Definition] = &[
+    Definition {
+        name: "subagent_cancel",
+        scope: "dialog.subagent",
+        keys: "x",
+        command: "subagent.cancel",
+        prevent_default: None,
+        description: "Confirm cancellation of the selected subagent job",
+    },
+    Definition {
+        name: "background_cancel",
+        scope: "dialog.background",
+        keys: "x",
+        command: "background.cancel",
+        prevent_default: None,
+        description: "Confirm cancellation of the selected background terminal",
+    },
+    Definition {
+        name: "ps_view",
+        scope: "background",
+        keys: "none",
+        command: "background.list",
+        prevent_default: None,
+        description: "List background terminals",
+    },
+];

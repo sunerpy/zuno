@@ -3775,7 +3775,7 @@ fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usiz
     let rendered = rows(&render_offscreen(screen, width, height).expect("infallible"));
     let first = rendered
         .iter()
-        .position(|row| row.starts_with(PROMPT_MARKER))
+        .position(|row| row.contains(PROMPT_MARKER))
         .expect("the prompt paints its gutter marker at every width these tests use");
     // Every band below the prompt is subtracted — the strip and `INFO_ROWS` as well as the
     // tail — because all of them are drawn *below* the band this measures. See the band order
@@ -3866,6 +3866,9 @@ fn session_a_click_on_one_tool_header_expands_only_that_call() {
         }
     }
 
+    screen
+        .transcript_mut()
+        .set_activity_display(crate::views::message::ActivityDisplay::Detailed);
     let before = rows(&render_offscreen(&mut screen, 100, 32).expect("infallible"));
     assert!(
         !before.join("\n").contains("first-output-6")
@@ -3907,7 +3910,7 @@ fn session_a_click_on_one_tool_header_expands_only_that_call() {
 }
 
 #[test]
-fn session_a_transcript_drag_stops_before_the_sidebar_and_copies_only_transcript_text() {
+fn session_a_transcript_drag_auto_copies_and_right_click_repeats_the_pane_bounded_copy() {
     let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
     let (screen, _shutdown) = mouse_conversing();
     let mut screen = screen.with_clipboard(clipboard.clone());
@@ -3961,11 +3964,10 @@ fn session_a_transcript_drag_stops_before_the_sidebar_and_copies_only_transcript
         "the highlight crossed into the sidebar"
     );
 
-    copy_action(&mut screen);
     let copied = clipboard
         .read()
         .expect("a memory clipboard cannot fail")
-        .expect("the selection was copied")
+        .expect("releasing the drag auto-copied the selection")
         .data;
     assert!(
         copied.contains("Here is the summary of the plan."),
@@ -3975,9 +3977,23 @@ fn session_a_transcript_drag_stops_before_the_sidebar_and_copies_only_transcript
         assert!(
             !copied.contains(sidebar_text),
             "the copied selection crossed into the sidebar and captured {sidebar_text:?}: \
-             {copied:?}"
+            {copied:?}"
         );
     }
+
+    clipboard.write("sentinel").expect("memory clipboard write");
+    pointer_at(
+        &mut screen,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+        10,
+        row,
+    );
+    let copied_again = clipboard
+        .read()
+        .expect("a memory clipboard cannot fail")
+        .expect("right click copied the retained selection")
+        .data;
+    assert_eq!(copied_again, copied);
 }
 
 #[test]
@@ -5834,10 +5850,8 @@ fn the_agent_and_model_strip_is_the_composers_footer() {
 ///   it rather than an unpainted seam holding ratatui's `Color::Reset`.
 /// * The two columns immediately outside the box carry the rule glyphs, which is what closes it.
 ///
-/// Below [`COMPOSER_MAX_COLS`] there is no margin to give, so the narrow sizes assert the
-/// degradation instead: the box is the frame, and there are no rules. That branch is asserted
-/// rather than skipped, because a `min` that became a `clamp` would panic there — the hazard
-/// `prompt_rows` documents — and a test that stopped at 120 columns would never reach it.
+/// The composer now uses all available left-column width except one cell on each side. This is
+/// enough to close the box without imposing an arbitrary prose-width cap on pasted input.
 #[test]
 fn the_composer_occupies_a_centred_region_with_visible_edges() {
     for (width, height) in [
@@ -5858,20 +5872,11 @@ fn the_composer_occupies_a_centred_region_with_visible_edges() {
         let palette = blank.context.palette();
         let surface = ratatui::style::Color::from(palette.background_panel);
 
-        if width <= COMPOSER_MAX_COLS {
-            assert_eq!(
-                (x, columns),
-                (0, usize::from(width)),
-                "at {width}x{height} the composer was narrowed on a frame with no margin to \
-                 spare, so the text lost columns it needed"
-            );
-            continue;
-        }
-
-        assert!(
-            columns < usize::from(width),
-            "at {width}x{height} the composer still spans the whole frame, so it reads as a \
-             band rather than as a box"
+        assert_eq!(
+            (x, columns),
+            (1, usize::from(width.saturating_sub(2))),
+            "at {width}x{height} the composer did not fill the content column with one-cell \
+             margins"
         );
         let right = usize::from(width) - x - columns;
         assert!(
@@ -6271,12 +6276,11 @@ fn the_welcome_surface_survives_a_startup_notice() {
             composer_span(&plain, width, height),
             "at {width}x{height} a startup notice changed the composer's region"
         );
-        if width > COMPOSER_MAX_COLS {
-            assert!(
-                columns < usize::from(width),
-                "at {width}x{height} the composer spans the whole frame, so it reads as a band"
-            );
-        }
+        assert_eq!(
+            (x, columns),
+            (1, usize::from(width.saturating_sub(2))),
+            "at {width}x{height} the composer did not retain its one-cell margins"
+        );
         let first = content_row(&rendered, &warned, width, height);
         let full = &rendered[prompt_first(&rendered, &warned, width, height)];
         let edges = full.chars().collect::<Vec<_>>();
@@ -6576,8 +6580,9 @@ fn the_composer_stays_inside_the_body_and_gains_an_info_row() {
         } else {
             assert_eq!(
                 (x, columns),
-                (0, usize::from(width)),
-                "at {width} columns there is no panel, so the composer must keep the frame"
+                (1, usize::from(width.saturating_sub(2))),
+                "at {width} columns there is no panel, so the composer must fill the frame \
+                 except for its one-cell margins"
             );
         }
 

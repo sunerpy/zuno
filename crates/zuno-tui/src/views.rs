@@ -45,6 +45,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 pub mod ambient;
 pub mod autocomplete;
+pub mod background;
 pub mod basics;
 pub mod diagnostics;
 pub mod dialog;
@@ -62,6 +63,7 @@ pub mod permission;
 pub mod picker;
 pub mod question;
 pub mod scroll;
+mod selection;
 pub mod session;
 pub mod slash;
 pub mod subagent;
@@ -244,6 +246,15 @@ impl ViewContext {
         let palette = self.palette();
         Style::new()
             .fg(palette.border_active.into())
+            .bg(palette.background_panel.into())
+    }
+
+    /// Secondary accent used to distinguish delegated work from ordinary tools.
+    #[must_use]
+    pub fn secondary(&self) -> Style {
+        let palette = self.palette();
+        Style::new()
+            .fg(palette.secondary.into())
             .bg(palette.background_panel.into())
     }
 

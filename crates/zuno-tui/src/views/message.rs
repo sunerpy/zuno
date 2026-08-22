@@ -36,6 +36,7 @@
 
 use crate::app::{AppEvent, Component, EventResult};
 use crate::keybind::APP_EXIT;
+use crate::views::selection::{TextPoint, TextSelection, slice_columns};
 use crate::views::{ViewContext, display_width, fill, key_label, padded, truncate};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -156,6 +157,7 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         "web_search" => ("◈", "Searching web..."),
         "task" => ("#", "Delegating..."),
         "job" => ("◷", "Checking job..."),
+        "bg" => ("◉", "Inspecting background execution..."),
         // A patch is a write, so it shares the write arrow rather than inventing a glyph:
         // the two differ in how the change is expressed, not in what happens to the file.
         "apply_patch" => ("→", "Preparing patch..."),
@@ -225,6 +227,14 @@ pub enum ToolDisplay {
     Collapsed,
     /// Up to [`TOOL_OUTPUT_MAX_ROWS`] rows.
     Expanded,
+}
+
+/// Whether routine activity is compacted into one row per contiguous group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivityDisplay {
+    #[default]
+    Summary,
+    Detailed,
 }
 
 impl ToolDisplay {
@@ -451,6 +461,32 @@ pub enum MessagePart {
         /// The report, already sorted worst-first.
         report: crate::views::lsp::Report,
     },
+}
+
+fn compact_activity(part: &MessagePart) -> Option<zuno_types::ActivityKind> {
+    use zuno_types::ActivityKind;
+    match part {
+        MessagePart::Tool {
+            ui_intent: zuno_tool::ToolUiIntent::Subagent,
+            status: ToolStatus::Completed,
+            diff: None,
+            ..
+        } => Some(ActivityKind::Delegation),
+        MessagePart::Tool {
+            name,
+            status: ToolStatus::Completed,
+            diff: None,
+            ..
+        } => match name.as_str() {
+            "bash" | "shell" | "exec" | "exec_command" => Some(ActivityKind::Command),
+            "read" | "glob" | "grep" | "list" | "ls" => Some(ActivityKind::Read),
+            "web_search" | "google_search" | "webfetch" | "web_fetch" => Some(ActivityKind::Search),
+            "view_image" | "image" | "imagegen" => Some(ActivityKind::Image),
+            _ => None,
+        },
+        MessagePart::Attachment { .. } => Some(ActivityKind::Image),
+        _ => None,
+    }
 }
 
 impl MessagePart {
@@ -1086,56 +1122,6 @@ impl Transcript {
     }
 }
 
-/// One cell in the transcript's rendered content coordinates.
-///
-/// Rows are absolute content rows, before the viewport offset is applied. Columns are
-/// terminal cells inside the transcript rectangle. Keeping this coordinate system means a
-/// selection survives scrolling without ever acquiring coordinates from the sidebar beside
-/// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TextPoint {
-    row: usize,
-    column: u16,
-}
-
-/// An application-owned drag selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TextSelection {
-    anchor: TextPoint,
-    head: TextPoint,
-}
-
-impl TextSelection {
-    fn ordered(self) -> (TextPoint, TextPoint) {
-        if self.anchor <= self.head {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-
-    /// Selected columns on `row`, with an exclusive end.
-    fn columns(self, row: usize, width: u16) -> Option<(u16, u16)> {
-        let (start, end) = self.ordered();
-        if row < start.row || row > end.row || width == 0 {
-            return None;
-        }
-        let last = width.saturating_sub(1);
-        let start_column = start.column.min(last);
-        let end_column = end.column.min(last);
-        let (left, right) = if start.row == end.row {
-            (start_column, end_column.saturating_add(1))
-        } else if row == start.row {
-            (start_column, width)
-        } else if row == end.row {
-            (0, end_column.saturating_add(1))
-        } else {
-            (0, width)
-        };
-        (left < right).then_some((left, right.min(width)))
-    }
-}
-
 /// One message's rows and the tool-header rows inside it.
 #[derive(Clone)]
 struct MessageRows {
@@ -1152,6 +1138,7 @@ pub struct TranscriptView {
     transcript: Transcript,
     thinking: ThinkingDisplay,
     tool_output: ToolDisplay,
+    activity: ActivityDisplay,
     /// Per-call overrides applied on top of [`Self::tool_output`].
     tool_overrides: BTreeMap<String, ToolDisplay>,
     /// Cache invalidation for per-call affordance changes.
@@ -1211,6 +1198,7 @@ impl TranscriptView {
             transcript: Transcript::new(),
             thinking: ThinkingDisplay::Collapsed,
             tool_output: ToolDisplay::Collapsed,
+            activity: ActivityDisplay::Detailed,
             tool_overrides: BTreeMap::new(),
             tool_revision: 0,
             offset: 0,
@@ -1296,6 +1284,19 @@ impl TranscriptView {
     #[must_use]
     pub const fn tool_output(&self) -> ToolDisplay {
         self.tool_output
+    }
+
+    /// Choose the main-timeline summary or the complete activity transcript.
+    pub fn set_activity_display(&mut self, display: ActivityDisplay) {
+        if self.activity != display {
+            self.activity = display;
+            self.cache = RowCache::default();
+        }
+    }
+
+    #[must_use]
+    pub const fn activity_display(&self) -> ActivityDisplay {
+        self.activity
     }
 
     fn tool_display(&self, call_id: &str) -> ToolDisplay {
@@ -1571,13 +1572,63 @@ impl TranscriptView {
         {
             lines.push(self.ruled(message.role, rule, label, self.context.title(), width));
         }
-        for part in &message.parts {
+        let mut parts = message.parts.iter().peekable();
+        while let Some(part) = parts.next() {
+            if self.activity == ActivityDisplay::Summary
+                && let Some(kind) = compact_activity(part)
+            {
+                let mut activity = zuno_types::ActivityProjection::default();
+                let mut compacted = vec![part];
+                activity.record(kind);
+                while let Some(next) = parts.peek()
+                    && let Some(kind) = compact_activity(next)
+                {
+                    activity.record(kind);
+                    compacted.push(parts.next().expect("peeked part exists"));
+                }
+                if compacted.len() == 1 {
+                    if let MessagePart::Tool { call_id, .. } = part {
+                        tools.push((lines.len(), call_id.clone()));
+                    }
+                    self.part_lines(message.role, rule, part, width, &mut lines);
+                } else {
+                    self.activity_lines(message.role, rule, activity, width, &mut lines);
+                }
+                continue;
+            }
             if let MessagePart::Tool { call_id, .. } = part {
                 tools.push((lines.len(), call_id.clone()));
             }
             self.part_lines(message.role, rule, part, width, &mut lines);
         }
         MessageRows { lines, tools }
+    }
+
+    fn activity_lines(
+        &self,
+        role: Role,
+        rule: Style,
+        activity: zuno_types::ActivityProjection,
+        width: u16,
+        out: &mut Vec<Line<'static>>,
+    ) {
+        let mut labels = Vec::new();
+        let mut push = |count: usize, singular: &str, plural: &str| {
+            if count > 0 {
+                labels.push(format!(
+                    "{count} {}",
+                    if count == 1 { singular } else { plural }
+                ));
+            }
+        };
+        push(activity.commands, "command", "commands");
+        push(activity.reads, "read", "reads");
+        push(activity.searches, "search", "searches");
+        push(activity.delegations, "delegation", "delegations");
+        push(activity.images, "image", "images");
+        push(activity.tools, "tool", "tools");
+        let row = format!(" • {} · Ctrl+T details", labels.join(" · "));
+        out.push(self.ruled(role, rule, &row, self.context.accent(), width));
     }
 
     /// The user's message as a closed box: a titled top rule, the body, a closing rule.
@@ -1767,6 +1818,7 @@ impl TranscriptView {
                 width,
                 thinking: self.thinking,
                 tool_output: self.tool_output,
+                activity: self.activity,
                 tool_revision: self.tool_revision,
                 previous,
                 content: fingerprint(message),
@@ -2058,7 +2110,7 @@ impl TranscriptView {
                 };
                 push(
                     &row,
-                    crate::views::tool::status_style(*status, &self.context),
+                    crate::views::tool::status_style(*status, *ui_intent, &self.context),
                     out,
                 );
                 // A patch travels beside the output rather than inside it, so a result that
@@ -2078,7 +2130,7 @@ impl TranscriptView {
                             && let Some(envelope) = crate::views::subagent::output_envelope(output)
                         {
                             let detail = format!("{}{}", Self::RESULT_INSET, envelope.detail);
-                            push(&detail, self.context.accent(), out);
+                            push(&detail, self.context.secondary(), out);
                             if !envelope.result.is_empty() {
                                 self.tool_result_lines(
                                     frame,
@@ -2309,6 +2361,7 @@ struct RowKey {
     width: u16,
     thinking: ThinkingDisplay,
     tool_output: ToolDisplay,
+    activity: ActivityDisplay,
     tool_revision: u64,
     previous: Option<Role>,
     content: u64,
@@ -3417,34 +3470,6 @@ impl Component for ScrollbarView {
     fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
         EventResult::IGNORED
     }
-}
-
-/// The characters whose terminal cells overlap `[left, right)`.
-fn slice_columns(text: &str, left: u16, right: u16) -> String {
-    let left = usize::from(left);
-    let right = usize::from(right);
-    let mut column = 0usize;
-    let mut out = String::new();
-    let mut selected_previous = false;
-    for character in text.chars() {
-        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-        if width == 0 {
-            if selected_previous {
-                out.push(character);
-            }
-            continue;
-        }
-        let end = column.saturating_add(width);
-        selected_previous = column < right && end > left;
-        if selected_previous {
-            out.push(character);
-        }
-        column = end;
-        if column >= right {
-            break;
-        }
-    }
-    out
 }
 
 /// The summary line a collapsed reasoning block shows.

@@ -1216,7 +1216,7 @@ fn is_control(character: char) -> bool {
 /// them is a dozen lines. Anything unrecognized after `ESC` drops the `ESC` and
 /// keeps the text, which is the conservative direction: a stray letter is
 /// harmless, a stray `ESC` is not.
-fn strip_ansi(input: &str) -> String {
+pub(crate) fn strip_ansi(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(character) = chars.next() {

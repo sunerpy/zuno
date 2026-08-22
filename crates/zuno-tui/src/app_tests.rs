@@ -510,9 +510,6 @@ fn app_the_input_filter_forwards_exactly_what_a_screen_consumes() {
     for kind in [
         MouseEventKind::Moved,
         MouseEventKind::Down(MouseButton::Left),
-        // A right press: the screen hit-tests the left button only, so a filter widened to
-        // "any button" would be caught here rather than by a user wondering why a
-        // context-menu attempt collapsed a panel section.
         MouseEventKind::Down(MouseButton::Right),
     ] {
         if consumable_name(kind).is_some_and(|name| consumed.contains(name)) {
@@ -535,6 +532,7 @@ const fn consumable_name(kind: MouseEventKind) -> Option<&'static str> {
         MouseEventKind::ScrollRight => Some("ScrollRight"),
         MouseEventKind::Moved => Some("Moved"),
         MouseEventKind::Down(MouseButton::Left) => Some("Down"),
+        MouseEventKind::Down(MouseButton::Right) => Some("Down"),
         MouseEventKind::Drag(MouseButton::Left) => Some("Drag"),
         MouseEventKind::Up(MouseButton::Left) => Some("Up"),
         _ => None,

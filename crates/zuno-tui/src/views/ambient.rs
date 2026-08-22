@@ -26,10 +26,11 @@
 //! [`SIDEBAR_WIDTH`] is why the threshold is where it is.
 
 use crate::app::{AppEvent, Component, EventResult};
+use crate::views::selection::{TextPoint, TextSelection, slice_columns};
 use crate::views::{ViewContext, display_width, fill, padded, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -408,6 +409,11 @@ pub struct SidebarView {
     context: ViewContext,
     ambient: Ambient,
     expanded: Expanded,
+    offset: usize,
+    content_height: usize,
+    viewport_height: usize,
+    body_area: Option<Rect>,
+    selection: Option<TextSelection>,
     /// Where each section's heading was drawn in the frame that was drawn.
     ///
     /// Absolute screen rows, recorded by [`Component::render`] from the same `lines()`
@@ -430,6 +436,11 @@ impl SidebarView {
             context,
             ambient: Ambient::default(),
             expanded: Expanded::default(),
+            offset: 0,
+            content_height: 0,
+            viewport_height: 0,
+            body_area: None,
+            selection: None,
             hits: Vec::new(),
         }
     }
@@ -506,6 +517,117 @@ impl SidebarView {
         true
     }
 
+    /// Whether `(column, row)` belongs to the scrollable body drawn last frame.
+    #[must_use]
+    pub fn contains(&self, column: u16, row: u16) -> bool {
+        self.body_area.is_some_and(|area| {
+            column >= area.left()
+                && column < area.right()
+                && row >= area.top()
+                && row < area.bottom()
+        })
+    }
+
+    /// Begin a selection in the sidebar body.
+    pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.point_at(column, row, false) else {
+            return false;
+        };
+        self.selection = Some(TextSelection {
+            anchor: point,
+            head: point,
+        });
+        true
+    }
+
+    /// Extend the active selection, clamped to the sidebar body.
+    pub fn update_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.point_at(column, row, true) else {
+            return false;
+        };
+        let Some(selection) = &mut self.selection else {
+            return false;
+        };
+        selection.head = point;
+        true
+    }
+
+    /// Clear the sidebar selection.
+    pub const fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Text covered by the current sidebar selection.
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let area = self.body_area?;
+        if area.width == 0 {
+            return None;
+        }
+        let rows = self.rows(area.width).lines;
+        let (start, end) = selection.ordered();
+        if start.row >= rows.len() {
+            return None;
+        }
+        let mut selected = Vec::new();
+        let last = end.row.min(rows.len().saturating_sub(1));
+        for (row, line) in rows
+            .iter()
+            .enumerate()
+            .take(last.saturating_add(1))
+            .skip(start.row)
+        {
+            let Some((left, right)) = selection.columns(row, area.width) else {
+                continue;
+            };
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            selected.push(slice_columns(&text, left, right).trim_end().to_owned());
+        }
+        let text = selected.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Move the independent sidebar viewport by whole rows.
+    pub fn scroll_lines(&mut self, delta: isize) -> bool {
+        let max = self.content_height.saturating_sub(self.viewport_height);
+        let target = isize::try_from(self.offset)
+            .unwrap_or(isize::MAX)
+            .saturating_add(delta)
+            .max(0);
+        let next = usize::try_from(target).unwrap_or(max).min(max);
+        if next == self.offset {
+            return false;
+        }
+        self.offset = next;
+        true
+    }
+
+    fn point_at(&self, column: u16, row: u16, clamp: bool) -> Option<TextPoint> {
+        let area = self.body_area?;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if !clamp
+            && (column < area.left()
+                || column >= area.right()
+                || row < area.top()
+                || row >= area.bottom())
+        {
+            return None;
+        }
+        let column = column.clamp(area.left(), area.right().saturating_sub(1)) - area.left();
+        let visible_row = row.clamp(area.top(), area.bottom().saturating_sub(1)) - area.top();
+        Some(TextPoint {
+            row: self.offset.saturating_add(usize::from(visible_row)),
+            column,
+        })
+    }
+
     /// Discard the recorded heading positions.
     ///
     /// Called by the owner on any frame that does not draw this panel — the user hid it, or
@@ -513,6 +635,8 @@ impl SidebarView {
     /// geometry would keep answering clicks aimed at whatever now occupies those columns.
     pub fn forget_hit_targets(&mut self) {
         self.hits.clear();
+        self.body_area = None;
+        self.selection = None;
     }
 
     fn health_style(&self, health: Health) -> Style {
@@ -771,14 +895,19 @@ impl SidebarView {
                 lines.push(padded("  none discovered", width, self.context.muted()));
             } else {
                 for skill in &self.ambient.skills {
+                    let style = if skill.loaded {
+                        self.context.accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        self.context.text()
+                    };
                     lines.push(padded(
-                        &format!("  {} {}", if skill.loaded { "✓" } else { "·" }, skill.name),
-                        width,
-                        if skill.loaded {
-                            self.context.success()
+                        &if skill.loaded {
+                            format!("  ✓ {} · loaded", skill.name)
                         } else {
-                            self.context.text()
+                            format!("  · {}", skill.name)
                         },
+                        width,
+                        style,
                     ));
                 }
             }
@@ -838,6 +967,7 @@ impl Component for SidebarView {
         // Cleared before any early return, so a frame that draws nothing leaves no target
         // behind. Every path below that does draw refills it.
         self.hits.clear();
+        self.body_area = None;
         fill(frame.buffer_mut(), area, self.context.surface());
         if area.width == 0 || area.height == 0 {
             return;
@@ -863,9 +993,34 @@ impl Component for SidebarView {
             return;
         }
 
-        let footer = self.footer_lines(inner.width);
-        let body_rows = usize::from(inner.height).saturating_sub(footer.len());
-        let rows = self.rows(inner.width);
+        let footer_height = self
+            .footer_lines(inner.width)
+            .len()
+            .min(usize::from(inner.height));
+        let body_height = inner
+            .height
+            .saturating_sub(u16::try_from(footer_height).unwrap_or(inner.height));
+        let provisional = self.rows(inner.width);
+        let scrollable = provisional.lines.len() > usize::from(body_height) && inner.width > 1;
+        let body_width = inner.width.saturating_sub(u16::from(scrollable));
+        let rows = if scrollable {
+            self.rows(body_width)
+        } else {
+            provisional
+        };
+        let footer = self.footer_lines(body_width);
+        let body = Rect {
+            width: body_width,
+            height: body_height,
+            ..inner
+        };
+        self.body_area = Some(body);
+        self.content_height = rows.lines.len();
+        self.viewport_height = usize::from(body.height);
+        self.offset = self
+            .offset
+            .min(self.content_height.saturating_sub(self.viewport_height));
+        let body_rows = self.viewport_height;
         // Recorded from `body_rows` — the count actually painted — not from `headers`. The
         // panel is clipped by `take` whenever the pane is short, and a heading that was
         // dropped has no row on screen for a click to land on. Recording it anyway would
@@ -874,12 +1029,14 @@ impl Component for SidebarView {
             self.hits = rows
                 .headers
                 .iter()
-                .filter(|(index, _)| *index < body_rows)
+                .filter(|(index, _)| {
+                    *index >= self.offset && *index < self.offset.saturating_add(body_rows)
+                })
                 .filter_map(|(index, section)| {
-                    let offset = u16::try_from(*index).ok()?;
+                    let offset = u16::try_from(index.saturating_sub(self.offset)).ok()?;
                     Some((
                         Rect {
-                            y: inner.y.checked_add(offset)?,
+                            y: body.y.checked_add(offset)?,
                             height: 1,
                             // The whole panel row, not just the heading's own columns: the
                             // rule and the two-column indent belong to no other control.
@@ -891,10 +1048,59 @@ impl Component for SidebarView {
                 })
                 .collect();
         }
-        let body = rows.lines.into_iter().take(body_rows).collect::<Vec<_>>();
-        Paragraph::new(body)
+        let visible = rows
+            .lines
+            .into_iter()
+            .skip(self.offset)
+            .take(body_rows)
+            .collect::<Vec<_>>();
+        Paragraph::new(visible)
             .style(self.context.surface())
-            .render(inner, frame.buffer_mut());
+            .render(body, frame.buffer_mut());
+
+        if let Some(selection) = self.selection {
+            let selected = self.context.selected();
+            for visible_row in 0..body.height {
+                let content_row = self.offset.saturating_add(usize::from(visible_row));
+                let Some((left, right)) = selection.columns(content_row, body.width) else {
+                    continue;
+                };
+                for column in left..right {
+                    frame.buffer_mut()[(body.x + column, body.y + visible_row)].set_style(selected);
+                }
+            }
+        }
+
+        if scrollable && body.height > 0 {
+            let track_x = body.right();
+            let track = self.context.muted();
+            for row in body.top()..body.bottom() {
+                frame.buffer_mut()[(track_x, row)]
+                    .set_style(track)
+                    .set_symbol("│");
+            }
+            let thumb = usize::from(body.height)
+                .saturating_mul(self.viewport_height)
+                .checked_div(self.content_height.max(1))
+                .unwrap_or(1)
+                .max(1)
+                .min(usize::from(body.height));
+            let travel = usize::from(body.height).saturating_sub(thumb);
+            let max = self.content_height.saturating_sub(self.viewport_height);
+            let start = self
+                .offset
+                .saturating_mul(travel)
+                .checked_div(max)
+                .unwrap_or(0);
+            for row in start..start.saturating_add(thumb) {
+                let Ok(row) = u16::try_from(row) else {
+                    break;
+                };
+                frame.buffer_mut()[(track_x, body.y + row)]
+                    .set_style(self.context.accent())
+                    .set_symbol("█");
+            }
+        }
 
         if footer.is_empty() {
             return;
@@ -908,6 +1114,7 @@ impl Component for SidebarView {
         let region = Rect {
             y: inner.bottom() - height,
             height,
+            width: body_width,
             ..inner
         };
         Paragraph::new(footer)

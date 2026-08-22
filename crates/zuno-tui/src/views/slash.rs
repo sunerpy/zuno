@@ -63,12 +63,14 @@ pub enum SlashCommandKind {
 }
 
 /// A slash command executed by the runtime host rather than the model or view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostCommand {
     /// Restore the worktree boundary before the most recent completed turn.
     Undo,
     /// Reapply the most recently undone turn boundary.
     Redo,
+    /// Stop one background execution, or open the selector when omitted.
+    Stop(Option<String>),
 }
 
 /// One discoverable slash command.
@@ -179,13 +181,16 @@ impl SlashRouter {
         let Some(command) = self.commands.iter().find(|command| command.matches(name)) else {
             return SlashSubmission::Unknown(name.to_owned());
         };
-        match command.kind {
+        match &command.kind {
             SlashCommandKind::UiAction(action) => SlashSubmission::UiAction(action),
             SlashCommandKind::Catalog => SlashSubmission::Catalog {
                 command: command.name.clone(),
                 arguments,
             },
-            SlashCommandKind::Host(command) => SlashSubmission::Host(command),
+            SlashCommandKind::Host(HostCommand::Stop(_)) => SlashSubmission::Host(
+                HostCommand::Stop((!arguments.is_empty()).then_some(arguments)),
+            ),
+            SlashCommandKind::Host(command) => SlashSubmission::Host(command.clone()),
         }
     }
 }
@@ -259,6 +264,10 @@ const UI_SPECS: &[UiSpec] = &[
         action: "app_exit",
         aliases: &["quit", "q"],
     },
+    UiSpec {
+        action: "ps_view",
+        aliases: &[],
+    },
 ];
 
 fn ui_commands() -> Vec<SlashCommand> {
@@ -271,6 +280,7 @@ fn ui_commands() -> Vec<SlashCommand> {
     // variant picker. The route stays absent until there is a consumer.
     DEFINITIONS
         .iter()
+        .chain(crate::keybind::LOCAL_DEFINITIONS.iter())
         .filter(|definition| {
             command_family(definition.name) == CommandFamily::Local
                 && command_family(definition.command) == CommandFamily::Local
@@ -316,6 +326,12 @@ fn ui_commands() -> Vec<SlashCommand> {
                 aliases: Vec::new(),
                 description: "Reapply the most recently undone turn".to_owned(),
                 kind: SlashCommandKind::Host(HostCommand::Redo),
+            },
+            SlashCommand {
+                name: "stop".to_owned(),
+                aliases: Vec::new(),
+                description: "Stop one background terminal, or choose one".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Stop(None)),
             },
         ])
         .collect()

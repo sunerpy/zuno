@@ -222,6 +222,43 @@ fn views_sidebar_skill_names_appear_only_once_expanded() {
 }
 
 #[test]
+fn views_sidebar_scrolls_its_body_independently_and_keeps_the_footer_pinned() {
+    let mut view = view();
+    view.ambient_mut().skills = (0..24)
+        .map(|index| SkillSummary {
+            name: format!("skill-{index:02}"),
+            description: String::new(),
+            loaded: index == 23,
+        })
+        .collect();
+    view.toggle_skills();
+
+    let before = rows(&render_offscreen(&mut view, SIDEBAR_WIDTH, 12).expect("infallible"));
+    let footer = before.last().cloned().expect("version footer");
+    assert!(
+        footer.contains("● zuno 0.1.0"),
+        "the version footer is not pinned before scrolling: {footer}"
+    );
+
+    assert!(
+        view.scroll_lines(isize::MAX),
+        "the sidebar reported no scrollable body"
+    );
+    let after = rows(&render_offscreen(&mut view, SIDEBAR_WIDTH, 12).expect("infallible"));
+    assert_ne!(before, after, "scrolling did not change the sidebar body");
+    assert!(
+        after.join("\n").contains("skill-23 · loaded"),
+        "the loaded skill is not labelled after scrolling:\n{}",
+        after.join("\n")
+    );
+    assert_eq!(
+        after.last(),
+        Some(&footer),
+        "scrolling moved the pinned footer"
+    );
+}
+
+#[test]
 fn views_sidebar_toggle_mcp_is_independent_of_the_other_sections() {
     let mut view = view();
     view.toggle_mcp();

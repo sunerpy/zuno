@@ -82,7 +82,7 @@ console_org_switch	none	console.org.switch		Switch console organization
 agent_list	<leader>a	agent.list		List agents
 agent_cycle	tab	agent.cycle		Next agent
 agent_cycle_reverse	shift+tab	agent.cycle.reverse		Previous agent
-variant_cycle	ctrl+t	variant.cycle		Cycle model variants
+variant_cycle	alt+t	variant.cycle		Cycle model variants
 variant_list	none	variant.list		List model variants
 messages_page_up	pageup,ctrl+alt+b	session.page.up		Scroll messages up by one page
 messages_page_down	pagedown,ctrl+alt+f	session.page.down		Scroll messages down by one page
@@ -100,6 +100,7 @@ messages_undo	<leader>u	session.undo		Undo message
 messages_redo	<leader>r	session.redo		Redo message
 messages_toggle_conceal	<leader>h	session.toggle.conceal		Toggle code block concealment in messages
 tool_details	none	session.toggle.actions		Toggle tool details visibility
+messages_transcript	ctrl+t	session.transcript		Toggle full activity transcript
 display_thinking	none	session.toggle.thinking		Toggle thinking blocks visibility
 prompt_submit	none	prompt.submit		Submit prompt
 prompt_editor_context_clear	none	prompt.editor_context.clear		Clear editor context

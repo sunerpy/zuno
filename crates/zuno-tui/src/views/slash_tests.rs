@@ -15,10 +15,8 @@ fn every_ui_route_is_backed_by_the_keybind_source_of_truth() {
         let SlashCommandKind::UiAction(action) = command.kind else {
             panic!("UI projection produced a catalog command");
         };
-        let definition = DEFINITIONS
-            .iter()
-            .find(|definition| definition.name == action)
-            .expect("slash action must exist in DEFINITIONS");
+        let definition = crate::keybind::definition(action)
+            .expect("slash action must exist in the keybind source of truth");
         assert_eq!(command.description, definition.description);
     }
 }
@@ -33,10 +31,8 @@ fn every_ui_slash_action_lives_in_a_session_scope() {
         let SlashCommandKind::UiAction(action) = command.kind else {
             panic!("UI projection produced a catalog command");
         };
-        let definition = DEFINITIONS
-            .iter()
-            .find(|definition| definition.name == action)
-            .expect("slash action must exist in DEFINITIONS");
+        let definition = crate::keybind::definition(action)
+            .expect("slash action must exist in the keybind source of truth");
         assert!(
             scopes.iter().any(|scope| scope == definition.scope),
             "/{} dispatches `{action}` from unregistered scope `{}`",

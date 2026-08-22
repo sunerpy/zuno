@@ -868,6 +868,7 @@ pub(crate) struct TurnHost {
     goal_continuation: GoalContinuation,
     runs: SessionRunRegistry,
     background_jobs: super::child_turn::BackgroundJobSupervisor,
+    background_executions: Arc<zuno_pty::BackgroundExecutionService>,
     background_reports: super::child_turn::ChildSessionHost,
     product_agents: super::product_agent::NativeProductAgentHost,
     background_reports_recovered: bool,
@@ -1246,6 +1247,7 @@ impl TurnHost {
             goal_continuation,
             runs,
             background_jobs,
+            background_executions,
             background_reports: child_host,
             product_agents,
             background_reports_recovered: false,
@@ -1335,6 +1337,10 @@ impl TurnHost {
     /// Whether deleting this host's session would race a background subagent write.
     pub(super) fn has_running_background_tasks(&self) -> bool {
         self.background_jobs.has_running_tasks()
+    }
+
+    pub(super) fn background_executions(&self) -> Arc<zuno_pty::BackgroundExecutionService> {
+        Arc::clone(&self.background_executions)
     }
 
     /// Ask the live executor to cancel one job owned by this session.

@@ -440,9 +440,15 @@ fn tool_output_budget_is_not_the_tool_layers_own_cap() {
 #[test]
 fn tool_status_style_paints_from_the_palette_and_separates_the_terminal_states() {
     let context = ViewContext::defaults();
-    let error = status_style(ToolStatus::Error, &context);
-    let completed = status_style(ToolStatus::Completed, &context);
-    let running = status_style(ToolStatus::Running, &context);
+    let generic = zuno_tool::ToolUiIntent::Generic;
+    let error = status_style(ToolStatus::Error, generic, &context);
+    let completed = status_style(ToolStatus::Completed, generic, &context);
+    let delegated = status_style(
+        ToolStatus::Completed,
+        zuno_tool::ToolUiIntent::Subagent,
+        &context,
+    );
+    let running = status_style(ToolStatus::Running, generic, &context);
     assert_ne!(
         error.fg, completed.fg,
         "a failed call and a successful one paint the same, so a reader scanning for red \
@@ -459,7 +465,17 @@ fn tool_status_style_paints_from_the_palette_and_separates_the_terminal_states()
     );
     assert_eq!(
         running.fg,
-        status_style(ToolStatus::Pending, &context).fg,
+        status_style(ToolStatus::Pending, generic, &context).fg,
         "pending and running differ in glyph, not in colour — both are simply not done"
+    );
+    assert_eq!(
+        completed.fg,
+        Some(ratatui::style::Color::from(context.palette().border_active)),
+        "ordinary completed tools must use the readable accent, not success green"
+    );
+    assert_eq!(
+        delegated.fg,
+        Some(ratatui::style::Color::from(context.palette().secondary)),
+        "delegated work must remain visually distinct from ordinary tools"
     );
 }

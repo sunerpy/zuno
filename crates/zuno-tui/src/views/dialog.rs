@@ -138,6 +138,8 @@ pub enum DialogOutcome {
         /// Durable job identifier.
         job_id: String,
     },
+    /// The background-terminal dialog requested cancellation while remaining open.
+    BackgroundCancel { execution_id: String },
 }
 
 /// One of `§11.4`'s three fixed dialog widths.

@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 const FIXTURE: &str = include_str!("../tests/fixtures/zuno-keybinds.tsv");
 
 /// The count the plan and the oracle agree on.
-const EXPECTED_ROWS: usize = 184;
+const EXPECTED_ROWS: usize = 185;
 
 /// Rows whose default spelling deliberately differs from the oracle, and why.
 ///
