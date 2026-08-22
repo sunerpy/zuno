@@ -405,11 +405,13 @@ pub enum ProvidersCommand {
     /// Authenticate a provider with one of its implemented login methods.
     Login {
         /// Provider id/name, or an HTTPS URL implementing `/.well-known/zuno`.
+        /// Omit in a terminal to choose interactively.
         target: Option<String>,
         /// Provider id or display name, as an alternative to the positional target.
         #[arg(short = 'p', long)]
         provider: Option<String>,
         /// Method id shown by `zuno auth methods <provider>`.
+        /// Omit in a terminal to choose when several methods are available.
         #[arg(short = 'm', long)]
         method: Option<String>,
     },

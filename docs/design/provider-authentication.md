@@ -41,6 +41,22 @@ Catalog resolution receives the same registry. A stored OAuth credential makes a
 
 A future custom OAuth component must register its methods, implement authorization and refresh, and consume the resulting credential in its provider. Adding only a config value or credential shape is insufficient.
 
+## CLI selection
+
+`zuno auth login` owns a short-lived terminal picker rather than borrowing the
+resident TUI or putting selection policy in the provider registry. Provider
+choices combine the cached provider catalog, configured provider blocks, and
+stored credential ids. The official `openai` id is always present, and an
+`Other` row admits a new valid provider id. `enabled_providers` and
+`disabled_providers` are applied before the list is rendered.
+
+When the selected provider has several registered methods, a second picker
+selects the method. Both pickers support arrows, paging, type-to-filter, Enter,
+and Escape/Ctrl+C cancellation. They are entered only when standard input and
+standard error are terminals. A redirected invocation remains deterministic:
+the provider must be explicit, and piped standard input selects the generic
+API-key method.
+
 ## OpenAI authentication
 
 The official `openai` provider supports two independent families:

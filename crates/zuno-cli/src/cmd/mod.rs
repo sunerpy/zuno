@@ -14,6 +14,7 @@ mod serve;
 mod session;
 mod session_list;
 mod session_prune;
+mod terminal_prompt;
 mod tool_runtime;
 mod tui;
 mod tui_lsp;

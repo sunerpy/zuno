@@ -66,11 +66,27 @@ zuno auth methods openai
 zuno auth methods myopenai
 ```
 
+In a terminal, a bare login opens a searchable provider picker. It includes
+catalog providers, providers declared by the active Zuno configuration, existing
+credential ids, and an `Other` entry for a new custom id:
+
+```sh
+zuno auth login
+```
+
+Use the arrow keys or type to filter, then press Enter. If the selected provider
+has several authentication methods, Zuno opens a second picker for the method.
+Escape or Ctrl+C cancels either picker. Non-interactive invocations still require
+an explicit provider so scripts cannot hang on a prompt.
+
 The built-in `openai` provider supports three methods:
 
 ```sh
-# ChatGPT Plus/Pro in the local browser; this is the TTY default.
+# Select browser OAuth, device-code OAuth, or API key interactively.
 zuno auth login openai
+
+# ChatGPT Plus/Pro in the local browser.
+zuno auth login openai --method chatgpt-browser
 
 # ChatGPT Plus/Pro on a headless or remote host.
 zuno auth login openai --method chatgpt-device
