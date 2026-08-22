@@ -82,10 +82,9 @@ impl LoginMethod {
 
 /// Typed registry of provider-specific authentication methods.
 ///
-/// Every provider also receives the generic API-key method. Provider-specific
-/// methods are explicit registrations so a custom provider does not accidentally
-/// inherit OpenAI's ChatGPT OAuth route merely because it uses an OpenAI wire
-/// transport.
+/// Every method is an explicit registration. A credential shape is not a login
+/// implementation, and an arbitrary provider id must not become login-capable
+/// merely because the CLI knows how to read an API key.
 #[derive(Clone, Debug, Default)]
 pub struct LoginMethodRegistry {
     methods: BTreeMap<String, Vec<LoginMethod>>,
@@ -114,7 +113,21 @@ impl LoginMethodRegistry {
             )
             .with_aliases(["device", "headless"]),
         );
+        registry.register_api_key("openai");
         registry
+    }
+
+    /// Register the standard hidden-input API-key flow for one provider instance.
+    pub fn register_api_key(&mut self, provider: impl Into<String>) {
+        self.register(
+            provider,
+            LoginMethod::new(
+                API_KEY_METHOD,
+                "Manually enter API key",
+                LoginMethodKind::ApiKey,
+            )
+            .with_aliases(["api", "api key", "key"]),
+        );
     }
 
     /// Register one provider-specific method.
@@ -133,19 +146,10 @@ impl LoginMethodRegistry {
         }
     }
 
-    /// Every method a provider can use, provider-specific methods first.
+    /// Every explicitly registered method a provider can use.
     #[must_use]
     pub fn methods_for(&self, provider: &str) -> Vec<LoginMethod> {
-        let mut methods = self.methods.get(provider).cloned().unwrap_or_default();
-        methods.push(
-            LoginMethod::new(
-                API_KEY_METHOD,
-                "Manually enter API key",
-                LoginMethodKind::ApiKey,
-            )
-            .with_aliases(["api", "api key", "key"]),
-        );
-        methods
+        self.methods.get(provider).cloned().unwrap_or_default()
     }
 
     /// Whether this provider has a native OAuth implementation.
@@ -223,7 +227,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_official_openai_provider_gets_chatgpt_oauth() {
+    fn only_explicitly_registered_providers_receive_login_methods() {
         let registry = LoginMethodRegistry::native();
         assert_eq!(
             registry
@@ -243,9 +247,24 @@ mod tests {
                 .iter()
                 .map(LoginMethod::id)
                 .collect::<Vec<_>>(),
-            vec![API_KEY_METHOD]
+            Vec::<&str>::new()
         );
         assert!(registry.supports_oauth("openai"));
+        assert!(!registry.supports_oauth("myopenai"));
+    }
+
+    #[test]
+    fn an_api_key_method_is_registered_per_provider_instance() {
+        let mut registry = LoginMethodRegistry::native();
+        registry.register_api_key("myopenai");
+        assert_eq!(
+            registry
+                .methods_for("myopenai")
+                .iter()
+                .map(LoginMethod::id)
+                .collect::<Vec<_>>(),
+            vec![API_KEY_METHOD]
+        );
         assert!(!registry.supports_oauth("myopenai"));
     }
 

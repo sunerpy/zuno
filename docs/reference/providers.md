@@ -66,9 +66,10 @@ zuno auth methods openai
 zuno auth methods myopenai
 ```
 
-In a terminal, a bare login opens a searchable provider picker. It includes
-catalog providers, providers declared by the active Zuno configuration, existing
-credential ids, and an `Other` entry for a new custom id:
+In a terminal, a bare login opens a searchable provider picker. It includes the
+official OpenAI integration and configured providers whose resolved model route
+has a real API-key consumer. Catalog-only entries, historical credential ids,
+and ambient-credential transports such as Bedrock are not login choices:
 
 ```sh
 zuno auth login
@@ -95,11 +96,16 @@ zuno auth login openai --method chatgpt-device
 printf '%s' "$OPENAI_API_KEY" | zuno auth login openai --method api-key
 ```
 
-An arbitrary provider id such as `myopenai` receives only the generic API-key method:
+A configured provider id such as `myopenai` receives only the API-key method
+when its resolved native transport consumes that credential:
 
 ```sh
 printf '%s' "$MYOPENAI_API_KEY" | zuno auth login myopenai
 ```
+
+Configure a custom provider before logging in. An arbitrary or credential-only
+id such as `kiro-auth` is rejected before Zuno reads standard input or writes
+`auth.json`.
 
 Using `transport: "openai"` does not grant a custom provider OpenAI's ChatGPT OAuth flow. The id `openai` owns that login, refresh protocol, ChatGPT endpoint rewrite, and account header. A custom OAuth provider needs its own registered login method and request-side consumer; an OAuth-shaped JSON object alone is not treated as a complete integration.
 
@@ -116,7 +122,7 @@ Credential precedence is:
 
 Putting `apiKey` in `zuno.json` is supported but exposes a secret to configuration backups and source control, so the credential store or an injected `ZUNO_AUTH_CONTENT` is preferable.
 
-An environment key is consumed directly and is not copied into `auth.json`. This is why a provider can already be authenticated even when the user never ran a Zuno login command. `zuno auth list` prints the active credential kinds, storage path, and matching environment variable names without printing secret values.
+An environment key is consumed directly and is not copied into `auth.json`. This is why a provider can already be authenticated even when the user never ran a Zuno login command. `zuno auth list` prints the active credential kinds, storage path, and matching environment variable names without printing secret values. A stored credential with no current login-capable provider route is retained and labelled `orphan` so it can be removed with `zuno auth logout`.
 
 ChatGPT OAuth stores an access token, refresh token, expiry, and account id in the same file. Before a request, Zuno refreshes a token that is near expiry and persists the rotated tokens unless credentials came from `ZUNO_AUTH_CONTENT`.
 

@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{Read as _, Write};
 use std::os::unix::fs::PermissionsExt as _;
+use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -19,8 +20,15 @@ fn bare_auth_login_selects_a_provider_and_stores_a_hidden_api_key() {
           "acme": {
             "id": "acme",
             "name": "Acme",
+            "api": "https://acme.example.test/v1",
+            "npm": "@ai-sdk/openai-compatible",
             "env": ["ACME_API_KEY"],
-            "models": {}
+            "models": {
+              "acme-test": {
+                "id": "acme-test",
+                "name": "Acme Test"
+              }
+            }
           }
         }"#,
     )
@@ -33,6 +41,22 @@ fn bare_auth_login_selects_a_provider_and_stores_a_hidden_api_key() {
     for directory in [&data, &config, &cache, &home] {
         fs::create_dir_all(directory).expect("create isolated directory");
     }
+    let zuno_config = config.join("zuno");
+    fs::create_dir_all(&zuno_config).expect("create Zuno config directory");
+    fs::write(
+        zuno_config.join("zuno.json"),
+        r#"{
+          "provider": {
+            "acme": {
+              "name": "Acme",
+              "transport": "openai-compatible",
+              "options": {"baseURL": "https://acme.example.test/v1"},
+              "models": {"acme-test": {"name": "Acme Test"}}
+            }
+          }
+        }"#,
+    )
+    .expect("write configured provider");
 
     let mut terminal = TestPty::spawn(
         root.path(),
@@ -80,6 +104,103 @@ fn bare_auth_login_selects_a_provider_and_stores_a_hidden_api_key() {
             & 0o777,
         0o600
     );
+}
+
+#[test]
+fn bare_auth_login_hides_catalog_only_and_credential_only_providers() {
+    let root = tempfile::tempdir().expect("temporary login environment");
+    let models = root.path().join("models.json");
+    fs::write(
+        &models,
+        r#"{
+          "acme": {
+            "id": "acme",
+            "name": "Acme Catalog Only",
+            "api": "https://acme.example.test/v1",
+            "npm": "@ai-sdk/openai-compatible",
+            "env": ["ACME_API_KEY"],
+            "models": {
+              "acme-test": {"id": "acme-test", "name": "Acme Test"}
+            }
+          }
+        }"#,
+    )
+    .expect("write provider catalog");
+
+    let data = root.path().join("data");
+    let config = root.path().join("config");
+    let cache = root.path().join("cache");
+    let home = root.path().join("home");
+    for directory in [&data, &config, &cache, &home] {
+        fs::create_dir_all(directory).expect("create isolated directory");
+    }
+    let auth_dir = data.join("zuno");
+    fs::create_dir_all(&auth_dir).expect("create auth directory");
+    fs::write(
+        auth_dir.join("auth.json"),
+        r#"{"kiro-auth":{"type":"api","key":"old-key"}}"#,
+    )
+    .expect("write orphan credential");
+
+    let mut terminal = TestPty::spawn(
+        root.path(),
+        &[
+            ("HOME", home.as_path()),
+            ("XDG_DATA_HOME", data.as_path()),
+            ("XDG_CONFIG_HOME", config.as_path()),
+            ("XDG_CACHE_HOME", cache.as_path()),
+            ("ZUNO_MODELS_PATH", models.as_path()),
+        ],
+    );
+    assert!(
+        terminal.wait_for_output("Select provider"),
+        "{}",
+        terminal.output()
+    );
+    let output = terminal.output();
+    assert!(output.contains("OpenAI"), "{output}");
+    assert!(!output.contains("Acme Catalog Only"), "{output}");
+    assert!(!output.contains("kiro-auth"), "{output}");
+    assert!(!output.contains("Other"), "{output}");
+
+    terminal.write(b"\x1b");
+    let (status, output) = terminal.finish();
+    assert!(!status.success(), "{output}");
+    assert!(output.contains("provider login cancelled"), "{output}");
+}
+
+#[test]
+fn explicit_unsupported_provider_fails_before_reading_or_storing_a_key() {
+    let root = tempfile::tempdir().expect("temporary login environment");
+    let models = root.path().join("models.json");
+    fs::write(&models, "{}").expect("write empty provider catalog");
+    let data = root.path().join("data");
+    let config = root.path().join("config");
+    let cache = root.path().join("cache");
+    let home = root.path().join("home");
+    for directory in [&data, &config, &cache, &home] {
+        fs::create_dir_all(directory).expect("create isolated directory");
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zuno"))
+        .args(["auth", "login", "kiro-auth"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("ZUNO_MODELS_PATH", &models)
+        .env("ZUNO_DISABLE_PROJECT_CONFIG", "1")
+        .output()
+        .expect("run unsupported login");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has no configured login capability"),
+        "{stderr}"
+    );
+    assert!(!data.join("zuno/auth.json").exists());
 }
 
 #[test]

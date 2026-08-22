@@ -31,7 +31,11 @@ Environment credentials remain process inputs. They are not copied into the cred
 
 ## Method registration and catalog availability
 
-Every provider has the generic `api-key` method. Provider-specific methods are explicit registrations. The shipped registry adds `chatgpt-browser` and `chatgpt-device` only to the `openai` id.
+Every login method is an explicit registration. The shipped registry gives the
+official `openai` id `api-key`, `chatgpt-browser`, and `chatgpt-device`.
+Configured provider instances receive `api-key` only when their resolved models
+use a native transport that consumes stored API keys. Ambient-credential
+transports such as Bedrock and Vertex do not advertise a login method.
 
 Catalog resolution receives the same registry. A stored OAuth credential makes a provider selectable only when that exact provider id has a native OAuth method. This joins the interface, provider, and consumer at the composition boundary:
 
@@ -44,18 +48,20 @@ A future custom OAuth component must register its methods, implement authorizati
 ## CLI selection
 
 `zuno auth login` owns a short-lived terminal picker rather than borrowing the
-resident TUI or putting selection policy in the provider registry. Provider
-choices combine the cached provider catalog, configured provider blocks, and
-stored credential ids. The official `openai` id is always present, and an
-`Other` row admits a new valid provider id. `enabled_providers` and
+resident TUI or putting selection policy in the provider registry. The official
+`openai` id is always present. Other rows require both a configured, selectable
+model route and an explicitly registered login method. A catalog entry or a
+stored credential alone never creates a row, and there is no `Other` escape
+hatch that stores an unusable credential. `enabled_providers` and
 `disabled_providers` are applied before the list is rendered.
 
 When the selected provider has several registered methods, a second picker
 selects the method. Both pickers support arrows, paging, type-to-filter, Enter,
 and Escape/Ctrl+C cancellation. They are entered only when standard input and
 standard error are terminals. A redirected invocation remains deterministic:
-the provider must be explicit, and piped standard input selects the generic
-API-key method.
+the provider must be explicit, and piped standard input selects its registered
+API-key method. An unsupported or unconfigured id fails before standard input is
+read or the credential file is changed.
 
 ## OpenAI authentication
 

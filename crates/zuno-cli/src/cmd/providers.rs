@@ -10,13 +10,12 @@ use zuno_auth::{
     API_KEY_METHOD, BrowserAuthorization, Credential, LoginMethod, LoginMethodKind,
     LoginMethodRegistry, OpenAiOauthClient, Secret,
 };
-use zuno_llm::catalog::{CatalogDocument, CatalogSource};
+use zuno_config::schema::provider::ProviderTransport;
+use zuno_llm::catalog::{Catalog, CatalogDocument, CatalogSource, ResolveInput, ResolvedProvider};
 
 use super::terminal_prompt::{self, Choice};
 use crate::command::{ProvidersArgs, ProvidersCommand};
 use crate::environment::StartupEnvironment;
-
-const OTHER_PROVIDER: &str = "@other";
 
 pub(super) fn execute(
     args: &ProvidersArgs,
@@ -56,13 +55,22 @@ fn list(
 ) -> Result<(), String> {
     let credentials = store.all().map_err(|error| error.to_string())?;
     let document = catalog_document(env, layout)?;
+    let config = discovered_config(env)?;
+    let methods = login_method_registry(&document, &config);
+    let providers = ProviderIndex::new(&document, &config, &credentials.entries, &methods);
 
     println!("Credentials {}", display_path(store.path(), env));
     for (provider_id, credential) in &credentials.entries {
+        let suffix = if providers.contains(provider_id) {
+            ""
+        } else {
+            " orphan"
+        };
         println!(
-            "{} {}",
+            "{} {}{}",
             provider_name(&document, provider_id),
-            credential.kind()
+            credential.kind(),
+            suffix
         );
     }
     println!(
@@ -100,13 +108,14 @@ fn methods(
     requested: &str,
 ) -> Result<(), String> {
     let document = catalog_document(env, layout)?;
-    let provider_id =
-        resolve_provider(&document, requested).unwrap_or_else(|| requested.to_owned());
-    if !valid_provider_id(&provider_id) {
-        return Err(format!("Unknown provider {requested:?}"));
-    }
+    let config = discovered_config(env)?;
+    let registry = login_method_registry(&document, &config);
+    let providers = ProviderIndex::new(&document, &config, &BTreeMap::new(), &registry);
+    let provider_id = providers
+        .resolve(requested)
+        .ok_or_else(|| unavailable_login_provider(requested))?;
     println!("Login methods for {provider_id}");
-    for method in LoginMethodRegistry::native().methods_for(&provider_id) {
+    for method in registry.methods_for(&provider_id) {
         println!("{} {}", method.id(), method.label());
     }
     Ok(())
@@ -140,25 +149,19 @@ fn login(
             );
         }
     };
-    let document = if requested.is_none() {
-        login_catalog_document(env, layout)?
-    } else {
-        catalog_document(env, layout)?
-    };
+    let document = catalog_document(env, layout)?;
     let config = discovered_config(env)?;
     let credentials = store.all().map_err(|error| error.to_string())?.entries;
-    let providers = ProviderIndex::new(&document, &config, &credentials);
+    let registry = login_method_registry(&document, &config);
+    let providers = ProviderIndex::new(&document, &config, &credentials, &registry);
     let provider_id = match requested {
         Some(requested) => providers
             .resolve(requested)
-            .unwrap_or_else(|| requested.to_owned()),
+            .ok_or_else(|| unavailable_login_provider(requested))?,
         None => select_provider(&providers)?,
     };
-    if !valid_provider_id(&provider_id) {
-        return Err(format!("Unknown provider {provider_id:?}"));
-    }
 
-    let selected = select_login_method(&provider_id, method)?;
+    let selected = select_login_method(&registry, &provider_id, method)?;
     match selected.kind() {
         LoginMethodKind::ApiKey => login_api_key(store, &provider_id),
         LoginMethodKind::OAuthBrowser => login_chatgpt_browser(store, &provider_id),
@@ -167,23 +170,15 @@ fn login(
 }
 
 fn select_provider(providers: &ProviderIndex) -> Result<String, String> {
-    let selected = terminal_prompt::select("Select provider", providers.prompt_choices())?
-        .ok_or("provider login cancelled")?;
-    if selected != OTHER_PROVIDER {
-        return Ok(selected);
-    }
-
-    let provider = read_provider_id()?;
-    if !providers.contains(&provider) {
-        eprintln!(
-            "This stores a credential for {provider}; configure that provider before selecting its models."
-        );
-    }
-    Ok(provider)
+    terminal_prompt::select("Select provider", providers.prompt_choices())?
+        .ok_or_else(|| "provider login cancelled".to_owned())
 }
 
-fn select_login_method(provider: &str, requested: Option<&str>) -> Result<LoginMethod, String> {
-    let registry = LoginMethodRegistry::native();
+fn select_login_method(
+    registry: &LoginMethodRegistry,
+    provider: &str,
+    requested: Option<&str>,
+) -> Result<LoginMethod, String> {
     if let Some(requested) = requested {
         return registry
             .resolve(provider, Some(requested))
@@ -320,23 +315,6 @@ fn catalog_document(
         .map_err(|error| error.to_string())
 }
 
-fn login_catalog_document(
-    env: &zuno_paths::Env,
-    layout: &zuno_paths::Layout,
-) -> Result<CatalogDocument, String> {
-    let source = CatalogSource::resolve(env, layout);
-    if let Some(document) = source.load_from_disk().map_err(|error| error.to_string())? {
-        return Ok(document);
-    }
-    match oauth_runtime()?.block_on(source.load()) {
-        Ok(loaded) => Ok(loaded.into_document()),
-        Err(error) => {
-            eprintln!("Unable to refresh the provider catalog: {error}");
-            Ok(CatalogDocument::new())
-        }
-    }
-}
-
 fn discovered_config(env: &zuno_paths::Env) -> Result<zuno_config::Config, String> {
     let directory = std::env::current_dir().map_err(|error| error.to_string())?;
     let project = zuno_paths::project::resolve_project(&directory);
@@ -362,43 +340,82 @@ struct ProviderIndex {
     choices: Vec<ProviderChoice>,
 }
 
+fn login_method_registry(
+    document: &CatalogDocument,
+    config: &zuno_config::Config,
+) -> LoginMethodRegistry {
+    let mut methods = LoginMethodRegistry::native();
+    let resolved = Catalog::resolve(document, &ResolveInput::new().with_config(config));
+    let configured = config.provider.as_ref();
+    for (provider_id, provider) in resolved.providers() {
+        if configured.is_none_or(|providers| !providers.contains_key(provider_id))
+            || provider_id == "openai"
+            || !accepts_stored_api_key(provider)
+        {
+            continue;
+        }
+        methods.register_api_key(provider_id.clone());
+    }
+    methods
+}
+
+fn accepts_stored_api_key(provider: &ResolvedProvider) -> bool {
+    provider
+        .models
+        .values()
+        .any(|model| match model.api.transport {
+            Some(
+                ProviderTransport::Anthropic
+                | ProviderTransport::Google
+                | ProviderTransport::Openai
+                | ProviderTransport::Openrouter,
+            ) => true,
+            Some(ProviderTransport::OpenaiCompatible) => !model.api.url.is_empty(),
+            Some(
+                ProviderTransport::Bedrock
+                | ProviderTransport::BedrockMantle
+                | ProviderTransport::GoogleVertex
+                | ProviderTransport::GoogleVertexAnthropic,
+            )
+            | None => false,
+        })
+}
+
+fn unavailable_login_provider(provider: &str) -> String {
+    format!(
+        "provider {provider:?} has no configured login capability; configure a routable provider before logging in"
+    )
+}
+
 impl ProviderIndex {
     fn new(
         document: &CatalogDocument,
         config: &zuno_config::Config,
         credentials: &BTreeMap<String, Credential>,
+        methods: &LoginMethodRegistry,
     ) -> Self {
-        let mut choices = document
-            .iter()
-            .map(|(id, provider)| {
-                (
-                    id.clone(),
-                    ProviderChoice {
-                        id: id.clone(),
-                        name: provider.name.clone(),
-                        configured: false,
-                        credential: false,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        choices
-            .entry("openai".to_owned())
-            .or_insert_with(|| ProviderChoice {
+        let mut choices = BTreeMap::from([(
+            "openai".to_owned(),
+            ProviderChoice {
                 id: "openai".to_owned(),
                 name: "OpenAI".to_owned(),
                 configured: false,
                 credential: false,
-            });
+            },
+        )]);
 
         if let Some(configured) = config.provider.as_ref() {
             for (id, provider) in configured.iter() {
+                if methods.methods_for(id).is_empty() {
+                    continue;
+                }
                 let choice = choices
                     .entry(id.to_owned())
                     .or_insert_with(|| ProviderChoice {
                         id: id.to_owned(),
-                        name: id.to_owned(),
+                        name: document
+                            .get(id)
+                            .map_or_else(|| id.to_owned(), |provider| provider.name.clone()),
                         configured: false,
                         credential: false,
                     });
@@ -409,13 +426,9 @@ impl ProviderIndex {
             }
         }
         for id in credentials.keys() {
-            let choice = choices.entry(id.clone()).or_insert_with(|| ProviderChoice {
-                id: id.clone(),
-                name: id.clone(),
-                configured: false,
-                credential: false,
-            });
-            choice.credential = true;
+            if let Some(choice) = choices.get_mut(id) {
+                choice.credential = true;
+            }
         }
 
         let disabled = config
@@ -463,8 +476,7 @@ impl ProviderIndex {
     }
 
     fn prompt_choices(&self) -> Vec<Choice> {
-        let mut choices = self
-            .choices
+        self.choices
             .iter()
             .map(|provider| {
                 let mut hints = Vec::new();
@@ -484,9 +496,7 @@ impl ProviderIndex {
                 };
                 Choice::new(&provider.id, &provider.name).hinted(hint)
             })
-            .collect::<Vec<_>>();
-        choices.push(Choice::new(OTHER_PROVIDER, "Other").hinted("enter provider id"));
-        choices
+            .collect()
     }
 }
 
@@ -508,6 +518,7 @@ fn provider_name(document: &CatalogDocument, provider_id: &str) -> String {
         .map_or_else(|| provider_id.to_owned(), |provider| provider.name.clone())
 }
 
+#[cfg(test)]
 fn resolve_provider(document: &CatalogDocument, requested: &str) -> Option<String> {
     document
         .iter()
@@ -526,28 +537,6 @@ fn valid_provider_id(provider: &str) -> bool {
 
 fn looks_like_url(value: &str) -> bool {
     value.starts_with("https://") || value.starts_with("http://")
-}
-
-fn read_provider_id() -> Result<String, String> {
-    loop {
-        eprint!("Enter provider id: ");
-        std::io::stderr()
-            .flush()
-            .map_err(|error| error.to_string())?;
-        let mut value = String::new();
-        if std::io::stdin()
-            .read_line(&mut value)
-            .map_err(|error| error.to_string())?
-            == 0
-        {
-            return Err("provider id entry cancelled".to_owned());
-        }
-        let value = value.trim().trim_start_matches("@ai-sdk/").to_owned();
-        if valid_provider_id(&value) {
-            return Ok(value);
-        }
-        eprintln!("Provider ids may contain only lowercase letters, digits, and hyphens.");
-    }
 }
 
 fn read_api_key() -> Result<String, String> {
@@ -885,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_provider_index_includes_native_configured_and_stored_providers() {
+    fn interactive_provider_index_includes_only_native_and_routable_configured_providers() {
         let document: CatalogDocument = serde_json::from_str(
             r#"{
               "anthropic":{"id":"anthropic","name":"Anthropic","env":[],"models":{}},
@@ -896,30 +885,44 @@ mod tests {
         let config: zuno_config::Config = serde_json::from_str(
             r#"{
               "provider": {
-                "myopenai": {"name": "My OpenAI", "transport": "openai"}
+                "myopenai": {
+                  "name": "My OpenAI",
+                  "transport": "openai",
+                  "models": {"gpt-test": {"name": "GPT Test"}}
+                }
               }
             }"#,
         )
         .expect("config");
-        let credentials = BTreeMap::from([("legacy".to_owned(), api_credential())]);
+        let credentials = BTreeMap::from([
+            ("legacy".to_owned(), api_credential()),
+            ("myopenai".to_owned(), api_credential()),
+        ]);
+        let methods = login_method_registry(&document, &config);
 
-        let providers = ProviderIndex::new(&document, &config, &credentials);
+        let providers = ProviderIndex::new(&document, &config, &credentials, &methods);
         let ids = providers
             .choices
             .iter()
             .map(|provider| provider.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            ids,
-            vec!["openai", "anthropic", "legacy", "myopenai", "zeta"]
-        );
+        assert_eq!(ids, vec!["openai", "myopenai"]);
         assert_eq!(providers.resolve("My OpenAI").as_deref(), Some("myopenai"));
         assert!(
             providers
                 .choices
                 .iter()
-                .find(|provider| provider.id == "legacy")
+                .find(|provider| provider.id == "myopenai")
                 .is_some_and(|provider| provider.credential)
+        );
+        assert!(!providers.contains("legacy"));
+        assert_eq!(
+            methods
+                .methods_for("myopenai")
+                .iter()
+                .map(LoginMethod::id)
+                .collect::<Vec<_>>(),
+            vec![API_KEY_METHOD]
         );
     }
 
@@ -940,8 +943,9 @@ mod tests {
             }"#,
         )
         .expect("config");
+        let methods = login_method_registry(&document, &config);
 
-        let providers = ProviderIndex::new(&document, &config, &BTreeMap::new());
+        let providers = ProviderIndex::new(&document, &config, &BTreeMap::new(), &methods);
         assert_eq!(
             providers
                 .choices
@@ -950,6 +954,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["openai"]
         );
+    }
+
+    #[test]
+    fn ambient_credential_transports_do_not_advertise_api_key_login() {
+        let document = CatalogDocument::new();
+        let config: zuno_config::Config = serde_json::from_str(
+            r#"{
+              "provider": {
+                "bedrock": {
+                  "transport": "bedrock",
+                  "models": {"claude": {"name": "Claude"}}
+                },
+                "vertex": {
+                  "transport": "google-vertex",
+                  "models": {"gemini": {"name": "Gemini"}}
+                }
+              }
+            }"#,
+        )
+        .expect("config");
+        let methods = login_method_registry(&document, &config);
+        let providers = ProviderIndex::new(&document, &config, &BTreeMap::new(), &methods);
+        assert_eq!(
+            providers
+                .choices
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["openai"]
+        );
+        assert!(methods.methods_for("bedrock").is_empty());
+        assert!(methods.methods_for("vertex").is_empty());
     }
 
     #[test]

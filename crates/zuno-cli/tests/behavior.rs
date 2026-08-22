@@ -228,6 +228,17 @@ fn auth_methods_expose_openai_oauth_without_leaking_it_to_custom_providers() {
         .current_dir(root.path());
     isolated(&mut custom, root.path());
     configure_models(&mut custom);
+    custom.env(
+        "ZUNO_CONFIG_CONTENT",
+        r#"{
+          "provider": {
+            "myopenai": {
+              "transport": "openai",
+              "models": {"gpt-test": {"name": "GPT Test"}}
+            }
+          }
+        }"#,
+    );
     let output = custom.output().expect("list custom methods");
     assert!(
         output.status.success(),
