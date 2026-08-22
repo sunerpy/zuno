@@ -391,6 +391,29 @@ fn theme_system_without_terminal_capabilities_does_not_panic() {
 }
 
 #[test]
+fn theme_system_without_terminal_capabilities_uses_the_terminal_background() {
+    let mut registry = ThemeRegistry::new();
+    assert_eq!(
+        registry.refresh_system_theme(&FakePalette(None), None, Mode::Dark),
+        SystemThemeOutcome::Unavailable
+    );
+
+    let palette = registry.resolve(SYSTEM_THEME, Mode::Dark).palette;
+    for (name, color) in [
+        ("background", palette.background),
+        ("backgroundPanel", palette.background_panel),
+        ("backgroundElement", palette.background_element),
+        ("backgroundMenu", palette.background_menu),
+    ] {
+        assert_eq!(
+            Color::from(color),
+            Color::Reset,
+            "fallback system role {name} must preserve the terminal's own background"
+        );
+    }
+}
+
+#[test]
 fn theme_system_refresh_clears_a_stale_derived_layer() {
     let mut registry = ThemeRegistry::new();
     let asset = registry.resolve(SYSTEM_THEME, Mode::Dark).palette;
@@ -564,6 +587,17 @@ fn theme_system_keeps_every_surface_legible_and_bordered() {
     for mode in [Mode::Dark, Mode::Light] {
         let palette = registry.resolve(SYSTEM_THEME, mode).palette;
         let gap = |a: Rgba, b: Rgba| (a.luminance() - b.luminance()).abs();
+        let terminal_background = match mode {
+            Mode::Dark => Rgba::opaque(0x0d, 0x0d, 0x0d),
+            Mode::Light => Rgba::opaque(0xf7, 0xf7, 0xf7),
+        };
+        let visible = |color: Rgba| {
+            if color.a == 0 {
+                terminal_background
+            } else {
+                color
+            }
+        };
 
         for (name, fg, bg, floor) in [
             (
@@ -639,7 +673,7 @@ fn theme_system_keeps_every_surface_legible_and_bordered() {
                 40.0,
             ),
         ] {
-            let measured = gap(fg, bg);
+            let measured = gap(visible(fg), visible(bg));
             assert!(
                 measured >= floor,
                 "`system` in {mode:?}: {name} has a luminance gap of {measured:.1}, \
@@ -649,19 +683,18 @@ fn theme_system_keeps_every_surface_legible_and_bordered() {
             );
         }
 
-        // The base background is opaque on purpose, so the scrollbar track and the
-        // diff browser's selected row cannot paint a `Color::Reset` column beside an
-        // opaque panel. See `SYSTEM_THEME`'s own documentation.
-        assert_ne!(
-            palette.background.a, 0,
-            "a transparent base would reintroduce the colour seam in {mode:?}"
-        );
-        assert_ne!(Color::from(palette.background), Color::Reset);
-        assert!(
-            gap(palette.background, palette.background_panel) <= 20.0,
-            "the base and the panel must be one step apart, or the seam is merely \
-             recoloured rather than removed"
-        );
+        for (name, color) in [
+            ("background", palette.background),
+            ("backgroundPanel", palette.background_panel),
+            ("backgroundElement", palette.background_element),
+            ("backgroundMenu", palette.background_menu),
+        ] {
+            assert_eq!(
+                Color::from(color),
+                Color::Reset,
+                "fallback system role {name} must preserve the terminal background in {mode:?}"
+            );
+        }
     }
 }
 

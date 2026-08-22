@@ -8,9 +8,10 @@
     "ansiCyan": { "dark": 14, "light": 6 },
     "ansiGreenBright": { "dark": 10, "light": 2 },
     "ansiRedBright": { "dark": 9, "light": 1 },
-    "base": { "dark": "#0d0d0d", "light": "#f7f7f7" },
-    "panel": { "dark": "#171717", "light": "#ededed" },
-    "element": { "dark": "#212121", "light": "#e2e2e2" },
+    "base": "none",
+    "panel": "none",
+    "element": "none",
+    "selectionText": { "dark": "#0d0d0d", "light": "#f7f7f7" },
     "lineSubtle": { "dark": "#303030", "light": "#d0d0d0" },
     "line": { "dark": "#4d4d4d", "light": "#b0b0b0" },
     "lineActive": { "dark": "#7a7a7a", "light": "#808080" },
@@ -32,7 +33,7 @@
 
     "text": "fg",
     "textMuted": "fgMuted",
-    "selectedListItemText": "base",
+    "selectedListItemText": "selectionText",
 
     "background": "base",
     "backgroundPanel": "panel",

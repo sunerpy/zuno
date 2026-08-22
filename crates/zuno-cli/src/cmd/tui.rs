@@ -239,11 +239,9 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
     let history_notice = history.notice().map(str::to_owned);
 
     let mut themes = ThemeRegistry::new();
-    // `COLORFGBG` is the only non-invasive mode signal available before
-    // `TerminalSession` owns terminal I/O. A complete palette query needs an
-    // stdin/stdout escape-sequence round trip; doing that here would violate this
-    // module's rule that startup failures are resolved before raw mode. When the
-    // environment has no usable signal, retain today's dark-mode behaviour.
+    // `COLORFGBG` can refine the palette without consuming bytes from the same
+    // terminal input stream that carries an immediately typed prompt. When it is
+    // absent, the built-in `system` asset keeps terminal defaults visible.
     let mode = match themes.refresh_system_theme(&EnvironmentPalette, None, Mode::Dark) {
         SystemThemeOutcome::Derived(mode) => mode,
         SystemThemeOutcome::Unavailable => Mode::Dark,

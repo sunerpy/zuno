@@ -52,6 +52,8 @@ The TUI favors dense, keyboard-first operation:
 - multiline question input with bounded growth;
 - visible permission, retry, diagnostics, and background-job states;
 - generic rendering for unknown future events;
+- a `system` theme that reads non-invasive terminal color hints when available
+  and otherwise preserves the terminal's foreground and background defaults;
 - no blocking network, LSP, or provider work in the render loop.
 
 ## Future GUI
