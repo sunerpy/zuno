@@ -33,16 +33,18 @@ The complete checked starter is [`examples/config/zuno.json`](../../examples/con
 
 `theme`, `mouse`, key bindings, prompt dimensions, diff layout, and notification settings do **not** belong in `zuno.json`. They belong in `tui.json` or `tui.jsonc` at the corresponding global or project configuration layer.
 
-The default preserves terminal-native selection:
+The default enables application-owned mouse interaction:
 
 ```json
 {
   "theme": "system",
-  "mouse": false
+  "mouse": true
 }
 ```
 
-With `mouse` absent or `false`, Zuno does not enable terminal mouse capture, so dragging can select text across the transcript, sidebar, and input area. On terminals that implement alternate-scroll mode, wheel notches scroll a long transcript while the composer is empty without taking selection away from the terminal. Set `"mouse": true` only when direct TUI mouse events and click handling are more important than native drag selection.
+With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events. The transcript provides its own selection and copy behavior, clamps a drag to the transcript instead of crossing into the sidebar, exposes clickable tool and sidebar disclosure rows, and mounts a draggable scrollbar when a conversation overflows.
+
+Set `"mouse": false` to opt out of those interactions and return drag selection to the terminal. In that mode native selection may cross the transcript, sidebar, and input area; terminals that implement alternate-scroll mode can still translate wheel notches into transcript scrolling while the composer is empty.
 
 The `system` theme queries the terminal's OSC 10/11 foreground and background colours before the TUI starts, then derives its text, panel, input, border, and syntax colours from that result. Terminals which do not support colour queries fall back to `COLORFGBG`; if neither source is available, Zuno applies a neutral root, panel, and input hierarchy so the interface does not collapse into one near-black surface.
 

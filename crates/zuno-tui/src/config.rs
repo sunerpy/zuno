@@ -499,8 +499,8 @@ pub struct ResolvedTuiConfig {
     pub scroll_acceleration: Option<ScrollAcceleration>,
     /// Diff rendering style, when configured.
     pub diff_style: Option<DiffStyle>,
-    /// Whether application mouse handling is enabled. Defaults to `false` so the
-    /// terminal owns selection unless the user explicitly opts into mouse events.
+    /// Whether application mouse handling is enabled. Defaults to `true` so the
+    /// transcript can provide pane-bounded selection and a draggable scrollbar.
     pub mouse: bool,
     /// The theme name to render with, with the default already applied.
     ///
@@ -710,7 +710,7 @@ impl TuiConfig {
             scroll_speed: self.scroll_speed,
             scroll_acceleration: self.scroll_acceleration,
             diff_style: self.diff_style,
-            mouse: self.mouse.unwrap_or(false),
+            mouse: self.mouse.unwrap_or(true),
             theme: self
                 .theme
                 .unwrap_or_else(|| crate::theme::DEFAULT_THEME.to_owned()),
@@ -752,7 +752,7 @@ impl Default for ResolvedTuiConfig {
             scroll_speed: None,
             scroll_acceleration: None,
             diff_style: None,
-            mouse: false,
+            mouse: true,
             theme: crate::theme::DEFAULT_THEME.to_owned(),
             attention: crate::attention::AttentionSettings::default(),
         }

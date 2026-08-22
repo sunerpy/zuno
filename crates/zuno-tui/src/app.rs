@@ -325,11 +325,9 @@ impl CrosstermLifecycle {
 ///
 /// # Why not crossterm's `EnableMouseCapture`
 ///
-/// That command requests five DEC private modes, two of which are `?1002` (report motion
-/// while a button is held) and `?1003` (report **every** pointer motion). The only mouse
-/// consumer in this binary is `SessionScreen::handle_mouse`, which acts on `ScrollUp`,
-/// `ScrollDown` and a left press, and returns `IGNORED` for drags and motion. So those two
-/// modes ask the terminal to send a packet per pointer pixel that nothing will ever read.
+/// That command requests five DEC private modes, including `?1003` (report **every** pointer
+/// motion). Zuno needs `?1002` now: the transcript owns drag selection and the scrollbar owns
+/// thumb dragging. It still does not need free pointer motion, so `?1003` remains excluded.
 ///
 /// The cost is not hypothetical, and it is not merely CPU. Each arriving event is two
 /// `spawn_blocking` round trips in [`forward_terminal_input_from`] — one to poll, one to
@@ -337,22 +335,19 @@ impl CrosstermLifecycle {
 /// across the window therefore fills the same queue a keystroke needs, and backpressure
 /// makes that a latency defect: the keypress waits behind motion nobody wanted.
 ///
-/// `?1000` alone reports press and release, which is how a wheel notch arrives, and
-/// `?1006` is the SGR encoding that keeps coordinates past column 223 correct. Requesting
-/// only those loses no behaviour this application has.
+/// `?1000` reports press and release, `?1002` adds motion while a button is held, and `?1006`
+/// is the SGR encoding that keeps coordinates past column 223 correct.
 ///
 /// # What this does not do
 ///
-/// It does not preserve the terminal's own text selection. Any mouse reporting mode takes
-/// the pointer, so Zuno leaves mouse capture disabled by default and requires `mouse =
-/// true` for wheel scrolling and clickable sidebar sections. Re-implementing selection
-/// inside the application was rejected: leaving reporting off gives every rendered region
-/// the terminal's native selection and clipboard behavior.
+/// It does not preserve the terminal's own text selection. Zuno instead owns transcript
+/// selection while capture is enabled, which is what keeps a drag from crossing into the
+/// sidebar or input column.
 struct NarrowMouseCapture;
 
 impl crossterm::Command for NarrowMouseCapture {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        f.write_str("\u{1b}[?1000h\u{1b}[?1006h")
+        f.write_str("\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1006h")
     }
 
     #[cfg(windows)]
@@ -369,7 +364,7 @@ struct NarrowMouseRelease;
 
 impl crossterm::Command for NarrowMouseRelease {
     fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        f.write_str("\u{1b}[?1006l\u{1b}[?1000l")
+        f.write_str("\u{1b}[?1006l\u{1b}[?1002l\u{1b}[?1000l")
     }
 
     #[cfg(windows)]
@@ -418,16 +413,16 @@ impl crossterm::Command for AlternateScrollRelease {
 /// than in the screen is what keeps an unconsumed event out of the bounded channel, where
 /// it would otherwise delay a keystroke.
 ///
-/// A left press is forwarded because the ambient panel's section headings draw a disclosure
-/// triangle and a click is how one is actuated. The matching *release* is still dropped: a
-/// toggle needs one event, and forwarding both would double the channel cost of every
-/// click for a consumer that does not exist.
+/// A left press begins either a click, a transcript selection, or a scrollbar drag. The
+/// matching drag and release events are therefore consumers too.
 const fn is_consumable_mouse(kind: crossterm::event::MouseEventKind) -> bool {
     matches!(
         kind,
         crossterm::event::MouseEventKind::ScrollUp
             | crossterm::event::MouseEventKind::ScrollDown
             | crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            | crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+            | crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
     )
 }
 

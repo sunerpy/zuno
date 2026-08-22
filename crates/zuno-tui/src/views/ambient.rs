@@ -125,6 +125,8 @@ pub struct SkillSummary {
     pub name: String,
     /// Its one-line description.
     pub description: String,
+    /// Whether this session successfully loaded the skill through the `skill` tool.
+    pub loaded: bool,
 }
 
 /// Every ambient fact the sidebar states.
@@ -743,9 +745,20 @@ impl SidebarView {
 
         lines.push(blank());
         headers.push((lines.len(), Section::Skills));
+        let loaded = self
+            .ambient
+            .skills
+            .iter()
+            .filter(|skill| skill.loaded)
+            .count();
+        let skill_summary = if self.ambient.skills.is_empty() {
+            Self::tally(0)
+        } else {
+            format!("{loaded}/{} loaded", self.ambient.skills.len())
+        };
         lines.push(self.heading(
             "Skills",
-            &Self::tally(self.ambient.skills.len()),
+            &skill_summary,
             self.disclosure(self.expanded.skills),
             width,
         ));
@@ -755,9 +768,13 @@ impl SidebarView {
             } else {
                 for skill in &self.ambient.skills {
                     lines.push(padded(
-                        &format!("  · {}", skill.name),
+                        &format!("  {} {}", if skill.loaded { "✓" } else { "·" }, skill.name),
                         width,
-                        self.context.text(),
+                        if skill.loaded {
+                            self.context.success()
+                        } else {
+                            self.context.text()
+                        },
                     ));
                 }
             }

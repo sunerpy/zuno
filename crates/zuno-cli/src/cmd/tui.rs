@@ -908,6 +908,7 @@ impl SessionFacts {
             .map(|skill| zuno_tui::views::ambient::SkillSummary {
                 name: skill.name,
                 description: skill.description.unwrap_or_default(),
+                loaded: false,
             })
             .collect();
 

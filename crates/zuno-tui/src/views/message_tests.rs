@@ -1338,6 +1338,55 @@ fn views_transcript_collapses_long_tool_output_and_says_how_much_it_hid() {
 }
 
 #[test]
+fn views_task_results_render_as_a_child_session_instead_of_raw_envelope_markup() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("task_1"),
+        name: String::from(crate::views::subagent::TASK_TOOL),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
+        String::from(
+            r#"{"description":"trace the runtime","subagent_type":"deep","prompt":"inspect it"}"#,
+        ),
+    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd)));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("task_1"),
+        name: String::from(crate::views::subagent::TASK_TOOL),
+        title: String::from("Delegated runtime trace"),
+        output: String::from(
+            "<task id=\"ses_child\" state=\"completed\">\n\
+             <summary>runtime trace</summary>\n\
+             <task_result>\n\
+             child answer with the traced call path\n\
+             </task_result>\n\
+             </task>",
+        ),
+        diff: None,
+        written_paths: Vec::new(),
+        is_error: false,
+    }));
+
+    let joined = draw(&mut view, 80, 20).join("\n");
+    assert!(
+        joined.contains("session ses_child · completed"),
+        "the task row did not identify its child session and state:\n{joined}"
+    );
+    assert!(
+        joined.contains("child answer with the traced call path"),
+        "the child result was lost while unwrapping the task envelope:\n{joined}"
+    );
+    assert!(
+        !joined.contains("<task")
+            && !joined.contains("<summary>")
+            && !joined.contains("<task_result>"),
+        "wire markup leaked into the conversation instead of using the task renderer:\n{joined}"
+    );
+}
+
+#[test]
 fn views_status_strip_keeps_a_resolved_model_after_the_turn_that_resolved_it_ends() {
     // Measured live: choosing a model in the picker printed
     // `session: model is now myopenai/…` on the strip while the strip's own model field

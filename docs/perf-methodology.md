@@ -362,16 +362,17 @@ A hit costs 6.17% of a miss at 931 messages, so reuse was worth building.
 frame. Per frame would miss on every delta of a streaming turn, because the
 trailer carries a spinner that advances on every folded event.
 
-The key is the width, the two display affordances, the preceding role, a
-content fingerprint of the message, and the resolved theme compared by `Arc`
-identity. `ViewContext` holds `Arc<RwLock<Arc<Resolved>>>` and `set_theme`
-installs a new `Arc`, so a pointer comparison is a *complete* test for a palette
-change — including `thinkingOpacity`, which `Palette::entries` does not report and
-which a field-by-field hash would have missed. The comparison is free of an ABA
-hazard only because the entry holds the `Arc` it rendered with, so that address
-cannot be reused. The fingerprint is derived from the parts rather than tracked as
-a revision counter, because the fold mutates parts in place from several places
-and a counter is a thing an edit can forget to bump, whose failure mode is a frame
+The key is the width, the reasoning affordance, the global tool-output default,
+the per-call tool-affordance revision, the preceding role, a content fingerprint
+of the message, and the resolved theme compared by `Arc` identity. `ViewContext`
+holds `Arc<RwLock<Arc<Resolved>>>` and `set_theme` installs a new `Arc`, so a
+pointer comparison is a *complete* test for a palette change — including
+`thinkingOpacity`, which `Palette::entries` does not report and which a
+field-by-field hash would have missed. The comparison is free of an ABA hazard
+only because the entry holds the `Arc` it rendered with, so that address cannot be
+reused. The fingerprint is derived from the parts rather than tracked as a
+revision counter, because the fold mutates parts in place from several places and
+a counter is a thing an edit can forget to bump, whose failure mode is a frame
 showing content the transcript no longer holds.
 
 The bound is **32,768 rows** across all entries, not an entry count: an expanded

@@ -51,7 +51,7 @@ use crate::views::ViewContext;
 use crate::views::autocomplete::{AutocompleteStep, AutocompleteView, SlashSource};
 use crate::views::editor::{EditorSignal, InputEditor};
 use crate::views::external::{Clipboard, EditorRequest, ExternalError, SystemClipboard};
-use crate::views::message::{Message, StatusView, TranscriptView};
+use crate::views::message::{Message, ScrollbarView, StatusView, TranscriptView};
 use crate::views::permission::typed_character;
 use crate::views::scroll::Scroller;
 use crate::views::slash::{CatalogCommand, HostCommand, SlashRouter, SlashSubmission};
@@ -361,6 +361,19 @@ const fn sidebar_drawn(sidebar_visible: bool, empty: bool, width: u16) -> bool {
     sidebar_visible && !empty && width >= crate::views::SIDEBAR_MIN_WIDTH
 }
 
+/// The left session column after the optional full-height sidebar is reserved.
+const fn content_bounds(area: Rect, sidebar: bool) -> Rect {
+    if !sidebar {
+        return area;
+    }
+    Rect {
+        width: area
+            .width
+            .saturating_sub(SIDEBAR_GAP_COLS.saturating_add(crate::views::ambient::SIDEBAR_WIDTH)),
+        ..area
+    }
+}
+
 /// The widest the composer ever gets.
 ///
 /// The complaint was that the input box took the whole frame, and a box the width of the frame
@@ -377,10 +390,10 @@ const fn sidebar_drawn(sidebar_visible: bool, empty: bool, width: u16) -> bool {
 /// second of them — that a composer centred on the *frame* would sit off the transcript's own
 /// axis once the ambient panel split the body — was correct, and was the reason the whole
 /// narrowing was abandoned mid-conversation rather than the reason it should be. It is answered
-/// by [`composer_bounds`], which measures the composer inside the body's columns instead of the
-/// frame's, so the box is centred on the same axis the transcript is and stops at the panel's
-/// rule. That was the reported defect: at 120 columns the composer and the strip ran edge to
-/// edge underneath a sidebar that occupies the last thirty-eight of them.
+/// by [`content_bounds`], which reserves the full-height sidebar before the prompt, status and
+/// transcript are laid out. The box is therefore centred on the transcript's own axis and stops
+/// before the panel. That was the reported defect: at 120 columns the composer and the strip ran
+/// edge to edge underneath a sidebar that occupies the last forty columns including its gap.
 ///
 /// The first ground — that mid-conversation the composer is where a pasted diff goes, so
 /// rationing its columns evicts the one region whose content the user supplies — is superseded
@@ -407,36 +420,11 @@ const COMPOSER_MAX_COLS: u16 = 80;
 const COMPOSER_LEFT_RULE: &str = "▌";
 const COMPOSER_RIGHT_RULE: &str = "▐";
 
-/// The columns of `band` the composer may use, given whether the ambient panel is drawn.
+/// Centre the composer inside a band that already belongs to the left content column.
 ///
-/// The panel is drawn over the *body* region only — see [`Component::render`]'s horizontal
-/// split — but the prompt band and the status strip are separate bands spanning the whole
-/// frame, so nothing stopped them from running underneath it. Measured at 120x32 with a
-/// conversation in progress, the composer and its footer reached column 119 while the panel's
-/// rule stood at column 81, which is what was reported as the input box crossing into the
-/// right-hand region.
-///
-/// The subtraction is the *same* one the body's split performs, spelled once here and read by
-/// both the render path and the tests, for the reason [`prompt_and_tail`](SessionScreen::prompt_and_tail)
-/// is one function: a second copy of this arithmetic that drifted would leave every assertion
-/// about the composer reading the panel's columns, where the row is blank, so the failure would
-/// name the wrong thing.
-///
-/// Saturating rather than checked: a frame narrow enough for the panel not to be drawn never
-/// reaches the subtraction, and one wide enough to draw it has the columns by construction —
-/// but the guard costs nothing and the alternative is an underflow on a `Rect` field.
-const fn composer_bounds(band: Rect, sidebar: bool) -> Rect {
-    if !sidebar {
-        return band;
-    }
-    let taken = SIDEBAR_GAP_COLS.saturating_add(crate::views::ambient::SIDEBAR_WIDTH);
-    Rect {
-        width: band.width.saturating_sub(taken),
-        ..band
-    }
-}
-
-/// `bounds` narrowed to the composer's central region.
+/// [`Component::render`] applies [`content_bounds`] before its vertical split, so `bounds`
+/// cannot include sidebar or gap columns. This function has one job after that split: cap the
+/// input measure and centre it inside the transcript column.
 ///
 /// The narrowing is a `min`, never a `clamp`. [`u16::clamp`] **panics when its minimum exceeds
 /// its maximum** — the hazard [`prompt_rows`] documents at length — and on the 20-column pane a
@@ -445,7 +433,7 @@ const fn composer_bounds(band: Rect, sidebar: bool) -> Rect {
 /// to a slit or an abort.
 ///
 /// Centred within `bounds` and not within the frame, which is what keeps the box on the
-/// transcript's own axis once [`composer_bounds`] has taken the panel's columns away.
+/// transcript's own axis once [`content_bounds`] has taken the panel's columns away.
 const fn composer_region(bounds: Rect) -> Rect {
     let width = if bounds.width < COMPOSER_MAX_COLS {
         bounds.width
@@ -528,9 +516,32 @@ fn prompt_frame(band: Rect) -> (Option<Rect>, Rect) {
     (Some(gutter), editor)
 }
 
+const fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerGesture {
+    Transcript {
+        column: u16,
+        row: u16,
+        dragged: bool,
+    },
+    Scrollbar {
+        anchor: usize,
+    },
+}
+
 /// The transcript, the status strip and the prompt as one screen.
 pub struct SessionScreen {
     transcript: TranscriptView,
+    scrollbar: ScrollbarView,
+    scrollbar_visible: bool,
+    scrollbar_area: Option<Rect>,
+    pointer: Option<PointerGesture>,
     status: StatusView,
     editor: InputEditor,
     autocomplete: AutocompleteView,
@@ -754,6 +765,10 @@ impl SessionScreen {
         let slash = SlashRouter::default();
         Self {
             transcript: TranscriptView::new(context.clone()),
+            scrollbar: ScrollbarView::new(context.clone()),
+            scrollbar_visible: true,
+            scrollbar_area: None,
+            pointer: None,
             status: StatusView::new(context.clone()),
             welcome: crate::views::welcome::WelcomeView::new(context.clone()),
             sidebar: crate::views::ambient::SidebarView::new(context.clone()),
@@ -1405,7 +1420,29 @@ impl Component for SessionScreen {
             .map(crate::views::picker::McpServer::service)
             .collect();
         let empty = !self.transcript.transcript().conversation_started();
-        let (prompt_band, tail) = self.prompt_and_tail(area.width, area.height);
+        // Split the whole frame first. The transcript, prompt, status and info row now share
+        // one left column, so none of those bands can run underneath the sidebar.
+        let sidebar_drawn = sidebar_drawn(self.sidebar_visible, empty, area.width);
+        let (content, gap, aside) = if sidebar_drawn {
+            let content = content_bounds(area, true);
+            let gap = Rect {
+                x: content.x.saturating_add(content.width),
+                width: SIDEBAR_GAP_COLS,
+                ..area
+            };
+            let aside = Rect {
+                x: gap.x.saturating_add(gap.width),
+                width: crate::views::ambient::SIDEBAR_WIDTH,
+                ..area
+            };
+            (content, Some(gap), Some(aside))
+        } else {
+            (area, None, None)
+        };
+        if let Some(gap) = gap {
+            crate::views::fill(frame.buffer_mut(), gap, self.context.surface());
+        }
+        let (prompt_band, tail) = self.prompt_and_tail(content.width, content.height);
         // Prompt above strip: the agent and the model are what the *composer* is set to, so they
         // belong under the box the way a caption belongs under a figure. See `welcome_tail_rows`,
         // which counts the strip among the rows below the band for exactly this reason.
@@ -1420,27 +1457,18 @@ impl Component for SessionScreen {
             Constraint::Length(prompt_band),
             Constraint::Length(STATUS_ROWS),
             Constraint::Length(tail),
-            Constraint::Length(info_rows(area.height)),
+            Constraint::Length(info_rows(content.height)),
         ])
-        .areas(area);
+        .areas(content);
 
-        // The sidebar is dropped rather than narrowed below the threshold: a panel
-        // squeezed until its server names truncate says less than no panel while still
-        // costing the reply the columns it needed. And it is dropped outright while the
-        // transcript is empty — see `sidebar_drawn`.
-        let (main, aside) = if sidebar_drawn(self.sidebar_visible, empty, area.width) {
-            // The gap column is between the two, not inside either, so neither the
-            // transcript's wrap width nor the panel's own layout has to know about it.
-            let [main, _gap, aside] = Layout::horizontal([
-                Constraint::Min(1),
-                Constraint::Length(SIDEBAR_GAP_COLS),
-                Constraint::Length(crate::views::ambient::SIDEBAR_WIDTH),
-            ])
-            .areas(body);
-            (main, Some(aside))
+        let (main, scrollbar) = if !empty && self.scrollbar_visible && body.width > 1 {
+            let [main, scrollbar] =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).areas(body);
+            (main, Some(scrollbar))
         } else {
             (body, None)
         };
+        self.scrollbar_area = scrollbar;
 
         // The transcript owns this region as soon as there is anything to show, so the
         // welcome screen can never hide content — it only fills rows that would
@@ -1462,6 +1490,12 @@ impl Component for SessionScreen {
             self.transcript.forget_hit_targets();
         } else {
             self.transcript.render(frame, main);
+            if let Some(scrollbar) = scrollbar {
+                self.scrollbar.total = self.transcript.content_height();
+                self.scrollbar.viewport = self.transcript.viewport_height();
+                self.scrollbar.offset = self.transcript.offset();
+                self.scrollbar.render(frame, scrollbar);
+            }
         }
 
         // Both the panel and the strip read the transcript's single accumulator rather than
@@ -1483,6 +1517,10 @@ impl Component for SessionScreen {
         ambient.title = title;
         ambient.tokens = self.transcript.transcript().tokens();
         ambient.context_used = self.transcript.transcript().context_used();
+        let loaded_skills = self.transcript.loaded_skills();
+        for skill in &mut ambient.skills {
+            skill.loaded = loaded_skills.contains(&skill.name);
+        }
         if let Some(aside) = aside {
             self.sidebar.render(frame, aside);
         } else {
@@ -1521,12 +1559,7 @@ impl Component for SessionScreen {
         // colour seam the centring band's fill exists to avoid, reintroduced sideways.
         crate::views::fill(frame.buffer_mut(), prompt, self.context.surface());
         crate::views::fill(frame.buffer_mut(), status, self.context.surface());
-        // `sidebar_drawn` and not `empty`: the composer's columns are bounded by whether the
-        // panel is on screen, which is what makes the box share the transcript's axis instead of
-        // running under the panel. The same predicate the horizontal split above used, so the
-        // two cannot disagree about where the body ends.
-        let sidebar = sidebar_drawn(self.sidebar_visible, empty, area.width);
-        let composer = composer_region(composer_bounds(prompt, sidebar));
+        let composer = composer_region(prompt);
         // The whole band is painted next, so the spacer row and the right inset carry the
         // prompt's own background rather than whatever the previous frame left there. `element`
         // rather than `text`: they differ only in background, and `text`'s is the surface the
@@ -1536,13 +1569,8 @@ impl Component for SessionScreen {
         // Narrowed to the same region as the band it describes, and by the same call: a
         // full-width strip under a centred box would put the composer's own footer on a
         // different axis from the composer.
-        self.status
-            .render(frame, composer_region(composer_bounds(status, sidebar)));
-        self.composer_rules(
-            frame,
-            composer_bounds(prompt, sidebar).union(composer_bounds(status, sidebar)),
-            composer,
-        );
+        self.status.render(frame, composer_region(status));
+        self.composer_rules(frame, prompt.union(status), composer);
         self.render_info(frame, info);
         let (gutter, buffer) = prompt_frame(composer);
         if let Some(gutter) = gutter {
@@ -1878,22 +1906,116 @@ impl SessionScreen {
     /// body to prove the two lists agree. An arm added in a sibling method would be a kind
     /// the filter still drops, so the arm could never run.
     ///
-    /// `Down(Left)` is a press, not a drag: `?1000` reports button presses and releases
-    /// only, and `?1002`/`?1003` were removed deliberately once measured — motion reporting
-    /// cost keystroke latency for a consumer that did not exist. A section header needs one
-    /// press, so nothing here asks for them back.
+    /// Button-event reporting (`?1002`) supplies drag and release events. All-motion
+    /// reporting (`?1003`) remains disabled, so moving the pointer without a held button
+    /// still costs no channel traffic.
     fn handle_mouse(&mut self, mouse: &MouseEvent, now_ms: u64) -> EventResult {
         let notches = match mouse.kind {
             MouseEventKind::ScrollUp => -1.0,
             MouseEventKind::ScrollDown => 1.0,
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                return self.handle_click(mouse.column, mouse.row);
+                return self.begin_pointer(mouse.column, mouse.row);
             }
-            // Horizontal wheels, other buttons and drags: the transcript has one axis, and a
-            // screen that claimed the rest would stop a later surface from seeing them.
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                return self.drag_pointer(mouse.column, mouse.row);
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                return self.end_pointer(mouse.column, mouse.row);
+            }
+            // Horizontal wheels, other buttons and free pointer movement: the transcript has
+            // one axis, and a screen that claimed the rest would stop a later surface from
+            // seeing them.
             _ => return EventResult::IGNORED,
         };
         self.scroll_transcript(notches, now_ms)
+    }
+
+    fn begin_pointer(&mut self, column: u16, row: u16) -> EventResult {
+        if self.sidebar.click(column, row) {
+            self.transcript.clear_selection();
+            return EventResult::REDRAW;
+        }
+        if let Some(area) = self
+            .scrollbar_area
+            .filter(|area| rect_contains(*area, column, row))
+        {
+            self.transcript.clear_selection();
+            let anchor = self.scrollbar.drag_anchor(row, area);
+            self.pointer = Some(PointerGesture::Scrollbar { anchor });
+            return self.drag_scrollbar(row, area, anchor);
+        }
+        if self.transcript.begin_selection(column, row) {
+            self.pointer = Some(PointerGesture::Transcript {
+                column,
+                row,
+                dragged: false,
+            });
+            return EventResult::REDRAW;
+        }
+        self.pointer = None;
+        self.handle_click(column, row)
+    }
+
+    fn drag_pointer(&mut self, column: u16, row: u16) -> EventResult {
+        match self.pointer {
+            Some(PointerGesture::Scrollbar { anchor }) => {
+                let Some(area) = self.scrollbar_area else {
+                    self.pointer = None;
+                    return EventResult::IGNORED;
+                };
+                self.drag_scrollbar(row, area, anchor)
+            }
+            Some(PointerGesture::Transcript {
+                column: start_column,
+                row: start_row,
+                ..
+            }) => {
+                if !self.transcript.update_selection(column, row) {
+                    return EventResult::IGNORED;
+                }
+                self.pointer = Some(PointerGesture::Transcript {
+                    column: start_column,
+                    row: start_row,
+                    dragged: true,
+                });
+                EventResult::REDRAW
+            }
+            None => EventResult::IGNORED,
+        }
+    }
+
+    fn end_pointer(&mut self, column: u16, row: u16) -> EventResult {
+        match self.pointer.take() {
+            Some(PointerGesture::Scrollbar { anchor }) => {
+                let Some(area) = self.scrollbar_area else {
+                    return EventResult::IGNORED;
+                };
+                self.drag_scrollbar(row, area, anchor)
+            }
+            Some(PointerGesture::Transcript {
+                column: start_column,
+                row: start_row,
+                dragged,
+            }) => {
+                let _ = self.transcript.update_selection(column, row);
+                if dragged {
+                    EventResult::REDRAW
+                } else {
+                    self.transcript.clear_selection();
+                    self.handle_click(start_column, start_row)
+                }
+            }
+            None => EventResult::IGNORED,
+        }
+    }
+
+    fn drag_scrollbar(&mut self, row: u16, area: Rect, anchor: usize) -> EventResult {
+        let offset = self.scrollbar.offset_at(row, area, anchor);
+        self.transcript.set_offset(offset);
+        self.scroller.total = self.transcript.content_height();
+        self.scroller.viewport = self.transcript.viewport_height();
+        self.scroller.sync_offset(self.transcript.offset());
+        EventResult::REDRAW
     }
 
     /// Give a press to whichever surface owns the cell under it.
@@ -1907,8 +2029,12 @@ impl SessionScreen {
         if self.sidebar.click(column, row) {
             return EventResult::REDRAW;
         }
-        // The panel first, because it is drawn *over* the body's right-hand columns and its
-        // rows would otherwise be claimed by whichever transcript row lies beneath them.
+        if let Some(call_id) = self.transcript.tool_at(column, row).map(str::to_owned) {
+            self.transcript.toggle_tool(&call_id);
+            return EventResult::REDRAW;
+        }
+        // The panel first so its heading cells remain owned by the disclosure controls even
+        // if a future layout puts another clickable surface beside or beneath them.
         if let Some(dialog) = self.message_actions(column, row) {
             self.requested.push(dialog);
             return EventResult::REDRAW;
@@ -2112,6 +2238,10 @@ impl SessionScreen {
             }
             "sidebar_toggle" => {
                 self.sidebar_visible = !self.sidebar_visible;
+                EventResult::REDRAW
+            }
+            "scrollbar_toggle" => {
+                self.scrollbar_visible = !self.scrollbar_visible;
                 EventResult::REDRAW
             }
             "tips_toggle" => {
@@ -2945,6 +3075,11 @@ impl ActionComponent for SessionScreen {
             !self.editor.text().is_empty() && matches!(action.name, "input_clear" | "input_delete");
         if action.name == APP_EXIT || (is_exit_request(event) && !editor_owns_chord) {
             return self.request_exit();
+        }
+        if action.name == "messages_copy"
+            && let Some(text) = self.transcript.selected_text()
+        {
+            return self.copy(text);
         }
         if self.handle_view_action(action).handled {
             return EventResult::REDRAW;

@@ -69,7 +69,10 @@ Prompt assembly is ordered data, not string concatenation spread across the CLI.
 3. global and project memory;
 4. extension lifecycle guidance and the exact active package projection;
 5. discovered instruction files;
-6. the available skill catalog.
+6. the skill trigger policy;
+7. the available skill catalog.
+
+The trigger policy makes a named or clearly matching skill a pre-action requirement: the model must load the complete body through the `skill` tool, use only the minimal matching set, and may not claim a skill was used unless that call completed successfully. The catalog remains discovery metadata rather than a substitute for the body.
 
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 

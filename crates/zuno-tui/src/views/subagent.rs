@@ -63,6 +63,17 @@ pub const SUBAGENT_DIALOG_ID: &str = "session_child_first";
 /// crate to learn one string. The pairing is asserted by this module's tests.
 pub const TASK_TOOL: &str = "task";
 
+/// Structured facts recovered from the task tool's stable output envelope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskEnvelope {
+    /// Child session id, when the tool reached one.
+    pub session_id: Option<String>,
+    /// Child state reported by the envelope.
+    pub state: Option<String>,
+    /// The child report without the transport envelope.
+    pub result: String,
+}
+
 /// What the view says when the session has delegated nothing.
 ///
 /// A named answer rather than an empty body, for the reason
@@ -146,14 +157,14 @@ pub fn delegations(messages: &[Message]) -> Vec<Delegation> {
                     .map(str::to_owned)
                     .filter(|value| !value.is_empty())
             };
-            let envelope = output.as_deref().map(envelope_attributes);
+            let envelope = output.as_deref().and_then(task_envelope);
             found.push(Delegation {
                 call_id: call_id.clone(),
                 agent: field("subagent_type").or_else(|| field("category")),
                 objective: field("description").or_else(|| field("prompt")),
                 status: *status,
-                session_id: envelope.as_ref().and_then(|found| found.0.clone()),
-                state: envelope.and_then(|found| found.1),
+                session_id: envelope.as_ref().and_then(|found| found.session_id.clone()),
+                state: envelope.and_then(|found| found.state),
                 background: parsed
                     .as_ref()
                     .and_then(|value| value.get("background"))
@@ -165,18 +176,27 @@ pub fn delegations(messages: &[Message]) -> Vec<Delegation> {
     found
 }
 
-/// The `id` and `state` of a `<task …>` envelope, when its opening tag carries them.
+/// Parse the stable `<task …>` envelope emitted by `zuno_tools::task`.
 ///
 /// A scan for two quoted attributes rather than an XML parse: the envelope is produced by
 /// one function (`zuno_tools::task::render`) whose shape is `<task id="…" state="…">`, and
 /// pulling in a parser to read two attributes off a line this crate does not own would be
 /// a larger commitment than the fact deserves. Anything unrecognised yields [`None`],
 /// which renders as a row without a session id instead of a wrong one.
-fn envelope_attributes(output: &str) -> (Option<String>, Option<String>) {
-    let Some(tag) = output.lines().find(|line| line.starts_with("<task ")) else {
-        return (None, None);
-    };
-    (attribute(tag, "id"), attribute(tag, "state"))
+#[must_use]
+pub fn task_envelope(output: &str) -> Option<TaskEnvelope> {
+    let tag = output.lines().find(|line| line.starts_with("<task "))?;
+    let result = output
+        .split_once("<task_result>")
+        .and_then(|(_, rest)| rest.split_once("</task_result>"))
+        .map_or("", |(result, _)| result)
+        .trim_matches('\n')
+        .to_owned();
+    Some(TaskEnvelope {
+        session_id: attribute(tag, "id"),
+        state: attribute(tag, "state"),
+        result,
+    })
 }
 
 fn attribute(tag: &str, name: &str) -> Option<String> {

@@ -54,11 +54,18 @@ The TUI favors dense, keyboard-first operation:
 - generic rendering for unknown future events;
 - a `system` theme that reads non-invasive terminal color hints when available
   and otherwise preserves the terminal's foreground and background defaults;
-- terminal-native mouse selection across the transcript, sidebar, and input by
-  default; `mouse: true` in `tui.json` explicitly trades selection for TUI mouse
-  capture and click handling; native-selection mode enables terminal
-  alternate-scroll translation so wheel input scrolls a long transcript while
-  the composer is empty;
+- a full-height ambient sidebar outside the transcript, prompt, status, and info
+  column, so no left-hand band renders underneath it;
+- a visible transcript scrollbar with wheel and thumb dragging, plus
+  application-owned text selection that is clipped to the transcript.
+  `mouse: false` opts back into terminal-native selection and alternate-scroll
+  translation;
+- per-call tool disclosure rows, so one result can expand without changing its
+  siblings, and a task renderer that presents child session id, state, and result
+  without exposing the tool's envelope markup;
+- a skill census that separates discovery from use: the heading reports
+  `loaded/discovered`, and only a successfully completed `skill` tool call marks a
+  row loaded;
 - no empty LSP status or setup prompt; the sidebar adds LSP only for configured
   services or real diagnostics;
 - `/session` lists active root sessions from the current durable database and

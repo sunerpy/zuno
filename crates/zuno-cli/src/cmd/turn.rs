@@ -1932,6 +1932,15 @@ fn dynamic_context_from_goal_entry(
 /// never silent — see [`announce_skills`].
 const SKILL_PROMPT_BUDGET: usize = 32 * 1024;
 
+/// System-level trigger rules for the skill catalogue below.
+const SKILL_USAGE_POLICY: &str = "\
+Skills are mandatory trigger rules, not optional suggestions. Before taking any task action, \
+compare the request with the advertised skill descriptions. If the user names a skill or the \
+task clearly matches one, call the `skill` tool first, read the complete skill body, and follow \
+it for that turn. Load only the minimal matching set, in the order needed. Do not claim a skill \
+was used unless its tool call completed successfully, and do not substitute the catalogue \
+description for the skill body.";
+
 /// Put the discovered skills in the system prompt, and say so if any did not fit.
 ///
 /// Discovery has run since todo 14, and until now its only consumer was a TUI status
@@ -1967,6 +1976,11 @@ fn announce_skills(
             rendered.rendered + rendered.omitted,
         ));
     }
+    resolver.append_prompt_section(
+        "skills.policy",
+        "zuno skill trigger policy",
+        SKILL_USAGE_POLICY,
+    )?;
     resolver.append_prompt_section("skills.catalog", "discovered skills", rendered.text)
 }
 

@@ -42,6 +42,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, symbols};
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use zuno_engine::r#loop::TurnEvent;
@@ -233,6 +234,24 @@ impl ToolDisplay {
         match self {
             Self::Collapsed => TOOL_OUTPUT_PREVIEW_ROWS,
             Self::Expanded => TOOL_OUTPUT_MAX_ROWS,
+        }
+    }
+
+    /// The other display state.
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Expanded,
+            Self::Expanded => Self::Collapsed,
+        }
+    }
+
+    /// The disclosure glyph drawn on a tool header.
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Collapsed => "▸",
+            Self::Expanded => "▾",
         }
     }
 }
@@ -1023,6 +1042,63 @@ impl Transcript {
     }
 }
 
+/// One cell in the transcript's rendered content coordinates.
+///
+/// Rows are absolute content rows, before the viewport offset is applied. Columns are
+/// terminal cells inside the transcript rectangle. Keeping this coordinate system means a
+/// selection survives scrolling without ever acquiring coordinates from the sidebar beside
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPoint {
+    row: usize,
+    column: u16,
+}
+
+/// An application-owned drag selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextSelection {
+    anchor: TextPoint,
+    head: TextPoint,
+}
+
+impl TextSelection {
+    fn ordered(self) -> (TextPoint, TextPoint) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Selected columns on `row`, with an exclusive end.
+    fn columns(self, row: usize, width: u16) -> Option<(u16, u16)> {
+        let (start, end) = self.ordered();
+        if row < start.row || row > end.row || width == 0 {
+            return None;
+        }
+        let last = width.saturating_sub(1);
+        let start_column = start.column.min(last);
+        let end_column = end.column.min(last);
+        let (left, right) = if start.row == end.row {
+            (start_column, end_column.saturating_add(1))
+        } else if row == start.row {
+            (start_column, width)
+        } else if row == end.row {
+            (0, end_column.saturating_add(1))
+        } else {
+            (0, width)
+        };
+        (left < right).then_some((left, right.min(width)))
+    }
+}
+
+/// One message's rows and the tool-header rows inside it.
+#[derive(Clone)]
+struct MessageRows {
+    lines: Vec<Line<'static>>,
+    tools: Vec<(usize, String)>,
+}
+
 /// The chat transcript as a component.
 ///
 /// Owns the fold, the reasoning affordance, and the scroll offset. Scrolling itself
@@ -1032,6 +1108,10 @@ pub struct TranscriptView {
     transcript: Transcript,
     thinking: ThinkingDisplay,
     tool_output: ToolDisplay,
+    /// Per-call overrides applied on top of [`Self::tool_output`].
+    tool_overrides: BTreeMap<String, ToolDisplay>,
+    /// Cache invalidation for per-call affordance changes.
+    tool_revision: u64,
     /// First rendered row, from the top of the produced line list.
     offset: usize,
     /// Rows the last render produced, so a scroller can clamp against content.
@@ -1054,11 +1134,14 @@ pub struct TranscriptView {
     ///
     /// Built beside the rows in [`Self::cached_lines`] rather than reconstructed afterwards,
     /// which is the only way it can be right: the number of rows a message occupies is
-    /// decided by the two display affordances, by the wrap width and by whether the message
-    /// opens with a header — every one of them already an input to the cache key. Anything
-    /// that recomputed the mapping would be a second implementation of `message_rows`, and
-    /// the copy that drifted would attribute a click to the neighbouring message.
+    /// decided by the reasoning affordance, the global and per-call tool affordances, the wrap
+    /// width and whether the message opens with a header — every one of them already an input
+    /// to the cache key. Anything that recomputed the mapping would be a second implementation
+    /// of `message_rows`, and the copy that drifted would attribute a click to the neighbouring
+    /// message.
     line_owners: Vec<Option<usize>>,
+    /// Which tool header produced each row of the last measured line list.
+    line_tools: Vec<Option<String>>,
     /// Where each message was drawn in the frame that **was drawn**.
     ///
     /// Absolute screen rows, recorded by [`Component::render`] from the same slice it paints,
@@ -1067,6 +1150,12 @@ pub struct TranscriptView {
     /// need re-deriving on every resize, scroll and affordance toggle — and the update that is
     /// forgotten is a click landing on a message that has moved.
     hits: Vec<(Rect, usize)>,
+    /// Tool-header targets from the frame that was drawn.
+    tool_hits: Vec<(Rect, String)>,
+    /// The transcript rectangle from the frame that was drawn.
+    area: Option<Rect>,
+    /// The user's application-owned selection, in content coordinates.
+    selection: Option<TextSelection>,
 }
 
 impl TranscriptView {
@@ -1078,13 +1167,19 @@ impl TranscriptView {
             transcript: Transcript::new(),
             thinking: ThinkingDisplay::Collapsed,
             tool_output: ToolDisplay::Collapsed,
+            tool_overrides: BTreeMap::new(),
+            tool_revision: 0,
             offset: 0,
             content_height: 0,
             viewport_height: 0,
             following: true,
             cache: RowCache::default(),
             line_owners: Vec::new(),
+            line_tools: Vec::new(),
             hits: Vec::new(),
+            tool_hits: Vec::new(),
+            area: None,
+            selection: None,
         }
     }
 
@@ -1112,6 +1207,20 @@ impl TranscriptView {
             .map(|(_, index)| *index)
     }
 
+    /// Which tool header occupies `(column, row)` in the frame that was drawn.
+    #[must_use]
+    pub fn tool_at(&self, column: u16, row: u16) -> Option<&str> {
+        self.tool_hits
+            .iter()
+            .find(|(area, _)| {
+                column >= area.left()
+                    && column < area.right()
+                    && row >= area.top()
+                    && row < area.bottom()
+            })
+            .map(|(_, call_id)| call_id.as_str())
+    }
+
     /// Discard the recorded message positions.
     ///
     /// Called by the owner on any frame that draws the welcome surface instead of this view,
@@ -1120,20 +1229,163 @@ impl TranscriptView {
     /// occupies those rows.
     pub fn forget_hit_targets(&mut self) {
         self.hits.clear();
+        self.tool_hits.clear();
+        self.area = None;
+        self.selection = None;
     }
 
     /// Flip the tool-output affordance, the `tool_details` action.
-    pub const fn toggle_tool_output(&mut self) {
-        self.tool_output = match self.tool_output {
-            ToolDisplay::Collapsed => ToolDisplay::Expanded,
-            ToolDisplay::Expanded => ToolDisplay::Collapsed,
-        };
+    pub fn toggle_tool_output(&mut self) {
+        self.tool_output = self.tool_output.toggled();
+        self.tool_overrides.clear();
+        self.tool_revision = self.tool_revision.wrapping_add(1);
+    }
+
+    /// Flip one tool call without changing its neighbours.
+    pub fn toggle_tool(&mut self, call_id: &str) {
+        let next = self.tool_display(call_id).toggled();
+        self.tool_overrides.insert(call_id.to_owned(), next);
+        self.tool_revision = self.tool_revision.wrapping_add(1);
     }
 
     /// The current tool-output affordance.
     #[must_use]
     pub const fn tool_output(&self) -> ToolDisplay {
         self.tool_output
+    }
+
+    fn tool_display(&self, call_id: &str) -> ToolDisplay {
+        self.tool_overrides
+            .get(call_id)
+            .copied()
+            .unwrap_or(self.tool_output)
+    }
+
+    /// Skill names whose `skill` tool call completed successfully in this transcript.
+    #[must_use]
+    pub fn loaded_skills(&self) -> BTreeSet<String> {
+        self.transcript
+            .messages
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| {
+                let MessagePart::Tool {
+                    name,
+                    arguments,
+                    status: ToolStatus::Completed,
+                    ..
+                } = part
+                else {
+                    return None;
+                };
+                if name != "skill" {
+                    return None;
+                }
+                let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+                value
+                    .get("name")
+                    .or_else(|| value.get("skill"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// Begin a transcript selection at a screen coordinate.
+    ///
+    /// A press outside the last rendered transcript rectangle is rejected rather than
+    /// clamped. Only an already-started drag is clamped, which is what lets a pointer move
+    /// into the sidebar without letting a press in the sidebar create a transcript
+    /// selection.
+    pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.point_at(column, row, false) else {
+            return false;
+        };
+        self.selection = Some(TextSelection {
+            anchor: point,
+            head: point,
+        });
+        true
+    }
+
+    /// Extend the active selection, clamped to the transcript rectangle.
+    pub fn update_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.point_at(column, row, true) else {
+            return false;
+        };
+        let Some(selection) = &mut self.selection else {
+            return false;
+        };
+        selection.head = point;
+        true
+    }
+
+    /// Clear any transcript selection.
+    pub const fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Whether a transcript selection currently exists.
+    #[must_use]
+    pub const fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Text covered by the active transcript selection.
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let area = self.area?;
+        if area.width == 0 {
+            return None;
+        }
+        let rows = self.lines(area.width);
+        let (start, end) = selection.ordered();
+        if start.row >= rows.len() {
+            return None;
+        }
+        let mut selected = Vec::new();
+        let last = end.row.min(rows.len().saturating_sub(1));
+        for (row, line) in rows
+            .iter()
+            .enumerate()
+            .take(last.saturating_add(1))
+            .skip(start.row)
+        {
+            let Some((left, right)) = selection.columns(row, area.width) else {
+                continue;
+            };
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let slice = slice_columns(&text, left, right);
+            selected.push(slice.trim_end().to_owned());
+        }
+        let text = selected.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn point_at(&self, column: u16, row: u16, clamp: bool) -> Option<TextPoint> {
+        let area = self.area?;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if !clamp
+            && (column < area.left()
+                || column >= area.right()
+                || row < area.top()
+                || row >= area.bottom())
+        {
+            return None;
+        }
+        let column = column.clamp(area.left(), area.right().saturating_sub(1)) - area.left();
+        let visible_row = row.clamp(area.top(), area.bottom().saturating_sub(1)) - area.top();
+        Some(TextPoint {
+            row: self.offset.saturating_add(usize::from(visible_row)),
+            column,
+        })
     }
 
     /// Whether the viewport is pinned to the newest row.
@@ -1230,7 +1482,7 @@ impl TranscriptView {
         let mut lines = Vec::new();
         let mut previous: Option<Role> = None;
         for message in &self.transcript.messages {
-            lines.append(&mut self.message_rows(message, previous, width));
+            lines.append(&mut self.message_rows(message, previous, width).lines);
             previous = Some(message.role);
         }
         self.push_trailer(&mut lines, previous.is_some(), width);
@@ -1244,13 +1496,9 @@ impl TranscriptView {
     /// structurally rather than by inspection. Both callers reach the frame through
     /// exactly this function, so the only difference between them is whether the rows
     /// were computed now or recalled.
-    fn message_rows(
-        &self,
-        message: &Message,
-        previous: Option<Role>,
-        width: u16,
-    ) -> Vec<Line<'static>> {
+    fn message_rows(&self, message: &Message, previous: Option<Role>, width: u16) -> MessageRows {
         let mut lines = Vec::new();
+        let mut tools = Vec::new();
         let rule = self.rule_style(message.role);
         // A multi-step turn opens one assistant message per step, so a header per
         // message printed `Assistant` five times for what the user experienced as
@@ -1272,7 +1520,7 @@ impl TranscriptView {
         }
         if message.role == Role::User {
             self.push_boxed(message, rule, width, &mut lines);
-            return lines;
+            return MessageRows { lines, tools };
         }
         if previous != Some(message.role)
             && let Some(label) = self.role_label(message.role)
@@ -1280,9 +1528,12 @@ impl TranscriptView {
             lines.push(self.ruled(message.role, rule, label, self.context.title(), width));
         }
         for part in &message.parts {
+            if let MessagePart::Tool { call_id, .. } = part {
+                tools.push((lines.len(), call_id.clone()));
+            }
             self.part_lines(message.role, rule, part, width, &mut lines);
         }
-        lines
+        MessageRows { lines, tools }
     }
 
     /// The user's message as a closed box: a titled top rule, the body, a closing rule.
@@ -1433,8 +1684,9 @@ impl TranscriptView {
     ///   freed, so its address cannot be reused by a later theme, which is what would
     ///   otherwise make this an ABA hazard.
     /// * **the width**, since every row is laid out and padded to it.
-    /// * **the two display affordances**, `thinking` and `tool_output`, which decide how
-    ///   many rows a reasoning block and a tool result produce.
+    /// * **the display affordances**, `thinking`, `tool_output`, and `tool_revision`, which
+    ///   decide how many rows reasoning blocks and globally or individually expanded tool
+    ///   results produce.
     /// * **the preceding role**, which decides whether the message opens with a header or
     ///   with a same-speaker separator.
     /// * **a fingerprint of the message's content**, via [`fingerprint`]. Derived from the
@@ -1463,6 +1715,7 @@ impl TranscriptView {
         // many rows each message produced; a `render` that cleared it would be describing a
         // list it did not build.
         self.line_owners.clear();
+        self.line_tools.clear();
         let mut previous: Option<Role> = None;
         for index in 0..self.transcript.messages.len() {
             let message = &self.transcript.messages[index];
@@ -1470,20 +1723,35 @@ impl TranscriptView {
                 width,
                 thinking: self.thinking,
                 tool_output: self.tool_output,
+                tool_revision: self.tool_revision,
                 previous,
                 content: fingerprint(message),
             };
             previous = Some(message.role);
             if let Some(rows) = self.cache.get(index, &key, &theme) {
                 self.line_owners
-                    .extend(std::iter::repeat_n(Some(index), rows.len()));
-                lines.extend(rows.iter().cloned());
+                    .extend(std::iter::repeat_n(Some(index), rows.lines.len()));
+                let mut tools = vec![None; rows.lines.len()];
+                for (row, call_id) in &rows.tools {
+                    if let Some(slot) = tools.get_mut(*row) {
+                        *slot = Some(call_id.clone());
+                    }
+                }
+                self.line_tools.extend(tools);
+                lines.extend(rows.lines.iter().cloned());
                 continue;
             }
             let rows = self.message_rows(&self.transcript.messages[index], key.previous, width);
             self.line_owners
-                .extend(std::iter::repeat_n(Some(index), rows.len()));
-            lines.extend(rows.iter().cloned());
+                .extend(std::iter::repeat_n(Some(index), rows.lines.len()));
+            let mut tools = vec![None; rows.lines.len()];
+            for (row, call_id) in &rows.tools {
+                if let Some(slot) = tools.get_mut(*row) {
+                    *slot = Some(call_id.clone());
+                }
+            }
+            self.line_tools.extend(tools);
+            lines.extend(rows.lines.iter().cloned());
             if is_recallable(&self.transcript.messages[index]) {
                 self.cache.put(index, key, Arc::clone(&theme), rows);
             } else {
@@ -1497,6 +1765,7 @@ impl TranscriptView {
         // length rather than leaving the vector short is what keeps `render` from having to
         // know which rows are chrome.
         self.line_owners.resize(lines.len(), None);
+        self.line_tools.resize(lines.len(), None);
         lines
     }
 
@@ -1689,6 +1958,7 @@ impl TranscriptView {
                 }
             }
             MessagePart::Tool {
+                call_id,
                 name,
                 arguments,
                 title,
@@ -1707,11 +1977,11 @@ impl TranscriptView {
                 } else {
                     status.glyph()
                 };
-                // `" {glyph} {icon} {name}"` — one leading space, so the tool block sits one
-                // column inside the assistant's prose. That inset plus the two-column rule
-                // is §7.5's three-column tool indent, and it is what makes a tool call read
-                // as something the reply *did* rather than as another paragraph of it.
-                let head = format!(" {glyph} {icon} {name}");
+                let display = self.tool_display(call_id);
+                // The disclosure is part of the header rather than an overflow notice:
+                // clicking this exact row changes this exact call and leaves every sibling
+                // alone.
+                let head = format!(" {} {glyph} {icon} {name}", display.glyph());
                 // The tool's wire name plus the argument that matters, which is the whole of
                 // §7.5. `title` is no longer preferred over the arguments: a completed
                 // `read` reported `Read diff.rs`, which names the kind of work and drops the
@@ -1733,8 +2003,12 @@ impl TranscriptView {
                             .saturating_sub(1);
                         format!("{head} {}", summary.fit(room))
                     }
-                    (None, Some(title), _) => format!(" {glyph} {icon} {title}"),
-                    (None, None, ToolStatus::Pending) => format!(" {glyph} {icon} {placeholder}"),
+                    (None, Some(title), _) => {
+                        format!(" {} {glyph} {icon} {title}", display.glyph())
+                    }
+                    (None, None, ToolStatus::Pending) => {
+                        format!(" {} {glyph} {icon} {placeholder}", display.glyph())
+                    }
                     (None, None, _) => head,
                 };
                 push(
@@ -1752,10 +2026,37 @@ impl TranscriptView {
                 let frame = RowFrame { role, rule, width };
                 match (diff, output) {
                     (Some(patch), _) => {
-                        self.tool_result_lines(frame, name, patch, *status, out);
+                        self.tool_result_lines(frame, name, patch, *status, display, out);
                     }
                     (None, Some(output)) => {
-                        self.tool_result_lines(frame, name, output, *status, out);
+                        if name == crate::views::subagent::TASK_TOOL
+                            && let Some(envelope) = crate::views::subagent::task_envelope(output)
+                        {
+                            let mut detail = String::from(Self::RESULT_INSET);
+                            if let Some(session) = envelope.session_id.as_deref() {
+                                detail.push_str("session ");
+                                detail.push_str(session);
+                            } else {
+                                detail.push_str("no child session");
+                            }
+                            if let Some(state) = envelope.state.as_deref() {
+                                detail.push_str(" · ");
+                                detail.push_str(state);
+                            }
+                            push(&detail, self.context.accent(), out);
+                            if !envelope.result.is_empty() {
+                                self.tool_result_lines(
+                                    frame,
+                                    name,
+                                    &envelope.result,
+                                    *status,
+                                    display,
+                                    out,
+                                );
+                            }
+                        } else {
+                            self.tool_result_lines(frame, name, output, *status, display, out);
+                        }
                     }
                     (None, None) => {}
                 }
@@ -1834,12 +2135,13 @@ impl TranscriptView {
         name: &str,
         result: &str,
         status: ToolStatus,
+        display: ToolDisplay,
         out: &mut Vec<Line<'static>>,
     ) {
         let RowFrame { role, rule, width } = frame;
         let body_width = width.saturating_sub(frame.gutter(Self::RESULT_INSET));
         let marker = role.marker();
-        let budget = crate::views::tool::output_budget(name, self.tool_output);
+        let budget = crate::views::tool::output_budget(name, display);
         // Trimmed before the wrap, not after. A single-line minified bundle is one row to
         // the row cap and a megabyte to the wrap, so a cap applied afterwards would already
         // have paid for the work it exists to avoid.
@@ -1972,6 +2274,7 @@ struct RowKey {
     width: u16,
     thinking: ThinkingDisplay,
     tool_output: ToolDisplay,
+    tool_revision: u64,
     previous: Option<Role>,
     content: u64,
 }
@@ -1980,7 +2283,7 @@ struct RowKey {
 struct CachedRows {
     key: RowKey,
     theme: Arc<crate::theme::Resolved>,
-    rows: Vec<Line<'static>>,
+    rows: MessageRows,
 }
 
 /// The per-message row cache: one slot per message, bounded by total rows.
@@ -2011,7 +2314,7 @@ impl RowCache {
         index: usize,
         key: &RowKey,
         theme: &Arc<crate::theme::Resolved>,
-    ) -> Option<&[Line<'static>]> {
+    ) -> Option<&MessageRows> {
         let recalled = self.slots.get(index).is_some_and(|slot| {
             slot.as_ref()
                 .is_some_and(|entry| entry.key == *key && Arc::ptr_eq(&entry.theme, theme))
@@ -2025,7 +2328,7 @@ impl RowCache {
         if !recalled {
             return None;
         }
-        Some(self.slots[index].as_ref()?.rows.as_slice())
+        Some(&self.slots[index].as_ref()?.rows)
     }
 
     /// Store `rows` for `index`, evicting the oldest entries to stay inside the bound.
@@ -2034,12 +2337,12 @@ impl RowCache {
         index: usize,
         key: RowKey,
         theme: Arc<crate::theme::Resolved>,
-        rows: Vec<Line<'static>>,
+        rows: MessageRows,
     ) {
         // A message taller than the whole budget is never stored. Storing it would evict
         // every other entry to make room for one that cannot be reused often enough to
         // pay for that, and the eviction loop below could not reach the budget anyway.
-        if rows.len() > MAX_CACHED_ROWS {
+        if rows.lines.len() > MAX_CACHED_ROWS {
             self.forget(index);
             return;
         }
@@ -2047,7 +2350,7 @@ impl RowCache {
             self.slots.resize_with(index + 1, || None);
         }
         self.forget(index);
-        self.rows += rows.len();
+        self.rows += rows.lines.len();
         self.slots[index] = Some(CachedRows { key, theme, rows });
         // Oldest first, which is the top of the transcript. The viewport follows the
         // newest row, so the rows evicted are the ones least likely to be drawn next.
@@ -2065,7 +2368,7 @@ impl RowCache {
         if let Some(slot) = self.slots.get_mut(index)
             && let Some(entry) = slot.take()
         {
-            self.rows -= entry.rows.len();
+            self.rows -= entry.rows.lines.len();
         }
     }
 
@@ -2242,10 +2545,20 @@ impl RowFrame {
 impl Component for TranscriptView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         fill(frame.buffer_mut(), area, self.context.surface());
+        if self
+            .area
+            .is_some_and(|previous| previous.width != area.width)
+        {
+            // Content coordinates are row/column positions after wrapping. A width change
+            // changes both, so retaining the old points would highlight unrelated text.
+            self.selection = None;
+        }
+        self.area = Some(area);
         // Cleared before anything can return early, so a frame that draws nothing leaves no
         // target behind — the same discipline `SidebarView::render` keeps, and for the same
         // reason: stale geometry answers clicks aimed at whatever now occupies those rows.
         self.hits.clear();
+        self.tool_hits.clear();
         let lines = self.cached_lines(area.width);
         self.content_height = lines.len();
         self.viewport_height = usize::from(area.height);
@@ -2292,6 +2605,26 @@ impl Component for TranscriptView {
                     ))
                 })
                 .collect();
+            self.tool_hits = self
+                .line_tools
+                .iter()
+                .skip(self.offset)
+                .take(self.viewport_height)
+                .enumerate()
+                .filter_map(|(row, call_id)| {
+                    let call_id = call_id.as_ref()?.clone();
+                    let y = area.y.checked_add(u16::try_from(row).ok()?)?;
+                    Some((
+                        Rect {
+                            x: area.x,
+                            y,
+                            width: area.width,
+                            height: 1,
+                        },
+                        call_id,
+                    ))
+                })
+                .collect();
         }
         let visible = lines
             .into_iter()
@@ -2301,6 +2634,18 @@ impl Component for TranscriptView {
         Paragraph::new(visible)
             .style(self.context.surface())
             .render(area, frame.buffer_mut());
+        if let Some(selection) = self.selection {
+            let selected = self.context.selected();
+            for visible_row in 0..area.height {
+                let content_row = self.offset.saturating_add(usize::from(visible_row));
+                let Some((left, right)) = selection.columns(content_row, area.width) else {
+                    continue;
+                };
+                for column in left..right {
+                    frame.buffer_mut()[(area.x + column, area.y + visible_row)].set_style(selected);
+                }
+            }
+        }
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> EventResult {
@@ -2938,6 +3283,50 @@ impl ScrollbarView {
             offset: 0,
         }
     }
+
+    fn thumb(&self, height: usize) -> Option<(usize, usize, usize, usize)> {
+        if height == 0 || self.total <= self.viewport || self.total == 0 {
+            return None;
+        }
+        let span = (self.viewport * height / self.total).max(1).min(height);
+        let travel = height.saturating_sub(span);
+        let scrollable = self.total.saturating_sub(self.viewport).max(1);
+        let start = self.offset.min(scrollable) * travel / scrollable;
+        Some((start, span, travel, scrollable))
+    }
+
+    /// Where inside the thumb a drag started.
+    #[must_use]
+    pub fn drag_anchor(&self, row: u16, area: Rect) -> usize {
+        let local = usize::from(
+            row.saturating_sub(area.top())
+                .min(area.height.saturating_sub(1)),
+        );
+        let Some((start, span, _, _)) = self.thumb(usize::from(area.height)) else {
+            return 0;
+        };
+        if local >= start && local < start.saturating_add(span) {
+            local - start
+        } else {
+            span / 2
+        }
+    }
+
+    /// Map a pointer row to a content offset while preserving `anchor` inside the thumb.
+    #[must_use]
+    pub fn offset_at(&self, row: u16, area: Rect, anchor: usize) -> usize {
+        let local = usize::from(
+            row.saturating_sub(area.top())
+                .min(area.height.saturating_sub(1)),
+        );
+        let Some((_, _, travel, scrollable)) = self.thumb(usize::from(area.height)) else {
+            return 0;
+        };
+        if travel == 0 {
+            return 0;
+        }
+        local.saturating_sub(anchor).min(travel) * scrollable / travel
+    }
 }
 
 impl Component for ScrollbarView {
@@ -2956,13 +3345,9 @@ impl Component for ScrollbarView {
         for y in area.top()..area.bottom() {
             frame.buffer_mut()[(area.left(), y)].set_symbol(symbols::line::VERTICAL);
         }
-        if self.total <= self.viewport || self.total == 0 {
+        let Some((start, span, _, _)) = self.thumb(height) else {
             return;
-        }
-        let span = (self.viewport * height / self.total).max(1);
-        let travel = height.saturating_sub(span);
-        let scrollable = self.total.saturating_sub(self.viewport).max(1);
-        let start = self.offset.min(scrollable) * travel / scrollable;
+        };
         for row in 0..span {
             let Ok(dy) = u16::try_from(start + row) else {
                 break;
@@ -2979,6 +3364,34 @@ impl Component for ScrollbarView {
     fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
         EventResult::IGNORED
     }
+}
+
+/// The characters whose terminal cells overlap `[left, right)`.
+fn slice_columns(text: &str, left: u16, right: u16) -> String {
+    let left = usize::from(left);
+    let right = usize::from(right);
+    let mut column = 0usize;
+    let mut out = String::new();
+    let mut selected_previous = false;
+    for character in text.chars() {
+        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if width == 0 {
+            if selected_previous {
+                out.push(character);
+            }
+            continue;
+        }
+        let end = column.saturating_add(width);
+        selected_previous = column < right && end > left;
+        if selected_previous {
+            out.push(character);
+        }
+        column = end;
+        if column >= right {
+            break;
+        }
+    }
+    out
 }
 
 /// The summary line a collapsed reasoning block shows.

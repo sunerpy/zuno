@@ -338,10 +338,8 @@ fn app_every_mode_entering_the_terminal_enables_is_disabled_on_the_way_out() {
 
 #[test]
 fn app_mouse_reporting_asks_only_for_the_events_a_screen_consumes() {
-    // `EnableMouseCapture` requests `?1002` and `?1003`, which report drag and every
-    // pointer motion. Nothing in this binary reads either, and each arriving event costs
-    // two `spawn_blocking` hops and a slot in the bounded input channel — so requesting
-    // them makes pointer movement delay keystrokes. This pins the narrowed request.
+    // Drag reporting is required by transcript selection and the scrollbar. Free pointer
+    // motion still has no consumer and must remain disabled.
     let mut entered = Vec::new();
     enter_terminal(&mut entered, true).expect("a vector accepts every write");
     let entered = String::from_utf8(entered).expect("crossterm writes utf-8");
@@ -355,12 +353,14 @@ fn app_mouse_reporting_asks_only_for_the_events_a_screen_consumes() {
         "SGR encoding is off, so a click past column 223 reports the wrong cell: \
          {entered:?}"
     );
-    for (mode, what) in [("1002", "drag"), ("1003", "any pointer motion")] {
-        assert!(
-            !entered.contains(&format!("\u{1b}[?{mode}h")),
-            "mode ?{mode} ({what}) is requested and nothing consumes it: {entered:?}"
-        );
-    }
+    assert!(
+        entered.contains("\u{1b}[?1002h"),
+        "button drag reporting is off, so selection and thumb dragging cannot work: {entered:?}"
+    );
+    assert!(
+        !entered.contains("\u{1b}[?1003h"),
+        "free pointer motion is requested even though no surface consumes it: {entered:?}"
+    );
 
     // And nothing is requested when the user turned the mouse off.
     let mut without = Vec::new();
@@ -386,16 +386,9 @@ fn app_mouse_reporting_asks_only_for_the_events_a_screen_consumes() {
 }
 
 #[tokio::test]
-async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_and_a_press_still_arrive() {
-    // The functional risk in narrowing the mouse pipeline: drop too much and the wheel
-    // stops scrolling, or the ambient panel's disclosure triangles stop answering. Driven
-    // through the real producer, so what is asserted is what the event loop would actually
-    // receive.
-    //
-    // `Moved` and `Drag` are what must not survive. A press must, and `Drag(Left)` sitting
-    // immediately before it in the input is deliberate: the two differ only in their
-    // variant, so a filter widened to "any left-button event" would let the drag through
-    // and be caught here rather than reintroducing the motion cost `?1002` was removed for.
+async fn app_free_motion_is_dropped_while_drag_release_wheel_and_press_arrive() {
+    // The functional risk in narrowing the mouse pipeline: drop too much and selection,
+    // thumb dragging, the wheel, or sidebar clicks stop working. Only free movement is noise.
     let mouse = |kind| {
         CrosstermEvent::Mouse(crossterm::event::MouseEvent {
             kind,
@@ -406,8 +399,9 @@ async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_and_a_press_still
     };
     let input = RecordingInput::new([
         mouse(MouseEventKind::Moved),
-        mouse(MouseEventKind::Drag(MouseButton::Left)),
         mouse(MouseEventKind::Down(MouseButton::Left)),
+        mouse(MouseEventKind::Drag(MouseButton::Left)),
+        mouse(MouseEventKind::Up(MouseButton::Left)),
         mouse(MouseEventKind::ScrollDown),
         mouse(MouseEventKind::Moved),
         mouse(MouseEventKind::ScrollUp),
@@ -421,7 +415,7 @@ async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_and_a_press_still
     ));
 
     let mut delivered = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..5 {
         let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
             .await
             .expect("the consumable events arrive well inside the timeout")
@@ -442,16 +436,17 @@ async fn app_motion_is_dropped_at_the_boundary_while_the_wheel_and_a_press_still
         kinds,
         vec![
             MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
             MouseEventKind::ScrollDown,
             MouseEventKind::ScrollUp
         ],
-        "the producer forwarded something other than the press and the two wheel notches, \
-         so either motion reached the queue or a consumed event stopped arriving: \
+        "the producer forwarded free motion or dropped a consumed gesture event: \
          {delivered:?}"
     );
     assert_eq!(
         input.reads.load(Ordering::SeqCst),
-        6,
+        7,
         "the filter is meant to drop after the read, not to skip reading; a changed count \
          means this test is no longer exercising the path it describes"
     );
@@ -498,6 +493,8 @@ fn app_the_input_filter_forwards_exactly_what_a_screen_consumes() {
             "ScrollRight" => MouseEventKind::ScrollRight,
             "Moved" => MouseEventKind::Moved,
             "Down" => MouseEventKind::Down(MouseButton::Left),
+            "Drag" => MouseEventKind::Drag(MouseButton::Left),
+            "Up" => MouseEventKind::Up(MouseButton::Left),
             other => panic!(
                 "`{other}` is consumed by the screen and this test cannot construct it, so \
                  the filter's agreement with the screen is unproven"
@@ -512,13 +509,11 @@ fn app_the_input_filter_forwards_exactly_what_a_screen_consumes() {
     // The complement: a kind the screen ignores must not reach the queue.
     for kind in [
         MouseEventKind::Moved,
-        MouseEventKind::Drag(MouseButton::Left),
         MouseEventKind::Down(MouseButton::Left),
         // A right press: the screen hit-tests the left button only, so a filter widened to
         // "any button" would be caught here rather than by a user wondering why a
         // context-menu attempt collapsed a panel section.
         MouseEventKind::Down(MouseButton::Right),
-        MouseEventKind::Up(MouseButton::Left),
     ] {
         if consumable_name(kind).is_some_and(|name| consumed.contains(name)) {
             continue;
@@ -540,6 +535,8 @@ const fn consumable_name(kind: MouseEventKind) -> Option<&'static str> {
         MouseEventKind::ScrollRight => Some("ScrollRight"),
         MouseEventKind::Moved => Some("Moved"),
         MouseEventKind::Down(MouseButton::Left) => Some("Down"),
+        MouseEventKind::Drag(MouseButton::Left) => Some("Drag"),
+        MouseEventKind::Up(MouseButton::Left) => Some("Up"),
         _ => None,
     }
 }

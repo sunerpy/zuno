@@ -34,10 +34,12 @@ fn ambient() -> Ambient {
             SkillSummary {
                 name: String::from("commit-msg"),
                 description: String::from("conventional commits"),
+                loaded: false,
             },
             SkillSummary {
                 name: String::from("codegraph"),
                 description: String::from("code navigation"),
+                loaded: false,
             },
         ],
         version: Some(String::from("0.1.0")),

@@ -2278,6 +2278,7 @@ fn furnished_screen() -> SessionScreen {
     ambient.skills = vec![crate::views::ambient::SkillSummary {
         name: String::from("codegraph"),
         description: String::from("navigate an indexed codebase"),
+        loaded: false,
     }];
     screen
         .transcript_mut()
@@ -3088,6 +3089,7 @@ fn session_skill_picker_lists_discovered_skills_on_one_row_each() {
     screen.sidebar_mut().ambient_mut().skills = vec![crate::views::ambient::SkillSummary {
         name: String::from("codegraph"),
         description: String::from("navigate\n  a  codebase"),
+        loaded: false,
     }];
     screen.handle_action(action("prompt_skills"), &press_none());
     let mut opened = screen.drain_dialogs();
@@ -3767,21 +3769,254 @@ fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usiz
     rendered.len() - first - tail - usize::from(STATUS_ROWS) - usize::from(info_rows(height))
 }
 
-/// One left press at `(column, row)`, delivered the way the event loop delivers one.
+/// One complete left click at `(column, row)`, delivered the way the event loop does.
 ///
 /// Through `handle_event` rather than `handle_mouse`, because the defect was not a missing
 /// hit test — it was that nothing on this screen consumed a press at all. A test that called
 /// the hit test directly would pass against a screen whose `handle_event` still discards
 /// every mouse event, which is precisely the shipped state being fixed.
 fn click_at(screen: &mut SessionScreen, column: u16, row: u16) -> EventResult {
+    pointer_at(
+        screen,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column,
+        row,
+    )
+    .merge(pointer_at(
+        screen,
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column,
+        row,
+    ))
+}
+
+/// Deliver one pointer event through the same terminal-event path as the live app.
+fn pointer_at(
+    screen: &mut SessionScreen,
+    kind: crossterm::event::MouseEventKind,
+    column: u16,
+    row: u16,
+) -> EventResult {
     screen.handle_event(&crate::app::AppEvent::Terminal(TerminalEvent::Input(
         crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            kind,
             column,
             row,
             modifiers: crossterm::event::KeyModifiers::NONE,
         }),
     )))
+}
+
+#[test]
+fn session_a_click_on_one_tool_header_expands_only_that_call() {
+    let (mut screen, _shutdown) = mouse_screen();
+    let provider = |event| TurnEvent::Provider { step: 1, event };
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("run both checks"));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::AssistantMessageCreated {
+        step: 1,
+        message_id: String::from("assistant"),
+    }));
+    for (call_id, command, prefix) in [
+        ("call_first", "first-command", "first-output"),
+        ("call_second", "second-command", "second-output"),
+    ] {
+        for event in [
+            provider(StreamEvent::ToolUseStart {
+                id: call_id.to_owned(),
+                name: String::from("bash"),
+            }),
+            provider(StreamEvent::ToolInputDelta(format!(
+                r#"{{"command":"{command}"}}"#
+            ))),
+            provider(StreamEvent::ToolUseEnd),
+            TurnEvent::ToolDispatchCompleted {
+                step: 1,
+                call_id: call_id.to_owned(),
+                name: String::from("bash"),
+                title: command.to_owned(),
+                output: (1..=6)
+                    .map(|line| format!("{prefix}-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                diff: None,
+                written_paths: Vec::new(),
+                is_error: false,
+            },
+        ] {
+            screen.handle_event(&AppEvent::Engine(event));
+        }
+    }
+
+    let before = rows(&render_offscreen(&mut screen, 100, 32).expect("infallible"));
+    assert!(
+        !before.join("\n").contains("first-output-6")
+            && !before.join("\n").contains("second-output-6"),
+        "the fixture did not start with both calls collapsed:\n{}",
+        before.join("\n")
+    );
+    let first_row = u16::try_from(
+        before
+            .iter()
+            .position(|row| row.contains("first-command"))
+            .expect("the first tool header is drawn"),
+    )
+    .expect("in frame");
+
+    assert!(click_at(&mut screen, 4, first_row).redraw);
+    let after = rows(&render_offscreen(&mut screen, 100, 32).expect("infallible"));
+    let joined = after.join("\n");
+    assert!(
+        joined.contains("first-output-6"),
+        "clicking the first header did not reveal its withheld output:\n{joined}"
+    );
+    assert!(
+        !joined.contains("second-output-6"),
+        "clicking the first header expanded its sibling too:\n{joined}"
+    );
+    let first_header = after
+        .iter()
+        .find(|row| row.contains("first-command"))
+        .expect("the first header remains");
+    let second_header = after
+        .iter()
+        .find(|row| row.contains("second-command"))
+        .expect("the second header remains");
+    assert!(
+        first_header.contains('▾') && second_header.contains('▸'),
+        "the disclosure glyphs do not describe the two independent states:\n{joined}"
+    );
+}
+
+#[test]
+fn session_a_transcript_drag_stops_before_the_sidebar_and_copies_only_transcript_text() {
+    let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
+    let (screen, _shutdown) = mouse_conversing();
+    let mut screen = screen.with_clipboard(clipboard.clone());
+    let initial = rows(&render_offscreen(&mut screen, 120, 32).expect("infallible"));
+    let row = u16::try_from(
+        initial
+            .iter()
+            .position(|row| row.contains("Here is the summary"))
+            .expect("the assistant row is drawn"),
+    )
+    .expect("in frame");
+
+    pointer_at(
+        &mut screen,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        row,
+    );
+    pointer_at(
+        &mut screen,
+        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        119,
+        row,
+    );
+    pointer_at(
+        &mut screen,
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        119,
+        row,
+    );
+
+    assert!(
+        screen.transcript.has_selection(),
+        "the transcript never acquired the drag selection"
+    );
+    let selected = render_offscreen(&mut screen, 120, 32).expect("infallible");
+    let selected_bg = screen
+        .context
+        .selected()
+        .bg
+        .expect("the selected style has a background");
+    assert_eq!(
+        selected[(10, row)].bg,
+        selected_bg,
+        "the transcript side of the drag is not highlighted"
+    );
+    let sidebar_column = 120 - crate::views::ambient::SIDEBAR_WIDTH + 2;
+    assert_ne!(
+        selected[(sidebar_column, row)].bg,
+        selected_bg,
+        "the highlight crossed into the sidebar"
+    );
+
+    copy_action(&mut screen);
+    let copied = clipboard
+        .read()
+        .expect("a memory clipboard cannot fail")
+        .expect("the selection was copied")
+        .data;
+    assert!(
+        copied.contains("Here is the summary of the plan."),
+        "the copied selection lost the transcript text: {copied:?}"
+    );
+    for sidebar_text in ["Context", "MCP", "Skills"] {
+        assert!(
+            !copied.contains(sidebar_text),
+            "the copied selection crossed into the sidebar and captured {sidebar_text:?}: \
+             {copied:?}"
+        );
+    }
+}
+
+#[test]
+fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skills() {
+    let (mut screen, _shutdown) = screen();
+    screen.sidebar_mut().ambient_mut().skills = vec![crate::views::ambient::SkillSummary {
+        name: String::from("codegraph"),
+        description: String::from("navigate the indexed repository"),
+        loaded: false,
+    }];
+    screen.sidebar_mut().toggle_skills();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("analyse this repository"));
+
+    let before = rows(&render_offscreen(&mut screen, 120, 32).expect("infallible")).join("\n");
+    assert!(
+        before.contains("0/1 loaded") && before.contains("· codegraph"),
+        "a discovered-but-unused skill was presented as loaded:\n{before}"
+    );
+
+    let provider = |event| TurnEvent::Provider { step: 1, event };
+    for event in [
+        TurnEvent::AssistantMessageCreated {
+            step: 1,
+            message_id: String::from("assistant"),
+        },
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("skill_1"),
+            name: String::from("skill"),
+        }),
+        provider(StreamEvent::ToolInputDelta(String::from(
+            r#"{"name":"codegraph"}"#,
+        ))),
+        provider(StreamEvent::ToolUseEnd),
+        TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("skill_1"),
+            name: String::from("skill"),
+            title: String::from("Loaded codegraph"),
+            output: String::from("complete skill body"),
+            diff: None,
+            written_paths: Vec::new(),
+            is_error: false,
+        },
+    ] {
+        screen.handle_event(&AppEvent::Engine(event));
+    }
+
+    let after = rows(&render_offscreen(&mut screen, 120, 32).expect("infallible")).join("\n");
+    assert!(
+        after.contains("1/1 loaded") && after.contains("✓ codegraph"),
+        "a successfully completed skill call did not update the sidebar:\n{after}"
+    );
 }
 
 #[test]
@@ -3835,12 +4070,12 @@ fn session_a_click_on_a_sidebar_section_heading_collapses_it_through_the_event_l
         "the section reports itself collapsed but still draws its rows:\n{after}"
     );
 
-    // A press on the transcript side of the same row is not the panel's, and claiming it
-    // would silently forbid a future consumer there.
+    // A click on the transcript side is now claimed by pane-bounded selection, but it must
+    // not reach the panel.
     let elsewhere = click_at(&mut screen, 2, heading);
     assert!(
-        !elsewhere.handled,
-        "a press over the transcript was claimed by the screen"
+        elsewhere.handled,
+        "the transcript did not claim the click for pane-bounded selection"
     );
     assert!(
         !screen.sidebar.expanded().lsp,
@@ -3877,8 +4112,8 @@ fn session_a_click_where_the_sidebar_used_to_be_does_nothing_once_it_is_hidden()
 
     let outcome = click_at(&mut screen, inside, heading);
     assert!(
-        !outcome.handled,
-        "the hidden panel still claimed a press at its old coordinates"
+        outcome.handled,
+        "the widened transcript did not claim the old panel coordinate"
     );
     assert_eq!(
         before,
@@ -4130,6 +4365,66 @@ fn session_a_fresh_render_rests_on_the_newest_row_not_the_oldest() {
     assert!(
         !painted.contains("line 0\n") && !painted.contains("line 0 "),
         "the oldest message is still on screen, so nothing scrolled:\n{painted}"
+    );
+}
+
+#[test]
+fn session_dragging_the_visible_scrollbar_moves_the_transcript_to_the_bottom() {
+    let (mut screen, _shutdown) = scrollable(scroll_config(None, None));
+    let before = render_offscreen(&mut screen, 120, 24).expect("infallible");
+    let area = screen
+        .scrollbar_area
+        .expect("an overflowing used session mounts its scrollbar");
+    assert!(
+        matches!(
+            before[(area.x, area.y)].symbol(),
+            ratatui::symbols::block::FULL | ratatui::symbols::line::VERTICAL
+        ),
+        "the mounted scrollbar column was blank"
+    );
+    let max = screen
+        .transcript
+        .content_height()
+        .saturating_sub(screen.transcript.viewport_height());
+    assert!(max > 0, "the fixture does not overflow");
+    assert_eq!(
+        screen.transcript.offset(),
+        0,
+        "the fixture is not at the top"
+    );
+
+    pointer_at(
+        &mut screen,
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        area.x,
+        area.y,
+    );
+    pointer_at(
+        &mut screen,
+        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        area.x,
+        area.bottom().saturating_sub(1),
+    );
+    pointer_at(
+        &mut screen,
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        area.x,
+        area.bottom().saturating_sub(1),
+    );
+
+    assert_eq!(
+        screen.transcript.offset(),
+        max,
+        "dragging the thumb to the bottom did not reach the final viewport"
+    );
+    assert!(
+        !screen.transcript.has_selection(),
+        "a scrollbar drag also created a transcript selection"
+    );
+    let after = rows(&render_offscreen(&mut screen, 120, 24).expect("infallible")).join("\n");
+    assert!(
+        after.contains("line 79"),
+        "the scrollbar reached the final offset but the newest message is not visible:\n{after}"
     );
 }
 
@@ -4508,7 +4803,7 @@ fn composer_span(screen: &SessionScreen, width: u16, height: u16) -> (usize, usi
     // every assertion below the wrong columns and read the margin instead of the band.
     let empty = !screen.transcript.transcript().conversation_started();
     let sidebar = sidebar_drawn(screen.sidebar_visible(), empty, width);
-    let region = composer_region(composer_bounds(Rect::new(0, 0, width, height), sidebar));
+    let region = composer_region(content_bounds(Rect::new(0, 0, width, height), sidebar));
     (usize::from(region.x), usize::from(region.width))
 }
 
@@ -4835,7 +5130,9 @@ fn a_notice_never_reaches_the_sidebar_column_with_or_without_the_panel() {
             .unwrap_or(0)
     };
     assert!(
-        rendered.iter().all(|row| !row.contains('│')),
+        rendered
+            .iter()
+            .all(|row| !row.contains("no usage reported yet")),
         "the panel is still drawn after the toggle, so this proves nothing"
     );
     assert!(
@@ -5811,7 +6108,7 @@ fn the_input_band_grows_on_both_input_paths_and_stays_centred() {
         // Every fixture here has an empty transcript, so the panel is not drawn and the composer
         // is centred on the whole frame. Taken from the production narrowing rather than
         // re-derived.
-        let probe = composer_region(composer_bounds(Rect::new(0, 0, width, height), false)).x;
+        let probe = composer_region(content_bounds(Rect::new(0, 0, width, height), false)).x;
         // The chord path. `shift+return` cannot be delivered through a real terminal — the
         // legacy encoding gives it the same bytes as `return` — so `ctrl+j` is the spelling
         // driven here, and it is the same binding.
@@ -6247,14 +6544,17 @@ fn the_composer_stays_inside_the_body_and_gains_an_info_row() {
                  {body}, so the input box crosses into the sidebar's region",
                 x + columns
             );
-            // The strip is the composer's footer and is narrowed by the same call, so it has to
-            // stop at the same place. A footer that crossed the panel would put the agent and
-            // the model under it while the box above stopped short — two axes again.
+            // The gap between the left column and the full-height sidebar stays blank. The
+            // sidebar itself legitimately has content on this row now.
             let strip = strip_index(&rendered, &screen, width, 32);
-            let footer: String = rendered[strip].chars().skip(body).collect();
+            let footer: String = rendered[strip]
+                .chars()
+                .skip(body)
+                .take(usize::from(SIDEBAR_GAP_COLS))
+                .collect();
             assert!(
                 footer.trim().is_empty(),
-                "at {width} columns the status strip reaches into the sidebar's columns: \
+                "at {width} columns the status strip reaches across the sidebar gap: \
                  {footer:?}"
             );
         } else {
@@ -6317,14 +6617,15 @@ fn the_users_prompt_is_framed_and_the_reply_is_not() {
         // Sliced to the body's own columns, because at 120 the panel is drawn *on the same
         // rows*: a whole frame row carries `▌ You ───▐ │   Context`, so an `ends_with` against
         // the frame would be asserting about the sidebar rather than about the box. This is the
-        // same subtraction `composer_bounds` performs, taken from the production predicate.
-        let body = if sidebar_drawn(screen.sidebar_visible(), false, width) {
+        // same subtraction `content_bounds` performs, taken from the production predicate.
+        let content = if sidebar_drawn(screen.sidebar_visible(), false, width) {
             usize::from(width)
                 - usize::from(crate::views::ambient::SIDEBAR_WIDTH)
                 - usize::from(SIDEBAR_GAP_COLS)
         } else {
             usize::from(width)
         };
+        let body = content.saturating_sub(usize::from(screen.scrollbar_visible));
         let rendered: Vec<String> = rendered
             .iter()
             .map(|row| row.chars().take(body).collect())

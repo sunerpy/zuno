@@ -383,6 +383,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             "memory.global",
             "memory.project",
             "instructions.0",
+            "skills.policy",
             "skills.catalog",
         ]
     );
@@ -398,7 +399,8 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
         assembly.sections()[3].source(),
         repo.join("AGENTS.md").display().to_string()
     );
-    assert_eq!(assembly.sections()[4].source(), "discovered skills");
+    assert_eq!(assembly.sections()[4].source(), "zuno skill trigger policy");
+    assert_eq!(assembly.sections()[5].source(), "discovered skills");
     assert_eq!(resolver.system_prompt, assembly.render());
     assert!(notes.is_empty(), "{notes:?}");
 }
@@ -3452,6 +3454,24 @@ mod skill_prompt {
             resolver.system_prompt.contains("/skills/deploy/SKILL.md"),
             "the location is what leaves `read` as a fallback"
         );
+        let policy = resolver
+            .system_prompt
+            .find(SKILL_USAGE_POLICY)
+            .expect("skill trigger policy");
+        let catalog = resolver
+            .system_prompt
+            .find("<name>deploy</name>")
+            .expect("skill catalogue");
+        assert!(
+            policy < catalog,
+            "the model saw the catalogue before the rules that make it actionable"
+        );
+        assert!(
+            resolver
+                .system_prompt
+                .contains("call the `skill` tool first"),
+            "the prompt does not require loading a matching skill before task actions"
+        );
         assert!(notes.is_empty(), "nothing was trimmed: {notes:?}");
     }
 
@@ -3488,7 +3508,8 @@ mod skill_prompt {
         announce_skills(&mut resolver, &skills, &mut notes).expect("announce bounded skills");
 
         assert!(
-            resolver.system_prompt.len() < "AGENT PROMPT".len() + SKILL_PROMPT_BUDGET + 1,
+            resolver.system_prompt.len()
+                < "AGENT PROMPT".len() + SKILL_PROMPT_BUDGET + SKILL_USAGE_POLICY.len() + 8,
             "the prompt exceeded the budget: {} bytes",
             resolver.system_prompt.len()
         );
