@@ -202,6 +202,74 @@ fn providers_headless_login_reads_the_key_from_stdin() {
 }
 
 #[test]
+fn auth_methods_expose_openai_oauth_without_leaking_it_to_custom_providers() {
+    let root = tempfile::tempdir().expect("tempdir");
+
+    let mut openai = zuno();
+    openai
+        .args(["auth", "methods", "openai"])
+        .current_dir(root.path());
+    isolated(&mut openai, root.path());
+    configure_models(&mut openai);
+    let output = openai.output().expect("list OpenAI methods");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for method in ["chatgpt-browser", "chatgpt-device", "api-key"] {
+        assert!(stdout.contains(method), "{stdout}");
+    }
+
+    let mut custom = zuno();
+    custom
+        .args(["auth", "methods", "myopenai"])
+        .current_dir(root.path());
+    isolated(&mut custom, root.path());
+    configure_models(&mut custom);
+    let output = custom.output().expect("list custom methods");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("api-key"), "{stdout}");
+    assert!(!stdout.contains("chatgpt-"), "{stdout}");
+}
+
+#[test]
+fn auth_login_accepts_a_positional_provider_and_explicit_api_key_method() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut command = zuno();
+    command
+        .args(["auth", "login", "AnyAPI", "--method", "api-key"])
+        .current_dir(root.path())
+        .stdin(Stdio::piped());
+    isolated(&mut command, root.path());
+    configure_models(&mut command);
+    let mut child = command.spawn().expect("spawn positional provider login");
+    child
+        .stdin
+        .take()
+        .expect("login stdin")
+        .write_all(b"positional-secret\n")
+        .expect("write API key");
+    let output = child.wait_with_output().expect("wait for login");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let auth: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("data/zuno/auth.json")).expect("read auth"),
+    )
+    .expect("auth JSON");
+    assert_eq!(auth["anyapi"]["key"], "positional-secret");
+}
+
+#[test]
 fn mcp_add_list_auth_and_logout_persist_headless_state() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut add = zuno();

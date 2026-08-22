@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
-use zuno_auth::Credential;
+use zuno_auth::{AuthStore, Credential, LoginMethodRegistry};
 use zuno_config::schema::provider::ProviderTransport;
 use zuno_engine::compaction::{CompactionState, TokenWindow};
 use zuno_engine::dispatch::ToolRegistryDispatcher;
@@ -142,6 +142,7 @@ pub(crate) struct TurnPlan {
     extension_generation: u64,
     provider_id: String,
     model_id: String,
+    auth_store: AuthStore,
     credential: Option<Credential>,
     resolver: Resolver,
     session: SessionChoice,
@@ -245,17 +246,17 @@ impl TurnPlan {
         .map_err(to_string)?;
         let extension_generation = environment.extensions().composition_generation();
         let goal_retry_policy = resolve_goal_retry_policy(&config)?;
-        let credentials = zuno_auth::AuthStore::resolve(&layout, env)
-            .all()
-            .map_err(to_string)?
-            .entries;
+        let auth_store = AuthStore::resolve(&layout, env);
+        let credentials = auth_store.all().map_err(to_string)?.entries;
         let loaded = CatalogSource::resolve(env, &layout)
             .load()
             .await
             .map_err(to_string)?;
+        let login_methods = LoginMethodRegistry::native();
         let input = ResolveInput::new()
             .with_config(&config)
             .with_credentials(credentials.clone())
+            .with_login_methods(&login_methods)
             .with_env(
                 env.iter()
                     .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -400,9 +401,11 @@ impl TurnPlan {
             agent,
             extensions,
             extension_generation,
+            auth_store,
             credential: resolved_credential(
                 catalog.provider(&provider_id),
                 credentials.get(&provider_id),
+                env,
             ),
             provider_id,
             model_id,
@@ -958,7 +961,11 @@ impl TurnHost {
             .as_ref()
             .map(|_| plan.project.directory.clone());
         let presented = plan.credential.as_ref().map(credential_value);
-        let providers = provider_registry(&plan.provider_id, plan.credential.clone());
+        let providers = provider_registry(
+            &plan.provider_id,
+            plan.credential.clone(),
+            Some(plan.auth_store.clone()),
+        );
 
         let mut connection = database.open_connection().map_err(to_string)?;
         zuno_db::migration::apply(&mut connection).map_err(to_string)?;
@@ -2344,7 +2351,11 @@ fn provider_factory_key(transport: Option<ProviderTransport>) -> Option<&'static
     }
 }
 
-fn provider_registry(provider_id: &str, credential: Option<Credential>) -> ProviderRegistry {
+fn provider_registry(
+    provider_id: &str,
+    credential: Option<Credential>,
+    auth_store: Option<AuthStore>,
+) -> ProviderRegistry {
     let mut providers = ProviderRegistry::new();
 
     let transport: Arc<dyn Transport> = Arc::new(ReqwestTransport::new(provider_id));
@@ -2363,7 +2374,7 @@ fn provider_registry(provider_id: &str, credential: Option<Credential>) -> Provi
     let openai_credential = credential.clone();
     providers.register_fallible(
         "openai",
-        zuno_provider_openai::factory(move |_| openai_credential.clone()),
+        zuno_provider_openai::factory(move |_| openai_credential.clone(), auth_store),
     );
 
     providers.register_fallible("amazon-bedrock", |spec| {
@@ -2491,6 +2502,7 @@ fn provider_api_key(provider: Option<&zuno_llm::catalog::ResolvedProvider>) -> O
 fn resolved_credential(
     provider: Option<&zuno_llm::catalog::ResolvedProvider>,
     stored: Option<&Credential>,
+    env: &zuno_paths::Env,
 ) -> Option<Credential> {
     provider_api_key(provider)
         .map(|key| Credential::Api {
@@ -2498,6 +2510,16 @@ fn resolved_credential(
             metadata: None,
         })
         .or_else(|| stored.cloned())
+        .or_else(|| {
+            provider.and_then(|provider| {
+                provider.env.iter().find_map(|name| {
+                    env.truthy_value(name).map(|key| Credential::Api {
+                        key: zuno_auth::Secret::new(key),
+                        metadata: None,
+                    })
+                })
+            })
+        })
 }
 
 /// Every `provider/model` a picker may offer.

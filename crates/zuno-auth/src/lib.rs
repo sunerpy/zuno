@@ -8,11 +8,12 @@
 //! - [`McpAuthStore`] over `mcp-auth.json` — per-MCP-server OAuth tokens, dynamic
 //!   client registration, the PKCE verifier, the CSRF state, and the server URL.
 //!
-//! # Scope
+//! Provider credentials are split into three responsibilities:
 //!
-//! Storage. Nothing here performs an OAuth flow, refreshes a token, decides which
-//! provider a model belongs to, or asks whether a credential has expired. Those
-//! are separate concerns and are deliberately absent.
+//! - [`AuthStore`] owns durable storage and redaction.
+//! - [`LoginMethodRegistry`] declares how a provider can obtain a credential.
+//! - [`OpenAiOauthClient`] implements OpenAI ChatGPT browser/device authorization
+//!   and refresh without making custom OpenAI-compatible providers inherit it.
 //!
 //! # Two properties this crate exists to guarantee
 //!
@@ -79,12 +80,23 @@
 
 pub mod error;
 pub mod mcp;
+pub mod method;
+pub mod openai;
 pub mod provider;
 pub mod secret;
 pub mod store;
 
 pub use crate::error::AuthError;
 pub use crate::mcp::{ClientInfo, Entry, McpAuthStore, McpCredentials, Tokens};
+pub use crate::method::{
+    API_KEY_METHOD, CHATGPT_BROWSER_METHOD, CHATGPT_DEVICE_METHOD, LoginMethod, LoginMethodError,
+    LoginMethodKind, LoginMethodRegistry,
+};
+pub use crate::openai::{
+    BrowserAuthorization, CHATGPT_CODEX_BASE_URL, DeviceAuthorization, OPENAI_OAUTH_CLIENT_ID,
+    OPENAI_OAUTH_ISSUER, OpenAiOauthClient, OpenAiOauthError, OpenAiOauthOperation,
+    residency_from_jwt,
+};
 pub use crate::provider::{AuthStore, Credential, Credentials, OAUTH_DUMMY_KEY, ZUNO_AUTH_CONTENT};
 pub use crate::secret::{REDACTED, Secret};
 pub use crate::store::{CREDENTIAL_FILE_MODE, PermissionWarning};

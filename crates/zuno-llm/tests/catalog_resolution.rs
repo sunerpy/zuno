@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use zuno_auth::{Credential, Secret};
+use zuno_auth::{Credential, LoginMethodRegistry, Secret};
 use zuno_config::schema::Config;
 use zuno_llm::catalog::models_dev::CatalogDocument;
 use zuno_llm::catalog::{Catalog, ResolveInput};
@@ -191,6 +191,47 @@ fn a_stored_oauth_credential_alone_is_not_availability() {
         catalog.model_lines().is_empty(),
         "an oauth credential needs its provider's own flow; the generic path \
          must not guess on its behalf"
+    );
+}
+
+#[test]
+fn a_native_oauth_registration_enables_only_its_exact_provider_id() {
+    let mut openai_document = document();
+    let provider = openai_document
+        .remove("deepseek")
+        .expect("fixture provider");
+    openai_document.insert("openai".to_owned(), provider.clone());
+    openai_document.insert("myopenai".to_owned(), provider);
+
+    let oauth = Credential::Oauth {
+        refresh: Secret::new("r"),
+        access: Secret::new("a"),
+        expires: u64::MAX,
+        account_id: Some("acct-test".to_owned()),
+        enterprise_url: None,
+    };
+    let mut credentials = BTreeMap::new();
+    credentials.insert("openai".to_owned(), oauth.clone());
+    credentials.insert("myopenai".to_owned(), oauth);
+    let methods = LoginMethodRegistry::native();
+    let input = ResolveInput::new()
+        .with_credentials(credentials)
+        .with_login_methods(&methods);
+    let catalog = Catalog::resolve(&openai_document, &input);
+
+    assert!(
+        catalog
+            .model_lines()
+            .iter()
+            .any(|model| model.starts_with("openai/")),
+        "the registered native OAuth provider must be selectable"
+    );
+    assert!(
+        catalog
+            .model_lines()
+            .iter()
+            .all(|model| !model.starts_with("myopenai/")),
+        "a custom id must not inherit OpenAI's ChatGPT OAuth"
     );
 }
 

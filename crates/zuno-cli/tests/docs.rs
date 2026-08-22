@@ -99,6 +99,19 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "only when a real handler exists",
         ],
     );
+    contains_all(
+        "docs/design/provider-authentication.md",
+        &[
+            "AuthStore",
+            "LoginMethodRegistry",
+            "chatgpt-browser",
+            "chatgpt-device",
+            "ChatGPT-Account-Id",
+            "ZUNO_AUTH_CONTENT",
+            "transport",
+            "myopenai",
+        ],
+    );
 }
 
 #[test]
@@ -188,6 +201,16 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             r#""transport": "openai""#,
             r#""model": "myopenai/primary-model""#,
             r#""small_model": "myopenai/fast-model""#,
+        ],
+    );
+    contains_all(
+        "docs/reference/providers.md",
+        &[
+            "zuno auth methods openai",
+            "zuno auth login openai --method chatgpt-device",
+            "zuno auth login openai --method api-key",
+            "first non-empty variable",
+            "not copied into `auth.json`",
         ],
     );
 }

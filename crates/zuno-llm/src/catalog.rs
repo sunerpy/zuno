@@ -69,7 +69,7 @@ pub mod source;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use zuno_auth::Credential;
+use zuno_auth::{Credential, LoginMethodRegistry};
 use zuno_config::schema::Config;
 use zuno_config::schema::provider::ProviderConfig;
 
@@ -90,6 +90,7 @@ pub use crate::catalog::source::{CatalogProvenance, CatalogSource, LoadedCatalog
 pub struct ResolveInput<'a> {
     config: Option<&'a Config>,
     credentials: BTreeMap<String, Credential>,
+    login_methods: Option<&'a LoginMethodRegistry>,
     env: BTreeMap<String, String>,
     experimental_models: bool,
 }
@@ -116,6 +117,14 @@ impl<'a> ResolveInput<'a> {
     #[must_use]
     pub fn with_credentials(mut self, credentials: BTreeMap<String, Credential>) -> Self {
         self.credentials = credentials;
+        self
+    }
+
+    /// Supply provider-specific login implementations mounted by the composition
+    /// root.
+    #[must_use]
+    pub const fn with_login_methods(mut self, methods: &'a LoginMethodRegistry) -> Self {
+        self.login_methods = Some(methods);
         self
     }
 
@@ -195,7 +204,11 @@ impl Catalog {
                 found.record(source);
             }
             if let Some(credential) = input.credentials.get(provider_id) {
-                found.record(availability::credential_source(credential));
+                found.record(availability::credential_source(
+                    provider_id,
+                    credential,
+                    input.login_methods,
+                ));
             }
             if config_providers.contains_key(provider_id.as_str()) {
                 found.record(AvailabilitySource::ConfigBlock);
@@ -336,7 +349,11 @@ impl Catalog {
             }
             let mut found = Availability::none();
             if let Some(credential) = input.credentials.get(provider_id) {
-                found.record(availability::credential_source(credential));
+                found.record(availability::credential_source(
+                    provider_id,
+                    credential,
+                    input.login_methods,
+                ));
             }
             if let Some(reason) = found.unavailable_reason() {
                 out.insert(provider_id.clone(), reason);

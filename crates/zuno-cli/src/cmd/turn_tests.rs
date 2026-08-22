@@ -64,6 +64,7 @@ fn test_delegation() -> tool_runtime::Delegation {
 
 fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
     let directory = PathBuf::from(directory);
+    let auth_store = zuno_auth::AuthStore::new(directory.join(".zuno-test-auth.json"));
     let project = zuno_paths::project::ResolvedProject {
         previous: None,
         id: "project-turn-test".to_owned(),
@@ -109,6 +110,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         agent,
         provider_id: "provider".to_owned(),
         model_id: "model".to_owned(),
+        auth_store,
         credential: None,
         session,
         title: None,
@@ -753,7 +755,7 @@ where
         key: zuno_auth::Secret::new("production-replay-credential"),
         metadata: None,
     };
-    let providers = provider_registry(provider_id, Some(credential));
+    let providers = provider_registry(provider_id, Some(credential), None);
     assert!(
         providers.is_registered(registry_key),
         "production registry omitted `{registry_key}`"
@@ -2256,7 +2258,8 @@ fn probe_provider(options: serde_json::Value) -> Catalog {
     Catalog::resolve(&document, &ResolveInput::new().with_config(&config))
 }
 
-/// `options.apiKey` is primary; the stored credential is the fallback — `:1719`.
+/// `options.apiKey` is primary, stored auth is next, and provider env is the
+/// final fallback.
 ///
 /// The whole table in one test, because the defect was a *precedence* and a precedence
 /// is only wrong relative to its alternatives: reading only the option breaks
@@ -2312,7 +2315,8 @@ fn an_options_api_key_is_primary_and_the_stored_credential_is_the_fallback() {
             "the fixture lost `apiKey` in the merge, so this row proves nothing"
         );
 
-        let resolved = resolved_credential(Some(provider), present.then_some(&stored));
+        let resolved =
+            resolved_credential(Some(provider), present.then_some(&stored), &Env::empty());
 
         assert_eq!(
             resolved.as_ref().map(credential_value).as_deref(),
@@ -2320,6 +2324,34 @@ fn an_options_api_key_is_primary_and_the_stored_credential_is_the_fallback() {
             "{why} (options={options})"
         );
     }
+}
+
+#[test]
+fn the_first_declared_provider_environment_key_is_the_final_credential_fallback() {
+    let document = serde_json::from_str(
+        r#"{"probe":{"id":"probe","name":"Probe","env":["PRIMARY_KEY","SECONDARY_KEY"],
+             "npm":"@ai-sdk/openai-compatible",
+             "models":{"probe-model":{"id":"probe-model","name":"Probe Model",
+               "limit":{"context":1,"output":1}}}}}"#,
+    )
+    .expect("catalog document");
+    let config: zuno_config::schema::Config =
+        serde_json::from_str(r#"{"provider":{"probe":{}}}"#).expect("config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let provider = catalog.provider("probe").expect("provider");
+    let env = Env::empty()
+        .with("PRIMARY_KEY", "sk-from-primary-env")
+        .with("SECONDARY_KEY", "sk-from-secondary-env");
+
+    let from_env = resolved_credential(Some(provider), None, &env).expect("environment key");
+    assert_eq!(credential_value(&from_env), "sk-from-primary-env");
+
+    let stored = Credential::Api {
+        key: zuno_auth::Secret::new("sk-from-store"),
+        metadata: None,
+    };
+    let from_store = resolved_credential(Some(provider), Some(&stored), &env).expect("stored key");
+    assert_eq!(credential_value(&from_store), "sk-from-store");
 }
 
 /// Why [`provider_api_key`]'s string test can never be reached from a config file.

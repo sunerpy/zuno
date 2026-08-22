@@ -9,6 +9,7 @@
 //! |---|---|---|
 //! | [`AvailabilitySource::EnvVar`] | `provider.ts:1523-1533` | one of the provider's declared env vars is set in the process |
 //! | [`AvailabilitySource::StoredApiKey`] | `provider.ts:1536-1546` | `auth.json` holds a **`type: "api"`** credential |
+//! | [`AvailabilitySource::NativeOauth`] | Zuno auth registry | a native login method and request consumer both exist |
 //! | [`AvailabilitySource::ConfigBlock`] | `provider.ts:1588-1595` | the user wrote a `provider.<id>` block at all |
 //!
 //! Collapsing these into one boolean loses information a user needs. "Set
@@ -41,14 +42,12 @@
 //! catalog produced an empty model list, where the same file with `type: "api"`
 //! produced mistral's models.
 //!
-//! That is not a bug in the oracle. OAuth providers reach availability through
-//! their own `custom()` loader (`provider.ts:168-963`), which knows how to refresh
-//! a token and what to do when it has expired. This crate deliberately does not
-//! guess on their behalf: [`AvailabilitySource::StoredOauth`] records that the
-//! credential exists and [`Availability::is_available`] does **not** count it, so
-//! the provider crate that owns the flow can decide. Todos 29/30/94/95/96 own that
-//! decision; a caller reads [`Availability::has_oauth_credential`] to find the
-//! providers worth asking.
+//! Zuno follows the same ownership boundary without importing a JavaScript
+//! `custom()` loader. [`AvailabilitySource::StoredOauth`] remains insufficient,
+//! while [`AvailabilitySource::NativeOauth`] is recorded only when the supplied
+//! [`zuno_auth::LoginMethodRegistry`] says a native OAuth implementation is
+//! mounted for that provider. A custom provider therefore cannot become
+//! selectable merely because its credential happens to use the OAuth JSON shape.
 //!
 //! # How this maps onto the registry's two diagnostics
 //!
@@ -64,7 +63,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use zuno_auth::Credential;
+use zuno_auth::{Credential, LoginMethodRegistry};
 
 use crate::registry::Unavailable;
 
@@ -83,6 +82,8 @@ pub enum AvailabilitySource {
     ///
     /// Recorded but **not** sufficient on its own; see the module docs.
     StoredOauth,
+    /// A stored OAuth credential whose provider has a native OAuth implementation.
+    NativeOauth,
     /// `auth.json` holds a `type: "wellknown"` credential.
     ///
     /// Recorded but not sufficient on its own, for the same reason as OAuth.
@@ -102,7 +103,9 @@ impl AvailabilitySource {
     #[must_use]
     pub const fn is_sufficient(&self) -> bool {
         match self {
-            Self::EnvVar { .. } | Self::StoredApiKey | Self::ConfigBlock => true,
+            Self::EnvVar { .. } | Self::StoredApiKey | Self::NativeOauth | Self::ConfigBlock => {
+                true
+            }
             Self::StoredOauth | Self::StoredWellKnown => false,
         }
     }
@@ -161,9 +164,12 @@ impl Availability {
     /// path cannot act on. Not availability.
     #[must_use]
     pub fn has_oauth_credential(&self) -> bool {
-        self.sources
-            .iter()
-            .any(|source| matches!(source, AvailabilitySource::StoredOauth))
+        self.sources.iter().any(|source| {
+            matches!(
+                source,
+                AvailabilitySource::StoredOauth | AvailabilitySource::NativeOauth
+            )
+        })
     }
 
     /// Why this provider is not selectable, in the registry's vocabulary.
@@ -203,9 +209,18 @@ pub fn env_var_source(
 
 /// The source a stored credential contributes, by shape.
 #[must_use]
-pub const fn credential_source(credential: &Credential) -> AvailabilitySource {
+pub fn credential_source(
+    provider: &str,
+    credential: &Credential,
+    login_methods: Option<&LoginMethodRegistry>,
+) -> AvailabilitySource {
     match credential {
         Credential::Api { .. } => AvailabilitySource::StoredApiKey,
+        Credential::Oauth { .. }
+            if login_methods.is_some_and(|methods| methods.supports_oauth(provider)) =>
+        {
+            AvailabilitySource::NativeOauth
+        }
         Credential::Oauth { .. } => AvailabilitySource::StoredOauth,
         Credential::WellKnown { .. } => AvailabilitySource::StoredWellKnown,
     }
@@ -215,10 +230,16 @@ pub const fn credential_source(credential: &Credential) -> AvailabilitySource {
 #[must_use]
 pub fn credential_sources(
     credentials: &BTreeMap<String, Credential>,
+    login_methods: Option<&LoginMethodRegistry>,
 ) -> BTreeMap<String, AvailabilitySource> {
     credentials
         .iter()
-        .map(|(provider, credential)| (provider.clone(), credential_source(credential)))
+        .map(|(provider, credential)| {
+            (
+                provider.clone(),
+                credential_source(provider, credential, login_methods),
+            )
+        })
         .collect()
 }
 
@@ -242,8 +263,11 @@ mod tests {
             account_id: None,
             enterprise_url: None,
         };
-        assert!(credential_source(&api).is_sufficient());
-        assert!(!credential_source(&oauth).is_sufficient());
+        assert!(credential_source("openai", &api, None).is_sufficient());
+        assert!(!credential_source("openai", &oauth, None).is_sufficient());
+        let methods = LoginMethodRegistry::native();
+        assert!(credential_source("openai", &oauth, Some(&methods)).is_sufficient());
+        assert!(!credential_source("myopenai", &oauth, Some(&methods)).is_sufficient());
     }
 
     #[test]

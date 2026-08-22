@@ -5018,12 +5018,19 @@ dependencies = [
 name = "zuno-auth"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "uuid",
  "zuno-error",
  "zuno-paths",
 ]
@@ -5061,6 +5068,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "clap_complete",
+ "crossterm 0.29.0",
  "futures",
  "portable-pty",
  "reqwest",
@@ -5074,6 +5082,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "url",
  "uuid",
  "walkdir",
  "which",

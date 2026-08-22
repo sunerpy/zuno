@@ -2523,14 +2523,13 @@ async fn api_skill_reports_the_v2_builtin_location_and_description() {
         builtin["location"], "/builtin/customize-zuno.md",
         "the API reports the native built-in location rather than the catalog sentinel"
     );
-    assert!(
-        builtin["description"]
-            .as_str()
-            .expect("description is a string")
-            .contains("agents, commands, skills, MCP servers"),
-        "the description names the native configuration surfaces"
-    );
     let description = builtin["description"].as_str().expect("description");
+    for surface in ["agents", "commands", "skills", "MCP servers"] {
+        assert!(
+            description.contains(surface),
+            "the description omits native configuration surface {surface:?}: {description}"
+        );
+    }
     assert!(description.contains("Zuno's own configuration"));
     assert!(description.contains("files under .zuno/"));
     assert!(!description.contains("opencode's own configuration"));
@@ -2669,5 +2668,20 @@ async fn api_catalogue_projects_a_pinned_models_document_onto_the_v2_shape() {
             .expect("groq is registered")["connections"],
         json!([]),
         "an unset variable is not a connection"
+    );
+    let openai = integrations
+        .iter()
+        .find(|entry| entry["id"] == "openai")
+        .expect("native OpenAI authentication is registered");
+    let methods = openai["methods"].as_array().expect("OpenAI methods");
+    for method_id in ["chatgpt-browser", "chatgpt-device"] {
+        assert!(
+            methods.iter().any(|method| method["id"] == method_id),
+            "OpenAI must advertise {method_id}: {methods:?}"
+        );
+    }
+    assert!(
+        methods.iter().any(|method| method["type"] == "key"),
+        "OpenAI must also accept API keys: {methods:?}"
     );
 }

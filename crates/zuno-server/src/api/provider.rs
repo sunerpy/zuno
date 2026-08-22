@@ -42,6 +42,7 @@ use std::sync::Arc;
 use axum::extract::{Path as PathParam, State};
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
+use zuno_auth::{LoginMethod, LoginMethodKind, LoginMethodRegistry};
 use zuno_llm::catalog::models_dev::{
     CatalogCost, CatalogDocument, CatalogModel, CatalogProvider, CatalogStatus,
 };
@@ -49,43 +50,6 @@ use zuno_llm::catalog::models_dev::{
 use super::catalog::{LocationEnvelope, OptionalEnvelope, RequestBody};
 use super::error::ApiError;
 use super::state::ApiState;
-
-/// Native authentication methods that are not described by models.dev.
-const NATIVE_INTEGRATIONS: &[StaticIntegration] = &[StaticIntegration {
-    id: "openai",
-    name: "openai",
-    methods: &[
-        StaticMethod::OAuth {
-            id: "chatgpt-browser",
-            label: "ChatGPT Pro/Plus (browser)",
-        },
-        StaticMethod::OAuth {
-            id: "chatgpt-headless",
-            label: "ChatGPT Pro/Plus (headless)",
-        },
-    ],
-}];
-
-/// A native integration.
-struct StaticIntegration {
-    /// The integration id.
-    id: &'static str,
-    /// Its display name.
-    name: &'static str,
-    /// The connection methods it offers.
-    methods: &'static [StaticMethod],
-}
-
-/// One native connection method.
-enum StaticMethod {
-    /// An OAuth flow.
-    OAuth {
-        /// The method id.
-        id: &'static str,
-        /// The button label.
-        label: &'static str,
-    },
-}
 
 /// Upstream's `Provider.Info` (`packages/schema/src/provider.ts:52-60`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -420,9 +384,11 @@ impl CatalogView {
             .all()
             .map(|stored| stored.entries)
             .unwrap_or_default();
+        let login_methods = LoginMethodRegistry::native();
         let input = zuno_llm::catalog::ResolveInput::new()
             .with_config(&resolved.config)
             .with_credentials(credentials)
+            .with_login_methods(&login_methods)
             .with_env(
                 state
                     .env()
@@ -525,29 +491,53 @@ impl CatalogView {
                     .collect(),
             });
         }
-        for entry in NATIVE_INTEGRATIONS {
-            if data.iter().any(|existing| existing.id == entry.id) {
-                continue;
+        let openai_methods = LoginMethodRegistry::native().methods_for("openai");
+        if let Some(openai) = data.iter_mut().find(|entry| entry.id == "openai") {
+            for method in openai_methods {
+                append_login_method(&mut openai.methods, &method);
+            }
+        } else {
+            let mut methods = Vec::new();
+            for method in openai_methods {
+                append_login_method(&mut methods, &method);
             }
             data.push(IntegrationInfo {
-                id: entry.id.to_owned(),
-                name: entry.name.to_owned(),
-                methods: entry
-                    .methods
-                    .iter()
-                    .map(|method| match method {
-                        StaticMethod::OAuth { id, label } => Method::OAuth {
-                            id: (*id).to_owned(),
-                            kind: "oauth",
-                            label: (*label).to_owned(),
-                        },
-                    })
-                    .collect(),
+                id: "openai".to_owned(),
+                name: "openai".to_owned(),
+                methods,
                 connections: Vec::new(),
             });
         }
         data.sort_by(|left, right| locale_compare(&left.name, &right.name));
         data
+    }
+}
+
+fn append_login_method(methods: &mut Vec<Method>, method: &LoginMethod) {
+    match method.kind() {
+        LoginMethodKind::ApiKey => {
+            if !methods
+                .iter()
+                .any(|entry| matches!(entry, Method::Key { .. }))
+            {
+                methods.push(Method::Key {
+                    kind: "key",
+                    label: Some(method.label().to_owned()),
+                });
+            }
+        }
+        LoginMethodKind::OAuthBrowser | LoginMethodKind::OAuthDevice => {
+            if !methods
+                .iter()
+                .any(|entry| matches!(entry, Method::OAuth { id, .. } if id == method.id()))
+            {
+                methods.push(Method::OAuth {
+                    id: method.id().to_owned(),
+                    kind: "oauth",
+                    label: method.label().to_owned(),
+                });
+            }
+        }
     }
 }
 

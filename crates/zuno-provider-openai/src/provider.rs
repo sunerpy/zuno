@@ -5,7 +5,11 @@ use std::sync::Arc;
 
 use futures::{TryStreamExt as _, stream};
 use serde_json::Value;
-use zuno_auth::{AuthStore, Credential, Secret};
+use tokio::sync::Mutex;
+use zuno_auth::{
+    AuthStore, CHATGPT_CODEX_BASE_URL, Credential, OpenAiOauthClient, OpenAiOauthError, Secret,
+    residency_from_jwt,
+};
 use zuno_error::ProviderError;
 use zuno_llm::event::StreamEvent;
 use zuno_llm::registry::{
@@ -229,7 +233,7 @@ impl OpenAiConfig {
 #[derive(Clone, Debug)]
 pub struct OpenAiProvider {
     client: reqwest::Client,
-    credential: Secret,
+    auth: OpenAiAuth,
     config: OpenAiConfig,
 }
 
@@ -242,27 +246,29 @@ impl OpenAiProvider {
     /// bearer value.
     pub fn from_credential(
         credential: Credential,
-        mut config: OpenAiConfig,
+        config: OpenAiConfig,
     ) -> Result<Self, ProviderError> {
-        let credential = match credential {
-            Credential::Api { key, .. } => key,
-            Credential::Oauth {
-                access,
-                enterprise_url,
-                ..
-            } => {
-                if config.base_url == DEFAULT_BASE_URL
-                    && let Some(enterprise_url) = enterprise_url
-                {
-                    config.base_url = enterprise_url;
-                }
-                access
-            }
-            Credential::WellKnown { token, .. } => token,
-        };
+        Self::from_credential_and_store(credential, config, None)
+    }
+
+    fn from_credential_and_store(
+        credential: Credential,
+        mut config: OpenAiConfig,
+        store: Option<AuthStore>,
+    ) -> Result<Self, ProviderError> {
+        if let Credential::Oauth {
+            enterprise_url: Some(enterprise_url),
+            ..
+        } = &credential
+            && config.base_url == DEFAULT_BASE_URL
+        {
+            config.base_url.clone_from(enterprise_url);
+        }
+        let chatgpt = config.provider == DEFAULT_PROVIDER;
+        let auth = OpenAiAuth::new(credential, store, chatgpt);
         Ok(Self {
             client: reqwest::Client::new(),
-            credential,
+            auth,
             config,
         })
     }
@@ -285,7 +291,7 @@ impl OpenAiProvider {
                 provider: config.provider.clone(),
                 source: None,
             })?;
-        Self::from_credential(credential, config)
+        Self::from_credential_and_store(credential, config, Some(store.clone()))
     }
 
     /// Immutable request options.
@@ -315,17 +321,20 @@ impl Provider for OpenAiProvider {
             request.surface = self.config.surface;
         }
         let client = self.client.clone();
-        let credential = self.credential.clone();
+        let auth = self.auth.clone();
         let config = self.config.clone();
         Box::pin(
-            stream::once(async move { start_stream(client, credential, config, request).await })
+            stream::once(async move { start_stream(client, auth, config, request).await })
                 .try_flatten(),
         )
     }
 }
 
 /// Build the registry factory for OpenAI Chat Completions and Responses.
-pub fn factory<C>(credentials: C) -> impl Fn(Spec) -> FactoryOutcome + Send + Sync + 'static
+pub fn factory<C>(
+    credentials: C,
+    store: Option<AuthStore>,
+) -> impl Fn(Spec) -> FactoryOutcome + Send + Sync + 'static
 where
     C: Fn(&str) -> Option<Credential> + Send + Sync + 'static,
 {
@@ -333,29 +342,48 @@ where
         let credential = credentials(&spec.provider)
             .ok_or(Declined::Unavailable(Unavailable::MissingCredential))?;
         let config = OpenAiConfig::from_spec(spec);
-        let provider =
-            OpenAiProvider::from_credential(credential, config).map_err(Declined::Failed)?;
+        let provider = OpenAiProvider::from_credential_and_store(credential, config, store.clone())
+            .map_err(Declined::Failed)?;
         Ok(Arc::new(provider) as Arc<dyn Provider>)
     }
 }
 
 async fn start_stream(
     client: reqwest::Client,
-    credential: Secret,
+    auth: OpenAiAuth,
     config: OpenAiConfig,
     request: CompletionRequest,
 ) -> Result<ProviderStream<'static>, ProviderError> {
     let mut body = build_request_body(&request, &config)?;
     let surface = resolve_surface(request.surface);
+    let request_auth = auth.resolve(config.provider()).await?;
+    if request_auth.chatgpt && surface != ApiSurface::Responses {
+        return Err(ProviderError::fatal(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ChatGPT OAuth supports the OpenAI Responses surface only",
+        )));
+    }
     request.apply_parameters(&mut body, surface);
-    let endpoint = endpoint(&config.base_url, surface);
+    let endpoint = endpoint(&config.base_url, surface, request_auth.chatgpt);
     let provider = config.provider.clone();
     let model = request.model_id;
     let mut outgoing = client
         .post(endpoint)
-        .bearer_auth(credential.expose())
+        .bearer_auth(request_auth.bearer.expose())
         .header("content-type", "application/json")
         .header("accept", "text/event-stream");
+    if request_auth.chatgpt {
+        outgoing = outgoing
+            .header("originator", "zuno")
+            .header("user-agent", format!("zuno/{}", env!("CARGO_PKG_VERSION")))
+            .header("version", env!("CARGO_PKG_VERSION"));
+        if let Some(account_id) = request_auth.account_id {
+            outgoing = outgoing.header("ChatGPT-Account-Id", account_id);
+        }
+        if let Some(residency) = request_auth.residency {
+            outgoing = outgoing.header("x-openai-internal-codex-residency", residency);
+        }
+    }
     for (name, value) in &config.headers {
         outgoing = outgoing.header(name, value);
     }
@@ -415,7 +443,10 @@ struct ResponseState {
     ended: bool,
 }
 
-fn endpoint(base_url: &str, surface: ApiSurface) -> String {
+fn endpoint(base_url: &str, surface: ApiSurface, chatgpt: bool) -> String {
+    if chatgpt && base_url == DEFAULT_BASE_URL {
+        return format!("{CHATGPT_CODEX_BASE_URL}/responses");
+    }
     let base = base_url.trim_end_matches('/');
     let suffix = match resolve_surface(surface) {
         ApiSurface::Chat => "/v1/chat/completions",
@@ -426,6 +457,100 @@ fn endpoint(base_url: &str, surface: ApiSurface) -> String {
         base.to_owned()
     } else {
         format!("{base}{suffix}")
+    }
+}
+
+#[derive(Clone, Debug)]
+enum OpenAiAuth {
+    Bearer(Secret),
+    OAuth {
+        credential: Arc<Mutex<Credential>>,
+        store: Option<AuthStore>,
+        client: OpenAiOauthClient,
+    },
+}
+
+impl OpenAiAuth {
+    fn new(credential: Credential, store: Option<AuthStore>, chatgpt: bool) -> Self {
+        match credential {
+            Credential::Api { key, .. } => Self::Bearer(key),
+            Credential::WellKnown { token, .. } => Self::Bearer(token),
+            Credential::Oauth { access, .. } if !chatgpt => Self::Bearer(access),
+            credential @ Credential::Oauth { .. } => Self::OAuth {
+                credential: Arc::new(Mutex::new(credential)),
+                store,
+                client: OpenAiOauthClient::production(),
+            },
+        }
+    }
+
+    async fn resolve(&self, provider: &str) -> Result<RequestAuth, ProviderError> {
+        match self {
+            Self::Bearer(bearer) => Ok(RequestAuth {
+                bearer: bearer.clone(),
+                account_id: None,
+                residency: None,
+                chatgpt: false,
+            }),
+            Self::OAuth {
+                credential,
+                store,
+                client,
+            } => {
+                let mut credential = credential.lock().await;
+                if zuno_auth::openai::needs_refresh(&credential) {
+                    let refreshed = client
+                        .refresh(&credential)
+                        .await
+                        .map_err(|error| oauth_error(provider, error))?;
+                    if let Some(store) = store
+                        && !store.has_env_override()
+                    {
+                        store.set(provider, refreshed.clone()).map_err(|source| {
+                            ProviderError::Auth {
+                                provider: provider.to_owned(),
+                                source: Some(Box::new(source)),
+                            }
+                        })?;
+                    }
+                    *credential = refreshed;
+                }
+                let Credential::Oauth {
+                    access, account_id, ..
+                } = &*credential
+                else {
+                    return Err(ProviderError::Auth {
+                        provider: provider.to_owned(),
+                        source: None,
+                    });
+                };
+                Ok(RequestAuth {
+                    bearer: access.clone(),
+                    account_id: account_id.clone(),
+                    residency: residency_from_jwt(access.expose()),
+                    chatgpt: true,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RequestAuth {
+    bearer: Secret,
+    account_id: Option<String>,
+    residency: Option<String>,
+    chatgpt: bool,
+}
+
+fn oauth_error(provider: &str, error: OpenAiOauthError) -> ProviderError {
+    if error.is_transient() {
+        ProviderError::transient(error)
+    } else {
+        ProviderError::Auth {
+            provider: provider.to_owned(),
+            source: Some(Box::new(error)),
+        }
     }
 }
 
@@ -440,12 +565,45 @@ mod tests {
     #[test]
     fn default_surface_targets_responses() {
         assert_eq!(
-            endpoint(DEFAULT_BASE_URL, ApiSurface::Default),
+            endpoint(DEFAULT_BASE_URL, ApiSurface::Default, false),
             "https://api.openai.com/v1/responses"
         );
         assert_eq!(
-            endpoint(DEFAULT_BASE_URL, ApiSurface::Chat),
+            endpoint(DEFAULT_BASE_URL, ApiSurface::Chat, false),
             "https://api.openai.com/v1/chat/completions"
         );
+        assert_eq!(
+            endpoint(DEFAULT_BASE_URL, ApiSurface::Responses, true),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_official_openai_provider_treats_oauth_as_chatgpt() {
+        let credential = Credential::Oauth {
+            refresh: Secret::new("refresh"),
+            access: Secret::new("access"),
+            expires: u64::MAX,
+            account_id: Some("acct-test".to_owned()),
+            enterprise_url: None,
+        };
+
+        let official = OpenAiAuth::new(credential.clone(), None, true)
+            .resolve("openai")
+            .await
+            .expect("official OAuth");
+        assert!(official.chatgpt);
+        assert_eq!(official.account_id.as_deref(), Some("acct-test"));
+        assert_eq!(official.bearer.expose(), "access");
+        assert!(official.residency.is_none());
+
+        let custom = OpenAiAuth::new(credential, None, false)
+            .resolve("myopenai")
+            .await
+            .expect("custom bearer");
+        assert!(!custom.chatgpt);
+        assert!(custom.account_id.is_none());
+        assert!(custom.residency.is_none());
+        assert_eq!(custom.bearer.expose(), "access");
     }
 }

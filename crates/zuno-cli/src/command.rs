@@ -397,10 +397,19 @@ pub struct ProvidersArgs {
 pub enum ProvidersCommand {
     #[command(alias = "ls")]
     List,
+    /// List the login methods implemented for a provider.
+    Methods {
+        /// Provider id or display name.
+        provider: String,
+    },
+    /// Authenticate a provider with one of its implemented login methods.
     Login {
-        url: Option<String>,
+        /// Provider id/name, or an HTTPS URL implementing `/.well-known/zuno`.
+        target: Option<String>,
+        /// Provider id or display name, as an alternative to the positional target.
         #[arg(short = 'p', long)]
         provider: Option<String>,
+        /// Method id shown by `zuno auth methods <provider>`.
         #[arg(short = 'm', long)]
         method: Option<String>,
     },

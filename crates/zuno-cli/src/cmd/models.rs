@@ -72,9 +72,11 @@ fn resolve_catalog(
     credentials: &BTreeMap<String, zuno_auth::Credential>,
     env: &zuno_paths::Env,
 ) -> Catalog {
+    let login_methods = zuno_auth::LoginMethodRegistry::native();
     let input = ResolveInput::new()
         .with_config(config)
         .with_credentials(credentials.clone())
+        .with_login_methods(&login_methods)
         .with_env(
             env.iter()
                 .map(|(key, value)| (key.to_owned(), value.to_owned()))
