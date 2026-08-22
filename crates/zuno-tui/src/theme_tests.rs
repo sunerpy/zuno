@@ -399,10 +399,10 @@ fn theme_system_without_terminal_capabilities_keeps_a_readable_surface_hierarchy
     );
 
     let palette = registry.resolve(SYSTEM_THEME, Mode::Dark).palette;
-    assert_eq!(
+    assert_ne!(
         Color::from(palette.background),
         Color::Reset,
-        "the root canvas must preserve the terminal's own background"
+        "a silent terminal still needs a deterministic root canvas"
     );
     assert_ne!(
         palette.background_panel, palette.background,
@@ -685,10 +685,10 @@ fn theme_system_keeps_every_surface_legible_and_bordered() {
             );
         }
 
-        assert_eq!(
+        assert_ne!(
             Color::from(palette.background),
             Color::Reset,
-            "fallback system root must preserve the terminal background in {mode:?}"
+            "fallback system root must remain visible in {mode:?}"
         );
         assert_ne!(
             palette.background_panel, palette.background,

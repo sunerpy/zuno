@@ -41,7 +41,7 @@ The default preserves terminal-native selection:
 
 With `mouse` absent or `false`, Zuno does not enable terminal mouse capture, so dragging can select text across the transcript, sidebar, and input area. On terminals that implement alternate-scroll mode, wheel notches scroll a long transcript while the composer is empty without taking selection away from the terminal. Set `"mouse": true` only when direct TUI mouse events and click handling are more important than native drag selection.
 
-The `system` theme queries the terminal's OSC 10/11 foreground and background colours before the TUI starts, then derives its text, panel, input, border, and syntax colours from that result. Terminals which do not support colour queries fall back to `COLORFGBG`; if neither source is available, Zuno keeps the terminal's root background and applies a neutral panel/input hierarchy so the interface does not collapse into one near-black surface.
+The `system` theme queries the terminal's OSC 10/11 foreground and background colours before the TUI starts, then derives its text, panel, input, border, and syntax colours from that result. Terminals which do not support colour queries fall back to `COLORFGBG`; if neither source is available, Zuno applies a neutral root, panel, and input hierarchy so the interface does not collapse into one near-black surface.
 
 ## Inspecting the result
 
