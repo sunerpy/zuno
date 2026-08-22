@@ -2691,10 +2691,10 @@ pub const DEFINITIONS: &[Definition] = &[
     },
 ];
 
-/// Zuno-native dialog bindings that have no upstream row.
+/// Zuno-native dialog bindings that are not part of the imported baseline.
 ///
-/// Kept outside [`DEFINITIONS`] so the mechanically extracted compatibility table
-/// remains auditable row-for-row. These still pass through the same parser, conflict
+/// Kept outside [`DEFINITIONS`] so the mechanically extracted baseline remains
+/// auditable row-for-row. These still pass through the same parser, conflict
 /// detection, user overrides, and action dispatcher as every upstream binding.
 pub const LOCAL_DEFINITIONS: &[Definition] = &[
     Definition {
@@ -2720,5 +2720,53 @@ pub const LOCAL_DEFINITIONS: &[Definition] = &[
         command: "background.list",
         prevent_default: None,
         description: "List background terminals",
+    },
+    Definition {
+        name: "memory_view",
+        scope: "memory",
+        keys: "none",
+        command: "memory.list",
+        prevent_default: None,
+        description: "Review resident memory",
+    },
+    Definition {
+        name: "memory_apply",
+        scope: "dialog.memory",
+        keys: "a",
+        command: "memory.apply",
+        prevent_default: None,
+        description: "Approve the selected memory candidate",
+    },
+    Definition {
+        name: "memory_edit",
+        scope: "dialog.memory",
+        keys: "e",
+        command: "memory.edit",
+        prevent_default: None,
+        description: "Edit and approve the selected memory candidate",
+    },
+    Definition {
+        name: "memory_reject",
+        scope: "dialog.memory",
+        keys: "r",
+        command: "memory.reject",
+        prevent_default: None,
+        description: "Reject the selected memory candidate",
+    },
+    Definition {
+        name: "memory_undo",
+        scope: "dialog.memory",
+        keys: "u",
+        command: "memory.undo",
+        prevent_default: None,
+        description: "Undo the selected applied memory candidate",
+    },
+    Definition {
+        name: "memory_remove",
+        scope: "dialog.memory",
+        keys: "x",
+        command: "memory.remove",
+        prevent_default: None,
+        description: "Confirm removal of the selected resident entry",
     },
 ];

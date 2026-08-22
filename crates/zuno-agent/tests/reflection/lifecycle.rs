@@ -45,8 +45,7 @@ async fn default_counter_triggers_on_the_tenth_delivered_user_turn() {
         ReflectionConfig::default(),
         runner.clone(),
         Arc::new(memory.clone()),
-    )
-    .expect("memory probe has the required id");
+    );
 
     // When
     for turn_number in 1..10 {
@@ -120,6 +119,8 @@ async fn fork_replays_an_owned_transcript_with_compaction_disabled() {
     // Then
     assert_eq!(request.transcript, transcript);
     assert_eq!(request.compaction, CompactionMode::Disabled);
+    assert_eq!(request.source_session_id, "ses_reflection");
+    assert_eq!(request.source_message_id, "msg_reflection");
     assert_eq!(memory.call_count(), 0);
 }
 

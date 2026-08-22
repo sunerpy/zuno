@@ -10,17 +10,21 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+zuno-db = { workspace = true }
+zuno-error = { workspace = true }
 zuno-paths = { workspace = true }
+zuno-types = { workspace = true }
 regex = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }
 zuno-agent = { workspace = true }
 zuno-config = { workspace = true }
-zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
 zuno-llm = { workspace = true }

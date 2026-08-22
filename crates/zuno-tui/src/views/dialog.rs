@@ -140,6 +140,19 @@ pub enum DialogOutcome {
     },
     /// The background-terminal dialog requested cancellation while remaining open.
     BackgroundCancel { execution_id: String },
+    /// Approve one pending resident-memory candidate.
+    MemoryApply { id: String },
+    /// Reject one pending resident-memory candidate.
+    MemoryReject { id: String },
+    /// Undo one applied resident-memory candidate.
+    MemoryUndo { id: String },
+    /// Open an editor for a candidate, then approve the edited result.
+    MemoryEditRequested { id: String, content: String },
+    /// Remove one current resident-memory entry after in-dialog confirmation.
+    MemoryRemove {
+        scope: zuno_types::MemoryScope,
+        content: String,
+    },
 }
 
 /// One of `§11.4`'s three fixed dialog widths.

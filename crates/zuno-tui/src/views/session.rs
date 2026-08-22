@@ -531,6 +531,8 @@ pub struct SessionScreen {
     /// instead would need the push to find every open surface, and the surface a push
     /// forgets is precisely the one that goes stale.
     mcp_generation: u64,
+    work: crate::views::ambient::WorkState,
+    work_generation: u64,
     /// The non-MCP halves of `§8.7`'s status census, resolved once by the host.
     ///
     /// MCP is deliberately *not* stored here: it is live, and `status_panel` reads it from
@@ -586,6 +588,8 @@ pub struct SessionScreen {
     /// re-open the prompt after an empty submission without querying storage from the
     /// view layer.
     session_rename: Option<(String, String)>,
+    /// Pending memory candidate whose edit prompt is open.
+    memory_edit: Option<String>,
     /// The user's resolved keymap, for the keybinding reference.
     ///
     /// Optional because every view test builds a screen without one, and a help view
@@ -658,6 +662,19 @@ pub enum Selection {
     SessionDelete(String),
     /// Cancel one running background subagent job.
     JobCancel(String),
+    /// Approve one durable memory candidate.
+    MemoryApply(String),
+    /// Reject one durable memory candidate.
+    MemoryReject(String),
+    /// Undo one applied durable memory candidate.
+    MemoryUndo(String),
+    /// Replace candidate content and approve it in one audited operation.
+    MemoryEditApply { id: String, content: String },
+    /// Remove one current resident-memory entry.
+    MemoryRemove {
+        scope: zuno_types::MemoryScope,
+        content: String,
+    },
     /// A different theme.
     Theme(String),
     /// A different reasoning level for subsequent turns.
@@ -753,6 +770,8 @@ impl SessionScreen {
             title_generation: 0,
             mcp: crate::views::picker::McpProjection::default(),
             mcp_generation: 0,
+            work: crate::views::ambient::WorkState::default(),
+            work_generation: 0,
             census: Vec::new(),
             debug: crate::views::diagnostics::DebugFacts::default(),
             cancels: None,
@@ -773,6 +792,7 @@ impl SessionScreen {
             theme_restore: None,
             message_menu: None,
             session_rename: None,
+            memory_edit: None,
             modal: None,
             scroller: Scroller::new(&context.config),
             started: Instant::now(),
@@ -868,6 +888,14 @@ impl SessionScreen {
     pub fn with_session_title(mut self, title: crate::views::ambient::SessionTitle) -> Self {
         self.title_generation = title.generation();
         self.title = title;
+        self
+    }
+
+    /// Install the live durable work-state projection.
+    #[must_use]
+    pub fn with_work_state(mut self, work: crate::views::ambient::WorkState) -> Self {
+        self.work_generation = work.generation();
+        self.work = work;
         self
     }
 
@@ -1462,6 +1490,9 @@ impl Component for SessionScreen {
             .iter()
             .map(crate::views::picker::McpServer::service)
             .collect();
+        let (work_generation, work) = self.work.observe();
+        self.work_generation = work_generation;
+        self.sidebar.ambient_mut().work = work;
         if self.transcript_full {
             self.sidebar.forget_hit_targets();
             crate::views::fill(frame.buffer_mut(), area, self.context.surface());
@@ -1714,6 +1745,7 @@ impl Component for SessionScreen {
             .merge(self.observe_session_materialized(event))
             .merge(self.observe_session_title())
             .merge(self.observe_mcp())
+            .merge(self.observe_work_state())
             .merge(self.drain_editor_results())
             .merge(self.drain_reports())
             .merge(self.transcript.handle_event(event))
@@ -1974,6 +2006,13 @@ impl SessionScreen {
 
     fn observe_session_title(&self) -> EventResult {
         if self.title.generation() == self.title_generation {
+            return EventResult::IGNORED;
+        }
+        EventResult::REDRAW
+    }
+
+    fn observe_work_state(&self) -> EventResult {
+        if self.work.generation() == self.work_generation {
             return EventResult::IGNORED;
         }
         EventResult::REDRAW
@@ -2440,6 +2479,7 @@ impl SessionScreen {
             }
             "session_child_first" => self.request(self.subagent_view()),
             "ps_view" => self.request(self.background_view()),
+            "memory_view" => self.request(self.memory_view()),
             "mcp_list" => self.request(self.mcp_list()),
             "status_view" => self.request(self.status_panel()),
             "debug_view" => self.request(self.debug_panel()),
@@ -2582,6 +2622,13 @@ impl SessionScreen {
             self.context.clone(),
             Arc::clone(self.background_executions.as_ref()?),
             self.background_session.clone().unwrap_or_default(),
+        )))
+    }
+
+    fn memory_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        Some(Box::new(crate::views::memory::MemoryView::new(
+            self.context.clone(),
+            self.work.clone(),
         )))
     }
 
@@ -2852,6 +2899,15 @@ impl SessionScreen {
             }
             Selection::SessionDelete(id) => format!("deleting session {id}"),
             Selection::JobCancel(id) => format!("cancelling background job {id}"),
+            Selection::MemoryApply(id) => format!("approving memory candidate {id}"),
+            Selection::MemoryReject(id) => format!("rejecting memory candidate {id}"),
+            Selection::MemoryUndo(id) => format!("undoing memory candidate {id}"),
+            Selection::MemoryEditApply { id, .. } => {
+                format!("applying edited memory candidate {id}")
+            }
+            Selection::MemoryRemove { scope, .. } => {
+                format!("removing {} resident memory", scope.as_str())
+            }
             Selection::Theme(theme) => format!("theme {theme} selected"),
             Selection::Effort(effort) => {
                 format!("reasoning set to {effort} for the next turn")
@@ -3209,6 +3265,66 @@ impl ActionComponent for SessionScreen {
                 self.toasts.push(Toast::new(level, notice));
                 EventResult::REDRAW
             }
+            crate::views::dialog::DialogOutcome::MemoryApply { id } => {
+                let (notice, level) = self.commit_selection(Selection::MemoryApply(id.clone()));
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::MemoryReject { id } => {
+                let (notice, level) = self.commit_selection(Selection::MemoryReject(id.clone()));
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::MemoryUndo { id } => {
+                let (notice, level) = self.commit_selection(Selection::MemoryUndo(id.clone()));
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::MemoryEditRequested { id, content } => {
+                self.memory_edit = Some(id.clone());
+                self.requested
+                    .push(Box::new(crate::views::basics::PromptDialog::new(
+                        self.context.clone(),
+                        crate::views::memory::EDIT_DIALOG_ID,
+                        "Edit and approve memory",
+                        content,
+                    )));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::Submitted { text, .. }
+                if dialog == crate::views::memory::EDIT_DIALOG_ID =>
+            {
+                let Some(id) = self.memory_edit.take() else {
+                    return EventResult::IGNORED;
+                };
+                let content = text.trim();
+                if content.is_empty() {
+                    self.memory_edit = Some(id);
+                    self.toasts
+                        .push(Toast::warning("memory content cannot be empty"));
+                    return EventResult::REDRAW;
+                }
+                let (notice, level) = self.commit_selection(Selection::MemoryEditApply {
+                    id,
+                    content: content.to_owned(),
+                });
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::Cancelled
+                if dialog == crate::views::memory::EDIT_DIALOG_ID =>
+            {
+                self.memory_edit = None;
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::MemoryRemove { scope, content } => {
+                let (notice, level) = self.commit_selection(Selection::MemoryRemove {
+                    scope: *scope,
+                    content: content.clone(),
+                });
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
             crate::views::dialog::DialogOutcome::BackgroundCancel { execution_id } => {
                 self.cancel_background(execution_id)
             }
@@ -3352,6 +3468,7 @@ pub fn scopes() -> Vec<String> {
         "command",
         "help",
         "background",
+        "memory",
         // `status` and `debug` cost no typeable character, which is the question this list
         // exists to answer. Each is a one-row scope — `status_view` on `<leader>s` and an
         // unbound `debug_view` — so neither can claim a bare letter the way `diff` below

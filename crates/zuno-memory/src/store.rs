@@ -326,6 +326,16 @@ impl MemoryStore {
     /// the material needed to consolidate for the three failures where that is the
     /// remedy.
     pub fn apply_batch(&mut self, operations: &[Operation]) -> Result<Usage, MemoryError> {
+        let candidate = self.preview_batch(operations)?;
+        let before = self.entries.clone();
+        self.replace_exact(&before, &candidate)
+    }
+
+    /// Validate and project a batch without changing the resident file.
+    ///
+    /// On success [`Self::entries`] is the matching `before` snapshot and the
+    /// returned vector is the exact `after` snapshot.
+    pub fn preview_batch(&mut self, operations: &[Operation]) -> Result<Vec<String>, MemoryError> {
         if operations.is_empty() {
             return Err(MemoryError::EmptyBatch);
         }
@@ -388,8 +398,58 @@ impl MemoryStore {
             });
         }
 
-        let stamp = write_atomic(&self.path, &serialize(&candidate))?;
-        self.entries = candidate;
+        Ok(candidate)
+    }
+
+    /// Replace one exact audited snapshot with another.
+    ///
+    /// The write is refused when the file no longer equals `expected`, so apply
+    /// and undo cannot overwrite a concurrent session or a manual edit.
+    pub fn replace_exact(
+        &mut self,
+        expected: &[String],
+        replacement: &[String],
+    ) -> Result<Usage, MemoryError> {
+        let observed = read_checked(&self.path)?;
+        if let Some(reason) = self.drift(observed.as_ref()) {
+            let raw = observed.map(|(raw, _)| raw).unwrap_or_default();
+            let backup = self.snapshot(&raw)?;
+            return Err(MemoryError::ExternalDrift {
+                path: self.path.clone(),
+                reason,
+                backup,
+            });
+        }
+        let actual = observed
+            .as_ref()
+            .map_or_else(Vec::new, |(raw, _)| parse(raw));
+        if actual != expected {
+            return Err(MemoryError::StateMismatch {
+                path: self.path.clone(),
+                expected: expected.to_vec(),
+                actual,
+            });
+        }
+        for (offset, entry) in replacement.iter().enumerate() {
+            if let Some(threat) = first_threat(entry) {
+                return Err(MemoryError::Blocked {
+                    index: offset + 1,
+                    threat,
+                });
+            }
+        }
+        let projected = char_count(&serialize(replacement));
+        if projected > self.limit {
+            return Err(MemoryError::CapExceeded {
+                scope: self.scope,
+                projected,
+                limit: self.limit,
+                entries: self.entries.clone(),
+            });
+        }
+
+        let stamp = write_atomic(&self.path, &serialize(replacement))?;
+        self.entries = replacement.to_vec();
         self.stamp = Some(stamp);
         Ok(self.usage())
     }

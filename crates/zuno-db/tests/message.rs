@@ -732,7 +732,7 @@ fn a_stamp_clamped_past_the_latest_message_cannot_tie_it() {
 }
 
 #[test]
-fn hydration_orders_messages_by_time_then_id_and_parts_by_id() {
+fn hydration_orders_messages_and_parts_by_creation_time_then_id() {
     let connection = seeded();
     let store = MessageStore::new(&connection);
 
@@ -745,25 +745,28 @@ fn hydration_orders_messages_by_time_then_id_and_parts_by_id() {
         let record = MessageRecord::from_json(user_message(id, created)).expect("split");
         store.put_message_at(&record, created).expect("write");
     }
-    for (part_id, message_id) in [
+    for (part_id, message_id, created) in [
         (
             "prt_z00000000000000000000000000000",
             "msg_a00000000000000000000000000000",
+            1,
         ),
         (
             "prt_m00000000000000000000000000000",
             "msg_a00000000000000000000000000000",
+            3,
         ),
         (
             "prt_a00000000000000000000000000000",
             "msg_a00000000000000000000000000000",
+            2,
         ),
     ] {
         let mut payload = part_payload(PartKind::Text, part_id);
         let object = payload.as_object_mut().expect("payload is an object");
         object.insert("messageID".to_owned(), json!(message_id));
-        let record = PartRecord::from_json(payload, 1).expect("split");
-        store.put_part_at(&record, 1).expect("write");
+        let record = PartRecord::from_json(payload, created).expect("split");
+        store.put_part_at(&record, created).expect("write");
     }
 
     let hydrated = store.hydrate_session(SESSION_ID).expect("hydrate");
@@ -789,11 +792,11 @@ fn hydration_orders_messages_by_time_then_id_and_parts_by_id() {
     assert_eq!(
         part_ids,
         [
+            "prt_z00000000000000000000000000000",
             "prt_a00000000000000000000000000000",
             "prt_m00000000000000000000000000000",
-            "prt_z00000000000000000000000000000",
         ],
-        "parts come back in id order, as message-v2.ts:107 asks for"
+        "parts come back in creation order, with id only breaking timestamp ties"
     );
     assert!(
         hydrated[1].parts.is_empty(),

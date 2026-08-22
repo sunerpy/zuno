@@ -46,7 +46,7 @@ fn literal(code: &str) -> Option<String> {
 /// Two shapes are recognised, because the registry declares its tools in two places:
 /// `BuiltinSlot::wire_id`'s `Self::X => "name"` arms for the seventeen slots, and
 /// `pub const *_TOOL_ID: &str = "name"` for the built-ins registered outside the slot table
-/// (`memory` and the three goal tools).
+/// (`memory_propose` and the three goal tools).
 fn registry_wire_ids() -> Vec<String> {
     let mut ids = Vec::new();
     for path in registry_sources() {
@@ -82,7 +82,7 @@ fn registry_wire_ids() -> Vec<String> {
 fn tool_summaries_cover_every_tool_the_registry_can_expose() {
     let ids = registry_wire_ids();
     // A floor, so the scan cannot pass by finding nothing — the same guard the colour and
-    // keybind scans carry. Seventeen slots plus `memory` plus three goal tools is 21.
+    // keybind scans carry. Seventeen slots plus `memory_propose` plus three goal tools is 21.
     assert!(
         ids.len() >= 21,
         "the registry scan found only {} wire ids, so it is reading the wrong files and \
@@ -207,9 +207,9 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
             "nosuchtool",
         ),
         (
-            "memory",
-            r#"{"target":"project","action":"add"}"#,
-            "add project",
+            "memory_propose",
+            r#"{"target":"project","action":"add","content":"run cargo fmt"}"#,
+            "add project: run cargo fmt",
         ),
         ("create_goal", r#"{"objective":"ship P2-4"}"#, "ship P2-4"),
         (

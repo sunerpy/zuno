@@ -943,10 +943,17 @@
       ],
       "type": "object"
     },
+    "MemoryConfidence": {
+      "description": "A validated probability used by memory promotion.",
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
     "MemoryConfig": {
       "anyOf": [
         {
-          "description": "`false` is the strict-parity kill switch; `true` selects all defaults.",
+          "description": "`false` disables the subsystem; `true` selects all defaults.",
           "type": "boolean"
         },
         {
@@ -959,6 +966,17 @@
     "MemoryOptions": {
       "description": "Fine-grained settings under the `memory` top-level key.",
       "properties": {
+        "auto_confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryConfidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Threshold used by `high_confidence`. Defaults to 0.9."
+        },
         "global_char_limit": {
           "description": "Character cap for global agent notes. Defaults to 2200.",
           "format": "uint32",
@@ -986,6 +1004,17 @@
             "null"
           ]
         },
+        "promotion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryPromotion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Candidate promotion policy. Defaults to `review`."
+        },
         "reflection": {
           "description": "Run post-response background reflection.",
           "type": [
@@ -1009,6 +1038,26 @@
         }
       },
       "type": "object"
+    },
+    "MemoryPromotion": {
+      "description": "How durable memory candidates become resident entries.",
+      "oneOf": [
+        {
+          "const": "review",
+          "description": "Keep every candidate pending until a user approves it.",
+          "type": "string"
+        },
+        {
+          "const": "high_confidence",
+          "description": "Apply only candidates at or above `auto_confidence`.",
+          "type": "string"
+        },
+        {
+          "const": "automatic",
+          "description": "Apply every validated candidate immediately.",
+          "type": "string"
+        }
+      ]
     },
     "Modality": {
       "description": "A modality a model accepts or emits (`config/provider.ts:56-59`).",

@@ -24,7 +24,7 @@ impl MemoryProbe {
 #[async_trait]
 impl Tool for MemoryProbe {
     fn id(&self) -> &str {
-        "memory"
+        "memory_propose"
     }
 
     fn description(&self) -> &str {
@@ -63,8 +63,14 @@ impl ReflectionRunner for WritingRunner {
         tools
             .dispatch(ReflectionToolCall::new(
                 "reflection-memory-call",
-                "memory",
-                json!({ "action": "add", "content": "durable correction" }),
+                "memory_propose",
+                json!({
+                    "target": "project",
+                    "action": "add",
+                    "content": "durable correction",
+                    "reason": "verified repository convention",
+                    "confidence": 0.95
+                }),
             ))
             .await?;
         Ok(())
@@ -174,7 +180,6 @@ where
         runner,
         Arc::new(memory.clone()),
     )
-    .expect("memory probe has the required id")
 }
 
 pub fn turn(delivery: TurnDelivery, transcript: TurnTranscript) -> ReflectionTurn {

@@ -174,6 +174,15 @@ const CHANNELS: &[ChannelGate] = &[
         "self.sender.send(event)",
     ),
     gate(
+        "turn-work-state-changes",
+        "zuno-cli/src/cmd/turn.rs",
+        "let (sender, _receiver) = tokio::sync::watch::channel(0);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-cli/src/cmd/turn.rs",
+        "self.sender.send_modify(|generation| {",
+    ),
+    gate(
         "pty-subscriber-output",
         "zuno-pty/src/session.rs",
         "let (sender, output) = mpsc::channel(options.capacity.max(1));",
@@ -190,6 +199,60 @@ const CHANNELS: &[ChannelGate] = &[
         Policy::BroadcastLag,
         "zuno-pty/src/lib.rs",
         "self.inner.events.send(event)",
+    ),
+    gate(
+        "background-execution-events",
+        "zuno-pty/src/background.rs",
+        "let (events, _) = broadcast::channel(256);",
+        "256",
+        Policy::BroadcastLag,
+        "zuno-pty/src/background.rs",
+        "events.send(BackgroundExecutionEvent::Settled(info))",
+    ),
+    gate(
+        "background-restored-info",
+        "zuno-pty/src/background.rs",
+        "let (info, _) = watch::channel(persisted.info);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-pty/src/background.rs",
+        "state.info.send_replace(info.clone())",
+    ),
+    gate(
+        "background-restored-cancel",
+        "zuno-pty/src/background.rs",
+        "let (cancel, _) = watch::channel(false);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-pty/src/background.rs",
+        "state.cancel.send_replace(true)",
+    ),
+    gate(
+        "background-live-info",
+        "zuno-pty/src/background.rs",
+        "let (info_sender, _) = watch::channel(info.clone());",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-pty/src/background.rs",
+        "state.info.send_replace(info.clone())",
+    ),
+    gate(
+        "background-live-cancel",
+        "zuno-pty/src/background.rs",
+        "let (cancel_sender, cancel_receiver) = watch::channel(false);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-pty/src/background.rs",
+        "state.cancel.send_replace(true)",
+    ),
+    gate(
+        "background-output-chunks",
+        "zuno-pty/src/background.rs",
+        "let (chunks, receiver) = mpsc::channel::<Vec<u8>>(32);",
+        "32",
+        Policy::LosslessBlock,
+        "zuno-pty/src/background.rs",
+        "sender.send(buffer[..read].to_vec()).await",
     ),
     gate(
         "tui-terminal-events",
@@ -334,7 +397,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 29);
+    assert_eq!(CHANNELS.len(), 36);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -402,6 +465,10 @@ channel_gate!(
 );
 channel_gate!(lsp_client_closed_keeps_latest_value, "lsp-client-closed");
 channel_gate!(watch_events_coalesce_when_full, "watch-events");
+channel_gate!(
+    turn_work_state_changes_keep_latest_value,
+    "turn-work-state-changes"
+);
 #[tokio::test]
 async fn engine_turn_events_apply_backpressure() {
     let (sender, mut receiver) = event_channel();
@@ -437,6 +504,30 @@ channel_gate!(pty_subscriber_output_reports_lag, "pty-subscriber-output");
 channel_gate!(
     pty_lifecycle_events_lag_one_subscriber,
     "pty-lifecycle-events"
+);
+channel_gate!(
+    background_execution_events_lag_one_subscriber,
+    "background-execution-events"
+);
+channel_gate!(
+    background_restored_info_keeps_latest_value,
+    "background-restored-info"
+);
+channel_gate!(
+    background_restored_cancel_keeps_latest_value,
+    "background-restored-cancel"
+);
+channel_gate!(
+    background_live_info_keeps_latest_value,
+    "background-live-info"
+);
+channel_gate!(
+    background_live_cancel_keeps_latest_value,
+    "background-live-cancel"
+);
+channel_gate!(
+    background_output_chunks_apply_backpressure,
+    "background-output-chunks"
 );
 channel_gate!(
     tui_terminal_events_apply_backpressure,

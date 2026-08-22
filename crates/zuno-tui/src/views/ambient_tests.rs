@@ -43,6 +43,7 @@ fn ambient() -> Ambient {
                 loaded: false,
             },
         ],
+        work: zuno_types::WorkStateProjection::default(),
         version: Some(String::from("0.1.0")),
     }
 }
@@ -83,6 +84,76 @@ fn views_sidebar_states_tokens_servers_and_skills() {
         "Skills",
     ] {
         assert!(joined.contains(needle), "`{needle}` is missing:\n{joined}");
+    }
+}
+
+#[test]
+fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
+    let mut view = view();
+    view.ambient_mut().work = zuno_types::WorkStateProjection {
+        goal: Some(zuno_types::GoalStateProjection {
+            objective: "finish the durable runtime upgrade".to_owned(),
+            status: "active".to_owned(),
+            tokens_used: 1_200,
+            token_budget: Some(5_000),
+        }),
+        todos: vec![zuno_types::TodoProjection {
+            content: "run the workspace gates".to_owned(),
+            status: "in_progress".to_owned(),
+            priority: "high".to_owned(),
+        }],
+        jobs: vec![zuno_types::JobProjection {
+            id: "job_1".to_owned(),
+            subject: "codex · review patch".to_owned(),
+            status: "running".to_owned(),
+            report_delivery: "quiet".to_owned(),
+        }],
+        memory_candidates: vec![zuno_types::MemoryCandidateProjection {
+            id: "mem_1".to_owned(),
+            scope: zuno_types::MemoryScope::Project,
+            action: zuno_types::MemoryAction::Add,
+            content: Some("run cargo fmt before commit".to_owned()),
+            old_text: None,
+            reason: "verified repository gate".to_owned(),
+            confidence: 9_500,
+            source: zuno_types::MemorySource::Reflection,
+            source_session_id: Some("ses_1".to_owned()),
+            source_message_id: Some("msg_1".to_owned()),
+            status: zuno_types::MemoryCandidateStatus::Pending,
+            error: None,
+            time_created: 1,
+            time_updated: 1,
+        }],
+        memory_entries: vec![zuno_types::MemoryEntryProjection {
+            scope: zuno_types::MemoryScope::Global,
+            content: "prefer concise explanations".to_owned(),
+        }],
+    };
+    view.toggle(Section::Memory);
+    let joined = view
+        .lines(SIDEBAR_WIDTH)
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let normalized = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for expected in [
+        "Goal",
+        "finish the durable runtime upgrade",
+        "Todos",
+        "run the workspace gates",
+        "Jobs",
+        "codex · review patch",
+        "Memory",
+        "1 review · 1 saved",
+        "run cargo fmt",
+        "prefer concise",
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "missing `{expected}`:\n{joined}"
+        );
     }
 }
 

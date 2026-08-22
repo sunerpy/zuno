@@ -41,13 +41,26 @@ use crate::environment::StartupEnvironment;
 /// `subagent_depth`, which is single digits.
 const MAX_ANCESTRY_WALK: u32 = 64;
 
+type ChangeHook = Arc<dyn Fn() + Send + Sync>;
+type SharedChangeHook = Arc<Mutex<Option<ChangeHook>>>;
+
 /// Owns background tasks started by one turn host.
 ///
 /// Waiting is part of host shutdown, so one-shot runtimes cannot discard a job after
 /// returning its id but before committing its terminal state.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct BackgroundJobSupervisor {
     tasks: Arc<Mutex<Vec<ManagedJob>>>,
+    changed: SharedChangeHook,
+}
+
+impl Default for BackgroundJobSupervisor {
+    fn default() -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(Vec::new())),
+            changed: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 struct ManagedJob {
@@ -58,6 +71,24 @@ struct ManagedJob {
 }
 
 impl BackgroundJobSupervisor {
+    pub(crate) fn set_change_hook(&self, changed: ChangeHook) {
+        *self
+            .changed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(changed);
+    }
+
+    fn notify_changed(&self) {
+        if let Some(changed) = self
+            .changed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            changed();
+        }
+    }
+
     pub(crate) fn spawn(
         &self,
         id: impl Into<String>,
@@ -65,6 +96,11 @@ impl BackgroundJobSupervisor {
         cancellation: CancellationToken,
         task: impl Future<Output = ()> + Send + 'static,
     ) {
+        let changed = self
+            .changed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         self.tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -72,8 +108,14 @@ impl BackgroundJobSupervisor {
                 id: id.into(),
                 parent_session_id: parent_session_id.into(),
                 cancellation,
-                task: tokio::spawn(task),
+                task: tokio::spawn(async move {
+                    task.await;
+                    if let Some(changed) = changed {
+                        changed();
+                    }
+                }),
             });
+        self.notify_changed();
     }
 
     /// Request cancellation without replaying or directly settling the job.

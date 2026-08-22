@@ -1,48 +1,80 @@
-//! Cross-crate proof for resident memory, the model-facing tool, and reflection.
-//!
-//! The component crates cannot prove this loop separately: the store does not own
-//! reflection, reflection accepts only an erased tool, and the tool does not own a
-//! session prompt. These tests deliberately cross all three boundaries.
+//! Cross-crate proof for candidate review, reflection, promotion, and undo.
 
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::Notify;
 use zuno_agent::reflection::{
     ReflectionConfig, ReflectionError, ReflectionFork, ReflectionRequest, ReflectionRunner,
     ReflectionToolCall, ReflectionTools, ReflectionTurn, TranscriptEvent, TurnDelivery,
     TurnTranscript,
 };
-use zuno_config::Config;
 use zuno_memory::{
-    MemoryStore, Operation, Scope, ScopeLimits, SessionMemory, assemble_system_prompt,
+    MemoryProposal, MemoryService, MemoryStore, PromotionPolicy, Scope, ScopeLimits, ScopePaths,
+    SessionMemory,
 };
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext, erase};
-use zuno_tools::{MemoryTool, ScopePaths};
+use zuno_tools::MemoryTool;
+use zuno_types::{MemoryAction, MemoryCandidateStatus, MemoryScope, MemorySource};
 
-const BASE_PROMPT: &str = "SYSTEM\nPreserve these bytes: ${UNEXPANDED}\r\n终";
 const CORRECTION: &str =
     "Use `cargo test -p zuno-memory --test integration` before the workspace suite.";
 
-fn parse_config(text: &str) -> Config {
-    Config::from_json_str(Path::new("opencode.json"), text).expect("memory config parses")
+fn fixture(
+    directory: &TempDir,
+    promotion: PromotionPolicy,
+) -> (Arc<zuno_db::Pool>, Arc<MemoryService>) {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+    let mut connection = pool.open_connection().expect("database connection");
+    zuno_db::migration::apply(&mut connection).expect("initialize schema");
+    connection
+        .execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('project', '/tmp/project', 1, 1, '[]');
+             INSERT INTO session (
+                 id, project_id, slug, directory, title, version, time_created, time_updated
+             ) VALUES (
+                 'ses_reflection', 'project', 'reflection', '/tmp/project',
+                 'Reflection', '1', 1, 1
+             );",
+        )
+        .expect("seed reflection session");
+    drop(connection);
+    let service = Arc::new(MemoryService::new(
+        Arc::clone(&pool),
+        ScopePaths::at(
+            directory.path().join("global").join("MEMORY.md"),
+            directory.path().join("project").join("RULES.md"),
+        ),
+        ScopeLimits::default(),
+        promotion,
+    ));
+    (pool, service)
 }
 
-fn paths(directory: &TempDir) -> ScopePaths {
-    ScopePaths::at(
-        directory.path().join("global").join("MEMORY.md"),
-        directory.path().join("project").join("RULES.md"),
-    )
+fn service(directory: &TempDir, promotion: PromotionPolicy) -> Arc<MemoryService> {
+    fixture(directory, promotion).1
 }
 
-fn context(session_id: &str) -> ToolContext {
+fn proposal(content: &str, confidence: f64) -> MemoryProposal {
+    MemoryProposal {
+        scope: MemoryScope::Project,
+        action: MemoryAction::Add,
+        content: Some(content.to_owned()),
+        old_text: None,
+        reason: "verified repository validation rule".to_owned(),
+        confidence,
+        source: MemorySource::User,
+        source_session_id: None,
+        source_message_id: None,
+    }
+}
+
+fn context() -> ToolContext {
     ToolContext::new(
-        session_id,
+        "ses_reflection",
         "msg_reflection",
         "call_reflection",
         "build",
@@ -51,31 +83,7 @@ fn context(session_id: &str) -> ToolContext {
     )
 }
 
-fn delivered(session_id: &str, transcript: TurnTranscript) -> ReflectionTurn {
-    ReflectionTurn::new(
-        TurnDelivery::new(true, false),
-        transcript,
-        context(session_id),
-    )
-}
-
-struct CorrectionRunner {
-    reviews: AtomicUsize,
-    invoked: Notify,
-}
-
-impl CorrectionRunner {
-    fn new() -> Self {
-        Self {
-            reviews: AtomicUsize::new(0),
-            invoked: Notify::new(),
-        }
-    }
-
-    fn review_count(&self) -> usize {
-        self.reviews.load(Ordering::SeqCst)
-    }
-}
+struct CorrectionRunner;
 
 #[async_trait]
 impl ReflectionRunner for CorrectionRunner {
@@ -84,16 +92,16 @@ impl ReflectionRunner for CorrectionRunner {
         _request: ReflectionRequest,
         tools: ReflectionTools,
     ) -> Result<(), ReflectionError> {
-        self.reviews.fetch_add(1, Ordering::SeqCst);
-        self.invoked.notify_one();
         tools
             .dispatch(ReflectionToolCall::new(
                 "reflection-memory-call",
-                "memory",
+                "memory_propose",
                 json!({
                     "target": "project",
                     "action": "add",
                     "content": CORRECTION,
+                    "reason": "the user corrected the repository gate",
+                    "confidence": 0.98
                 }),
             ))
             .await?;
@@ -102,152 +110,179 @@ impl ReflectionRunner for CorrectionRunner {
 }
 
 #[tokio::test]
-async fn a_correction_reflected_in_session_one_changes_session_twos_system_prompt() {
+async fn reflection_creates_a_pending_candidate_and_approval_changes_the_next_prompt() {
     let directory = TempDir::new().expect("temp dir");
-    let paths = paths(&directory);
-    let config = parse_config(r#"{"memory":{"nudge_interval":1}}"#);
-    let memory = config.resolved_memory();
-    let limits = ScopeLimits::new(memory.global_char_limit, memory.project_char_limit);
-
-    let session_one = SessionMemory::open_configured(
-        memory.resident,
-        paths.for_scope(Scope::Global),
-        paths.for_scope(Scope::Project),
-        limits,
-    )
-    .expect("session one opens")
-    .expect("resident memory is enabled");
-    assert_eq!(
-        assemble_system_prompt(BASE_PROMPT, Some(&session_one)),
-        BASE_PROMPT
-    );
-
-    let tool = MemoryTool::configured(memory.tool, paths.clone(), limits)
-        .expect("the model-facing memory tool is enabled");
-    let runner = Arc::new(CorrectionRunner::new());
+    let service = service(&directory, PromotionPolicy::Review);
     let fork = ReflectionFork::new(
         ReflectionConfig {
-            enabled: memory.reflection,
-            turn_interval: memory.nudge_interval,
-        },
-        Arc::clone(&runner) as Arc<dyn ReflectionRunner>,
-        erase(tool),
-    )
-    .expect("the configured tool has the memory id");
-    let transcript = TurnTranscript::new(vec![TranscriptEvent::user(format!(
-        "Correction: {CORRECTION}"
-    ))]);
-
-    fork.spawn_after_turn(delivered("ses_one", transcript))
-        .expect("the delivered correction starts reflection")
-        .await
-        .expect("reflection contains its own failures");
-    assert_eq!(runner.review_count(), 1, "the correction is reviewed once");
-    drop(session_one);
-
-    let session_two = SessionMemory::open_configured(
-        memory.resident,
-        paths.for_scope(Scope::Global),
-        paths.for_scope(Scope::Project),
-        limits,
-    )
-    .expect("session two opens")
-    .expect("resident memory is enabled");
-    let prompt = assemble_system_prompt(BASE_PROMPT, Some(&session_two));
-    assert!(
-        prompt.contains(CORRECTION),
-        "next session did not learn: {prompt}"
-    );
-    assert!(prompt.contains(Scope::Project.label()), "{prompt}");
-}
-
-#[tokio::test]
-async fn memory_false_matches_a_real_upstream_control_and_spawns_no_reflection() {
-    let directory = TempDir::new().expect("temp dir");
-    let paths = paths(&directory);
-    let mut seeded = MemoryStore::open(Scope::Project, paths.for_scope(Scope::Project).into())
-        .expect("seeded store opens");
-    seeded
-        .apply_batch(&[Operation::add(CORRECTION)])
-        .expect("non-empty memory makes the control sensitive");
-
-    let config = parse_config(r#"{"memory":false}"#);
-    let memory = config.resolved_memory();
-    assert!(!memory.resident && !memory.tool && !memory.reflection);
-    let limits = ScopeLimits::new(memory.global_char_limit, memory.project_char_limit);
-
-    let disabled_session = SessionMemory::open_configured(
-        memory.resident,
-        paths.for_scope(Scope::Global),
-        paths.for_scope(Scope::Project),
-        limits,
-    )
-    .expect("disabled construction is infallible");
-    assert!(
-        disabled_session.is_none(),
-        "disabled memory must not open a store"
-    );
-    let disabled_prompt = assemble_system_prompt(BASE_PROMPT, disabled_session.as_ref());
-
-    // This control is genuinely subsystem-absent: it is copied directly from the
-    // pre-memory prompt bytes and never calls a memory constructor or prompt helper.
-    let upstream_without_memory = BASE_PROMPT.as_bytes().to_vec();
-    assert_eq!(
-        disabled_prompt.as_bytes(),
-        upstream_without_memory.as_slice()
-    );
-    assert!(!disabled_prompt.contains(CORRECTION));
-
-    // Sensitivity guard: the same seeded files must change the enabled path. If a
-    // future edit empties the fixture, the byte-identity assertion cannot pass
-    // vacuously because this independent inequality fails.
-    let enabled_session = SessionMemory::open_configured(
-        true,
-        paths.for_scope(Scope::Global),
-        paths.for_scope(Scope::Project),
-        limits,
-    )
-    .expect("enabled construction reads the seeded file")
-    .expect("enabled session exists");
-    let enabled_prompt = assemble_system_prompt(BASE_PROMPT, Some(&enabled_session));
-    assert_ne!(
-        enabled_prompt.as_bytes(),
-        upstream_without_memory.as_slice()
-    );
-    assert!(enabled_prompt.contains(CORRECTION));
-
-    assert!(
-        MemoryTool::configured(memory.tool, paths.clone(), limits).is_none(),
-        "the model-facing tool must be absent, not merely refusing calls"
-    );
-
-    // Deliberately provide a usable memory tool underneath the disabled fork. This
-    // isolates the reflection gate: only `enabled: false` can explain no spawn.
-    let runner = Arc::new(CorrectionRunner::new());
-    let fork = ReflectionFork::new(
-        ReflectionConfig {
-            enabled: memory.reflection,
+            enabled: true,
             turn_interval: 1,
         },
-        Arc::clone(&runner) as Arc<dyn ReflectionRunner>,
-        erase(MemoryTool::with_paths_and_limits(paths, limits)),
+        Arc::new(CorrectionRunner),
+        erase(MemoryTool::reflection(Arc::clone(&service))),
+    );
+    let task = fork
+        .spawn_after_turn(ReflectionTurn::new(
+            TurnDelivery::new(true, false),
+            TurnTranscript::new(vec![TranscriptEvent::user(format!(
+                "Correction: {CORRECTION}"
+            ))]),
+            context(),
+        ))
+        .expect("reflection spawned");
+    task.await.expect("reflection task");
+
+    let candidates = service.candidates().expect("candidates");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].status, MemoryCandidateStatus::Pending);
+    assert!(!service.paths().for_scope(Scope::Project).exists());
+
+    service.apply(&candidates[0].id).expect("approve candidate");
+    let prompt = SessionMemory::open(
+        service.paths().for_scope(Scope::Global),
+        service.paths().for_scope(Scope::Project),
     )
-    .expect("test tool has the memory id");
-    let spawned = fork.spawn_after_turn(delivered(
-        "ses_disabled",
-        TurnTranscript::new(vec![TranscriptEvent::user(
-            "Correction that must be ignored",
-        )]),
-    ));
-    assert!(
-        spawned.is_none(),
-        "disabled reflection returned a task handle"
+    .expect("session memory")
+    .inject_into("SYSTEM");
+    assert!(prompt.contains(CORRECTION), "{prompt}");
+}
+
+#[test]
+fn high_confidence_promotion_applies_only_at_the_configured_threshold() {
+    let directory = TempDir::new().expect("temp dir");
+    let service = service(
+        &directory,
+        PromotionPolicy::HighConfidence { threshold: 9_000 },
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), runner.invoked.notified())
-            .await
-            .is_err(),
-        "the runner was invoked despite memory: false"
+
+    let pending = service
+        .propose(proposal("candidate below the threshold", 0.89))
+        .expect("low confidence proposal");
+    let applied = service
+        .propose(proposal("candidate at the threshold", 0.90))
+        .expect("high confidence proposal");
+
+    assert_eq!(pending.projection.status, MemoryCandidateStatus::Pending);
+    assert_eq!(applied.projection.status, MemoryCandidateStatus::Applied);
+    assert_eq!(
+        service.entries().expect("entries")[0].content,
+        "candidate at the threshold"
     );
-    assert_eq!(runner.review_count(), 0);
+}
+
+#[test]
+fn undo_restores_the_exact_pre_apply_snapshot() {
+    let directory = TempDir::new().expect("temp dir");
+    let service = service(&directory, PromotionPolicy::Review);
+    let first = service
+        .propose(proposal("first durable entry", 1.0))
+        .expect("first proposal");
+    service.apply(first.id()).expect("first apply");
+    let second = service
+        .propose(proposal("second durable entry", 1.0))
+        .expect("second proposal");
+    service.apply(second.id()).expect("second apply");
+
+    service.undo(second.id()).expect("undo second");
+
+    assert_eq!(
+        service
+            .entries()
+            .expect("entries")
+            .into_iter()
+            .map(|entry| entry.content)
+            .collect::<Vec<_>>(),
+        vec!["first durable entry"]
+    );
+    assert_eq!(
+        service
+            .candidates()
+            .expect("candidates")
+            .into_iter()
+            .find(|candidate| candidate.id == second.id())
+            .expect("second candidate")
+            .status,
+        MemoryCandidateStatus::Undone
+    );
+}
+
+#[test]
+fn restart_reconciliation_observes_apply_and_undo_without_replaying_either_write() {
+    let directory = TempDir::new().expect("temp dir");
+    let (pool, service) = fixture(&directory, PromotionPolicy::Review);
+    let store = zuno_db::memory_candidate::MemoryCandidateStore::new(pool);
+    let candidate = service
+        .propose(proposal("durable entry", 1.0))
+        .expect("proposal");
+    let project_path = service.paths().for_scope(Scope::Project);
+
+    store
+        .begin_apply(candidate.id(), &[], &["durable entry".to_owned()], 20)
+        .expect("record interrupted apply");
+    MemoryStore::open(Scope::Project, project_path.to_path_buf())
+        .expect("open resident store")
+        .replace_exact(&[], &["durable entry".to_owned()])
+        .expect("simulate completed file write");
+    service.reconcile().expect("reconcile apply");
+    assert_eq!(
+        store
+            .get(candidate.id())
+            .expect("applied candidate")
+            .projection
+            .status,
+        MemoryCandidateStatus::Applied
+    );
+
+    store
+        .begin_undo(candidate.id(), 30)
+        .expect("record interrupted undo");
+    MemoryStore::open(Scope::Project, project_path.to_path_buf())
+        .expect("open resident store")
+        .replace_exact(&["durable entry".to_owned()], &[])
+        .expect("simulate completed undo write");
+    service.reconcile().expect("reconcile undo");
+    assert_eq!(
+        store
+            .get(candidate.id())
+            .expect("undone candidate")
+            .projection
+            .status,
+        MemoryCandidateStatus::Undone
+    );
+    assert!(service.entries().expect("resident entries").is_empty());
+}
+
+#[test]
+fn restart_reconciliation_marks_divergent_resident_state_uncertain() {
+    let directory = TempDir::new().expect("temp dir");
+    let (pool, service) = fixture(&directory, PromotionPolicy::Review);
+    let store = zuno_db::memory_candidate::MemoryCandidateStore::new(pool);
+    let candidate = service
+        .propose(proposal("expected entry", 1.0))
+        .expect("proposal");
+    store
+        .begin_apply(candidate.id(), &[], &["expected entry".to_owned()], 20)
+        .expect("record interrupted apply");
+    MemoryStore::open(
+        Scope::Project,
+        service.paths().for_scope(Scope::Project).to_path_buf(),
+    )
+    .expect("open resident store")
+    .replace_exact(&[], &["different external state".to_owned()])
+    .expect("simulate divergent state");
+
+    service.reconcile().expect("reconcile divergence");
+
+    assert_eq!(
+        store
+            .get(candidate.id())
+            .expect("candidate")
+            .projection
+            .status,
+        MemoryCandidateStatus::Uncertain
+    );
+    assert_eq!(
+        service.entries().expect("resident entries")[0].content,
+        "different external state"
+    );
 }

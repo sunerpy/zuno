@@ -57,6 +57,7 @@ pub mod help;
 mod highlight;
 pub mod lsp;
 pub mod markdown;
+pub mod memory;
 pub mod message;
 pub mod palette;
 pub mod permission;

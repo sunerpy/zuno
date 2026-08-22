@@ -1,6 +1,8 @@
 # Zuno database lifecycle
 
-Zuno reads only its own config and data roots. The migrations on this page evolve a database already selected and created by Zuno.
+Zuno reads only its own config and data roots. Because the project is unreleased,
+the database is created directly at the current format and is never upgraded
+through an incremental migration chain.
 
 ## The channel database
 

@@ -24,7 +24,8 @@ pub enum ReportDelivery {
 }
 
 impl ReportDelivery {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::NextStep => "next-step",
             Self::Quiet => "quiet",
@@ -127,7 +128,8 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Completed => "completed",

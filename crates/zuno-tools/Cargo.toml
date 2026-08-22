@@ -37,6 +37,7 @@ zuno-permission = { workspace = true }
 zuno-pty = { workspace = true }
 zuno-search = { workspace = true }
 zuno-tool = { workspace = true }
+zuno-types = { workspace = true }
 reqwest = { workspace = true }
 # Only for `rusqlite::params!` in `todo::SqliteTodoStore`; the connection, pragmas
 # and schema all come from `zuno-db`, which re-exports the types this crate names.

@@ -1,6 +1,15 @@
 {
   "model": "myopenai/primary-model",
   "small_model": "myopenai/fast-model",
+  "concurrency": {
+    "tool_calls": 8,
+    "mcp_connections": 8,
+    "lsp_requests": 4
+  },
+  "memory": {
+    "promotion": "review",
+    "auto_confidence": 0.9
+  },
   "provider": {
     "myopenai": {
       "name": "My OpenAI gateway",

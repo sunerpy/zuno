@@ -268,11 +268,15 @@ const UI_SPECS: &[UiSpec] = &[
         action: "ps_view",
         aliases: &[],
     },
+    UiSpec {
+        action: "memory_view",
+        aliases: &[],
+    },
 ];
 
 fn ui_commands() -> Vec<SlashCommand> {
     // This route metadata contains only actions `SessionScreen` consumes. Definitions for
-    // planned surfaces remain in the compatibility table, but advertising one before its
+    // planned surfaces remain in the source binding table, but advertising one before its
     // screen arm exists turns a valid slash command into silent failure. `variant_list` is
     // the concrete case: the complete `variant` scope is `variant_cycle` on `ctrl+t` plus
     // unbound `variant_list`, so registering it would not steal a bare character the way

@@ -101,6 +101,41 @@ Independent runtime work has three bounded controls:
 Each field accepts `1..=64`; omission uses the values above. Set a field to `1`
 to restore serial behavior for that layer.
 
+## Memory learning
+
+Resident memory is enabled by default, but model and reflection writes enter an
+auditable candidate queue first:
+
+```json
+{
+  "memory": {
+    "resident": true,
+    "tool": true,
+    "reflection": true,
+    "global_char_limit": 2200,
+    "project_char_limit": 3000,
+    "nudge_interval": 10,
+    "promotion": "review",
+    "auto_confidence": 0.9
+  }
+}
+```
+
+- `resident` injects the frozen global and project memory blocks into prompts.
+- `tool` exposes `memory_propose`; it never grants direct file mutation.
+- `reflection` reviews completed delivered turns with `small_model`. Reflection
+  is disabled with a visible diagnostic when no explicit reachable small model
+  is configured; Zuno does not silently spend the session model.
+- `nudge_interval` triggers periodic review every N delivered turns. A verified
+  recovery can trigger review earlier; zero disables only the periodic trigger.
+- `promotion` is `review` (default), `high_confidence`, or `automatic`.
+  `high_confidence` applies only candidates at or above `auto_confidence`.
+- `auto_confidence` is a finite value in `0..=1` and defaults to `0.9`.
+
+`memory: false` disables resident injection, proposal tools, and reflection.
+`/memory` reviews, edits, approves, rejects, removes, and undoes durable changes.
+See [auditable memory and reflection](../design/memory-learning.md).
+
 ## Inspecting the result
 
 Use `zuno debug paths` to inspect resolved roots and `zuno debug config` to inspect the merged configuration. A validation error names every rejected top-level key; for example, putting `theme` in `zuno.json` is rejected because it belongs in `tui.json`.

@@ -19,12 +19,19 @@ This ledger records reviewed upstream behavior. It does not promise API compatib
 | Dynamic Cordis package lifecycle | `zuno-extension` process registry, typed lifecycle tools, active-composition generation, and TUI rebuild | `adapt`: preserve define/run/stop/undefine and restart-loss semantics; reject JavaScript/Cordis ABI compatibility. |
 | Static profile/bundle loading | `zuno.extension/v1` manifests under config-root `extensions/<id>/extension.json` | `adapt`: use the same validated agent/workflow/skill package as the dynamic path; compiled services remain Rust profiles. |
 | Codex and Claude Code product subagents | `zuno-product-agent`, configured static tools, generic durable jobs, `job_cancel`, and the shared TUI subagent projection | `adapt`: retain native product protocols, authentication, configuration, and model choice; reject the TypeScript API as a compatibility target. |
+| Reflection, memory review, and durable work state | `memory_propose`, `MemoryCandidate`, `WorkStateProjection`, reflection request/outcome events, and `/memory` | `adapt`: preserve isolated post-delivery learning and live work tracking, but require an auditable review path, explicit promotion policy, typed uncertainty, and no automatic code/prompt/agent/skill rewrites. |
 
 ## 2026-08-22 no-delta review
 
 `dsh_delta.py` resolved both the recorded baseline and current `origin/master` to `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` (`dsh-v0.1.1-rc.2`). There were no unreviewed commits, so the baseline JSON was not advanced.
 
 The Codex and Claude Code product-subagent design was reviewed from the already-pinned release and classified `adapt`: Zuno uses native Rust providers, durable `JobSubject::ProductAgent` state, `ToolReplayPolicy::Never`, process-tree cancellation, and frontend-neutral `ToolUiIntent::Subagent` projection.
+
+The TUI/runtime/memory upgrade was also classified `adapt` against the pinned
+release and current design sources: Zuno uses frontend-neutral activity/work
+projections, durable reflection events, candidate review, and at-most-once file
+application/undo. No upstream commit was added, so the baseline remains
+`dsh-v0.1.1-rc.2`.
 
 ## dsh-v0.1.1-rc.1
 

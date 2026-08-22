@@ -82,7 +82,7 @@ fn host_commands_win_catalog_name_collisions() {
 }
 
 #[test]
-fn supported_ui_commands_and_compatibility_aliases_dispatch_actions() {
+fn supported_ui_commands_and_aliases_dispatch_actions() {
     for (input, action) in [
         ("/models", "model_list"),
         ("/model", "model_list"),
@@ -105,6 +105,8 @@ fn supported_ui_commands_and_compatibility_aliases_dispatch_actions() {
         ("/editor", "editor_open"),
         ("/thinking", "display_thinking"),
         ("/toggle-thinking", "display_thinking"),
+        ("/ps", "ps_view"),
+        ("/memory", "memory_view"),
         ("/exit", "app_exit"),
         ("/quit", "app_exit"),
         ("/q", "app_exit"),

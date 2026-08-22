@@ -14,6 +14,7 @@ zuno-error = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-snapshot = { workspace = true }
 zuno-tool = { workspace = true }
+zuno-types = { workspace = true }
 # `trace` is carried for one reason: the hydration test proves its statement
 # count with SQLite's own `SQLITE_TRACE_STMT` hook, not only with the counter
 # this crate keeps. A self-reported number is not evidence of an absent N+1.

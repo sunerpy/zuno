@@ -5077,6 +5077,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
  "tikv-jemallocator",
@@ -5123,6 +5124,7 @@ dependencies = [
  "zuno-tool",
  "zuno-tools",
  "zuno-tui",
+ "zuno-types",
  "zuno-watch",
 ]
 
@@ -5165,6 +5167,7 @@ dependencies = [
  "zuno-snapshot",
  "zuno-testkit",
  "zuno-tool",
+ "zuno-types",
 ]
 
 [[package]]
@@ -5339,6 +5342,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "uuid",
  "zuno-agent",
  "zuno-config",
  "zuno-db",
@@ -5348,6 +5352,7 @@ dependencies = [
  "zuno-paths",
  "zuno-tool",
  "zuno-tools",
+ "zuno-types",
 ]
 
 [[package]]
@@ -5713,6 +5718,7 @@ dependencies = [
  "zuno-search",
  "zuno-testkit",
  "zuno-tool",
+ "zuno-types",
 ]
 
 [[package]]

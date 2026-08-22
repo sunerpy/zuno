@@ -46,11 +46,11 @@ use async_trait::async_trait;
 use zuno_catalog::agent;
 use zuno_config::schema::Config;
 use zuno_error::ToolError;
-use zuno_memory::ScopeLimits;
 use zuno_paths::Env;
 use zuno_permission::Rule;
 use zuno_permission::visibility::permission_key;
 use zuno_tool::{PermissionAsk, PermissionAsker, Tool, erase};
+use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::question::{QuestionAsker, QuestionTool};
 use zuno_tools::registry::{
@@ -58,7 +58,6 @@ use zuno_tools::registry::{
 };
 use zuno_tools::search_common::{SearchScope, SearchTooling};
 use zuno_tools::websearch::gating::SearchConfig;
-use zuno_tools::{FileTools, MemoryTool, ScopePaths};
 
 /// The executable tools and the ruleset that governs them, for one turn.
 pub(crate) struct ToolRuntime {
@@ -88,6 +87,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) delegation: Delegation,
     pub(crate) product_agents: Arc<dyn zuno_tools::product_agent::ProductAgentHost>,
     pub(crate) job_controller: Arc<dyn zuno_tools::job_cancel::JobController>,
+    pub(crate) memory: Option<Arc<dyn Tool>>,
 }
 
 /// The collaborators `task` needs, which only a surface that can drive a turn has.
@@ -231,8 +231,7 @@ pub(crate) fn assemble(
         builder = builder.with_mcp_loader(loader);
     }
 
-    let memory_root = worktree.unwrap_or(directory);
-    if let Some(memory) = configured_memory_tool(memory_root, config) {
+    if let Some(memory) = selection.memory {
         builder.register_configured_builtin(memory);
     }
     let mut product_tool_names = BTreeSet::new();
@@ -299,12 +298,6 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
         || harness_tool_names.contains(name)
 }
 
-fn configured_memory_tool(root: &Path, config: &Config) -> Option<Arc<dyn Tool>> {
-    let memory = config.resolved_memory();
-    let limits = ScopeLimits::new(memory.global_char_limit, memory.project_char_limit);
-    MemoryTool::configured(memory.tool, ScopePaths::discover(root), limits).map(erase)
-}
-
 /// The approval collaborator for a surface with no user attached.
 ///
 /// Every `ask` becomes [`ToolError::Denied`] carrying the permission key and the
@@ -338,37 +331,13 @@ fn to_string(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
 
-    fn config(text: &str) -> Config {
-        Config::from_json_str(Path::new("opencode.json"), text).expect("memory config")
-    }
-
-    #[test]
-    fn memory_tool_is_present_by_default_and_absent_under_master_switch() {
-        let root = Path::new("/tmp/memory-tool-gate");
-        let enabled = configured_memory_tool(root, &Config::default());
-        let disabled = configured_memory_tool(root, &config(r#"{"memory":false}"#));
-
-        assert_eq!(enabled.as_ref().map(|tool| tool.id()), Some("memory"));
-        assert!(disabled.is_none());
-    }
-
-    #[test]
-    fn component_tool_switch_can_disable_only_model_facing_access() {
-        let memory = configured_memory_tool(
-            Path::new("/tmp/memory-tool-component-gate"),
-            &config(r#"{"memory":{"tool":false}}"#),
-        );
-
-        assert!(memory.is_none());
-    }
-
     #[test]
     fn product_agent_names_reserve_every_native_and_harness_tool() {
         let harness = BTreeSet::from(["extension_tool".to_owned()]);
         for name in [
             "task",
             "job_cancel",
-            "memory",
+            "memory_propose",
             "get_goal",
             "create_goal",
             "update_goal",

@@ -10,6 +10,7 @@ This directory is organized so it can be projected into a documentation site wit
 - [Codex and Claude Code product agents](design/product-agents.md): native product protocols, permissions, background jobs, cancellation, and credential ownership.
 - [Harness runtime](harness-runtime.md): components, profiles, durable delivery, goals, and recovery.
 - [Client interfaces](design/client-interfaces.md): TUI, HTTP, ACP, and future GUI ownership.
+- [Memory learning](design/memory-learning.md): durable candidates, reflection, review, promotion, and undo.
 
 ## Operate
 
@@ -22,6 +23,7 @@ This directory is organized so it can be projected into a documentation site wit
 - [Harness comparison](design/harness-comparison.md)
 - [Provider authentication](design/provider-authentication.md)
 - [Product agents](design/product-agents.md)
+- [Memory learning](design/memory-learning.md)
 - [Migration and durable schema](migration.md)
 
 Future site navigation should keep the same three user-facing groups: **Learn**, **Operate**, and **Design**. Generated API and JSON Schema artifacts belong under **Reference**, not in tutorials.

@@ -162,6 +162,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         session,
         title: None,
         internals: stub_internals(),
+        reflection_model: None,
         window: TokenWindow {
             context: 0,
             max_output: 0,
@@ -326,7 +327,7 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
 #[test]
 fn production_prompt_composition_honours_the_memory_master_switch() {
     let directory = tempfile::TempDir::new().expect("temporary memory paths");
-    let paths = zuno_tools::ScopePaths::at(
+    let paths = zuno_memory::ScopePaths::at(
         directory.path().join("global/MEMORY.md"),
         directory.path().join("project/RULES.md"),
     );
@@ -364,7 +365,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     let root = tempfile::TempDir::new().expect("temporary prompt root");
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo");
-    let paths = zuno_tools::ScopePaths::at(
+    let paths = zuno_memory::ScopePaths::at(
         root.path().join("global/MEMORY.md"),
         repo.join(".zuno/RULES.md"),
     );
@@ -2622,6 +2623,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             delegation: test_delegation(),
             product_agents: test_product_agents(),
             job_controller: test_job_controller(),
+            memory: None,
         },
     )
     .expect("production registry assembles");
@@ -3432,6 +3434,7 @@ mod production_registry {
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
                 job_controller: test_job_controller(),
+                memory: None,
             },
         )?;
         let ids = runtime
@@ -3573,7 +3576,7 @@ mod production_registry {
             (
                 r#"{
                     "productAgent": {
-                        "one": {"kind":"codex","enabled":true,"toolName":"memory"}
+                        "one": {"kind":"codex","enabled":true,"toolName":"memory_propose"}
                     }
                 }"#,
                 "collides with a native tool",
@@ -3640,6 +3643,7 @@ mod production_registry {
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
                 job_controller: test_job_controller(),
+                memory: None,
             },
         )
         .expect("production registry assembles");
@@ -4075,7 +4079,7 @@ fn instruction_files_are_injected_once_between_memory_and_the_skill_catalogue() 
     .expect("turn.rs is readable");
 
     let memory_at = turn
-        .find("configure_resident_memory(\n            &mut plan.resolver,")
+        .find("configure_resident_memory(&mut plan.resolver, &plan.config, memory_paths.clone())?;")
         .expect("the resident-memory call site moved; this test's anchors need updating");
     let instructions_at = turn
         .find("announce_instructions(&mut plan.resolver")
@@ -4188,7 +4192,7 @@ fn every_extension_contribution_reaches_its_native_consumer() {
     }
 
     let memory_at = turn
-        .find("configure_resident_memory(\n            &mut plan.resolver,")
+        .find("configure_resident_memory(&mut plan.resolver, &plan.config, memory_paths.clone())?;")
         .expect("resident memory is assembled");
     let extensions_at = turn
         .find("append_prompt_section(\n            \"extensions\"")
@@ -4689,4 +4693,340 @@ fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
         "`model_spec` no longer defaults the output cap from the catalog, so every \
          request runs uncapped"
     );
+}
+
+mod reflection_runtime {
+    use super::*;
+    use futures::stream;
+    use zuno_agent::reflection::{
+        ReflectionConfig, ReflectionTurn, TranscriptEvent, TurnDelivery, TurnTranscript,
+    };
+    use zuno_llm::registry::{Capabilities, ProviderStream};
+
+    const SESSION_ID: &str = "ses_reflection_runtime";
+
+    #[derive(Debug)]
+    struct ScriptedProvider {
+        events: Vec<StreamEvent>,
+    }
+
+    impl Provider for ScriptedProvider {
+        fn id(&self) -> &str {
+            "reflection-provider"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                tool_calls: true,
+                ..Capabilities::text_only()
+            }
+        }
+
+        fn stream(&self, _request: CompletionRequest) -> ProviderStream<'_> {
+            Box::pin(stream::iter(self.events.clone().into_iter().map(Ok)))
+        }
+    }
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        memory: Arc<MemoryService>,
+        events: zuno_db::event_log::SessionEventLog,
+        fork: ReflectionFork,
+    }
+
+    fn fixture(provider_events: Vec<StreamEvent>) -> Fixture {
+        let directory = tempfile::tempdir().expect("temporary memory directory");
+        let pool =
+            Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+        let mut connection = pool.open_connection().expect("database connection");
+        zuno_db::migration::apply(&mut connection).expect("initialize schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+                 VALUES ('project', '/workspace', 1, 1, '[]');
+                 INSERT INTO session (
+                     id, project_id, slug, directory, title, version, time_created, time_updated
+                 ) VALUES (
+                     'ses_reflection_runtime', 'project', 'reflection-runtime', '/workspace',
+                     'Reflection runtime', 'zuno', 1, 1
+                 );",
+            )
+            .expect("seed reflection session");
+        drop(connection);
+
+        let memory = Arc::new(MemoryService::new(
+            Arc::clone(&pool),
+            ScopePaths::at(
+                directory.path().join("global/MEMORY.md"),
+                directory.path().join("project/RULES.md"),
+            ),
+            ScopeLimits::default(),
+            PromotionPolicy::Review,
+        ));
+        let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool));
+        let runner = ProviderReflectionRunner {
+            provider: Arc::new(ScriptedProvider {
+                events: provider_events,
+            }),
+            model: EngineModel::new(
+                Spec::new("reflection-provider"),
+                "small-model",
+                ApiSurface::Chat,
+            ),
+            events: zuno_db::event_log::SessionEventLog::new(pool),
+        };
+        let fork = ReflectionFork::new(
+            ReflectionConfig {
+                enabled: true,
+                turn_interval: 1,
+            },
+            Arc::new(runner),
+            erase(zuno_tools::MemoryTool::reflection(Arc::clone(&memory))),
+        );
+        Fixture {
+            _directory: directory,
+            memory,
+            events,
+            fork,
+        }
+    }
+
+    async fn run(fixture: &Fixture) {
+        fixture
+            .fork
+            .spawn_after_turn(ReflectionTurn::new(
+                TurnDelivery::new(true, false),
+                TurnTranscript::new(vec![
+                    TranscriptEvent::user("remember the verified repository gate"),
+                    TranscriptEvent::assistant("The gate passed and is reusable."),
+                ]),
+                ToolContext::new(
+                    SESSION_ID,
+                    "msg_delivered",
+                    "call_reflection",
+                    "build",
+                    Arc::new(AllowAll),
+                    Arc::new(NeverInterrupted),
+                ),
+            ))
+            .expect("reflection task")
+            .await
+            .expect("reflection supervisor task");
+    }
+
+    fn tool_events(name: &str, input: &str, with_end: bool) -> Vec<StreamEvent> {
+        let mut events = vec![
+            StreamEvent::ToolUseStart {
+                id: "call_memory".to_owned(),
+                name: name.to_owned(),
+            },
+            StreamEvent::ToolInputDelta(input.to_owned()),
+            StreamEvent::ToolUseEnd,
+        ];
+        if with_end {
+            events.push(StreamEvent::MessageEnd {
+                stop_reason: Some(zuno_llm::event::FinishReason::ToolCalls),
+            });
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn provider_reflection_persists_request_outcome_and_pending_candidate() {
+        let fixture = fixture(tool_events(
+            "memory_propose",
+            r#"{"target":"project","action":"add","content":"run cargo test","reason":"verified repository gate","confidence":0.98}"#,
+            true,
+        ));
+
+        run(&fixture).await;
+
+        let candidates = fixture.memory.candidates().expect("memory candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].status,
+            zuno_types::MemoryCandidateStatus::Pending
+        );
+        let events = fixture
+            .events
+            .read_after(SESSION_ID, None)
+            .expect("reflection events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["memory.reflection.request", "memory.reflection.outcome"]
+        );
+        assert_eq!(events[0].properties["tool"]["name"], "memory_propose");
+        assert_eq!(events[1].properties["status"], "completed");
+        assert_eq!(events[1].properties["toolCalls"], 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_denied_and_truncated_reflection_streams_are_durable_failures() {
+        for (events, expected) in [
+            (
+                tool_events("memory_propose", "{", true),
+                "malformed tool arguments",
+            ),
+            (
+                tool_events("bash", r#"{"command":"echo forbidden"}"#, true),
+                "denied non-whitelisted tool",
+            ),
+            (
+                tool_events(
+                    "memory_propose",
+                    r#"{"target":"project","action":"add","content":"x","reason":"y","confidence":1}"#,
+                    false,
+                ),
+                "ended before MessageEnd",
+            ),
+        ] {
+            let fixture = fixture(events);
+            run(&fixture).await;
+
+            assert!(
+                fixture.memory.candidates().expect("candidates").is_empty(),
+                "failed reflection wrote a candidate"
+            );
+            let events = fixture
+                .events
+                .read_after(SESSION_ID, None)
+                .expect("reflection events");
+            let outcome = events.last().expect("failure outcome");
+            assert_eq!(outcome.event_type, "memory.reflection.outcome");
+            assert_eq!(outcome.properties["status"], "failed");
+            assert!(
+                outcome.properties["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(expected)),
+                "missing `{expected}` in {}",
+                outcome.properties["error"]
+            );
+        }
+    }
+
+    #[test]
+    fn durable_reflection_transcript_replays_delivered_text_and_terminal_tool_results() {
+        let mut connection =
+            zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open database");
+        zuno_db::migration::apply(&mut connection).expect("initialize schema");
+        let fixture_plan = plan("/workspace", SessionChoice::New);
+        let now = 1_780_000_000_000;
+        ensure_project(&connection, &fixture_plan.project, now).expect("persist project");
+        let session = resolve_session(&mut connection, &fixture_plan, now).expect("create session");
+        let (user, user_parts) = prepare_user_message(
+            UserMessageInput {
+                session_id: &session.id,
+                agent: "build",
+                provider_id: "provider",
+                model_id: "model",
+                text: "verify the gate",
+                message_id: Some("msg_reflection_user"),
+                now,
+            },
+            None,
+        )
+        .expect("prepare user message");
+        persist_prepared_user_message(&connection, &user, &user_parts)
+            .expect("persist user message");
+
+        let assistant = zuno_db::message::MessageRecord::from_json(json!({
+            "id": "msg_reflection_assistant",
+            "sessionID": session.id,
+            "role": "assistant",
+            "time": {"created": now + 1, "completed": now + 2},
+            "parentID": user.id,
+            "modelID": "model",
+            "providerID": "provider",
+            "mode": "build",
+            "agent": "build",
+            "path": {"cwd": "/workspace", "root": "/workspace"},
+            "cost": 0,
+            "tokens": {
+                "input": 1,
+                "output": 1,
+                "reasoning": 0,
+                "cache": {"read": 0, "write": 0}
+            },
+            "finish": "stop"
+        }))
+        .expect("assistant message");
+        let parts = [
+            json!({
+                "id": "prt_reflection_text",
+                "sessionID": session.id,
+                "messageID": assistant.id,
+                "type": "text",
+                "text": "I verified the gate."
+            }),
+            json!({
+                "id": "prt_reflection_failed",
+                "sessionID": session.id,
+                "messageID": assistant.id,
+                "type": "tool",
+                "callID": "call_failed",
+                "tool": "bash",
+                "state": {
+                    "status": "error",
+                    "input": {"command": "cargo test"},
+                    "error": "first attempt failed"
+                }
+            }),
+            json!({
+                "id": "prt_reflection_succeeded",
+                "sessionID": session.id,
+                "messageID": assistant.id,
+                "type": "tool",
+                "callID": "call_succeeded",
+                "tool": "bash",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "cargo test"},
+                    "output": "all tests passed"
+                }
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(offset, part)| {
+            zuno_db::message::PartRecord::from_json(part, now + 2 + offset as i64)
+                .expect("assistant part")
+        })
+        .collect::<Vec<_>>();
+        let store = zuno_db::message::MessageStore::new(&connection);
+        store
+            .put_message_at(&assistant, now + 1)
+            .expect("persist assistant");
+        for part in &parts {
+            store
+                .put_part_at(part, part.time_created)
+                .expect("persist assistant part");
+        }
+
+        let transcript =
+            durable_reflection_transcript(&connection, &session.id, "msg_reflection_assistant")
+                .expect("durable transcript");
+        assert_eq!(
+            transcript,
+            TurnTranscript::new(vec![
+                TranscriptEvent::user("verify the gate"),
+                TranscriptEvent::assistant("I verified the gate."),
+                TranscriptEvent::command(
+                    "cargo test",
+                    zuno_agent::reflection::CommandOutcome::failed("first attempt failed"),
+                ),
+                TranscriptEvent::command(
+                    "cargo test",
+                    zuno_agent::reflection::CommandOutcome::succeeded("all tests passed"),
+                ),
+            ])
+        );
+        assert!(
+            durable_reflection_transcript(&connection, &session.id, "msg_missing")
+                .expect_err("missing delivered message must fail")
+                .contains("missing from durable history")
+        );
+    }
 }

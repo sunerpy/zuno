@@ -163,6 +163,8 @@ pub struct Ambient {
     pub mcp: Vec<Service>,
     /// Discovered skills.
     pub skills: Vec<SkillSummary>,
+    /// Durable goal, todo, job, and resident-memory state.
+    pub work: zuno_types::WorkStateProjection,
     /// The build's version.
     pub version: Option<String>,
 }
@@ -238,6 +240,65 @@ impl SessionTitle {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (titled.generation, titled.title.clone())
+    }
+}
+
+/// Durable work state and a counter that advances only when it changes.
+#[derive(Debug, Default)]
+struct ProjectedWork {
+    generation: u64,
+    state: zuno_types::WorkStateProjection,
+}
+
+/// Shared client projection for goal, todo, job, and memory state.
+#[derive(Debug, Clone, Default)]
+pub struct WorkState(std::sync::Arc<std::sync::RwLock<ProjectedWork>>);
+
+impl WorkState {
+    #[must_use]
+    pub fn new(state: zuno_types::WorkStateProjection) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(ProjectedWork {
+            generation: 0,
+            state,
+        })))
+    }
+
+    pub fn replace(&self, state: zuno_types::WorkStateProjection) {
+        let mut projected = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if projected.state == state {
+            return;
+        }
+        projected.state = state;
+        projected.generation = projected.generation.wrapping_add(1);
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    #[must_use]
+    pub fn observe(&self) -> (u64, zuno_types::WorkStateProjection) {
+        let projected = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (projected.generation, projected.state.clone())
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> zuno_types::WorkStateProjection {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+            .clone()
     }
 }
 
@@ -360,6 +421,14 @@ pub fn compact(value: u64) -> String {
 /// Which sidebar sections are expanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Expanded {
+    /// Whether the active-goal summary is open.
+    pub goal: bool,
+    /// Whether the todo list is open.
+    pub todos: bool,
+    /// Whether the durable job list is open.
+    pub jobs: bool,
+    /// Whether memory candidates and entries are open.
+    pub memory: bool,
     /// Whether the LSP list is open.
     pub lsp: bool,
     /// Whether the MCP list is open.
@@ -376,6 +445,10 @@ impl Default for Expanded {
     /// their names are not. Servers are few and can break, so their names are.
     fn default() -> Self {
         Self {
+            goal: true,
+            todos: true,
+            jobs: true,
+            memory: false,
             lsp: true,
             mcp: true,
             skills: false,
@@ -390,6 +463,14 @@ impl Default for Expanded {
 /// section moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
+    /// The active goal.
+    Goal,
+    /// The durable todo list.
+    Todos,
+    /// Background jobs.
+    Jobs,
+    /// Resident-memory candidates and entries.
+    Memory,
     /// The language-server list.
     Lsp,
     /// The MCP server list.
@@ -480,6 +561,10 @@ impl SidebarView {
     /// Open or close `section`.
     pub const fn toggle(&mut self, section: Section) {
         match section {
+            Section::Goal => self.expanded.goal = !self.expanded.goal,
+            Section::Todos => self.expanded.todos = !self.expanded.todos,
+            Section::Jobs => self.expanded.jobs = !self.expanded.jobs,
+            Section::Memory => self.expanded.memory = !self.expanded.memory,
             Section::Lsp => self.toggle_lsp(),
             Section::Mcp => self.toggle_mcp(),
             Section::Skills => self.toggle_skills(),
@@ -834,6 +919,195 @@ impl SidebarView {
                         self.context.muted()
                     },
                 ));
+            }
+        }
+
+        if let Some(goal) = &self.ambient.work.goal {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Goal));
+            lines.push(self.heading(
+                "Goal",
+                &goal.status,
+                self.disclosure(self.expanded.goal),
+                width,
+            ));
+            if self.expanded.goal {
+                for row in wrap(&goal.objective, usize::from(width).saturating_sub(2), 3) {
+                    lines.push(padded(&format!("  {row}"), width, self.context.text()));
+                }
+                let usage = goal.token_budget.map_or_else(
+                    || format!("{} tokens", compact(goal.tokens_used.max(0) as u64)),
+                    |budget| {
+                        format!(
+                            "{} / {} tokens",
+                            compact(goal.tokens_used.max(0) as u64),
+                            compact(budget.max(0) as u64)
+                        )
+                    },
+                );
+                lines.push(padded(&format!("  {usage}"), width, self.context.muted()));
+            }
+        }
+
+        if !self.ambient.work.todos.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Todos));
+            let active = self
+                .ambient
+                .work
+                .todos
+                .iter()
+                .filter(|todo| todo.status == "in_progress")
+                .count();
+            lines.push(self.heading(
+                "Todos",
+                &format!("{active}/{} active", self.ambient.work.todos.len()),
+                self.disclosure(self.expanded.todos),
+                width,
+            ));
+            if self.expanded.todos {
+                for todo in &self.ambient.work.todos {
+                    let (glyph, style) = match todo.status.as_str() {
+                        "completed" => ("✓", self.context.muted()),
+                        "in_progress" => ("◐", self.context.accent()),
+                        "cancelled" => ("×", self.context.muted()),
+                        _ => ("○", self.context.text()),
+                    };
+                    lines.push(padded(&format!("  {glyph} {}", todo.content), width, style));
+                }
+            }
+        }
+
+        if !self.ambient.work.jobs.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Jobs));
+            let running = self
+                .ambient
+                .work
+                .jobs
+                .iter()
+                .filter(|job| job.status == "running")
+                .count();
+            lines.push(self.heading(
+                "Jobs",
+                &format!("{running}/{} running", self.ambient.work.jobs.len()),
+                self.disclosure(self.expanded.jobs),
+                width,
+            ));
+            if self.expanded.jobs {
+                for job in &self.ambient.work.jobs {
+                    let style = match job.status.as_str() {
+                        "running" => self.context.accent(),
+                        "failed" | "uncertain" => self.context.error(),
+                        "cancelled" => self.context.muted(),
+                        _ => self.context.text(),
+                    };
+                    lines.push(padded(
+                        &format!("  {} · {}", job.subject, job.status),
+                        width,
+                        style,
+                    ));
+                }
+            }
+        }
+
+        if !self.ambient.work.memory_candidates.is_empty()
+            || !self.ambient.work.memory_entries.is_empty()
+        {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Memory));
+            let review = self
+                .ambient
+                .work
+                .memory_candidates
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate.status,
+                        zuno_types::MemoryCandidateStatus::Pending
+                            | zuno_types::MemoryCandidateStatus::Failed
+                            | zuno_types::MemoryCandidateStatus::Uncertain
+                    )
+                })
+                .count();
+            let active = self
+                .ambient
+                .work
+                .memory_candidates
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate.status,
+                        zuno_types::MemoryCandidateStatus::Applying
+                            | zuno_types::MemoryCandidateStatus::Undoing
+                    )
+                })
+                .count();
+            let summary = if active == 0 {
+                format!(
+                    "{review} review · {} saved",
+                    self.ambient.work.memory_entries.len()
+                )
+            } else {
+                format!(
+                    "{review} review · {active} active · {} saved",
+                    self.ambient.work.memory_entries.len()
+                )
+            };
+            lines.push(self.heading(
+                "Memory",
+                &summary,
+                self.disclosure(self.expanded.memory),
+                width,
+            ));
+            if self.expanded.memory {
+                for candidate in self
+                    .ambient
+                    .work
+                    .memory_candidates
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            candidate.status,
+                            zuno_types::MemoryCandidateStatus::Pending
+                                | zuno_types::MemoryCandidateStatus::Applying
+                                | zuno_types::MemoryCandidateStatus::Undoing
+                                | zuno_types::MemoryCandidateStatus::Failed
+                                | zuno_types::MemoryCandidateStatus::Uncertain
+                        )
+                    })
+                {
+                    let content = candidate
+                        .content
+                        .as_deref()
+                        .or(candidate.old_text.as_deref())
+                        .unwrap_or(candidate.reason.as_str());
+                    let style = match candidate.status {
+                        zuno_types::MemoryCandidateStatus::Pending => self.context.warning(),
+                        zuno_types::MemoryCandidateStatus::Applying
+                        | zuno_types::MemoryCandidateStatus::Undoing => self.context.accent(),
+                        zuno_types::MemoryCandidateStatus::Failed
+                        | zuno_types::MemoryCandidateStatus::Uncertain => self.context.error(),
+                        _ => self.context.muted(),
+                    };
+                    lines.push(padded(
+                        &format!(
+                            "  {} {} · {}",
+                            candidate.scope.as_str(),
+                            candidate.action.as_str(),
+                            content
+                        ),
+                        width,
+                        style,
+                    ));
+                }
+                for entry in &self.ambient.work.memory_entries {
+                    lines.push(padded(
+                        &format!("  ✓ {} · {}", entry.scope.as_str(), entry.content),
+                        width,
+                        self.context.muted(),
+                    ));
+                }
             }
         }
 

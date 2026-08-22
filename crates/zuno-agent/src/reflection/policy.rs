@@ -86,6 +86,12 @@ impl TurnTranscript {
         Self { events }
     }
 
+    /// Events in chronological order for a provider-facing reflection runner.
+    #[must_use]
+    pub fn events(&self) -> &[TranscriptEvent] {
+        &self.events
+    }
+
     pub(crate) fn has_failure_recovery(&self) -> bool {
         let mut failed = HashSet::new();
         for event in &self.events {

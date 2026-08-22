@@ -60,7 +60,7 @@ use zuno_tui::theme::{
     EnvironmentPalette, HostTerminalPalette, Mode, SYSTEM_THEME, SystemThemeOutcome, ThemeRegistry,
 };
 use zuno_tui::views::ViewContext;
-use zuno_tui::views::ambient::SessionTitle;
+use zuno_tui::views::ambient::{SessionTitle, WorkState};
 use zuno_tui::views::dialog::DialogHost;
 use zuno_tui::views::external::{
     EditorCancellation, EditorProcess, EditorProcessLauncher, EditorRequest, ExternalEditor,
@@ -416,6 +416,7 @@ fn execute_once(
         projection: session_title.clone(),
         wake: terminal_sender.clone(),
     }));
+    let work_state = WorkState::new(host.work_state()?);
     // Copied before the host is moved into the turn driver. The id is what the hint
     // printed after teardown has to name, and by then the host is gone — a driver task
     // owns it and is aborted, not joined, so nothing survives to be asked.
@@ -455,6 +456,7 @@ fn execute_once(
         .with_selection_sink(selection_sender)
         .with_mcp_control(mcp_projection.clone(), mcp_toggle_sender)
         .with_session_title(session_title)
+        .with_work_state(work_state.clone())
         .with_catalog(catalog)
         .with_diagnostics_source(report_receiver)
         .with_edit_sink(pending_edits)
@@ -586,6 +588,7 @@ fn execute_once(
     ));
     let editor_wake = terminal_sender.clone();
     let mcp_wake = terminal_sender.clone();
+    let work_wake = terminal_sender.clone();
     let session_shutdown = terminal_sender.clone();
     let remount = CompositionRemount::default();
     let driver_remount = remount.clone();
@@ -612,6 +615,8 @@ fn execute_once(
                 mcp_catalog,
                 mcp_dirty: Arc::clone(&mcp_dirty),
                 snapshots: SnapshotHistory::new(snapshot_store),
+                work_state,
+                work_wake,
                 remount: driver_remount,
                 shutdown: session_shutdown,
             },
@@ -1517,6 +1522,51 @@ async fn apply_selection(
                 .await;
             return SelectionOutcome::Unchanged;
         }
+        zuno_tui::views::session::Selection::MemoryApply(id) => {
+            report_memory_action(
+                rebuild.events,
+                host.memory_apply(&id),
+                format!("memory candidate {id} approved"),
+            )
+            .await;
+            return SelectionOutcome::Unchanged;
+        }
+        zuno_tui::views::session::Selection::MemoryReject(id) => {
+            report_memory_action(
+                rebuild.events,
+                host.memory_reject(&id),
+                format!("memory candidate {id} rejected"),
+            )
+            .await;
+            return SelectionOutcome::Unchanged;
+        }
+        zuno_tui::views::session::Selection::MemoryUndo(id) => {
+            report_memory_action(
+                rebuild.events,
+                host.memory_undo(&id),
+                format!("memory candidate {id} undone"),
+            )
+            .await;
+            return SelectionOutcome::Unchanged;
+        }
+        zuno_tui::views::session::Selection::MemoryEditApply { id, content } => {
+            report_memory_action(
+                rebuild.events,
+                host.memory_edit_and_apply(&id, content),
+                format!("edited memory candidate {id} approved"),
+            )
+            .await;
+            return SelectionOutcome::Unchanged;
+        }
+        zuno_tui::views::session::Selection::MemoryRemove { scope, content } => {
+            report_memory_action(
+                rebuild.events,
+                host.memory_remove(scope, content),
+                format!("{} resident memory removed", scope.as_str()),
+            )
+            .await;
+            return SelectionOutcome::Unchanged;
+        }
         // A theme is owned and applied entirely by the view layer.
         zuno_tui::views::session::Selection::Theme(_) => return SelectionOutcome::Unchanged,
     }
@@ -1552,6 +1602,23 @@ async fn apply_selection(
     }
 }
 
+async fn report_memory_action(
+    events: &TurnEventSender,
+    result: Result<(), String>,
+    success: String,
+) {
+    let detail = result.map_or_else(
+        |error| format!("warning: memory action failed: {error}"),
+        |()| success,
+    );
+    let _reported = events
+        .publish(TurnEvent::Provider {
+            step: 0,
+            event: StreamEvent::StatusDetail { detail },
+        })
+        .await;
+}
+
 struct TurnDriver {
     host: TurnHost,
     options: TurnOptions,
@@ -1561,6 +1628,8 @@ struct TurnDriver {
     mcp_catalog: zuno_mcp::Catalog,
     mcp_dirty: Arc<AtomicBool>,
     snapshots: SnapshotHistory,
+    work_state: WorkState,
+    work_wake: mpsc::Sender<TerminalEvent>,
     remount: CompositionRemount,
     shutdown: mpsc::Sender<TerminalEvent>,
 }
@@ -1607,6 +1676,7 @@ async fn drive_turns(
     environment: StartupEnvironment,
     mut events: TurnEventSender,
 ) {
+    let mut work_changes = driver.host.work_state_changes();
     loop {
         let queued = if prompts.is_empty() && selections.is_empty() {
             zuno_goal::QueuedUserInput::Absent
@@ -1618,7 +1688,17 @@ async fn drive_turns(
             .continue_goal_if_idle(queued, events.clone())
             .await
         {
-            Ok(true) => continue,
+            Ok(true) => {
+                refresh_work_state(
+                    &mut driver.host,
+                    &driver.work_state,
+                    &driver.work_wake,
+                    &events,
+                )
+                .await;
+                work_changes.borrow_and_update();
+                continue;
+            }
             Ok(false) => {}
             Err(message) => {
                 report_turn_failure(&events, message).await;
@@ -1649,7 +1729,10 @@ async fn drive_turns(
                 )
                 .await
                 {
-                    SelectionOutcome::Rebuilt(rebuilt) => events = rebuilt,
+                    SelectionOutcome::Rebuilt(rebuilt) => {
+                        events = rebuilt;
+                        work_changes = driver.host.work_state_changes();
+                    }
                     SelectionOutcome::Remount(request) => {
                         driver.remount.request(request);
                         let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
@@ -1657,6 +1740,28 @@ async fn drive_turns(
                     }
                     SelectionOutcome::Unchanged => {}
                 }
+                refresh_work_state(
+                    &mut driver.host,
+                    &driver.work_state,
+                    &driver.work_wake,
+                    &events,
+                )
+                .await;
+                work_changes.borrow_and_update();
+                continue;
+            },
+            changed = work_changes.changed() => {
+                if changed.is_err() {
+                    work_changes = driver.host.work_state_changes();
+                }
+                refresh_work_state(
+                    &mut driver.host,
+                    &driver.work_state,
+                    &driver.work_wake,
+                    &events,
+                )
+                .await;
+                work_changes.borrow_and_update();
                 continue;
             }
         };
@@ -1664,6 +1769,7 @@ async fn drive_turns(
             && let Some(rebuilt) = refresh_mcp_host(&mut driver, &environment, &events).await
         {
             events = rebuilt;
+            work_changes = driver.host.work_state_changes();
         }
         drive_one(
             &mut driver.host,
@@ -1674,6 +1780,14 @@ async fn drive_turns(
             &mut driver.snapshots,
         )
         .await;
+        refresh_work_state(
+            &mut driver.host,
+            &driver.work_state,
+            &driver.work_wake,
+            &events,
+        )
+        .await;
+        work_changes.borrow_and_update();
         if environment.extensions().composition_generation() != driver.host.extension_generation() {
             let mut next = driver.options.clone();
             next.session = driver.host.rebuild_session_choice();
@@ -1683,6 +1797,35 @@ async fn drive_turns(
             driver.remount.request(RemountRequest::plain(next));
             let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
             return;
+        }
+    }
+}
+
+async fn refresh_work_state(
+    host: &mut TurnHost,
+    projection: &WorkState,
+    wake: &mpsc::Sender<TerminalEvent>,
+    events: &TurnEventSender,
+) {
+    match host.work_state() {
+        Ok(state) => {
+            let generation = projection.generation();
+            projection.replace(state);
+            if projection.generation() != generation {
+                let _nudged = wake.try_send(TerminalEvent::Wake);
+            }
+        }
+        Err(error) => {
+            let _reported = events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::StatusDetail {
+                        detail: format!(
+                            "warning: durable work state could not be refreshed: {error}"
+                        ),
+                    },
+                })
+                .await;
         }
     }
 }

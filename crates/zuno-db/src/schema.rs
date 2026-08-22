@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 20;
+pub const TABLE_COUNT: usize = 21;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -231,6 +231,32 @@ CREATE TABLE `todo` (
   CONSTRAINT `todo_pk` PRIMARY KEY(`session_id`, `position`),
   CONSTRAINT `fk_todo_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
 );
+CREATE TABLE `memory_candidate` (
+  `id` text PRIMARY KEY,
+  `target` text NOT NULL,
+  `target_path` text NOT NULL,
+  `action` text NOT NULL,
+  `content` text,
+  `old_text` text,
+  `reason` text NOT NULL,
+  `confidence` integer NOT NULL,
+  `source_kind` text NOT NULL,
+  `source_session_id` text,
+  `source_message_id` text,
+  `status` text NOT NULL,
+  `before_entries` text,
+  `after_entries` text,
+  `error` text,
+  `time_created` integer NOT NULL,
+  `time_updated` integer NOT NULL,
+  `time_applied` integer,
+  CONSTRAINT `memory_candidate_target` CHECK (`target` IN ('global','project')),
+  CONSTRAINT `memory_candidate_action` CHECK (`action` IN ('add','replace','remove')),
+  CONSTRAINT `memory_candidate_confidence` CHECK (`confidence` BETWEEN 0 AND 10000),
+  CONSTRAINT `memory_candidate_source` CHECK (`source_kind` IN ('reflection','tool','user')),
+  CONSTRAINT `memory_candidate_status` CHECK (`status` IN ('pending','applying','undoing','applied','rejected','undone','failed','uncertain')),
+  CONSTRAINT `fk_memory_candidate_session_id_session_id_fk` FOREIGN KEY (`source_session_id`) REFERENCES `session`(`id`) ON DELETE SET NULL
+);
 CREATE TABLE `session_share` (
   `session_id` text PRIMARY KEY,
   `id` text NOT NULL,
@@ -260,6 +286,8 @@ CREATE INDEX `session_project_idx` ON `session` (`project_id`);
 CREATE INDEX `session_workspace_idx` ON `session` (`workspace_id`);
 CREATE INDEX `session_parent_idx` ON `session` (`parent_id`);
 CREATE INDEX `todo_session_idx` ON `todo` (`session_id`);
+CREATE INDEX `memory_candidate_path_status_time_idx` ON `memory_candidate` (`target_path`,`status`,`time_created`);
+CREATE INDEX `memory_candidate_session_time_idx` ON `memory_candidate` (`source_session_id`,`time_created`);
 "#;
 
 /// Create every application table and explicit index in the current schema.

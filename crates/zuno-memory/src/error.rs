@@ -170,6 +170,20 @@ pub enum MemoryError {
         backup: PathBuf,
     },
 
+    /// The resident file no longer matches an audited apply or undo snapshot.
+    #[error(
+        "refusing to replace {}: resident memory changed after the audited snapshot was prepared",
+        path.display()
+    )]
+    StateMismatch {
+        /// The store that changed.
+        path: PathBuf,
+        /// Snapshot the operation was prepared against.
+        expected: Vec<String>,
+        /// Entries now present on disk.
+        actual: Vec<String>,
+    },
+
     /// The file exists but could not be read as UTF-8 text.
     ///
     /// Treated as abort, never as "empty store". A read-modify-write that took a
@@ -225,6 +239,32 @@ impl MemoryError {
         matches!(
             self,
             Self::NoMatch { .. } | Self::Ambiguous { .. } | Self::CapExceeded { .. }
+        )
+    }
+
+    /// Whether a proposal can be corrected by changing its model-supplied fields.
+    #[must_use]
+    pub const fn is_proposal_correctable(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyBatch
+                | Self::MalformedOperation { .. }
+                | Self::Blocked { .. }
+                | Self::NoMatch { .. }
+                | Self::Ambiguous { .. }
+                | Self::CapExceeded { .. }
+        )
+    }
+
+    /// Whether the destination rename may have landed before this error arose.
+    #[must_use]
+    pub fn may_have_written(&self) -> bool {
+        matches!(
+            self,
+            Self::Io {
+                operation: "stat after write",
+                ..
+            }
         )
     }
 }

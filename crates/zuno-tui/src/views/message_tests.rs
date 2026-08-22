@@ -2467,7 +2467,10 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
             "todowrite",
             r#"{"todos":[{"content":"ship it","status":"pending","priority":"high"}]}"#,
         ),
-        ("memory", r#"{"target":"project","action":"add"}"#),
+        (
+            "memory_propose",
+            r#"{"target":"project","action":"add","content":"run cargo fmt"}"#,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -2498,7 +2501,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
         "bash cargo build",
         "web_search ratatui spans",
         "todowrite 1 items · ship it",
-        "memory add project",
+        "memory_propose add project: run cargo fmt",
     ] {
         assert!(
             rendered.iter().any(|row| row.contains(expected)),

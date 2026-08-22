@@ -167,7 +167,7 @@ pub const SUMMARISED: [&str; 23] = [
     "lsp",
     "plan_exit",
     // Built-ins registered outside the slot table: memory, and the three goal tools.
-    "memory",
+    "memory_propose",
     "get_goal",
     "create_goal",
     "update_goal",
@@ -320,9 +320,9 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
         // The name the model *tried* to call. This is the whole content of an `invalid`
         // call: the error text below it explains why, and the row above it has to say what.
         "invalid" => text("tool").map(Summary::tail),
-        // `<action> <target>`, e.g. `add project`. Either half alone is ambiguous: three
-        // actions apply to two targets.
-        "memory" => {
+        // `<action> <target>: <entry>`, e.g. `add project: run cargo fmt`. The action and
+        // target identify the mutation while the entry distinguishes concurrent proposals.
+        "memory_propose" => {
             let target = text("target").unwrap_or_else(|| String::from("memory"));
             let action = text("action").or_else(|| {
                 value
@@ -331,9 +331,14 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
                     .and_then(|operations| operations.first())
                     .and_then(|operation| field(operation, "action"))
             });
-            Some(Summary::tail(match action {
+            let operation = match action {
                 Some(action) => format!("{action} {target}"),
                 None => target,
+            };
+            let entry = text("content").or_else(|| text("old_text"));
+            Some(Summary::tail(match entry {
+                Some(entry) => format!("{operation}: {entry}"),
+                None => operation,
             }))
         }
         "create_goal" => text("objective").map(Summary::tail),

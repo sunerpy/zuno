@@ -1,27 +1,19 @@
-//! The `memory` tool through the boundary a model actually reaches: erased to
-//! `dyn Tool`, called with raw JSON, carrying the centrally injected `intent`.
-//!
-//! The unit tests call `run` with a decoded `MemoryParams`. That skips the two things
-//! most likely to break silently after a schema change: whether real model JSON
-//! deserializes into the dual shape at all, and whether the cross-cutting properties
-//! Todo 38 injects are stripped before a `deny_unknown_fields` params struct sees
-//! them. Both are exercised here.
-//!
-//! Nothing in this file resolves a scope through `zuno_paths`; every store is a file in
-//! a `TempDir`. A test that writes the developer's real `MEMORY.md` is a bug in the
-//! test.
+//! Model-facing proof for the durable `memory_propose` boundary.
 
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tempfile::TempDir;
-use zuno_memory::{MemoryStore, Scope, SessionMemory};
-use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext, ToolOutput, erase};
-use zuno_tools::{MEMORY_TOOL_ID, MemoryTool, ScopePaths};
+use zuno_memory::{
+    MemoryService, MemoryStore, Operation, PromotionPolicy, Scope, ScopeLimits, ScopePaths,
+    SessionMemory,
+};
+use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext, erase};
+use zuno_tools::{MEMORY_TOOL_ID, MemoryTool};
 
-/// A worktree whose two memory files are both inside it.
 struct Fixture {
-    directory: TempDir,
+    _directory: TempDir,
     tool: Arc<dyn Tool>,
+    service: Arc<MemoryService>,
     paths: ScopePaths,
 }
 
@@ -32,32 +24,42 @@ impl Fixture {
             directory.path().join("MEMORY.md"),
             directory.path().join("RULES.md"),
         );
+        let pool =
+            Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+        let mut connection = pool.open_connection().expect("database connection");
+        zuno_db::migration::apply(&mut connection).expect("initialize schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+                 VALUES ('project', '/tmp/project', 1, 1, '[]');
+                 INSERT INTO session (
+                     id, project_id, slug, directory, title, version, time_created, time_updated
+                 ) VALUES (
+                     'ses_integration', 'project', 'integration', '/tmp/project',
+                     'Integration', '1', 1, 1
+                 );",
+            )
+            .expect("seed tool session");
+        drop(connection);
+        let service = Arc::new(MemoryService::new(
+            pool,
+            paths.clone(),
+            ScopeLimits::default(),
+            PromotionPolicy::Review,
+        ));
         Self {
-            tool: erase(MemoryTool::with_paths(paths.clone())),
+            tool: erase(MemoryTool::new(Arc::clone(&service))),
+            service,
             paths,
-            directory,
+            _directory: directory,
         }
     }
 
-    async fn call(&self, arguments: Value) -> ToolOutput {
+    async fn call(&self, arguments: Value) -> zuno_tool::ToolOutput {
         self.tool
             .execute(arguments, context())
             .await
-            .expect("a memory refusal is a response, never a failed turn")
-    }
-
-    fn store(&self, scope: Scope) -> MemoryStore {
-        MemoryStore::open(scope, self.paths.for_scope(scope).to_path_buf()).expect("re-open")
-    }
-
-    /// A fresh session's frozen prompt blocks, as Todo 99 captures them.
-    fn next_session_prompt(&self, base: &str) -> String {
-        SessionMemory::open(
-            self.paths.for_scope(Scope::Global),
-            self.paths.for_scope(Scope::Project),
-        )
-        .expect("both stores load")
-        .inject_into(base)
+            .expect("valid proposal")
     }
 }
 
@@ -72,175 +74,156 @@ fn context() -> ToolContext {
     )
 }
 
-fn body(output: &ToolOutput) -> Value {
-    serde_json::from_str(&output.output).expect("the response body is JSON")
-}
-
 #[tokio::test]
-async fn a_saved_convention_appears_in_the_next_sessions_prompt_but_not_this_ones() {
+async fn proposal_is_durable_but_does_not_change_the_resident_prompt_until_approved() {
     let fixture = Fixture::new();
-    let convention = "run `cargo test -p <crate>`; the workspace suite is the merge gate only";
-    let before = fixture.next_session_prompt("SYSTEM");
-
-    let saved = fixture
+    let convention = "run `cargo test -p <crate>` before the workspace suite";
+    let output = fixture
         .call(json!({
-            "intent": "record the test command",
             "target": "project",
-            "operations": [{ "action": "add", "content": convention }],
+            "action": "add",
+            "content": convention,
+            "reason": "repository validation convention",
+            "confidence": 0.97
         }))
         .await;
 
-    assert_eq!(body(&saved)["success"], json!(true), "{}", saved.output);
-    assert_eq!(
-        before, "SYSTEM",
-        "an empty store must add no prompt bytes at all"
-    );
+    assert!(output.output.contains("pending"), "{}", output.output);
+    let metadata = &output.metadata["memory_candidate"];
+    let id = metadata["id"].as_str().expect("candidate id");
+    assert_eq!(metadata["status"], "pending");
+    assert!(!fixture.paths.for_scope(Scope::Project).exists());
 
-    let after = fixture.next_session_prompt("SYSTEM");
-    assert!(after.contains(convention), "{after}");
-    assert!(
-        after.contains(Scope::Project.label()),
-        "the block keeps its header so a consistency check can find it: {after}"
-    );
-    assert!(
-        !after.contains(Scope::Global.label()),
-        "the untouched global store must stay out of the prompt: {after}"
-    );
+    fixture.service.apply(id).expect("approve candidate");
+    let prompt = SessionMemory::open(
+        fixture.paths.for_scope(Scope::Global),
+        fixture.paths.for_scope(Scope::Project),
+    )
+    .expect("memory stores")
+    .inject_into("SYSTEM");
+    assert!(prompt.contains(convention), "{prompt}");
 }
 
 #[tokio::test]
-async fn a_locator_matching_two_entries_is_refused_naming_both() {
+async fn cross_cutting_tool_fields_are_stripped_before_candidate_decoding() {
     let fixture = Fixture::new();
-    for crate_name in ["api", "web"] {
-        let response = fixture
-            .call(json!({
-                "intent": "record a build command",
-                "target": "project",
-                "action": "add",
-                "content": format!("build the {crate_name} crate with `make build`"),
-            }))
-            .await;
-        assert_eq!(body(&response)["success"], json!(true));
-    }
-
-    let refused = fixture
+    let output = fixture
         .call(json!({
-            "intent": "retire a stale build command",
-            "target": "project",
-            "action": "remove",
-            "old_text": "`make build`",
-        }))
-        .await;
-    let refused = body(&refused);
-    let error = refused["error"].as_str().expect("an error");
-
-    assert_eq!(refused["success"], json!(false));
-    assert!(error.contains("matched 2 distinct entries"), "{error}");
-    assert!(error.contains("api crate"), "{error}");
-    assert!(error.contains("web crate"), "{error}");
-    assert_eq!(
-        refused["current_entries"]
-            .as_array()
-            .expect("the entries so the model can pick a unique locator")
-            .len(),
-        2
-    );
-    assert_eq!(
-        fixture.store(Scope::Project).entries().len(),
-        2,
-        "an ambiguous locator must not have removed anything"
-    );
-}
-
-#[tokio::test]
-async fn the_injected_intent_never_reaches_the_params_struct() {
-    let fixture = Fixture::new();
-
-    // `MemoryParams` is `deny_unknown_fields`, so this call fails unless the central
-    // augmentation's own properties are stripped before decoding.
-    let saved = fixture
-        .call(json!({
-            "intent": "save a preference",
+            "intent": "save a stable preference",
             "accept_large_output": true,
             "target": "global",
             "action": "add",
-            "content": "explains the change before applying it",
+            "content": "explain changes before applying them",
+            "reason": "explicit user preference",
+            "confidence": 1.0
         }))
         .await;
 
-    assert_eq!(body(&saved)["success"], json!(true), "{}", saved.output);
-    assert_eq!(fixture.store(Scope::Global).entries().len(), 1);
+    assert!(output.output.contains("pending"));
+    assert_eq!(fixture.service.candidates().expect("candidates").len(), 1);
 }
 
 #[tokio::test]
-async fn an_unusable_call_shape_is_a_model_correctable_argument_error() {
+async fn malformed_candidate_arguments_are_model_correctable_and_write_nothing() {
     let fixture = Fixture::new();
+    let error = fixture
+        .tool
+        .execute(
+            json!({
+                "target": "project",
+                "action": "add",
+                "content": "missing reason and confidence"
+            }),
+            context(),
+        )
+        .await
+        .expect_err("invalid proposal");
+
+    assert_eq!(error.tool(), MEMORY_TOOL_ID);
+    assert!(error.is_model_correctable());
+    assert!(fixture.service.candidates().expect("candidates").is_empty());
+    assert!(!fixture.paths.for_scope(Scope::Project).exists());
+}
+
+#[tokio::test]
+async fn ambiguous_locator_is_rejected_before_a_candidate_is_inserted() {
+    let fixture = Fixture::new();
+    let mut store = MemoryStore::open(
+        Scope::Project,
+        fixture.paths.for_scope(Scope::Project).to_path_buf(),
+    )
+    .expect("store");
+    store
+        .apply_batch(&[
+            Operation::add("build the api crate with `make build`"),
+            Operation::add("build the web crate with `make build`"),
+        ])
+        .expect("seed entries");
 
     let error = fixture
         .tool
         .execute(
-            json!({ "intent": "save something", "target": "project" }),
+            json!({
+                "target": "project",
+                "action": "remove",
+                "old_text": "`make build`",
+                "reason": "retire a stale command",
+                "confidence": 1.0
+            }),
             context(),
         )
         .await
-        .expect_err("no change was requested, so there is nothing to report about memory");
+        .expect_err("ambiguous locator");
 
-    assert_eq!(error.tool(), MEMORY_TOOL_ID);
-    assert!(error.is_model_correctable());
-    assert!(
-        fixture
-            .directory
-            .path()
-            .join("RULES.md")
-            .symlink_metadata()
-            .is_err()
-    );
+    let detail = zuno_error::source::describe(&error);
+    assert!(detail.contains("matched 2 distinct entries"), "{detail}");
+    assert!(fixture.service.candidates().expect("candidates").is_empty());
+    assert_eq!(store.entries().len(), 2);
 }
 
 #[tokio::test]
-async fn a_batch_consolidates_and_adds_in_one_call() {
+async fn credential_literals_are_rejected_before_a_candidate_is_inserted() {
     let fixture = Fixture::new();
-    fixture
-        .call(json!({
-            "intent": "seed two stale rules",
-            "target": "project",
-            "operations": [
-                { "action": "add", "content": "the package manager is yarn" },
-                { "action": "add", "content": "node 18 is the supported runtime" },
-            ],
-        }))
-        .await;
+    let error = fixture
+        .tool
+        .execute(
+            json!({
+                "target": "global",
+                "action": "add",
+                "content": "sk-1234567890abcdefghijklmnop",
+                "reason": "save the credential",
+                "confidence": 1.0
+            }),
+            context(),
+        )
+        .await
+        .expect_err("credential must be blocked");
 
-    let consolidated = fixture
-        .call(json!({
-            "intent": "retire both stale rules and record what replaced them",
-            "target": "project",
-            "operations": [
-                { "action": "remove", "old_text": "yarn" },
-                { "action": "replace", "old_text": "node 18",
-                  "content": "bun is the runtime; the CI gate is `bun test`" },
-            ],
-        }))
-        .await;
-    let consolidated_body = body(&consolidated);
+    assert!(error.is_model_correctable());
+    assert!(fixture.service.candidates().expect("candidates").is_empty());
+    assert!(!fixture.paths.for_scope(Scope::Global).exists());
+}
 
-    assert_eq!(consolidated_body["success"], json!(true));
-    assert_eq!(consolidated_body["entry_count"], json!(1));
-    assert!(
-        consolidated_body.get("current_entries").is_none(),
-        "success must not echo the entries: {consolidated_body}"
-    );
-    assert!(
-        consolidated_body["usage"]
-            .as_str()
-            .expect("usage")
-            .contains("/3,000 chars"),
-        "every response reports current/limit: {consolidated_body}"
-    );
+#[tokio::test]
+async fn resident_storage_failures_are_not_reported_as_model_correctable_arguments() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.paths.for_scope(Scope::Project))
+        .expect("replace resident file path with a directory");
+    let error = fixture
+        .tool
+        .execute(
+            json!({
+                "target": "project",
+                "action": "add",
+                "content": "run cargo test",
+                "reason": "verified repository gate",
+                "confidence": 1.0
+            }),
+            context(),
+        )
+        .await
+        .expect_err("resident storage failure");
 
-    let entries = fixture.store(Scope::Project).entries().to_vec();
-    assert_eq!(
-        entries,
-        vec!["bun is the runtime; the CI gate is `bun test`"]
-    );
+    assert!(!error.is_model_correctable());
+    assert!(fixture.service.candidates().expect("candidates").is_empty());
 }

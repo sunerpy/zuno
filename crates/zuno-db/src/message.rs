@@ -472,7 +472,8 @@ impl PartRecord {
     }
 }
 
-/// A message and the parts that belong to it, in `part.id` order.
+/// A message and the parts that belong to it, in creation order with `part.id`
+/// as the stable tie-break.
 ///
 /// The `{info, parts}` pair from `WithParts` (`v1/session.ts:493-500`) and the
 /// return shape of `hydrate` (`message-v2.ts:118-121`).
@@ -786,8 +787,8 @@ impl<'conn> MessageStore<'conn> {
     /// Every part belonging to any of `message_ids`, grouped by message id.
     ///
     /// One statement per [`HYDRATION_CHUNK`] ids, never one per message. Within
-    /// each group the order is `part.id` ascending, matching
-    /// `message-v2.ts:107`.
+    /// each group the order is `(part.time_created, part.id)` ascending so
+    /// durable transcript reconstruction preserves mixed text/tool chronology.
     ///
     /// # Errors
     ///
@@ -808,7 +809,8 @@ impl<'conn> MessageStore<'conn> {
                 .join(", ");
             let sql = format!(
                 "SELECT id, message_id, session_id, time_created, time_updated, data FROM part \
-                 WHERE message_id IN ({placeholders}) ORDER BY message_id ASC, id ASC"
+                 WHERE message_id IN ({placeholders}) \
+                 ORDER BY message_id ASC, time_created ASC, id ASC"
             );
             let mut statement = self.prepare(&sql)?;
             let rows = statement
@@ -831,7 +833,7 @@ impl<'conn> MessageStore<'conn> {
     ///
     /// This is the metadata phase of retained-history hydration: callers can inspect
     /// compaction markers or summary text without decoding unrelated tool outputs.
-    /// The result keeps the same `part.id` order as [`Self::parts_by_message`].
+    /// The result keeps the same creation order as [`Self::parts_by_message`].
     ///
     /// # Errors
     ///
@@ -855,7 +857,7 @@ impl<'conn> MessageStore<'conn> {
                 "SELECT id, message_id, session_id, time_created, time_updated, data FROM part \
                  WHERE message_id IN ({placeholders}) \
                  AND json_extract(data, '$.type') = ?{kind_parameter} \
-                 ORDER BY message_id ASC, id ASC"
+                 ORDER BY message_id ASC, time_created ASC, id ASC"
             );
             let mut statement = self.prepare(&sql)?;
             let parameters = chunk
@@ -878,7 +880,7 @@ impl<'conn> MessageStore<'conn> {
         Ok(grouped)
     }
 
-    /// Every part of `kind` in a session, ordered by message id and part id.
+    /// Every part of `kind` in a session, ordered by creation time and id.
     ///
     /// The JSON predicate runs inside SQLite so non-matching payloads never become
     /// Rust JSON trees. This is intentionally not a replacement for full hydration;
@@ -896,7 +898,7 @@ impl<'conn> MessageStore<'conn> {
         let mut statement = self.prepare(
             "SELECT id, message_id, session_id, time_created, time_updated, data FROM part \
              WHERE session_id = ?1 AND json_extract(data, '$.type') = ?2 \
-             ORDER BY message_id ASC, id ASC",
+             ORDER BY time_created ASC, id ASC",
         )?;
         let rows = statement
             .query_map((session_id, kind.as_str()), |row| {
@@ -929,7 +931,7 @@ impl<'conn> MessageStore<'conn> {
              WHERE session_id = ?1 AND json_extract(data, '$.type') = 'tool' \
              AND (json_extract(data, '$.state.status') IS NULL \
                   OR json_extract(data, '$.state.status') NOT IN ('completed', 'error')) \
-             ORDER BY message_id ASC, id ASC",
+             ORDER BY time_created ASC, id ASC",
         )?;
         let rows = statement
             .query_map([session_id], |row| Ok(PartRecord::from_row(row)))

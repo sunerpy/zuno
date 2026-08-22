@@ -45,6 +45,7 @@ pub mod event_log;
 pub mod fts;
 pub mod inbox;
 pub mod job;
+pub mod memory_candidate;
 pub mod message;
 pub mod migration;
 pub mod open;

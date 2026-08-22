@@ -545,11 +545,55 @@ pub const DEFAULT_PROJECT_MEMORY_CHAR_LIMIT: u32 = 3_000;
 /// Default delivered-turn interval for background reflection.
 pub const DEFAULT_MEMORY_NUDGE_INTERVAL: u32 = 10;
 
+/// Confidence threshold used by high-confidence promotion.
+pub const DEFAULT_MEMORY_AUTO_CONFIDENCE: f64 = 0.9;
+
+/// How durable memory candidates become resident entries.
+#[derive(Default, JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPromotion {
+    /// Keep every candidate pending until a user approves it.
+    #[default]
+    Review,
+    /// Apply only candidates at or above `auto_confidence`.
+    HighConfidence,
+    /// Apply every validated candidate immediately.
+    Automatic,
+}
+
+/// A validated probability used by memory promotion.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct MemoryConfidence(#[schemars(range(min = 0.0, max = 1.0))] f64);
+
+impl MemoryConfidence {
+    #[must_use]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryConfidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = f64::deserialize(deserializer)?;
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(serde::de::Error::custom(
+                "memory confidence must be between 0 and 1",
+            ))
+        }
+    }
+}
+
 /// Persistent memory: a master boolean, or component settings.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MemoryConfig {
-    /// `false` is the strict-parity kill switch; `true` selects all defaults.
+    /// `false` disables the subsystem; `true` selects all defaults.
     Enabled(bool),
     /// Fine-grained settings for an enabled subsystem.
     Options(MemoryOptions),
@@ -587,6 +631,10 @@ impl MemoryConfig {
                     .nudge_interval
                     .unwrap_or(DEFAULT_MEMORY_NUDGE_INTERVAL)
                     as u64,
+                promotion: options.promotion.unwrap_or_default(),
+                auto_confidence: options
+                    .auto_confidence
+                    .map_or(DEFAULT_MEMORY_AUTO_CONFIDENCE, MemoryConfidence::get),
             },
         }
     }
@@ -613,10 +661,16 @@ pub struct MemoryOptions {
     /// Reflect every N delivered turns; zero disables only the periodic trigger.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nudge_interval: Option<u32>,
+    /// Candidate promotion policy. Defaults to `review`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<MemoryPromotion>,
+    /// Threshold used by `high_confidence`. Defaults to 0.9.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_confidence: Option<MemoryConfidence>,
 }
 
 /// Fully defaulted memory settings consumed by runtime composition roots.
-#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq)]
 pub struct ResolvedMemoryConfig {
     /// Whether the master switch is on.
     pub enabled: bool,
@@ -632,6 +686,10 @@ pub struct ResolvedMemoryConfig {
     pub project_char_limit: usize,
     /// Delivered-turn reflection cadence; zero disables the periodic trigger.
     pub nudge_interval: u64,
+    /// How candidates become resident entries.
+    pub promotion: MemoryPromotion,
+    /// High-confidence promotion threshold.
+    pub auto_confidence: f64,
 }
 
 impl Default for ResolvedMemoryConfig {
@@ -644,6 +702,8 @@ impl Default for ResolvedMemoryConfig {
             global_char_limit: DEFAULT_GLOBAL_MEMORY_CHAR_LIMIT as usize,
             project_char_limit: DEFAULT_PROJECT_MEMORY_CHAR_LIMIT as usize,
             nudge_interval: u64::from(DEFAULT_MEMORY_NUDGE_INTERVAL),
+            promotion: MemoryPromotion::Review,
+            auto_confidence: DEFAULT_MEMORY_AUTO_CONFIDENCE,
         }
     }
 }

@@ -1,8 +1,8 @@
 //! Post-response reflection over an owned turn transcript.
 //!
 //! The caller invokes [`ReflectionFork::spawn_after_turn`] after delivery. The fork
-//! receives a cloned transcript and an injected `memory` tool, so it cannot mutate
-//! foreground conversation state or reach the rest of the tool registry.
+//! receives a cloned transcript and an injected `memory_propose` tool, so it cannot
+//! mutate foreground conversation state or reach the rest of the tool registry.
 
 mod policy;
 
@@ -20,7 +20,7 @@ use zuno_tool::{Tool, ToolContext, ToolOutput};
 pub use policy::{CommandOutcome, NEGATIVE_LEARNING_LIST, TranscriptEvent, TurnTranscript};
 
 /// The only tool id a reflection fork may dispatch.
-pub const MEMORY_TOOL_ID: &str = "memory";
+pub const MEMORY_TOOL_ID: &str = "memory_propose";
 
 /// Periodic reflection cadence when the caller does not override it.
 pub const DEFAULT_TURN_INTERVAL: u64 = 10;
@@ -135,6 +135,10 @@ pub struct ReflectionRequest {
     pub compaction: CompactionMode,
     /// Review instructions, including the negative-learning safety list.
     pub prompt: Arc<str>,
+    /// Durable session whose delivered turn is being reviewed.
+    pub source_session_id: String,
+    /// Delivered assistant message anchoring the review.
+    pub source_message_id: String,
 }
 
 /// One model-requested call inside reflection.
@@ -160,11 +164,17 @@ impl ReflectionToolCall {
 /// A memory-only dispatcher owned by one reflection request.
 #[derive(Clone)]
 pub struct ReflectionTools {
-    memory: Arc<dyn Tool>,
+    proposal: Arc<dyn Tool>,
     context: ToolContext,
 }
 
 impl ReflectionTools {
+    /// The one tool schema offered to the isolated model.
+    #[must_use]
+    pub fn definition(&self) -> zuno_tool::ToolDefinition {
+        self.proposal.definition()
+    }
+
     /// Dispatch a reflection tool call after enforcing the hard whitelist.
     pub async fn dispatch(
         &self,
@@ -175,7 +185,7 @@ impl ReflectionTools {
         }
 
         let context = self.context.for_subcall(call.id);
-        self.memory
+        self.proposal
             .execute(call.args, context)
             .await
             .map_err(|error| ReflectionDispatchError::Execution {
@@ -190,7 +200,7 @@ impl ReflectionTools {
 pub enum ReflectionDispatchError {
     /// The model attempted a tool outside the memory-only whitelist.
     Denied { tool: String },
-    /// The injected memory tool failed.
+    /// The injected proposal tool failed.
     Execution { tool: String, detail: String },
 }
 
@@ -199,7 +209,7 @@ impl fmt::Display for ReflectionDispatchError {
         match self {
             Self::Denied { tool } => write!(
                 formatter,
-                "Background review denied non-whitelisted tool: {tool}. Only memory tools are allowed."
+                "Background review denied non-whitelisted tool: {tool}. Only memory proposals are allowed."
             ),
             Self::Execution { tool, detail } => {
                 write!(formatter, "Background review tool {tool} failed: {detail}")
@@ -227,50 +237,29 @@ pub trait ReflectionRunner: Send + Sync {
     ) -> Result<(), ReflectionError>;
 }
 
-/// Construction failure for a reflection fork.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReflectionSetupError {
-    tool: String,
-}
-
-impl fmt::Display for ReflectionSetupError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "reflection requires tool `{MEMORY_TOOL_ID}`, received `{}`",
-            self.tool
-        )
-    }
-}
-
-impl Error for ReflectionSetupError {}
-
 /// Schedules best-effort, post-delivery reflection tasks.
 pub struct ReflectionFork {
     config: ReflectionConfig,
     runner: Arc<dyn ReflectionRunner>,
-    memory: Arc<dyn Tool>,
+    proposal: Arc<dyn Tool>,
     delivered_turns: AtomicU64,
 }
 
 impl ReflectionFork {
-    /// Build a fork around an injected runner and concrete memory tool.
+    /// Build a fork around an injected runner and concrete proposal tool.
+    #[must_use]
     pub fn new(
         config: ReflectionConfig,
         runner: Arc<dyn ReflectionRunner>,
-        memory: Arc<dyn Tool>,
-    ) -> Result<Self, ReflectionSetupError> {
-        if memory.id() != MEMORY_TOOL_ID {
-            return Err(ReflectionSetupError {
-                tool: memory.id().to_owned(),
-            });
-        }
-        Ok(Self {
+        proposal: Arc<dyn Tool>,
+    ) -> Self {
+        debug_assert_eq!(proposal.id(), MEMORY_TOOL_ID);
+        Self {
             config,
             runner,
-            memory,
+            proposal,
             delivered_turns: AtomicU64::new(0),
-        })
+        }
     }
 
     /// Spawn only when delivery, trigger, and negative-learning policy all permit it.
@@ -294,9 +283,11 @@ impl ReflectionFork {
             transcript: turn.transcript,
             compaction: CompactionMode::Disabled,
             prompt: reflection_prompt(),
+            source_session_id: turn.tool_context.session_id.clone(),
+            source_message_id: turn.tool_context.message_id.clone(),
         };
         let tools = ReflectionTools {
-            memory: Arc::clone(&self.memory),
+            proposal: Arc::clone(&self.proposal),
             context: turn.tool_context,
         };
         let runner = Arc::clone(&self.runner);
@@ -327,7 +318,7 @@ impl ReflectionFork {
 
 fn reflection_prompt() -> Arc<str> {
     let mut prompt = String::from(
-        "Review the completed turn and save only durable user or project facts with memory.\n\nDo NOT capture:\n",
+        "Review the completed turn and propose only durable user or project facts for memory review.\n\nDo NOT capture:\n",
     );
     for item in NEGATIVE_LEARNING_LIST {
         prompt.push_str("  • ");
@@ -335,7 +326,7 @@ fn reflection_prompt() -> Arc<str> {
         prompt.push('\n');
     }
     prompt.push_str(
-        "\nYou can only call the memory tool. Other tools will be denied at runtime — do not attempt them.",
+        "\nYou can only call memory_propose. Other tools will be denied at runtime — do not attempt them.",
     );
     Arc::from(prompt)
 }

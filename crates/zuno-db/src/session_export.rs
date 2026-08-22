@@ -121,10 +121,10 @@ fn normalize_numbers(value: &mut Value) {
 
 /// Read one session and its whole transcript.
 ///
-/// Ordering is inherited from [`MessageStore::hydrate_session`]: messages by
-/// `(time_created, id)` ascending and parts by `id` ascending, which is the order
-/// `MessageV2.page` produces after upstream's reverse
-/// (`session/session.ts:837-852`).
+/// Messages are ordered by `(time_created, id)` through
+/// [`MessageStore::hydrate_session`]. Export then sorts each message's parts by
+/// id to keep the serialized document deterministic independently of runtime
+/// transcript chronology.
 ///
 /// # Errors
 ///
@@ -137,9 +137,12 @@ pub fn export(connection: &Connection, session_id: &str) -> Result<ExportDocumen
         info: session_info(session),
         messages: hydrated
             .into_iter()
-            .map(|message| ExportMessage {
-                info: message.info.to_json(),
-                parts: message.parts.iter().map(PartRecord::to_json).collect(),
+            .map(|mut message| {
+                message.parts.sort_by(|left, right| left.id.cmp(&right.id));
+                ExportMessage {
+                    info: message.info.to_json(),
+                    parts: message.parts.iter().map(PartRecord::to_json).collect(),
+                }
             })
             .collect(),
     })

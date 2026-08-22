@@ -504,6 +504,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "data_migration",
             "event",
             "event_sequence",
+            "memory_candidate",
             "message",
             "part",
             "permission",

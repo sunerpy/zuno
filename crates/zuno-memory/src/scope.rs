@@ -176,6 +176,24 @@ impl std::fmt::Display for Scope {
     }
 }
 
+impl From<zuno_types::MemoryScope> for Scope {
+    fn from(scope: zuno_types::MemoryScope) -> Self {
+        match scope {
+            zuno_types::MemoryScope::Global => Self::Global,
+            zuno_types::MemoryScope::Project => Self::Project,
+        }
+    }
+}
+
+impl From<Scope> for zuno_types::MemoryScope {
+    fn from(scope: Scope) -> Self {
+        match scope {
+            Scope::Global => Self::Global,
+            Scope::Project => Self::Project,
+        }
+    }
+}
+
 /// The store's size in the unit the cap is expressed in.
 ///
 /// One function so no call site can disagree with another about what "2200 chars"

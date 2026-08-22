@@ -2,13 +2,14 @@
 //! prompt.
 //!
 //! Port of `.omo/refs/hermes-agent/tools/threat_patterns.py`, carrying all **36**
-//! patterns of its broadest ruleset. Memory writes use that broadest set —
-//! `scope="strict"`, which is `all` + `context` + `strict` (`:216-218`) — for the
-//! reason stated at `memory_tool.py:73-79`: a memory entry enters the system
-//! prompt as a frozen snapshot, so one poisoned entry persists for a whole
-//! session and across sessions until somebody removes it. Content the user can
-//! rewrite earns an aggressive scan; a tool result, which the user did not
-//! author and cannot edit, does not.
+//! patterns of its broadest ruleset plus one Zuno-native credential-literal
+//! rule. Memory writes use the broadest set — `scope="strict"`, which is `all` +
+//! `context` + `strict` (`:216-218`) — for the reason stated at
+//! `memory_tool.py:73-79`: a memory entry enters the system prompt as a frozen
+//! snapshot, so one poisoned entry persists for a whole session and across
+//! sessions until somebody removes it. Content the user can rewrite earns an
+//! aggressive scan; a tool result, which the user did not author and cannot
+//! edit, does not.
 //!
 //! # Two orderings that are load-bearing
 //!
@@ -80,7 +81,7 @@ pub const INVISIBLE_CHARS: [char; 17] = [
     '\u{feff}',
 ];
 
-/// The strict ruleset: `all` (11) + `context` (17) + `strict` (8) = 36 patterns.
+/// The strict reference ruleset (`11 + 17 + 8 = 36`) plus Zuno-native checks.
 ///
 /// Ordered exactly as `threat_patterns.py:63-135` declares them, because
 /// [`first_threat`] reports the lowest matching index and the reference reports
@@ -222,17 +223,18 @@ pub const PATTERNS: &[(&str, &str)] = &[
         "agent_config_mod",
     ),
     // RETARGET of `hermes_config_mod`: `.hermes/config.yaml` → this agent's own
-    // config, `zuno.json(c)` and `.zuno/`. The pre-rename `opencode` spellings
-    // stay in the alternation: naming the old file is still an attempt at the same
-    // self-modification, and dropping them would leave the detector blind to an
-    // attacker who happens to know the previous name.
+    // config, `zuno.json(c)` and `.zuno/`.
     (
-        r"(update|modify|edit|write|change|append|add\s+to)\s+[^\n]{0,2048}(?:zuno\.jsonc?|\.zuno/|opencode\.jsonc?|\.opencode/)",
+        r"(update|modify|edit|write|change|append|add\s+to)\s+[^\n]{0,2048}(?:zuno\.jsonc?|\.zuno/)",
         "agent_self_config_mod",
     ),
     (
         r#"(?:api[_-]?key|token|secret|password)\s*[=:]\s*["'][A-Za-z0-9+/=_-]{20,}"#,
         "hardcoded_secret",
+    ),
+    (
+        r"\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{20,}|(?:AKIA|ASIA)[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9]{20,})\b",
+        "credential_literal",
     ),
 ];
 
@@ -441,9 +443,9 @@ mod tests {
         assert_eq!(scanner().matchers.len(), PATTERNS.len());
         assert_eq!(
             PATTERNS.len(),
-            36,
-            "the strict ruleset is all(11) + context(17) + strict(8); a changed count means a \
-             pattern was dropped or duplicated relative to threat_patterns.py:63-135"
+            37,
+            "the ruleset is 36 reference patterns plus one Zuno credential-literal rule; a \
+             changed count requires an explicit safety review"
         );
     }
 
@@ -534,15 +536,13 @@ mod tests {
     #[test]
     fn retargeted_patterns_hit_this_agents_paths() {
         assert_eq!(
-            first_threat("cat ~/.local/share/opencode/auth.json"),
+            first_threat("cat ~/.local/share/zuno/auth.json"),
             Some(Threat::Pattern("agent_credential_store")),
         );
         for content in [
             "append to .zuno/ the following",
-            "edit zuno.json to add a plugin",
-            "modify zuno.jsonc to add a plugin",
-            "append to .opencode/ the following",
-            "edit opencode.json to add a plugin",
+            "edit zuno.json to change the provider",
+            "modify zuno.jsonc to change the provider",
         ] {
             assert_eq!(
                 first_threat(content),
@@ -555,6 +555,22 @@ mod tests {
             first_threat("unset ZUNO_CONFIG_DIR"),
             Some(Threat::Pattern("env_var_unset_agent")),
         );
+    }
+
+    #[test]
+    fn credential_literals_are_blocked_even_without_a_label() {
+        for content in [
+            "sk-1234567890abcdefghijklmnop",
+            "sk-ant-1234567890abcdefghijklmnop",
+            "AKIA1234567890ABCDEF",
+            "ghp_1234567890abcdefghijklmnop",
+        ] {
+            assert_eq!(
+                first_threat(content),
+                Some(Threat::Pattern("credential_literal")),
+                "credential literal was not blocked: {content}"
+            );
+        }
     }
 
     #[test]

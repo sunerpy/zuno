@@ -11,6 +11,17 @@ Every client uses four runtime surfaces:
 3. Projections derive current conversation and status state from those events.
 4. The durable inbox accepts prompts, live steering, and `reportDelivery: nextStep` reports before work is scheduled.
 
+The shared projection vocabulary includes:
+
+- `ActivityProjection` for one model step's commands, reads, searches, images,
+  delegations, and other tool activity;
+- `WorkStateProjection` for the active goal, todos, durable jobs, memory
+  candidates, and resident entries;
+- `SessionUsage` for cumulative provider-accounted tokens and context-window
+  state;
+- `BackgroundExecutionProjection` for process-owned terminal state and bounded
+  output.
+
 The server exposes cursor-based replay followed by live delivery. A reconnect sends the last committed cursor, receives every later event in order, then joins the bounded live stream. A client that misses live events must replay; it must not infer the missing state.
 
 The only HTTP event operations are `GET /api/event` for live process-wide notifications and `GET /api/session/{sessionID}/event` for durable session replay plus live delivery. The session operation emits `sessionID:sequence` as the SSE id and accepts that value through `Last-Event-ID` on reconnect. Zuno does not mount an unscoped `/event` adapter or a second event envelope.
@@ -49,6 +60,7 @@ Human input has priority over an automatic goal retry. The client may show the p
 The TUI favors dense, keyboard-first operation:
 
 - stable transcript and status-strip dimensions;
+- a composer that uses the available left pane with only a one-column gutter;
 - multiline question input with bounded growth;
 - visible permission, retry, diagnostics, and background-job states;
 - generic rendering for unknown future events;
@@ -57,12 +69,20 @@ The TUI favors dense, keyboard-first operation:
 - a full-height ambient sidebar outside the transcript, prompt, status, and info
   column, so no left-hand band renders underneath it;
 - a visible transcript scrollbar with wheel and thumb dragging, plus
-  application-owned text selection that is clipped to the transcript.
+  application-owned text selection that is clipped to the transcript. Releasing
+  a drag copies automatically, right-click copies the retained selection, and
+  success or failure is reported without clearing the highlight.
   `mouse: false` opts back into terminal-native selection and alternate-scroll
   translation;
-- per-call tool disclosure rows, so one result can expand without changing its
-  siblings, and subagent rendering selected by persisted `ToolUiIntent::Subagent`
-  rather than hard-coded tool names;
+- step-level activity summaries for completed routine commands, reads, searches,
+  images, and delegations. Running work, approvals, failures, and important
+  results remain visible. `Ctrl+T` opens the complete scrollable durable
+  transcript and preserves manual scroll position; `Alt+T` changes reasoning
+  effort. Thinking remains folded by default and uses muted styling when
+  expanded;
+- per-call tool disclosure in the complete transcript, with subagent rendering
+  selected by persisted `ToolUiIntent::Subagent` rather than hard-coded tool
+  names;
 - one subagent view for native child sessions and configured Codex or Claude Code
   product agents. It shows product/target, objective, status, elapsed time,
   session/run, job, report delivery, result, and safety diagnostics without
@@ -71,7 +91,13 @@ The TUI favors dense, keyboard-first operation:
   mounted for consecutive cancellations;
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
-  row loaded;
+  row `✓ skill-name · loaded`;
+- an independently scrollable and selectable sidebar whose location/version
+  footer stays fixed. It projects goal, todos, jobs, pending memory, token usage,
+  LSP, MCP, and skills from shared state rather than polling;
+- `/ps` for process-owned background terminals and `/memory` for auditable
+  candidate review. Both keep their list mounted after an action so several
+  entries can be handled consecutively;
 - the welcome screen owns only a prepared process identity. It creates no durable
   session until the first model-bound submission commits the session and user
   message together. `session.materialized` updates the in-place session catalog,

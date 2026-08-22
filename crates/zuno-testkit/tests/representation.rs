@@ -169,6 +169,7 @@ fn stream_event_variant_name(event: &StreamEvent) -> &'static str {
 /// Every [`TurnEvent`] variant's payload size. See [`stream_event_payloads`].
 fn turn_event_payloads() -> Vec<VariantPayload> {
     vec![
+        payload("SessionMaterialized", size_of::<(String, String)>()),
         payload("TurnStarted", size_of::<(String,)>()),
         payload("HistoryRepaired", size_of::<(usize,)>()),
         payload("AgentResolved", size_of::<(u32, String)>()),
@@ -202,6 +203,7 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
 /// The compile-time coupling for [`turn_event_payloads`].
 fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
     match event {
+        TurnEvent::SessionMaterialized { .. } => "SessionMaterialized",
         TurnEvent::TurnStarted { .. } => "TurnStarted",
         TurnEvent::HistoryRepaired { .. } => "HistoryRepaired",
         TurnEvent::AgentResolved { .. } => "AgentResolved",

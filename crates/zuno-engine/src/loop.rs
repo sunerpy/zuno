@@ -1592,7 +1592,7 @@ fn persist_live_input(
         }),
         created,
     )?);
-    for (media_type, data) in &input.images {
+    for (offset, (media_type, data)) in input.images.iter().enumerate() {
         parts.push(PartRecord::from_json(
             json!({
                 "id": format!("prt_{}", Uuid::new_v4().simple()),
@@ -1603,12 +1603,12 @@ fn persist_live_input(
                 "data": data,
                 "url": format!("data:{media_type};base64,{data}")
             }),
-            created,
+            created.saturating_add(i64::try_from(offset).unwrap_or(i64::MAX).saturating_add(1)),
         )?);
     }
     store.put_message_at(&message, created)?;
     for part in parts {
-        store.put_part_at(&part, created)?;
+        store.put_part_at(&part, part.time_created)?;
     }
     Ok(())
 }
@@ -2721,11 +2721,12 @@ fn reasoning_part_id(turn_id: &str, step: u32) -> String {
     format!("prt_{turn_id}_{step:04}_reasoning")
 }
 
-/// Parts come back `ORDER BY id ASC` (`zuno-db/src/message.rs:807`), and this id
-/// has to sort *before* [`text_part_id`] and [`tool_part_id`] so the capsule is
-/// replayed as the assistant message's opening content — which is the only
-/// position the provider accepts it in. `"reasoning_"` &lt; `"text"` &lt; `"tool_"`
-/// holds, and the zero-padded index keeps several capsules in stream order.
+/// Parts with the same creation time use their id as the stable tie-break
+/// (`zuno-db/src/message.rs`). This id has to sort *before* [`text_part_id`] and
+/// [`tool_part_id`] so the capsule is replayed as the assistant message's opening
+/// content — the only position the provider accepts it in. `"reasoning_"` &lt;
+/// `"text"` &lt; `"tool_"` holds, and the zero-padded index keeps several capsules
+/// in stream order.
 fn provider_reasoning_part_id(turn_id: &str, step: u32, capsule_index: usize) -> String {
     format!("prt_{turn_id}_{step:04}_reasoning_{capsule_index:04}")
 }

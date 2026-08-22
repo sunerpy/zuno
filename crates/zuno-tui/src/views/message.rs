@@ -177,7 +177,7 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         // Not the status glyph `✗`, which says *this call* failed. `invalid` is a call the
         // model should not have made at all, and the two are worth telling apart.
         "invalid" => ("!", "Rejecting..."),
-        "memory" => ("≡", "Updating memory..."),
+        "memory_propose" => ("≡", "Proposing memory..."),
         // One glyph for all three goal tools: they read, set and amend one object, and
         // three glyphs would imply three subjects.
         "get_goal" | "create_goal" | "update_goal" => ("◎", "Reading the goal..."),

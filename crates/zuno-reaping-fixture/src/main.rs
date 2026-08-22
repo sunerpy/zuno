@@ -72,7 +72,12 @@ async fn run_parent(ready: &Path, stop: &Path, root: &Path) -> Result<(), Box<dy
         let registry = Arc::new(ServerRegistry::offline(&ResolvedLsp::resolve(Some(
             &config,
         ))));
-        let manager = Manager::new(root, registry, RestartPolicy::default());
+        let manager = Manager::new(
+            root,
+            registry,
+            RestartPolicy::default(),
+            std::num::NonZeroUsize::MIN,
+        );
         manager.touch_file(&file).await?;
         lsp.push(manager);
     }

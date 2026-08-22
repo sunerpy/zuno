@@ -2,9 +2,10 @@
 //!
 //! A coding agent that has to be told the same thing every session is not learning
 //! anything. This crate stores a small, curated, capped set of notes and freezes
-//! their rendered blocks into each session's system prompt. Writes persist during
-//! the session but only appear in the next session's frozen snapshot. Todos 100 and
-//! 101 add the tool the model calls and the nudge that makes it call it.
+//! their rendered blocks into each session's system prompt. Harness writes enter
+//! [`MemoryService`] as durable candidates and reach the resident files only after
+//! the configured review or promotion policy. A session keeps its frozen snapshot;
+//! approved changes appear in later prompt assembly.
 //!
 //! # Shape
 //!
@@ -72,6 +73,7 @@
 pub mod error;
 pub mod render;
 pub mod scope;
+pub mod service;
 pub mod snapshot;
 pub mod store;
 pub mod threat;
@@ -82,6 +84,9 @@ pub use crate::render::{
 };
 pub use crate::scope::{
     ENTRY_DELIMITER, GLOBAL_FILE, MEMORY_DIRECTORY, PROJECT_FILE, Scope, ScopeLimits, char_count,
+};
+pub use crate::service::{
+    MemoryObserver, MemoryProposal, MemoryService, MemoryServiceError, PromotionPolicy, ScopePaths,
 };
 pub use crate::snapshot::{
     CacheConsistency, EXTERNAL_MEMORY_NOTE, ScopeEnablement, SessionMemory, assemble_system_prompt,

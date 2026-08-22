@@ -160,6 +160,8 @@ fn memory_false_dominates_every_enabled_default() {
     assert_eq!(memory.global_char_limit, 2_200);
     assert_eq!(memory.project_char_limit, 3_000);
     assert_eq!(memory.nudge_interval, 10);
+    assert_eq!(memory.promotion, MemoryPromotion::Review);
+    assert_eq!(memory.auto_confidence, 0.9);
 }
 
 #[test]
@@ -177,6 +179,25 @@ fn memory_options_resolve_caps_cadence_and_component_flags() {
     assert_eq!(memory.global_char_limit, 1_200);
     assert_eq!(memory.project_char_limit, 2_400);
     assert_eq!(memory.nudge_interval, 0);
+}
+
+#[test]
+fn memory_promotion_and_confidence_are_typed_and_resolved() {
+    let config = parse(r#"{"memory":{"promotion":"high_confidence","auto_confidence":0.95}}"#)
+        .expect("memory promotion parses");
+    let memory = config.resolved_memory();
+
+    assert_eq!(memory.promotion, MemoryPromotion::HighConfidence);
+    assert_eq!(memory.auto_confidence, 0.95);
+}
+
+#[test]
+fn memory_confidence_must_be_a_finite_probability() {
+    for value in ["-0.01", "1.01"] {
+        let error = parse(&format!(r#"{{"memory":{{"auto_confidence":{value}}}}}"#))
+            .expect_err("confidence outside the probability range must fail");
+        assert_eq!(issue_path(&error), "memory.auto_confidence");
+    }
 }
 
 #[test]

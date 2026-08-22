@@ -76,6 +76,46 @@ The trigger policy makes a named or clearly matching skill a pre-action requirem
 
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 
+## Auditable memory and reflection
+
+Resident memory has one mutation boundary: `memory_propose`. Foreground agents
+and the isolated post-delivery reflection fork both use that tool, which validates
+the requested add/replace/remove operation and inserts a durable
+`MemoryCandidate`; it never edits the resident file directly. Candidates retain
+scope, action, reason, confidence, source session/message, timestamps,
+diagnostics, and exact before/after snapshots.
+
+The default promotion policy is `review`. `high_confidence` applies candidates at
+or above the configured threshold, while `automatic` applies every validated
+candidate. All policies use the same durable state machine:
+
+```text
+pending -> applying -> applied -> undoing -> undone
+       \-> rejected
+       \-> failed / uncertain
+```
+
+`applying` and `undoing` are written before touching the file. After process loss,
+the runtime compares the resident file with both stored snapshots and marks the
+observed result; it never replays the write or undo. Any third state becomes
+`uncertain` and requires user inspection.
+
+Reflection runs only after a final response was delivered and uses an explicitly
+configured reachable `small_model`. Zuno persists the exact review prompt,
+replayed durable turn transcript, tool schema, model identity, digest, and
+terminal outcome as `memory.reflection.request` and
+`memory.reflection.outcome`. Stream truncation, malformed arguments, denied
+tools, and proposal failures are durable failed outcomes. The fork can call only
+`memory_propose`; it cannot reach shell, files, normal tools, or foreground
+conversation state.
+
+Candidate validation rejects prompt injection, credential literals, ambiguous
+locators, over-budget results, and external file drift. Automatic learning is
+limited to durable user facts, explicit corrections, repository rules, and
+verified reusable recovery knowledge. It cannot rewrite code, prompts, agents,
+extensions, or skills. `/memory` is the user-owned review and correction surface.
+See [auditable memory and reflection](design/memory-learning.md).
+
 ## Durable inputs
 
 Every model-visible external input is admitted to the session event log and durable inbox in one SQLite transaction before execution is attempted. The inbox is the source of truth across active turns, idle sessions, process restarts, and competing drivers.
@@ -246,6 +286,11 @@ Registrations are effects: every component must return the exact cleanup needed 
 
 ## Client surfaces
 
-The TUI, headless CLI, server, ACP adapter, and future GUI consume the same commands, durable events, inbox, and projections. Cursor replay closes gaps after disconnects; live delivery is only a wake/latency path. See [client interface architecture](design/client-interfaces.md).
+The TUI, headless CLI, server, ACP adapter, and future GUI consume the same
+commands, durable events, inbox, and frontend-neutral projections.
+`ActivityProjection`, `WorkStateProjection`, `SessionUsage`, and
+`BackgroundExecutionProjection` prevent clients from rebuilding agent-loop state
+privately. Cursor replay closes gaps after disconnects; live delivery is only a
+wake/latency path. See [client interface architecture](design/client-interfaces.md).
 
 The design sources and explicit adopt/adapt/reject decisions are recorded in [the harness comparison](design/harness-comparison.md).

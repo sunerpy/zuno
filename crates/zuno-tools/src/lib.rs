@@ -248,8 +248,8 @@ pub use crate::task::{
 };
 
 pub use crate::memory::{
-    DESCRIPTION as MEMORY_DESCRIPTION, MAX_CONSOLIDATION_FAILURES_PER_TURN, MEMORY_TOOL_ID,
-    MemoryAction, MemoryOperation, MemoryParams, MemoryTarget, MemoryTool, ScopePaths,
+    DESCRIPTION as MEMORY_DESCRIPTION, MEMORY_TOOL_ID, MemoryAction, MemoryParams, MemoryTarget,
+    MemoryTool,
 };
 
 #[cfg(test)]
