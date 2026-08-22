@@ -47,6 +47,22 @@ $ zuno --help
 $ zuno --version --long
 ```
 
+Start first-time configuration from the checked native provider example. It uses the Rust `openai`
+transport and neither installs Node packages nor loads an AI SDK:
+
+```sh
+install -d -m 700 "${XDG_CONFIG_HOME:-$HOME/.config}/zuno"
+install -m 600 examples/config/zuno.json "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/zuno.json"
+$EDITOR "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/zuno.json"
+printf '%s' "$MYOPENAI_API_KEY" | zuno providers login --provider myopenai
+zuno debug config
+zuno models myopenai --verbose
+```
+
+For a prebuilt installation without a source checkout, create the contents of
+[`examples/config/zuno.json`](../../examples/config/zuno.json) directly at the same configuration
+path. Provider configuration accepts native `transport` values and has no `npm` field.
+
 `zuno export` and `zuno import` close Zuno's own round trip. Both are **top-level** commands, not
 subcommands of `session`; `zuno session` carries only `list`, `prune`, and `delete`.
 

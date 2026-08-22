@@ -52,6 +52,22 @@ $ zuno --help
 $ zuno --version --long
 ```
 
+首次配置从仓库内已校验的原生 provider 示例开始；它使用 Rust `openai` transport，不安装
+Node 包，也不加载 AI SDK：
+
+```sh
+install -d -m 700 "${XDG_CONFIG_HOME:-$HOME/.config}/zuno"
+install -m 600 examples/config/zuno.json "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/zuno.json"
+$EDITOR "${XDG_CONFIG_HOME:-$HOME/.config}/zuno/zuno.json"
+printf '%s' "$MYOPENAI_API_KEY" | zuno providers login --provider myopenai
+zuno debug config
+zuno models myopenai --verbose
+```
+
+如果使用预编译安装而没有源码 checkout，直接在同一配置路径创建
+[`examples/config/zuno.json`](examples/config/zuno.json) 所示内容。Provider 配置只接受原生
+`transport`；不接受 `npm` 字段。
+
 `zuno export` 与 `zuno import` 构成 Zuno 自身的导出/导入闭环。两者都是**顶层命令**，
 不是 `session` 的子命令；`zuno session` 只有 `list`、`prune`、`delete`。
 

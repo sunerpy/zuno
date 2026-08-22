@@ -837,6 +837,23 @@ fn the_real_user_config_deserializes() {
     assert!(permission.get("todoread").is_some());
 }
 
+#[test]
+fn checked_native_provider_starter_deserializes() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/config/zuno.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let config = parse(&text).expect("the checked native provider starter must load");
+    let value = serde_json::to_value(config).expect("starter serializes");
+
+    assert_eq!(value["model"], "myopenai/primary-model");
+    assert_eq!(value["small_model"], "myopenai/fast-model");
+    assert_eq!(value["provider"]["myopenai"]["transport"], "openai");
+    assert!(
+        value["provider"]["myopenai"].get("npm").is_none(),
+        "Zuno provider config must not grow a package-manager selector"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The order-preserving map itself.
 // ---------------------------------------------------------------------------

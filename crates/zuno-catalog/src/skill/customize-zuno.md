@@ -5,9 +5,10 @@ is wrong. The forms below cover the supported configuration surface.
 
 ## Schema ownership
 
-Zuno does not currently publish a JSON Schema. Omit `$schema` unless the user
-already owns a Zuno-specific schema reference; schemas for other products include
-fields Zuno rejects.
+Zuno's canonical JSON Schema is `schemas/zuno.json` in the matching source
+checkout. It is generated from the same Rust types that load configuration.
+Use an editor schema association or an absolute file URI when the user's config
+is outside that checkout. Never use another product's schema.
 
 If a field is not documented here, inspect the installed Zuno version's
 configuration documentation or its `zuno-config` schema before editing. Unknown
@@ -75,7 +76,7 @@ Every field is optional.
 
   "agent": {
     "my-agent": {
-      "model": "anthropic/claude-sonnet-4-6",
+      "model": "myopenai/primary-model",
       "mode": "subagent",
       "description": "...",
       "permission": { "edit": "deny" }
@@ -87,15 +88,25 @@ Every field is optional.
   },
 
   "provider": {
-    "anthropic": { "options": { "apiKey": "..." } }
+    "myopenai": {
+      "transport": "openai",
+      "env": ["MYOPENAI_API_KEY"],
+      "options": { "baseURL": "https://gateway.example.com/v1" },
+      "models": {
+        "primary-model": {
+          "name": "Primary model",
+          "reasoning": true,
+          "tool_call": true
+        }
+      }
+    }
   },
-  "disabled_providers": ["openai"],
-  "enabled_providers": ["anthropic"],
+  "enabled_providers": ["myopenai"],
 
   "mcp": {
-    "playwright": {
+    "codegraph": {
       "type": "local",
-      "command": ["npx", "-y", "@playwright/mcp"],
+      "command": ["codegraph", "serve", "--mcp"],
       "enabled": true,
       "environment": {}
     },
@@ -134,7 +145,10 @@ Every field is optional.
 
 Shape notes worth being explicit about:
 
-- `model` always carries a provider prefix: `"anthropic/claude-sonnet-4-6"`.
+- `model` always carries a provider prefix: `"myopenai/primary-model"`.
+- `provider.<id>.transport` selects a native Rust implementation. Recommended
+  custom OpenAI endpoints use `"openai"`; generic compatible gateways use
+  `"openai-compatible"`. Provider config has no `npm` field.
 - `skills` is an object with `paths` and/or `urls`, not an array.
 - `references` is an object keyed by alias. Each value is a local path, Git repository, or string shorthand.
 - `agent` is an object keyed by agent name, not an array.
@@ -142,6 +156,21 @@ Shape notes worth being explicit about:
 - `mcp[name].command` is an array of strings, never a single string. `type` is required.
 - `permission` is either a string action or an object keyed by tool name.
 - `web_search.provider` is `"exa"` or `"parallel"`; limits are positive integers.
+
+## Provider initialization
+
+Do not install a package or generate provider config through Node. Create
+`zuno.json` with a native `transport`, then store the credential through Zuno:
+
+```sh
+printf '%s' "$MYOPENAI_API_KEY" | zuno providers login --provider myopenai
+zuno debug config
+zuno models myopenai --verbose
+```
+
+Credentials are stored separately from `zuno.json`. Inline
+`provider.<id>.options.apiKey` is supported, but the credential store avoids
+putting secrets in source control and configuration backups.
 
 ## Skills
 
@@ -218,7 +247,7 @@ Two ways to define an agent. Use the file form for anything non-trivial.
     "my-reviewer": {
       "description": "Reviews PRs for style violations.",
       "mode": "subagent",
-      "model": "anthropic/claude-sonnet-4-6",
+      "model": "myopenai/primary-model",
       "permission": { "edit": "deny", "bash": "ask" },
       "prompt": "You are a strict PR reviewer..."
     }
@@ -236,7 +265,7 @@ Two ways to define an agent. Use the file form for anything non-trivial.
 ---
 description: Reviews PRs for style violations.
 mode: subagent
-model: anthropic/claude-sonnet-4-6
+model: myopenai/primary-model
 permission:
   edit: deny
   bash: ask
@@ -281,7 +310,7 @@ Frontmatter:
 ---
 description: One sentence describing what the command does.
 agent: build
-model: anthropic/claude-sonnet-4-6
+model: myopenai/primary-model
 ---
 
 (command body in markdown: the prompt Zuno runs, with $ARGUMENTS for the user's input)
@@ -299,11 +328,11 @@ model: anthropic/claude-sonnet-4-6
 ```json
 {
   "mcp": {
-    "playwright": {
+    "codegraph": {
       "type": "local",
-      "command": ["npx", "-y", "@playwright/mcp"],
+      "command": ["codegraph", "serve", "--mcp"],
       "enabled": true,
-      "environment": { "BROWSER": "chromium" }
+      "environment": {}
     },
     "github": {
       "type": "remote",

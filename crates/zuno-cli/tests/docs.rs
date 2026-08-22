@@ -140,6 +140,59 @@ fn readmes_document_extension_examples_and_do_not_advertise_compatibility() {
 }
 
 #[test]
+fn provider_setup_recommends_native_transports_without_node_bootstrap() {
+    for relative in [
+        "README.md",
+        "docs/readme/README.en.md",
+        "docs/reference/configuration.md",
+        "docs/reference/providers.md",
+        "crates/zuno-catalog/src/skill/customize-zuno.md",
+        "examples/config/zuno.json",
+    ] {
+        let text = read(relative);
+        assert!(
+            text.contains("myopenai"),
+            "{relative} must use the checked custom provider id"
+        );
+        assert!(
+            text.contains("transport"),
+            "{relative} must name the native provider selector"
+        );
+        for retired in [r#""npm":"#, "@ai-sdk/", r#""npx""#] {
+            assert!(
+                !text.contains(retired),
+                "{relative} contains retired provider bootstrap form {retired:?}"
+            );
+        }
+    }
+
+    for relative in [
+        "README.md",
+        "docs/readme/README.en.md",
+        "docs/reference/providers.md",
+        "crates/zuno-catalog/src/skill/customize-zuno.md",
+    ] {
+        contains_all(
+            relative,
+            &[
+                "zuno providers login --provider myopenai",
+                "zuno debug config",
+                "zuno models myopenai --verbose",
+            ],
+        );
+    }
+
+    contains_all(
+        "examples/config/zuno.json",
+        &[
+            r#""transport": "openai""#,
+            r#""model": "myopenai/primary-model""#,
+            r#""small_model": "myopenai/fast-model""#,
+        ],
+    );
+}
+
+#[test]
 fn database_docs_describe_a_hard_pre_release_format_cut() {
     let text = read("docs/migration.md");
     for required in [

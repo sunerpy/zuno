@@ -20,11 +20,14 @@ For a repository-root configuration:
 ```json
 {
   "$schema": "./schemas/zuno.json",
-  "model": "myopenai/example-model"
+  "model": "myopenai/primary-model",
+  "small_model": "myopenai/fast-model"
 }
 ```
 
 Use an editor-specific schema association or an absolute file URI when the config file and repository schema are not in the same tree. A later documentation deployment can publish this unchanged artifact at a stable HTTPS URL.
+
+The complete checked starter is [`examples/config/zuno.json`](../../examples/config/zuno.json). It declares a native `openai` transport and contains no package-manager or AI SDK field. Follow the [provider initialization guide](providers.md#first-run-initialization) to install it, edit the endpoint and model ids, and store credentials.
 
 ## Main config versus TUI config
 
