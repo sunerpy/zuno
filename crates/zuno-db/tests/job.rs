@@ -2,7 +2,9 @@ use serde_json::json;
 use std::sync::Arc;
 use zuno_db::event_log::SessionEventLog;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
-use zuno_db::job::{AgentJobStore, JobSettlement, JobStatus, NewAgentJob, ReportDelivery};
+use zuno_db::job::{
+    AgentJobStore, JobSettlement, JobStatus, JobSubject, NewAgentJob, ReportDelivery,
+};
 use zuno_db::{Pool, migration, session};
 use zuno_paths::DbLocation;
 
@@ -58,7 +60,7 @@ fn initialized(location: &DbLocation) -> Arc<Pool> {
 }
 
 fn running(id: &str, delivery: ReportDelivery) -> NewAgentJob {
-    NewAgentJob::new(id, PARENT, CHILD, delivery, 10)
+    NewAgentJob::new(id, PARENT, JobSubject::child_session(CHILD), delivery, 10)
 }
 
 fn report(id: &str) -> NewSessionInput {
@@ -94,7 +96,63 @@ fn creating_a_job_persists_running_state_and_parent_event() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, "agent.job.created");
     assert_eq!(events[0].properties["jobID"], "job_1");
-    assert_eq!(events[0].properties["childSessionID"], CHILD);
+    assert_eq!(
+        events[0].properties["subject"],
+        json!({"kind":"childSession","sessionID":CHILD})
+    );
+}
+
+#[test]
+fn product_agent_jobs_have_no_fake_child_session_and_can_be_uncertain() {
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    let created = store
+        .create(NewAgentJob::new(
+            "job_product",
+            PARENT,
+            JobSubject::product_agent("run_product", "codex", "codex-work", "subagent_codex"),
+            ReportDelivery::Quiet,
+            10,
+        ))
+        .expect("create product job");
+
+    assert!(matches!(
+        created.subject,
+        JobSubject::ProductAgent { ref run_id, .. } if run_id == "run_product"
+    ));
+    let settled = store
+        .settle(
+            "job_product",
+            JobSettlement::uncertain("app-server disconnected", 20, None),
+        )
+        .expect("mark uncertain");
+    assert_eq!(settled.job.status, JobStatus::Uncertain);
+    assert_eq!(
+        store
+            .running_product_agents_for(PARENT)
+            .expect("running products"),
+        Vec::new()
+    );
+}
+
+#[test]
+fn durable_product_subjects_reject_blank_identifiers() {
+    let pool = initialized(&DbLocation::Memory);
+    let connection = pool.get().expect("database connection");
+    let error = connection
+        .execute(
+            "INSERT INTO agent_job (
+               id, parent_session_id, subject_kind, child_session_id, product_run_id,
+               product_kind, product_instance, product_tool, status, report_delivery,
+               created_seq, time_created, time_updated
+             ) VALUES (
+               'job_blank_product', ?1, 'product-agent', NULL, '   ',
+               'codex', 'reviewer', 'subagent_codex', 'running', 'quiet', 0, 1, 1
+             )",
+            [PARENT],
+        )
+        .expect_err("blank durable product identifiers must fail");
+    assert!(error.to_string().contains("agent_job_subject"), "{error}");
 }
 
 #[test]

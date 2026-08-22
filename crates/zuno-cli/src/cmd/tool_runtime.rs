@@ -38,6 +38,7 @@
 //! `zuno run`, `zuno serve` and the TUI all reach — because a hand-assembled registry
 //! would have passed throughout. `tests/tool_runtime.rs` is that assertion.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -84,6 +85,8 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
     pub(crate) skills: Arc<zuno_catalog::skill::Skills>,
     pub(crate) delegation: Delegation,
+    pub(crate) product_agents: Arc<dyn zuno_tools::product_agent::ProductAgentHost>,
+    pub(crate) job_controller: Arc<dyn zuno_tools::job_cancel::JobController>,
 }
 
 /// The collaborators `task` needs, which only a surface that can drive a turn has.
@@ -134,6 +137,12 @@ pub(crate) fn assemble(
         experimental_lsp_tool: false,
         experimental_code_mode: false,
     };
+    let harness_tool_names = selection
+        .contributions
+        .tools()
+        .iter()
+        .map(|tool| tool.id().to_owned())
+        .collect::<BTreeSet<_>>();
 
     let file_tools = FileTools::new(directory).map_err(to_string)?;
     let mut builder = ToolRegistryBuilder::new(directory, file_tools, flags)
@@ -171,6 +180,10 @@ pub(crate) fn assemble(
                 ))),
             )
             .map_err(|error| error.to_string())?;
+        builder.register_configured_builtin(erase(zuno_tools::job_cancel::JobCancelTool::new(
+            Arc::clone(&selection.todo_store),
+            Arc::clone(&selection.job_controller),
+        )));
     }
     for (slot, tool) in [
         (
@@ -213,6 +226,33 @@ pub(crate) fn assemble(
     if let Some(memory) = configured_memory_tool(memory_root, config) {
         builder.register_configured_builtin(memory);
     }
+    let mut product_tool_names = BTreeSet::new();
+    for (instance, product) in config.product_agent.iter().flatten() {
+        if !product.is_enabled() {
+            continue;
+        }
+        product.validate(instance)?;
+        let tool_name = product.resolved_tool_name();
+        if native_tool_name(tool_name, &harness_tool_names) {
+            return Err(format!(
+                "productAgent.{instance}.toolName `{tool_name}` collides with a native tool"
+            ));
+        }
+        if !product_tool_names.insert(tool_name.to_owned()) {
+            return Err(format!(
+                "enabled product-agent instances must have distinct toolName values; \
+                 `{tool_name}` is registered more than once"
+            ));
+        }
+        builder.register_configured_builtin(erase(
+            zuno_tools::product_agent::ProductAgentTool::new(
+                tool_name,
+                instance,
+                zuno_tools::product_agent::product_id(product.kind),
+                Arc::clone(&selection.product_agents),
+            ),
+        ));
+    }
     for tool in zuno_goal::goal_tools(Arc::clone(&selection.goal_store)) {
         builder.register_configured_builtin(tool);
     }
@@ -233,6 +273,21 @@ pub(crate) fn assemble(
         rules,
         suppressions,
     })
+}
+
+fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
+    zuno_tools::registry::BUILTIN_ORDER
+        .iter()
+        .any(|slot| slot.wire_id() == name)
+        || [
+            zuno_tools::JOB_CANCEL_WIRE_ID,
+            zuno_tools::memory::MEMORY_TOOL_ID,
+            zuno_goal::GET_GOAL_TOOL_ID,
+            zuno_goal::CREATE_GOAL_TOOL_ID,
+            zuno_goal::UPDATE_GOAL_TOOL_ID,
+        ]
+        .contains(&name)
+        || harness_tool_names.contains(name)
 }
 
 fn configured_memory_tool(root: &Path, config: &Config) -> Option<Arc<dyn Tool>> {
@@ -296,5 +351,22 @@ mod tests {
         );
 
         assert!(memory.is_none());
+    }
+
+    #[test]
+    fn product_agent_names_reserve_every_native_and_harness_tool() {
+        let harness = BTreeSet::from(["extension_tool".to_owned()]);
+        for name in [
+            "task",
+            "job_cancel",
+            "memory",
+            "get_goal",
+            "create_goal",
+            "update_goal",
+            "extension_tool",
+        ] {
+            assert!(native_tool_name(name, &harness), "{name}");
+        }
+        assert!(!native_tool_name("subagent_codex", &harness));
     }
 }

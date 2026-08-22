@@ -133,6 +133,11 @@ pub enum DialogOutcome {
     Session(crate::views::picker::SessionDialogAction),
     /// The MCP dialog requested an explicit lifecycle target.
     McpToggle(crate::views::picker::McpToggleRequest),
+    /// The subagent dialog requested cancellation while remaining open.
+    JobCancel {
+        /// Durable job identifier.
+        job_id: String,
+    },
 }
 
 /// One of `§11.4`'s three fixed dialog widths.

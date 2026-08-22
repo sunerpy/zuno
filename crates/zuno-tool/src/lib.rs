@@ -87,6 +87,7 @@ pub use crate::store::{StoredOutput, ToolOutputStore};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use zuno_error::ToolError;
@@ -103,6 +104,19 @@ pub struct ToolDefinition {
     pub description: String,
     /// The augmented JSON Schema for the arguments.
     pub parameters: Value,
+    /// Stable client presentation intent, independent from the wire name.
+    pub ui_intent: ToolUiIntent,
+}
+
+/// A tool's durable client presentation category.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolUiIntent {
+    /// Ordinary tool rendering.
+    #[default]
+    Generic,
+    /// Native or product subagent execution.
+    Subagent,
 }
 
 /// Whether an identical tool call may be issued again after a transient failure.
@@ -137,6 +151,11 @@ pub trait Tool: Send + Sync {
     /// Whether an identical call may be retried after a typed transient failure.
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Never
+    }
+
+    /// Stable client presentation intent.
+    fn ui_intent(&self) -> ToolUiIntent {
+        ToolUiIntent::Generic
     }
 
     /// The parameter schema **before** central augmentation.
@@ -203,6 +222,7 @@ pub trait Tool: Send + Sync {
             id: self.id().to_owned(),
             description: self.description().to_owned(),
             parameters: schema::augment(self.raw_parameters_schema()),
+            ui_intent: self.ui_intent(),
         }
     }
 }
@@ -283,6 +303,11 @@ pub trait TypedTool: Send + Sync + 'static {
         ToolReplayPolicy::Never
     }
 
+    /// Stable client presentation intent.
+    fn ui_intent(&self) -> ToolUiIntent {
+        ToolUiIntent::Generic
+    }
+
     /// Runs the tool against decoded arguments.
     async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError>;
 }
@@ -308,6 +333,10 @@ impl<T: TypedTool> Tool for Typed<T> {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         self.0.replay_policy()
+    }
+
+    fn ui_intent(&self) -> ToolUiIntent {
+        self.0.ui_intent()
     }
 
     fn raw_parameters_schema(&self) -> Value {

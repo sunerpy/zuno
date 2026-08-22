@@ -62,6 +62,45 @@ fn test_delegation() -> tool_runtime::Delegation {
     }
 }
 
+#[derive(Debug, Default)]
+struct NoProductAgents;
+
+#[async_trait::async_trait]
+impl zuno_tools::product_agent::ProductAgentHost for NoProductAgents {
+    async fn dispatch(
+        &self,
+        _request: zuno_tools::product_agent::ProductAgentRequest,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<zuno_tools::product_agent::ProductAgentTurn, String> {
+        Err("test fixture has no product agents".to_owned())
+    }
+}
+
+#[derive(Debug, Default)]
+struct NoJobController;
+
+#[async_trait::async_trait]
+impl zuno_tools::job_cancel::JobController for NoJobController {
+    async fn cancel(
+        &self,
+        _parent_session_id: &str,
+        _job_id: &str,
+    ) -> Result<zuno_tools::job_cancel::CancelOutcome, String> {
+        Ok(zuno_tools::job_cancel::CancelOutcome {
+            requested: false,
+            message: "no live fixture job".to_owned(),
+        })
+    }
+}
+
+fn test_product_agents() -> Arc<dyn zuno_tools::product_agent::ProductAgentHost> {
+    Arc::new(NoProductAgents)
+}
+
+fn test_job_controller() -> Arc<dyn zuno_tools::job_cancel::JobController> {
+    Arc::new(NoJobController)
+}
+
 fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
     let directory = PathBuf::from(directory);
     let auth_store = zuno_auth::AuthStore::new(directory.join(".zuno-test-auth.json"));
@@ -2530,6 +2569,8 @@ fn production_registry_exposes_all_three_goal_tools() {
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            job_controller: test_job_controller(),
         },
     )
     .expect("production registry assembles");
@@ -3297,14 +3338,20 @@ fn the_picker_enumeration_spans_every_provider_the_catalog_holds() {
 /// missing from the composition root is only observable from the composition root.
 mod production_registry {
     use super::*;
+    use std::path::Path;
 
+    #[derive(Debug)]
     struct Fixture {
         _directory: tempfile::TempDir,
         _goal_spill: tempfile::TempDir,
         ids: Vec<String>,
+        intents: std::collections::BTreeMap<String, zuno_tool::ToolUiIntent>,
     }
 
-    fn assemble_with(skills: zuno_catalog::skill::Skills) -> Fixture {
+    fn try_assemble_with(
+        skills: zuno_catalog::skill::Skills,
+        config: zuno_config::schema::Config,
+    ) -> Result<Fixture, String> {
         let directory = tempfile::TempDir::new().expect("temporary tool workspace");
         let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
         let selected_agent = agent("build");
@@ -3312,7 +3359,7 @@ mod production_registry {
             directory.path(),
             None,
             &Env::empty(),
-            &zuno_config::schema::Config::default(),
+            &config,
             &selected_agent,
             tool_runtime::ToolSelection {
                 provider_id: "provider",
@@ -3331,19 +3378,31 @@ mod production_registry {
                 mcp_loader: None,
                 skills: Arc::new(skills),
                 delegation: test_delegation(),
+                product_agents: test_product_agents(),
+                job_controller: test_job_controller(),
             },
-        )
-        .expect("production registry assembles");
+        )?;
         let ids = runtime
             .tools
             .iter()
             .map(|tool| tool.id().to_owned())
+            .collect::<Vec<_>>();
+        let intents = runtime
+            .tools
+            .iter()
+            .map(|tool| (tool.id().to_owned(), tool.ui_intent()))
             .collect();
-        Fixture {
+        Ok(Fixture {
             _directory: directory,
             _goal_spill: goal_spill,
             ids,
-        }
+            intents,
+        })
+    }
+
+    fn assemble_with(skills: zuno_catalog::skill::Skills) -> Fixture {
+        try_assemble_with(skills, zuno_config::schema::Config::default())
+            .expect("production registry assembles")
     }
 
     fn assemble() -> Fixture {
@@ -3374,6 +3433,115 @@ mod production_registry {
             zuno_tools::TASK_WIRE_ID,
             fixture.ids
         );
+    }
+
+    #[test]
+    fn advertises_job_cancel_only_because_the_live_controller_is_wired() {
+        let fixture = assemble();
+
+        assert!(
+            fixture
+                .ids
+                .iter()
+                .any(|id| id == zuno_tools::JOB_CANCEL_WIRE_ID),
+            "the production registry has no `{}`; visible tools: {:?}",
+            zuno_tools::JOB_CANCEL_WIRE_ID,
+            fixture.ids
+        );
+    }
+
+    #[test]
+    fn product_agents_are_default_off_and_enabled_instances_register_static_tools() {
+        let disabled = assemble();
+        assert!(
+            !disabled.ids.iter().any(
+                |id| id.starts_with("subagent_codex") || id.starts_with("subagent_claude_code")
+            ),
+            "default configuration exposed product agents: {:?}",
+            disabled.ids
+        );
+
+        let config = zuno_config::schema::Config::from_json_str(
+            Path::new("opencode.json"),
+            r#"{
+                "productAgent": {
+                    "codex-review": {
+                        "kind": "codex",
+                        "enabled": true,
+                        "command": "codex",
+                        "toolName": "subagent_codex_review",
+                        "permissionMode": "never"
+                    },
+                    "claude-audit": {
+                        "kind": "claude-code",
+                        "enabled": true,
+                        "command": "claude",
+                        "toolName": "subagent_claude_audit",
+                        "permissionMode": "dontAsk"
+                    }
+                }
+            }"#,
+        )
+        .expect("product-agent config");
+        let enabled =
+            try_assemble_with(zuno_catalog::skill::Skills::default(), config).expect("assemble");
+
+        for id in ["subagent_codex_review", "subagent_claude_audit"] {
+            assert!(
+                enabled.ids.iter().any(|candidate| candidate == id),
+                "{enabled:?}"
+            );
+            assert_eq!(
+                enabled.intents.get(id),
+                Some(&zuno_tool::ToolUiIntent::Subagent)
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_or_native_product_tool_names_fail_before_a_turn_starts() {
+        for (document, expected) in [
+            (
+                r#"{
+                    "productAgent": {
+                        "one": {"kind":"codex","enabled":true,"toolName":"same"},
+                        "two": {"kind":"claude-code","enabled":true,"toolName":"same"}
+                    }
+                }"#,
+                "distinct toolName",
+            ),
+            (
+                r#"{
+                    "productAgent": {
+                        "one": {"kind":"codex","enabled":true,"toolName":"task"}
+                    }
+                }"#,
+                "collides with a native tool",
+            ),
+            (
+                r#"{
+                    "productAgent": {
+                        "one": {"kind":"codex","enabled":true,"toolName":"memory"}
+                    }
+                }"#,
+                "collides with a native tool",
+            ),
+            (
+                r#"{
+                    "productAgent": {
+                        "one": {"kind":"codex","enabled":true,"toolName":"get_goal"}
+                    }
+                }"#,
+                "collides with a native tool",
+            ),
+        ] {
+            let config =
+                zuno_config::schema::Config::from_json_str(Path::new("opencode.json"), document)
+                    .expect("config parses before assembly validation");
+            let error = try_assemble_with(zuno_catalog::skill::Skills::default(), config)
+                .expect_err("invalid static tool registration");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     /// The `skill` tool must answer from the same set the prompt advertised.
@@ -3417,6 +3585,8 @@ mod production_registry {
                 mcp_loader: None,
                 skills: Arc::new(skills),
                 delegation: test_delegation(),
+                product_agents: test_product_agents(),
+                job_controller: test_job_controller(),
             },
         )
         .expect("production registry assembles");

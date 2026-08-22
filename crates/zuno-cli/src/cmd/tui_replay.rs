@@ -220,6 +220,11 @@ fn tool(data: &serde_json::Map<String, Value>) -> Option<MessagePart> {
     Some(MessagePart::Tool {
         call_id,
         name,
+        ui_intent: data
+            .get("uiIntent")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
         // The stored `input` object re-serialised, which is what the live transcript
         // accumulates from the provider's input deltas and what
         // `zuno_tui::views::tool::summary` parses to name the file a `read` read.

@@ -695,6 +695,8 @@ pub enum Selection {
     SessionRename { id: String, title: String },
     /// Delete a session after the list has confirmed the destructive action.
     SessionDelete(String),
+    /// Cancel one running background subagent job.
+    JobCancel(String),
     /// A different theme.
     Theme(String),
     /// A different reasoning level for subsequent turns.
@@ -2675,6 +2677,7 @@ impl SessionScreen {
                 format!("renaming session {id} to {title}")
             }
             Selection::SessionDelete(id) => format!("deleting session {id}"),
+            Selection::JobCancel(id) => format!("cancelling background job {id}"),
             Selection::Theme(theme) => format!("theme {theme} selected"),
             Selection::Effort(effort) => {
                 format!("reasoning set to {effort} for the next turn")
@@ -3025,6 +3028,11 @@ impl ActionComponent for SessionScreen {
                             request.server
                         )));
                 }
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::JobCancel { job_id } => {
+                let (notice, level) = self.commit_selection(Selection::JobCancel(job_id.clone()));
+                self.toasts.push(Toast::new(level, notice));
                 EventResult::REDRAW
             }
             _ => EventResult::IGNORED,

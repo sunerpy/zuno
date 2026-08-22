@@ -48,6 +48,35 @@ Set `"mouse": false` to opt out of those interactions and return drag selection 
 
 The `system` theme queries the terminal's OSC 10/11 foreground and background colours before the TUI starts, then derives its text, panel, input, border, and syntax colours from that result. Terminals which do not support colour queries fall back to `COLORFGBG`; if neither source is available, Zuno applies a neutral root, panel, and input hierarchy so the interface does not collapse into one near-black surface.
 
+## Product subagents
+
+`productAgent` is a map of named, default-off Codex or Claude Code instances. Each enabled instance contributes one statically named tool:
+
+```json
+{
+  "productAgent": {
+    "codex": {
+      "kind": "codex",
+      "enabled": true,
+      "command": "codex",
+      "toolName": "subagent_codex",
+      "permissionMode": "never"
+    },
+    "claude-code": {
+      "kind": "claude-code",
+      "enabled": true,
+      "command": "claude",
+      "toolName": "subagent_claude_code",
+      "permissionMode": "dontAsk"
+    }
+  }
+}
+```
+
+Instances inherit the Zuno process environment, working directory, and the product's native configuration and login. An optional `env` object overlays inherited variables, including proxy variables. Zuno does not copy Codex or Claude Code tokens into its provider credential store.
+
+Dangerous modes `dangerouslyBypassApprovals` and `bypassPermissions` are accepted only when written explicitly. Tool names must be unique and cannot collide with native tools. See [Codex and Claude Code product agents](../design/product-agents.md) for protocol, job, cancellation, and TUI behavior.
+
 ## Inspecting the result
 
 Use `zuno debug paths` to inspect resolved roots and `zuno debug config` to inspect the merged configuration. A validation error names every rejected top-level key; for example, putting `theme` in `zuno.json` is rejected because it belongs in `tui.json`.

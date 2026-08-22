@@ -313,10 +313,23 @@ fn every_binding_resolves_to_its_documented_action() {
 fn defaults_have_no_conflicts_and_cover_every_scope() {
     let keymap = Keymap::defaults().expect("the shipped defaults must not conflict");
     let scopes = keymap.scope_names();
+    let local_scopes = crate::keybind::LOCAL_DEFINITIONS
+        .iter()
+        .map(|definition| definition.scope)
+        .filter(|scope| {
+            *scope != "leader"
+                && !crate::keybind::DEFINITIONS
+                    .iter()
+                    .any(|definition| definition.scope == *scope)
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let expected_scopes = 38 + local_scopes;
     assert_eq!(
         scopes.len(),
-        38,
-        "expected 38 action scopes (39 table namespaces minus `leader`), found {}: {scopes:?}",
+        expected_scopes,
+        "expected 38 upstream action scopes plus {local_scopes} Zuno-native scopes, found {}: \
+         {scopes:?}",
         scopes.len()
     );
     assert_eq!(

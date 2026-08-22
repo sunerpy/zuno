@@ -13,9 +13,12 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput};
-use zuno_db::job::{AgentJobStore, JobSettlement, NewAgentJob, ReportDelivery as DbReportDelivery};
+use zuno_db::job::{
+    AgentJobStore, JobSettlement, JobSubject, NewAgentJob, ReportDelivery as DbReportDelivery,
+};
 use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::event_channel;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
@@ -44,15 +47,50 @@ const MAX_ANCESTRY_WALK: u32 = 64;
 /// returning its id but before committing its terminal state.
 #[derive(Clone, Default)]
 pub(crate) struct BackgroundJobSupervisor {
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    tasks: Arc<Mutex<Vec<ManagedJob>>>,
+}
+
+struct ManagedJob {
+    id: String,
+    parent_session_id: String,
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
 }
 
 impl BackgroundJobSupervisor {
-    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+    pub(crate) fn spawn(
+        &self,
+        id: impl Into<String>,
+        parent_session_id: impl Into<String>,
+        cancellation: CancellationToken,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
         self.tasks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(tokio::spawn(task));
+            .push(ManagedJob {
+                id: id.into(),
+                parent_session_id: parent_session_id.into(),
+                cancellation,
+                task: tokio::spawn(task),
+            });
+    }
+
+    /// Request cancellation without replaying or directly settling the job.
+    pub(crate) fn cancel(&self, parent_session_id: &str, job_id: &str) -> bool {
+        let tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(job) = tasks.iter().find(|job| {
+            job.id == job_id
+                && job.parent_session_id == parent_session_id
+                && !job.task.is_finished()
+        }) else {
+            return false;
+        };
+        job.cancellation.cancel();
+        true
     }
 
     /// Whether this host still owns a background task that can write session state.
@@ -61,7 +99,7 @@ impl BackgroundJobSupervisor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .any(|task| !task.is_finished())
+            .any(|job| !job.task.is_finished())
     }
 
     /// Wait for every task this supervisor owns.
@@ -77,8 +115,8 @@ impl BackgroundJobSupervisor {
             if tasks.is_empty() {
                 return;
             }
-            for task in tasks {
-                if let Err(error) = task.await {
+            for job in tasks {
+                if let Err(error) = job.task.await {
                     tracing::error!(%error, "background subagent task panicked");
                 }
             }
@@ -87,12 +125,38 @@ impl BackgroundJobSupervisor {
 }
 
 #[async_trait]
-trait DelegatedTurnRunner: Send + Sync + 'static {
-    async fn run(&self, session_id: &str, request: &ChildTurnRequest) -> Result<String, String>;
+impl zuno_tools::job_cancel::JobController for BackgroundJobSupervisor {
+    async fn cancel(
+        &self,
+        parent_session_id: &str,
+        job_id: &str,
+    ) -> Result<zuno_tools::job_cancel::CancelOutcome, String> {
+        let requested = self.cancel(parent_session_id, job_id);
+        Ok(zuno_tools::job_cancel::CancelOutcome {
+            requested,
+            message: if requested {
+                "the live executor accepted the cancellation request".to_owned()
+            } else {
+                "this process has no running executor for the job; inspect durable state before \
+                 retrying or reconciling"
+                    .to_owned()
+            },
+        })
+    }
 }
 
 #[async_trait]
-trait ParentReportWake: Send + Sync + 'static {
+trait DelegatedTurnRunner: Send + Sync + 'static {
+    async fn run(
+        &self,
+        session_id: &str,
+        request: &ChildTurnRequest,
+        cancellation: CancellationToken,
+    ) -> Result<String, String>;
+}
+
+#[async_trait]
+pub(crate) trait ParentReportWake: Send + Sync + 'static {
     async fn wake(&self, report: SessionInput) -> Result<(), String>;
 }
 
@@ -206,6 +270,11 @@ impl ChildSessionHost {
         Ok(recovered)
     }
 
+    /// Share the parent's durable report coordinator with another job provider.
+    pub(crate) fn wake_handle(&self) -> Arc<dyn ParentReportWake> {
+        Arc::clone(&self.wake)
+    }
+
     /// Open a connection of this host's own.
     ///
     /// Not the parent's: `run_turn` holds that one mutably for the whole turn, and a
@@ -278,7 +347,15 @@ struct ProductionDelegatedTurnRunner {
 
 #[async_trait]
 impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
-    async fn run(&self, session_id: &str, request: &ChildTurnRequest) -> Result<String, String> {
+    async fn run(
+        &self,
+        session_id: &str,
+        request: &ChildTurnRequest,
+        cancellation: CancellationToken,
+    ) -> Result<String, String> {
+        if cancellation.is_cancelled() {
+            return Err("child turn was cancelled before it started".to_owned());
+        }
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
             model: request.model.as_ref().map(|model| model.model.clone()),
@@ -297,7 +374,23 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             self.mcp.clone(),
             Arc::clone(&self.database),
         )?;
-        let outcome = drive_and_drain(&mut host, &request.prompt, None, None).await;
+        let guard = self
+            .runs
+            .begin_turn(session_id.to_owned())
+            .map_err(to_string)?;
+        let control = self.runs.control(session_id.to_owned());
+        let outcome = {
+            let drive = drive_and_drain(&mut host, &request.prompt, None, Some(guard));
+            tokio::pin!(drive);
+            tokio::select! {
+                outcome = &mut drive => outcome,
+                () = cancellation.cancelled() => {
+                    let _aborted = control.abort();
+                    let _drained = drive.await;
+                    Err("child turn was cancelled".to_owned())
+                }
+            }
+        };
         host.shutdown().await;
         outcome?;
         child_answer(&self.database, session_id)
@@ -481,9 +574,10 @@ impl ChildTurnHost for ChildSessionHost {
     async fn dispatch(&self, request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError> {
         let session_id = self.session_for(&request)?;
         if !request.background {
+            let cancellation = CancellationToken::new();
             let output = self
                 .runner
-                .run(&session_id, &request)
+                .run(&session_id, &request, cancellation)
                 .await
                 .map_err(ChildTurnError::Host)?;
             return Ok(ChildTurn {
@@ -502,7 +596,7 @@ impl ChildTurnHost for ChildSessionHost {
             .create(NewAgentJob::new(
                 job_id.clone(),
                 request.parent_session_id.clone(),
-                session_id.clone(),
+                JobSubject::child_session(session_id.clone()),
                 delivery,
                 zuno_db::message::now_millis(),
             ))
@@ -513,73 +607,105 @@ impl ChildTurnHost for ChildSessionHost {
         let job_store = self.job_store.clone();
         let background_job_id = job_id.clone();
         let background_session_id = session_id.clone();
-        self.supervisor.spawn(async move {
-            let outcome = runner.run(&background_session_id, &request).await;
-            let completed = zuno_db::message::now_millis();
-            let (settlement, report_text) = match outcome {
-                Ok(output) => {
+        let parent_session_id = request.parent_session_id.clone();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        self.supervisor.spawn(
+            job_id.clone(),
+            parent_session_id,
+            cancellation,
+            async move {
+                let outcome = runner
+                    .run(&background_session_id, &request, task_cancellation.clone())
+                    .await;
+                let completed = zuno_db::message::now_millis();
+                let (settlement, report_text) = if task_cancellation.is_cancelled() {
                     let text = format!(
-                        "Background subagent `{background_session_id}` completed job \
+                        "Background subagent `{background_session_id}` cancelled job \
+                     `{background_job_id}`."
+                    );
+                    (
+                        JobSettlement::cancelled(
+                            "cancelled by user",
+                            completed,
+                            report_input(
+                                &request,
+                                &background_job_id,
+                                &background_session_id,
+                                "cancelled",
+                                &text,
+                                completed,
+                            ),
+                        ),
+                        text,
+                    )
+                } else {
+                    match outcome {
+                        Ok(output) => {
+                            let text = format!(
+                                "Background subagent `{background_session_id}` completed job \
                          `{background_job_id}`.\n\n{output}"
-                    );
-                    (
-                        JobSettlement::completed(
-                            json!({"text": output}),
-                            completed,
-                            report_input(
-                                &request,
-                                &background_job_id,
-                                &background_session_id,
-                                "completed",
-                                &text,
-                                completed,
-                            ),
-                        ),
-                        text,
-                    )
-                }
-                Err(error) => {
-                    let text = format!(
-                        "Background subagent `{background_session_id}` failed job \
+                            );
+                            (
+                                JobSettlement::completed(
+                                    json!({"text": output}),
+                                    completed,
+                                    report_input(
+                                        &request,
+                                        &background_job_id,
+                                        &background_session_id,
+                                        "completed",
+                                        &text,
+                                        completed,
+                                    ),
+                                ),
+                                text,
+                            )
+                        }
+                        Err(error) => {
+                            let text = format!(
+                                "Background subagent `{background_session_id}` failed job \
                          `{background_job_id}`: {error}"
-                    );
-                    (
-                        JobSettlement::failed(
-                            error,
-                            completed,
-                            report_input(
-                                &request,
-                                &background_job_id,
-                                &background_session_id,
-                                "failed",
-                                &text,
-                                completed,
-                            ),
-                        ),
-                        text,
-                    )
-                }
-            };
-            match job_store.settle(&background_job_id, settlement) {
-                Ok(settled) => {
-                    if let Some(report) = settled.report
-                        && let Err(error) = wake.wake(report).await
-                    {
-                        tracing::error!(
-                            job_id = %background_job_id,
-                            %error,
-                            "background report remains pending after wake failure"
-                        );
+                            );
+                            (
+                                JobSettlement::failed(
+                                    error,
+                                    completed,
+                                    report_input(
+                                        &request,
+                                        &background_job_id,
+                                        &background_session_id,
+                                        "failed",
+                                        &text,
+                                        completed,
+                                    ),
+                                ),
+                                text,
+                            )
+                        }
                     }
+                };
+                match job_store.settle(&background_job_id, settlement) {
+                    Ok(settled) => {
+                        if let Some(report) = settled.report
+                            && let Err(error) = wake.wake(report).await
+                        {
+                            tracing::error!(
+                                job_id = %background_job_id,
+                                %error,
+                                "background report remains pending after wake failure"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::error!(
+                        job_id = %background_job_id,
+                        %error,
+                        report = %report_text,
+                        "background job settlement failed"
+                    ),
                 }
-                Err(error) => tracing::error!(
-                    job_id = %background_job_id,
-                    %error,
-                    report = %report_text,
-                    "background job settlement failed"
-                ),
-            }
-        });
+            },
+        );
 
         Ok(ChildTurn {
             session_id,

@@ -61,8 +61,14 @@ The TUI favors dense, keyboard-first operation:
   `mouse: false` opts back into terminal-native selection and alternate-scroll
   translation;
 - per-call tool disclosure rows, so one result can expand without changing its
-  siblings, and a task renderer that presents child session id, state, and result
-  without exposing the tool's envelope markup;
+  siblings, and subagent rendering selected by persisted `ToolUiIntent::Subagent`
+  rather than hard-coded tool names;
+- one subagent view for native child sessions and configured Codex or Claude Code
+  product agents. It shows product/target, objective, status, elapsed time,
+  session/run, job, report delivery, result, and safety diagnostics without
+  exposing product-internal reasoning or tool streams. Enter toggles details;
+  pressing `x` twice requests cancellation of a running job and keeps the list
+  mounted for consecutive cancellations;
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
   row loaded;

@@ -76,6 +76,12 @@ The stored OAuth credential contains access, refresh, expiry, and optional accou
 
 ChatGPT OAuth is accepted only for the Responses surface. Its request uses the ChatGPT Codex backend, includes `ChatGPT-Account-Id` when the token identifies an account, and forwards a constrained compute-residency claim when one is present. Custom OpenAI-wire providers treat a manually supplied OAuth access value as an ordinary bearer and do not receive ChatGPT endpoint or refresh semantics.
 
+## Product-agent authentication is separate
+
+Configured Codex and Claude Code subagents are not model providers and never participate in `zuno auth login`. Zuno starts the host-installed command and inherits that product's own configuration and login state. It does not read, translate, refresh, or copy those tokens into `AuthStore`, and it does not choose a product model from the Zuno catalog.
+
+This boundary is intentional: `openai` provider OAuth authenticates Zuno's in-process OpenAI request implementation, while a Codex product agent authenticates the separate Codex installation and app-server process. See [Codex and Claude Code product agents](product-agents.md).
+
 ## Security properties
 
 - Credential files are created with mode `0600` on Unix and repaired to that mode on later writes.

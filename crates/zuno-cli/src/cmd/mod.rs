@@ -8,6 +8,7 @@ mod export;
 mod mcp;
 mod mcp_runtime;
 mod models;
+mod product_agent;
 mod providers;
 mod run;
 mod serve;

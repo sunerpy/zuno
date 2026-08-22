@@ -161,6 +161,7 @@ pub const NO_KEY: &str = "none";
 pub fn default_spelling(name: &str) -> Option<&'static str> {
     DEFINITIONS
         .iter()
+        .chain(LOCAL_DEFINITIONS.iter())
         .find(|definition| definition.name == name)
         .map(|definition| definition.keys)
 }
@@ -170,6 +171,7 @@ pub fn default_spelling(name: &str) -> Option<&'static str> {
 pub fn definition(name: &str) -> Option<&'static Definition> {
     DEFINITIONS
         .iter()
+        .chain(LOCAL_DEFINITIONS.iter())
         .find(|definition| definition.name == name)
 }
 
@@ -765,7 +767,11 @@ impl Keymap {
 
         let leader = Self::resolve_leader(overrides)?;
         let mut scopes: BTreeMap<&'static str, Vec<Binding>> = BTreeMap::new();
-        for definition in DEFINITIONS.iter().filter(|row| !row.is_leader()) {
+        for definition in DEFINITIONS
+            .iter()
+            .chain(LOCAL_DEFINITIONS.iter())
+            .filter(|row| !row.is_leader())
+        {
             let value = overrides
                 .get(definition.name)
                 .cloned()
@@ -2676,3 +2682,17 @@ pub const DEFINITIONS: &[Definition] = &[
         description: "Jump to last which-key binding",
     },
 ];
+
+/// Zuno-native dialog bindings that have no upstream row.
+///
+/// Kept outside [`DEFINITIONS`] so the mechanically extracted compatibility table
+/// remains auditable row-for-row. These still pass through the same parser, conflict
+/// detection, user overrides, and action dispatcher as every upstream binding.
+pub const LOCAL_DEFINITIONS: &[Definition] = &[Definition {
+    name: "subagent_cancel",
+    scope: "dialog.subagent",
+    keys: "x",
+    command: "subagent.cancel",
+    prevent_default: None,
+    description: "Confirm cancellation of the selected subagent job",
+}];

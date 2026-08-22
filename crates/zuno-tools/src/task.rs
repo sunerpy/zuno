@@ -65,7 +65,7 @@ use zuno_agent::model_policy::{
 };
 use zuno_error::ToolError;
 use zuno_llm::effort::{EffortCapabilities, ProviderFamily, ReasoningEffort};
-use zuno_tool::{PermissionAsk, ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{PermissionAsk, ToolContext, ToolOutput, ToolUiIntent, TypedTool};
 
 /// The id the model calls, and the registry slot it fills
 /// ([`crate::registry::BuiltinSlot::Task`]).
@@ -676,6 +676,10 @@ impl TypedTool for TaskTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn ui_intent(&self) -> ToolUiIntent {
+        ToolUiIntent::Subagent
     }
 
     async fn run(&self, params: TaskParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {

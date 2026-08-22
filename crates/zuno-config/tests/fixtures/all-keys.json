@@ -138,6 +138,18 @@
       }
     }
   },
+  "productAgent": {
+    "codex": {
+      "kind": "codex",
+      "enabled": true,
+      "command": "codex",
+      "toolName": "subagent_codex",
+      "permissionMode": "never",
+      "env": {
+        "HTTPS_PROXY": "http://127.0.0.1:7890"
+      }
+    }
+  },
   "mcp": {
     "local-one": {
       "type": "local",

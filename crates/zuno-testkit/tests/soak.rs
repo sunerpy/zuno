@@ -663,6 +663,7 @@ impl ToolDispatcher for LargeOutputDispatcher {
                     "properties": { "city": { "type": "string" } },
                     "required": ["city"]
                 }),
+                ui_intent: zuno_tool::ToolUiIntent::Generic,
             }],
             McpToolStatus::Ready,
         )

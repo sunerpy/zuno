@@ -19,6 +19,7 @@ use zuno_llm::event::StreamEvent;
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
+use zuno_tool::ToolUiIntent;
 
 const SESSION_ID: &str = "ses_status_test";
 
@@ -239,6 +240,7 @@ fn status_urgent_soft_interrupt_skips_remaining_tools_in_event_sequence() {
                 step: 1,
                 call_id: "call-1".to_owned(),
                 name: "first".to_owned(),
+                ui_intent: ToolUiIntent::Generic,
             },
             TurnEvent::ToolDispatchCompleted {
                 step: 1,
@@ -268,6 +270,7 @@ fn emit_tool_events(events: &mut Vec<TurnEvent>, call_id: &str, name: &str) {
         step: 1,
         call_id: call_id.to_owned(),
         name: name.to_owned(),
+        ui_intent: ToolUiIntent::Generic,
     });
     events.push(TurnEvent::ToolDispatchCompleted {
         step: 1,

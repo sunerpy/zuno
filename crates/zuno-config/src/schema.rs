@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod ordered;
 pub mod parse;
 pub mod permission;
+pub mod product_agent;
 pub mod provider;
 pub mod reference;
 
@@ -33,6 +34,7 @@ use crate::schema::lsp::LspConfig;
 use crate::schema::mcp::McpServerConfig;
 use crate::schema::ordered::OrderedMap;
 use crate::schema::permission::PermissionConfig;
+use crate::schema::product_agent::ProductAgentConfig;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
 use schemars::JsonSchema;
@@ -65,6 +67,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "username",
     "agent",
     "provider",
+    "productAgent",
     "mcp",
     "formatter",
     "lsp",
@@ -154,6 +157,9 @@ pub struct Config {
     /// Custom providers and model overrides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<OrderedMap<ProviderConfig>>,
+    /// Native Codex and Claude Code subagent instances.
+    #[serde(rename = "productAgent", skip_serializing_if = "Option::is_none")]
+    pub product_agent: Option<OrderedMap<ProductAgentConfig>>,
     /// MCP servers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<OrderedMap<McpServerConfig>>,

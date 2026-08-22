@@ -19,6 +19,7 @@ zuno-observability
 zuno-paths
 zuno-permission
 zuno-process
+zuno-product-agent
 zuno-provider-anthropic
 zuno-provider-bedrock
 zuno-provider-compatible

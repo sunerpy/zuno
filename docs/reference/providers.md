@@ -135,6 +135,8 @@ These are separate authentication products:
 
 Selecting `--method api-key` never invokes ChatGPT login. Selecting either ChatGPT method never treats the resulting access token as a Platform API key.
 
+Codex and Claude Code product subagents are a separate capability. They inherit the native command's existing login and never appear in `zuno auth login`; Zuno does not copy their credentials into `auth.json` or select their models. See [Codex and Claude Code product agents](../design/product-agents.md).
+
 ## How `myopenai` is called
 
 The request path is native Rust:

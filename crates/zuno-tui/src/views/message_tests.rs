@@ -67,6 +67,7 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
             step: 1,
             call_id: String::from("call_1"),
             name: String::from("read"),
+            ui_intent: zuno_tool::ToolUiIntent::Generic,
         },
         TurnEvent::ToolDispatchCompleted {
             step: 1,
@@ -345,6 +346,7 @@ fn views_tool_call_walks_pending_running_and_terminal_states() {
         step: 1,
         call_id: String::from("c1"),
         name: String::from("bash"),
+        ui_intent: zuno_tool::ToolUiIntent::Generic,
     });
     assert_eq!(status(&transcript), ToolStatus::Running);
     assert!(status(&transcript).is_active());
@@ -373,6 +375,7 @@ fn views_tool_dispatch_without_a_provider_stream_still_appears() {
         step: 1,
         call_id: String::from("orphan"),
         name: String::from("grep"),
+        ui_intent: zuno_tool::ToolUiIntent::Generic,
     });
     assert_eq!(transcript.messages()[0].parts.len(), 1);
 }
@@ -1343,7 +1346,7 @@ fn views_task_results_render_as_a_child_session_instead_of_raw_envelope_markup()
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
         id: String::from("task_1"),
-        name: String::from(crate::views::subagent::TASK_TOOL),
+        name: String::from("renamed_delegate"),
     })));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
         String::from(
@@ -1351,10 +1354,16 @@ fn views_task_results_render_as_a_child_session_instead_of_raw_envelope_markup()
         ),
     ))));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd)));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchStarted {
+        step: 1,
+        call_id: String::from("task_1"),
+        name: String::from("renamed_delegate"),
+        ui_intent: zuno_tool::ToolUiIntent::Subagent,
+    }));
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("task_1"),
-        name: String::from(crate::views::subagent::TASK_TOOL),
+        name: String::from("renamed_delegate"),
         title: String::from("Delegated runtime trace"),
         output: String::from(
             "<task id=\"ses_child\" state=\"completed\">\n\
@@ -3062,6 +3071,7 @@ fn cache_subjects() -> Vec<(&'static str, TranscriptView)> {
             step: 1,
             call_id: String::from("r1"),
             name: String::from("bash"),
+            ui_intent: zuno_tool::ToolUiIntent::Generic,
         },
     ] {
         running.transcript_mut().observe(&event);
@@ -3351,6 +3361,7 @@ fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
             step: 1,
             call_id: String::from("c"),
             name: String::from("bash"),
+            ui_intent: zuno_tool::ToolUiIntent::Generic,
         },
     ] {
         view.transcript_mut().observe(&event);
@@ -3557,6 +3568,7 @@ fn views_transcript_fingerprint_separates_every_part_shape() {
                 parts: vec![MessagePart::Tool {
                     call_id: String::from("c"),
                     name: String::from("bash"),
+                    ui_intent: zuno_tool::ToolUiIntent::Generic,
                     arguments: String::new(),
                     title: None,
                     status: ToolStatus::Pending,
@@ -3573,6 +3585,7 @@ fn views_transcript_fingerprint_separates_every_part_shape() {
                 parts: vec![MessagePart::Tool {
                     call_id: String::from("c"),
                     name: String::from("bash"),
+                    ui_intent: zuno_tool::ToolUiIntent::Generic,
                     arguments: String::new(),
                     title: None,
                     status: ToolStatus::Completed,
@@ -3589,6 +3602,7 @@ fn views_transcript_fingerprint_separates_every_part_shape() {
                 parts: vec![MessagePart::Tool {
                     call_id: String::from("c"),
                     name: String::from("bash"),
+                    ui_intent: zuno_tool::ToolUiIntent::Generic,
                     arguments: String::new(),
                     title: None,
                     status: ToolStatus::Completed,

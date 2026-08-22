@@ -384,6 +384,8 @@ pub enum MessagePart {
         call_id: String,
         /// The tool's wire name.
         name: String,
+        /// Durable client presentation intent supplied by the tool implementation.
+        ui_intent: zuno_tool::ToolUiIntent,
         /// The raw JSON arguments, accumulated from the provider's input deltas.
         ///
         /// Raw and not parsed, because the deltas arrive as a byte stream and a *prefix*
@@ -792,10 +794,21 @@ impl Transcript {
                 true
             }
             TurnEvent::Provider { event, .. } => self.observe_stream(event),
-            TurnEvent::ToolDispatchStarted { call_id, name, .. } => {
+            TurnEvent::ToolDispatchStarted {
+                call_id,
+                name,
+                ui_intent,
+                ..
+            } => {
                 self.update_tool(call_id, |part| {
-                    if let MessagePart::Tool { status, .. } = part {
+                    if let MessagePart::Tool {
+                        status,
+                        ui_intent: intent,
+                        ..
+                    } = part
+                    {
                         *status = ToolStatus::Running;
+                        *intent = *ui_intent;
                     }
                 }) || {
                     // A dispatch with no `ToolUseStart` seen — the provider stream
@@ -804,6 +817,7 @@ impl Transcript {
                     self.append(MessagePart::Tool {
                         call_id: call_id.clone(),
                         name: name.clone(),
+                        ui_intent: *ui_intent,
                         arguments: String::new(),
                         title: None,
                         status: ToolStatus::Running,
@@ -910,6 +924,7 @@ impl Transcript {
                 self.append(MessagePart::Tool {
                     call_id: id.clone(),
                     name: name.clone(),
+                    ui_intent: zuno_tool::ToolUiIntent::Generic,
                     arguments: String::new(),
                     title: None,
                     status: ToolStatus::Pending,
@@ -1965,6 +1980,7 @@ impl TranscriptView {
                 status,
                 output,
                 diff,
+                ui_intent,
                 ..
             } => {
                 let (icon, placeholder) = tool_affordance(name);
@@ -2029,20 +2045,10 @@ impl TranscriptView {
                         self.tool_result_lines(frame, name, patch, *status, display, out);
                     }
                     (None, Some(output)) => {
-                        if name == crate::views::subagent::TASK_TOOL
-                            && let Some(envelope) = crate::views::subagent::task_envelope(output)
+                        if *ui_intent == zuno_tool::ToolUiIntent::Subagent
+                            && let Some(envelope) = crate::views::subagent::output_envelope(output)
                         {
-                            let mut detail = String::from(Self::RESULT_INSET);
-                            if let Some(session) = envelope.session_id.as_deref() {
-                                detail.push_str("session ");
-                                detail.push_str(session);
-                            } else {
-                                detail.push_str("no child session");
-                            }
-                            if let Some(state) = envelope.state.as_deref() {
-                                detail.push_str(" · ");
-                                detail.push_str(state);
-                            }
+                            let detail = format!("{}{}", Self::RESULT_INSET, envelope.detail);
                             push(&detail, self.context.accent(), out);
                             if !envelope.result.is_empty() {
                                 self.tool_result_lines(
@@ -2466,6 +2472,7 @@ fn fingerprint(message: &Message) -> u64 {
                 status,
                 output,
                 diff,
+                ..
             } => {
                 2_u8.hash(&mut hasher);
                 call_id.hash(&mut hasher);

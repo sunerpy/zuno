@@ -106,6 +106,7 @@ fn assistant_reply(index: usize) -> Message {
             MessagePart::Tool {
                 call_id: format!("call-{index}"),
                 name: String::from("read"),
+                ui_intent: zuno_tool::ToolUiIntent::Generic,
                 arguments: format!(
                     "{{\"filePath\":\"crates/zuno-tui/src/views/message.rs\",\"offset\":{index}}}"
                 ),

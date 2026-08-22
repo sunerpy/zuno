@@ -2295,6 +2295,7 @@ fn furnished_screen() -> SessionScreen {
             step: 1,
             call_id: String::from("call_1"),
             name: String::from("edit"),
+            ui_intent: zuno_tool::ToolUiIntent::Generic,
         });
     screen
         .transcript_mut()
@@ -7112,7 +7113,7 @@ fn the_leader_down_chord_opens_the_delegated_task_view() {
 
     let joined = rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
     assert!(
-        joined.contains("Delegated tasks"),
+        joined.contains("Subagents"),
         "ctrl+x down did not open the delegated-task view:\n{joined}"
     );
     assert!(
@@ -7127,6 +7128,7 @@ fn delegating_message() -> Message {
         crate::views::message::MessagePart::Tool {
             call_id: String::from(id),
             name: String::from("task"),
+            ui_intent: zuno_tool::ToolUiIntent::Subagent,
             arguments: format!(
                 r#"{{"description":"{description}","prompt":"go","subagent_type":"{agent}"}}"#
             ),

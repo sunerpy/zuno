@@ -198,7 +198,9 @@ pub use crate::websearch::gating::{
 pub mod exposure;
 pub mod invalid;
 pub mod job;
+pub mod job_cancel;
 pub mod plan_exit;
+pub mod product_agent;
 pub mod question;
 pub mod registry;
 pub mod todo;
@@ -209,7 +211,13 @@ pub use crate::exposure::{
 };
 pub use crate::invalid::{InvalidParams, InvalidTool};
 pub use crate::job::{DESCRIPTION as JOB_DESCRIPTION, JobParams, JobTool, WIRE_ID as JOB_WIRE_ID};
+pub use crate::job_cancel::{
+    CancelOutcome, JobCancelParams, JobCancelTool, JobController, WIRE_ID as JOB_CANCEL_WIRE_ID,
+};
 pub use crate::plan_exit::{PlanExitHost, PlanExitParams, PlanExitTool, RecordingHost};
+pub use crate::product_agent::{
+    ProductAgentHost, ProductAgentParams, ProductAgentRequest, ProductAgentTool, ProductAgentTurn,
+};
 pub use crate::question::{
     Answer, QuestionAsker, QuestionOption, QuestionParams, QuestionPrompt, QuestionRequest,
     QuestionTool, ScriptedAnswers,

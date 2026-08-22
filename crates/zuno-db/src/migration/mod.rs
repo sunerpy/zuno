@@ -7,7 +7,7 @@
 //! * **has `session` and `migration`** — a Zuno database. Run only migrations
 //!   its journal does not already record ([`apply_only`]).
 //! * **empty** — a fresh install. Create the current schema in one statement batch
-//!   and pre-seed all 39 journal ids, so no migration ever replays.
+//!   and pre-seed every journal id, so no migration ever replays.
 //! * **anything else** — unsupported. Fail without manufacturing a journal or
 //!   guessing how another schema should be interpreted.
 //!
@@ -266,13 +266,16 @@ mod tests {
 
     #[test]
     fn migration_ids_are_derived_from_the_statements_that_actually_run() {
-        assert_eq!(MIGRATION_IDS.len(), 39);
-        assert_eq!(CURRENT_VERSION, 39);
+        assert_eq!(MIGRATION_IDS.len(), 40);
+        assert_eq!(CURRENT_VERSION, 40);
         for (index, migration) in MIGRATIONS.iter().enumerate() {
             assert_eq!(MIGRATION_IDS[index], migration.id);
         }
         assert_eq!(MIGRATION_IDS[0], "20260127222353_familiar_lady_ursula");
-        assert_eq!(MIGRATION_IDS[38], "20260821160000_agent_job");
+        assert_eq!(
+            MIGRATION_IDS[39],
+            "20260822170000_generalize_agent_job_subject"
+        );
     }
 
     #[test]

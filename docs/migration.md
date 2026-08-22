@@ -74,7 +74,7 @@ The migration journal is forward-only. If it contains an id above this binary's
 known ceiling, Zuno refuses to open the database and names both the ceiling and
 the observed id. Keep the backup before allowing any version to migrate the file.
 
-## The 39 migrations
+## The 40 migrations
 
 Generated from `zuno_db::migration::MIGRATION_IDS`, in execution order.
 `CURRENT_VERSION` equals this list's length; the documentation gate asserts that,
@@ -121,6 +121,8 @@ so adding a migration without documenting it fails.
 | 36 | `20260622142730_simplify_session_context_epoch` |
 | 37 | `20260622170816_reset_v2_session_state` |
 | 38 | `20260622202450_simplify_session_input` |
+| 39 | `20260821160000_agent_job` |
+| 40 | `20260822170000_generalize_agent_job_subject` |
 <!-- generated:END migration-journal -->
 
 Regenerate with:

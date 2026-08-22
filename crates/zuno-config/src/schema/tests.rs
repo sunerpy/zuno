@@ -9,6 +9,7 @@ use crate::schema::lsp::{BUILTIN_SERVER_IDS, LspConfig};
 use crate::schema::mcp::{McpOauth, McpServerConfig};
 use crate::schema::ordered::False;
 use crate::schema::permission::{PermissionAction, PermissionConfig, PermissionRule};
+use crate::schema::product_agent::{ProductAgentKind, ProductAgentPermissionMode};
 use crate::schema::provider::Timeout;
 use crate::schema::reference::ReferenceEntry;
 use serde_json::{Value, json};
@@ -183,6 +184,52 @@ fn memory_character_caps_must_be_positive() {
     let error = parse(r#"{"memory":{"global_char_limit":0}}"#)
         .expect_err("a zero character budget is not usable");
     assert_eq!(issue_path(&error), "memory.global_char_limit");
+}
+
+#[test]
+fn product_agents_default_off_and_validate_native_permission_modes() {
+    let config = parse(
+        r#"{
+          "productAgent": {
+            "codex-work": {"kind":"codex"},
+            "claude-review": {
+              "kind":"claude-code",
+              "enabled":true,
+              "toolName":"subagent_review",
+              "permissionMode":"dontAsk"
+            }
+          }
+        }"#,
+    )
+    .expect("product agents parse");
+    let agents = config.product_agent.expect("product agents");
+    let codex = agents.get("codex-work").expect("codex");
+    assert_eq!(codex.kind, ProductAgentKind::Codex);
+    assert!(!codex.is_enabled());
+    assert_eq!(
+        codex.resolved_permission_mode(),
+        ProductAgentPermissionMode::Never
+    );
+    codex.validate("codex-work").expect("codex config");
+
+    let claude = agents.get("claude-review").expect("claude");
+    assert!(claude.is_enabled());
+    assert_eq!(claude.resolved_tool_name(), "subagent_review");
+    claude.validate("claude-review").expect("claude config");
+}
+
+#[test]
+fn product_agent_permission_modes_do_not_cross_products() {
+    let config = parse(r#"{"productAgent":{"bad":{"kind":"codex","permissionMode":"dontAsk"}}}"#)
+        .expect("the shared schema parses before product-specific validation");
+    let bad = config
+        .product_agent
+        .expect("product agents")
+        .get("bad")
+        .expect("bad")
+        .clone();
+    let error = bad.validate("bad").expect_err("dontAsk is Claude-only");
+    assert!(error.contains("not valid"), "{error}");
 }
 
 // ---------------------------------------------------------------------------

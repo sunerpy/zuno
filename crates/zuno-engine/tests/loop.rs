@@ -26,7 +26,7 @@ use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role,
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
-use zuno_tool::{ToolDefinition, ToolOutput};
+use zuno_tool::{ToolDefinition, ToolOutput, ToolUiIntent};
 
 const SESSION_ID: &str = "ses_loop_test";
 
@@ -186,6 +186,7 @@ impl ToolDispatcher for FakeDispatcher {
                     "properties": { "text": { "type": "string" } },
                     "required": ["text"]
                 }),
+                ui_intent: zuno_tool::ToolUiIntent::Generic,
             }],
             McpToolStatus::Ready,
         )
@@ -907,6 +908,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
             step: 1,
             call_id: "call-1".to_owned(),
             name: "echo".to_owned(),
+            ui_intent: ToolUiIntent::Generic,
         },
         TurnEvent::ToolDispatchCompleted {
             step: 1,

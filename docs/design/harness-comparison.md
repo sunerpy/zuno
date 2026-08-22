@@ -1,6 +1,6 @@
 # Harness design comparison
 
-Status: 2026-08-21.
+Status: 2026-08-22.
 
 This document records which ideas Zuno adopts from other agent harnesses. The source projects are references, not runtime compatibility targets.
 
@@ -53,6 +53,9 @@ Zuno adapts:
   `zuno.extension/v1` agent/workflow/skill packages, with process-local and static lifetimes but no
   JavaScript ABI;
 - worker-thread orchestration becomes Tokio tasks with durable SQLite coordination.
+- product-owned Codex and Claude Code subagents become native Rust protocol
+  providers, static Zuno tools, and durable `ProductAgent` jobs rather than a
+  TypeScript compatibility API.
 
 ### Codex
 
@@ -94,6 +97,7 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | Stable client projections | adopt | cursor replay plus snapshots shared by TUI/server/ACP/future GUI |
 | Goal persistence | adopt and extend | separate goal DB, typed recovery reason, persisted exponential backoff |
 | Tool replay after failure | adapt | `Never` by default; explicit `Safe` only for read-only/idempotent tools |
+| Codex and Claude Code product subagents | adapt | Native app-server/stream-json providers, static configured tools, durable jobs, explicit cancellation, and uncertain non-replay |
 | Bounded specialist roster | adopt | `build`, `plan`, `deep`, `explorer`, `librarian`, `advisor`, `worker`, `looker` |
 | Provider-specific batch search | reject | concurrency belongs in the shared consumer above single-query providers |
 | UI-owned agent behavior | reject | clients render events and submit commands; they do not run a private loop |

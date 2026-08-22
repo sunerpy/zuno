@@ -4,11 +4,15 @@ use crate::event_log::{NewSessionEvent, append_in, query_error};
 use crate::inbox::{NewSessionInput, SessionInput, admit_in, validate_input};
 use crate::{Pool, open};
 use rusqlite::{OptionalExtension, Row, Transaction, params};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use zuno_error::DbError;
 
 const TABLE: &str = "agent_job";
+const SELECT_COLUMNS: &str = "id, parent_session_id, subject_kind, child_session_id, product_run_id, \
+     product_kind, product_instance, product_tool, status, report_delivery, result, \
+     error, report_input_id, created_seq, settled_seq, time_created, time_updated, \
+     time_completed";
 
 /// Whether a settled background job should wake its parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,17 +42,88 @@ impl ReportDelivery {
     }
 }
 
+/// The durable subject one background job owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobSubject {
+    /// A native Zuno child session.
+    ChildSession {
+        /// The child session that performs the turn.
+        session_id: String,
+    },
+    /// A one-shot host-installed coding-agent product.
+    ProductAgent {
+        /// Unique invocation id, distinct from the durable job id.
+        run_id: String,
+        /// Product protocol (`codex` or `claude-code`).
+        product: String,
+        /// Configured product-agent instance name.
+        instance: String,
+        /// Static tool name that admitted the invocation.
+        tool: String,
+    },
+}
+
+impl JobSubject {
+    /// A native child-session subject.
+    #[must_use]
+    pub fn child_session(session_id: impl Into<String>) -> Self {
+        Self::ChildSession {
+            session_id: session_id.into(),
+        }
+    }
+
+    /// A product-agent subject.
+    #[must_use]
+    pub fn product_agent(
+        run_id: impl Into<String>,
+        product: impl Into<String>,
+        instance: impl Into<String>,
+        tool: impl Into<String>,
+    ) -> Self {
+        Self::ProductAgent {
+            run_id: run_id.into(),
+            product: product.into(),
+            instance: instance.into(),
+            tool: tool.into(),
+        }
+    }
+
+    /// Stable JSON exposed in events, tools, and clients.
+    #[must_use]
+    pub fn as_json(&self) -> Value {
+        match self {
+            Self::ChildSession { session_id } => {
+                json!({"kind":"childSession","sessionID":session_id})
+            }
+            Self::ProductAgent {
+                run_id,
+                product,
+                instance,
+                tool,
+            } => json!({
+                "kind":"productAgent",
+                "runID":run_id,
+                "product":product,
+                "instance":instance,
+                "tool":tool
+            }),
+        }
+    }
+}
+
 /// Durable execution state for one background job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
-    /// The child turn has not settled.
+    /// The background execution has not settled.
     Running,
-    /// The child turn produced a final answer.
+    /// The execution produced a final answer.
     Completed,
-    /// The child turn failed.
+    /// The execution produced an authoritative failure.
     Failed,
-    /// The child turn was cancelled.
+    /// Cancellation completed and the process/session stopped.
     Cancelled,
+    /// Process or protocol loss left external side effects unknowable.
+    Uncertain,
 }
 
 impl JobStatus {
@@ -58,6 +133,7 @@ impl JobStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Uncertain => "uncertain",
         }
     }
 
@@ -67,13 +143,16 @@ impl JobStatus {
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
+            "uncertain" => Ok(Self::Uncertain),
             _ => Err(query_error(std::io::Error::other(format!(
                 "unknown job status `{value}`"
             )))),
         }
     }
 
-    fn is_terminal(self) -> bool {
+    /// Whether no live executor may transition this state again.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
         !matches!(self, Self::Running)
     }
 }
@@ -83,7 +162,7 @@ impl JobStatus {
 pub struct NewAgentJob {
     pub id: String,
     pub parent_session_id: String,
-    pub child_session_id: String,
+    pub subject: JobSubject,
     pub report_delivery: ReportDelivery,
     pub time_created: i64,
 }
@@ -94,14 +173,14 @@ impl NewAgentJob {
     pub fn new(
         id: impl Into<String>,
         parent_session_id: impl Into<String>,
-        child_session_id: impl Into<String>,
+        subject: JobSubject,
         report_delivery: ReportDelivery,
         time_created: i64,
     ) -> Self {
         Self {
             id: id.into(),
             parent_session_id: parent_session_id.into(),
-            child_session_id: child_session_id.into(),
+            subject,
             report_delivery,
             time_created,
         }
@@ -113,7 +192,7 @@ impl NewAgentJob {
 pub struct AgentJob {
     pub id: String,
     pub parent_session_id: String,
-    pub child_session_id: String,
+    pub subject: JobSubject,
     pub status: JobStatus,
     pub report_delivery: ReportDelivery,
     pub result: Option<Value>,
@@ -137,7 +216,7 @@ pub struct JobSettlement {
 }
 
 impl JobSettlement {
-    /// A successful child result.
+    /// A successful result.
     #[must_use]
     pub fn completed(result: Value, time_completed: i64, report: Option<NewSessionInput>) -> Self {
         Self {
@@ -149,15 +228,44 @@ impl JobSettlement {
         }
     }
 
-    /// A failed child result.
+    /// An authoritative failure.
     #[must_use]
     pub fn failed(
         error: impl Into<String>,
         time_completed: i64,
         report: Option<NewSessionInput>,
     ) -> Self {
+        Self::error(JobStatus::Failed, error, time_completed, report)
+    }
+
+    /// A confirmed cancellation.
+    #[must_use]
+    pub fn cancelled(
+        error: impl Into<String>,
+        time_completed: i64,
+        report: Option<NewSessionInput>,
+    ) -> Self {
+        Self::error(JobStatus::Cancelled, error, time_completed, report)
+    }
+
+    /// A process/protocol loss whose side effects must not be replayed.
+    #[must_use]
+    pub fn uncertain(
+        error: impl Into<String>,
+        time_completed: i64,
+        report: Option<NewSessionInput>,
+    ) -> Self {
+        Self::error(JobStatus::Uncertain, error, time_completed, report)
+    }
+
+    fn error(
+        status: JobStatus,
+        error: impl Into<String>,
+        time_completed: i64,
+        report: Option<NewSessionInput>,
+    ) -> Self {
         Self {
-            status: JobStatus::Failed,
+            status,
             result: None,
             error: Some(error.into()),
             time_completed,
@@ -202,6 +310,36 @@ impl AgentJobStore {
         })
     }
 
+    /// Read every job owned by one parent, oldest first.
+    pub fn list_for_parent(&self, parent_session_id: &str) -> Result<Vec<AgentJob>, DbError> {
+        let connection = self.pool.get()?;
+        query_jobs(
+            &connection,
+            &format!(
+                "SELECT {SELECT_COLUMNS} FROM agent_job \
+                 WHERE parent_session_id = ?1 ORDER BY time_created, id"
+            ),
+            parent_session_id,
+        )
+    }
+
+    /// Read running product invocations which cannot survive process loss.
+    pub fn running_product_agents_for(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<AgentJob>, DbError> {
+        let connection = self.pool.get()?;
+        query_jobs(
+            &connection,
+            &format!(
+                "SELECT {SELECT_COLUMNS} FROM agent_job \
+                 WHERE parent_session_id = ?1 AND subject_kind = 'product-agent' \
+                   AND status = 'running' ORDER BY time_created, id"
+            ),
+            parent_session_id,
+        )
+    }
+
     /// Settle one running job and atomically admit its parent report.
     pub fn settle(&self, job_id: &str, settlement: JobSettlement) -> Result<SettledJob, DbError> {
         self.pool
@@ -224,14 +362,15 @@ impl AgentJobStore {
     ) -> Result<Vec<AgentJob>, DbError> {
         let connection = self.pool.get()?;
         let sql = format!(
-            "SELECT j.id, j.parent_session_id, j.child_session_id, j.status, \
-                    j.report_delivery, j.result, j.error, j.report_input_id, \
-                    j.created_seq, j.settled_seq, j.time_created, j.time_updated, \
-                    j.time_completed \
-             FROM agent_job AS j \
+            "SELECT {} FROM agent_job AS j \
              JOIN session_input AS i ON i.id = j.report_input_id \
              WHERE j.status <> 'running' AND i.promoted_seq IS NULL{} \
              ORDER BY j.time_created, j.id",
+            SELECT_COLUMNS
+                .split(", ")
+                .map(|column| format!("j.{column}"))
+                .collect::<Vec<_>>()
+                .join(", "),
             if parent_session_id.is_some() {
                 " AND j.parent_session_id = ?1"
             } else {
@@ -253,18 +392,38 @@ impl AgentJobStore {
 }
 
 fn validate_new_job(job: &NewAgentJob) -> Result<(), DbError> {
-    if job.id.trim().is_empty()
-        || job.parent_session_id.trim().is_empty()
-        || job.child_session_id.trim().is_empty()
-    {
+    if job.id.trim().is_empty() || job.parent_session_id.trim().is_empty() {
         return Err(query_error(std::io::Error::other(
-            "job id, parent session id, and child session id must not be empty",
+            "job id and parent session id must not be empty",
         )));
     }
-    if job.parent_session_id == job.child_session_id {
-        return Err(query_error(std::io::Error::other(
-            "a background job's parent and child sessions must differ",
-        )));
+    match &job.subject {
+        JobSubject::ChildSession { session_id } => {
+            if session_id.trim().is_empty() {
+                return Err(query_error(std::io::Error::other(
+                    "child session id must not be empty",
+                )));
+            }
+            if job.parent_session_id == *session_id {
+                return Err(query_error(std::io::Error::other(
+                    "a background job's parent and child sessions must differ",
+                )));
+            }
+        }
+        JobSubject::ProductAgent {
+            run_id,
+            product,
+            instance,
+            tool,
+        } if [run_id, product, instance, tool]
+            .iter()
+            .any(|value| value.trim().is_empty()) =>
+        {
+            return Err(query_error(std::io::Error::other(
+                "product-agent run id, product, instance, and tool must not be empty",
+            )));
+        }
+        JobSubject::ProductAgent { .. } => {}
     }
     Ok(())
 }
@@ -275,17 +434,25 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
         &job.parent_session_id,
         NewSessionEvent::new("agent.job.created", created_properties(&job))?,
     )?;
+    let subject = subject_columns(&job.subject);
     transaction
         .execute(
             "INSERT INTO agent_job \
-             (id, parent_session_id, child_session_id, status, report_delivery, \
-              result, error, report_input_id, created_seq, settled_seq, \
-              time_created, time_updated, time_completed) \
-             VALUES (?1, ?2, ?3, 'running', ?4, NULL, NULL, NULL, ?5, NULL, ?6, ?6, NULL)",
+             (id, parent_session_id, subject_kind, child_session_id, product_run_id, \
+              product_kind, product_instance, product_tool, status, report_delivery, \
+              result, error, report_input_id, created_seq, settled_seq, time_created, \
+              time_updated, time_completed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, NULL, NULL, \
+                     NULL, ?10, NULL, ?11, ?11, NULL)",
             params![
                 job.id,
                 job.parent_session_id,
-                job.child_session_id,
+                subject.kind,
+                subject.child_session_id,
+                subject.product_run_id,
+                subject.product_kind,
+                subject.product_instance,
+                subject.product_tool,
                 job.report_delivery.as_str(),
                 event.sequence,
                 job.time_created,
@@ -295,7 +462,7 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
     Ok(AgentJob {
         id: job.id,
         parent_session_id: job.parent_session_id,
-        child_session_id: job.child_session_id,
+        subject: job.subject,
         status: JobStatus::Running,
         report_delivery: job.report_delivery,
         result: None,
@@ -307,6 +474,41 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
         time_updated: job.time_created,
         time_completed: None,
     })
+}
+
+struct SubjectColumns<'a> {
+    kind: &'static str,
+    child_session_id: Option<&'a str>,
+    product_run_id: Option<&'a str>,
+    product_kind: Option<&'a str>,
+    product_instance: Option<&'a str>,
+    product_tool: Option<&'a str>,
+}
+
+fn subject_columns(subject: &JobSubject) -> SubjectColumns<'_> {
+    match subject {
+        JobSubject::ChildSession { session_id } => SubjectColumns {
+            kind: "child-session",
+            child_session_id: Some(session_id),
+            product_run_id: None,
+            product_kind: None,
+            product_instance: None,
+            product_tool: None,
+        },
+        JobSubject::ProductAgent {
+            run_id,
+            product,
+            instance,
+            tool,
+        } => SubjectColumns {
+            kind: "product-agent",
+            child_session_id: None,
+            product_run_id: Some(run_id),
+            product_kind: Some(product),
+            product_instance: Some(instance),
+            product_tool: Some(tool),
+        },
+    }
 }
 
 fn settle_in(
@@ -368,7 +570,7 @@ fn settle_in(
         ))));
     }
     let job = get_in(transaction, job_id)?
-        .expect("the settled job remains present until its parent or child is deleted");
+        .expect("the settled job remains present until its parent is deleted");
     Ok(SettledJob { job, report })
 }
 
@@ -410,15 +612,17 @@ fn validate_settlement(job: &AgentJob, settlement: &JobSettlement) -> Result<(),
                 "a completed job requires a result and no error",
             )))
         }
-        JobStatus::Failed | JobStatus::Cancelled
+        JobStatus::Failed | JobStatus::Cancelled | JobStatus::Uncertain
             if settlement.error.as_deref().is_none_or(str::is_empty) =>
         {
             Err(query_error(std::io::Error::other(
-                "a failed or cancelled job requires an error",
+                "a failed, cancelled, or uncertain job requires an error",
             )))
         }
         JobStatus::Running => unreachable!("terminal status checked above"),
-        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => Ok(()),
+        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled | JobStatus::Uncertain => {
+            Ok(())
+        }
     }
 }
 
@@ -429,10 +633,7 @@ fn created_properties(job: &NewAgentJob) -> Map<String, Value> {
             "parentSessionID".to_owned(),
             Value::String(job.parent_session_id.clone()),
         ),
-        (
-            "childSessionID".to_owned(),
-            Value::String(job.child_session_id.clone()),
-        ),
+        ("subject".to_owned(), job.subject.as_json()),
         (
             "reportDelivery".to_owned(),
             Value::String(job.report_delivery.as_str().to_owned()),
@@ -453,10 +654,7 @@ fn settled_properties(job: &AgentJob, settlement: &JobSettlement) -> Map<String,
             "parentSessionID".to_owned(),
             Value::String(job.parent_session_id.clone()),
         ),
-        (
-            "childSessionID".to_owned(),
-            Value::String(job.child_session_id.clone()),
-        ),
+        ("subject".to_owned(), job.subject.as_json()),
         (
             "status".to_owned(),
             Value::String(settlement.status.as_str().to_owned()),
@@ -480,7 +678,12 @@ fn settled_properties(job: &AgentJob, settlement: &JobSettlement) -> Map<String,
 struct StoredJob {
     id: String,
     parent_session_id: String,
-    child_session_id: String,
+    subject_kind: String,
+    child_session_id: Option<String>,
+    product_run_id: Option<String>,
+    product_kind: Option<String>,
+    product_instance: Option<String>,
+    product_tool: Option<String>,
     status: String,
     report_delivery: String,
     result: Option<String>,
@@ -496,10 +699,7 @@ struct StoredJob {
 fn get_in(connection: &rusqlite::Connection, job_id: &str) -> Result<Option<AgentJob>, DbError> {
     connection
         .query_row(
-            "SELECT id, parent_session_id, child_session_id, status, report_delivery, \
-                    result, error, report_input_id, created_seq, settled_seq, \
-                    time_created, time_updated, time_completed \
-             FROM agent_job WHERE id = ?1",
+            &format!("SELECT {SELECT_COLUMNS} FROM agent_job WHERE id = ?1"),
             [job_id],
             decode_stored_job,
         )
@@ -509,29 +709,63 @@ fn get_in(connection: &rusqlite::Connection, job_id: &str) -> Result<Option<Agen
         .transpose()
 }
 
+fn query_jobs(
+    connection: &rusqlite::Connection,
+    sql: &str,
+    parameter: &str,
+) -> Result<Vec<AgentJob>, DbError> {
+    let mut statement = connection.prepare(sql).map_err(open::map_error)?;
+    let rows = statement
+        .query_map([parameter], decode_stored_job)
+        .map_err(open::map_error)?;
+    rows.map(|row| row.map_err(open::map_error).and_then(decode_job))
+        .collect()
+}
+
 fn decode_stored_job(row: &Row<'_>) -> rusqlite::Result<StoredJob> {
     Ok(StoredJob {
         id: row.get(0)?,
         parent_session_id: row.get(1)?,
-        child_session_id: row.get(2)?,
-        status: row.get(3)?,
-        report_delivery: row.get(4)?,
-        result: row.get(5)?,
-        error: row.get(6)?,
-        report_input_id: row.get(7)?,
-        created_sequence: row.get(8)?,
-        settled_sequence: row.get(9)?,
-        time_created: row.get(10)?,
-        time_updated: row.get(11)?,
-        time_completed: row.get(12)?,
+        subject_kind: row.get(2)?,
+        child_session_id: row.get(3)?,
+        product_run_id: row.get(4)?,
+        product_kind: row.get(5)?,
+        product_instance: row.get(6)?,
+        product_tool: row.get(7)?,
+        status: row.get(8)?,
+        report_delivery: row.get(9)?,
+        result: row.get(10)?,
+        error: row.get(11)?,
+        report_input_id: row.get(12)?,
+        created_sequence: row.get(13)?,
+        settled_sequence: row.get(14)?,
+        time_created: row.get(15)?,
+        time_updated: row.get(16)?,
+        time_completed: row.get(17)?,
     })
 }
 
 fn decode_job(stored: StoredJob) -> Result<AgentJob, DbError> {
+    let subject = match stored.subject_kind.as_str() {
+        "child-session" => {
+            JobSubject::child_session(required(stored.child_session_id, "child_session_id")?)
+        }
+        "product-agent" => JobSubject::product_agent(
+            required(stored.product_run_id, "product_run_id")?,
+            required(stored.product_kind, "product_kind")?,
+            required(stored.product_instance, "product_instance")?,
+            required(stored.product_tool, "product_tool")?,
+        ),
+        other => {
+            return Err(query_error(std::io::Error::other(format!(
+                "unknown job subject kind `{other}`"
+            ))));
+        }
+    };
     Ok(AgentJob {
         id: stored.id,
         parent_session_id: stored.parent_session_id,
-        child_session_id: stored.child_session_id,
+        subject,
         status: JobStatus::parse(&stored.status)?,
         report_delivery: ReportDelivery::parse(&stored.report_delivery)?,
         result: stored
@@ -545,5 +779,13 @@ fn decode_job(stored: StoredJob) -> Result<AgentJob, DbError> {
         time_created: stored.time_created,
         time_updated: stored.time_updated,
         time_completed: stored.time_completed,
+    })
+}
+
+fn required(value: Option<String>, column: &str) -> Result<String, DbError> {
+    value.ok_or_else(|| {
+        query_error(std::io::Error::other(format!(
+            "job subject is missing `{column}`"
+        )))
     })
 }

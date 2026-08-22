@@ -6,7 +6,7 @@ This ledger records reviewed upstream behavior. It does not promise API compatib
 
 - DSH: `dsh-v0.1.1-rc.2` at `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`
 - Zuno review point: `45d1d0c`
-- Reviewed: 2026-08-21
+- Reviewed: 2026-08-22
 
 ## Already Covered
 
@@ -18,6 +18,13 @@ This ledger records reviewed upstream behavior. It does not promise API compatib
 | Goal continuation after transient failure | Persistent exponential backoff, restart recovery, typed failure policy, and CLI integration test | Continue strengthening coverage; never replay uncertain tool side effects. |
 | Dynamic Cordis package lifecycle | `zuno-extension` process registry, typed lifecycle tools, active-composition generation, and TUI rebuild | `adapt`: preserve define/run/stop/undefine and restart-loss semantics; reject JavaScript/Cordis ABI compatibility. |
 | Static profile/bundle loading | `zuno.extension/v1` manifests under config-root `extensions/<id>/extension.json` | `adapt`: use the same validated agent/workflow/skill package as the dynamic path; compiled services remain Rust profiles. |
+| Codex and Claude Code product subagents | `zuno-product-agent`, configured static tools, generic durable jobs, `job_cancel`, and the shared TUI subagent projection | `adapt`: retain native product protocols, authentication, configuration, and model choice; reject the TypeScript API as a compatibility target. |
+
+## 2026-08-22 no-delta review
+
+`dsh_delta.py` resolved both the recorded baseline and current `origin/master` to `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` (`dsh-v0.1.1-rc.2`). There were no unreviewed commits, so the baseline JSON was not advanced.
+
+The Codex and Claude Code product-subagent design was reviewed from the already-pinned release and classified `adapt`: Zuno uses native Rust providers, durable `JobSubject::ProductAgent` state, `ToolReplayPolicy::Never`, process-tree cancellation, and frontend-neutral `ToolUiIntent::Subagent` projection.
 
 ## dsh-v0.1.1-rc.1
 

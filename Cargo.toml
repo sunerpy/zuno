@@ -57,6 +57,7 @@ zuno-observability = { path = "crates/zuno-observability" }
 zuno-paths = { path = "crates/zuno-paths" }
 zuno-permission = { path = "crates/zuno-permission" }
 zuno-process = { path = "crates/zuno-process" }
+zuno-product-agent = { path = "crates/zuno-product-agent" }
 zuno-provider-anthropic = { path = "crates/zuno-provider-anthropic" }
 zuno-provider-bedrock = { path = "crates/zuno-provider-bedrock" }
 zuno-provider-compatible = { path = "crates/zuno-provider-compatible" }

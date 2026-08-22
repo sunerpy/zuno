@@ -51,6 +51,9 @@ fn harness_guide_documents_the_native_extension_contract() {
             "reportDelivery",
             "nextStep",
             "quiet",
+            "ProductAgent",
+            "job_cancel",
+            "uncertain",
             "queries: string[]",
             "WebSearchProvider",
         ],
@@ -110,6 +113,21 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "ZUNO_AUTH_CONTENT",
             "transport",
             "myopenai",
+        ],
+    );
+    contains_all(
+        "docs/design/product-agents.md",
+        &[
+            "productAgent",
+            "subagent_codex",
+            "subagent_claude_code",
+            "app-server",
+            "stream-json",
+            "ToolReplayPolicy::Never",
+            "JobSubject",
+            "uncertain",
+            "job_cancel",
+            "ToolUiIntent::Subagent",
         ],
     );
 }
@@ -221,7 +239,7 @@ fn database_docs_describe_a_hard_pre_release_format_cut() {
     for required in [
         "unsupported pre-release format",
         "without modification",
-        "The 39 migrations",
+        "The 40 migrations",
     ] {
         assert!(
             text.contains(required),

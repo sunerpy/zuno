@@ -283,6 +283,7 @@ fn event_json(event: TurnEvent) -> Value {
             step,
             call_id,
             name,
+            ..
         } => json!({"type":"tool_dispatch_started","step":step,"callID":call_id,"name":name}),
         TurnEvent::ToolDispatchCompleted {
             step,

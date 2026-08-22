@@ -787,6 +787,7 @@ pub(crate) struct TurnHost {
     runs: SessionRunRegistry,
     background_jobs: super::child_turn::BackgroundJobSupervisor,
     background_reports: super::child_turn::ChildSessionHost,
+    product_agents: super::product_agent::NativeProductAgentHost,
     background_reports_recovered: bool,
     last_turn_completed: bool,
     title_sink: Option<Arc<dyn SessionTitleSink>>,
@@ -1049,6 +1050,14 @@ impl TurnHost {
                 parent_effort: plan.effort,
                 supervisor: background_jobs.clone(),
             })?;
+        let product_agents = super::product_agent::NativeProductAgentHost::new(
+            &plan.config,
+            env,
+            plan.directory.clone(),
+            Arc::clone(&database),
+            child_host.wake_handle(),
+            background_jobs.clone(),
+        )?;
 
         let runtime_tools = super::tool_runtime::assemble(
             &plan.directory,
@@ -1084,6 +1093,8 @@ impl TurnHost {
                     },
                     vision_available: plan.vision_available,
                 },
+                product_agents: Arc::new(product_agents.clone()),
+                job_controller: Arc::new(background_jobs.clone()),
             },
         )?;
         // Joins the notes so shadowing reaches whatever surface is watching: the
@@ -1133,6 +1144,7 @@ impl TurnHost {
             runs,
             background_jobs,
             background_reports: child_host,
+            product_agents,
             background_reports_recovered: false,
             last_turn_completed: active_goal,
             title_sink: None,
@@ -1196,6 +1208,33 @@ impl TurnHost {
     /// Whether deleting this host's session would race a background subagent write.
     pub(super) fn has_running_background_tasks(&self) -> bool {
         self.background_jobs.has_running_tasks()
+    }
+
+    /// Ask the live executor to cancel one job owned by this session.
+    pub(super) async fn cancel_job(
+        &mut self,
+        job_id: &str,
+    ) -> Result<zuno_tools::job_cancel::CancelOutcome, String> {
+        let store = zuno_db::job::AgentJobStore::new(Arc::clone(&self.database));
+        let job = store.get(job_id).map_err(to_string)?;
+        if job.parent_session_id != self.session_id {
+            return Err(format!(
+                "job `{job_id}` is not owned by session `{}`",
+                self.session_id
+            ));
+        }
+        if job.status.is_terminal() {
+            return Ok(zuno_tools::job_cancel::CancelOutcome {
+                requested: false,
+                message: format!("job `{job_id}` is already terminal"),
+            });
+        }
+        zuno_tools::job_cancel::JobController::cancel(
+            &self.background_jobs,
+            &self.session_id,
+            job_id,
+        )
+        .await
     }
 
     /// The active harness profile that assembled this session.
@@ -1410,6 +1449,9 @@ impl TurnHost {
         if self.background_reports_recovered {
             return Ok(());
         }
+        self.product_agents
+            .recover_uncertain(&self.session_id)
+            .await?;
         self.background_reports
             .recover_pending_reports(&self.session_id)
             .await?;

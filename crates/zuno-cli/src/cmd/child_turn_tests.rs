@@ -114,8 +114,16 @@ impl RecordingRunner {
 
 #[async_trait]
 impl DelegatedTurnRunner for RecordingRunner {
-    async fn run(&self, _session_id: &str, _request: &ChildTurnRequest) -> Result<String, String> {
+    async fn run(
+        &self,
+        _session_id: &str,
+        _request: &ChildTurnRequest,
+        cancellation: CancellationToken,
+    ) -> Result<String, String> {
         loop {
+            if cancellation.is_cancelled() {
+                return Err("cancelled".to_owned());
+            }
             if let Some(result) = self.result.lock().expect("runner result lock").take() {
                 return result;
             }
@@ -293,9 +301,14 @@ fn resuming_this_parents_own_child_reuses_it_rather_than_forking() {
 async fn background_supervisor_reports_a_live_writer_until_it_finishes() {
     let jobs = BackgroundJobSupervisor::default();
     let (release, waiting) = tokio::sync::oneshot::channel();
-    jobs.spawn(async move {
-        let _released = waiting.await;
-    });
+    jobs.spawn(
+        "job_test",
+        "ses_test",
+        CancellationToken::new(),
+        async move {
+            let _released = waiting.await;
+        },
+    );
     tokio::task::yield_now().await;
 
     assert!(jobs.has_running_tasks());
@@ -392,6 +405,26 @@ async fn quiet_background_dispatch_persists_the_result_without_waking_the_parent
             .expect("pending")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn cancelling_a_native_background_job_keeps_the_host_alive_and_settles_cancelled() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+
+    let turn = fixture.host.dispatch(request).await.expect("dispatch");
+    let job_id = turn.job_id.expect("job id");
+    assert!(fixture.jobs.cancel("ses_owner", &job_id));
+    fixture.jobs.wait_all().await;
+
+    let job = fixture.host.job_store.get(&job_id).expect("cancelled job");
+    assert_eq!(job.status, zuno_db::job::JobStatus::Cancelled);
+    assert!(!fixture.jobs.has_running_tasks());
+    let reports = fixture.wake.reports.lock().expect("wake reports");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].prompt["status"], "cancelled");
 }
 
 #[tokio::test]

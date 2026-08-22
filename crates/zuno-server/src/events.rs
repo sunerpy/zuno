@@ -228,6 +228,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             step,
             call_id,
             name,
+            ..
         } => (
             "tool.dispatch.started",
             object(json!({"step": step, "callID": call_id, "name": name})),

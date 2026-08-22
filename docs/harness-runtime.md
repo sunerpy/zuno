@@ -121,16 +121,22 @@ Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherite
 
 The loop never mechanically replays a call. It persists the failed tool result and gives it to the model in the next step, including timeouts that might have completed an external side effect before their response was lost. A later recovery turn receives a hidden, SQL-derived notice naming the retry attempt. A `Safe` failure may be attempted again after backoff; a `Never` failure requires authoritative inspection of the worktree or external state before the model decides whether another mutation is appropriate.
 
-## Background subagents
+## Background subagents and product agents
 
 `task` creates a distinct `job_*` identifier for each background run while retaining a separate child session identifier for conversational continuation.
+
+Enabled `productAgent` instances register independent static tools backed by a host-installed Codex or Claude Code process. A product invocation has a one-shot `run_*` id and, in background mode, a separate `job_*` id. It does not create a Zuno child session and cannot be resumed as one.
 
 `reportDelivery` supports:
 
 - `nextStep` (default): settle the job and admit the report to the parent inbox atomically, then wake the parent.
 - `quiet`: settle the job without admitting a parent input.
 
-The `job` tool reads durable status for jobs owned by the current parent session. It reports `running`, `completed`, `failed`, or `cancelled` together with the child session, delivery policy, result, and error.
+The `job` tool reads durable status for jobs owned by the current parent session. `JobSubject` distinguishes `ChildSession` from `ProductAgent`; status is `running`, `completed`, `failed`, `cancelled`, or `uncertain`, together with delivery policy, result, error, and subject identity.
+
+`job_cancel` verifies parent ownership and requests cancellation from the live supervisor. It never pre-settles a job and has `ToolReplayPolicy::Never`; the executor records `cancelled` only after the child session or complete product process tree has stopped. Product protocol or process loss after work may have begun records `uncertain`. A restart reconciles still-running product jobs to `uncertain` and never replays them.
+
+Codex and Claude Code retain ownership of their native login, configuration, and model choice. Zuno inherits the session directory and proxy environment but never copies product tokens into `AuthStore`. See [Codex and Claude Code product agents](design/product-agents.md).
 
 ## Concurrent web search
 

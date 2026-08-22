@@ -79,7 +79,7 @@ fn render(job: AgentJob) -> Result<ToolOutput, ToolError> {
     let body = json!({
         "jobID": job.id,
         "parentSessionID": job.parent_session_id,
-        "childSessionID": job.child_session_id,
+        "subject": job.subject.as_json(),
         "status": status,
         "reportDelivery": delivery_name(job.report_delivery),
         "result": job.result,
@@ -108,6 +108,7 @@ fn status_name(status: JobStatus) -> &'static str {
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
+        JobStatus::Uncertain => "uncertain",
     }
 }
 

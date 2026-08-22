@@ -1,45 +1,9 @@
-//! The delegated-task view: what this session handed to a subagent, and what came back.
+//! Durable native and product-subagent activity projected from the transcript.
 //!
-//! # What this can honestly show, and why it is not a job monitor
-//!
-//! The owner asked to *view running subagent tasks*. This build has no running ones to
-//! view, and that is a runtime fact rather than a rendering gap:
-//!
-//! * `zuno_agent::continuation::JobBoard` models a running job — alias, agent, state,
-//!   objective — and has **no production caller**. Nothing constructs it outside its own
-//!   tests.
-//! * `ChildSessionHost::dispatch` (`zuno-cli/src/cmd/child_turn.rs`) therefore *refuses*
-//!   `background: true` outright, saying "nothing tracks a running subagent job or
-//!   reports its completion, so a job id would name work you could never collect".
-//! * A foreground delegation blocks the parent turn for its whole duration, and the
-//!   child's own events are deliberately drained rather than forwarded, so no progress
-//!   from inside a child is observable from here even while it runs.
-//!
-//! So a panel promising live job state would have nothing to put in it. What *does*
-//! exist, completely, is the parent transcript's record of every delegation: a
-//! [`crate::views::message::MessagePart::Tool`] named `task`, carrying the arguments the
-//! model wrote, the dispatch status, and — on completion — the `<task …>` envelope
-//! `zuno_tools::task::render` produced, whose `id` attribute is the child session's id.
-//! This view is built over exactly that, so every row it shows is a delegation that
-//! really happened.
-//!
-//! Its one honest limitation is stated on screen rather than hidden: the child's own
-//! messages live in the child session's own transcript, which this view names by id so
-//! the id can be opened, instead of pretending to contain it.
-//!
-//! # Why left and right move between tasks
-//!
-//! The binding table already ships `session_child_cycle` on `right` and
-//! `session_child_cycle_reverse` on `left` (`keybind.ts` rows reproduced in
-//! [`crate::keybind::DEFINITIONS`]), described as "Go to next/previous child session" —
-//! which is what a delegation *is*. `session_child_first` on `<leader>down` — `ctrl+x`
-//! then `down` — opens this view. Those three rows had no handler anywhere in the crate
-//! before this view existed, so the keys the table advertised did nothing at all.
-//!
-//! [`crate::views::dialog::DialogHost`] already promotes the `session` scope while a
-//! dialog is open, and `focused_scopes` are resolved *before* the static chain, so the
-//! bare arrows reach this view only while it is open and go back to moving the prompt
-//! cursor the moment it closes.
+//! Tool names are configuration, not presentation contracts. A call enters this view
+//! only when its persisted [`zuno_tool::ToolUiIntent`] is `Subagent`; the stable task
+//! and product envelopes then provide subject details. Later `job` output and durable
+//! next-step reports refine the same row to completed, failed, cancelled, or uncertain.
 
 use crate::keybind::Definition;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogStep, DialogWidth};
@@ -47,6 +11,9 @@ use crate::views::message::{Message, MessagePart, ToolStatus};
 use crate::views::{ViewContext, truncate};
 use crossterm::event::KeyEvent;
 use ratatui::text::{Line, Span};
+use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
+use zuno_tool::ToolUiIntent;
 
 #[cfg(test)]
 #[path = "subagent_tests.rs"]
@@ -55,80 +22,97 @@ mod tests;
 /// The dialog id [`DialogOutcome`] carries for this view.
 pub const SUBAGENT_DIALOG_ID: &str = "session_child_first";
 
-/// The tool whose calls are delegations.
-///
-/// The wire name, matching `zuno_tools::task::WIRE_ID`, because that is what the
-/// transcript records. Spelled here rather than imported: `zuno-tui` does not depend on
-/// `zuno-tools`, and a view that did would pull the whole tool runtime into the render
-/// crate to learn one string. The pairing is asserted by this module's tests.
-pub const TASK_TOOL: &str = "task";
+/// What an empty view says instead of looking broken.
+pub const EMPTY: &str = "no native or product subagent jobs yet";
 
-/// Structured facts recovered from the task tool's stable output envelope.
+/// Where a native child's internal transcript remains available.
+pub const CHILD_TRANSCRIPT_NOTE: &str = "the subagent's own messages are in that session";
+
+/// Stable facts parsed from a native `<task …>` result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskEnvelope {
-    /// Child session id, when the tool reached one.
     pub session_id: Option<String>,
-    /// Child state reported by the envelope.
+    pub job_id: Option<String>,
     pub state: Option<String>,
-    /// The child report without the transport envelope.
+    pub report_delivery: Option<String>,
     pub result: String,
 }
 
-/// What the view says when the session has delegated nothing.
-///
-/// A named answer rather than an empty body, for the reason
-/// [`crate::views::diagnostics::EMPTY`] exists: a blank panel reads as one that failed to
-/// load. This one also says what would fill it, because "no delegations" is a fact about
-/// the conversation rather than a fault.
-pub const EMPTY: &str = "no delegated tasks yet";
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProductEnvelope {
+    product: Option<String>,
+    instance: Option<String>,
+    run_id: Option<String>,
+    job_id: Option<String>,
+    state: Option<String>,
+    report_delivery: Option<String>,
+    result: String,
+}
 
-/// What the view says about where a child's own messages are.
-pub const CHILD_TRANSCRIPT_NOTE: &str = "the subagent's own messages are in that session";
+/// Compact envelope projection used by the inline transcript renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputEnvelope {
+    pub detail: String,
+    pub result: String,
+}
 
-/// One delegation, projected from the parent transcript.
+/// One native or external delegation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delegation {
-    /// The provider's call id, which is this row's stable identity.
     pub call_id: String,
-    /// The subagent asked for, when the model named one.
-    pub agent: Option<String>,
-    /// The delegation's description, or its prompt when it had no description.
+    pub tool: String,
+    pub product: String,
+    pub target: Option<String>,
     pub objective: Option<String>,
-    /// How far the dispatch got.
-    pub status: ToolStatus,
-    /// The child session's id, parsed from the completed envelope.
+    pub dispatch_status: ToolStatus,
+    pub state: String,
     pub session_id: Option<String>,
-    /// The state the envelope reported.
-    pub state: Option<String>,
-    /// Whether the model asked for this to run in the background.
-    ///
-    /// Kept because a refused background request is the one case where a row exists and
-    /// no child session does, and the refusal is worth reading rather than looking like a
-    /// delegation that vanished.
-    pub background: bool,
+    pub run_id: Option<String>,
+    pub job_id: Option<String>,
+    pub report_delivery: Option<String>,
+    pub result: Option<String>,
+    pub diagnostic: Option<String>,
+    pub time_created: Option<i64>,
+    pub time_completed: Option<i64>,
 }
 
 impl Delegation {
-    /// The row's headline, at most `width` columns.
     #[must_use]
     pub fn headline(&self, width: usize) -> String {
-        let agent = self.agent.as_deref().unwrap_or("subagent");
+        let target = self.target.as_deref().unwrap_or("subagent");
         let objective = self.objective.as_deref().unwrap_or("(no description)");
         truncate(
-            &format!("{} {agent}: {objective}", self.status.glyph()),
+            &format!(
+                "{} {} {target}: {objective}",
+                state_glyph(&self.state),
+                self.product
+            ),
             width,
         )
     }
+
+    fn cancellable(&self) -> bool {
+        self.job_id.is_some() && self.state == "running"
+    }
+
+    fn elapsed(&self) -> String {
+        let Some(started) = self.time_created else {
+            return "not reported".to_owned();
+        };
+        let ended = self.time_completed.unwrap_or_else(now_millis);
+        format_duration(ended.saturating_sub(started))
+    }
+
+    fn safety(&self) -> &'static str {
+        if self.product == "zuno" {
+            "Zuno child session; durable transcript and normal Zuno permissions"
+        } else {
+            "native login/config/model; credentials stay outside Zuno; uncertain calls are not replayed"
+        }
+    }
 }
 
-/// Every delegation in `messages`, in the order the model made them.
-///
-/// Reads the transcript already in memory rather than querying the session database.
-/// Both would work and they would answer differently: the database's child sessions
-/// include delegations from *earlier* runs of this session, while a view opened to see
-/// "what did this conversation hand off" means the ones on screen. The transcript is
-/// also the only source that has a row for a delegation that failed, because a failed
-/// dispatch creates no child session to find.
+/// Project every persisted subagent-intent call, then refine it with job observations.
 #[must_use]
 pub fn delegations(messages: &[Message]) -> Vec<Delegation> {
     let mut found = Vec::new();
@@ -137,6 +121,7 @@ pub fn delegations(messages: &[Message]) -> Vec<Delegation> {
             let MessagePart::Tool {
                 call_id,
                 name,
+                ui_intent,
                 arguments,
                 status,
                 output,
@@ -145,58 +130,206 @@ pub fn delegations(messages: &[Message]) -> Vec<Delegation> {
             else {
                 continue;
             };
-            if name != TASK_TOOL {
+            if *ui_intent != ToolUiIntent::Subagent {
                 continue;
             }
-            let parsed = serde_json::from_str::<serde_json::Value>(arguments).ok();
-            let field = |key: &str| -> Option<String> {
-                parsed
-                    .as_ref()?
-                    .get(key)?
-                    .as_str()
-                    .map(str::to_owned)
-                    .filter(|value| !value.is_empty())
-            };
-            let envelope = output.as_deref().and_then(task_envelope);
-            found.push(Delegation {
-                call_id: call_id.clone(),
-                agent: field("subagent_type").or_else(|| field("category")),
-                objective: field("description").or_else(|| field("prompt")),
-                status: *status,
-                session_id: envelope.as_ref().and_then(|found| found.session_id.clone()),
-                state: envelope.and_then(|found| found.state),
-                background: parsed
-                    .as_ref()
-                    .and_then(|value| value.get("background"))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
-            });
+            found.push(project_call(
+                call_id,
+                name,
+                arguments,
+                *status,
+                output.as_deref(),
+            ));
+        }
+    }
+
+    for message in messages {
+        for part in &message.parts {
+            match part {
+                MessagePart::Tool {
+                    ui_intent: ToolUiIntent::Generic,
+                    output: Some(output),
+                    ..
+                } => refine_from_job_output(&mut found, output),
+                MessagePart::Text { text } => refine_from_report(&mut found, text),
+                _ => {}
+            }
         }
     }
     found
 }
 
-/// Parse the stable `<task …>` envelope emitted by `zuno_tools::task`.
-///
-/// A scan for two quoted attributes rather than an XML parse: the envelope is produced by
-/// one function (`zuno_tools::task::render`) whose shape is `<task id="…" state="…">`, and
-/// pulling in a parser to read two attributes off a line this crate does not own would be
-/// a larger commitment than the fact deserves. Anything unrecognised yields [`None`],
-/// which renders as a row without a session id instead of a wrong one.
+fn project_call(
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    status: ToolStatus,
+    output: Option<&str>,
+) -> Delegation {
+    let arguments = serde_json::from_str::<Value>(arguments).ok();
+    let field = |key: &str| {
+        arguments
+            .as_ref()
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty())
+    };
+    let objective = field("description").or_else(|| field("prompt"));
+    let requested_delivery = field("reportDelivery").or_else(|| {
+        arguments
+            .as_ref()
+            .and_then(|value| value.get("background"))
+            .and_then(Value::as_bool)
+            .filter(|background| *background)
+            .map(|_| "nextStep".to_owned())
+    });
+
+    if let Some(task) = output.and_then(task_envelope) {
+        return Delegation {
+            call_id: call_id.to_owned(),
+            tool: name.to_owned(),
+            product: "zuno".to_owned(),
+            target: field("subagent_type").or_else(|| field("category")),
+            objective,
+            dispatch_status: status,
+            state: task
+                .state
+                .unwrap_or_else(|| dispatch_state(status).to_owned()),
+            session_id: task.session_id,
+            run_id: None,
+            job_id: task.job_id,
+            report_delivery: task.report_delivery.or(requested_delivery),
+            result: nonempty(task.result),
+            diagnostic: (status == ToolStatus::Error)
+                .then(|| output.unwrap_or_default().to_owned()),
+            time_created: None,
+            time_completed: None,
+        };
+    }
+    if let Some(product) = output.and_then(product_envelope) {
+        return Delegation {
+            call_id: call_id.to_owned(),
+            tool: name.to_owned(),
+            product: product.product.unwrap_or_else(|| name.to_owned()),
+            target: product.instance,
+            objective,
+            dispatch_status: status,
+            state: product
+                .state
+                .unwrap_or_else(|| dispatch_state(status).to_owned()),
+            session_id: None,
+            run_id: product.run_id,
+            job_id: product.job_id,
+            report_delivery: product.report_delivery.or(requested_delivery),
+            result: nonempty(product.result),
+            diagnostic: (status == ToolStatus::Error)
+                .then(|| output.unwrap_or_default().to_owned()),
+            time_created: None,
+            time_completed: None,
+        };
+    }
+
+    Delegation {
+        call_id: call_id.to_owned(),
+        tool: name.to_owned(),
+        product: name.to_owned(),
+        target: field("subagent_type").or_else(|| field("category")),
+        objective,
+        dispatch_status: status,
+        state: dispatch_state(status).to_owned(),
+        session_id: None,
+        run_id: None,
+        job_id: None,
+        report_delivery: requested_delivery,
+        result: output.and_then(|value| nonempty(value.to_owned())),
+        diagnostic: (status == ToolStatus::Error)
+            .then(|| output.unwrap_or("subagent dispatch failed").to_owned()),
+        time_created: None,
+        time_completed: None,
+    }
+}
+
+/// Parse a native task result without depending on the tool's wire name.
 #[must_use]
 pub fn task_envelope(output: &str) -> Option<TaskEnvelope> {
     let tag = output.lines().find(|line| line.starts_with("<task "))?;
-    let result = output
-        .split_once("<task_result>")
-        .and_then(|(_, rest)| rest.split_once("</task_result>"))
-        .map_or("", |(result, _)| result)
-        .trim_matches('\n')
-        .to_owned();
     Some(TaskEnvelope {
         session_id: attribute(tag, "id"),
+        job_id: attribute(tag, "job"),
         state: attribute(tag, "state"),
-        result,
+        report_delivery: attribute(tag, "reportDelivery"),
+        result: enclosed(output, "task_result"),
     })
+}
+
+/// Parse either supported subagent envelope without consulting a wire tool name.
+#[must_use]
+pub fn output_envelope(output: &str) -> Option<OutputEnvelope> {
+    if let Some(task) = task_envelope(output) {
+        let mut detail = task.session_id.as_deref().map_or_else(
+            || "no child session".to_owned(),
+            |id| format!("session {id}"),
+        );
+        if let Some(state) = task.state {
+            detail.push_str(" · ");
+            detail.push_str(&state);
+        }
+        if let Some(job) = task.job_id {
+            detail.push_str(" · job ");
+            detail.push_str(&job);
+        }
+        return Some(OutputEnvelope {
+            detail,
+            result: task.result,
+        });
+    }
+    let product = product_envelope(output)?;
+    let mut detail = product
+        .product
+        .unwrap_or_else(|| "product agent".to_owned());
+    if let Some(instance) = product.instance {
+        detail.push(' ');
+        detail.push_str(&instance);
+    }
+    if let Some(state) = product.state {
+        detail.push_str(" · ");
+        detail.push_str(&state);
+    }
+    if let Some(job) = product.job_id {
+        detail.push_str(" · job ");
+        detail.push_str(&job);
+    }
+    Some(OutputEnvelope {
+        detail,
+        result: product.result,
+    })
+}
+
+fn product_envelope(output: &str) -> Option<ProductEnvelope> {
+    let tag = output
+        .lines()
+        .find(|line| line.starts_with("<product-agent "))?;
+    Some(ProductEnvelope {
+        product: attribute(tag, "product"),
+        instance: attribute(tag, "instance"),
+        run_id: attribute(tag, "run"),
+        job_id: attribute(tag, "job"),
+        state: attribute(tag, "state"),
+        report_delivery: attribute(tag, "reportDelivery"),
+        result: enclosed(output, "product_agent_result"),
+    })
+}
+
+fn enclosed(output: &str, element: &str) -> String {
+    let open = format!("<{element}>");
+    let close = format!("</{element}>");
+    output
+        .split_once(&open)
+        .and_then(|(_, rest)| rest.split_once(&close))
+        .map_or("", |(result, _)| result)
+        .trim_matches('\n')
+        .to_owned()
 }
 
 fn attribute(tag: &str, name: &str) -> Option<String> {
@@ -207,58 +340,205 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
     Some(rest.get(..end)?.to_owned())
 }
 
-/// The delegated-task view: a cursor over [`Delegation`]s with a detail body.
+fn refine_from_job_output(tasks: &mut [Delegation], output: &str) {
+    let Ok(job) = serde_json::from_str::<Value>(output) else {
+        return;
+    };
+    let Some(job_id) = job.get("jobID").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(task) = tasks
+        .iter_mut()
+        .find(|task| task.job_id.as_deref() == Some(job_id))
+    else {
+        return;
+    };
+    if let Some(status) = job.get("status").and_then(Value::as_str) {
+        task.state = status.to_owned();
+    }
+    if job.get("cancellationRequested").and_then(Value::as_bool) == Some(true)
+        && task.state == "running"
+    {
+        task.state = "cancelling".to_owned();
+    }
+    task.report_delivery = job
+        .get("reportDelivery")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| task.report_delivery.clone());
+    task.result = job
+        .get("result")
+        .and_then(result_text)
+        .or_else(|| task.result.clone());
+    task.diagnostic = job
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| task.diagnostic.clone());
+    task.time_created = job
+        .get("timeCreated")
+        .and_then(Value::as_i64)
+        .or(task.time_created);
+    task.time_completed = job
+        .get("timeCompleted")
+        .and_then(Value::as_i64)
+        .or(task.time_completed);
+    if let Some(subject) = job.get("subject") {
+        match subject.get("kind").and_then(Value::as_str) {
+            Some("childSession") => {
+                task.product = "zuno".to_owned();
+                task.session_id = subject
+                    .get("sessionID")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| task.session_id.clone());
+            }
+            Some("productAgent") => {
+                task.product = subject
+                    .get("product")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&task.product)
+                    .to_owned();
+                task.target = subject
+                    .get("instance")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| task.target.clone());
+                task.run_id = subject
+                    .get("runID")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| task.run_id.clone());
+            }
+            _ => {}
+        }
+    }
+}
+
+fn result_text(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.get("text").and_then(Value::as_str).map(str::to_owned))
+        .or_else(|| (!value.is_null()).then(|| value.to_string()))
+}
+
+fn refine_from_report(tasks: &mut [Delegation], text: &str) {
+    for task in tasks {
+        let Some(job) = task.job_id.as_deref() else {
+            continue;
+        };
+        let completed = format!("completed job `{job}`");
+        let failed = format!("failed job `{job}`");
+        let cancelled = format!("cancelled job `{job}`");
+        let uncertain = format!("uncertain outcome for job `{job}`");
+        if text.contains(&uncertain) {
+            task.state = "uncertain".to_owned();
+            task.diagnostic = Some(text.to_owned());
+        } else if text.contains(&cancelled) {
+            task.state = "cancelled".to_owned();
+            task.diagnostic = Some(text.to_owned());
+        } else if text.contains(&failed) {
+            task.state = "failed".to_owned();
+            task.diagnostic = Some(text.to_owned());
+        } else if text.contains(&completed) {
+            task.state = "completed".to_owned();
+            task.result = text
+                .split_once("\n\n")
+                .and_then(|(_, result)| nonempty(result.to_owned()))
+                .or_else(|| task.result.clone());
+        }
+    }
+}
+
+fn dispatch_state(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Pending => "pending",
+        ToolStatus::Running => "running",
+        ToolStatus::Completed => "completed",
+        ToolStatus::Error => "failed",
+    }
+}
+
+fn state_glyph(state: &str) -> &'static str {
+    match state {
+        "completed" => "✓",
+        "failed" => "✗",
+        "cancelled" => "■",
+        "uncertain" => "?",
+        "running" | "cancelling" => "…",
+        _ => "~",
+    }
+}
+
+fn nonempty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn format_duration(milliseconds: i64) -> String {
+    if milliseconds < 1_000 {
+        return format!("{}ms", milliseconds.max(0));
+    }
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    format!("{}m {}s", seconds / 60, seconds % 60)
+}
+
+/// Cursor, detail disclosure, and in-place cancellation confirmation.
 pub struct SubagentView {
     context: ViewContext,
     tasks: Vec<Delegation>,
     cursor: usize,
+    expanded: bool,
+    confirm_cancel: Option<String>,
 }
 
 impl SubagentView {
-    /// A view over the delegations the host projected from the transcript.
     #[must_use]
     pub fn new(context: ViewContext, tasks: Vec<Delegation>) -> Self {
         Self {
             context,
             tasks,
             cursor: 0,
+            expanded: false,
+            confirm_cancel: None,
         }
     }
 
-    /// How many delegations the view is showing.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.tasks.len()
     }
 
-    /// Whether the session has delegated nothing.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
 
-    /// Which delegation the cursor is on.
     #[must_use]
     pub const fn cursor(&self) -> usize {
         self.cursor
     }
 
-    /// The delegation under the cursor.
     #[must_use]
     pub fn selected(&self) -> Option<&Delegation> {
         self.tasks.get(self.cursor)
     }
 
-    /// Move `step` places along the list, wrapping at both ends.
-    ///
-    /// `rem_euclid` over the signed sum, as the agent and effort cycles do, so one
-    /// expression serves both directions including the wrap backwards off the first row.
-    /// An empty list moves nowhere rather than panicking on a remainder by zero.
     fn step(&mut self, step: isize) -> DialogStep {
+        self.confirm_cancel = None;
         if self.tasks.len() < 2 {
-            // Still a redraw: with one task the keys are legitimately inert, and the
-            // footer says `1/1`, which is the honest report. Returning `Ignored` would
-            // let the arrow fall through to a scope below and move something else.
             return DialogStep::Redraw;
         }
         let length = isize::try_from(self.tasks.len()).unwrap_or(isize::MAX);
@@ -269,51 +549,76 @@ impl SubagentView {
         DialogStep::Redraw
     }
 
+    fn cancel_step(&mut self) -> DialogStep {
+        let Some(job_id) = self
+            .selected()
+            .filter(|task| task.cancellable())
+            .and_then(|task| task.job_id.clone())
+        else {
+            self.confirm_cancel = None;
+            return DialogStep::Redraw;
+        };
+        if self.confirm_cancel.as_deref() != Some(job_id.as_str()) {
+            self.confirm_cancel = Some(job_id);
+            self.expanded = true;
+            return DialogStep::Redraw;
+        }
+        self.confirm_cancel = None;
+        if let Some(task) = self.tasks.get_mut(self.cursor) {
+            task.state = "cancelling".to_owned();
+        }
+        DialogStep::Emitted(DialogOutcome::JobCancel { job_id })
+    }
+
     fn detail(&self, width: usize) -> Vec<Line<'static>> {
         let Some(task) = self.selected() else {
-            return vec![
-                Line::from(Span::styled(EMPTY.to_owned(), self.context.muted())),
-                Line::from(Span::styled(
-                    format!("delegations appear here once the model uses `{TASK_TOOL}`"),
-                    self.context.muted(),
-                )),
-            ];
+            return vec![Line::from(Span::styled(
+                EMPTY.to_owned(),
+                self.context.muted(),
+            ))];
         };
-        let mut lines = vec![Line::from(Span::styled(
-            task.headline(width),
-            match task.status {
-                ToolStatus::Completed => self.context.success(),
-                ToolStatus::Error => self.context.error(),
-                ToolStatus::Running | ToolStatus::Pending => self.context.warning(),
-            },
-        ))];
+        let mut lines = Vec::new();
         let mut row = |label: &str, value: String| {
             lines.push(Line::from(Span::styled(
                 truncate(&format!("  {label} {value}"), width),
                 self.context.muted(),
             )));
         };
-        if let Some(state) = &task.state {
-            row("state", state.clone());
+        row("product", task.product.clone());
+        row(
+            "target",
+            task.target
+                .clone()
+                .unwrap_or_else(|| "not reported".to_owned()),
+        );
+        row("status", task.state.clone());
+        row("elapsed", task.elapsed());
+        row(
+            "job",
+            task.job_id
+                .clone()
+                .unwrap_or_else(|| "foreground".to_owned()),
+        );
+        row(
+            "report",
+            task.report_delivery
+                .clone()
+                .unwrap_or_else(|| "foreground".to_owned()),
+        );
+        if let Some(session) = &task.session_id {
+            row("session", session.clone());
+            row("note", CHILD_TRANSCRIPT_NOTE.to_owned());
         }
-        match &task.session_id {
-            Some(id) => {
-                row("session", id.clone());
-                row("note", CHILD_TRANSCRIPT_NOTE.to_owned());
-            }
-            None if task.status == ToolStatus::Error => {
-                // Named rather than left blank: a refused background delegation is the
-                // common way to arrive here, and "no session" alone reads as data loss.
-                row("session", String::from("none — the delegation did not run"));
-            }
-            None => row("session", String::from("not reported yet")),
+        if let Some(run) = &task.run_id {
+            row("run", run.clone());
         }
-        if task.background {
-            row(
-                "background",
-                String::from("requested; this build runs delegations in the foreground"),
-            );
+        if let Some(result) = &task.result {
+            row("result", result.clone());
         }
+        if let Some(diagnostic) = &task.diagnostic {
+            row("diagnostic", diagnostic.clone());
+        }
+        row("safety", task.safety().to_owned());
         lines
     }
 }
@@ -325,18 +630,17 @@ impl Dialog for SubagentView {
 
     fn title(&self) -> String {
         if self.tasks.is_empty() {
-            return String::from("Delegated tasks");
+            "Subagents".to_owned()
+        } else {
+            format!(
+                "Subagents  {}/{}",
+                self.cursor.saturating_add(1),
+                self.tasks.len()
+            )
         }
-        format!(
-            "Delegated tasks  {}/{}",
-            self.cursor.saturating_add(1),
-            self.tasks.len()
-        )
     }
 
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
-        // `saturating_sub`, and never a `clamp` with a computed minimum: `u16::clamp`
-        // panics when min exceeds max, which is exactly what a 20-column frame produces.
         let body = usize::from(width.saturating_sub(2)).max(1);
         let mut lines = Vec::new();
         for (index, task) in self.tasks.iter().enumerate() {
@@ -350,47 +654,66 @@ impl Dialog for SubagentView {
                 },
             )));
         }
-        if !self.tasks.is_empty() {
-            lines.push(Line::from(Span::raw(String::new())));
+        if self.tasks.is_empty() {
+            lines.push(Line::from(Span::styled(
+                EMPTY.to_owned(),
+                self.context.muted(),
+            )));
+            return lines;
         }
-        lines.extend(self.detail(body));
+        if self.expanded {
+            lines.push(Line::from(Span::raw(String::new())));
+            lines.extend(self.detail(body));
+        }
+        if let Some(job) = &self.confirm_cancel {
+            lines.push(Line::from(Span::styled(
+                truncate(
+                    &format!("press x again to cancel job {job}; the call will not be replayed"),
+                    body,
+                ),
+                self.context.warning(),
+            )));
+        }
         lines
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        vec![("←→", "task"), ("esc", "close")]
+        vec![
+            ("←→", "job"),
+            ("enter", "details"),
+            ("x x", "cancel"),
+            ("esc", "close"),
+        ]
     }
 
     fn width(&self) -> DialogWidth {
         DialogWidth::Large
     }
 
-    /// The `session` scope, so the bare arrows reach this view while it is open.
-    ///
-    /// Named explicitly even though [`crate::views::dialog::DialogHost`] appends it for
-    /// every dialog: this view is the only one whose *navigation* depends on it, and a
-    /// later change to the host's list would otherwise silently take the arrows away.
     fn focused_scopes(&self) -> Vec<&'static str> {
-        vec!["session"]
+        vec!["dialog.subagent", "session"]
     }
 
     fn handle_action(&mut self, action: &'static Definition, _event: &KeyEvent) -> DialogStep {
         match action.name {
             "session_child_cycle" | "dialog.select.next" => self.step(1),
             "session_child_cycle_reverse" | "dialog.select.prev" => self.step(-1),
-            // `session_child_first` is the key that opened this view; pressing it again
-            // returns to the first row rather than reopening or closing, which is what
-            // "first child" means with the view already up.
             "session_child_first" | "dialog.select.home" => {
                 self.cursor = 0;
+                self.confirm_cancel = None;
                 DialogStep::Redraw
             }
             "dialog.select.end" => {
                 self.cursor = self.tasks.len().saturating_sub(1);
+                self.confirm_cancel = None;
                 DialogStep::Redraw
             }
-            // Up is `session_parent`: from a child back to the parent conversation, which
-            // from here is the transcript behind this view.
+            "dialog.select.submit" => {
+                self.expanded = !self.expanded;
+                self.confirm_cancel = None;
+                DialogStep::Redraw
+            }
+            "subagent_cancel" => self.cancel_step(),
             "session_parent" | "session_interrupt" => {
                 DialogStep::Resolved(DialogOutcome::Cancelled)
             }

@@ -64,14 +64,14 @@ fn schema_prefills_every_current_migration_id_in_generated_order() {
 
     let ids = journal_ids(&connection);
     assert_eq!(ids, migration::MIGRATION_IDS);
-    assert_eq!(ids.len(), 39);
+    assert_eq!(ids.len(), 40);
     assert_eq!(
         ids.first().map(String::as_str),
         Some("20260127222353_familiar_lady_ursula")
     );
     assert_eq!(
         ids.last().map(String::as_str),
-        Some("20260821160000_agent_job")
+        Some("20260822170000_generalize_agent_job_subject")
     );
 }
 
@@ -112,8 +112,8 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
                (session_id, id, secret, url, time_created, time_updated) \
              VALUES ('session-1', 'share-1', 'secret', 'https://example.invalid', 1, 1);
              INSERT INTO agent_job \
-               (id, parent_session_id, child_session_id, status, report_delivery, created_seq, time_created, time_updated) \
-             VALUES ('job-1', 'session-1', 'session-child', 'running', 'next-step', 1, 1, 1);",
+               (id, parent_session_id, subject_kind, child_session_id, status, report_delivery, created_seq, time_created, time_updated) \
+             VALUES ('job-1', 'session-1', 'child-session', 'session-child', 'running', 'next-step', 1, 1, 1);",
         )
         .expect("seed a complete session graph");
 

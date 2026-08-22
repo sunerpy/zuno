@@ -53,7 +53,7 @@ pub(crate) enum Step {
 /// Order is load-bearing twice over: it is the order the statements must run in,
 /// and it is the order [`crate::migration::MIGRATION_IDS`] is derived from, which
 /// a freshly created database seeds its journal with.
-pub(crate) const MIGRATIONS: [Migration; 39] = [
+pub(crate) const MIGRATIONS: [Migration; 40] = [
     Migration {
         id: "20260127222353_familiar_lady_ursula",
         step: Step::Sql(&[
@@ -652,6 +652,59 @@ pub(crate) const MIGRATIONS: [Migration; 39] = [
                CONSTRAINT `fk_agent_job_report_input_id_session_input_id_fk` FOREIGN KEY (`report_input_id`) REFERENCES `session_input`(`id`) ON DELETE SET NULL
              );",
             "CREATE UNIQUE INDEX `agent_job_child_running_idx` ON `agent_job` (`child_session_id`) WHERE `status` = 'running';",
+            "CREATE INDEX `agent_job_parent_status_created_idx` ON `agent_job` (`parent_session_id`,`status`,`time_created`);",
+        ]),
+    },
+    Migration {
+        id: "20260822170000_generalize_agent_job_subject",
+        step: Step::Sql(&[
+            "CREATE TABLE `__new_agent_job` (
+               `id` text PRIMARY KEY,
+               `parent_session_id` text NOT NULL,
+               `subject_kind` text NOT NULL,
+               `child_session_id` text,
+               `product_run_id` text,
+               `product_kind` text,
+               `product_instance` text,
+               `product_tool` text,
+               `status` text NOT NULL,
+               `report_delivery` text NOT NULL,
+               `result` text,
+               `error` text,
+               `report_input_id` text,
+               `created_seq` integer NOT NULL,
+               `settled_seq` integer,
+               `time_created` integer NOT NULL,
+               `time_updated` integer NOT NULL,
+               `time_completed` integer,
+               CONSTRAINT `agent_job_subject` CHECK (
+                 (`subject_kind` = 'child-session' AND `child_session_id` IS NOT NULL AND
+                  `product_run_id` IS NULL AND `product_kind` IS NULL AND
+                  `product_instance` IS NULL AND `product_tool` IS NULL) OR
+                 (`subject_kind` = 'product-agent' AND `child_session_id` IS NULL AND
+                  length(trim(`product_run_id`)) > 0 AND length(trim(`product_kind`)) > 0 AND
+                  length(trim(`product_instance`)) > 0 AND length(trim(`product_tool`)) > 0)
+               ),
+               CONSTRAINT `agent_job_distinct_sessions` CHECK (`child_session_id` IS NULL OR `parent_session_id` <> `child_session_id`),
+               CONSTRAINT `agent_job_status` CHECK (`status` IN ('running','completed','failed','cancelled','uncertain')),
+               CONSTRAINT `agent_job_report_delivery` CHECK (`report_delivery` IN ('next-step','quiet')),
+               CONSTRAINT `fk_agent_job_parent_session_id_session_id_fk` FOREIGN KEY (`parent_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
+               CONSTRAINT `fk_agent_job_child_session_id_session_id_fk` FOREIGN KEY (`child_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
+               CONSTRAINT `fk_agent_job_report_input_id_session_input_id_fk` FOREIGN KEY (`report_input_id`) REFERENCES `session_input`(`id`) ON DELETE SET NULL
+             );",
+            "INSERT INTO `__new_agent_job` (
+               `id`, `parent_session_id`, `subject_kind`, `child_session_id`,
+               `status`, `report_delivery`, `result`, `error`, `report_input_id`,
+               `created_seq`, `settled_seq`, `time_created`, `time_updated`, `time_completed`
+             )
+             SELECT `id`, `parent_session_id`, 'child-session', `child_session_id`,
+                    `status`, `report_delivery`, `result`, `error`, `report_input_id`,
+                    `created_seq`, `settled_seq`, `time_created`, `time_updated`, `time_completed`
+             FROM `agent_job`;",
+            "DROP TABLE `agent_job`;",
+            "ALTER TABLE `__new_agent_job` RENAME TO `agent_job`;",
+            "CREATE UNIQUE INDEX `agent_job_child_running_idx` ON `agent_job` (`child_session_id`) WHERE `status` = 'running';",
+            "CREATE UNIQUE INDEX `agent_job_product_run_idx` ON `agent_job` (`product_run_id`) WHERE `product_run_id` IS NOT NULL;",
             "CREATE INDEX `agent_job_parent_status_created_idx` ON `agent_job` (`parent_session_id`,`status`,`time_created`);",
         ]),
     },

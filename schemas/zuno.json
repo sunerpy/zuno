@@ -1412,6 +1412,12 @@
       },
       "type": "object"
     },
+    "OrderedMap_of_ProductAgentConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProductAgentConfig"
+      },
+      "type": "object"
+    },
     "OrderedMap_of_ProviderConfig": {
       "additionalProperties": {
         "$ref": "#/$defs/ProviderConfig"
@@ -1527,6 +1533,132 @@
         "resource"
       ],
       "type": "object"
+    },
+    "ProductAgentConfig": {
+      "additionalProperties": false,
+      "description": "One named product-agent instance.",
+      "properties": {
+        "command": {
+          "description": "Executable or executable path. Defaults to the product's normal command.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "description": "Disabled unless explicitly true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Additional child-process environment values.\n\nOrdinary process variables, including proxy variables, are inherited even when\nthis map is absent. These entries only overlay that inherited environment.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ProductAgentKind",
+          "description": "Which native product implements this instance."
+        },
+        "permissionMode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProductAgentPermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native product permission policy."
+        },
+        "toolName": {
+          "description": "Static model-visible tool name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ProductAgentKind": {
+      "description": "A supported external coding-agent product.",
+      "oneOf": [
+        {
+          "const": "codex",
+          "description": "OpenAI Codex CLI through its app-server protocol.",
+          "type": "string"
+        },
+        {
+          "const": "claude-code",
+          "description": "Anthropic Claude Code through its non-interactive stream-json CLI.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProductAgentPermissionMode": {
+      "description": "Native permission vocabulary accepted by either supported product.\n\nValidation keeps product-specific values from crossing the boundary. One enum\nkeeps the JSON schema useful while [`ProductAgentConfig::validate`] enforces the\nactual Codex/Claude Code split.",
+      "oneOf": [
+        {
+          "const": "never",
+          "description": "Codex: never ask Zuno for approval.",
+          "type": "string"
+        },
+        {
+          "const": "unlessTrusted",
+          "description": "Codex: ask only for commands outside its trusted set.",
+          "type": "string"
+        },
+        {
+          "const": "onRequest",
+          "description": "Codex: request approval when its policy requires it.",
+          "type": "string"
+        },
+        {
+          "const": "dangerouslyBypassApprovals",
+          "description": "Codex: explicit full-access bypass.",
+          "type": "string"
+        },
+        {
+          "const": "manual",
+          "description": "Claude Code asks before protected operations. Zuno still disables interactive questions.",
+          "type": "string"
+        },
+        {
+          "const": "auto",
+          "description": "Claude Code selects its own non-interactive policy.",
+          "type": "string"
+        },
+        {
+          "const": "acceptEdits",
+          "description": "Claude Code may apply edits without asking.",
+          "type": "string"
+        },
+        {
+          "const": "dontAsk",
+          "description": "Claude Code refuses operations that would require a prompt.",
+          "type": "string"
+        },
+        {
+          "const": "bypassPermissions",
+          "description": "Claude Code's explicit permission bypass.",
+          "type": "string"
+        },
+        {
+          "const": "plan",
+          "description": "Claude Code's read-only planning policy.",
+          "type": "string"
+        }
+      ]
     },
     "ProviderConfig": {
       "additionalProperties": false,
@@ -2220,6 +2352,17 @@
         }
       ],
       "description": "Global permissions."
+    },
+    "productAgent": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_ProductAgentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Native Codex and Claude Code subagent instances."
     },
     "provider": {
       "anyOf": [

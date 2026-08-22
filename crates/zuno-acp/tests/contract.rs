@@ -1,6 +1,7 @@
 use zuno_acp::{IMPLEMENTED_METHODS, turn_event_update};
 use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::event::StreamEvent;
+use zuno_tool::ToolUiIntent;
 
 #[test]
 fn adapter_exposes_the_thirteen_methods_implemented_upstream() {
@@ -39,6 +40,7 @@ fn engine_stream_events_project_to_protocol_updates() {
         step: 1,
         call_id: "call-1".to_owned(),
         name: "write".to_owned(),
+        ui_intent: ToolUiIntent::Generic,
     })
     .expect("tool start is client-visible");
     assert_eq!(started["sessionUpdate"], "tool_call");

@@ -176,6 +176,7 @@ fn a_completed_tool_call_replays_with_its_arguments_output_title_and_diff() {
             status,
             output,
             diff,
+            ..
         },
     ] = replay.messages[0].parts.as_slice()
     else {

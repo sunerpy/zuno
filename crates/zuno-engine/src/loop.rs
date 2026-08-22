@@ -36,7 +36,7 @@ use zuno_llm::event::{
 };
 use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
-use zuno_tool::{ToolDefinition, ToolOutput, ToolReplayPolicy};
+use zuno_tool::{ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent};
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
@@ -149,6 +149,7 @@ pub enum TurnEvent {
         step: u32,
         call_id: String,
         name: String,
+        ui_intent: ToolUiIntent,
     },
     ToolDispatchCompleted {
         step: u32,
@@ -1195,6 +1196,7 @@ pub async fn run_turn(
                 step,
                 &mut assistant,
                 &accumulator,
+                &locked_tools,
                 true,
             )?;
             events
@@ -1223,6 +1225,7 @@ pub async fn run_turn(
                 step,
                 &mut assistant,
                 &accumulator,
+                &locked_tools,
                 false,
             )?;
             return Err(TurnError::StreamEndedWithoutMessageEnd { step });
@@ -1234,6 +1237,7 @@ pub async fn run_turn(
             step,
             &mut assistant,
             &accumulator,
+            &locked_tools,
             false,
         )?;
         if !accumulator.has_assistant_parts() {
@@ -1253,11 +1257,13 @@ pub async fn run_turn(
         let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
         if !injected.skip_remaining_tools {
             for (call_index, call) in accumulator.calls.iter().cloned().enumerate() {
+                let ui_intent = tool_ui_intent(&locked_tools, &call.name);
                 events
                     .send(TurnEvent::ToolDispatchStarted {
                         step,
                         call_id: call.id.clone(),
                         name: call.name.clone(),
+                        ui_intent,
                     })
                     .await?;
                 let dispatch = context
@@ -1279,10 +1285,13 @@ pub async fn run_turn(
                 persist_tool_result(
                     context.connection,
                     &request,
-                    step,
-                    call_index,
-                    &assistant_id,
-                    &call,
+                    ToolResultIdentity {
+                        step,
+                        call_index,
+                        message_id: &assistant_id,
+                        call: &call,
+                        ui_intent,
+                    },
                     &dispatch,
                 )?;
                 events
@@ -2268,6 +2277,7 @@ fn checkpoint_assistant(
     step: u32,
     assistant: &mut MessageRecord,
     accumulator: &StepAccumulator,
+    locked_tools: &[ToolDefinition],
     interrupted: bool,
 ) -> Result<(), TurnError> {
     let completed = now_millis();
@@ -2344,7 +2354,14 @@ fn checkpoint_assistant(
         store.put_part_at(&part, completed)?;
     }
     for (call_index, call) in accumulator.calls.iter().enumerate() {
-        let tool = pending_tool_part(request, step, call_index, &assistant.id, call)?;
+        let tool = pending_tool_part(
+            request,
+            step,
+            call_index,
+            &assistant.id,
+            call,
+            tool_ui_intent(locked_tools, &call.name),
+        )?;
         store.put_part_at(&tool, completed)?;
     }
     Ok(())
@@ -2426,6 +2443,7 @@ fn pending_tool_part(
     call_index: usize,
     message_id: &str,
     call: &ToolCall,
+    ui_intent: ToolUiIntent,
 ) -> Result<PartRecord, TurnError> {
     let mut payload = json!({
         "id": tool_part_id(&request.turn_id, step, call_index),
@@ -2434,6 +2452,7 @@ fn pending_tool_part(
         "type": "tool",
         "callID": call.id,
         "tool": call.name,
+        "uiIntent": ui_intent,
         "state": {
             "status": "pending",
             "input": call.input,
@@ -2446,13 +2465,18 @@ fn pending_tool_part(
     PartRecord::from_json(payload, now_millis()).map_err(TurnError::from)
 }
 
+struct ToolResultIdentity<'a> {
+    step: u32,
+    call_index: usize,
+    message_id: &'a str,
+    call: &'a ToolCall,
+    ui_intent: ToolUiIntent,
+}
+
 fn persist_tool_result(
     connection: &Connection,
     request: &RunTurnRequest,
-    step: u32,
-    call_index: usize,
-    message_id: &str,
-    call: &ToolCall,
+    identity: ToolResultIdentity<'_>,
     dispatch: &ToolDispatchResult,
 ) -> Result<(), TurnError> {
     let status = if dispatch.is_error {
@@ -2462,8 +2486,8 @@ fn persist_tool_result(
     };
     let mut state = json!({
         "status": status,
-        "input": call.input,
-        "raw": call.raw_input,
+        "input": identity.call.input,
+        "raw": identity.call.raw_input,
         "title": dispatch.output.title,
         "metadata": dispatch.output.metadata,
         "attachments": dispatch.output.attachments,
@@ -2475,21 +2499,29 @@ fn persist_tool_result(
         state["output"] = Value::String(dispatch.output.output.clone());
     }
     let mut payload = json!({
-        "id": tool_part_id(&request.turn_id, step, call_index),
+        "id": tool_part_id(&request.turn_id, identity.step, identity.call_index),
         "sessionID": request.session_id,
-        "messageID": message_id,
+        "messageID": identity.message_id,
         "type": "tool",
-        "callID": call.id,
-        "tool": call.name,
+        "callID": identity.call.id,
+        "tool": identity.call.name,
+        "uiIntent": identity.ui_intent,
         "state": state
     });
-    if let Some(signature) = &call.thought_signature {
+    if let Some(signature) = &identity.call.thought_signature {
         payload["metadata"] = json!({ "thoughtSignature": signature.as_str() });
     }
     let now = now_millis();
     let part = PartRecord::from_json(payload, now)?;
     MessageStore::new(connection).put_part_at(&part, now)?;
     Ok(())
+}
+
+fn tool_ui_intent(definitions: &[ToolDefinition], name: &str) -> ToolUiIntent {
+    definitions
+        .iter()
+        .find(|definition| definition.id == name)
+        .map_or(ToolUiIntent::Generic, |definition| definition.ui_intent)
 }
 
 fn assistant_message_id(turn_id: &str, step: u32) -> String {

@@ -1474,6 +1474,20 @@ async fn apply_selection(
             }
             return SelectionOutcome::Remount(RemountRequest::reopening_sessions(next));
         }
+        zuno_tui::views::session::Selection::JobCancel(job_id) => {
+            let detail = match host.cancel_job(&job_id).await {
+                Ok(outcome) => outcome.message,
+                Err(error) => format!("warning: could not cancel job {job_id}: {error}"),
+            };
+            let _reported = rebuild
+                .events
+                .publish(TurnEvent::Provider {
+                    step: 0,
+                    event: StreamEvent::StatusDetail { detail },
+                })
+                .await;
+            return SelectionOutcome::Unchanged;
+        }
         // A theme is owned and applied entirely by the view layer.
         zuno_tui::views::session::Selection::Theme(_) => return SelectionOutcome::Unchanged,
     }

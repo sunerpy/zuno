@@ -185,7 +185,12 @@ CREATE TABLE `session` (
 CREATE TABLE `agent_job` (
   `id` text PRIMARY KEY,
   `parent_session_id` text NOT NULL,
-  `child_session_id` text NOT NULL,
+  `subject_kind` text NOT NULL,
+  `child_session_id` text,
+  `product_run_id` text,
+  `product_kind` text,
+  `product_instance` text,
+  `product_tool` text,
   `status` text NOT NULL,
   `report_delivery` text NOT NULL,
   `result` text,
@@ -196,8 +201,16 @@ CREATE TABLE `agent_job` (
   `time_created` integer NOT NULL,
   `time_updated` integer NOT NULL,
   `time_completed` integer,
-  CONSTRAINT `agent_job_distinct_sessions` CHECK (`parent_session_id` <> `child_session_id`),
-  CONSTRAINT `agent_job_status` CHECK (`status` IN ('running','completed','failed','cancelled')),
+  CONSTRAINT `agent_job_subject` CHECK (
+    (`subject_kind` = 'child-session' AND `child_session_id` IS NOT NULL AND
+     `product_run_id` IS NULL AND `product_kind` IS NULL AND
+     `product_instance` IS NULL AND `product_tool` IS NULL) OR
+    (`subject_kind` = 'product-agent' AND `child_session_id` IS NULL AND
+     length(trim(`product_run_id`)) > 0 AND length(trim(`product_kind`)) > 0 AND
+     length(trim(`product_instance`)) > 0 AND length(trim(`product_tool`)) > 0)
+  ),
+  CONSTRAINT `agent_job_distinct_sessions` CHECK (`child_session_id` IS NULL OR `parent_session_id` <> `child_session_id`),
+  CONSTRAINT `agent_job_status` CHECK (`status` IN ('running','completed','failed','cancelled','uncertain')),
   CONSTRAINT `agent_job_report_delivery` CHECK (`report_delivery` IN ('next-step','quiet')),
   CONSTRAINT `fk_agent_job_parent_session_id_session_id_fk` FOREIGN KEY (`parent_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_agent_job_child_session_id_session_id_fk` FOREIGN KEY (`child_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
@@ -237,6 +250,7 @@ CREATE INDEX `session_message_session_type_seq_idx` ON `session_message` (`sessi
 CREATE INDEX `session_message_session_time_created_id_idx` ON `session_message` (`session_id`,`time_created`,`id`);
 CREATE INDEX `session_message_time_created_idx` ON `session_message` (`time_created`);
 CREATE UNIQUE INDEX `agent_job_child_running_idx` ON `agent_job` (`child_session_id`) WHERE `status` = 'running';
+CREATE UNIQUE INDEX `agent_job_product_run_idx` ON `agent_job` (`product_run_id`) WHERE `product_run_id` IS NOT NULL;
 CREATE INDEX `agent_job_parent_status_created_idx` ON `agent_job` (`parent_session_id`,`status`,`time_created`);
 CREATE INDEX `session_project_idx` ON `session` (`project_id`);
 CREATE INDEX `session_workspace_idx` ON `session` (`workspace_id`);
