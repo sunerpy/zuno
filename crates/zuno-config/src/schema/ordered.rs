@@ -10,6 +10,7 @@
 //! [`False`] exists because the oracle has two `Schema.Literal(false)` arms
 //! (provider timeouts and MCP OAuth) where `bool` would wrongly accept `true`.
 
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -23,6 +24,20 @@ use std::marker::PhantomData;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderedMap<V> {
     entries: Vec<(String, V)>,
+}
+
+impl<V: JsonSchema> JsonSchema for OrderedMap<V> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("OrderedMap_of_{}", V::schema_name()).into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        format!("{}::OrderedMap<{}>", module_path!(), V::schema_id()).into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        <std::collections::BTreeMap<String, V>>::json_schema(generator)
+    }
 }
 
 impl<V> OrderedMap<V> {
@@ -152,6 +167,18 @@ impl<'de, V: Deserialize<'de>> Deserialize<'de> for OrderedMap<V> {
 /// `config/mcp.ts:53`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct False;
+
+impl JsonSchema for False {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "false".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        serde_json::json!({ "const": false })
+            .try_into()
+            .expect("the literal false is a valid JSON Schema")
+    }
+}
 
 impl Serialize for False {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

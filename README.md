@@ -117,6 +117,9 @@ Profile 中还可以挂载 provider、远程执行器、审批、评测或 bench
 
 | 页面 | 内容 |
 | --- | --- |
+| [docs/README.md](docs/README.md) | 后续文档站的信息架构与完整导航 |
+| [docs/reference/configuration.md](docs/reference/configuration.md) | `zuno.json` Schema、配置层与独立 `tui.json` |
+| [docs/reference/providers.md](docs/reference/providers.md) | Provider、凭证、`myopenai` 与原生 Rust 请求链 |
 | [docs/harness-runtime.md](docs/harness-runtime.md) | 原生组件、Profile 事务、持久 inbox 与自定义 Harness |
 | [docs/design/harness-comparison.md](docs/design/harness-comparison.md) | DSH、Codex、OMO、pi-agent、OpenCode 与 Claw Code 的借鉴决策 |
 | [docs/design/client-interfaces.md](docs/design/client-interfaces.md) | TUI、ACP、HTTP 与未来 GUI 共用的事件和投影接口 |

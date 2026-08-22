@@ -74,7 +74,7 @@ fn a_full_document_parses_every_key_this_todo_owns() {
 }
 
 #[test]
-fn an_empty_document_resolves_to_the_upstream_defaults() {
+fn an_empty_document_preserves_native_terminal_selection() {
     let resolved = TuiConfig::from_json_str("{}")
         .expect("an empty document parses")
         .resolve(ResolveOptions {
@@ -83,7 +83,10 @@ fn an_empty_document_resolves_to_the_upstream_defaults() {
         .expect("resolve succeeds");
 
     assert_eq!(resolved.leader_timeout, DEFAULT_LEADER_TIMEOUT);
-    assert!(resolved.mouse, "mouse capture defaults to true");
+    assert!(
+        !resolved.mouse,
+        "mouse reporting must be opt-in so terminal-native selection works everywhere"
+    );
     assert_eq!(resolved.prompt, PromptConfig::default());
     assert_eq!(resolved.scroll_speed, None);
     assert_eq!(resolved.diff_style, None);
@@ -435,7 +438,7 @@ fn a_key_no_layer_mentions_falls_back_to_the_documented_default() {
         resolved.leader_timeout, DEFAULT_LEADER_TIMEOUT,
         "an unmentioned key takes the same default it would with no file at all"
     );
-    assert!(resolved.mouse);
+    assert!(!resolved.mouse);
     assert_eq!(resolved.prompt, PromptConfig::default());
     assert_eq!(resolved.attention, AttentionSettings::default());
 }

@@ -419,14 +419,6 @@ pub struct SidebarView {
 }
 
 impl SidebarView {
-    /// What the LSP section says when no language server is enabled.
-    ///
-    /// It names the config key, because "none" without a way to change it leaves the user
-    /// with a verdict and no next step. Kept inside [`SIDEBAR_WIDTH`] on purpose: this
-    /// panel truncates, and a sentence cut off mid-word is a worse next step than none —
-    /// `views_sidebar_explains_itself_without_being_truncated` pins the fit.
-    pub const NO_LSP_CONFIGURED: &'static str = "  none enabled — set `lsp`";
-
     /// A panel over `context` with nothing resolved yet.
     #[must_use]
     pub fn new(context: ViewContext) -> Self {
@@ -715,23 +707,16 @@ impl SidebarView {
             }
         }
 
-        lines.push(blank());
-        headers.push((lines.len(), Section::Lsp));
-        lines.push(self.heading(
-            "LSP",
-            &Self::summarise(&self.ambient.lsp),
-            self.disclosure(self.expanded.lsp),
-            width,
-        ));
-        if self.expanded.lsp {
-            if self.ambient.lsp.is_empty() {
-                // Not "starts as files are read": an empty list means no server is
-                // enabled, so nothing will ever start no matter what is read. The old
-                // copy made "no `lsp` key at all" look identical to "servers configured
-                // and merely idle", which are the two states a user most needs to tell
-                // apart when diagnostics never appear.
-                lines.push(padded(Self::NO_LSP_CONFIGURED, width, self.context.muted()));
-            } else {
+        if !self.ambient.lsp.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Lsp));
+            lines.push(self.heading(
+                "LSP",
+                &Self::summarise(&self.ambient.lsp),
+                self.disclosure(self.expanded.lsp),
+                width,
+            ));
+            if self.expanded.lsp {
                 for service in &self.ambient.lsp {
                     lines.push(self.service_row(service, width));
                 }

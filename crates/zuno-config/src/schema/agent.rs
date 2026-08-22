@@ -11,13 +11,14 @@
 
 use crate::schema::JsonMap;
 use crate::schema::permission::PermissionConfig;
+use schemars::JsonSchema;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::num::NonZeroU32;
 
 /// Where an agent may be used (`config/agent.ts:26`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentMode {
     /// Only reachable as a subagent.
@@ -29,7 +30,7 @@ pub enum AgentMode {
 }
 
 /// A named theme colour (`config/agent.ts:9`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeColor {
     /// Primary.
@@ -50,7 +51,7 @@ pub enum ThemeColor {
 
 /// An agent's colour: a six-digit hex code, or a theme colour
 /// (`config/agent.ts:7-10`).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum AgentColor {
     /// A theme colour.
@@ -121,7 +122,7 @@ pub const UNSUPPORTED_AGENT_KEYS: &[&str] = &["tools", "maxSteps"];
 /// Deserialization performs the oracle's sweep: any key this struct does not name
 /// is copied into [`options`](Self::options) *and* kept verbatim in
 /// [`extra`](Self::extra).
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize)]
 pub struct AgentConfig {
     /// Model in `provider/model` form.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -193,7 +194,7 @@ impl<'de> Deserialize<'de> for AgentConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(JsonSchema, Deserialize)]
 struct AgentWire {
     model: Option<String>,
     variant: Option<String>,

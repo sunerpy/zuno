@@ -4,6 +4,7 @@
 //! Record<String, Entry>`.
 
 use crate::schema::ordered::OrderedMap;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -11,7 +12,7 @@ use std::collections::BTreeMap;
 ///
 /// Omitted disables formatting, `true` enables the built-ins, and an object
 /// enables the built-ins with the listed overrides applied.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FormatterConfig {
     /// Enable or disable every formatter at once.
@@ -21,7 +22,7 @@ pub enum FormatterConfig {
 }
 
 /// One formatter's overrides (`config/formatter.ts:5-10`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FormatterEntry {
     /// Turn this formatter off.
     #[serde(skip_serializing_if = "Option::is_none")]

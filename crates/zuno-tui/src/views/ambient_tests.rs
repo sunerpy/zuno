@@ -45,7 +45,15 @@ fn ambient() -> Ambient {
 }
 
 fn view() -> SidebarView {
-    let mut view = SidebarView::new(ViewContext::defaults());
+    let context = ViewContext::new(
+        &crate::theme::ThemeRegistry::new()
+            .resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark),
+        crate::config::ResolvedTuiConfig {
+            mouse: true,
+            ..crate::config::ResolvedTuiConfig::default()
+        },
+    );
+    let mut view = SidebarView::new(context);
     *view.ambient_mut() = ambient();
     view
 }
@@ -88,7 +96,7 @@ fn views_sidebar_reports_a_failed_server_in_its_section_summary() {
 }
 
 #[test]
-fn views_sidebar_distinguishes_empty_from_broken() {
+fn views_sidebar_hides_an_unconfigured_lsp_section() {
     // "No servers configured" and "servers failed" must never render the same, which is
     // the "no results versus cannot see the data" confusion.
     let mut view = SidebarView::new(ViewContext::defaults());
@@ -97,20 +105,9 @@ fn views_sidebar_distinguishes_empty_from_broken() {
         empty.contains("none configured"),
         "an unconfigured MCP section says nothing at all:\n{empty}"
     );
-    // Was "starts as files are read", which is false for an empty list: with no server
-    // enabled nothing will ever start no matter what is read, and that copy made "no `lsp`
-    // key at all" indistinguishable from "configured and merely idle".
     assert!(
-        empty.contains(SidebarView::NO_LSP_CONFIGURED.trim()),
-        "an empty LSP section does not explain itself:\n{empty}"
-    );
-    assert!(
-        crate::views::display_width(SidebarView::NO_LSP_CONFIGURED) < usize::from(SIDEBAR_WIDTH),
-        "the explanation is wider than the panel, so it renders cut off mid-word"
-    );
-    assert!(
-        !empty.contains("starts as files are read"),
-        "an empty section promised a start that will never happen:\n{empty}"
+        !empty.contains("LSP"),
+        "an unconfigured capability was rendered as an action item:\n{empty}"
     );
     assert!(
         !empty.contains("failed"),
@@ -130,8 +127,8 @@ fn views_sidebar_separates_a_server_that_will_start_from_one_that_cannot() {
     ];
     let drawn = drawn(&mut view);
     assert!(
-        !drawn.contains(SidebarView::NO_LSP_CONFIGURED.trim()),
-        "two configured servers rendered as none:\n{drawn}"
+        drawn.contains("LSP"),
+        "configured language servers have no section:\n{drawn}"
     );
     // The tails, not the whole detail: a 34-column panel elides the middle of a long
     // detail, so asserting the full sentence would fail on a frame that is in fact correct.

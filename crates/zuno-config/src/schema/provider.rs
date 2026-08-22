@@ -7,12 +7,13 @@
 
 use crate::schema::JsonMap;
 use crate::schema::ordered::{False, OrderedMap};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 /// One entry of the `provider` map (`config/provider.ts:82-126`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Base API URL for the provider.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,7 +49,7 @@ pub struct ProviderConfig {
 /// The oracle spells this `StructWithRest(..., [Record(String, Any)])`, so any key
 /// the schema does not name is still valid and is handed to the provider SDK. That
 /// rest record is [`ProviderOptions::extra`].
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ProviderOptions {
     /// API key.
     #[serde(rename = "apiKey", skip_serializing_if = "Option::is_none")]
@@ -78,7 +79,7 @@ pub struct ProviderOptions {
 
 /// A timeout in milliseconds, or `false` to disable it
 /// (`config/provider.ts:101-116`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Timeout {
     /// Milliseconds to wait.
@@ -88,7 +89,7 @@ pub enum Timeout {
 }
 
 /// A model's lifecycle status (`config/provider.ts:6`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelStatus {
     /// Alpha.
@@ -102,7 +103,7 @@ pub enum ModelStatus {
 }
 
 /// A modality a model accepts or emits (`config/provider.ts:56-59`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Modality {
     /// Text.
@@ -121,7 +122,7 @@ pub enum Modality {
 ///
 /// The oracle's field arm is `Union([Literals([...]), String])`, which accepts any
 /// string; the three literals are documentation, not a constraint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Interleaved {
     /// Switch interleaved reasoning on or off.
@@ -133,14 +134,14 @@ pub enum Interleaved {
 }
 
 /// The object arm of [`Interleaved`] (`config/provider.ts:26-28`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterleavedField {
     /// The stream field carrying reasoning.
     pub field: String,
 }
 
 /// Per-token pricing (`config/provider.ts:31-46`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCost {
     /// Input price.
     pub input: f64,
@@ -158,7 +159,7 @@ pub struct ModelCost {
 }
 
 /// The long-context pricing tier (`config/provider.ts:37-44`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCostTier {
     /// Input price.
     pub input: f64,
@@ -173,7 +174,7 @@ pub struct ModelCostTier {
 }
 
 /// Token limits (`config/provider.ts:47-53`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelLimit {
     /// Total context window.
     pub context: f64,
@@ -185,7 +186,7 @@ pub struct ModelLimit {
 }
 
 /// Input and output modalities (`config/provider.ts:54-61`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ModelModalities {
     /// Accepted modalities.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -197,7 +198,7 @@ pub struct ModelModalities {
 
 /// The npm package and API endpoint backing a single model
 /// (`config/provider.ts:64-66`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ModelProvider {
     /// npm package implementing the provider.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,7 +211,7 @@ pub struct ModelProvider {
 /// One named variant of a model (`config/provider.ts:69-79`).
 ///
 /// `StructWithRest`: everything but `disabled` is variant-specific payload.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ModelVariant {
     /// Disable this variant for the model.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -221,7 +222,7 @@ pub struct ModelVariant {
 }
 
 /// One entry of a provider's `models` map (`config/provider.ts:13-80`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Model id override.
     #[serde(skip_serializing_if = "Option::is_none")]

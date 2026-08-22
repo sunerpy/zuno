@@ -2627,8 +2627,14 @@ impl SessionScreen {
         use zuno_llm::effort::ReasoningEffort;
         if !self.catalog.reasoning {
             self.toasts.push(Toast::warning(match &self.catalog.model {
-                Some(model) => format!("{model} does not accept a reasoning level"),
-                None => String::from("no model resolved, so no reasoning level applies"),
+                Some(model) => format!(
+                    "{model} does not support selectable reasoning effort. Choose a \
+                     reasoning-capable model to change the effort level."
+                ),
+                None => String::from(
+                    "No model is currently resolved, so reasoning effort cannot be changed. \
+                     Choose a model first.",
+                ),
             }));
             return EventResult::REDRAW;
         }

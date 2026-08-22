@@ -5086,6 +5086,7 @@ dependencies = [
  "globset",
  "proptest",
  "reqwest",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",

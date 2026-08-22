@@ -3,13 +3,14 @@
 //! Oracle: `packages/core/src/config/reference.ts:5-21` — a three-way union of a
 //! bare string, a git reference, and a local-path reference.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// One entry of the `references` map.
 ///
 /// The arms are disjoint: a string is a string, [`GitReference`] requires
 /// `repository`, and [`LocalReference`] requires `path`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ReferenceEntry {
     /// The shorthand form: a bare repository or path string.
@@ -21,7 +22,7 @@ pub enum ReferenceEntry {
 }
 
 /// A reference to a git repository (`config/reference.ts:5-10`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GitReference {
     /// The repository to clone.
     pub repository: String,
@@ -37,7 +38,7 @@ pub struct GitReference {
 }
 
 /// A reference to a local directory (`config/reference.ts:12-16`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalReference {
     /// The directory to reference.
     pub path: String,

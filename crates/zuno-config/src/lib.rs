@@ -2,6 +2,7 @@
 
 pub mod discovery;
 pub mod instructions;
+pub mod json_schema;
 pub mod schema;
 pub mod variable;
 

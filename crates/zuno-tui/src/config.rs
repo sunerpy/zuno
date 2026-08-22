@@ -432,7 +432,11 @@ pub struct TuiConfig {
     /// Diff rendering style.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_style: Option<DiffStyle>,
-    /// Whether mouse capture is enabled.
+    /// Whether application mouse handling is enabled.
+    ///
+    /// Disabled by default so the terminal retains native drag selection and copy
+    /// across the transcript, sidebar, prompt, dialogs, and notices. Set this to
+    /// `true` only when click-to-toggle sections and wheel scrolling are preferred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
     /// The theme to render with.
@@ -495,7 +499,8 @@ pub struct ResolvedTuiConfig {
     pub scroll_acceleration: Option<ScrollAcceleration>,
     /// Diff rendering style, when configured.
     pub diff_style: Option<DiffStyle>,
-    /// Whether mouse capture is enabled (`index.tsx:115` — default `true`).
+    /// Whether application mouse handling is enabled. Defaults to `false` so the
+    /// terminal owns selection unless the user explicitly opts into mouse events.
     pub mouse: bool,
     /// The theme name to render with, with the default already applied.
     ///
@@ -705,7 +710,7 @@ impl TuiConfig {
             scroll_speed: self.scroll_speed,
             scroll_acceleration: self.scroll_acceleration,
             diff_style: self.diff_style,
-            mouse: self.mouse.unwrap_or(true),
+            mouse: self.mouse.unwrap_or(false),
             theme: self
                 .theme
                 .unwrap_or_else(|| crate::theme::DEFAULT_THEME.to_owned()),
@@ -747,7 +752,7 @@ impl Default for ResolvedTuiConfig {
             scroll_speed: None,
             scroll_acceleration: None,
             diff_style: None,
-            mouse: true,
+            mouse: false,
             theme: crate::theme::DEFAULT_THEME.to_owned(),
             attention: crate::attention::AttentionSettings::default(),
         }

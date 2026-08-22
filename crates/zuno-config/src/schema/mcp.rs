@@ -6,13 +6,14 @@
 //! third arm is how a config layer switches off a server another layer defined,
 //! without restating its command or url.
 
+use schemars::JsonSchema;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::num::{NonZeroU16, NonZeroU32};
 
 /// The `type: "local"` discriminator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LocalKind {
     /// A server this process spawns.
@@ -20,7 +21,7 @@ pub enum LocalKind {
 }
 
 /// The `type: "remote"` discriminator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RemoteKind {
     /// A server reached over HTTP.
@@ -31,7 +32,7 @@ pub enum RemoteKind {
 ///
 /// The arms are tried in the oracle's union order — local, remote, then the
 /// enabled-only toggle — and the first that fits wins.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum McpServerConfig {
     /// A locally spawned server.
@@ -69,7 +70,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
 }
 
 /// A locally spawned MCP server (`config/mcp.ts:6-23`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpLocal {
     /// Always `local`.
     #[serde(rename = "type")]
@@ -91,7 +92,7 @@ pub struct McpLocal {
 }
 
 /// A remote MCP server (`config/mcp.ts:44-59`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpRemote {
     /// Always `remote`.
     #[serde(rename = "type")]
@@ -114,7 +115,7 @@ pub struct McpRemote {
 
 /// A switch for a server another config layer defined
 /// (`config/config.ts:113-115`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpToggle {
     /// Start the server, or not.
     pub enabled: bool,
@@ -122,7 +123,7 @@ pub struct McpToggle {
 
 /// The `oauth` key: settings, or `false` to disable auto-detection
 /// (`config/mcp.ts:53-55`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum McpOauth {
     /// Explicit OAuth settings.
@@ -132,7 +133,7 @@ pub enum McpOauth {
 }
 
 /// OAuth settings for a remote MCP server (`config/mcp.ts:26-41`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct McpOauthConfig {
     /// Client id; absent means dynamic client registration (RFC 7591).
     #[serde(rename = "clientId", skip_serializing_if = "Option::is_none")]

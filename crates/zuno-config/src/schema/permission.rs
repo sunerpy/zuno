@@ -11,12 +11,13 @@
 //! which form the author wrote.
 
 use crate::schema::ordered::OrderedMap;
+use schemars::JsonSchema;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 /// What to do when a tool asks (`config/permission.ts:5`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionAction {
     /// Prompt the user.
@@ -29,7 +30,7 @@ pub enum PermissionAction {
 
 /// A permission rule: one action for the whole tool, or per-pattern actions
 /// (`config/permission.ts:8-12`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PermissionRule {
     /// One action covering every invocation of the tool.
@@ -69,7 +70,7 @@ pub const ACTION_ONLY_KEYS: &[&str] = &[
 ];
 
 /// The `permission` key: one action for everything, or per-tool rules.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum PermissionConfig {
     /// A bare action applied to every tool.
@@ -124,7 +125,7 @@ impl<'de> Deserialize<'de> for PermissionConfig {
 }
 
 /// Per-tool permission rules, in the author's key order.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize)]
 #[serde(transparent)]
 pub struct PermissionObject(pub OrderedMap<PermissionRule>);
 

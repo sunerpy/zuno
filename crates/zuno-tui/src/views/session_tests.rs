@@ -12,11 +12,26 @@ use zuno_engine::r#loop::TurnEvent;
 use zuno_llm::event::StreamEvent;
 
 fn screen() -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
+    screen_with(ViewContext::defaults())
+}
+
+/// A screen whose tests explicitly exercise application mouse handling.
+fn mouse_screen() -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
+    let registry = crate::theme::ThemeRegistry::new();
+    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
+    let context = ViewContext::new(
+        &resolved,
+        crate::config::ResolvedTuiConfig {
+            mouse: true,
+            ..crate::config::ResolvedTuiConfig::default()
+        },
+    );
+    screen_with(context)
+}
+
+fn screen_with(context: ViewContext) -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
     let (sender, receiver) = terminal_event_channel();
-    (
-        SessionScreen::new(ViewContext::defaults(), sender),
-        receiver,
-    )
+    (SessionScreen::new(context, sender), receiver)
 }
 
 fn press_none() -> KeyEvent {
@@ -3587,7 +3602,7 @@ fn session_a_click_on_a_sidebar_section_heading_collapses_it_through_the_event_l
     // match dispatches it, and the panel's recorded geometry answers. Before this the only
     // mouse consumer on the screen was the wheel, so a click on a heading that draws a
     // disclosure triangle was discarded.
-    let (mut screen, _shutdown) = screen();
+    let (mut screen, _shutdown) = mouse_screen();
     screen.sidebar_mut().ambient_mut().lsp = vec![crate::views::ambient::Service::new(
         "rust-analyzer",
         crate::views::ambient::Health::Ready,
@@ -5909,7 +5924,23 @@ fn brand_row(rendered: &[String]) -> usize {
 /// first, and a regression that fixed it by narrowing unconditionally can only be seen at the
 /// second.
 fn conversing() -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
-    let (mut screen, shutdown) = screen();
+    conversing_with(ViewContext::defaults())
+}
+
+fn mouse_conversing() -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
+    let (screen, receiver) = mouse_screen();
+    conversing_from(screen, receiver)
+}
+
+fn conversing_with(context: ViewContext) -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
+    let (screen, receiver) = screen_with(context);
+    conversing_from(screen, receiver)
+}
+
+fn conversing_from(
+    mut screen: SessionScreen,
+    shutdown: mpsc::Receiver<TerminalEvent>,
+) -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
     screen.sidebar_mut().ambient_mut().directory = Some(String::from("~/work/zuno"));
     // Through the transcript, not by setting `Ambient::context_used` directly: `render`
     // re-derives that field from the transcript on every frame so the panel, the strip and the
@@ -6181,7 +6212,7 @@ fn the_users_prompt_is_framed_and_the_reply_is_not() {
 fn a_press_on_the_prompt_opens_a_menu_that_copies_and_reverts() {
     for width in [120u16, 80] {
         let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
-        let (screen, _shutdown) = conversing();
+        let (screen, _shutdown) = mouse_conversing();
         let mut screen = screen.with_clipboard(clipboard.clone());
         let rendered = rows(&render_offscreen(&mut screen, width, 32).expect("infallible"));
         let row = rendered
@@ -6222,7 +6253,7 @@ fn a_press_on_the_prompt_opens_a_menu_that_copies_and_reverts() {
         );
 
         // Revert: the row exists, and it confirms rather than submitting.
-        let (mut reverting, _shutdown) = conversing();
+        let (mut reverting, _shutdown) = mouse_conversing();
         let rendered = rows(&render_offscreen(&mut reverting, width, 32).expect("infallible"));
         let row = u16::try_from(
             rendered
@@ -6447,9 +6478,21 @@ fn variant_cycle_does_nothing_visible_on_a_model_that_cannot_reason() {
     assert!(
         toasts[0]
             .text()
-            .contains("does not accept a reasoning level"),
+            .contains("does not support selectable reasoning effort"),
         "the refusal does not say why: {:?}",
         toasts[0].text()
+    );
+    assert!(
+        toasts[0]
+            .text()
+            .contains("Choose a reasoning-capable model"),
+        "the refusal gives no next step: {:?}",
+        toasts[0].text()
+    );
+    assert_eq!(
+        toasts[0].ttl(),
+        crate::views::toast::TOAST_ATTENTION_TTL,
+        "the capability explanation inherited the short confirmation timeout"
     );
 }
 
@@ -6742,7 +6785,7 @@ fn replay_declines_a_transcript_that_has_already_started() {
 #[test]
 fn the_message_menu_offers_no_revert_on_a_replayed_prompt() {
     for width in [120u16, 80] {
-        let (mut screen, _shutdown) = screen();
+        let (mut screen, _shutdown) = mouse_screen();
         screen
             .transcript_mut()
             .transcript_mut()
@@ -6793,7 +6836,7 @@ fn the_message_menu_offers_no_revert_on_a_replayed_prompt() {
 /// row must come back for it.
 #[test]
 fn the_message_menu_offers_revert_on_a_prompt_typed_after_a_resume() {
-    let (mut screen, _shutdown) = screen();
+    let (mut screen, _shutdown) = mouse_screen();
     screen
         .transcript_mut()
         .transcript_mut()

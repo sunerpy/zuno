@@ -343,11 +343,11 @@ impl CrosstermLifecycle {
 ///
 /// # What this does not do
 ///
-/// It does not restore the terminal's own text selection. Any mouse reporting mode takes
-/// the pointer, so a user who wants native selection either holds their terminal's bypass
-/// modifier (`shift` in xterm, GNOME Terminal, iTerm2 and Windows Terminal) or sets
-/// `mouse = false`, which this build already honours. Re-implementing selection inside the
-/// application was rejected — see the module header.
+/// It does not preserve the terminal's own text selection. Any mouse reporting mode takes
+/// the pointer, so Zuno leaves mouse capture disabled by default and requires `mouse =
+/// true` for wheel scrolling and clickable sidebar sections. Re-implementing selection
+/// inside the application was rejected: leaving reporting off gives every rendered region
+/// the terminal's native selection and clipboard behavior.
 struct NarrowMouseCapture;
 
 impl crossterm::Command for NarrowMouseCapture {

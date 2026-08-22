@@ -54,6 +54,13 @@ The TUI favors dense, keyboard-first operation:
 - generic rendering for unknown future events;
 - a `system` theme that reads non-invasive terminal color hints when available
   and otherwise preserves the terminal's foreground and background defaults;
+- terminal-native mouse selection across the transcript, sidebar, and input by
+  default; `mouse: true` in `tui.json` explicitly trades selection for TUI mouse
+  capture and click handling;
+- no empty LSP status or setup prompt; the sidebar adds LSP only for configured
+  services or real diagnostics;
+- warning and error notices wrap inside the viewport and remain visible long
+  enough to inspect or select;
 - no blocking network, LSP, or provider work in the render loop.
 
 ## Future GUI

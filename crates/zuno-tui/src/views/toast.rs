@@ -36,7 +36,7 @@
 //!   input and engine activity, not of what is on screen.
 //! * **Expire lazily only.** Free, and wrong for the reason above.
 //! * **One deadline, one wake.** What this does: [`ToastLayer::show`] arms a single
-//!   `tokio::time::sleep` for [`TOAST_TTL`] that sends one
+//!   `tokio::time::sleep` for the notice's level-specific TTL that sends one
 //!   [`crate::app::TerminalEvent::Wake`] on the terminal channel that already exists
 //!   for out-of-loop producers. The host prunes on that event and reports a redraw, so
 //!   the toast leaves the screen once and the loop returns to whatever tier it was in.
@@ -55,10 +55,9 @@
 //! anyway, which is precisely when the lazy check suffices.
 
 use crate::app::TerminalEvent;
-use crate::views::{ViewContext, display_width, padded};
+use crate::views::{ViewContext, display_width, message::wrap, padded};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -73,14 +72,19 @@ mod tests;
 /// without looking for it, short enough that it is gone before it becomes furniture.
 pub const TOAST_TTL: Duration = Duration::from_secs(5);
 
+/// How long warnings and failures stay visible.
+///
+/// These notices usually explain why an operation was refused and what the user can
+/// change. They need enough time to read or select, unlike a short success
+/// confirmation.
+pub const TOAST_ATTENTION_TTL: Duration = Duration::from_secs(15);
+
 /// The widest a toast is allowed to be.
 ///
 /// The `medium` dialog tier ([`crate::views::dialog::DialogWidth::Medium`]) rather
 /// than a number of its own, so a toast and the narrowest dialog agree about how wide
-/// a short message is. Anything that does not fit in one row of this belongs in an
-/// [`crate::views::basics::AlertDialog`], which the user dismisses when they have read
-/// it; truncating a long error into a corner for five seconds tells them only that
-/// something went wrong.
+/// a short message is. Longer notices wrap into additional rows instead of losing
+/// their actionable tail.
 pub const TOAST_MAX_WIDTH: u16 = 60;
 
 /// What kind of fact a toast is reporting.
@@ -115,6 +119,15 @@ impl ToastLevel {
             Self::Success => "✓",
             Self::Warning => "!",
             Self::Error => "✗",
+        }
+    }
+
+    /// How long this level remains visible.
+    #[must_use]
+    pub const fn ttl(self) -> Duration {
+        match self {
+            Self::Info | Self::Success => TOAST_TTL,
+            Self::Warning | Self::Error => TOAST_ATTENTION_TTL,
         }
     }
 
@@ -189,6 +202,12 @@ impl Toast {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    /// How long this notice remains visible.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        self.level.ttl()
+    }
 }
 
 /// The single-slot toast surface, drawn above everything else.
@@ -241,8 +260,9 @@ impl ToastLayer {
     /// The seam a test uses to place a toast in the past without sleeping. Production
     /// goes through [`Self::show`].
     pub fn show_at(&mut self, toast: Toast, now: Instant) {
+        let ttl = toast.ttl();
         self.slot = Some((toast, now));
-        self.arm();
+        self.arm(ttl);
     }
 
     /// Whether a toast is on screen.
@@ -260,8 +280,8 @@ impl ToastLayer {
         }
     }
 
-    /// Drop the toast if it has outlived [`TOAST_TTL`] by `now`, reporting whether the
-    /// screen changed.
+    /// Drop the toast if it has outlived its level-specific TTL by `now`, reporting
+    /// whether the screen changed.
     ///
     /// `now` is a parameter rather than `Instant::now()` so expiry is assertable without
     /// a sleep. The comparison is `>=` so a toast shown at `t` is gone at `t + TTL`
@@ -270,7 +290,7 @@ impl ToastLayer {
         let expired = self
             .slot
             .as_ref()
-            .is_some_and(|(_, shown)| now.saturating_duration_since(*shown) >= TOAST_TTL);
+            .is_some_and(|(toast, shown)| now.saturating_duration_since(*shown) >= toast.ttl());
         if expired {
             self.slot = None;
         }
@@ -289,20 +309,36 @@ impl ToastLayer {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let body = format!(" {} {} ", toast.level.glyph(), toast.text);
+        let body = format!("{} {}", toast.level.glyph(), toast.text);
+        let available = TOAST_MAX_WIDTH.min(area.width);
+        let inner = available.saturating_sub(2).max(1);
+        let rows = wrap(&body, inner);
         // Terminal columns, not characters: a notice naming a CJK path measured by
         // `chars().count()` would be placed one cell left of its own right edge per wide
         // glyph and paint over the frame's border.
-        let wanted = u16::try_from(display_width(&body)).unwrap_or(u16::MAX);
-        let width = wanted.min(TOAST_MAX_WIDTH).min(area.width);
-        let line = padded(&body, width, toast.level.style(&self.context));
+        let wanted = rows
+            .iter()
+            .map(|row| display_width(row))
+            .max()
+            .unwrap_or(1)
+            .saturating_add(2);
+        let width = u16::try_from(wanted).unwrap_or(u16::MAX).min(available);
+        let height = u16::try_from(rows.len())
+            .unwrap_or(u16::MAX)
+            .min(area.height);
+        let style = toast.level.style(&self.context);
+        let lines = rows
+            .into_iter()
+            .take(usize::from(height))
+            .map(|row| padded(&format!(" {row}"), width, style))
+            .collect::<Vec<_>>();
         let region = Rect {
             x: area.right() - width,
             y: area.top(),
             width,
-            height: 1,
+            height,
         };
-        Paragraph::new(vec![Line::from(line.spans)]).render(region, buffer);
+        Paragraph::new(lines).style(style).render(region, buffer);
     }
 
     /// Schedule the single wake that removes the current toast.
@@ -311,7 +347,7 @@ impl ToastLayer {
     /// has neither — and the task is one `sleep` that ends. Losing the send is safe: the
     /// lazy prune in [`Self::render`] and the host's per-event prune still clear the
     /// slot, just at the next event instead of on the deadline.
-    fn arm(&self) {
+    fn arm(&self, ttl: Duration) {
         let Some(waker) = self.waker.clone() else {
             return;
         };
@@ -319,7 +355,7 @@ impl ToastLayer {
             return;
         };
         handle.spawn(async move {
-            tokio::time::sleep(TOAST_TTL).await;
+            tokio::time::sleep(ttl).await;
             let _dropped_when_busy = waker.try_send(TerminalEvent::Wake);
         });
     }

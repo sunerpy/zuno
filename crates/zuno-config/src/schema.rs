@@ -35,6 +35,7 @@ use crate::schema::ordered::OrderedMap;
 use crate::schema::permission::PermissionConfig;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -85,7 +86,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
 /// Every field is optional because every field is optional in the oracle, and
 /// because merging layers depends on being able to tell "absent" from "set to the
 /// default".
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// JSON schema reference for editor validation.
@@ -208,7 +209,7 @@ impl Config {
 }
 
 /// Log level (`config/config.ts:27-30`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum LogLevel {
     /// Debug.
@@ -222,7 +223,7 @@ pub enum LogLevel {
 }
 
 /// Session sharing behaviour (`config/config.ts:59-62`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShareMode {
     /// Share only when asked.
@@ -234,7 +235,7 @@ pub enum ShareMode {
 }
 
 /// The `"notify"` arm of [`Autoupdate`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AutoupdateMode {
     /// Announce updates without installing them.
@@ -242,7 +243,7 @@ pub enum AutoupdateMode {
 }
 
 /// Update behaviour (`config/config.ts:67-71`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Autoupdate {
     /// Install updates automatically, or never.
@@ -252,7 +253,7 @@ pub enum Autoupdate {
 }
 
 /// Server configuration (`config/server.ts:6-18`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,7 +273,7 @@ pub struct ServerConfig {
 }
 
 /// One custom command (`config/command.ts:5-12`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandConfig {
     /// The prompt template. The only required field in the whole schema's leaves.
     pub template: String,
@@ -294,7 +295,7 @@ pub struct CommandConfig {
 }
 
 /// Additional skill sources (`config/skills.ts:5-12`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SkillsConfig {
     /// Additional paths to skill folders.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,7 +306,7 @@ pub struct SkillsConfig {
 }
 
 /// File-watcher configuration (`config/config.ts:49`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct WatcherConfig {
     /// Glob patterns the watcher ignores.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,7 +314,7 @@ pub struct WatcherConfig {
 }
 
 /// Attachment processing (`config/attachment.ts:22-24`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct AttachmentConfig {
     /// Image attachment limits.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -321,7 +322,7 @@ pub struct AttachmentConfig {
 }
 
 /// Image attachment limits (`config/attachment.ts:6-19`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ImageAttachmentConfig {
     /// Resize oversized images instead of rejecting them. Defaults to true.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -338,7 +339,7 @@ pub struct ImageAttachmentConfig {
 }
 
 /// Enterprise deployment settings (`config/config.ts:134-136`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct EnterpriseConfig {
     /// Enterprise URL.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -346,7 +347,7 @@ pub struct EnterpriseConfig {
 }
 
 /// Web-search settings owned by the active profile.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct WebSearchConfig {
     /// Hosted provider selected for this profile.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,7 +364,7 @@ pub struct WebSearchConfig {
 }
 
 /// Hosted web-search providers supported by the built-in adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebSearchBackend {
     /// Exa MCP search.
@@ -373,7 +374,7 @@ pub enum WebSearchBackend {
 }
 
 /// Persistent goal runtime settings.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GoalConfig {
     /// Automatic recovery after a retryable terminal turn failure.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,7 +382,7 @@ pub struct GoalConfig {
 }
 
 /// Exponential backoff settings for automatic goal recovery.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct GoalRetryConfig {
     /// Delay before the first retry, in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,7 +399,7 @@ pub struct GoalRetryConfig {
 }
 
 /// Tool-output truncation thresholds (`config/config.ts:137-150`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ToolOutputConfig {
     /// Lines of output before truncation. Defaults to 2000.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,7 +410,7 @@ pub struct ToolOutputConfig {
 }
 
 /// Context-compaction behaviour (`config/config.ts:151-172`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CompactionConfig {
     /// Compact automatically when the context fills. Defaults to true.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -438,7 +439,7 @@ pub const DEFAULT_PROJECT_MEMORY_CHAR_LIMIT: u32 = 3_000;
 pub const DEFAULT_MEMORY_NUDGE_INTERVAL: u32 = 10;
 
 /// Persistent memory: a master boolean, or component settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MemoryConfig {
     /// `false` is the strict-parity kill switch; `true` selects all defaults.
@@ -485,7 +486,7 @@ impl MemoryConfig {
 }
 
 /// Fine-grained settings under the `memory` top-level key.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct MemoryOptions {
     /// Inject frozen resident blocks into each session's system prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -508,7 +509,7 @@ pub struct MemoryOptions {
 }
 
 /// Fully defaulted memory settings consumed by runtime composition roots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedMemoryConfig {
     /// Whether the master switch is on.
     pub enabled: bool,
@@ -541,7 +542,7 @@ impl Default for ResolvedMemoryConfig {
 }
 
 /// Options under active development (`config/config.ts:173-188`).
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ExperimentalConfig {
     /// Stop summarizing pasted text.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -571,7 +572,7 @@ pub struct ExperimentalConfig {
 /// `packages/core/src/config/experimental.ts:9` builds this from
 /// `Catalog.PolicyActions`, which is `Literals(["provider.use"])` — one action,
 /// and anything else is rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyAction {
     /// Use of a provider.
     #[serde(rename = "provider.use")]
@@ -579,7 +580,7 @@ pub enum PolicyAction {
 }
 
 /// Whether a policy statement permits or refuses (`packages/core/src/policy.ts:8`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyEffect {
     /// Permit.
@@ -590,7 +591,7 @@ pub enum PolicyEffect {
 
 /// One policy statement (`packages/core/src/policy.ts:11-15` plus the narrowed
 /// `action` from `config/experimental.ts:11-14`). Every field is required.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyStatement {
     /// The action governed.
     pub action: PolicyAction,

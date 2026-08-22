@@ -134,6 +134,55 @@ fn views_toast_expires_on_its_own_after_the_ttl_with_no_keypress() {
 }
 
 #[test]
+fn views_toast_keeps_actionable_warnings_visible_longer() {
+    let mut layer = ToastLayer::new(ViewContext::defaults());
+    let shown = std::time::Instant::now();
+    layer.show_at(Toast::warning("choose another model"), shown);
+
+    assert!(
+        !layer.prune(shown + TOAST_TTL),
+        "an actionable warning inherited the short confirmation timeout"
+    );
+    assert!(
+        !layer.prune(shown + TOAST_ATTENTION_TTL - std::time::Duration::from_millis(1)),
+        "the warning disappeared before its reading and selection window ended"
+    );
+    assert!(layer.prune(shown + TOAST_ATTENTION_TTL));
+}
+
+#[test]
+fn views_toast_wraps_a_long_notice_without_losing_its_actionable_tail() {
+    let text = "myopenai/us.anthropic.claude-opus-5 does not support selectable reasoning \
+                effort. Choose a reasoning-capable model to change the effort level.";
+    let mut layer = ToastLayer::new(ViewContext::defaults());
+    layer.show(Toast::warning(text));
+
+    let rendered = frame_of(layer, 80, 8);
+    let joined = rendered.join("\n");
+    let normalized = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        rendered
+            .iter()
+            .take(4)
+            .filter(|row| !row.is_empty())
+            .count()
+            >= 2,
+        "the long notice was still forced through one clipped row: {rendered:?}"
+    );
+    for needle in [
+        "myopenai/us.anthropic.claude-opus-5",
+        "does not support selectable reasoning",
+        "Choose a reasoning-capable model",
+        "change the effort level.",
+    ] {
+        assert!(
+            normalized.contains(needle),
+            "the wrapped notice lost `{needle}`:\n{joined}"
+        );
+    }
+}
+
+#[test]
 fn views_toast_that_has_expired_is_not_drawn_even_if_nothing_pruned_it() {
     // The belt to the wake's braces: a dropped `Wake` must not leave a stale notice on
     // screen, so the frame prunes too. `show_at` in the past is the same state a dropped
@@ -168,35 +217,39 @@ fn views_toast_replaces_the_previous_one_and_restarts_its_clock() {
 fn views_toast_is_clamped_to_the_medium_tier_and_then_to_the_frame() {
     let mut layer = ToastLayer::new(ViewContext::defaults());
     layer.show(Toast::error("e".repeat(400)));
-    // Stated as "the notice occupies the rightmost 60 columns and nothing else", which is
-    // both halves of the clamp: it did not grow past the tier, and it did not shrink.
-    // Measuring the trimmed row instead would be off by the notice's own leading pad
-    // column, which is blank and therefore trimmed away with the empty ones.
+    // Every wrapped row starts inside the rightmost 60 columns. The first row may
+    // contain only the level glyph when the following unbreakable run fills later
+    // rows, so no single row is required to occupy the whole region.
     let rendered = frame_of(layer, 200, 3);
-    let row = &rendered[0];
     let boundary = 200 - usize::from(TOAST_MAX_WIDTH);
-    assert_eq!(
-        display_width(row),
-        200,
-        "the row is not the full frame: {row:?}"
-    );
+    let visible = rendered
+        .iter()
+        .filter(|row| !row.trim().is_empty())
+        .collect::<Vec<_>>();
     assert!(
-        row[..boundary].chars().all(|character| character == ' '),
-        "the notice grew past the medium tier: {row:?}"
+        visible.len() > 1,
+        "the long notice did not wrap: {rendered:?}"
     );
-    assert!(
-        !row[boundary..].trim().is_empty(),
-        "the notice did not fill the tier it was clamped to: {row:?}"
-    );
+    for row in visible {
+        let lead = display_width(row) - display_width(row.trim_start());
+        assert!(
+            lead >= boundary,
+            "the notice grew left of the medium tier: {row:?}"
+        );
+        assert!(
+            display_width(row) <= 200,
+            "the notice overflowed the frame: {row:?}"
+        );
+    }
 
     let mut narrow = ToastLayer::new(ViewContext::defaults());
     narrow.show(Toast::error("e".repeat(400)));
     let cramped = frame_of(narrow, 12, 3);
-    assert_eq!(
-        display_width(&cramped[0]),
-        12,
-        "the notice did not fit a 12-column frame exactly: {:?}",
-        cramped[0]
+    assert!(
+        cramped
+            .iter()
+            .all(|row| display_width(row) <= usize::from(12_u16)),
+        "the notice overflowed a 12-column frame: {cramped:?}"
     );
 }
 

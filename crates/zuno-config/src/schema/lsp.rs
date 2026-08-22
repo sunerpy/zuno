@@ -6,6 +6,7 @@
 
 use crate::schema::JsonMap;
 use crate::schema::ordered::OrderedMap;
+use schemars::JsonSchema;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -60,7 +61,7 @@ pub const BUILTIN_SERVER_IDS: &[&str] = &[
 ///
 /// Omitted disables LSP, `true` enables the built-ins, and an object enables the
 /// built-ins with the listed overrides applied.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum LspConfig {
     /// Enable or disable every server at once.
@@ -112,7 +113,7 @@ impl<'de> Deserialize<'de> for LspConfig {
 /// mandatory unless the server is switched off — accepts and rejects exactly the
 /// same documents while keeping every key the author wrote, which the union arm
 /// order would otherwise discard.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "LspEntryWire")]
 pub struct LspEntry {
     /// The server command, argv-style. Required unless `disabled` is `true`.
@@ -140,7 +141,7 @@ impl LspEntry {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(JsonSchema, Deserialize)]
 struct LspEntryWire {
     command: Option<Vec<String>>,
     extensions: Option<Vec<String>>,
