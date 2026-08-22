@@ -528,7 +528,9 @@ fn login_well_known(store: &zuno_auth::AuthStore, raw_url: &str) -> Result<(), S
     }
     let runtime = oauth_runtime()?;
     let metadata: WellKnown = runtime.block_on(async {
-        reqwest::get(format!("{url}{WELL_KNOWN_PATH}"))
+        zuno_network::client()
+            .get(format!("{url}{WELL_KNOWN_PATH}"))
+            .send()
             .await
             .map_err(|error| format!("Failed to load auth provider metadata from {url}: {error}"))?
             .error_for_status()

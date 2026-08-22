@@ -31,6 +31,7 @@ zuno-error = { workspace = true }
 # inventing a second effort vocabulary here.
 zuno-llm = { workspace = true }
 zuno-memory = { workspace = true }
+zuno-network = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-search = { workspace = true }

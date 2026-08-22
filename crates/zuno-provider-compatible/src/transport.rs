@@ -88,7 +88,7 @@ impl ReqwestTransport {
     /// A transport for `provider`, using a fresh client.
     #[must_use]
     pub fn new(provider: impl Into<String>) -> Self {
-        Self::with_client(provider, reqwest::Client::new())
+        Self::with_client(provider, zuno_network::client())
     }
 
     /// A transport for `provider` sharing an existing client.

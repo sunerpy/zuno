@@ -18,6 +18,7 @@ zuno-catalog = { workspace = true }
 zuno-config = { workspace = true }
 zuno-error = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-network = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-process = { workspace = true }

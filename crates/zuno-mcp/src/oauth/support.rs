@@ -17,7 +17,7 @@ pub(super) fn oauth_client(
         .map_or(crate::stdio::DEFAULT_REQUEST_TIMEOUT, |value| {
             std::time::Duration::from_millis(u64::from(value.get()))
         });
-    reqwest::Client::builder()
+    zuno_network::client_builder()
         .timeout(timeout)
         .build()
         .map_err(|error| oauth_error(server, error))

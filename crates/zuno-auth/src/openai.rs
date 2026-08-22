@@ -197,7 +197,7 @@ impl OpenAiOauthClient {
     #[must_use]
     pub fn production() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: zuno_network::client(),
             issuer: Url::parse(OPENAI_OAUTH_ISSUER)
                 .unwrap_or_else(|error| panic!("fixed OpenAI issuer is invalid: {error}")),
             client_id: OPENAI_OAUTH_CLIENT_ID.to_owned(),
@@ -212,7 +212,7 @@ impl OpenAiOauthClient {
         client_id: impl Into<String>,
     ) -> Result<Self, OpenAiOauthError> {
         Ok(Self {
-            http: reqwest::Client::new(),
+            http: zuno_network::client(),
             issuer: Url::parse(issuer).map_err(OpenAiOauthError::InvalidIssuer)?,
             client_id: client_id.into(),
             device_timeout: DEFAULT_DEVICE_TIMEOUT,

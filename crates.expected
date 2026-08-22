@@ -14,6 +14,7 @@ zuno-llm
 zuno-lsp
 zuno-mcp
 zuno-memory
+zuno-network
 zuno-observability
 zuno-paths
 zuno-permission

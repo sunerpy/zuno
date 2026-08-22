@@ -141,4 +141,49 @@ Important options include:
 
 Run `zuno models myopenai --verbose` to inspect resolved models and `zuno debug config` to confirm the merged provider block without opening the credential file.
 
+## Network proxies
+
+Zuno applies one process-wide environment proxy contract to every in-process
+outbound HTTP client used by a session: model providers, provider login and
+OAuth, remote MCP, model and skill catalogs, remote instruction files,
+`webfetch`, and `web_search`.
+
+Set the standard variables before starting Zuno:
+
+```sh
+export HTTP_PROXY=http://127.0.0.1:1080
+export HTTPS_PROXY=http://127.0.0.1:1080
+export ALL_PROXY=socks5h://127.0.0.1:1080
+export NO_PROXY=127.0.0.1,localhost,::1,.internal.example
+zuno
+```
+
+The lowercase aliases `http_proxy`, `https_proxy`, `all_proxy`, and `no_proxy`
+are also accepted. Scheme-specific variables take precedence over
+`ALL_PROXY`; `NO_PROXY` bypasses every configured proxy for matching
+destinations. HTTP, HTTPS CONNECT, SOCKS4, SOCKS5, and SOCKS5-with-proxy-DNS
+URLs are supported. Restart Zuno after changing these variables because
+connection pools capture the proxy policy when each client is constructed.
+
+Commands started by shell tools, formatters, language servers, and local MCP
+servers inherit the Zuno process environment. Their explicit environment
+configuration may override individual proxy variables.
+
+Amazon Bedrock runtime requests and AWS SSO credential requests use the same
+environment proxy policy. This means a region that is reachable only through a
+gateway needs no Bedrock-specific proxy option:
+
+```sh
+HTTPS_PROXY=http://127.0.0.1:1080 zuno
+```
+
+For a direct-versus-proxied comparison, add the resolved Bedrock hostname to
+`NO_PROXY`, for example
+`bedrock-runtime.us-east-1.amazonaws.com`. IMDS and the AWS-approved local ECS
+credential endpoints are always direct, even when `HTTP_PROXY` or `ALL_PROXY`
+is set; forwarding those metadata requests to an ambient proxy could expose
+temporary AWS credentials. A remote HTTPS
+`AWS_CONTAINER_CREDENTIALS_FULL_URI` remains proxy-aware and still honors
+`NO_PROXY`.
+
 The ownership and extension contract is specified in [Provider authentication](../design/provider-authentication.md).

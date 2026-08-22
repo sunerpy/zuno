@@ -115,7 +115,10 @@ pub async fn pull(url: &str, cache_root: &Path) -> Pulled {
         return pulled;
     };
 
-    let client = match reqwest::Client::builder().timeout(REMOTE_TIMEOUT).build() {
+    let client = match zuno_network::client_builder()
+        .timeout(REMOTE_TIMEOUT)
+        .build()
+    {
         Ok(client) => client,
         Err(error) => {
             pulled.push(url, SkillWarningKind::IndexUnreachable(error.to_string()));

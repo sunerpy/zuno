@@ -715,7 +715,10 @@ async fn fetch_all(urls: &[String]) -> LoadedInstructions {
         return loaded;
     }
 
-    let client = match reqwest::Client::builder().timeout(REMOTE_TIMEOUT).build() {
+    let client = match zuno_network::client_builder()
+        .timeout(REMOTE_TIMEOUT)
+        .build()
+    {
         Ok(client) => client,
         Err(error) => {
             for url in urls {

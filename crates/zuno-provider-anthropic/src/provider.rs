@@ -261,7 +261,7 @@ impl AnthropicProvider {
             }
         };
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: zuno_network::client(),
             auth,
             config,
         })

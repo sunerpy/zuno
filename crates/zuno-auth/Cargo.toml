@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 zuno-error = { workspace = true }
+zuno-network = { workspace = true }
 zuno-paths = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }

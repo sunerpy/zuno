@@ -31,7 +31,7 @@ pub(super) async fn connect_transport(
         Duration::from_millis(u64::from(value.get()))
     });
     let headers = configured_headers(server, config)?;
-    let http = reqwest::Client::builder()
+    let http = zuno_network::client_builder()
         .timeout(timeout)
         .build()
         .map_err(|source| RemoteError::Http {

@@ -307,7 +307,7 @@ impl CatalogSource {
     /// `GET {source}/api.json`, with the oracle's timeout and retry budget.
     async fn fetch(&self) -> Result<String, CatalogError> {
         let url = self.api_url();
-        let client = reqwest::Client::builder()
+        let client = zuno_network::client_builder()
             .timeout(FETCH_TIMEOUT)
             .build()
             .map_err(|error| CatalogError::Fetch {

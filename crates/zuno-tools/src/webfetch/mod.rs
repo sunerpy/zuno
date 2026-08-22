@@ -139,7 +139,7 @@ impl WebFetchTool {
     #[must_use]
     pub fn new() -> Self {
         Self::with_client(
-            reqwest::Client::builder()
+            zuno_network::client_builder()
                 .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
                 .build()
                 .expect("reqwest client with a redirect policy"),

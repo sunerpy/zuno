@@ -197,11 +197,12 @@ impl std::fmt::Debug for BedrockProvider {
 
 impl BedrockProvider {
     pub fn new(config: BedrockConfig) -> Result<Self, BedrockBuildError> {
-        let client = reqwest::Client::builder()
+        let client = zuno_network::client_builder()
             .build()
             .map_err(BedrockBuildError::HttpClient)?;
         let credentials =
-            CredentialResolver::with_client(config.credentials.clone(), client.clone());
+            CredentialResolver::with_network_client(config.credentials.clone(), client.clone())
+                .map_err(BedrockBuildError::HttpClient)?;
         Ok(Self {
             config,
             client,

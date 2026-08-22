@@ -64,8 +64,7 @@ impl LivenessProbe for LocalServerProbe {
 }
 
 async fn probe_urls(urls: &[String]) -> Liveness {
-    let Ok(client) = reqwest::Client::builder()
-        .no_proxy()
+    let Ok(client) = zuno_network::direct_client_builder()
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
         .build()

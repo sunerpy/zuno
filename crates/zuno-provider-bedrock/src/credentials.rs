@@ -6,7 +6,7 @@ use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use url::Url;
+use url::{Host, Url};
 
 use crate::AwsCredentials;
 
@@ -18,6 +18,9 @@ pub const CREDENTIAL_CHAIN_ORDER: [CredentialSource; 6] = [
     CredentialSource::Container,
     CredentialSource::Imds,
 ];
+
+const CREDENTIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CREDENTIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSource {
@@ -66,7 +69,8 @@ impl std::fmt::Debug for CredentialChainConfig {
 #[derive(Clone)]
 pub struct CredentialResolver {
     config: CredentialChainConfig,
-    client: reqwest::Client,
+    network_client: reqwest::Client,
+    metadata_client: reqwest::Client,
 }
 
 impl std::fmt::Debug for CredentialResolver {
@@ -80,17 +84,39 @@ impl std::fmt::Debug for CredentialResolver {
 
 impl CredentialResolver {
     pub fn new(config: CredentialChainConfig) -> Result<Self, CredentialError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(5))
+        let network_client = zuno_network::client_builder()
+            .connect_timeout(CREDENTIAL_CONNECT_TIMEOUT)
+            .timeout(CREDENTIAL_REQUEST_TIMEOUT)
             .build()
             .map_err(CredentialError::Http)?;
-        Ok(Self { config, client })
+        let metadata_client = metadata_client().map_err(CredentialError::Http)?;
+        Ok(Self::with_clients(config, network_client, metadata_client))
     }
 
+    /// Reuse a provider's proxy-aware client while keeping cloud metadata direct.
+    pub fn with_network_client(
+        config: CredentialChainConfig,
+        network_client: reqwest::Client,
+    ) -> reqwest::Result<Self> {
+        Ok(Self::with_clients(
+            config,
+            network_client,
+            metadata_client()?,
+        ))
+    }
+
+    /// Supply both credential transports explicitly.
     #[must_use]
-    pub fn with_client(config: CredentialChainConfig, client: reqwest::Client) -> Self {
-        Self { config, client }
+    pub fn with_clients(
+        config: CredentialChainConfig,
+        network_client: reqwest::Client,
+        metadata_client: reqwest::Client,
+    ) -> Self {
+        Self {
+            config,
+            network_client,
+            metadata_client,
+        }
     }
 
     pub async fn resolve(&self) -> Result<ResolvedCredentials, CredentialError> {
@@ -160,7 +186,7 @@ impl CredentialResolver {
             })?,
         };
         let response = self
-            .client
+            .network_client
             .get(endpoint)
             .query(&[
                 ("account_id", profile.account_id.as_str()),
@@ -209,7 +235,12 @@ impl CredentialResolver {
                 (None, Some(full)) => validate_container_endpoint(&full)?,
                 (None, None) => return Ok(None),
             };
-        let mut request = self.client.get(endpoint);
+        let client = if is_local_metadata_endpoint(&endpoint) {
+            &self.metadata_client
+        } else {
+            &self.network_client
+        };
+        let mut request = client.get(endpoint);
         if let Some(token) = container_authorization_token()? {
             request = request.header("authorization", token);
         }
@@ -241,7 +272,7 @@ impl CredentialResolver {
             }
         })?;
         let token_response = match self
-            .client
+            .metadata_client
             .put(token_url)
             .header("x-aws-ec2-metadata-token-ttl-seconds", "21600")
             .send()
@@ -262,7 +293,7 @@ impl CredentialResolver {
                 source,
             })?;
         let role_response = self
-            .client
+            .metadata_client
             .get(role_url.clone())
             .header("x-aws-ec2-metadata-token", token)
             .send()
@@ -286,7 +317,7 @@ impl CredentialResolver {
                     source,
                 })?;
         let response = self
-            .client
+            .metadata_client
             .get(credentials_url)
             .header("x-aws-ec2-metadata-token", token)
             .send()
@@ -297,6 +328,25 @@ impl CredentialResolver {
         }
         let bytes = response.bytes().await.map_err(CredentialError::Http)?;
         parse_metadata_credentials(&bytes, "IMDS").map(Some)
+    }
+}
+
+fn metadata_client() -> reqwest::Result<reqwest::Client> {
+    zuno_network::direct_client_builder()
+        .connect_timeout(CREDENTIAL_CONNECT_TIMEOUT)
+        .timeout(CREDENTIAL_REQUEST_TIMEOUT)
+        .build()
+}
+
+fn is_local_metadata_endpoint(endpoint: &Url) -> bool {
+    match endpoint.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => {
+            address.is_loopback()
+                || matches!(address.octets(), [169, 254, 170, 2] | [169, 254, 170, 23])
+        }
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
     }
 }
 
@@ -765,5 +815,80 @@ mod tests {
         assert!(validate_container_endpoint("http://example.com/credentials").is_err());
         assert!(validate_container_endpoint("http://127.0.0.1/credentials").is_ok());
         assert!(validate_container_endpoint("https://credentials.example.com/path").is_ok());
+    }
+
+    #[test]
+    fn local_container_metadata_endpoints_are_classified_for_direct_access() {
+        for endpoint in [
+            "http://127.0.0.1/credentials",
+            "http://localhost/credentials",
+            "http://169.254.170.2/credentials",
+            "http://169.254.170.23/credentials",
+            "https://[::1]/credentials",
+        ] {
+            let endpoint = Url::parse(endpoint).expect("valid local metadata endpoint");
+            assert!(
+                is_local_metadata_endpoint(&endpoint),
+                "{endpoint} must bypass ambient proxies"
+            );
+        }
+        assert!(!is_local_metadata_endpoint(
+            &Url::parse("https://credentials.example.com/path").expect("valid remote endpoint")
+        ));
+    }
+
+    #[tokio::test]
+    async fn imds_uses_the_direct_client_when_the_network_proxy_is_unreachable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/latest/api/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("imds-token"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/latest/meta-data/iam/security-credentials/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("zuno-role"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/latest/meta-data/iam/security-credentials/zuno-role"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "AccessKeyId": "AKID",
+                "SecretAccessKey": "SECRET",
+                "Token": "TOKEN"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let network_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:1").expect("broken proxy URL"))
+            .build()
+            .expect("network client");
+        let metadata_client = zuno_network::direct_client_builder()
+            .build()
+            .expect("direct metadata client");
+        let resolver = CredentialResolver::with_clients(
+            CredentialChainConfig {
+                imds_endpoint: Some(Url::parse(&server.uri()).expect("mock IMDS URL")),
+                ..CredentialChainConfig::default()
+            },
+            network_client,
+            metadata_client,
+        );
+
+        let credentials = resolver
+            .resolve_imds()
+            .await
+            .expect("IMDS resolution")
+            .expect("IMDS credentials");
+        assert_eq!(credentials.access_key_id, "AKID");
+        assert_eq!(credentials.secret_access_key, "SECRET");
+        assert_eq!(credentials.session_token.as_deref(), Some("TOKEN"));
     }
 }

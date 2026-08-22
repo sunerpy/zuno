@@ -140,6 +140,27 @@ The first failed query cancels its siblings and waits for every request to settl
 
 Provider adapters normalize transport output into `SearchResult` and `SearchSource`; they do not own batch scheduling or model-facing presentation.
 
+## Network egress
+
+`zuno-network` owns the outbound HTTP construction policy shared by providers,
+authentication, catalogs, remote instructions, remote MCP, and web tools.
+Session traffic uses `ProxyPolicy::Environment`, which resolves the standard
+HTTP, HTTPS, all-proxy, and no-proxy environment variables when a connection
+pool is constructed. A capability that constructs reqwest directly bypasses
+this product contract and is incomplete.
+
+`ProxyPolicy::Direct` is an explicit security boundary, not a fallback. It is
+used only for local control-plane probes and cloud metadata endpoints. Bedrock
+therefore has two transports with separate lifecycles: runtime and SSO traffic
+is proxy-aware, while IMDS and approved local ECS credential endpoints are
+direct. Remote HTTPS container credential endpoints remain on the proxy-aware
+transport.
+
+Child processes inherit the process proxy environment unless their typed
+configuration deliberately overrides a variable. The agent loop does not
+rewrite process globals per session; deployment-specific proxy choices belong
+in the environment that launches the Zuno process.
+
 ## Building a harness
 
 Use `zuno_harness::profile_with_tools` to combine an `AgentDriver`, `ToolManifest`, and native `ToolContributions`, then add more `ProfileBundle` values for typed capability providers:

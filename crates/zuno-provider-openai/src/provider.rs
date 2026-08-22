@@ -267,7 +267,7 @@ impl OpenAiProvider {
         let chatgpt = config.provider == DEFAULT_PROVIDER;
         let auth = OpenAiAuth::new(credential, store, chatgpt);
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: zuno_network::client(),
             auth,
             config,
         })

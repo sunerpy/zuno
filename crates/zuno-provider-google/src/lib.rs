@@ -2237,7 +2237,7 @@ impl fmt::Display for HttpStatusError {
 impl std::error::Error for HttpStatusError {}
 
 fn provider_client() -> Result<Client, GoogleProviderError> {
-    Client::builder()
+    zuno_network::client_builder()
         .build()
         .map_err(|source| GoogleProviderError::HttpClient { source })
 }

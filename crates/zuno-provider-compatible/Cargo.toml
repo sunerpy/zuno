@@ -21,6 +21,7 @@ publish.workspace = true
 [dependencies]
 zuno-error = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-network = { workspace = true }
 
 futures = { workspace = true }
 reqwest = { workspace = true }

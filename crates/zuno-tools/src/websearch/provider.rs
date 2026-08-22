@@ -133,7 +133,7 @@ pub(crate) struct McpSearchProvider {
 impl McpSearchProvider {
     pub(crate) fn new(config: SearchConfig) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: zuno_network::client_builder()
                 .redirect(reqwest::redirect::Policy::limited(
                     crate::webfetch::bounds::MAX_REDIRECTS,
                 ))
