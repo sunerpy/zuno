@@ -163,9 +163,9 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
     },
     CommandDisposition {
         upstream_symbol: "UpgradeCommand",
-        command: "upgrade",
-        disposition: Disposition::Rejected,
-        reason: "the TypeScript self-updater cannot safely replace this Rust artifact and is excluded; install the desired release through the Rust release installer instead",
+        command: "self-update",
+        disposition: Disposition::Implemented,
+        reason: "adapted as a native Rust updater that selects Zuno release assets, verifies SHA256SUMS, and atomically replaces the running executable",
     },
     CommandDisposition {
         upstream_symbol: "WebCommand",

@@ -15,6 +15,7 @@ This directory is organized so it can be projected into a documentation site wit
 
 ## Operate
 
+- [Self-update](reference/self-update.md)
 - [Operational logging](logging.md)
 - [Session retention](session-retention.md)
 - [Resource gates](resource-gates.md)

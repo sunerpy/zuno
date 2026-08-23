@@ -649,6 +649,23 @@ pub struct CompletionArgs {
     pub shell: clap_complete::Shell,
 }
 
+/// Update the running executable from a verified GitHub release.
+#[derive(Debug, Clone, Args)]
+pub struct SelfUpdateArgs {
+    /// Report whether a newer release exists without changing the executable.
+    #[arg(long, conflicts_with_all = ["force", "tag", "yes"])]
+    pub check: bool,
+    /// Reinstall the selected release even when it is not newer.
+    #[arg(long)]
+    pub force: bool,
+    /// Install one explicit release tag instead of the latest release.
+    #[arg(long, value_name = "vX.Y.Z")]
+    pub tag: Option<String>,
+    /// Replace the executable without an interactive confirmation.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
 /// Every command intentionally registered by this skeleton.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
@@ -680,6 +697,8 @@ pub enum Command {
     Debug(DebugArgs),
     /// Generate shell completion output.
     Completion(CompletionArgs),
+    /// Update Zuno in place from a checksum-verified GitHub release.
+    SelfUpdate(SelfUpdateArgs),
     /// Export session data as JSON.
     Export(ExportArgs),
     /// Import session data from a JSON file.
@@ -695,8 +714,6 @@ pub enum Command {
     Github(RejectedArgs),
     /// Explain the explicit GitHub CLI workflow.
     Pr(RejectedArgs),
-    /// Explain how Rust releases are installed.
-    Upgrade(RejectedArgs),
     /// Explain how this artifact is removed.
     Uninstall(RejectedArgs),
     /// Explain how to consume the runtime OpenAPI document.
@@ -718,6 +735,7 @@ impl Command {
             Self::Db(args) => dispatch(DispatchArguments::Db(args), environment),
             Self::Debug(args) => dispatch(DispatchArguments::Debug(args), environment),
             Self::Completion(args) => dispatch(DispatchArguments::Completion(args), environment),
+            Self::SelfUpdate(args) => dispatch(DispatchArguments::SelfUpdate(args), environment),
             Self::Export(args) => dispatch(DispatchArguments::Export(args), environment),
             Self::Import(args) => dispatch(DispatchArguments::Import(args), environment),
             Self::Console(_) => reject("console", environment),
@@ -725,7 +743,6 @@ impl Command {
             Self::Stats(_) => reject("stats", environment),
             Self::Github(_) => reject("github", environment),
             Self::Pr(_) => reject("pr", environment),
-            Self::Upgrade(_) => reject("upgrade", environment),
             Self::Uninstall(_) => reject("uninstall", environment),
             Self::Generate(_) => reject("generate", environment),
         }
@@ -778,6 +795,8 @@ pub enum ImplementedCommand {
     Debug,
     /// `completion`.
     Completion,
+    /// `self-update`.
+    SelfUpdate,
     /// `export`.
     Export,
     /// `import`.
@@ -801,6 +820,7 @@ impl ImplementedCommand {
             Self::Db => "db",
             Self::Debug => "debug",
             Self::Completion => "completion",
+            Self::SelfUpdate => "self-update",
             Self::Export => "export",
             Self::Import => "import",
         }
@@ -821,6 +841,7 @@ pub enum DispatchArguments {
     Db(DbArgs),
     Debug(DebugArgs),
     Completion(CompletionArgs),
+    SelfUpdate(SelfUpdateArgs),
     Export(ExportArgs),
     Import(ImportArgs),
 }
@@ -841,6 +862,7 @@ impl DispatchArguments {
             Self::Db(_) => ImplementedCommand::Db,
             Self::Debug(_) => ImplementedCommand::Debug,
             Self::Completion(_) => ImplementedCommand::Completion,
+            Self::SelfUpdate(_) => ImplementedCommand::SelfUpdate,
             Self::Export(_) => ImplementedCommand::Export,
             Self::Import(_) => ImplementedCommand::Import,
         }
@@ -874,6 +896,7 @@ impl DispatchArguments {
             | Self::Db(_)
             | Self::Debug(_)
             | Self::Completion(_)
+            | Self::SelfUpdate(_)
             | Self::Export(_)
             | Self::Import(_) => true,
             Self::Tui(_) | Self::Serve(_) => false,
@@ -909,6 +932,7 @@ impl DispatchArguments {
             | Self::Db(_)
             | Self::Debug(_)
             | Self::Completion(_)
+            | Self::SelfUpdate(_)
             | Self::Export(_)
             | Self::Import(_) => false,
         }
@@ -1019,6 +1043,7 @@ mod tests {
             &["debug", "paths"],
             &["tui"],
             &["completion", "bash"],
+            &["self-update", "--check"],
             &["export"],
             // `<file>` is required, as upstream's `demandOption: true`
             // (`cli/cmd/import.ts:98-102`) makes it; a bare `import` exits 1 on
@@ -1053,7 +1078,6 @@ mod tests {
             "stats",
             "github",
             "pr",
-            "upgrade",
             "uninstall",
             "generate",
         ] {
@@ -1062,6 +1086,44 @@ mod tests {
             assert!(
                 matches!(action, Action::Rejected { command, .. } if command == name),
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_update_parses_checked_and_explicit_install_modes() {
+        let checked =
+            Cli::try_parse_from(["zuno", "self-update", "--check"]).expect("check parses");
+        let Some(Command::SelfUpdate(checked)) = checked.command else {
+            panic!("expected self-update command");
+        };
+        assert!(checked.check);
+        assert!(!checked.force);
+        assert!(checked.tag.is_none());
+        assert!(!checked.yes);
+
+        let install =
+            Cli::try_parse_from(["zuno", "self-update", "--tag", "v0.2.0", "--force", "--yes"])
+                .expect("explicit install parses");
+        let Some(Command::SelfUpdate(install)) = install.command else {
+            panic!("expected self-update command");
+        };
+        assert!(!install.check);
+        assert!(install.force);
+        assert_eq!(install.tag.as_deref(), Some("v0.2.0"));
+        assert!(install.yes);
+    }
+
+    #[test]
+    fn self_update_check_rejects_mutating_options() {
+        for conflicting in ["--force", "--tag", "--yes"] {
+            let mut args = vec!["zuno", "self-update", "--check", conflicting];
+            if conflicting == "--tag" {
+                args.push("v0.2.0");
+            }
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "--check must conflict with {conflicting}"
             );
         }
     }

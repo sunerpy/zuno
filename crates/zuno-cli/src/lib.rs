@@ -16,6 +16,7 @@ mod version;
 pub use command::{
     Action, Cli, CliLogLevel, Command, CommandDispatcher, CompletionArgs, DispatchArguments,
     DispatchError, DispatchRequest, ExportArgs, GlobalOptions, ImplementedCommand, ImportArgs,
+    SelfUpdateArgs,
 };
 pub use disposition::{
     CommandDisposition, Disposition, SurfaceError, disposition_for, dispositions,

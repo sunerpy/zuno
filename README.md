@@ -45,6 +45,17 @@ ZUNO_VERSION=0.1.0 ZUNO_INSTALL_DIR=/usr/local/bin \
 也可以从 [GitHub Releases](https://github.com/sunerpy/zuno/releases) 下载对应平台的预编译归档，
 或在克隆仓库后运行 `cargo install --path crates/zuno-cli --locked` 从源码安装。
 
+已安装的 Zuno 可原地检查和更新。私有仓库需要把 GitHub token 传给进程；公开发布后可省略：
+
+```sh
+GH_TOKEN="$(gh auth token)" zuno self-update --check
+GH_TOKEN="$(gh auth token)" zuno self-update
+```
+
+更新器精确选择当前平台的 release 归档，先用同一 release 的 `SHA256SUMS` 校验，再原子替换
+当前可执行文件。`--tag v0.2.0` 固定版本，`--yes` 用于非交互确认；完整安全契约见
+[Self-update](docs/reference/self-update.md)。
+
 ## 快速开始
 
 ```console
@@ -172,6 +183,7 @@ Profile 中还可以挂载 provider、远程执行器、审批、评测或 bench
 | 页面 | 内容 |
 | --- | --- |
 | [docs/README.md](docs/README.md) | 后续文档站的信息架构与完整导航 |
+| [docs/reference/self-update.md](docs/reference/self-update.md) | Release 选择、SHA-256 校验、认证、代理与原子替换 |
 | [docs/reference/configuration.md](docs/reference/configuration.md) | `zuno.json` Schema、配置层与独立 `tui.json` |
 | [docs/reference/providers.md](docs/reference/providers.md) | Provider、凭证、`myopenai` 与原生 Rust 请求链 |
 | [docs/harness-runtime.md](docs/harness-runtime.md) | 原生组件、Profile 事务、持久 inbox 与自定义 Harness |

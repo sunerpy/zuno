@@ -259,6 +259,29 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
 }
 
 #[test]
+fn self_update_documentation_pins_the_verified_release_contract() {
+    contains_all(
+        "docs/reference/self-update.md",
+        &[
+            "zuno self-update --check",
+            "`--tag`",
+            "`--force`",
+            "`--yes`",
+            "x86_64-unknown-linux-musl",
+            "SHA256SUMS",
+            "atomic self-replace",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+        ],
+    );
+    for relative in ["README.md", "docs/readme/README.en.md", "docs/README.md"] {
+        contains_all(relative, &["self-update", "reference/self-update.md"]);
+    }
+}
+
+#[test]
 fn database_docs_describe_a_hard_pre_release_format_cut() {
     let text = read("docs/migration.md");
     for required in [

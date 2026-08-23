@@ -123,6 +123,19 @@ tikv-jemallocator = "=0.7.0"
 # -- CLI --------------------------------------------------------------------
 clap = { version = "4.6.5", features = ["derive", "env"] }
 clap_complete = "4.6.9"
+# GitHub release discovery, archive extraction, and platform-correct in-place
+# replacement for `zuno self-update`. The command verifies Zuno's published
+# SHA256SUMS itself before exposing the extracted executable to self-replace.
+# Keep reqwest + rustls explicit so this reuses the workspace's TLS stack and
+# never introduces native-tls/OpenSSL.
+self_update = { version = "0.44.0", default-features = false, features = [
+  "reqwest",
+  "rustls",
+  "archive-tar",
+  "archive-zip",
+  "compression-flate2",
+  "compression-zip-deflate",
+] }
 
 # -- HTTP server ------------------------------------------------------------
 axum = "0.8.9"

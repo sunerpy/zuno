@@ -73,6 +73,32 @@ fn surface_registered_commands_match_their_dispositions() {
 }
 
 #[test]
+fn surface_self_update_replaces_the_rejected_upgrade_placeholder() {
+    let command = Cli::command();
+    assert!(
+        command.find_subcommand("upgrade").is_none(),
+        "the unreleased Rust CLI must not retain the rejected compatibility placeholder"
+    );
+
+    let self_update = command
+        .find_subcommand("self-update")
+        .expect("self-update must be a real top-level command");
+    let flags: Vec<&str> = self_update
+        .get_arguments()
+        .filter_map(clap::Arg::get_long)
+        .collect();
+    for required in ["check", "force", "tag", "yes"] {
+        assert!(
+            flags.contains(&required),
+            "self-update is missing --{required}; flags: {flags:?}"
+        );
+    }
+
+    let disposition = disposition_for("self-update").expect("self-update disposition");
+    assert_eq!(disposition.disposition, Disposition::Implemented);
+}
+
+#[test]
 fn surface_version_reports_only_zuno_identity() {
     assert!(long_version().contains(BUILD_ID));
     assert!(long_version().contains(RUST_PACKAGE_VERSION));
@@ -239,6 +265,11 @@ const IMPLEMENTED_PROBES: &[Probe] = &[
         command: "serve",
         argv: &["serve", "--mdns"],
         evidence: "--mdns is not supported by the Rust server runtime",
+    },
+    Probe {
+        command: "self-update",
+        argv: &["self-update", "--tag", "not-a-version"],
+        evidence: "invalid release version",
     },
     Probe {
         command: "session",

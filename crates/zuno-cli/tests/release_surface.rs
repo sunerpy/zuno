@@ -1084,6 +1084,36 @@ fn publication_depends_on_the_smoke_job() {
     }
 }
 
+#[test]
+fn publication_includes_the_checksum_manifest_required_by_self_update() {
+    let text = workflow("release.yml");
+    let checksum_needs = job_needs(&text, "checksums");
+    for required in ["build", "smoke"] {
+        assert!(
+            checksum_needs.contains(required),
+            "the checksums job must depend on `{required}`: {checksum_needs:?}"
+        );
+    }
+
+    let publish_needs = job_needs(&text, "publish");
+    assert!(
+        publish_needs.contains("checksums"),
+        "publish can run without the checksum job: {publish_needs:?}"
+    );
+    let checksums = job_body(&text, "checksums").join("\n");
+    for required in ["sha256sum \"$archive\"", "SHA256SUMS"] {
+        assert!(
+            checksums.contains(required),
+            "the checksums job does not produce {required:?}"
+        );
+    }
+    let publish = job_body(&text, "publish").join("\n");
+    assert!(
+        publish.contains("dist/SHA256SUMS"),
+        "the GitHub Release does not attach SHA256SUMS"
+    );
+}
+
 /// The constraint the corrected plan wording actually states: no *per-target* C
 /// cross-toolchain. A C compiler for the host is required and expected — bundled
 /// SQLite and `aws-lc-sys` both compile C — so this scans for the specific

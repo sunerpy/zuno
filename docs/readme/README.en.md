@@ -40,6 +40,19 @@ Set `ZUNO_VERSION` to pin a release or `ZUNO_INSTALL_DIR` to change the destinat
 download a prebuilt archive from [GitHub Releases](https://github.com/sunerpy/zuno/releases), or
 build from source with `cargo install --path crates/zuno-cli --locked`.
 
+An installed Zuno can check and update itself in place. A private repository requires a GitHub
+token in the process environment; omit it after releases are public:
+
+```sh
+GH_TOKEN="$(gh auth token)" zuno self-update --check
+GH_TOKEN="$(gh auth token)" zuno self-update
+```
+
+The updater selects the exact platform archive, verifies it against the same release's
+`SHA256SUMS`, and only then atomically replaces the running executable. Use `--tag v0.2.0` to pin
+a release and `--yes` for non-interactive confirmation. See
+[Self-update](../reference/self-update.md) for the complete safety contract.
+
 ## Quick start
 
 ```console
@@ -180,6 +193,7 @@ durable events, the inbox, and projections. See the
 
 | Page                                                  | Purpose                                                                  |
 | ----------------------------------------------------- | ------------------------------------------------------------------------ |
+| [Self-update](../reference/self-update.md)            | Release selection, SHA-256, authentication, proxies, and atomic replace  |
 | [Harness Runtime](../harness-runtime.md)              | Native components, profile transactions, durable input, custom harnesses |
 | [Plugins](../plugins.md)                              | Installation, agents/workflows, WASI/process grants, and protocols       |
 | [Harness comparison](../design/harness-comparison.md) | Decisions from DSH, Codex, OMO, pi-agent, OpenCode, and Claw Code        |

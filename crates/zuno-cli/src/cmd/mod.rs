@@ -12,6 +12,7 @@ mod plugin;
 mod product_agent;
 mod providers;
 mod run;
+mod self_update;
 mod serve;
 mod session;
 mod session_list;
@@ -63,6 +64,7 @@ impl CommandDispatcher for HeadlessCommandDispatcher {
                 debug::execute(args, &request.environment).map_err(to_error)
             }
             DispatchArguments::Completion(args) => completion::execute(args).map_err(to_error),
+            DispatchArguments::SelfUpdate(args) => self_update::execute(args).map_err(to_error),
             DispatchArguments::Serve(args) => {
                 serve::execute(args, &request.environment).map_err(to_error)
             }
