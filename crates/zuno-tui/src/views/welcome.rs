@@ -3,7 +3,7 @@
 //! # Why an empty transcript was the worst possible first frame
 //!
 //! Measured on a 200×50 terminal before this module existed, `zuno tui` painted two
-//! non-empty rows out of fifty: the word `idle` on the status strip, and a cursor.
+//! non-empty rows out of fifty: the word `idle` on its old status row, and a cursor.
 //! Nothing named the working directory, the model, the agent, or a single key — so
 //! the only way to discover that the cancel chord leaves was to press it. That is not
 //! a cosmetic gap. A blank alternate screen is also indistinguishable from a
@@ -22,21 +22,20 @@
 //! # A row is earned by being the only place a fact appears
 //!
 //! Occupying space nothing else wants is not a licence to say things twice. Measured at
-//! 120×34, the first draft spent twenty-two rows and stated the agent and model
-//! **verbatim** on the row the status strip below already carried, the branch three times
-//! over (here, the strip's trailer, and the sidebar's footer), and a tagline that named no
+//! 120×34, the first draft spent twenty-two rows and stated the agent and model before
+//! any reply had resolved them, the branch three times over (here, the old status trailer,
+//! and the sidebar's footer), and a tagline that named no
 //! fact at all — and at forty columns that tagline, the census and the tip were each cut
 //! mid-word, so the rows that duplicated the most were also the ones that read as broken.
 //!
 //! The rule the surviving rows are chosen by is *whether the fact survives without them*,
 //! and the answer differs per carrier because both other carriers degrade:
 //!
-//! * [`crate::views::message::StatusView`] never drops its left-hand `state()` — agent,
-//!   model and turn state are padded or clipped, never omitted — so those are stated
-//!   **only** there. That is the one cut that costs nothing at any width.
-//! * The strip *does* drop its `trailers()` front-first, and the branch is the first to
-//!   go: at forty columns the strip carries neither branch nor exit key. So the branch
-//!   stays here, priced at zero extra rows by sharing the directory's row.
+//! * Agent and model belong to the reply identity, so the empty state does not claim a
+//!   turn has resolved either one. The first response introduces that row.
+//! * The branch stays here, priced at zero extra rows by sharing the directory's row.
+//!   The sidebar is intentionally absent on this surface and the idle footer prioritizes
+//!   the directory and command discovery.
 //! * The sidebar is not drawn beside this screen **at any width** — see
 //!   [`crate::views::session`]'s `sidebar_drawn`, which withholds the panel until there is a
 //!   transcript for it to sit beside. So everything it alone would carry — the directory, the
@@ -56,7 +55,7 @@
 //! Measured at 120×32 the eighteen-row block left nine dead rows under the prompt and none
 //! above the brand; the fourteen-row block that replaced it still put the band at rows 23–26
 //! of 32. On a twenty-four-row pane the arithmetic makes it impossible outright: half the
-//! frame is twelve rows and the block plus the strip needed fifteen.
+//! frame is twelve rows and the block plus the fixed footer needed fifteen.
 //!
 //! So the trim below is real and kept, and the *position* is fixed separately by splitting
 //! the surface at the input — [`WelcomeView::head`] above, [`WelcomeView::foot`] below. That
@@ -108,7 +107,7 @@
 //! [`crate::keybind::Keymap`] built from the user's own configuration, so a rebound
 //! `input_submit` changes what this screen advertises. That is the property a
 //! hard-coded `enter send` quietly loses — and this project has already paid for it
-//! once, on a status strip whose hard-coded exit key went stale the moment overrides
+//! once, on an old status row whose hard-coded exit key went stale the moment overrides
 //! became real.
 //!
 //! The keymap rather than [`crate::views::key_label`] is what makes the leader token
@@ -174,9 +173,9 @@ pub const WORDMARK_MIN_WIDTH: u16 = WORDMARK_WIDTH + 4;
 /// Derived rather than chosen, and re-derived when the hints moved below the prompt. The
 /// screen is now nine rows above the input — six of letterform, a separator and two facts —
 /// and four below it: a separator, the lead line, and the two hint rows sharing one more
-/// separator. With the status strip and the prompt's four-row band between them the whole
-/// screen is eighteen rows, so eighteen is the first frame that holds all of it and twenty is
-/// that figure with two rows to spare.
+/// separator. With the prompt's four-row band and the one-row frame footer the whole screen
+/// is eighteen rows, so eighteen is the first frame that holds all of it and twenty is that
+/// figure with two rows to spare.
 ///
 /// The spare rows are not slack, they are what the centring spends: at exactly eighteen the
 /// band would have to sit flush against the head with nothing above the wordmark, which is the
@@ -196,9 +195,8 @@ pub const COMPACT_BRAND: &str = "▌ ZUNO";
 ///
 /// Tight, where the location row spaces its branch glyph out. Five facts share this row
 /// and the wide `   ·   ` form spent twenty-eight of its columns on air — enough that at
-/// forty columns the row was cut mid-count. It is the same reason
-/// [`crate::views::message::TokenUsage::compact`] writes `↑3,000` rather than spelling
-/// the count out: a row carrying several facts compacts, a row owning one does not.
+/// forty columns the row was cut mid-count. A row carrying several facts compacts; a row
+/// owning one fact does not.
 const CENSUS_GAP: &str = " · ";
 
 /// The rotating hints shown one at a time under the brand.
@@ -208,7 +206,7 @@ const CENSUS_GAP: &str = " · ";
 /// resolved rather than spelled.
 pub const TIPS: [&str; 12] = [
     "type a question and send it; there is no mode to enter first",
-    "the status strip always names the agent and model actually in use",
+    "the reply identity names the agent and model actually in use",
     "every tool call carries its own status glyph, so a stall is visible",
     "reasoning is collapsed by default, and says how many lines it is hiding",
     "a patch is rendered as a diff, with line numbers, right in the transcript",
@@ -286,21 +284,18 @@ pub const SLASH_HINTS: [SlashHint; 3] = [
 /// most. An absent fact is omitted rather than shown as a placeholder: `unknown` in
 /// the model row would be indistinguishable from a model actually called `unknown`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-/// There is deliberately **no agent or model field**. Both are on
-/// [`crate::views::message::StatusView`], whose left-hand group is never dropped at any
-/// width, and this screen carried them verbatim on the row directly above it. The fields
-/// are gone rather than merely unrendered so that the three call sites which used to
-/// write the same value to the strip, the sidebar and here cannot quietly restore the
-/// repeat.
+/// There is deliberately **no agent or model field**. Those facts belong to the reply
+/// identity once a turn resolves them; the empty state must not imply that a reply exists.
+/// The fields are gone rather than merely unrendered so a caller cannot quietly restore
+/// the premature duplicate.
 pub struct WelcomeFacts {
     /// The working directory, already abbreviated for display.
     pub directory: Option<String>,
     /// The version-control branch, when the directory is a checkout.
     ///
-    /// Kept even though the strip and the sidebar both name it, because neither carries it
-    /// where this screen is drawn: the sidebar is withheld from the welcome screen at every
-    /// width, and the branch is the *first* trailer the strip drops, so at forty columns this
-    /// is the only carrier left. It shares the directory's row, so the cost is zero rows.
+    /// Kept because the sidebar is withheld from the welcome screen at every width and the
+    /// fixed footer prioritizes the directory and command discovery. This is the only carrier
+    /// here, and it shares the directory's row, so the cost is zero rows.
     pub branch: Option<String>,
     /// The build's version string.
     pub version: Option<String>,
@@ -707,12 +702,11 @@ impl WelcomeView {
 
     /// The head bottom-anchored in a `region`-row area, its fit decided by `frame`.
     ///
-    /// **Bottom-anchored rather than centred, and the owner is why.** What a reader sees above
-    /// the input is head, strip, prompt — so the head has to sit directly on top of the strip,
-    /// and the rows that push the band down to the middle belong *above* it. Centring within
-    /// the region instead would split those rows in two and open a gap between the head and
-    /// the strip, which is the "two blocks a third of a screen apart" reading this arrangement
-    /// exists to avoid.
+    /// **Bottom-anchored rather than centred, and the owner is why.** The head has to sit
+    /// directly on top of the prompt, while the rows that push the band down to the middle
+    /// belong *above* it. Centring within the region instead would split those rows in two
+    /// and open a gap between the head and prompt, which is the "two blocks a third of a
+    /// screen apart" reading this arrangement exists to avoid.
     ///
     /// `frame` rather than `region` decides the wordmark, for the reason
     /// [`WORDMARK_MIN_HEIGHT`] records: the region is derived from the head's height, so a
@@ -767,7 +761,7 @@ impl WelcomeView {
     ///
     /// Every row this screen states above the input is a row the input sits further from the
     /// centre of the frame, and the arithmetic is unforgiving: the owner can only centre the
-    /// band if the rows above it fit in half the frame minus the strip. With all fourteen rows
+    /// band if the rows above it fit in half the frame minus the fixed footer. With all fourteen rows
     /// above, half of a twenty-four-row pane is twelve and the block alone needed fifteen — so
     /// on the shortest common terminal the band could not reach the middle *at any* tail
     /// length. Measured at 120x32 the band landed at rows 23–26 of 32 with fourteen dead rows
@@ -825,8 +819,8 @@ impl WelcomeView {
     /// which drops the slash row before the key row for the reason [`Self::grid`] records.
     ///
     /// A separate entry point rather than a taller [`Component::render`] area, because the two
-    /// halves are on opposite sides of rows the session owns — the status strip and the prompt
-    /// band — so there is no single `Rect` that could carry both.
+    /// halves are on opposite sides of the prompt band the session owns, so there is no
+    /// single `Rect` that could carry both.
     pub fn render_foot(&mut self, frame: &mut Frame<'_>, area: Rect) {
         fill(frame.buffer_mut(), area, self.context.surface());
         if area.width == 0 || area.height == 0 {

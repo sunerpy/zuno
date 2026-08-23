@@ -696,20 +696,20 @@ async fn a_wake_reaches_the_component_below_the_bridge() {
     );
 }
 
-/// The spinner and the prompt are mutually exclusive, end to end through the real host.
+/// The live pulse and the prompt are mutually exclusive, end to end through the real host.
 ///
 /// `SessionScreen` sits under `DialogHost` and cannot see the stack, so this asserts the
 /// whole path: a parked ask opens a prompt, the host reports the active modal down to the
-/// screen while it draws, and the transcript drops `working`. Asserting
+/// screen while it draws, and the footer drops its pulse. Asserting
 /// `Transcript::set_awaiting_permission` directly would pass with the notification
 /// unwired, which is the state that shipped.
 ///
 /// A turn message is streamed first on purpose. With an empty transcript the welcome
-/// surface owns that area and the prompt overlays the status strip, so a frame assertion
-/// would be checking rows the user never sees — the strip's own wording is asserted in
+/// surface owns that area and the prompt replaces the composer, so a frame assertion
+/// would be checking a different layout — the footer's own wording is asserted in
 /// `zuno-tui`'s unit tests instead.
 #[tokio::test]
-async fn cmd_tui_permission_prompt_replaces_the_working_spinner() {
+async fn cmd_tui_permission_prompt_replaces_the_live_pulse() {
     let (broker, mut wake) = broker();
     let context = ViewContext::defaults();
     let (shutdown, _held) = tokio::sync::mpsc::channel(4);
@@ -734,8 +734,8 @@ async fn cmd_tui_permission_prompt_replaces_the_working_spinner() {
     }
     let busy = frame(&mut bridge);
     assert!(
-        busy.contains("working"),
-        "a running turn with nothing outstanding still spins:\n{busy}"
+        busy.contains("▰") && busy.contains("esc interrupt"),
+        "a running turn with nothing outstanding still pulses:\n{busy}"
     );
 
     let asked = tokio::spawn({
@@ -767,14 +767,14 @@ async fn cmd_tui_permission_prompt_replaces_the_working_spinner() {
     let waiting = frame(&mut bridge);
     assert!(
         waiting.contains("Permission required"),
-        "the prompt never opened, so this proves nothing about the spinner:\n{waiting}"
+        "the prompt never opened, so this proves nothing about the pulse:\n{waiting}"
     );
     assert!(
-        !waiting.contains("working"),
-        "the transcript still claimed to be working while asking the user to decide:\n{waiting}"
+        !waiting.contains("▰"),
+        "the footer kept pulsing while asking the user to decide:\n{waiting}"
     );
     assert!(
-        waiting.contains("waiting for your approval"),
+        waiting.contains("awaiting approval"),
         "nothing said who the turn is blocked on:\n{waiting}"
     );
 

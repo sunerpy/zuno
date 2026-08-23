@@ -39,8 +39,9 @@ fn press_none() -> KeyEvent {
 }
 
 #[test]
-fn session_screen_renders_the_transcript_the_status_strip_and_the_prompt() {
+fn session_screen_renders_the_transcript_reply_identity_and_prompt() {
     let (mut screen, _shutdown) = screen();
+    screen.status_mut().describe("build", "test/test-model");
     screen
         .transcript_mut()
         .transcript_mut()
@@ -54,8 +55,10 @@ fn session_screen_renders_the_transcript_the_status_strip_and_the_prompt() {
         "the transcript region is empty:\n{joined}"
     );
     assert!(
-        rendered[strip_index(&rendered, &screen, 40, 8)].contains("idle"),
-        "the status strip did not render in its own region: {rendered:?}"
+        rendered
+            .iter()
+            .any(|row| row.contains("▣ build · test-model")),
+        "the reply identity did not render in its own region: {rendered:?}"
     );
     assert!(
         content_row(&rendered, &screen, 40, 8).contains("what I am typing"),
@@ -64,8 +67,12 @@ fn session_screen_renders_the_transcript_the_status_strip_and_the_prompt() {
 }
 
 #[test]
-fn session_screen_folds_an_engine_event_into_the_status_strip() {
+fn session_screen_folds_an_engine_event_into_the_reply_identity() {
     let (mut screen, _shutdown) = screen();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("start a reply"));
     screen.handle_event(&AppEvent::Engine(TurnEvent::ModelResolved {
         step: 1,
         provider_id: String::from("test"),
@@ -74,8 +81,8 @@ fn session_screen_folds_an_engine_event_into_the_status_strip() {
 
     let rendered = rows(&render_offscreen(&mut screen, 40, 8).expect("infallible"));
     assert!(
-        rendered[strip_index(&rendered, &screen, 40, 8)].contains("test/test-model"),
-        "the resolved model did not reach the status strip: {rendered:?}"
+        rendered.iter().any(|row| row.contains("▣ test-model")),
+        "the resolved model did not reach the reply identity: {rendered:?}"
     );
 }
 
@@ -1233,10 +1240,10 @@ fn session_screen_double_escape_cancels_without_leaving_the_application() {
     let first = rows(&render_offscreen(&mut screen, 80, 24).expect("infallible"));
     let hint = first
         .iter()
-        .position(|row| row.contains("again to stop the active turn"))
+        .position(|row| row.contains("esc again to interrupt"))
         .unwrap_or_else(|| {
             panic!(
-                "the first escape did not put its confirmation above the composer:\n{}",
+                "the first escape did not put its confirmation in the live footer:\n{}",
                 first.join("\n")
             )
         });
@@ -1245,8 +1252,8 @@ fn session_screen_double_escape_cancels_without_leaving_the_application() {
         .position(|row| row.contains(PROMPT_PLACEHOLDER))
         .expect("the empty composer is visible");
     assert!(
-        hint < prompt,
-        "the interrupt confirmation belongs above the composer, not elsewhere:\n{}",
+        hint > prompt,
+        "the interrupt confirmation belongs in the footer below the composer:\n{}",
         first.join("\n")
     );
 
@@ -1307,7 +1314,7 @@ fn session_screen_two_escapes_cancel_even_when_the_first_closes_a_question_dialo
     );
     let armed = rows(&render_offscreen(&mut host, 80, 24).expect("infallible")).join("\n");
     assert!(
-        armed.contains("again to stop the active turn"),
+        armed.contains("esc again to interrupt"),
         "closing a modal consumed the escape instead of also arming the active turn:\n{armed}"
     );
 
@@ -1924,10 +1931,14 @@ fn session_screen_applies_a_model_choice_and_forwards_it() {
         Ok(Selection::Model(String::from("prov/sonnet"))),
         "the choice never reached the host"
     );
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("use the selected model"));
     let joined = rows(&render_offscreen(&mut screen, 90, 14).expect("infallible")).join("\n");
     assert!(
-        joined.contains("prov/sonnet"),
-        "the strip still names the previous model:\n{joined}"
+        joined.contains("▣ build · sonnet"),
+        "the reply identity still names the previous model:\n{joined}"
     );
     // On the toast rather than in the transcript — see `SessionScreen::adopt`. The claim is
     // unchanged: the user is told *when* the choice takes effect, because a strip that already
@@ -2124,7 +2135,7 @@ fn session_screen_suppresses_late_provider_and_tool_events_after_cancellation_is
     let stopping = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible")).join("\n");
     assert!(!stopping.contains("late model output"), "{stopping}");
     assert!(!stopping.contains("late-tool"), "{stopping}");
-    assert!(stopping.contains("Stopping the active turn"), "{stopping}");
+    assert!(stopping.contains("interrupting…"), "{stopping}");
 
     screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
         assistant_message_id: None,
@@ -2132,7 +2143,7 @@ fn session_screen_suppresses_late_provider_and_tool_events_after_cancellation_is
     }));
     let settled = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible")).join("\n");
     assert!(!settled.contains("late model output"), "{settled}");
-    assert!(!settled.contains("Stopping the active turn"), "{settled}");
+    assert!(!settled.contains("interrupting…"), "{settled}");
 }
 
 /// A screen wired to a pending-edit set, with the nudge receiver and the set itself.
@@ -2416,14 +2427,10 @@ fn session_diagnostics_survive_the_end_of_the_turn_that_produced_them() {
         steps: 1,
     }));
     let rendered = crate::app::render_offscreen(&mut screen, 160, 24).expect("an offscreen frame");
-    let strip = crate::views::testkit::rows(&rendered)
-        .into_iter()
-        .rev()
-        .find(|row| row.contains("idle"))
-        .expect("the status strip");
+    let joined = crate::views::testkit::rows(&rendered).join("\n");
     assert!(
-        strip.contains("src/lib.rs"),
-        "the verdict was cleared when the turn ended: [{strip}]"
+        joined.contains("src/lib.rs") && joined.contains("boom"),
+        "the verdict was cleared when the turn ended:\n{joined}"
     );
 }
 
@@ -3473,17 +3480,10 @@ fn session_skill_picker_lists_discovered_skills_on_one_row_each() {
     );
 }
 
-/// The seam defect 3's fix depends on: the transcript can suppress its spinner, but only
-/// if something tells it a permission prompt is open. `SessionScreen` sits *below* the
-/// dialog stack and cannot see it, so the host reports it on every frame. Without this the
-/// suppression is correct, tested, and unreachable — the same shape as the diff viewer that
-/// could never open.
+/// The live footer stops pulsing while a permission prompt is mounted.
 #[test]
 fn session_stops_spinning_while_a_permission_prompt_is_mounted_over_it() {
     let (mut screen, _shutdown) = screen();
-    // A message is required, not decoration: an empty transcript hands the region to the
-    // welcome screen, and the spinner this test is about lives in the transcript. Without
-    // it the assertions would pass on the status strip's own `working` and prove nothing.
     screen
         .transcript_mut()
         .transcript_mut()
@@ -3496,8 +3496,8 @@ fn session_stops_spinning_while_a_permission_prompt_is_mounted_over_it() {
 
     let busy = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
     assert!(
-        busy.contains("working"),
-        "a running turn with nothing outstanding must still spin:\n{busy}"
+        busy.contains('▰') && busy.contains("esc interrupt"),
+        "a running turn with nothing outstanding must still pulse:\n{busy}"
     );
 
     host.open(Box::new(crate::views::permission::PermissionPrompt::new(
@@ -3516,12 +3516,12 @@ fn session_stops_spinning_while_a_permission_prompt_is_mounted_over_it() {
 
     let waiting = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
     assert!(
-        !waiting.contains("working"),
-        "the spinner claimed the process was busy while the prompt asked the user to \
+        !waiting.contains("esc interrupt"),
+        "the pulse claimed the process was busy while the prompt asked the user to \
          decide:\n{waiting}"
     );
     assert!(
-        waiting.contains("waiting for your approval"),
+        waiting.contains("awaiting approval"),
         "nothing told the user they are the one being waited on:\n{waiting}"
     );
 
@@ -3531,7 +3531,7 @@ fn session_stops_spinning_while_a_permission_prompt_is_mounted_over_it() {
     );
     let resumed = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
     assert!(
-        resumed.contains("working"),
+        resumed.contains('▰') && resumed.contains("esc interrupt"),
         "the wait notice outlived the prompt that justified it:\n{resumed}"
     );
 }
@@ -3562,12 +3562,12 @@ fn session_reports_that_a_question_is_waiting_for_the_user() {
 
     let waiting = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
     assert!(
-        !waiting.contains("working"),
-        "the spinner claimed the process was busy while the question waited for an answer:\n\
+        !waiting.contains("esc interrupt"),
+        "the pulse claimed the process was busy while the question waited for an answer:\n\
          {waiting}"
     );
     assert!(
-        waiting.contains("waiting for your answer"),
+        waiting.contains("awaiting answer"),
         "the running-state surface did not name what it needs from the user:\n{waiting}"
     );
 }
@@ -3597,10 +3597,10 @@ fn session_keeps_spinning_behind_a_dialog_that_is_not_a_permission_ask() {
 
     let joined = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
     assert!(
-        joined.contains("working"),
+        joined.contains('▰') && joined.contains("esc interrupt"),
         "a picker opened during a live turn is not the turn waiting on the user:\n{joined}"
     );
-    assert!(!joined.contains("waiting for your approval"), "{joined}");
+    assert!(!joined.contains("awaiting approval"), "{joined}");
 }
 
 // ---------------------------------------------------------------------------
@@ -4156,12 +4156,9 @@ fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usiz
         .iter()
         .position(|row| row.contains(PROMPT_MARKER))
         .expect("the prompt paints its gutter marker at every width these tests use");
-    // Every band below the prompt is subtracted — the strip and `INFO_ROWS` as well as the
-    // tail — because all of them are drawn *below* the band this measures. See the band order
-    // in `Component::render`. Without these terms every caller would be told the band is two
-    // rows taller than it is, and the whole table of degradation heights below would silently
-    // move by two.
-    rendered.len() - first - tail - usize::from(STATUS_ROWS) - usize::from(info_rows(height))
+    // Every band below the prompt is subtracted — the welcome tail and `INFO_ROWS`.
+    // The reply identity is above the prompt and therefore does not enter this measure.
+    rendered.len() - first - tail - usize::from(info_rows(height))
 }
 
 /// One complete left click at `(column, row)`, delivered the way the event loop does.
@@ -4672,20 +4669,14 @@ fn session_prompt_offers_four_rows_to_an_empty_buffer_once_the_pane_can_pay_for_
         );
     }
 
-    // The 24-row pane is the one the decision was made on: the shortest common size. One row
-    // goes to the status strip and the rest to the transcript, so a four-row prompt spends
-    // two of the twenty-one rows a two-row prompt left. Asserted rather than asserted-in-a-
-    // comment, so a future floor of five has to come back here and account for the third.
+    // The 24-row pane is the one the decision was made on: the shortest common size.
+    // The reply now sizes to its content rather than claiming all spare rows, so only
+    // the prompt height itself is pinned here.
     let (mut screen, _shutdown) = screen();
     screen
         .transcript_mut()
         .transcript_mut()
         .push(Message::user("so the transcript owns the body region"));
-    let transcript_rows = 24 - i32::from(STATUS_ROWS) - i32::from(prompt_rows(0, 24));
-    assert_eq!(
-        transcript_rows, 19,
-        "the 24-row arithmetic this floor was chosen on no longer holds"
-    );
     assert_eq!(
         prompt_band_rows(&mut screen, 40, 24),
         4,
@@ -5251,22 +5242,11 @@ fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_nam
 /// helper that assumed one width would point every caller at the wrong row on the others.
 fn prompt_first(rendered: &[String], screen: &SessionScreen, width: u16, height: u16) -> usize {
     let (band, tail) = screen.prompt_and_tail(width, height);
-    // Every band `render` draws below the prompt is subtracted, `INFO_ROWS` included. One
-    // function, so a band added to the frame's foot moves every assertion that locates the
-    // prompt at once rather than leaving them reading a row that has shifted — which is the
-    // reason this helper exists at all.
-    rendered.len().saturating_sub(
-        usize::from(tail)
-            + usize::from(STATUS_ROWS)
-            + usize::from(info_rows(height))
-            + usize::from(band),
-    )
-}
-
-/// Where the status strip is, which is directly below the prompt band by construction.
-fn strip_index(rendered: &[String], screen: &SessionScreen, width: u16, height: u16) -> usize {
-    prompt_first(rendered, screen, width, height)
-        + usize::from(screen.prompt_and_tail(width, height).0)
+    // Every band `render` draws below the prompt is subtracted. The reply identity and
+    // unused transcript spacer are above it.
+    rendered
+        .len()
+        .saturating_sub(usize::from(tail) + usize::from(info_rows(height)) + usize::from(band))
 }
 
 /// The prompt band's rows, located rather than assumed to be the frame's last band.
@@ -5989,7 +5969,7 @@ fn the_welcome_screen_lifts_the_prompt_and_a_used_session_does_not() {
         let first = prompt_first(&rendered, &used, width, height);
         let band = usize::from(prompt_rows(used.editor.height(), height));
         assert_eq!(
-            first + band + usize::from(STATUS_ROWS) + usize::from(info_rows(height)),
+            first + band + usize::from(info_rows(height)),
             rendered.len(),
             "at {width}x{height} a used session pays for the welcome tail it cannot see"
         );
@@ -6015,11 +5995,12 @@ fn the_welcome_tail_never_takes_the_row_the_welcome_needs() {
         let (mut screen, _shutdown) = screen();
         screen.editor.set_text("hi");
         let (band, tail) = screen.prompt_and_tail(20, height);
-        let body_max = height.saturating_sub(STATUS_ROWS.saturating_add(band));
+        let info = info_rows(height);
+        let body_max = height.saturating_sub(info.saturating_add(band));
         assert!(
-            STATUS_ROWS + band + tail < height || height <= STATUS_ROWS + band,
+            info + band + tail < height || height <= info + band,
             "at {height} rows the chrome and the tail leave the body nothing: \
-             status {STATUS_ROWS} + prompt {band} + tail {tail}"
+             info {info} + prompt {band} + tail {tail}"
         );
         // The `max(1)` in `welcome_tail_rows`, asserted as the property it buys rather than as
         // the expression: whatever the head measures, the body is left at least one row to put
@@ -6062,12 +6043,10 @@ fn the_welcome_tail_never_takes_the_row_the_welcome_needs() {
 /// "is the row above the tail something a reader can see". It passed against a build the user
 /// measured as a one-row prompt with nine dead rows beneath it.
 ///
-/// Both edges of the band are therefore located by background: the band and the strip carry
-/// `element`, every other row carries `surface`, and the centring band is filled precisely so
-/// this question has an answer. The strip is one row of `element` directly *below* the band —
-/// the two are one composer, box then footer — so the run of `element` rows is found and its
-/// **last** row dropped. Revert the band's fill to `text` and its rows join the surface: the run
-/// collapses to the strip alone and this fails, without the arithmetic changing at all.
+/// Both edges of the band are therefore located by background: the composer carries
+/// `element` and every surrounding row carries `surface`. Revert the band's fill to
+/// `text` and its rows join the surface, so this fails without consulting the layout
+/// arithmetic it is meant to verify.
 ///
 /// Read at the composer's own column rather than at column zero, because the box no longer spans
 /// the frame: column zero is the body surface's margin on every size here, so a probe there
@@ -6099,31 +6078,26 @@ fn the_prompt_band_is_centred_on_the_frame() {
 
         let probe = u16::try_from(composer_span(&blank, width, height).0).expect("in frame");
         let bg = |y: usize| buffer[(probe, u16::try_from(y).expect("in frame"))].bg;
-        let strip = (0..rendered.len())
+        let band_last = (0..rendered.len())
             .rposition(|y| bg(y) == element)
             .expect("the composer is painted in its own surface");
-        let band_first = (0..=strip)
+        let band_first = (0..=band_last)
             .rev()
             .take_while(|y| bg(*y) == element)
             .last()
             .expect("the run contains the row it ends on");
-        // The run's last row is the status strip and the band is everything above it. Both are
-        // `element` by design — see `PROMPT_GUTTER_COLS` — so the run has to be split, and the
-        // split is checked rather than assumed: the row below the run must be the body surface,
-        // or what was found is not the strip and every row index here is off by one.
         assert!(
-            band_first < strip && strip + 1 < rendered.len(),
-            "at {width}x{height} the composer run is {band_first}..={strip} of {} rows, which \
-             leaves no band above the strip or no surface below it",
+            band_first <= band_last && band_last + 1 < rendered.len(),
+            "at {width}x{height} the composer run is {band_first}..={band_last} of {} rows, \
+             which leaves no surface below it",
             rendered.len()
         );
         assert_eq!(
-            bg(strip + 1),
+            bg(band_last + 1),
             surface,
-            "at {width}x{height} the run of composer rows ends at {strip} with another \
-             non-surface row below it, so the strip could not be told from the band"
+            "at {width}x{height} the composer has no visible lower edge"
         );
-        let last = strip - 1;
+        let last = band_last;
         let gap_above = band_first;
         let gap_below = rendered.len() - 1 - last;
 
@@ -6143,19 +6117,16 @@ fn the_prompt_band_is_centred_on_the_frame() {
         );
         // The edges found by paint have to be the edges the split produced, or the measures
         // above are of different things and the skew is a coincidence.
-        // `gap_below` counts every band drawn below the composer — the strip, the tail and the
-        // info row — so the split's contribution to those rows is
-        // `STATUS_ROWS + tail + info_rows`. Restore the old body / status / prompt / tail order
-        // and this is the assertion that fails: the painted band's lower edge stops being one
-        // row above the frame's `element` run.
+        // `gap_below` counts the welcome tail and the info row, the only bands below
+        // the composer.
         let (band, tail) = blank.prompt_and_tail(width, height);
         let info = info_rows(height);
         assert_eq!(
             (last + 1 - band_first, gap_below),
-            (usize::from(band), usize::from(STATUS_ROWS + tail + info)),
+            (usize::from(band), usize::from(tail + info)),
             "at {width}x{height} the painted band is rows {band_first}..={last} with \
-             {gap_below} rows below it, but the split gave the band {band}, the strip \
-             {STATUS_ROWS}, the tail {tail} and the info row {info}"
+             {gap_below} rows below it, but the split gave the band {band}, the tail \
+             {tail} and the info row {info}"
         );
         // And the surface still brackets the input rather than having been trimmed off it.
         let wordmark = rendered
@@ -6255,77 +6226,6 @@ fn the_ambient_panel_waits_for_a_transcript() {
     }
 }
 
-/// The agent and model strip is drawn **below** the prompt band, and is still drawn.
-///
-/// Two claims, and the second is not decoration. The reported defect was the strip's *position*
-/// — it read as a header over the transcript rather than as the composer's own footer — and the
-/// cheapest way to satisfy a position assertion is to delete the row, which would remove the
-/// only carrier of the agent and the model at any width (`WelcomeFacts` has no such fields for
-/// exactly that reason). So the strip's content is required to be present, and required to be
-/// under the band.
-///
-/// # Located by content on both sides, not by the split's own arithmetic
-///
-/// `strip_index` is derived from `prompt_and_tail`, so an assertion built on it would ask "did
-/// the formula put the strip where the formula says" and pass against any order. The prompt's
-/// gutter marker locates the band and the strip's own `idle` locates the strip, and the two row
-/// numbers are compared. Restore the `body / status / prompt` order and the marker's row moves
-/// below the strip's, which is what fails here.
-///
-/// Asserted for the empty screen and for a used one, because the two are different compositions
-/// — the empty one carries a centring tail — and the strip has to be the composer's footer in
-/// both.
-#[test]
-fn the_agent_and_model_strip_is_the_composers_footer() {
-    for (width, height) in [(120u16, 32u16), (80, 24), (120, 50)] {
-        for used in [false, true] {
-            let (mut screen, _shutdown) = screen();
-            if used {
-                screen
-                    .transcript_mut()
-                    .transcript_mut()
-                    .push(Message::user("a first prompt"));
-            }
-            let rendered = rows(&render_offscreen(&mut screen, width, height).expect("infallible"));
-            let (x, _) = composer_span(&screen, width, height);
-            let marker = rendered
-                .iter()
-                .position(|row| row.chars().nth(x) == Some('›'))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "at {width}x{height} (used={used}) the prompt's gutter marker is not on \
-                         the frame:\n{}",
-                        rendered.join("\n")
-                    )
-                });
-            let strip = rendered
-                .iter()
-                .position(|row| row.contains("idle"))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "at {width}x{height} (used={used}) the agent and model strip is gone \
-                         from the frame; it is the only carrier of those two facts:\n{}",
-                        rendered.join("\n")
-                    )
-                });
-            assert!(
-                strip > marker,
-                "at {width}x{height} (used={used}) the strip is on row {strip} and the prompt's \
-                 marker on row {marker}, so the strip is still drawn above the composer it \
-                 describes"
-            );
-            // Directly attached, not merely below: a strip separated from the band by blank rows
-            // reads as a third block rather than as the box's footer.
-            assert_eq!(
-                strip,
-                marker + usize::from(screen.prompt_and_tail(width, height).0),
-                "at {width}x{height} (used={used}) the strip is not flush under the band, so the \
-                 pair no longer reads as one composer"
-            );
-        }
-    }
-}
-
 /// The composer occupies a central region with air on both sides, and closes with visible edges.
 ///
 /// The reported defect, in the owner's words: the input box took the whole frame rather than a
@@ -6385,11 +6285,10 @@ fn the_welcome_composer_has_a_readable_maximum_width_and_visible_edges() {
                 "at {width}x{height} column {probe} beside the composer is not the body surface"
             );
         }
-        // And the edges, on every row of the box including its footer, because an edge that
-        // stops short of the strip leaves the pair reading as two objects.
+        // And the edges, on every row of the input box.
         let left_rule = u16::try_from(x).expect("in frame") - 1;
         let right_rule = u16::try_from(x + columns).expect("in frame");
-        for offset in 0..band + usize::from(STATUS_ROWS) {
+        for offset in 0..band {
             let y = row + u16::try_from(offset).expect("in frame");
             assert_eq!(
                 (
@@ -6491,14 +6390,12 @@ fn the_prompt_band_is_painted_to_its_full_height() {
             surface,
             "at {width}x{height} the row above the prompt band is not the body surface"
         );
-        // Below the band comes the strip, which shares the box's surface — the row after *that*
-        // is where the body surface resumes. Asserted so the band's lower edge is located from
-        // both sides rather than assumed to be wherever the run happens to stop.
+        // The body surface resumes immediately below the band. Asserted so the
+        // lower edge is located from both sides.
         assert_eq!(
-            row_of(first + band + usize::from(STATUS_ROWS)),
+            row_of(first + band),
             surface,
-            "at {width}x{height} the composer's footer is not one row, so the box's bottom edge \
-             cannot be told from what is below it"
+            "at {width}x{height} the box's bottom edge cannot be told from what is below it"
         );
     }
 }
@@ -6521,7 +6418,7 @@ fn the_first_message_takes_the_whole_welcome_band_with_it() {
             tail_before > 0,
             "at {width}x{height} the empty screen has no band to yield"
         );
-        let below = STATUS_ROWS + info_rows(height);
+        let below = info_rows(height);
         let body_before = before.len() - usize::from(tail_before + band_before + below);
 
         screen
@@ -6612,21 +6509,15 @@ fn the_input_band_grows_on_both_input_paths_and_stays_centred() {
     ) -> (usize, usize, usize) {
         let buffer = render_offscreen(root, width, height).expect("infallible");
         let bg = |y: usize| buffer[(probe, u16::try_from(y).expect("in frame"))].bg;
-        // The run's last row is the strip, which is the composer's footer, so the band is the
-        // run less that row. See `the_prompt_band_is_centred_on_the_frame`.
-        let strip = (0..usize::from(height))
+        let last = (0..usize::from(height))
             .rposition(|y| bg(y) == element)
             .expect("the composer is painted in its own surface");
-        let first = (0..=strip)
+        let first = (0..=last)
             .rev()
             .take_while(|y| bg(*y) == element)
             .last()
             .expect("the run contains the row it ends on");
-        assert!(
-            first < strip,
-            "the composer run is {first}..={strip}, which leaves no band above the strip"
-        );
-        let last = strip - 1;
+        assert!(first <= last, "the composer run is empty");
         (last + 1 - first, first, usize::from(height) - 1 - last)
     }
 
@@ -6961,6 +6852,9 @@ fn conversing_from(
     mut screen: SessionScreen,
     shutdown: mpsc::Receiver<TerminalEvent>,
 ) -> (SessionScreen, mpsc::Receiver<TerminalEvent>) {
+    screen
+        .status_mut()
+        .describe("build", "myopenai/gpt-5.6-sol");
     screen.sidebar_mut().ambient_mut().directory = Some(String::from("~/work/zuno"));
     // Through the transcript, not by setting `Ambient::context_used` directly: `render`
     // re-derives that field from the transcript on every frame so the panel, the strip and the
@@ -6995,6 +6889,141 @@ fn conversing_from(
         });
     screen.transcript_mut().transcript_mut().push(assistant);
     (screen, shutdown)
+}
+
+/// OpenCode's identity row belongs to the reply, not to the composer.
+///
+/// With a short transcript it sits immediately after the assistant content and leaves the
+/// unused viewport below it. Once the transcript consumes the available viewport it becomes a
+/// sticky row directly above the composer instead of scrolling away with older content.
+#[test]
+fn the_agent_identity_follows_a_short_reply_then_sticks_above_the_composer() {
+    let identity_catalog = || SessionCatalog {
+        models: vec![crate::views::picker::ModelEntry {
+            id: String::from("myopenai/claude-opus-5"),
+            name: String::from("Claude Opus 5"),
+            provider: String::from("myopenai"),
+            reasoning: true,
+        }],
+        model: Some(String::from("myopenai/claude-opus-5")),
+        agent: Some(String::from("Atlas - Plan Executor")),
+        reasoning: true,
+        effort: Some(zuno_llm::effort::ReasoningEffort::Max),
+        ..SessionCatalog::default()
+    };
+
+    let (short, _shutdown) = conversing();
+    let mut short = short.with_catalog(identity_catalog());
+    short
+        .status_mut()
+        .describe("Atlas - Plan Executor", "myopenai/claude-opus-5");
+    short
+        .status_mut()
+        .set_effort(Some(zuno_llm::effort::ReasoningEffort::Max));
+    let short_rows = rows(&render_offscreen(&mut short, 100, 24).expect("infallible"));
+    let reply = short_rows
+        .iter()
+        .position(|row| row.contains("Here is the summary of the plan."))
+        .expect("assistant reply");
+    let identity = short_rows
+        .iter()
+        .position(|row| row.contains("▣ Atlas - Plan Executor · Claude Opus 5 (max)"))
+        .unwrap_or_else(|| panic!("the reply identity is absent:\n{}", short_rows.join("\n")));
+    let prompt = short_rows
+        .iter()
+        .position(|row| row.contains(PROMPT_PLACEHOLDER))
+        .expect("composer");
+    assert!(
+        reply < identity && identity < prompt,
+        "the identity row does not follow the reply above the composer:\n{}",
+        short_rows.join("\n")
+    );
+    assert!(
+        short_rows[identity + 1..prompt]
+            .iter()
+            .all(|row| row.trim().is_empty()),
+        "a short reply should leave its unused viewport below the identity row:\n{}",
+        short_rows.join("\n")
+    );
+
+    let (mut long, _shutdown) = screen();
+    long = long.with_catalog(identity_catalog());
+    long.status_mut()
+        .describe("Atlas - Plan Executor", "myopenai/claude-opus-5");
+    long.status_mut()
+        .set_effort(Some(zuno_llm::effort::ReasoningEffort::Max));
+    long.transcript_mut()
+        .transcript_mut()
+        .push(Message::user("fill the viewport"));
+    let mut answer = Message::new(Role::Assistant);
+    answer.parts.push(crate::views::message::MessagePart::Text {
+        text: (1..=40)
+            .map(|line| format!("reply line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    });
+    long.transcript_mut().transcript_mut().push(answer);
+    let long_rows = rows(&render_offscreen(&mut long, 100, 18).expect("infallible"));
+    let identity = long_rows
+        .iter()
+        .position(|row| row.contains("▣ Atlas - Plan Executor · Claude Opus 5 (max)"))
+        .unwrap_or_else(|| panic!("the sticky identity is absent:\n{}", long_rows.join("\n")));
+    let prompt = long_rows
+        .iter()
+        .position(|row| row.contains(PROMPT_PLACEHOLDER))
+        .expect("composer");
+    assert_eq!(
+        identity + 1,
+        prompt,
+        "once content fills the viewport the identity must stick directly above the composer:\n{}",
+        long_rows.join("\n")
+    );
+}
+
+/// A live turn uses the final row as one compact control surface.
+///
+/// The pulse is the first visible item, followed by the configured interrupt key. Context
+/// occupancy and command discovery remain on the same row, and the animation changes without
+/// moving any text.
+#[test]
+fn the_running_footer_pulses_before_escape_and_keeps_context_and_commands_visible() {
+    let (mut screen, _shutdown) = conversing();
+    screen.mark_turn_accepted();
+
+    let first = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible"));
+    let footer = first.last().expect("footer");
+    let escape = footer
+        .find("esc interrupt")
+        .unwrap_or_else(|| panic!("the interrupt affordance is absent: {footer:?}"));
+    let pulse = footer
+        .find('▰')
+        .unwrap_or_else(|| panic!("the pulse bar is absent: {footer:?}"));
+    assert!(
+        pulse < escape,
+        "the pulse must lead the escape hint: {footer:?}"
+    );
+    assert!(
+        footer.contains("37.0K (37%)"),
+        "the live footer does not show context occupancy: {footer:?}"
+    );
+    assert!(
+        footer.contains("commands"),
+        "the live footer dropped command discovery: {footer:?}"
+    );
+    assert!(
+        !footer.contains("working"),
+        "the pulse already communicates liveness; a second state word is noise: {footer:?}"
+    );
+
+    screen.handle_event(&AppEvent::AnimationFrame);
+    let second = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible"));
+    let second_footer = second.last().expect("footer");
+    assert_ne!(
+        footer, second_footer,
+        "an animation frame did not advance the pulse"
+    );
+    assert!(second_footer.contains("esc interrupt"), "{second_footer:?}");
+    assert!(second_footer.contains("37.0K (37%)"), "{second_footer:?}");
 }
 
 /// Defect 1: a fresh conversation does not open with a `Session` header block.
@@ -7043,22 +7072,21 @@ fn the_conversation_does_not_open_with_a_session_header() {
     }
 }
 
-/// Defect 2: the composer stops at the body's edge, and a second info row sits under the strip.
+/// The composer and reply identity stop at the body's edge, with an info row at the foot.
 ///
 /// # Two claims, and the first is only visible at 120 columns
 ///
 /// At 120 the panel occupies the last `SIDEBAR_WIDTH + SIDEBAR_GAP_COLS` columns, so the
-/// composer and its footer must end before them — the reported defect was both running to
+/// composer and identity must end before them — the reported defect was both running to
 /// column 119 under a panel whose rule stands at 81. At 80 the panel is not drawn, so the
 /// composer may use the whole frame; asserting the narrowing at both widths would forbid that
 /// and is why the two are checked differently rather than in one loop body.
 ///
 /// # The info row is asserted by content *and* by surface
 ///
-/// Content alone would pass a row that merely repeated the strip. So the row must carry the
+/// Content alone would pass a row that merely repeated the identity. So the row must carry the
 /// directory and the command key, must be the frame's last row, and must be painted in the body
-/// surface rather than the strip's `element` — that is what makes it read as a footer outside
-/// the composer instead of a second row of it.
+/// surface rather than the composer's `element`.
 #[test]
 fn the_composer_stays_inside_the_body_and_gains_an_info_row() {
     for width in [120u16, 80] {
@@ -7080,16 +7108,19 @@ fn the_composer_stays_inside_the_body_and_gains_an_info_row() {
             );
             // The gap between the left column and the full-height sidebar stays blank. The
             // sidebar itself legitimately has content on this row now.
-            let strip = strip_index(&rendered, &screen, width, 32);
-            let footer: String = rendered[strip]
+            let identity = rendered
+                .iter()
+                .position(|row| row.contains('▣'))
+                .expect("the reply identity");
+            let gap: String = rendered[identity]
                 .chars()
                 .skip(body)
                 .take(usize::from(SIDEBAR_GAP_COLS))
                 .collect();
             assert!(
-                footer.trim().is_empty(),
-                "at {width} columns the status strip reaches across the sidebar gap: \
-                 {footer:?}"
+                gap.trim().is_empty(),
+                "at {width} columns the reply identity reaches across the sidebar gap: \
+                 {gap:?}"
             );
         } else {
             assert_eq!(
@@ -7122,12 +7153,13 @@ fn the_composer_stays_inside_the_body_and_gains_an_info_row() {
             "at {width} columns the info row shares the composer's surface, so it reads as \
              another row of the box rather than as the screen's own footer"
         );
-        // Strictly below the strip, which is what "its own row" means: a row that shared the
-        // strip's would have displaced the agent and the model rather than joined them.
-        let strip = strip_index(&rendered, &screen, width, 32);
+        let identity = rendered
+            .iter()
+            .position(|row| row.contains('▣'))
+            .expect("the reply identity");
         assert!(
-            strip < rendered.len() - 1,
-            "at {width} columns the strip is on the frame's last row, so there is no info row \
+            identity < rendered.len() - 1,
+            "at {width} columns the identity is on the frame's last row, so there is no info row \
              beneath it"
         );
     }
@@ -7448,17 +7480,17 @@ fn variant_cycle_steps_the_reasoning_level_and_shows_it_on_the_model_row() {
         Ok(Selection::Effort(zuno_llm::effort::ReasoningEffort::Low))
     );
 
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("show the selected effort"));
     let joined = rows(&render_offscreen(&mut screen, 80, 24).expect("infallible")).join("\n");
     assert!(
-        joined.contains("prov/haiku"),
+        joined.contains("▣ build · haiku"),
         "the model row is not on screen, so this proves nothing:\n{joined}"
     );
     assert!(
-        joined.contains(&format!(
-            "{}{}",
-            crate::views::message::StatusView::EFFORT_PREFIX,
-            zuno_llm::effort::ReasoningEffort::Low
-        )),
+        joined.contains("(low)"),
         "the chosen level is not shown on the model row:\n{joined}"
     );
 }
@@ -7540,8 +7572,8 @@ fn variant_cycle_does_nothing_visible_on_a_model_that_cannot_reason() {
     );
     let after = rows(&render_offscreen(&mut screen, 80, 24).expect("infallible")).join("\n");
     assert!(
-        !after.contains(crate::views::message::StatusView::EFFORT_PREFIX),
-        "the strip grew a reasoning segment on a model that cannot reason:\n{after}"
+        !after.contains("▣ build · haiku ("),
+        "the reply identity grew a reasoning segment on a model that cannot reason:\n{after}"
     );
     assert!(
         before.lines().next() == after.lines().next(),

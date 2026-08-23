@@ -3,7 +3,7 @@
 use super::*;
 use crate::app::render_offscreen;
 use crate::views::testkit::rows;
-use zuno_llm::event::{FinishReason, PromptAccounting};
+use zuno_llm::event::PromptAccounting;
 
 fn draw(view: &mut TranscriptView, width: u16, height: u16) -> Vec<String> {
     let buffer =
@@ -924,13 +924,41 @@ fn views_transcript_keeps_a_warning_detail_that_the_status_strip_would_overwrite
 }
 
 // ---------------------------------------------------------------------------
-// The status strip
+// The reply identity
 // ---------------------------------------------------------------------------
 
 #[test]
-fn views_status_strip_renders_agent_model_and_step_offscreen() {
+fn views_reply_identity_renders_agent_catalog_model_and_effort() {
+    let mut status = StatusView::new(ViewContext::defaults());
+    status.set_model_names([(
+        String::from("myopenai/claude-opus-5"),
+        String::from("Claude Opus 5"),
+    )]);
+    status.describe("Atlas - Plan Executor", "myopenai/claude-opus-5");
+    status.set_effort(Some(zuno_llm::effort::ReasoningEffort::Max));
+
+    let buffer = render_offscreen(&mut status, 80, 1).expect("infallible");
+    assert_eq!(
+        rows(&buffer).remove(0).trim_end(),
+        " ▣ Atlas - Plan Executor · Claude Opus 5 (max)"
+    );
+}
+
+#[test]
+fn views_reply_identity_is_empty_until_an_identity_is_known() {
+    let mut status = StatusView::new(ViewContext::defaults());
+    assert!(!status.has_identity());
+    let buffer = render_offscreen(&mut status, 20, 1).expect("infallible");
+    assert!(rows(&buffer).remove(0).trim().is_empty());
+}
+
+#[test]
+fn views_reply_identity_keeps_the_resolved_identity_after_completion() {
     let mut status = StatusView::new(ViewContext::defaults());
     for event in [
+        TurnEvent::TurnStarted {
+            session_id: String::from("ses_status"),
+        },
         TurnEvent::AgentResolved {
             step: 1,
             agent: String::from("build"),
@@ -940,126 +968,17 @@ fn views_status_strip_renders_agent_model_and_step_offscreen() {
             provider_id: String::from("anthropic"),
             model_id: String::from("claude"),
         },
-        TurnEvent::StepCompleted {
-            step: 2,
-            finish_reason: Some(FinishReason::Stop),
-        },
-    ] {
-        assert!(
-            status.handle_event(&AppEvent::Engine(event)).redraw,
-            "a status-changing event did not request a frame"
-        );
-    }
-    let buffer = render_offscreen(&mut status, 48, 1).expect("infallible");
-    let row = rows(&buffer).remove(0);
-    assert_eq!(row, " build · anthropic/claude · step 2");
-}
-
-#[test]
-fn views_status_strip_is_idle_before_anything_resolves() {
-    let mut status = StatusView::new(ViewContext::defaults());
-    let buffer = render_offscreen(&mut status, 20, 1).expect("infallible");
-    assert_eq!(rows(&buffer).remove(0), " idle");
-}
-
-/// The way out of a raw-mode terminal has to be readable on screen.
-///
-/// Wiring the exit chord is only half the fix: a binding nothing displays is one a
-/// user has to already know. This asserts the strip carries it, and that a terminal
-/// too narrow to hold it drops the hint rather than truncating either half — a
-/// half-printed key name would be worse than none.
-#[test]
-fn views_status_strip_shows_the_exit_binding_and_drops_it_when_too_narrow() {
-    let mut status = StatusView::new(ViewContext::defaults());
-    let row = rows(&render_offscreen(&mut status, 48, 1).expect("infallible")).remove(0);
-    assert!(
-        row.ends_with(StatusView::EXIT_HINT),
-        "the strip must show how to leave: {row:?}"
-    );
-    assert!(
-        row.starts_with(&format!(" {}", StatusView::IDLE)),
-        "the hint must not displace the turn state: {row:?}"
-    );
-
-    let narrow = rows(&render_offscreen(&mut status, 20, 1).expect("infallible")).remove(0);
-    assert_eq!(
-        narrow, " idle",
-        "a row too narrow for the hint must drop it whole, not truncate it"
-    );
-}
-
-/// The strip must never read `idle` while a turn is under way.
-///
-/// Three moments, because the strip can lie at any of them and only the middle one
-/// is obvious: before the engine's first event (the prompt is being persisted), while
-/// the turn resolves, and after it ends — where carrying the last turn's agent and
-/// model forward would leave the row describing a turn that is over.
-#[test]
-fn views_status_strip_never_reads_idle_while_a_turn_is_under_way() {
-    let mut status = StatusView::new(ViewContext::defaults());
-    // Reads the turn-state half of a row the exit hint shares. Asserting on the whole
-    // row would make any wording of the hint read as the strip lying about the turn.
-    let rendered = |status: &mut StatusView| {
-        let row = rows(&render_offscreen(status, 48, 1).expect("infallible")).remove(0);
-        row.strip_suffix(StatusView::EXIT_HINT)
-            .unwrap_or(&row)
-            .trim_end()
-            .to_owned()
-    };
-
-    status.mark_running();
-    assert!(status.is_running());
-    assert_eq!(
-        rendered(&mut status).trim(),
-        StatusView::WORKING,
-        "the window between a submitted prompt and the engine's first event read idle"
-    );
-
-    for event in [
-        TurnEvent::TurnStarted {
-            session_id: String::from("ses_status"),
-        },
-        TurnEvent::AgentResolved {
-            step: 1,
-            agent: String::from("build"),
+        TurnEvent::TurnCompleted {
+            assistant_message_id: String::from("msg_status"),
+            steps: 1,
         },
     ] {
         assert!(status.handle_event(&AppEvent::Engine(event)).redraw);
     }
-    assert!(status.is_running());
-    let running = rendered(&mut status);
-    assert!(running.contains("build"), "{running}");
-    assert!(running.contains(StatusView::WORKING), "{running}");
-
-    assert!(
-        status
-            .handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
-                assistant_message_id: String::from("msg_status"),
-                steps: 1,
-            }))
-            .redraw
-    );
     assert!(!status.is_running());
-    // The intent here is unchanged: the strip must never describe a turn that is over.
-    // What changed is that the agent a *later* turn will run as now survives the reset,
-    // because the alternative — a strip whose only pre-turn state is the bare word
-    // `idle` — answers neither of the questions a user has before pressing enter. So the
-    // assertion is now that `idle` is stated explicitly and that the finished turn's
-    // *step* is gone, which is the part that would genuinely have been a lie.
-    let after = rendered(&mut status);
-    assert!(
-        after.contains(StatusView::IDLE),
-        "the strip does not say that nothing is running: [{after}]"
-    );
-    assert!(
-        !after.contains("step"),
-        "the finished turn's step stayed on the strip, so it still describes a turn \
-         that is over: [{after}]"
-    );
-    assert!(
-        after.contains("build"),
-        "the agent the next turn will run as is not shown: [{after}]"
-    );
+    let row = rows(&render_offscreen(&mut status, 48, 1).expect("infallible")).remove(0);
+    assert!(row.contains("▣ build · claude"), "{row:?}");
+    assert!(!row.contains("idle") && !row.contains("working"), "{row:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1637,468 +1556,38 @@ fn views_task_results_render_as_a_child_session_instead_of_raw_envelope_markup()
 }
 
 #[test]
-fn views_status_strip_names_work_even_when_agent_and_model_are_preconfigured() {
+fn views_reply_identity_contains_no_transient_liveness_or_usage() {
     let mut status = StatusView::new(ViewContext::defaults());
     status.describe("build", "myopenai/gpt-5.6-sol");
+    status.set_effort(Some(zuno_llm::effort::ReasoningEffort::Max));
     status.mark_running();
+    status.set_awaiting_user(Some(AwaitingUser::Approval));
 
-    let state = strip(&status, 120);
-    assert!(state.contains("build"), "{state}");
-    assert!(state.contains("myopenai/gpt-5.6-sol"), "{state}");
-    assert!(
-        state.contains(StatusView::WORKING),
-        "the configured identity hid the active run state: {state}"
-    );
-    assert!(!state.contains(StatusView::IDLE), "{state}");
-}
-
-#[test]
-fn views_status_strip_keeps_a_resolved_model_after_the_turn_that_resolved_it_ends() {
-    // Measured live: choosing a model in the picker printed
-    // `session: model is now myopenai/…` on the strip while the strip's own model field
-    // still read `amazon-bedrock/amazon.nova-2-lite-v1:0`. A strip that contradicts the
-    // line beside it is worse than one that says nothing.
-    let mut view = StatusView::new(ViewContext::defaults());
-    view.handle_event(&AppEvent::Engine(TurnEvent::ModelResolved {
-        step: 0,
-        provider_id: String::from("myopenai"),
-        model_id: String::from("global.anthropic.claude-haiku-4-5-20251001-v1:0"),
-    }));
-    view.handle_event(&AppEvent::Engine(TurnEvent::AgentResolved {
-        step: 0,
-        agent: String::from("explore"),
-    }));
-    view.handle_event(&AppEvent::Engine(TurnEvent::TurnCompleted {
-        assistant_message_id: String::from("msg_1"),
-        steps: 1,
-    }));
-    let line = view.line(160);
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    assert!(
-        text.contains("myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0"),
-        "the resolved model did not survive the turn's end: [{text}]"
-    );
-    assert!(
-        text.contains("explore"),
-        "the resolved agent did not survive the turn's end: [{text}]"
-    );
-    assert!(
-        text.contains(StatusView::IDLE),
-        "the strip does not report that nothing is running: [{text}]"
-    );
-}
-
-#[test]
-fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hint() {
-    let mut view = StatusView::new(ViewContext::defaults());
-    for _ in 0..3 {
-        view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
-            input_tokens: Some(1_000),
-            output_tokens: Some(250),
-            cache_read_input_tokens: Some(10),
-            cache_write_input_tokens: Some(5),
-            accounting: PromptAccounting::CacheInsideInput,
-        })));
+    let row = rows(&render_offscreen(&mut status, 80, 1).expect("infallible")).remove(0);
+    assert!(row.contains("▣ build · gpt-5.6-sol (max)"), "{row:?}");
+    for absent in ["working", "idle", "awaiting", "ctx", "tokens", "cancel"] {
+        assert!(
+            !row.contains(absent),
+            "transient footer state leaked into the reply identity: {row:?}"
+        );
     }
-    assert_eq!(
-        view.usage(),
-        crate::views::message::TokenUsage {
-            // 2,955 and not 3,000: each step's 1,000 `prompt_tokens` already contained
-            // that step's 10 cache reads and 5 cache writes, so 985 were billed at the
-            // plain input rate. Storing 1,000 here would count the 15 twice, and the
-            // buckets have to stay disjoint for `total` to be a sum.
-            input: 2_955,
-            output: 750,
-            cache_read: 30,
-            cache_write: 15,
-        },
-        "usage is per-step rather than cumulative"
-    );
-    assert_eq!(
-        view.usage().total(),
-        3_750,
-        "three steps of 1,000 prompt plus 250 completion tokens is 3,750 billed tokens"
-    );
-    let text = view
-        .line(160)
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    assert!(text.contains("in 2,955"), "[{text}]");
-    assert!(text.contains("out 750"), "[{text}]");
-    assert!(text.contains("cache 45"), "[{text}]");
-    assert!(text.contains(StatusView::EXIT_HINT), "[{text}]");
-
-    // Under width pressure the counts go before the exit key, never the other way round.
-    let narrow = view
-        .line(40)
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    assert!(
-        narrow.contains(StatusView::EXIT_HINT),
-        "the exit hint was dropped before the token counts: [{narrow}]"
-    );
-    assert!(!narrow.contains("in 2,955"), "[{narrow}]");
 }
 
 #[test]
-fn views_status_strip_omits_a_cache_column_a_provider_never_reported() {
-    let mut view = StatusView::new(ViewContext::defaults());
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
-        input_tokens: Some(12),
-        output_tokens: Some(3),
-        cache_read_input_tokens: None,
-        cache_write_input_tokens: None,
-        accounting: PromptAccounting::CacheInsideInput,
-    })));
-    let text = view
-        .line(160)
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    assert!(text.contains("in 12 · out 3"), "[{text}]");
-    assert!(
-        !text.contains("cache"),
-        "a permanent `cache 0` is a column of noise: [{text}]"
-    );
-}
-
-/// The strip's rendered text, as one string.
-fn strip(view: &StatusView, width: u16) -> String {
-    view.line(width)
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect()
-}
-
-/// A status strip carrying a branch, a cost, and one step of token usage.
-fn priced_strip() -> StatusView {
-    priced_strip_in(ViewContext::defaults())
-}
-
-/// A context whose configuration rebinds `app_exit` to `spelling`.
-///
-/// Built the way `welcome_tests` builds its rebound context, because the whole claim
-/// under test is that these two surfaces read the same override the same way.
-fn rebound_exit(spelling: &str) -> ViewContext {
-    let mut config = crate::config::ResolvedTuiConfig::default();
-    config.keybinds.insert(
-        String::from("app_exit"),
-        crate::config::BindingValue::parse(spelling),
-    );
-    let registry = crate::theme::ThemeRegistry::new();
-    let resolved = registry.resolve(crate::theme::DEFAULT_THEME, crate::theme::Mode::Dark);
-    ViewContext::new(&resolved, config)
-}
-
-/// [`priced_strip`] over an arbitrary context, so the width rungs can be re-measured
-/// against a rebound exit key without duplicating the fixture.
-fn priced_strip_in(context: ViewContext) -> StatusView {
-    let mut view = StatusView::new(context);
-    view.describe("build", "gpt-5");
-    // A turn is in flight, which is both when a running cost is worth reading and what
-    // keeps ` · idle` off the state — the widths below are chosen against this state.
-    view.mark_running();
-    view.set_git_branch("feature/status-cost-strip");
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
-        input_tokens: Some(3_000),
-        output_tokens: Some(750),
-        cache_read_input_tokens: Some(30),
-        cache_write_input_tokens: Some(15),
-        accounting: PromptAccounting::CacheInsideInput,
-    })));
-    view
-}
-
-#[test]
-fn views_status_strip_sheds_the_branch_then_the_counts_before_the_exit_key() {
-    let view = priced_strip();
-    let branch = format!("{}feature/status-cost-strip", StatusView::BRANCH_GLYPH);
-
-    // Wide: every field is on the row, and the branch sits beside nothing it displaced —
-    // the exit key is still the rightmost thing on it.
-    let wide = strip(&view, 200);
-    assert!(
-        wide.contains(&branch),
-        "the branch never rendered: [{wide}]"
-    );
-    assert!(wide.contains("in 2,955 · out 750 · cache 45"), "[{wide}]");
-    assert!(wide.trim_end().ends_with(StatusView::EXIT_HINT), "[{wide}]");
-
-    // 110: the narrowest width that still holds everything. Asserted so the rung below
-    // measures the branch being shed rather than a row that never fitted to begin with.
-    let at_110 = strip(&view, 110);
-    assert!(at_110.contains(&branch), "[{at_110}]");
-    assert!(
-        at_110.contains("in 2,955 · out 750 · cache 45"),
-        "[{at_110}]"
-    );
-    assert!(at_110.contains(StatusView::EXIT_HINT), "[{at_110}]");
-
-    // 76: the branch goes first. It is the only field the ambient sidebar also prints,
-    // so it is the only one whose loss costs the user nothing they cannot read elsewhere.
-    let at_76 = strip(&view, 76);
-    assert!(
-        !at_76.contains(&branch),
-        "the branch outranked the counts it should yield to: [{at_76}]"
-    );
-    assert!(at_76.contains("in 2,955 · out 750 · cache 45"), "[{at_76}]");
-    assert!(at_76.contains(StatusView::EXIT_HINT), "[{at_76}]");
-
-    // 50: the counts go next. Between a report and the way out, the way out stays.
-    let at_50 = strip(&view, 50);
-    assert!(
-        !at_50.contains("in 2,955"),
-        "the counts outranked the exit key they should yield to: [{at_50}]"
-    );
-    assert!(at_50.contains(StatusView::EXIT_HINT), "[{at_50}]");
-
-    // 40: still only the exit key, well below the width that shed the counts — the row
-    // must not start keeping a report again as it narrows further.
-    let at_40 = strip(&view, 40);
-    assert!(
-        at_40.contains(StatusView::EXIT_HINT),
-        "a field was kept at the exit key's expense: [{at_40}]"
-    );
-    assert!(!at_40.contains(&branch), "[{at_40}]");
-    assert!(!at_40.contains("in 2,955"), "[{at_40}]");
-
-    // 20: 18 of the 20 columns are the exit key itself, so it cannot share the row with
-    // even the 6-column state — the pre-existing last rung drops it whole rather than
-    // truncating it. What this width proves is that nothing is left half-drawn: no
-    // fragment of the key, and no fragment of either new field.
-    let at_20 = strip(&view, 20);
-    assert!(
-        !at_20.contains("ctrl+c"),
-        "the exit key was truncated instead of dropped: [{at_20}]"
-    );
-    assert!(
-        !at_20.contains(StatusView::BRANCH_GLYPH),
-        "a branch fragment survived the row that had no space for it: [{at_20}]"
-    );
-    assert_eq!(
-        at_20.trim(),
-        "build · gpt-5",
-        "the state is what a row too narrow for a trailer keeps: [{at_20}]"
-    );
-}
-
-/// The strip renders no price, and has no way to be given one.
-///
-/// Stronger than the claim this replaced. There used to be a `set_cost` setter, no
-/// production caller for it, and a comment naming a caller that did not exist — so the
-/// segment was empty in every real session while the code advertised otherwise. Removing
-/// the setter makes "no price" a property of the type instead of an accident: pricing is
-/// per-million-token and the resolved catalog drops the `context_over_200k` band, so a
-/// figure derived here would be confidently wrong exactly where it matters, and the only
-/// stored figure is permanently zero.
-#[test]
-fn views_status_strip_never_shows_a_price_and_shows_no_branch_until_one_is_pushed() {
-    let mut view = StatusView::new(ViewContext::defaults());
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TokenUsage {
-        input_tokens: Some(3_000),
-        output_tokens: Some(750),
-        cache_read_input_tokens: Some(30),
-        cache_write_input_tokens: Some(15),
-        accounting: PromptAccounting::CacheInsideInput,
-    })));
-    let text = strip(&view, 200);
-    assert!(
-        text.contains("in 2,955 · out 750 · cache 45"),
-        "the counts a cost would be derived from are not even there: [{text}]"
-    );
-    assert!(
-        !text.contains('$'),
-        "usage alone produced a price: [{text}]"
-    );
-    assert!(
-        !text.contains(StatusView::BRANCH_GLYPH),
-        "a branch nobody pushed rendered: [{text}]"
-    );
-
-    // Empty is absent, not adopted: a host not on a branch must not spend the row's
-    // columns on a blank segment and its separator.
-    view.set_git_branch("");
-    let blanked = strip(&view, 200);
-    assert_eq!(
-        blanked, text,
-        "an empty push changed the row: [{blanked}] vs [{text}]"
-    );
-}
-
-/// Asserted on the drawn frame, not on [`StatusView::line`]'s return value: the defect
-/// this repo has already paid for was a status field that a component method reported
-/// correctly while the surface on screen still showed the old text.
-#[test]
-fn views_status_strip_draws_the_branch_and_the_counts_onto_the_frame() {
-    let mut view = priced_strip();
-    let buffer = render_offscreen(&mut view, 200, 1).expect("the offscreen backend is infallible");
-    let row = rows(&buffer).join("\n");
-    assert!(
-        row.contains(&format!(
-            "{}feature/status-cost-strip",
-            StatusView::BRANCH_GLYPH
-        )),
-        "the branch reached no cell of the frame:\n{row}"
-    );
-    assert!(
-        row.contains("in 2,955") && row.contains("out 750") && row.contains("cache 45"),
-        "the token counts reached no cell:\n{row}"
-    );
-    assert!(row.contains(StatusView::EXIT_HINT), "\n{row}");
-}
-
-/// The defect, in one assertion: with `app_exit` rebound, three surfaces stated the way
-/// out and this was the one that had not been told.
-///
-/// Asserted on the drawn frame rather than on [`StatusView::exit_hint`] for the reason
-/// this repo has already paid for once — a component method reporting the right value
-/// while the surface on screen still shows the old text is exactly the shape of the
-/// defect that survived here before.
-#[test]
-fn views_status_strip_names_the_users_own_exit_key_not_the_shipped_default() {
-    let mut view = StatusView::new(rebound_exit("ctrl+q"));
-    let row = rows(&render_offscreen(&mut view, 60, 1).expect("infallible")).remove(0);
-    assert!(
-        row.contains("ctrl+q cancel/exit"),
-        "the strip advertised a key the user did not bind:\n{row}"
-    );
-    assert!(
-        !row.contains("ctrl+c"),
-        "the shipped spelling outlived the override, so one frame names two exit keys \
-         (welcome and the palette both say ctrl+q):\n{row}"
-    );
-}
-
-/// No override means no change: the row reads exactly what it read before this became
-/// derived, so the fix cannot have moved the default text by a column.
-#[test]
-fn views_status_strip_still_shows_the_shipped_exit_key_when_nothing_is_rebound() {
-    let mut view = StatusView::new(ViewContext::defaults());
-    let row = rows(&render_offscreen(&mut view, 60, 1).expect("infallible")).remove(0);
-    assert!(row.ends_with("ctrl+c cancel/exit"), "{row:?}");
-    assert!(row.ends_with(StatusView::EXIT_HINT), "{row:?}");
-}
-
-/// [`StatusView::EXIT_HINT`] is the fallback, so it has to keep agreeing with what the
-/// shipped table would resolve to — otherwise re-spelling `app_exit`'s first binding
-/// makes the disabled-binding path advertise a key the table no longer prefers, which is
-/// the same staleness this task removed, one branch deeper.
-#[test]
-fn views_status_strip_exit_fallback_matches_the_shipped_tables_own_first_spelling() {
-    let shipped = crate::views::key_label("app_exit", &ViewContext::defaults())
-        .expect("the shipped table binds app_exit");
-    assert_eq!(StatusView::EXIT_HINT, format!("{shipped} cancel/exit"));
-}
-
-/// A user who unbinds `app_exit` still gets told how to leave.
-///
-/// Not a fabricated value: [`crate::keybind::is_exit_chord`] reads the static table on
-/// purpose (`keybind.rs:191`), so `ctrl+c` exits with no binding pointing at it. The row
-/// that survives every width degradation must not be the one that goes silent about it.
-#[test]
-fn views_status_strip_keeps_naming_ctrl_c_when_the_user_unbound_the_exit_action() {
-    let mut view = StatusView::new(rebound_exit("none"));
-    let row = rows(&render_offscreen(&mut view, 60, 1).expect("infallible")).remove(0);
-    assert!(
-        row.contains(StatusView::EXIT_HINT),
-        "unbinding app_exit left the always-visible row silent about the only \
-         guaranteed way out:\n{row}"
-    );
-}
-
-/// The degradation chain is a property of the ranking, not of the hint's wording.
-///
-/// The same widths as
-/// [`views_status_strip_sheds_the_branch_then_the_counts_before_the_exit_key`],
-/// re-measured against a rebound key: `ctrl+q cancel/exit` is the same eighteen columns
-/// as the shipped spelling, so every rung must break at exactly the same place. What
-/// this pins is that deriving the text did not smuggle a width change into the ranking.
-#[test]
-fn views_status_strip_sheds_fields_in_the_same_order_when_the_exit_key_is_rebound() {
-    let view = priced_strip_in(rebound_exit("ctrl+q"));
-    let hint = "ctrl+q cancel/exit";
-    let branch = format!("{}feature/status-cost-strip", StatusView::BRANCH_GLYPH);
-
-    let wide = strip(&view, 200);
-    assert!(wide.contains(&branch), "[{wide}]");
-    assert!(wide.contains("in 2,955 · out 750 · cache 45"), "[{wide}]");
-    assert!(wide.trim_end().ends_with(hint), "[{wide}]");
-
-    // 76: the branch first, exactly as with the shipped spelling.
-    let at_76 = strip(&view, 76);
-    assert!(!at_76.contains(&branch), "[{at_76}]");
-    assert!(at_76.contains("in 2,955 · out 750 · cache 45"), "[{at_76}]");
-    assert!(at_76.contains(hint), "[{at_76}]");
-
-    // 40: only the exit key is left, and it is the rebound one.
-    let at_40 = strip(&view, 40);
-    assert!(
-        at_40.contains(hint),
-        "a field was kept at the rebound exit key's expense: [{at_40}]"
-    );
-    assert!(!at_40.contains("in 2,955"), "[{at_40}]");
-
-    // 20: dropped whole, never truncated — a rebound key name must not be halved either.
-    let at_20 = strip(&view, 20);
-    assert!(
-        !at_20.contains("ctrl+"),
-        "the rebound exit key was truncated instead of dropped: [{at_20}]"
-    );
-    assert!(
-        !at_20.contains("cancel"),
-        "the hint's verb survived without its key: [{at_20}]"
-    );
-    assert_eq!(at_20.trim(), "build · gpt-5", "[{at_20}]");
-}
-
-/// `working` and `waiting for you` are mutually exclusive claims about who the turn is
-/// blocked on, and the defect was that both rendered at once: the spinner said the process
-/// was busy while a permission prompt sat below asking the user to decide.
-#[test]
-fn views_transcript_stops_claiming_it_is_working_while_a_permission_ask_is_open() {
+fn views_transcript_omits_transient_turn_liveness_rows() {
     let mut view = view();
     view.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
         session_id: String::from("s"),
     }));
     let busy = draw(&mut view, 60, 12).join("\n");
-    assert!(
-        busy.contains("working"),
-        "a running turn with nothing outstanding still spins:\n{busy}"
-    );
+    assert!(!busy.contains("working"), "{busy}");
 
     assert!(
         view.transcript_mut()
-            .set_awaiting_user(Some(AwaitingUser::Approval)),
-        "the first ask is a change, which is what a caller turns into a redraw"
+            .set_awaiting_user(Some(AwaitingUser::Approval))
     );
     let waiting = draw(&mut view, 60, 12).join("\n");
-    assert!(
-        !waiting.contains("working"),
-        "the spinner outlived the ask it contradicts:\n{waiting}"
-    );
-    assert!(
-        waiting.contains("waiting for your approval"),
-        "nothing told the user they are the one being waited on:\n{waiting}"
-    );
-
-    // Answered: the turn is running again and the spinner is the honest signal.
-    assert!(view.transcript_mut().set_awaiting_user(None));
-    let resumed = draw(&mut view, 60, 12).join("\n");
-    assert!(
-        resumed.contains("working"),
-        "the wait notice outlived the prompt:\n{resumed}"
-    );
-    assert!(!resumed.contains("waiting for your approval"), "{resumed}");
+    assert!(!waiting.contains("waiting for your approval"), "{waiting}");
 }
 
 /// A repeated report is not a change, so it must not cost a redraw.
@@ -2110,70 +1599,14 @@ fn views_transcript_reports_an_unchanged_permission_state_as_no_change() {
     assert_eq!(transcript.awaiting_user(), Some(AwaitingUser::Approval));
 }
 
-/// The strip must not say `working` while a permission prompt is waiting on the user.
-///
-/// The strip and not only the transcript, because the transcript's spinner is on screen
-/// only after a turn has produced a message; before that the welcome surface owns that
-/// area and this row is the only thing on screen saying anything about state.
 #[test]
-fn views_status_strip_says_it_is_waiting_rather_than_working_during_a_permission_ask() {
+fn views_reply_identity_tracks_awaiting_state_for_the_live_footer() {
     let mut status = StatusView::new(ViewContext::defaults());
-    let state = |status: &mut StatusView| {
-        let row = rows(&render_offscreen(status, 60, 1).expect("infallible")).remove(0);
-        row.strip_suffix(StatusView::EXIT_HINT)
-            .unwrap_or(&row)
-            .trim()
-            .to_owned()
-    };
-
-    status.mark_running();
-    assert_eq!(state(&mut status), StatusView::WORKING);
-
     assert!(status.set_awaiting_user(Some(AwaitingUser::Approval)));
-    assert_eq!(
-        state(&mut status),
-        AwaitingUser::Approval.status_text(),
-        "the always-visible row still pointed the user at the wrong thing to wait for"
-    );
-
+    assert_eq!(status.awaiting_user(), Some(AwaitingUser::Approval));
+    assert!(!status.set_awaiting_user(Some(AwaitingUser::Approval)));
     assert!(status.set_awaiting_user(None));
-    assert_eq!(
-        state(&mut status),
-        StatusView::WORKING,
-        "the notice outlived the prompt"
-    );
-    assert!(!status.set_awaiting_user(None), "no change, no redraw");
-}
-
-/// An outstanding ask outranks a resolved agent and model rather than being hidden by
-/// them: those describe the turn's configuration, this describes what it is stopped on.
-#[test]
-fn views_status_strip_names_an_outstanding_ask_beside_a_resolved_turn() {
-    let mut status = StatusView::new(ViewContext::defaults());
-    for event in [
-        TurnEvent::AgentResolved {
-            step: 1,
-            agent: String::from("build"),
-        },
-        TurnEvent::ModelResolved {
-            step: 1,
-            provider_id: String::from("anthropic"),
-            model_id: String::from("claude"),
-        },
-    ] {
-        status.handle_event(&AppEvent::Engine(event));
-    }
-    status.set_awaiting_user(Some(AwaitingUser::Approval));
-    let row = rows(&render_offscreen(&mut status, 80, 1).expect("infallible")).remove(0);
-    assert!(row.contains("build"), "{row:?}");
-    assert!(
-        row.contains(AwaitingUser::Approval.status_text()),
-        "a resolved turn hid the fact that it is blocked on the user: {row:?}"
-    );
-    assert!(
-        !row.contains(StatusView::IDLE),
-        "a blocked turn is not idle: {row:?}"
-    );
+    assert_eq!(status.awaiting_user(), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -3970,14 +3403,4 @@ fn views_transcript_fingerprint_separates_every_part_shape() {
         "two roles carrying the same text fingerprint alike, so a cached user row could \
          be served for an assistant message"
     );
-}
-
-#[test]
-fn zzz_probe_widths() {
-    let view = priced_strip();
-    for width in [
-        200, 90, 80, 76, 72, 70, 68, 66, 64, 60, 56, 52, 50, 48, 44, 40, 20,
-    ] {
-        eprintln!("{width}: [{}]", strip(&view, width).trim_end());
-    }
 }

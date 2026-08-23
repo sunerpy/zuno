@@ -243,6 +243,17 @@ pub(crate) enum ExtensionComposition {
     Desired,
 }
 
+/// One model row projected from the resolved catalog for client pickers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogModelChoice {
+    /// Exact `provider/model` value accepted by turn resolution.
+    pub id: String,
+    /// Human-readable model name from the catalog.
+    pub name: String,
+    /// Human-readable provider name from the catalog.
+    pub provider: String,
+}
+
 /// Everything resolved from configuration, with no handle open yet.
 pub(crate) struct TurnPlan {
     profile: zuno_runtime::HarnessProfile,
@@ -276,9 +287,10 @@ pub(crate) struct TurnPlan {
     /// A picker offering only one provider's models therefore withheld choices the
     /// rebuild path could already honour — the defect this field exists to close.
     ///
-    /// Filled from [`Catalog::model_lines`], which is the same enumeration `zuno models`
-    /// prints. One function, so the two surfaces cannot disagree again.
-    catalog_models: Vec<String>,
+    /// Filled in [`Catalog::model_lines`] order, with display metadata from the same
+    /// resolved entries. One projection, so the picker, reply identity and CLI
+    /// inventory cannot disagree about either ids or names.
+    catalog_models: Vec<CatalogModelChoice>,
     /// Canonical reasoning levels the TUI may offer for each catalog model.
     ///
     /// A model that explicitly declares canonical variants contributes only those
@@ -466,20 +478,20 @@ impl TurnPlan {
                 "model {provider_id}/{model_id} has no native provider transport"
             ));
         }
-        let catalog_models = picker_model_ids(&catalog);
+        let catalog_models = picker_models(&catalog);
         let reasoning_efforts = catalog_models
             .iter()
-            .filter_map(|qualified| {
-                let (provider, model) = qualified.split_once('/')?;
+            .filter_map(|choice| {
+                let (provider, model) = choice.id.split_once('/')?;
                 let resolved = catalog.model(provider, model)?;
-                Some((qualified.clone(), selectable_reasoning_efforts(resolved)))
+                Some((choice.id.clone(), selectable_reasoning_efforts(resolved)))
             })
             .collect::<BTreeMap<_, _>>();
         let reasoning_supported = reasoning_efforts
             .get(&format!("{provider_id}/{model_id}"))
             .is_some_and(|levels| !levels.is_empty());
-        let vision_available = catalog_models.iter().any(|line| {
-            line.split_once('/').is_some_and(|(provider, model)| {
+        let vision_available = catalog_models.iter().any(|choice| {
+            choice.id.split_once('/').is_some_and(|(provider, model)| {
                 catalog
                     .model(provider, model)
                     .is_some_and(|model| model.capabilities.input.image)
@@ -652,11 +664,11 @@ impl TurnPlan {
         &self.skills
     }
 
-    /// Every `provider/model` the catalog offers, in the order `zuno models` prints them.
+    /// Every model the catalog offers, in the order `zuno models` prints them.
     ///
     /// Kept from resolution rather than re-derived: rebuilding the catalog means reading
     /// the cache and re-applying plugin extensions, and a picker must not do that.
-    pub(crate) fn catalog_model_ids(&self) -> Vec<String> {
+    pub(crate) fn catalog_models(&self) -> Vec<CatalogModelChoice> {
         self.catalog_models.clone()
     }
 
@@ -3837,7 +3849,7 @@ fn delegation_agents(
 fn delegation_facts(catalog: &Catalog) -> zuno_tools::task::FixedFacts {
     let mut facts = zuno_tools::task::FixedFacts::new();
     // Walked through `model_lines`, the same enumeration `zuno models` prints and
-    // `picker_model_ids` fills the model picker from, so "a model a delegation may
+    // `picker_models` fills the model picker from, so "a model a delegation may
     // name" and "a model this build offers" are one list.
     for line in catalog.model_lines() {
         let Some((provider_id, model_id)) = line.split_once('/') else {
@@ -4065,15 +4077,28 @@ fn resolved_credential(
         })
 }
 
-/// Every `provider/model` a picker may offer.
+/// Every model a picker may offer.
 ///
 /// A named function rather than an inline call so the choice of enumeration is one
 /// testable decision. It is [`Catalog::model_lines`] — the same function `zuno models`
 /// prints from (`models.rs`'s `provider_ids` + `print_models` walk resolves to the same
 /// pairs in the same order). Reading the session provider's slice here instead is exactly
 /// the defect that let `/model` show one provider while `zuno models` showed ten.
-fn picker_model_ids(catalog: &Catalog) -> Vec<String> {
-    catalog.model_lines()
+fn picker_models(catalog: &Catalog) -> Vec<CatalogModelChoice> {
+    catalog
+        .model_lines()
+        .into_iter()
+        .filter_map(|id| {
+            let (provider_id, model_id) = id.split_once('/')?;
+            let provider = catalog.provider(provider_id)?;
+            let model = catalog.model(provider_id, model_id)?;
+            Some(CatalogModelChoice {
+                id,
+                name: model.name.clone(),
+                provider: provider.name.clone(),
+            })
+        })
+        .collect()
 }
 
 /// The SDK option bag for one model: the provider's options, with the model's on top.

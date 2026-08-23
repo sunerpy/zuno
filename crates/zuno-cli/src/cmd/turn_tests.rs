@@ -3483,10 +3483,10 @@ fn two_provider_catalog() -> Catalog {
 fn the_picker_enumeration_spans_every_provider_the_catalog_holds() {
     let catalog = two_provider_catalog();
 
-    let offered = picker_model_ids(&catalog);
+    let offered = picker_models(&catalog);
     let providers = offered
         .iter()
-        .filter_map(|qualified| qualified.split_once('/').map(|(provider, _)| provider))
+        .filter_map(|choice| choice.id.split_once('/').map(|(provider, _)| provider))
         .collect::<std::collections::BTreeSet<_>>();
 
     assert!(
@@ -3495,10 +3495,19 @@ fn the_picker_enumeration_spans_every_provider_the_catalog_holds() {
         providers.len()
     );
     assert_eq!(
-        offered,
+        offered
+            .iter()
+            .map(|choice| choice.id.clone())
+            .collect::<Vec<_>>(),
         catalog.model_lines(),
         "the picker must enumerate through the same function `zuno models` prints from, \
          or the two surfaces can disagree again"
+    );
+    assert!(
+        offered
+            .iter()
+            .any(|choice| choice.name == "GPT-5" && choice.provider == "My OpenAI"),
+        "the picker projection discarded catalog display names: {offered:?}"
     );
     // Pins the defect's mechanism, not just its symptom: the session provider's own slice
     // is what used to be handed over, and it can never span two providers.

@@ -10,9 +10,9 @@ fn keymap() -> Keymap {
     Keymap::defaults().expect("the shipped binding table resolves")
 }
 
-/// The agent and model this screen must **not** state, and the strip must.
-const STRIP_AGENT: &str = "build";
-const STRIP_MODEL: &str = "myopenai/claude-haiku-4-5";
+/// The agent and model this empty state must **not** claim before a reply exists.
+const REPLY_AGENT: &str = "build";
+const REPLY_MODEL: &str = "myopenai/claude-haiku-4-5";
 
 /// The one row `WelcomeView::lines` emits unconditionally, used to bound the block.
 const LEAD_LINE: &str = "type / for commands";
@@ -37,12 +37,12 @@ fn view() -> WelcomeView {
 
 /// The whole surface as its owner composes it: the head above, the foot at the bottom.
 ///
-/// [`Component::render`] draws the head alone, because the foot belongs on the far side of two
-/// rows the session owns — the status strip and the prompt band. A test that rendered only the
-/// head would therefore assert against half a screen and would call the lead line, the tip and
-/// every hint "absent", so this makes the two calls the owner makes.
+/// [`Component::render`] draws the head alone, because the foot belongs on the far side of the
+/// prompt band the session owns. A test that rendered only the head would therefore assert
+/// against half a screen and would call the lead line, the tip and every hint "absent", so this
+/// makes the two calls the owner makes.
 ///
-/// The strip and the band are *not* stood in for. Their heights belong to
+/// The prompt band is *not* stood in for. Its height belongs to
 /// [`crate::views::session::SessionScreen`] and are asserted there; what this fixture owes is
 /// that every row the welcome surface states reaches cells, on the side of the input it belongs
 /// to. The foot is bottom-anchored for the same reason the owner puts it in the last band: it
@@ -103,7 +103,7 @@ fn views_welcome_fills_a_large_frame_without_sprawling_across_it() {
     // Two bounds, because this screen has been wrong in both directions. The floor is the
     // original defect: two non-empty rows out of fifty, indistinguishable from a rendering
     // failure. The ceiling is the second one: twenty-two rows of vertical extent, four of
-    // them restating what the strip and the sidebar already carried.
+    // them restating facts already carried elsewhere or not yet resolved.
     //
     // A band rather than an equality so that editing a tip or a slash label cannot fail
     // this, and wide enough at the bottom that a screen which regressed to a couple of rows
@@ -289,8 +289,8 @@ fn views_welcome_paints_the_wordmark_shadow_in_its_own_colour() {
 fn views_welcome_states_every_fact_no_other_surface_keeps_at_every_width() {
     // The positive half of the trim. The list is shorter than it was by exactly the agent
     // and the model, which the negative test below now forbids; everything still here is a
-    // fact that has *no* other carrier at some supported width — the sidebar vanishes below
-    // `SIDEBAR_MIN_WIDTH`, and the strip drops the branch before anything else.
+    // fact that has *no* other carrier on this surface — the sidebar is deliberately absent
+    // and the footer prioritizes directory and command discovery.
     let mut view = view();
     let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     for needle in [
@@ -307,29 +307,20 @@ fn views_welcome_states_every_fact_no_other_surface_keeps_at_every_width() {
 }
 
 #[test]
-fn views_welcome_does_not_restate_the_agent_and_model_the_status_strip_carries() {
-    // The measured duplication this trim removes: at 120x34 the welcome screen's own row
-    // read `build   ·   myopenai/claude-haiku-4-5` while the strip two rows below read
-    // `build · myopenai/claude-haiku-4-5 · idle`.
+fn views_welcome_does_not_claim_a_reply_identity_before_a_conversation_starts() {
+    // The measured duplication this trim removes: at 120x34 the welcome screen used to claim
+    // an agent and model before any reply had resolved them.
     //
     // Asserted on the **composite**, not on `WelcomeView` alone, and that is the point. A
     // welcome-only assertion would pass the moment the row was deleted here even if a host
-    // re-added it, and it could not show that the fact is still on screen. Both halves are
-    // required together: absent from the welcome region, present on the strip.
+    // re-added it. The composite proves the host does not restore the premature identity.
     let mut screen = composed();
     let rendered = rows(&render_offscreen(&mut screen, 120, 34).expect("infallible"));
     let joined = rendered.join("\n");
     // Bracketed by both halves of the welcome surface rather than by one, which is stronger
     // than the version this replaces and is not a matter of taste: the surface now sits on
-    // **both** sides of the strip — the census above, the lead line below — so a one-sided
-    // "below the lead line" check would place the strip beneath the whole screen and hold for
-    // rows that are on the welcome surface's own upper half. Two anchors pin the occurrence
-    // into the strip-and-band region exactly.
-    //
-    // The strip's own words cannot be the anchor: it degrades through four tiers and at 40
-    // columns prints `idl` rather than `idle`. Both anchors here are unconditional at this
-    // width — the census is stated whenever any fact is known, and the lead line is the one
-    // row `WelcomeView::foot` always emits.
+    // **both** sides of the prompt — the census above, the lead line below — so both halves
+    // of the empty state have to be rendered for this to be meaningful.
     let census = rendered
         .iter()
         .position(|row| row.contains("zuno 0.1.0"))
@@ -344,38 +335,21 @@ fn views_welcome_does_not_restate_the_agent_and_model_the_status_strip_carries()
          back in rows {census} and {lead}:\n{joined}"
     );
 
-    for needle in [STRIP_AGENT, STRIP_MODEL] {
-        let rows_with = rendered
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.contains(needle))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            rows_with.len(),
-            1,
-            "`{needle}` is stated on {} rows; it belongs on the status strip alone, which \
-             is the one row never dropped at any width:\n{joined}",
-            rows_with.len()
-        );
+    for needle in [REPLY_AGENT, REPLY_MODEL] {
         assert!(
-            rows_with[0] > census && rows_with[0] < lead,
-            "`{needle}` is stated on row {}, outside the strip-and-band region the welcome \
-             surface brackets (census row {census}, lead line row {lead}), so the one \
-             remaining copy is the welcome screen's own:\n{joined}",
-            rows_with[0]
+            !rendered.iter().any(|row| row.contains(needle)),
+            "`{needle}` belongs to a reply identity and must not appear before a \
+             conversation starts:\n{joined}"
         );
     }
 }
 
 #[test]
-fn views_welcome_keeps_the_branch_because_both_other_carriers_drop_it() {
-    // The asymmetry that decides which duplicates may go. The agent and model are cut
-    // because `StatusView::state` is padded or clipped but never omitted; the branch is
-    // kept because it lives in `StatusView::trailers`, which is dropped front-first, and in
-    // the sidebar, which is not drawn below `SIDEBAR_MIN_WIDTH`. Forty columns is where
-    // both of those give out at once, so it is the width that proves the branch needs a
-    // carrier here.
+fn views_welcome_keeps_the_branch_when_the_sidebar_is_absent() {
+    // Agent and model wait for a real reply identity. The branch remains an empty-state fact
+    // because the sidebar is intentionally absent there and the fixed footer prioritizes the
+    // directory and command discovery. Forty columns proves the location row still keeps a
+    // useful carrier without relying on a wide layout.
     let mut screen = composed();
     let rendered = rows(&render_offscreen(&mut screen, 40, 24).expect("infallible"));
     let joined = rendered.join("\n");
@@ -386,13 +360,11 @@ fn views_welcome_keeps_the_branch_because_both_other_carriers_drop_it() {
     assert_eq!(
         carriers.len(),
         1,
-        "at 40 columns the branch should have exactly one carrier — more means the strip \
-         did not drop its trailer and this test proves nothing, none means the trim took \
-         the last one:\n{joined}"
+        "at 40 columns the branch should have exactly one carrier — more means the empty \
+         state duplicated it, none means the trim took the last one:\n{joined}"
     );
     // The surviving carrier has to be the welcome screen's location row, which is the row
-    // that also names the directory. Counting alone would be satisfied by the strip keeping
-    // it, which is the case this test exists to distinguish.
+    // that also names the directory.
     assert!(
         carriers[0].contains("~/src/zuno"),
         "the branch survived on some row other than the welcome location row:\n{joined}"
@@ -593,7 +565,7 @@ fn views_welcome_resolves_a_leader_sequence_to_the_chords_actually_pressed() {
 fn views_welcome_follows_the_users_own_leader_chord_rather_than_assuming_one() {
     // `ctrl+x` is not a fact about this program, it is a default. A spelling hard-coded
     // against it would read correctly today and lie the moment the leader was rebound —
-    // which is exactly how a hard-coded exit key on the status strip went stale in this
+    // which is exactly how a hard-coded exit key on the old status row went stale in this
     // project once overrides became real.
     use crate::config::BindingValue;
     let mut config = crate::config::ResolvedTuiConfig::default();
@@ -977,10 +949,9 @@ fn advertised_actions() -> Vec<(&'static str, String)> {
 /// The whole composed screen, so duplication *between* surfaces is visible.
 ///
 /// A welcome-only printer cannot answer the question this screen is judged on. The
-/// complaint is that rows restate what the status strip and the sidebar already carry
-/// permanently, and neither of those is part of [`WelcomeView`] — so the only rendering
-/// that can show a repeat is the composite, at the widths where the sidebar appears and
-/// disappears.
+/// complaint is that the empty state can restate or prematurely claim facts owned by
+/// neighboring session surfaces. Those are not part of [`WelcomeView`], so only the
+/// composite can expose the repeat.
 #[test]
 #[ignore = "printer, not an assertion: run with --ignored --nocapture to eyeball the rendering"]
 fn views_welcome_visual_probe() {
@@ -1018,7 +989,6 @@ fn composed() -> crate::views::session::SessionScreen {
     screen
         .status_mut()
         .set_configured_model("myopenai/claude-haiku-4-5");
-    screen.status_mut().set_git_branch("task-r17-solo");
     let ambient = screen.sidebar_mut().ambient_mut();
     ambient.directory = Some(String::from("~/src/zuno"));
     ambient.branch = Some(String::from("task-r17-solo"));

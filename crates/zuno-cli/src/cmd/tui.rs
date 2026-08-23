@@ -557,7 +557,6 @@ fn execute_once(
                 .and_then(|value| u64::try_from(value).ok()),
             usage.known,
         );
-        screen.status_mut().restore_usage(tokens);
     }
     // Before every notice below, and that order is load-bearing in both directions.
     //
@@ -1119,7 +1118,7 @@ impl SessionFacts {
         }
     }
 
-    /// State them on the screen's welcome surface, status strip and ambient panel.
+    /// State them on the welcome surface, reply identity, and ambient panel.
     fn describe(self, screen: &mut SessionScreen, tools: usize, runtime: RuntimeIdentity) {
         // Built before the moves below, which hand `lsp` to the ambient panel. The MCP
         // group is deliberately absent: the screen reads that from its live projection at
@@ -1151,9 +1150,6 @@ impl SessionFacts {
             .transcript_mut()
             .set_context_limit(self.context_window);
         screen.status_mut().describe(&self.agent, &self.model);
-        if let Some(branch) = self.branch.as_deref() {
-            screen.status_mut().set_git_branch(branch);
-        }
 
         let directory = (!self.directory.is_empty()).then(|| self.directory.clone());
         // No agent or model: `status_mut().describe` above already states both on the one
@@ -1411,8 +1407,8 @@ async fn forward_cancellations(
 /// Failures are reported through the same channel the turn's own events travel on,
 /// because the alternate screen is the only surface the user is looking at: an error
 /// on stderr under raw mode is either invisible or corrupts the frame. The interrupt
-/// event goes first so the status strip stops claiming a running turn, and the error
-/// second so the strip's detail is what remains on screen.
+/// event goes first so the live footer stops claiming a running turn, and the error
+/// second so the durable transcript detail remains on screen.
 /// What the model, agent and session pickers offer.
 ///
 /// Models are **every provider's**, which is what [`zuno models`] already reports and
@@ -1426,9 +1422,9 @@ async fn forward_cancellations(
 /// cross-provider pick a launch could make, the rebuild can make too — so withholding
 /// them hid working choices rather than preventing broken ones.
 ///
-/// One list, from [`TurnPlan::catalog_model_ids`], which is filled by
-/// `Catalog::model_lines` — the same enumeration `zuno models` prints. Two enumerations
-/// is precisely how the surfaces came to disagree.
+/// One list, from [`TurnPlan::catalog_models`], which preserves
+/// `Catalog::model_lines` ordering and carries the resolved display names. Two
+/// enumerations is precisely how the surfaces came to disagree.
 async fn session_catalog(
     plan: &TurnPlan,
     _environment: &StartupEnvironment,
@@ -1437,16 +1433,21 @@ async fn session_catalog(
     // model through, so the picker and the `task` tool cannot disagree about which models
     // reason. An undeclared model is treated as not reasoning: that yields a key which
     // explains itself rather than one that sends a control the provider may reject.
-    let model_ids = plan.catalog_model_ids();
-    let reasoning_efforts = model_ids
+    let model_choices = plan.catalog_models();
+    let reasoning_efforts = model_choices
         .iter()
-        .map(|qualified| (qualified.clone(), plan.model_reasoning_efforts(qualified)))
+        .map(|choice| (choice.id.clone(), plan.model_reasoning_efforts(&choice.id)))
         .collect();
-    let models = model_ids
+    let models = model_choices
         .into_iter()
-        .map(|qualified| {
-            let reasoning = plan.model_reasons(&qualified);
-            model_entry(&qualified, reasoning)
+        .map(|choice| {
+            let reasoning = plan.model_reasons(&choice.id);
+            zuno_tui::views::picker::ModelEntry {
+                id: choice.id,
+                name: choice.name,
+                provider: choice.provider,
+                reasoning,
+            }
         })
         .collect();
     // Filtered here rather than in `agent::list`, which must keep returning everything: the
@@ -1492,28 +1493,6 @@ fn session_entries(host: &TurnHost) -> Result<Vec<zuno_tui::views::picker::Sessi
             })
         })
         .collect()
-}
-
-/// Split one `provider/model` line into the entry the picker groups by.
-///
-/// `split_once`, never `rsplit_once` or `split`: a model id may itself contain slashes —
-/// `anyapi/openai/gpt` is a real catalog shape, pinned by `turn_tests.rs`'s
-/// `model_selection_splits_only_the_provider_prefix`. This has to divide the string
-/// exactly where `select_model` will divide it again, or a row would resolve to a
-/// different model than the one it named.
-///
-/// A line with no slash cannot come from `Catalog::model_lines`, which formats every one
-/// as `{provider}/{model}`. Should one arrive anyway the whole string becomes the name
-/// under an empty heading rather than being dropped: a visibly odd row is debuggable, and
-/// a silently missing model is the defect this function exists to fix.
-fn model_entry(qualified: &str, reasoning: bool) -> zuno_tui::views::picker::ModelEntry {
-    let (provider, name) = qualified.split_once('/').unwrap_or(("", qualified));
-    zuno_tui::views::picker::ModelEntry {
-        id: qualified.to_owned(),
-        name: name.to_owned(),
-        provider: provider.to_owned(),
-        reasoning,
-    }
 }
 
 /// Apply a picker choice at the boundary between turns.
@@ -4302,15 +4281,28 @@ mod tests {
     /// fail for that cause rather than for a shorter list.
     #[test]
     fn the_model_picker_offers_every_provider_the_catalog_holds() {
-        let lines = [
-            "amazon-bedrock/anthropic.claude-opus-4-6-v1",
-            "amazon-bedrock/amazon.nova-lite-v1:0",
-            "myopenai/gpt-5",
-            "myopenai/o4",
+        let entries = [
+            (
+                "amazon-bedrock/anthropic.claude-opus-4-6-v1",
+                "Claude Opus 4.6",
+                "Bedrock",
+            ),
+            (
+                "amazon-bedrock/amazon.nova-lite-v1:0",
+                "Nova Lite",
+                "Bedrock",
+            ),
+            ("myopenai/gpt-5", "GPT-5", "My OpenAI"),
+            ("myopenai/o4", "O4", "My OpenAI"),
         ];
-        let entries = lines
-            .iter()
-            .map(|line| model_entry(line, false))
+        let entries = entries
+            .into_iter()
+            .map(|(id, name, provider)| zuno_tui::views::picker::ModelEntry {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                provider: provider.to_owned(),
+                reasoning: false,
+            })
             .collect::<Vec<_>>();
 
         let providers = entries
@@ -4335,7 +4327,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             offered,
-            BTreeSet::from(["amazon-bedrock", "myopenai"]),
+            BTreeSet::from(["Bedrock", "My OpenAI"]),
             "the picker's own rows do not span both providers"
         );
         // `selecting` must still land on the session's model now that it is one row among
@@ -4350,12 +4342,16 @@ mod tests {
     /// A model id may itself contain slashes, so only the first one is the provider.
     #[test]
     fn a_nested_model_id_keeps_every_segment_past_the_provider() {
-        let entry = model_entry("anyapi/openai/gpt", false);
-        assert_eq!(entry.provider, "anyapi");
-        assert_eq!(entry.name, "openai/gpt");
+        let entry = crate::cmd::turn::CatalogModelChoice {
+            id: String::from("anyapi/openai/gpt"),
+            name: String::from("OpenAI GPT"),
+            provider: String::from("Any API"),
+        };
+        assert_eq!(entry.provider, "Any API");
+        assert_eq!(entry.name, "OpenAI GPT");
         assert_eq!(
             entry.id, "anyapi/openai/gpt",
-            "the value the rebuild re-resolves must be the line verbatim"
+            "display metadata must not rewrite the exact value turn resolution accepts"
         );
     }
 

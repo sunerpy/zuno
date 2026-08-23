@@ -35,9 +35,8 @@
 //! honours it and a test asserts the discard.
 
 use crate::app::{AppEvent, Component, EventResult};
-use crate::keybind::APP_EXIT;
 use crate::views::selection::{TextPoint, TextSelection, slice_columns};
-use crate::views::{ViewContext, display_width, fill, key_label, padded, truncate};
+use crate::views::{ViewContext, display_width, fill, padded, truncate};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -382,6 +381,13 @@ pub const ELIDED: &str = "…";
 /// expensive ambiguity an interactive surface can have.
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Compact pulse frames for the live control row beneath the composer.
+///
+/// Three cells make motion visible without making the footer jump horizontally. The
+/// transcript owns the clock because running tool glyphs already advance from it; a
+/// second timer in the footer would eventually drift and redraw the same frame twice.
+pub const WORK_PULSE: [&str; 6] = ["▰▱▱", "▰▰▱", "▱▰▰", "▱▱▰", "▱▰▰", "▰▰▱"];
+
 /// One renderable piece of a message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessagePart {
@@ -601,14 +607,7 @@ pub enum AwaitingUser {
 }
 
 impl AwaitingUser {
-    const fn transcript_text(self) -> &'static str {
-        match self {
-            Self::Approval => "△ waiting for your approval",
-            Self::Answer => "△ waiting for your answer",
-        }
-    }
-
-    const fn status_text(self) -> &'static str {
+    pub(crate) const fn status_text(self) -> &'static str {
         match self {
             Self::Approval => "awaiting approval",
             Self::Answer => "awaiting answer",
@@ -622,7 +621,7 @@ pub struct Transcript {
     messages: Vec<Message>,
     /// The index of the assistant message currently receiving deltas.
     streaming: Option<usize>,
-    /// Whether the turn is still running, for the status affordance.
+    /// Whether the turn is still running, for the fixed live footer.
     running: bool,
     /// Whether this live turn already emitted its session-owned interruption marker.
     ///
@@ -631,9 +630,9 @@ pub struct Transcript {
     interruption_noted: bool,
     /// Session-cumulative provider token accounting.
     ///
-    /// The same [`TokenUsage`] the status strip carries, folded from the same event.
+    /// The same [`TokenUsage`] the sidebar carries, folded from the same event.
     /// One type rather than two: a sidebar with its own accumulator is a second
-    /// running total free to disagree with the strip's, and two token figures on one
+    /// running total free to disagree with the transcript's, and two token figures on one
     /// screen that differ is worse than either alone.
     tokens: TokenUsage,
     /// Whether cumulative usage is known, unavailable, or not reported yet.
@@ -733,6 +732,15 @@ impl Transcript {
         self.running
     }
 
+    /// Mark an accepted submission live before the engine publishes `TurnStarted`.
+    ///
+    /// The footer appears immediately after Enter, so its animation clock must become
+    /// active during the persistence gap as well as after the first engine event.
+    pub const fn mark_running(&mut self) {
+        self.running = true;
+        self.interruption_noted = false;
+    }
+
     /// The session's cumulative token accounting.
     #[must_use]
     pub const fn tokens(&self) -> TokenUsage {
@@ -811,6 +819,12 @@ impl Transcript {
     #[must_use]
     pub const fn spinner(&self) -> &'static str {
         SPINNER[self.ticks % SPINNER.len()]
+    }
+
+    /// The pulse frame shown to the left of the running turn's interrupt hint.
+    #[must_use]
+    pub const fn work_pulse(&self) -> &'static str {
+        WORK_PULSE[self.ticks % WORK_PULSE.len()]
     }
 
     /// Advance the liveness animation if it is currently visible.
@@ -903,8 +917,7 @@ impl Transcript {
     pub fn observe(&mut self, event: &TurnEvent) -> bool {
         match event {
             TurnEvent::TurnStarted { .. } => {
-                self.running = true;
-                self.interruption_noted = false;
+                self.mark_running();
                 true
             }
             TurnEvent::AssistantMessageCreated { message_id, .. } => {
@@ -1142,12 +1155,19 @@ impl Transcript {
                 });
                 true
             }
-            // Warnings go in the transcript, not only on the status strip: the strip
+            // Warnings go in the transcript rather than a transient footer: a footer
             // holds one detail and the next one overwrites it, so a suppressed tool
-            // would appear for a moment and then be gone. The rest of the details are
-            // transient by nature and stay on the strip alone.
+            // would appear for a moment and then be gone.
             StreamEvent::StatusDetail { detail } if detail.starts_with("warning: ") => {
                 self.messages.push(Message::notice(detail.clone()));
+                self.streaming = None;
+                true
+            }
+            StreamEvent::Error { message, .. } => {
+                self.messages.push(Message::noticed(
+                    crate::views::toast::ToastLevel::Error,
+                    message.clone(),
+                ));
                 self.streaming = None;
                 true
             }
@@ -1622,6 +1642,16 @@ impl TranscriptView {
         self.content_height
     }
 
+    /// Measure the complete transcript at `width` before assigning its viewport.
+    ///
+    /// The session layout uses this to place the identity row immediately after short
+    /// content and to make it sticky only once the transcript fills the available pane.
+    /// It deliberately calls the cached renderer: the following `render` sees the same
+    /// rows and reuses them instead of formatting the whole history twice.
+    pub fn measure_content_height(&mut self, width: u16) -> usize {
+        self.cached_lines(width).len()
+    }
+
     /// Rows the last render had room for.
     #[must_use]
     pub const fn viewport_height(&self) -> usize {
@@ -1661,7 +1691,7 @@ impl TranscriptView {
             lines.append(&mut self.message_rows(index, message, previous, width).lines);
             previous = Some(message.role);
         }
-        self.push_trailer(&mut lines, previous.is_some(), width);
+        self.push_margin(&mut lines, previous.is_some(), width);
         lines
     }
 
@@ -1935,34 +1965,14 @@ impl TranscriptView {
         Line::from(spans)
     }
 
-    /// The bottom margin and whichever liveness row the turn's state calls for.
+    /// One bottom margin separating the reply from the sticky identity row.
     ///
-    /// Never cached, and it is the reason the cache is per message rather than per
-    /// frame: the spinner advances on every folded event, so a frame-level entry would
-    /// miss on every single delta of a streaming turn — the exact case the cache exists
-    /// to make cheap.
-    fn push_trailer(&self, lines: &mut Vec<Line<'static>>, any_message: bool, width: u16) {
+    /// Transient liveness no longer belongs to the transcript. It is rendered in the
+    /// composer's live control row, where it cannot be persisted, selected as message
+    /// content, or duplicated beside a running tool spinner.
+    fn push_margin(&self, lines: &mut Vec<Line<'static>>, any_message: bool, width: u16) {
         if any_message {
-            // The transcript's own bottom margin, so the spinner or the approval notice
-            // below is not flush against the last row of the reply.
             lines.push(padded("", width, self.context.surface()));
-        }
-        // `working` and `waiting for you` are mutually exclusive claims about who the
-        // turn is blocked on, so exactly one of them may be on screen. A spinner beside
-        // an open permission prompt says the process is busy while it is in fact idle,
-        // waiting for the very key press the prompt is asking for.
-        if let Some(awaiting) = self.transcript.awaiting_user {
-            lines.push(padded(
-                awaiting.transcript_text(),
-                width,
-                self.context.warning(),
-            ));
-        } else if self.transcript.running {
-            lines.push(padded(
-                &format!("{} working", self.transcript.spinner()),
-                width,
-                self.context.accent(),
-            ));
         }
     }
 
@@ -2089,10 +2099,9 @@ impl TranscriptView {
             }
         }
         self.cache.truncate_to(self.transcript.messages.len());
-        self.push_trailer(&mut lines, previous.is_some(), width);
-        // The trailer belongs to no message — it is the bottom margin and the liveness row —
-        // so its rows own nothing and a click on them falls through. Padding to the full
-        // length rather than leaving the vector short is what keeps `render` from having to
+        self.push_margin(&mut lines, previous.is_some(), width);
+        // The margin belongs to no message, so a click on it falls through. Padding to the
+        // full length rather than leaving the vector short keeps `render` from having to
         // know which rows are chrome.
         self.line_owners.resize(lines.len(), None);
         self.line_tools.resize(lines.len(), None);
@@ -3033,48 +3042,37 @@ impl Component for TranscriptView {
     }
 }
 
-/// A live status strip: what the turn is doing right now.
+/// The identity attached to the current reply.
 ///
-/// Separate from the transcript because it is derived state that changes on events
-/// the transcript deliberately ignores — model resolution, request starts, step
-/// completion — and because upstream draws it in its own region
-/// (`routes/session/footer.tsx`).
+/// This view owns only the durable-looking identity a reader associates with the
+/// response: agent, model, and reasoning level. Transient liveness, context occupancy,
+/// interrupt controls, branch, and command discovery belong to the composer's live
+/// footer instead. Keeping those surfaces separate lets a short reply carry its identity
+/// immediately below the content while the controls remain fixed and discoverable.
 pub struct StatusView {
     context: ViewContext,
     running: bool,
     agent: Option<String>,
     model: Option<String>,
-    step: u32,
-    detail: Option<String>,
     /// What the session was configured with, shown before the first turn resolves.
     ///
     /// Separate from `agent`/`model`, which are what the *engine* resolved: carrying
-    /// the configured pair in the same fields would make the strip claim a turn had
+    /// the configured pair in the same fields would make the identity claim a turn had
     /// resolved a model before one had run, and clearing them at the end of a turn
     /// would then blank a row that is still true.
     configured_agent: Option<String>,
     configured_model: Option<String>,
-    usage: TokenUsage,
-    /// The most recent language-server verdict.
+    /// Display names keyed by the exact `provider/model` value used on the wire.
     ///
-    /// Kept separately from `detail` because `detail` is overwritten by the next
-    /// transport message, and "your edit does not compile" must not be displaced by
-    /// "connected". It is the same reasoning that put the shadowing warning in the
-    /// transcript.
-    diagnostics: Option<String>,
+    /// The picker already receives these names from the catalog. Reusing the same map
+    /// keeps the reply identity readable (`Claude Opus 5`) without teaching the view to
+    /// guess names from provider-specific ids.
+    model_names: BTreeMap<String, String>,
     /// Why a mounted prompt is asking the user to decide.
     ///
-    /// The strip is the one row always on screen, so it is where a user looks when a
-    /// turn seems stuck. Saying `working` there while the process is parked on an ask
-    /// points them at the wrong thing to wait for.
+    /// The session footer is the one row always on screen, so the screen reads this
+    /// state when deciding whether to show a pulse or an explicit user-input request.
     awaiting_user: Option<AwaitingUser>,
-    /// The checkout's branch, as the host measured it.
-    ///
-    /// Not folded from an engine event, because no engine event carries it: the branch
-    /// describes the working tree rather than the turn, which is also why
-    /// [`Self::reset`] leaves it alone — the same reasoning that keeps `diagnostics`
-    /// across a turn boundary.
-    git_branch: Option<String>,
     /// The reasoning level the session asked the model for, when it asked for one.
     ///
     /// Beside `configured_model` rather than among the resolved fields, and surviving
@@ -3172,29 +3170,6 @@ impl TokenUsage {
         self.cache_read += cache_read;
         self.cache_write += cache_write;
     }
-
-    /// The compact form the status strip carries.
-    ///
-    /// Cache is named only when the provider reported some: a permanent `cache 0` on
-    /// a provider that does not support caching is a column of noise.
-    #[must_use]
-    pub fn compact(&self) -> String {
-        let cached = self.cache_read + self.cache_write;
-        if cached == 0 {
-            format!(
-                "in {} · out {}",
-                thousands(self.input),
-                thousands(self.output)
-            )
-        } else {
-            format!(
-                "in {} · out {} · cache {}",
-                thousands(self.input),
-                thousands(self.output),
-                thousands(cached)
-            )
-        }
-    }
 }
 
 /// Group `value` in thousands so a six-figure token count stays readable.
@@ -3212,55 +3187,7 @@ pub fn thousands(value: u64) -> String {
 }
 
 impl StatusView {
-    /// The word the strip shows when nothing is running.
-    pub const IDLE: &'static str = "idle";
-
-    /// The word the strip shows the instant a turn starts, before anything resolves.
-    pub const WORKING: &'static str = "working";
-
-    /// What the exit hint says the key *does*, appended to whichever key
-    /// [`Self::exit_hint`] resolved.
-    ///
-    /// Split out from [`Self::EXIT_HINT`] so that only the key varies: the verb is the
-    /// strip's own wording and has nothing to do with the binding table.
-    const EXIT_ACTION: &'static str = "cancel/exit";
-
-    /// The key shown as the way out, and what it does while a turn is running.
-    ///
-    /// The strip is the one row always on screen, so it is where a binding a user
-    /// cannot otherwise guess belongs. An application whose exit key is undiscoverable
-    /// is only marginally better than one that has none.
-    ///
-    /// This is the **fallback**, not the rendered text: [`Self::exit_hint`] looks the
-    /// key up. It is reached only when the user explicitly disabled `app_exit`, and it
-    /// still names a key that works — see that method for why that is not a lie. A test
-    /// pins it to the shipped table's own first spelling so it cannot drift from the
-    /// derived form.
-    pub const EXIT_HINT: &'static str = "ctrl+c cancel/exit";
-
-    /// What marks the branch segment, borrowed from the ambient sidebar so the two
-    /// surfaces name the same field the same way.
-    ///
-    /// Aliased to [`crate::views::ambient::BRANCH_GLYPH`] rather than spelled again here:
-    /// "the two surfaces agree" was a claim held up by a copied literal, and a copied
-    /// literal is a claim only until somebody edits one of the two.
-    ///
-    /// Written tight against the name — `⑂main`, not `⑂ main` — because the strip is one
-    /// shared row and every segment on it is already compacted for the same reason
-    /// [`TokenUsage::compact`] writes `↑3,000` rather than spelling the count out.
-    pub const BRANCH_GLYPH: &'static str = crate::views::ambient::BRANCH_GLYPH;
-
-    /// What separates two segments of the right-hand group.
-    const TRAILER_GAP: &'static str = "  ";
-
-    /// What labels the reasoning level on the strip.
-    ///
-    /// A word rather than a glyph: the level's own name (`low`, `high`, `max`) is a bare
-    /// adjective, and beside a model id it would read as part of the model's name. The
-    /// prefix is also what a user greps the help for after seeing it.
-    pub const EFFORT_PREFIX: &'static str = "think:";
-
-    /// A status strip over `context`.
+    /// A reply identity over `context`.
     #[must_use]
     pub fn new(context: ViewContext) -> Self {
         Self {
@@ -3268,26 +3195,12 @@ impl StatusView {
             running: false,
             agent: None,
             model: None,
-            step: 0,
-            detail: None,
             configured_agent: None,
             configured_model: None,
-            usage: TokenUsage::default(),
-            diagnostics: None,
+            model_names: BTreeMap::new(),
             awaiting_user: None,
-            git_branch: None,
             effort: None,
         }
-    }
-
-    /// Record the checkout's branch, as `zuno-cli/src/cmd/tui.rs` measured it.
-    ///
-    /// An empty string is treated as "not on a branch" rather than adopted, matching
-    /// [`Self::describe`]: a blank segment on the strip is indistinguishable from a
-    /// field that failed to resolve, and it would still cost the separator's columns.
-    pub fn set_git_branch(&mut self, branch: impl Into<String>) {
-        let branch = branch.into();
-        self.git_branch = (!branch.is_empty()).then_some(branch);
     }
 
     /// Record why a mounted prompt is waiting on the user.
@@ -3299,18 +3212,18 @@ impl StatusView {
         changed
     }
 
-    /// Record the latest language-server verdict.
-    pub fn set_diagnostics(&mut self, summary: impl Into<String>) {
-        self.diagnostics = Some(summary.into());
+    /// Why a mounted prompt is waiting on the user.
+    #[must_use]
+    pub const fn awaiting_user(&self) -> Option<AwaitingUser> {
+        self.awaiting_user
     }
 
-    /// Adopt the configured agent and model, so the idle strip is not just `idle`.
-    ///
-    /// Before this the strip's only pre-turn state was the literal word `idle`, which
-    /// answers none of the questions a user has before pressing enter: which agent
-    /// will run, and against which model. Both are known at launch.
-    /// An empty string is treated as "not resolved" rather than adopted, because a
-    /// blank agent on the strip is indistinguishable from one that failed to resolve.
+    /// Install catalog display names keyed by exact model id.
+    pub fn set_model_names(&mut self, names: impl IntoIterator<Item = (String, String)>) {
+        self.model_names = names.into_iter().collect();
+    }
+
+    /// Adopt the configured identity before the first turn resolves.
     pub fn describe(&mut self, agent: &str, model: &str) {
         if !agent.is_empty() {
             self.configured_agent = Some(agent.to_owned());
@@ -3335,27 +3248,30 @@ impl StatusView {
         self.effort = effort;
     }
 
-    /// The reasoning level the strip is showing.
+    /// The reasoning level the reply identity is showing.
     #[must_use]
     pub const fn effort(&self) -> Option<zuno_llm::effort::ReasoningEffort> {
         self.effort
     }
 
-    /// Whether a turn is in flight, as the strip is reporting it.
+    /// Whether a turn is in flight, for the session's live footer.
     #[must_use]
     pub const fn is_running(&self) -> bool {
         self.running
     }
 
-    /// The tokens counted so far.
+    /// Whether there is an identity worth assigning a row.
     #[must_use]
-    pub const fn usage(&self) -> TokenUsage {
-        self.usage
-    }
-
-    /// Restore the session-cumulative usage before the first live event.
-    pub const fn restore_usage(&mut self, usage: TokenUsage) {
-        self.usage = usage;
+    pub fn has_identity(&self) -> bool {
+        self.agent
+            .as_ref()
+            .or(self.configured_agent.as_ref())
+            .is_some()
+            || self
+                .model
+                .as_ref()
+                .or(self.configured_model.as_ref())
+                .is_some()
     }
 
     /// Replace the palette and settings, for a live theme change.
@@ -3364,247 +3280,70 @@ impl StatusView {
     }
 
     /// Report a turn as running before the engine's first event arrives.
-    ///
-    /// A prompt has to be persisted before [`TurnEvent::TurnStarted`] can be sent, so
-    /// there is a window in which work has started and no event has. Closing it here
-    /// is not cosmetic: for that window the strip would otherwise read
-    /// [`Self::IDLE`], which is the one thing it must never say while a turn is
-    /// under way.
     pub fn mark_running(&mut self) {
         self.reset(true);
     }
 
-    /// Discard everything a turn resolved and record whether one is now running.
-    ///
-    /// The strip reports what is happening, not what last happened. Carrying the
-    /// previous turn's agent, model and step past its end would leave the one row a
-    /// user glances at claiming a state the process is not in — the same defect as a
-    /// strip that stayed [`Self::IDLE`] through a running turn, in the other
-    /// direction.
+    /// Discard the live resolution and retain the configured identity.
     fn reset(&mut self, running: bool) {
         self.running = running;
         self.agent = None;
         self.model = None;
-        self.step = 0;
-        self.detail = None;
-        // `diagnostics` deliberately survives: it describes the working tree, not the
-        // turn, so clearing it at a turn boundary would hide a verdict that is still
-        // true. The next report replaces it.
+        self.awaiting_user = None;
     }
 
-    /// The exit hint, naming the key the *user's* keymap resolved for `app_exit`.
-    ///
-    /// Derived rather than written down because a hardcoded spelling goes stale the
-    /// moment overrides become real: with `{"keybinds": {"app_exit": "ctrl+q"}}` the
-    /// welcome grid and the command palette both said `ctrl+q` while this row still
-    /// said `ctrl+c`, so one frame advertised two different ways out.
-    ///
-    /// [`key_label`] and not [`crate::keybind::Keymap::sequences`], for two reasons.
-    /// The welcome grid is already built on [`key_label`]
-    /// (`views/welcome.rs:351`), and agreeing with the surface this row contradicted
-    /// is the entire fix — a second lookup could resolve the same override to a
-    /// different spelling and reintroduce the disagreement one layer down. And
-    /// `sequences` returns *every* binding: `app_exit` ships three
-    /// (`ctrl+c,ctrl+d,<leader>q`), and comma-joining them would spend about
-    /// twenty-four columns of a one-row strip advertising alternatives, evicting the
-    /// token counts at widths where they fit today. One key is what a hint is for, and
-    /// [`key_label`] takes the first because the table lists its preferred spelling
-    /// first and a user's override lists theirs.
-    ///
-    /// When the user *disabled* `app_exit` there is no resolved spelling, and the row
-    /// falls back to [`Self::EXIT_HINT`] rather than going quiet. That is still true,
-    /// not a guess: [`crate::keybind::is_exit_chord`] reads the static table on
-    /// purpose, so `ctrl+c` leaves the application even with no binding pointing at it
-    /// (`keybind.rs:191`). Dropping the hint would make the one row that survives every
-    /// width degradation silent about the only guaranteed way out.
-    fn exit_hint(&self) -> String {
-        key_label(APP_EXIT, &self.context).map_or_else(
-            || Self::EXIT_HINT.to_owned(),
-            |key| format!("{key} {}", Self::EXIT_ACTION),
-        )
+    fn display_model<'a>(&'a self, model: &'a str) -> &'a str {
+        self.model_names
+            .get(model)
+            .map(String::as_str)
+            .unwrap_or_else(|| model.split_once('/').map_or(model, |(_, id)| id))
     }
 
-    /// Every right-hand group the row will try, richest first.
-    ///
-    /// The fields are laid out in *ascending* priority left to right — branch, token
-    /// counts, exit key — and each rung is built by dropping the leftmost, which is to
-    /// say the lowest-ranked, field still present. Ordering them that way is what keeps
-    /// the right edge from reflowing as the terminal narrows: a dropped field vanishes
-    /// and nothing beside it moves.
-    ///
-    /// The ranking, lowest first, and why:
-    ///
-    /// * **branch** — the ambient sidebar already prints it (`views/ambient.rs:470`), so
-    ///   it is the one field a narrow row loses nothing unique by dropping.
-    /// * **token counts** — informational, and the sidebar carries the same accumulator.
-    /// * **exit key** — the only way out, so it is last to go. It already outranked the
-    ///   token counts before the branch existed; the branch joins below it rather than
-    ///   displacing that order. Its spelling comes from [`Self::exit_hint`]; the rank
-    ///   does not depend on how wide that spelling turns out to be.
-    ///
-    /// With no branch set this reduces to two rungs — counts plus the key, then the key
-    /// alone — so the pre-existing degradation is unchanged.
-    ///
-    /// # Why there is no cost rung
-    ///
-    /// There was one, and it could never be populated. It had a `set_cost` setter whose
-    /// comment named `zuno-cli/src/cmd/tui.rs` as the caller, and no such call existed:
-    /// only tests ever set it, so the segment was empty in every real session while the
-    /// comment asserted a contract nobody honoured.
-    ///
-    /// It was removed rather than wired because no authoritative figure is reachable to
-    /// wire it *to*. `zuno_engine::stream::ProjectionContext::with_cost` is called only
-    /// from `zuno-engine/tests/stream.rs`, so every persisted `"cost"` is `0.0` and the
-    /// session's column always sums to zero — a wired segment would read `$0.00` forever,
-    /// which a user reads as *free* rather than as *unknown*. Computing one here is worse:
-    /// prices are per-million-token and `catalog::merge::cost_from_catalog` drops the
-    /// `context_over_200k` band at resolve time, so a multiplication in this layer would
-    /// be confidently wrong on exactly the long-context models where the number matters.
-    /// A wrong price is worse than no price, and an empty segment claiming to be a price
-    /// is worse than neither.
-    fn trailers(&self) -> Vec<String> {
-        let mut ranked = Vec::with_capacity(3);
-        if let Some(branch) = &self.git_branch {
-            ranked.push(format!("{}{branch}", Self::BRANCH_GLYPH));
-        }
-        if !self.usage.is_empty() {
-            ranked.push(self.usage.compact());
-        }
-        ranked.push(self.exit_hint());
-        (0..ranked.len())
-            .map(|dropped| ranked[dropped..].join(Self::TRAILER_GAP))
-            .collect()
-    }
-
-    /// The rendered row, with [`Self::exit_hint`] right-aligned when it fits.
-    ///
-    /// The hint is dropped rather than truncated on a narrow terminal: half a key
-    /// name is worse than none, and the turn state it shares the row with is what a
-    /// user needs more. The state itself is never dropped, only padded or truncated by
-    /// [`padded`], which is why a field that must yield to the exit key belongs in
-    /// [`Self::trailers`] and not in [`Self::state`].
+    /// The reply identity, styled as one compact OpenCode-like line.
     #[must_use]
     pub fn line(&self, width: u16) -> Line<'static> {
-        let columns = usize::from(width);
-        let full_state = self.state();
-        let compact_state = self.compact_state(&full_state);
-        for state in compact_state.as_ref().map_or_else(
-            || vec![full_state.as_str()],
-            |compact| vec![full_state.as_str(), compact.as_str()],
-        ) {
-            let state = format!(" {state}");
-            // Terminal columns, not `chars().count()`: the cache glyph `⚡` and a CJK
-            // model name each occupy two cells, so counting characters here claims the
-            // row is narrower than it is and over-fills it by one column per wide glyph.
-            let state_columns = display_width(&state);
-            for trailer in self.trailers() {
-                let used = state_columns + display_width(&trailer) + 1;
-                if used < columns {
-                    return Line::from(vec![
-                        Span::styled(state, self.context.element()),
-                        Span::styled(" ".repeat(columns - used), self.context.element()),
-                        Span::styled(
-                            trailer,
-                            Style::new()
-                                .fg(self.context.palette().text_muted.into())
-                                .bg(self.context.palette().background_element.into()),
-                        ),
-                        Span::styled(String::from(" "), self.context.element()),
-                    ]);
-                }
+        let agent = self.agent.as_ref().or(self.configured_agent.as_ref());
+        let model = self.model.as_ref().or(self.configured_model.as_ref());
+        if agent.is_none() && model.is_none() {
+            return padded("", width, self.context.surface());
+        }
+        let mut spans = vec![Span::styled(" ▣ ".to_owned(), self.context.accent())];
+        if let Some(agent) = agent {
+            spans.push(Span::styled(agent.clone(), self.context.title()));
+        }
+        if let Some(model) = model {
+            if agent.is_some() {
+                spans.push(Span::styled(" · ".to_owned(), self.context.muted()));
             }
+            spans.push(Span::styled(
+                self.display_model(model).to_owned(),
+                self.context.text(),
+            ));
         }
-        let state = compact_state.unwrap_or(full_state);
-        let state = format!(" {state}");
-        padded(&state, width, self.context.element())
-    }
-
-    /// A narrower state that yields the transient `working` word to the exit hint.
-    ///
-    /// The configured agent and model still identify the active turn, while a missing
-    /// cancel key can trap the user. `working` therefore remains visible whenever it
-    /// fits, but it is the first part of the left side to go when no trailer can coexist
-    /// with it. A bare `working` has no more informative compact form and is retained.
-    fn compact_state(&self, full: &str) -> Option<String> {
-        if !self.running || self.awaiting_user.is_some() {
-            return None;
-        }
-        full.strip_suffix(&format!(" · {}", Self::WORKING))
-            .filter(|state| !state.is_empty())
-            .map(str::to_owned)
-    }
-
-    fn state(&self) -> String {
-        let mut text = String::new();
-        if let Some(agent) = self.agent.as_ref().or(self.configured_agent.as_ref()) {
-            text.push_str(agent);
-        }
-        if let Some(model) = self.model.as_ref().or(self.configured_model.as_ref()) {
-            if !text.is_empty() {
-                text.push_str(" · ");
-            }
-            text.push_str(model);
-        }
-        // Directly after the model, because it qualifies the model rather than the turn:
-        // the level is a property of what the composer will send, and reading
-        // `build · claude · think:high` as one phrase is what makes the key that cycles
-        // it discoverable at all.
         if let Some(effort) = self.effort {
-            if !text.is_empty() {
-                text.push_str(" · ");
-            }
-            text.push_str(Self::EFFORT_PREFIX);
-            text.push_str(effort.as_str());
+            spans.push(Span::styled(
+                format!(" ({})", effort.as_str()),
+                self.context.muted(),
+            ));
         }
-        if self.step > 0 {
-            if !text.is_empty() {
-                text.push_str(" · ");
-            }
-            text.push_str(&format!("step {}", self.step));
+        let columns = usize::from(width);
+        let mut spans = crate::views::markdown::truncate_row(spans, columns);
+        let used = crate::views::markdown::row_width(&spans);
+        if used < columns {
+            spans.push(Span::styled(
+                " ".repeat(columns - used),
+                self.context.surface(),
+            ));
         }
-        if let Some(detail) = &self.detail {
-            if !text.is_empty() {
-                text.push_str(" · ");
-            }
-            text.push_str(detail);
-        }
-        if let Some(diagnostics) = &self.diagnostics {
-            if !text.is_empty() {
-                text.push_str(" · ");
-            }
-            text.push_str(diagnostics);
-        }
-        if let Some(awaiting) = self.awaiting_user {
-            // Appended even beside a resolved agent and model, because those describe the
-            // turn's configuration while this describes what it is stopped on. It also
-            // displaces `working`/`idle` below: an outstanding ask outranks both.
-            if !text.is_empty() {
-                text.push_str(" · ");
-            }
-            text.push_str(awaiting.status_text());
-        } else if self.running {
-            if !text.is_empty() {
-                text.push_str(" · ");
-            }
-            text.push_str(Self::WORKING);
-        } else if text.is_empty() {
-            text.push_str(Self::IDLE);
-        } else if !self.running && self.agent.is_none() && self.model.is_none() && self.step == 0 {
-            // Only when every field came from configuration. Saying `idle` beside a
-            // resolved agent, model and step would contradict the state it sits next
-            // to, which is the same defect as a strip that stays `idle` mid-turn.
-            text.push_str(" · ");
-            text.push_str(Self::IDLE);
-        }
-        text
+        Line::from(spans)
     }
 }
 
 impl Component for StatusView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        fill(frame.buffer_mut(), area, self.context.element());
+        fill(frame.buffer_mut(), area, self.context.surface());
         Paragraph::new(vec![self.line(area.width)])
-            .style(self.context.element())
+            .style(self.context.surface())
             .render(area, frame.buffer_mut());
     }
 
@@ -3617,10 +3356,8 @@ impl Component for StatusView {
                 self.reset(true);
                 EventResult::REDRAW
             }
-            // Both the live field and the configured one. The live field is what the strip
-            // shows during a turn and is cleared when the turn ends; the configured one
-            // survives that reset, so a mid-session switch is still reported once the
-            // turn it applies to has finished.
+            // Both the live field and configured fallback. The reply keeps identifying
+            // the model and agent after completion without retaining transient run state.
             TurnEvent::AgentResolved { agent, .. } => {
                 self.agent = Some(agent.clone());
                 self.configured_agent = Some(agent.clone());
@@ -3634,49 +3371,6 @@ impl Component for StatusView {
                 let label = format!("{provider_id}/{model_id}");
                 self.model = Some(label.clone());
                 self.configured_model = Some(label);
-                EventResult::REDRAW
-            }
-            TurnEvent::StepCompleted { step, .. } => {
-                self.step = *step;
-                EventResult::REDRAW
-            }
-            TurnEvent::Provider {
-                event: StreamEvent::StatusDetail { detail },
-                ..
-            } => {
-                self.detail = Some(detail.clone());
-                EventResult::REDRAW
-            }
-            TurnEvent::Provider {
-                event:
-                    StreamEvent::TokenUsage {
-                        input_tokens,
-                        output_tokens,
-                        cache_read_input_tokens,
-                        cache_write_input_tokens,
-                        accounting,
-                    },
-                ..
-            } => {
-                let input = input_tokens.unwrap_or(0);
-                let cache_read = cache_read_input_tokens.unwrap_or(0);
-                let cache_write = cache_write_input_tokens.unwrap_or(0);
-                // Normalised the same way [`Transcript::observe`] does, and it has to be:
-                // the strip and the sidebar show the same session, so two accumulators
-                // folding the same event differently would put two totals on one screen.
-                self.usage.add(
-                    accounting.uncached_input(input, cache_read, cache_write),
-                    output_tokens.unwrap_or(0),
-                    cache_read,
-                    cache_write,
-                );
-                EventResult::REDRAW
-            }
-            TurnEvent::Provider {
-                event: StreamEvent::Error { message, .. },
-                ..
-            } => {
-                self.detail = Some(message.clone());
                 EventResult::REDRAW
             }
             TurnEvent::TurnCompleted { .. }

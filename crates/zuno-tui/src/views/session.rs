@@ -1,4 +1,4 @@
-//! The composed session screen: transcript above, status strip, prompt below.
+//! The composed session screen: transcript, reply identity, composer, and live footer.
 //!
 //! Todo 76 built every view and left this composition to whoever booted the TUI,
 //! and nothing did — so the views were reachable only from their own tests. This
@@ -31,18 +31,18 @@
 //!
 //! A single accidental escape must not discard a running turn. The session interrupt
 //! action therefore arms a short confirmation window; a second press inside it asks
-//! the driver to cancel. The arm is shown in a dedicated row immediately above the
-//! composer rather than in an expiring corner toast. When a modal or autocomplete
-//! surface owns the first press, it closes that surface and arms the same running turn,
-//! so the user's second physical press still confirms cancellation. The arm is
-//! transient UI state and is cleared at turn boundaries.
+//! the driver to cancel. The live footer changes from `esc interrupt` to
+//! `esc again to interrupt` without inserting a row or moving the composer. When a
+//! modal or autocomplete surface owns the first press, it closes that surface and arms
+//! the same running turn, so the user's second physical press still confirms
+//! cancellation. The arm is transient UI state and is cleared at turn boundaries.
 //!
 //! The application exit chord keeps the older two-stage emergency behavior: first it
 //! cancels, then it leaves unconditionally. Reading
-//! "has a turn been cancelled already" off the status strip's running state looks
+//! "has a turn been cancelled already" off the reply identity's running state looks
 //! equivalent and is not: a turn parked on a permission ask never reaches the
-//! engine's interrupt check, so it stays running after an abort and the strip never
-//! clears. A screen that re-derived its answer from the strip would cancel forever
+//! engine's interrupt check, so it stays running after an abort and the projection never
+//! clears. A screen that re-derived its answer from that projection would cancel forever
 //! and never leave — the same trap in a politer form. One press is therefore
 //! remembered explicitly, and cleared when a new turn starts.
 //!
@@ -109,17 +109,19 @@ pub const EDITOR_FALLBACK_DIALOG_ID: &str = "prompt.editor.fallback";
 /// The id the external-editor failure alert reports under.
 pub const EDITOR_ALERT_DIALOG_ID: &str = "alert.editor";
 
-/// Rows reserved for the status strip.
-const STATUS_ROWS: u16 = 1;
+/// Rows reserved for the reply identity when the pane can also retain transcript content.
+const IDENTITY_ROWS: u16 = 1;
 
 /// The info row's height on a `height`-row frame: [`INFO_ROWS`], or none when it costs the
 /// prompt its survival floor.
 ///
-/// Measured, not defensive. On a four-row pane the bands demand `body 1 + prompt 2 + strip 1 +
-/// info 1 = 5`, and ratatui resolves the overflow by shrinking the prompt — so adding this row
-/// unconditionally left a one-row composer whose only row is the spacer, which is nowhere to
+/// Measured, not defensive. On a three-row pane the bands demand `body 1 + prompt 2 + info 1 =
+/// 4`, and ratatui resolves the overflow by shrinking the prompt — so adding this row
+/// unconditionally leaves a one-row composer whose only row is the spacer, which is nowhere to
 /// type. [`PROMPT_MIN_ROWS`] calls two rows the least that can be typed into, and that floor
-/// outranks knowing which directory you are in.
+/// outranks knowing which directory you are in. The reply identity is not part of this minimum:
+/// the conversation layout admits it only when two rows remain above the prompt, preserving one
+/// row of transcript first.
 ///
 /// The threshold is the sum of those minimums rather than a chosen number, so it cannot drift
 /// away from the bands it protects: raise [`PROMPT_MIN_ROWS`] and this moves with it. Above it
@@ -130,23 +132,24 @@ const STATUS_ROWS: u16 = 1;
 /// split and [`welcome_tail_rows`]'s subtraction — and a frame whose tail was computed against
 /// a row the split then dropped is off centre by one.
 pub(crate) const fn info_rows(height: u16) -> u16 {
-    if height >= 1 + PROMPT_MIN_ROWS + STATUS_ROWS + INFO_ROWS {
+    if height >= 1 + PROMPT_MIN_ROWS + INFO_ROWS {
         INFO_ROWS
     } else {
         0
     }
 }
 
-/// Rows reserved for the ambient info row below the strip.
+/// Rows reserved for the ambient or live footer.
 ///
 /// One, and always drawn — on the welcome screen as well as mid-conversation. Both halves of
 /// that are taken from a real `opencode 1.18.18` pane rather than chosen: measured at 120x32,
 /// its welcome frame carries the working directory on the frame's **last** row while the
 /// composer sits centred above it, and its conversation frame carries the same row with the
-/// command hints moved onto its right end. So the row is not a property of having a
-/// conversation, and a row that appeared with the first message would move the composer up by
-/// one the instant a reply landed — the objection [`PROMPT_PREFERRED_ROWS`] records about the
-/// prompt's height, applied to the frame's floor.
+/// command hints moved onto its right end. While a turn runs, the same row becomes the pulse,
+/// interrupt control, context occupancy, and command hint. So the row is not a property of
+/// having a conversation, and a row that appeared with the first message would move the
+/// composer up by one the instant a reply landed — the objection
+/// [`PROMPT_PREFERRED_ROWS`] records about the prompt's height, applied to the frame's floor.
 const INFO_ROWS: u16 = 1;
 
 /// The prompt's survival floor, its preferred floor, and the share it may grow to.
@@ -171,10 +174,10 @@ const INFO_ROWS: u16 = 1;
 /// different applications.
 ///
 /// **Four rather than five, and the arithmetic is the reason.** On a 24-row pane — the
-/// shortest common one — the status strip takes one row and the transcript keeps the rest:
-/// 21 rows at a floor of two, 20 at three, 19 at four, 18 at five. Four spends two of the
-/// user's twenty-one transcript rows; five spends three. Both sit inside the range the
-/// report asked for, and the cheaper one is the one to take.
+/// shortest common one — the fixed footer takes one row and a populated conversation may
+/// reserve one reply-identity row. A four-row composer still leaves eighteen rows for the
+/// transcript, while a five-row composer spends one more row without improving a
+/// single-line edit. Four is the cheaper stable floor.
 ///
 /// The cap is a third because the prompt is only ever half of a conversation: a pasted diff
 /// allowed to take the whole height would evict the transcript it is about to be sent
@@ -196,9 +199,9 @@ const PROMPT_MAX_SHARE: u16 = 3;
 ///
 /// Taken from `codex`: the gutter and its marker, a column of air on the right, and a blank
 /// row under the text so the caret never sits on the terminal's last line. Not taken:
-/// `codex`'s *top* inset, because the status strip is a filled row directly **below** — see
-/// the band order in [`Component::render`] — and a second blank row above would spend a
-/// transcript row on separation the strip already supplies from the other side.
+/// `codex`'s *top* inset, because the reply identity already separates the transcript from
+/// the composer when present, while a short reply intentionally leaves its unused viewport
+/// below that identity. A second fixed inset would spend a transcript row in both cases.
 ///
 /// # The band's own surface is the third element of that containment, and it was missing
 ///
@@ -212,13 +215,9 @@ const PROMPT_MAX_SHARE: u16 = 3;
 /// surface above it is not a region.
 ///
 /// It is filled with [`crate::views::ViewContext::element`] instead, the role documented as the
-/// fill behind an inset element, and the role [`crate::views::message::StatusView`] already
-/// uses — which is the proof it reads on a real terminal, since the strip is the one row of
-/// this composite a user could always see. Strip and band therefore share a surface and read as
-/// one composer with a status *footer*, which is `codex`'s bottom pane
-/// (`.omo/refs/codex/codex-rs/tui/src/chatwidget/rendering.rs:49-56`, status and composer in one
-/// `bottom_pane`) and is the same judgement the refused top inset already recorded: the strip
-/// belongs to the prompt it describes.
+/// fill behind an inset element. The live status remains on the final frame row rather than
+/// sharing the composer's fill: that keeps the pulse and interrupt affordance fixed while the
+/// reply identity follows the response above the composer.
 ///
 /// # The fill alone is not a box, and at full width it never was
 ///
@@ -259,17 +258,32 @@ const INTERRUPT_CONFIRM_WINDOW_MS: u64 = 1_500;
 /// What separates the info row's right-hand facts from each other.
 ///
 /// The transcript's own `·` rather than two spaces, so the row reads as one list; the status
-/// strip above joins its state fields with the same glyph.
+/// footer joins its state fields with the same glyph.
 const INFO_SEPARATOR: &str = " · ";
 
 /// The fewest columns the info row keeps for the directory before dropping a right-hand fact.
 ///
 /// A path elided to four columns is `…uno`, which names no directory — so on a narrow pane the
 /// context figure and then the key hint yield instead, and the path keeps its tail. That is the
-/// opposite priority from the status strip, and deliberately: the strip's last survivor is the
-/// exit key because it is the only way out, while this row's reason to exist is saying *where
-/// you are*.
+/// opposite priority from the live footer, and deliberately: during work the footer's last
+/// survivor is the interrupt affordance, while this idle row's reason to exist is saying
+/// *where you are*.
 const INFO_MIN_DIRECTORY_COLS: usize = 8;
+
+/// Compact token count used by the live footer.
+///
+/// Upper-case suffixes match the compact work-state vocabulary used by the
+/// reference surface, while one decimal keeps pressure changes visible before a
+/// whole-thousand boundary.
+fn compact_live_tokens(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
 
 /// One blank column between the transcript and the ambient sidebar's rule.
 ///
@@ -296,9 +310,9 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// the band is what this balances:
 ///
 /// ```text
-/// height = above + band + STATUS_ROWS + tail + INFO_ROWS   (the frame, by definition)
-/// below  = STATUS_ROWS + tail + INFO_ROWS = (height - band) / 2
-///   ⟹    tail = (height - band) / 2 - STATUS_ROWS - INFO_ROWS
+/// height = above + band + tail + INFO_ROWS   (the frame, by definition)
+/// below  = tail + INFO_ROWS = (height - band) / 2
+///   ⟹    tail = (height - band) / 2 - INFO_ROWS
 ///   ⟹    above = ⌈(height - band) / 2⌉
 /// ```
 ///
@@ -307,16 +321,14 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// band and the tail move in opposite directions by the same amount, so a prompt growing from
 /// four rows to ten stays centred the whole way.
 ///
-/// **Every row drawn below the band is subtracted, because that is where it is drawn.** The
-/// strip used to sit above, and a tail of `(height - band) / 2` balanced the band exactly. Now
-/// that the strip is the composer's footer and [`INFO_ROWS`] sits under it, the unsubtracted
-/// tail leaves the band two rows off centre — those two rows, counted twice — so this is not a
-/// tweak, it is what keeps this function measuring the thing its name claims. Add a band below
-/// the prompt and it has to be subtracted here or the centring silently drifts by its height.
+/// **Every row drawn below the band is subtracted, because that is where it is drawn.**
+/// [`INFO_ROWS`] is the only fixed band below the welcome composer; the reply identity
+/// does not exist on this surface. Add another band below the prompt and it has to be
+/// subtracted here or the centring silently drifts by its height.
 ///
 /// # The head bounds it, and that is the only thing that can push the band off centre
 ///
-/// The rows above the band are not free: the head and the status strip live there, so the tail
+/// The rows above the band are not free: the welcome head lives there, so the tail
 /// cannot exceed `body_max - head` without clipping the wordmark. Both terms are taken and the
 /// smaller wins. With a nine-row head the centring term is the smaller one from twenty-four
 /// rows up — every common pane — and the head term binds only below that, where the frame
@@ -333,13 +345,9 @@ const SIDEBAR_GAP_COLS: u16 = 1;
 /// is load-bearing rather than defensive: without it a head measured as zero rows would let
 /// the tail take the entire region.
 ///
-/// A fourth band rather than moving the prompt out of the split: the order
-/// body / prompt / status / tail is what every other assertion about this screen measures from,
-/// and the strip has to stay directly attached to the prompt it describes — below it, so the
-/// agent and model read as the composer's footer rather than as a header the transcript wears.
-/// Lifting the pair by a tail keeps that order and every existing row relationship intact, and
-/// reduces to today's exact layout the moment a message arrives — which is what makes this cost
-/// nothing in the state the user spends their time in.
+/// A separate tail rather than moving the prompt out of the split keeps welcome
+/// centring independent from the conversation layout. The tail becomes zero the moment
+/// a message arrives.
 ///
 /// This is *not* a per-keystroke reflow: the tail is a function of the frame, of the band and
 /// of whether the transcript is empty. Typing into the prompt changes the band's height, and
@@ -348,9 +356,7 @@ fn welcome_tail_rows(empty: bool, height: u16, band: u16, body_max: u16, head: u
     if !empty {
         return 0;
     }
-    let centred = (height.saturating_sub(band) / 2)
-        .saturating_sub(STATUS_ROWS)
-        .saturating_sub(info_rows(height));
+    let centred = (height.saturating_sub(band) / 2).saturating_sub(info_rows(height));
     let room = body_max.saturating_sub(head.max(1));
     centred.min(room)
 }
@@ -468,8 +474,8 @@ fn prompt_rows(content_lines: usize, height: u16) -> u16 {
 fn prompt_frame(band: Rect) -> (Option<Rect>, Rect) {
     // Clamped to the band rather than floored at one: a `max(1)` here fabricates a row the
     // band does not own, and writing into it panics inside ratatui's buffer. The three-band
-    // split really does hand out a zero-row prompt — on a one-row viewport the status strip
-    // takes the only row — so this is a reachable input, not a defensive branch.
+    // split really does hand out a zero-row prompt — on a one-row viewport the footer takes
+    // the only row — so this is a reachable input, not a defensive branch.
     let content_height = if band.height <= PROMPT_SPACER_ROWS {
         band.height
     } else {
@@ -523,7 +529,7 @@ enum InterruptNotice {
     Stopping,
 }
 
-/// The transcript, the status strip and the prompt as one screen.
+/// The transcript, reply identity, composer, and live footer as one screen.
 pub struct SessionScreen {
     transcript: TranscriptView,
     transcript_full: bool,
@@ -1204,11 +1210,9 @@ impl SessionScreen {
 
     /// Append a language-server report to the transcript.
     ///
-    /// A method rather than letting the host reach through `transcript_mut` because the
-    /// report should also reach the status strip, and a host that pushed the message
-    /// itself would have to remember to do both.
+    /// A method rather than letting the host reach through `transcript_mut`, so every
+    /// diagnostics producer uses the same durable-looking transcript representation.
     pub fn report_diagnostics(&mut self, report: crate::views::lsp::Report) {
-        self.status.set_diagnostics(report.summary());
         self.transcript
             .transcript_mut()
             .push(Message::diagnostics(report));
@@ -1272,6 +1276,19 @@ impl SessionScreen {
     /// State what the pickers offer.
     #[must_use]
     pub fn with_catalog(mut self, catalog: SessionCatalog) -> Self {
+        self.status.set_model_names(
+            catalog
+                .models
+                .iter()
+                .map(|model| (model.id.clone(), model.name.clone())),
+        );
+        if let Some(agent) = catalog.agent.as_deref() {
+            self.status.set_configured_agent(agent);
+        }
+        if let Some(model) = catalog.model.as_deref() {
+            self.status.set_configured_model(model);
+        }
+        self.status.set_effort(catalog.effort);
         self.catalog = catalog;
         self
     }
@@ -1292,7 +1309,7 @@ impl SessionScreen {
         &mut self.catalog
     }
 
-    /// The status strip, for the host that states the configured agent and model.
+    /// The reply identity, for the host that states the configured agent and model.
     pub const fn status_mut(&mut self) -> &mut StatusView {
         &mut self.status
     }
@@ -1535,8 +1552,8 @@ impl SessionScreen {
     /// above the dialog for exactly this case, and `§6.1` names copy feedback as the
     /// example of a fact that must not interrupt the input flow.
     ///
-    /// Not the status strip either: the strip carries state that persists, and a notice
-    /// pinned there would still be claiming a copy minutes later.
+    /// Not the reply identity or footer either: neither is durable notification history,
+    /// and a notice pinned there would still be claiming a copy minutes later.
     fn copy(&mut self, text: String) -> EventResult {
         // An empty buffer with nothing selected is not a copy, and writing the empty
         // string would destroy whatever the user already had on their clipboard.
@@ -1618,8 +1635,8 @@ impl Component for SessionScreen {
             return;
         }
         let empty = self.welcome_active();
-        // Split the whole frame first. The transcript, prompt, status and info row now share
-        // one left column, so none of those bands can run underneath the sidebar.
+        // Split the whole frame first. The transcript, reply identity, prompt, and footer
+        // share one left column, so none of those bands can run underneath the sidebar.
         let sidebar_drawn = sidebar_drawn(self.sidebar_visible, empty, area.width);
         let (content, gap, aside) = if sidebar_drawn {
             let content = content_bounds(area, true);
@@ -1640,26 +1657,47 @@ impl Component for SessionScreen {
         if let Some(gap) = gap {
             crate::views::fill(frame.buffer_mut(), gap, self.context.surface());
         }
-        let (prompt_band, tail) = self.prompt_and_tail(content.width, content.height);
-        let interrupt_rows = self.interrupt_rows_at(now_ms);
-        // Prompt above strip: the agent and the model are what the *composer* is set to, so they
-        // belong under the box the way a caption belongs under a figure. See `welcome_tail_rows`,
-        // which counts the strip among the rows below the band for exactly this reason.
-        // The info row is last, so `body / prompt / status / tail` — the order every other
-        // assertion about this screen measures from — is untouched and the new band is appended
-        // rather than inserted. That is also where the reference puts it: a real
-        // `opencode 1.18.18` frame carries its directory row on the terminal's final line,
-        // under the composer on a used session and under the whole welcome surface on an empty
-        // one. See `INFO_ROWS`.
-        let [body, interrupt, prompt, status, tail, info] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(interrupt_rows),
-            Constraint::Length(prompt_band),
-            Constraint::Length(STATUS_ROWS),
-            Constraint::Length(tail),
-            Constraint::Length(info_rows(content.height)),
-        ])
-        .areas(content);
+        let (prompt_band, welcome_tail) = self.prompt_and_tail(content.width, content.height);
+        let info_height = info_rows(content.height);
+        let transcript_width = if !empty && self.scrollbar_visible && content.width > 1 {
+            content.width - 1
+        } else {
+            content.width
+        };
+        // The identity belongs to the reply, not the composer. A short reply therefore
+        // keeps only the rows it actually needs and leaves the remaining viewport below
+        // its identity. Once the transcript consumes the available pane, that spare run
+        // reaches zero and the same identity row becomes sticky immediately above the
+        // composer. The welcome screen retains its centred input band and has no identity.
+        let (body, identity, spacer, prompt, info) = if empty {
+            let [body, prompt, spacer, info] = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(prompt_band),
+                Constraint::Length(welcome_tail),
+                Constraint::Length(info_height),
+            ])
+            .areas(content);
+            (body, Rect::default(), spacer, prompt, info)
+        } else {
+            let available = content
+                .height
+                .saturating_sub(prompt_band.saturating_add(info_height));
+            let identity_rows = u16::from(self.status.has_identity() && available > IDENTITY_ROWS);
+            let capacity = available.saturating_sub(identity_rows);
+            let measured = u16::try_from(self.transcript.measure_content_height(transcript_width))
+                .unwrap_or(u16::MAX);
+            let transcript_rows = measured.max(1).min(capacity);
+            let spacer_rows = capacity.saturating_sub(transcript_rows);
+            let [body, identity, spacer, prompt, info] = Layout::vertical([
+                Constraint::Length(transcript_rows),
+                Constraint::Length(identity_rows),
+                Constraint::Length(spacer_rows),
+                Constraint::Length(prompt_band),
+                Constraint::Length(info_height),
+            ])
+            .areas(content);
+            (body, identity, spacer, prompt, info)
+        };
 
         let (main, scrollbar) = if !empty && self.scrollbar_visible && body.width > 1 {
             let [main, scrollbar] =
@@ -1698,8 +1736,8 @@ impl Component for SessionScreen {
             }
         }
 
-        // Both the panel and the strip read the transcript's single accumulator rather than
-        // folding the provider stream again, which is what keeps the two token figures on
+        // Both the panel and the footer read the transcript's single accumulator rather than
+        // folding the provider stream again, which is what keeps the two context figures on
         // screen from ever disagreeing.
         //
         // Refreshed on *every* frame, and that is a fix rather than a move. It used to happen
@@ -1743,7 +1781,7 @@ impl Component for SessionScreen {
         // tip and the hint grid — which fills them itself. The `empty` guard is the same one
         // the head is drawn under, and it is what stops a hint block from surviving under a
         // transcript.
-        crate::views::fill(frame.buffer_mut(), tail, self.context.surface());
+        crate::views::fill(frame.buffer_mut(), spacer, self.context.surface());
         if empty {
             // The full frame width, and so is the head's region: the two halves of this surface
             // centre their rows independently, so both have to be handed the same measure or the
@@ -1752,15 +1790,14 @@ impl Component for SessionScreen {
             // began at column 25 and `type / for commands` at column 39, fourteen columns apart
             // and reading as two unrelated blocks. The panel is no longer drawn on this screen
             // at all (see `sidebar_drawn`), so the shared measure is simply the frame.
-            self.welcome.render_foot(frame, tail);
+            self.welcome.render_foot(frame, spacer);
         }
         // The composer's two rows are narrower than the frame, so the columns beside them belong
         // to the body surface and are painted with it *first* — an unpainted margin keeps
         // ratatui's `Color::Reset` and renders as the terminal's own background, which is the
         // colour seam the centring band's fill exists to avoid, reintroduced sideways.
         crate::views::fill(frame.buffer_mut(), prompt, self.context.surface());
-        crate::views::fill(frame.buffer_mut(), status, self.context.surface());
-        self.render_interrupt(frame, interrupt, empty, now_ms);
+        crate::views::fill(frame.buffer_mut(), identity, self.context.surface());
         let composer = composer_region(prompt, empty);
         // The whole band is painted next, so the spacer row and the right inset carry the
         // prompt's own background rather than whatever the previous frame left there. `element`
@@ -1768,12 +1805,9 @@ impl Component for SessionScreen {
         // transcript already uses, which is why four allocated rows read as one. See
         // `PROMPT_GUTTER_COLS`.
         crate::views::fill(frame.buffer_mut(), composer, self.context.element());
-        // Narrowed to the same region as the band it describes, and by the same call: a
-        // full-width strip under a centred box would put the composer's own footer on a
-        // different axis from the composer.
-        self.status.render(frame, composer_region(status, empty));
-        self.composer_rules(frame, prompt.union(status), composer);
-        self.render_info(frame, info);
+        self.status.render(frame, identity);
+        self.composer_rules(frame, prompt, composer);
+        self.render_info(frame, info, now_ms);
         let (gutter, buffer) = prompt_frame(composer);
         if let Some(gutter) = gutter {
             crate::views::editor::PromptGutter::new(self.context.clone(), PROMPT_MARKER.to_owned())
@@ -1886,74 +1920,143 @@ impl SessionScreen {
         }
     }
 
-    /// Draw the ambient info row: the working directory, the context spend, the command key.
+    /// Draw the session footer.
     ///
-    /// # A third surface, deliberately, and why the strip could not carry these
+    /// Idle frames state the directory, context occupancy and command key. An active
+    /// turn replaces the directory with one compact control surface: animated pulse,
+    /// interrupt key, context occupancy and command discovery. It remains the final row
+    /// in both states, so starting, confirming or stopping a turn never reflows the
+    /// transcript or composer.
     ///
-    /// The strip directly above states what the *composer is set to* — agent, model, step,
-    /// and what the turn is blocked on. These three facts are about the **session's
-    /// surroundings** and none of them changes when a turn does, which is why
-    /// [`StatusView::reset`](crate::views::message::StatusView) would be wrong for them: it
-    /// clears the strip at every turn boundary on the grounds that the strip reports what is
-    /// happening rather than what last happened. A directory does not stop being true when a
-    /// turn ends.
-    ///
-    /// So it is its own band with its own surface — [`crate::views::ViewContext::muted`] on the
-    /// body's background, where the strip is [`crate::views::ViewContext::element`]. That is
-    /// what makes it read as a footer *outside* the composer rather than as a second row of it,
-    /// and it is why it spans the frame while the composer does not: it belongs to the screen,
-    /// not to the box.
-    ///
-    /// # Three facts and no more, in ascending priority
+    /// # Idle facts, in ascending priority
     ///
     /// The directory is truncated from the left when it does not fit
     /// ([`crate::views::ambient::elide_left`], whose note explains why the tail is what
     /// identifies a path), and the right-hand pair is dropped whole rather than cut — the same
-    /// ladder [`StatusView::trailers`](crate::views::message::StatusView) uses, for the same
-    /// reason: a fragment of a key name names no key.
+    /// same all-or-nothing rule the live footer uses, for the same reason: a fragment of a
+    /// key name names no key.
     ///
     /// The command hint comes from [`crate::views::pressable_label`] rather than a literal, so
     /// a user who rebound `command_list` is told their own chord. A hint that resolves to
     /// nothing is omitted instead of printed as `none`.
-    fn render_info(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn render_info(&self, frame: &mut Frame<'_>, area: Rect, now_ms: u64) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         crate::views::fill(frame.buffer_mut(), area, self.context.surface());
+        let line = if self.status.is_running() || self.interrupt_notice_at(now_ms).is_some() {
+            self.live_info_line(area.width, now_ms)
+        } else {
+            self.info_line(area.width)
+        };
         ratatui::widgets::Widget::render(
-            ratatui::widgets::Paragraph::new(vec![self.info_line(area.width)])
-                .style(self.context.surface()),
+            ratatui::widgets::Paragraph::new(vec![line]).style(self.context.surface()),
             area,
             frame.buffer_mut(),
         );
     }
 
-    fn render_interrupt(&self, frame: &mut Frame<'_>, area: Rect, welcome: bool, now_ms: u64) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        crate::views::fill(frame.buffer_mut(), area, self.context.surface());
-        let Some(notice) = self.interrupt_notice_at(now_ms) else {
-            return;
-        };
-        let region = composer_region(area, welcome);
+    /// The active turn's one-line control surface.
+    fn live_info_line(&self, width: u16, now_ms: u64) -> ratatui::text::Line<'static> {
         let key = crate::views::key_label("session_interrupt", &self.context)
+            .map(|key| {
+                if key == "escape" {
+                    String::from("esc")
+                } else {
+                    key
+                }
+            })
             .unwrap_or_else(|| String::from("esc"));
-        let (text, style) = match notice {
-            InterruptNotice::Confirm => (
-                format!(" {key} again to stop the active turn"),
-                self.context.warning(),
-            ),
-            InterruptNotice::Stopping => (
-                String::from(" Stopping the active turn…"),
-                self.context.muted(),
-            ),
-        };
-        ratatui::widgets::Widget::render(
-            ratatui::widgets::Paragraph::new(crate::views::padded(&text, region.width, style)),
-            region,
-            frame.buffer_mut(),
-        );
+        let mut left = vec![ratatui::text::Span::styled(
+            String::from(" "),
+            self.context.surface(),
+        )];
+        match (
+            self.status.awaiting_user(),
+            self.interrupt_notice_at(now_ms),
+        ) {
+            (Some(awaiting), _) => {
+                left.push(ratatui::text::Span::styled(
+                    String::from("△ "),
+                    self.context.warning(),
+                ));
+                left.push(ratatui::text::Span::styled(
+                    awaiting.status_text().to_owned(),
+                    self.context.warning(),
+                ));
+            }
+            (None, Some(InterruptNotice::Stopping)) => {
+                left.push(ratatui::text::Span::styled(
+                    String::from("interrupting…"),
+                    self.context.muted(),
+                ));
+            }
+            (None, Some(InterruptNotice::Confirm)) => {
+                left.push(ratatui::text::Span::styled(
+                    format!("{} ", self.transcript.transcript().work_pulse()),
+                    self.context.warning(),
+                ));
+                left.push(ratatui::text::Span::styled(key, self.context.warning()));
+                left.push(ratatui::text::Span::styled(
+                    String::from(" again to interrupt"),
+                    self.context.warning(),
+                ));
+            }
+            (None, None) => {
+                left.push(ratatui::text::Span::styled(
+                    format!("{} ", self.transcript.transcript().work_pulse()),
+                    self.context.accent(),
+                ));
+                left.push(ratatui::text::Span::styled(key, self.context.title()));
+                left.push(ratatui::text::Span::styled(
+                    String::from(" interrupt"),
+                    self.context.muted(),
+                ));
+            }
+        }
+
+        let ambient = self.sidebar.ambient();
+        let context = ambient.context.map(|context| {
+            format!(
+                "{} ({:.0}%)",
+                compact_live_tokens(context.prompt_tokens),
+                context.percent()
+            )
+        });
+        let commands = crate::views::pressable_label("command_list", &self.context)
+            .map(|key| format!("{key} commands"));
+        let mut trailing = Vec::new();
+        if let Some(context) = context {
+            trailing.push(context);
+        }
+        if let Some(commands) = commands {
+            trailing.push(commands);
+        }
+
+        let columns = usize::from(width);
+        let left_width = crate::views::markdown::row_width(&left);
+        // Richest first. On a narrow pane command discovery yields before context,
+        // because context pressure is the active turn's safety signal.
+        for keep in (0..=trailing.len()).rev() {
+            let right = trailing[..keep].join(INFO_SEPARATOR);
+            let right_width = crate::views::display_width(&right);
+            let minimum_gap = usize::from(!right.is_empty());
+            if left_width + right_width + minimum_gap > columns {
+                continue;
+            }
+            let gap = columns.saturating_sub(left_width + right_width);
+            let mut spans = left;
+            spans.push(ratatui::text::Span::styled(
+                " ".repeat(gap),
+                self.context.surface(),
+            ));
+            if !right.is_empty() {
+                spans.push(ratatui::text::Span::styled(right, self.context.muted()));
+            }
+            return ratatui::text::Line::from(spans);
+        }
+
+        ratatui::text::Line::from(crate::views::markdown::truncate_row(left, columns))
     }
 
     /// The info row's single line, for a `width`-column frame.
@@ -1971,12 +2074,12 @@ impl SessionScreen {
         }
         if let Some(key) = crate::views::pressable_label("command_list", &self.context) {
             trailing.push(format!("{key} commands"));
-        }
+        };
         let columns = usize::from(width);
         let muted = self.context.muted();
         // Rungs richest first, dropping the leftmost — which is to say the lowest-ranked —
         // field still present, so the right edge does not reflow as the terminal narrows. The
-        // same construction `StatusView::trailers` documents.
+        // same all-or-nothing trailer construction the live footer uses.
         for dropped in 0..=trailing.len() {
             let trailer = trailing[dropped..].join(INFO_SEPARATOR);
             let right = crate::views::display_width(&trailer);
@@ -2022,7 +2125,7 @@ impl SessionScreen {
     ///
     /// The head is **bottom-anchored** in the body region — [`WelcomeView::lines_in`] pads
     /// with blank rows above it, deliberately, so the brand sits directly on the status
-    /// strip. Those leading rows are the only part of this screen that is blank by
+    /// prompt. Those leading rows are the only part of this screen that is blank by
     /// construction, so notices drawn there displace nothing: `head_rows`,
     /// [`welcome_tail_rows`], [`composer_region`] and the band order are all untouched, and
     /// the head can never be clipped because the region handed over is what is left after
@@ -2054,10 +2157,11 @@ impl SessionScreen {
         // question than the one the tail was computed from — see `WelcomeView::head_rows`.
         let head = self.welcome.head_rows(main.width, frame_height);
         let blank = main.height.saturating_sub(head);
-        let rows = wanted.min(blank);
-        if rows == 0 {
-            return;
-        }
+        // Prefer the blank run above the welcome head, but never let decorative
+        // welcome content make an actionable startup diagnostic disappear on a short
+        // pane. When both cannot fit, the notice overlays the top of the welcome
+        // region; the composer and footer remain untouched.
+        let rows = wanted.min(main.height);
         let area = Rect {
             x: main.x,
             y: main.y.saturating_add(blank.saturating_sub(rows)),
@@ -2069,7 +2173,6 @@ impl SessionScreen {
 
     pub(crate) fn prompt_and_tail(&self, width: u16, height: u16) -> (u16, u16) {
         let band = prompt_rows(self.editor.height(), height);
-        let interrupt = self.interrupt_rows_at(self.now_ms());
         let empty = self.welcome_active();
         // At the *frame* height and the *frame* width — the same pair `WelcomeView::render`
         // decides the wordmark from. The width is no longer adjusted for the panel because the
@@ -2091,18 +2194,11 @@ impl SessionScreen {
             0
         };
         // Every band other than the body and the tail, which is what `body_max` means: the rows
-        // the body would get if the tail took none. `info_rows` belongs here for the same reason
-        // `STATUS_ROWS` does, and leaving it out is not a rounding error — it overstates the
-        // room the tail may take by one, so the tail takes a row the body needed and the head
-        // this term exists to protect is clipped by exactly that row. Measured: a startup notice
-        // at 40 columns lost its first line, and a CJK notice reassembled to a *suffix* of
-        // itself because the transcript follows its newest row.
-        let body_max = height.saturating_sub(
-            STATUS_ROWS
-                .saturating_add(info_rows(height))
-                .saturating_add(interrupt)
-                .saturating_add(band),
-        );
+        // the body would get if the tail took none. `info_rows` belongs here, and leaving it
+        // out is not a rounding error — it overstates the room the tail may take by one, so
+        // the tail takes a row the body needed and the head this term exists to protect is
+        // clipped by exactly that row.
+        let body_max = height.saturating_sub(info_rows(height).saturating_add(band));
         (band, welcome_tail_rows(empty, height, band, body_max, head))
     }
 
@@ -2113,10 +2209,6 @@ impl SessionScreen {
         self.interrupt_armed_at_ms
             .filter(|armed| now_ms.saturating_sub(*armed) <= INTERRUPT_CONFIRM_WINDOW_MS)
             .map(|_| InterruptNotice::Confirm)
-    }
-
-    fn interrupt_rows_at(&self, now_ms: u64) -> u16 {
-        u16::from(self.interrupt_notice_at(now_ms).is_some())
     }
 
     fn prune_interrupt_at(&mut self, now_ms: u64) -> bool {
@@ -2221,6 +2313,7 @@ impl SessionScreen {
     fn mark_turn_accepted(&mut self) {
         self.cancel_requested = false;
         self.interrupt_armed_at_ms = None;
+        self.transcript.transcript_mut().mark_running();
         self.status.mark_running();
     }
 
@@ -2876,7 +2969,7 @@ impl SessionScreen {
     /// `§8.7`'s status census, with the MCP group read live at open time.
     ///
     /// Always present, unlike the pickers: a census whose groups are all empty is itself
-    /// the answer to "why is nothing working", so returning `None` here would replace a
+    /// the answer to "why is nothing happening", so returning `None` here would replace a
     /// useful report with "nothing to choose from here yet".
     fn status_panel(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
         let mcp = self
@@ -3032,7 +3125,7 @@ impl SessionScreen {
 impl SessionScreen {
     /// Adopt a picker's answer, and forward it to whoever can act on it.
     ///
-    /// The strip and the welcome facts are updated here so the choice is visible
+    /// The reply identity and welcome facts are updated here so the choice is visible
     /// immediately, while the sink carries it to the host that can only apply it to the
     /// *next* turn. Saying so is the point: a model that changed on screen but not in the
     /// running turn, with nothing said, is a surface that lies.
@@ -3048,7 +3141,7 @@ impl SessionScreen {
     ///
     /// * It is **permanent.** A confirmation of a switch is true for one moment and is
     ///   then exported, re-read and re-rendered forever as though it were part of the
-    ///   conversation. The durable answer already lives on the status strip, which states
+    ///   conversation. The durable answer already lives on the reply identity, which states
     ///   the agent and the model on every frame.
     /// * It is **invisible when it matters.** A picker's answer is routed while the picker
     ///   is closing, and a transcript row lands behind whatever modal is still up.
@@ -3187,9 +3280,9 @@ impl SessionScreen {
     ///
     /// Reports through a toast where the picker pushes a transcript notice: cycling is
     /// exploratory and repeated, so walking seven agents would leave seven permanent rows in
-    /// a transcript being read for a reply, and the status strip already holds the durable
+    /// a transcript being read for a reply, and the reply identity already holds the durable
     /// answer. A refused sink still reports, at warning grade — a key that appears to switch
-    /// and reaches nothing is worse than a dead one, because the strip agrees with it.
+    /// and reaches nothing is worse than a dead one, because the identity agrees with it.
     ///
     /// Mid-turn is not special-cased, deliberately: `drive_turns` reads this channel only
     /// between turns, the same deferral the MCP toggle relies on.
@@ -3242,10 +3335,10 @@ impl SessionScreen {
     /// Track whether the newly chosen model reasons, and drop a level it cannot use.
     ///
     /// Both halves matter. Keeping `reasoning` stale leaves the cycling key looking live
-    /// on a model that ignores it; keeping the level itself would leave `think:high` on
-    /// the strip next to a model whose request carries no such control — the exact lie
+    /// on a model that ignores it; keeping the level itself would leave `(high)` on
+    /// the reply identity next to a model whose request carries no such control — the exact lie
     /// this feature must not tell. The host reaches the same conclusion independently in
-    /// `session_reasoning_options`, so the strip and the wire agree.
+    /// `session_reasoning_options`, so the identity and the wire agree.
     ///
     /// A model absent from the catalog list leaves both untouched: an unknown row is not
     /// evidence that reasoning went away.
@@ -3280,7 +3373,7 @@ impl SessionScreen {
     /// A level only means something if the request carries it, and the request carries it
     /// only when the catalog says the model reasons — `session_reasoning_options` in
     /// `zuno-cli/src/cmd/turn.rs` returns nothing otherwise. Cycling here anyway would
-    /// give a key that changes the strip and nothing else, which is the failure this
+    /// give a key that changes the identity and nothing else, which is the failure this
     /// project has removed repeatedly. The toast names the model so the refusal is
     /// actionable: the answer is to switch models, not to press harder.
     ///
@@ -3345,9 +3438,7 @@ impl ActionComponent for SessionScreen {
         let content = content_bounds(area, sidebar_drawn(self.sidebar_visible, empty, area.width));
         let composer = composer_region(content, empty);
         Some(Rect {
-            height: composer
-                .height
-                .saturating_sub(STATUS_ROWS.saturating_add(info_rows(content.height))),
+            height: composer.height.saturating_sub(info_rows(content.height)),
             ..composer
         })
     }
@@ -3601,7 +3692,7 @@ impl ActionComponent for SessionScreen {
         self.modal = active;
         // Only tool-owned human-input prompts make the turn wait on the user. A picker or
         // help view is something the user opened while work continued, so suppressing the
-        // spinner behind those would claim the turn had stopped when it had not.
+        // pulse behind those would claim the turn had stopped when it had not.
         let awaiting = match active {
             Some(crate::views::permission::DIALOG_ID) => {
                 Some(crate::views::message::AwaitingUser::Approval)
@@ -3611,10 +3702,9 @@ impl ActionComponent for SessionScreen {
             }
             _ => None,
         };
-        // Both surfaces, from one answer. The transcript's spinner is only on screen once
-        // a turn has produced a message — before that the welcome surface has the area and
-        // the strip is the only row saying anything about state, so fixing one and not the
-        // other leaves the claim on whichever surface the user is actually looking at.
+        // Both projections, from one answer. The transcript retains the state for activity
+        // rendering and the reply identity exposes it to the fixed footer; updating only one
+        // would let the two surfaces disagree about who the turn is waiting on.
         self.transcript.transcript_mut().set_awaiting_user(awaiting);
         self.status.set_awaiting_user(awaiting);
     }

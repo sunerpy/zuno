@@ -286,6 +286,27 @@ Enter, Space for multi-select, and mouse selection. Per-question cursors and
 custom drafts survive navigation. Cancelling either interaction resolves the
 tool as a typed denial and never fabricates an answer.
 
+The conversation surface separates reply identity from transient work state. The
+identity row contains the resolved agent, catalog model display name, and configured
+reasoning effort. It follows the bottom of a short assistant reply; once transcript
+content fills the available viewport, the same row becomes sticky immediately above
+the composer. It does not invent cost or speed multipliers when no authoritative
+runtime metadata exists.
+
+The frame's final row is the live control surface. During a turn it shows one
+animation-clock-driven pulse, the resolved interrupt key, latest provider-prompt
+occupancy, and the command-list key. The first interrupt press changes that same row
+to its confirmation state, so the transcript and composer do not reflow. Permission
+and question waits replace the pulse with their explicit reason. When idle, the row
+returns to directory, context, and command discovery. Transient `working` rows are not
+inserted into the transcript; durable activity, errors, interruption markers, and
+assistant content remain reconstructable from session events.
+
+Context occupancy is the most recent complete provider prompt divided by the catalog
+context limit. It is replaced on each provider report rather than accumulated across
+the session; cumulative disjoint token buckets remain available in the usage
+projection and sidebar.
+
 ## Compaction and hard interruption
 
 `/compact` invokes the hidden compaction agent through the live `TurnHost`; it
