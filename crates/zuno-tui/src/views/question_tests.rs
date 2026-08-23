@@ -105,14 +105,14 @@ fn views_question_prompt_renders_offscreen() {
     )
     .join("\n");
     assert!(
-        joined.contains("Build fix"),
-        "the header is missing:\n{joined}"
+        joined.contains("Question 1/1 (1 unanswered) · Build fix"),
+        "the progress header is missing:\n{joined}"
     );
     assert!(
         joined.contains("The build fails on Windows only"),
         "the question text is missing:\n{joined}"
     );
-    for label in ["Rewrite", "Patch", "Skip"] {
+    for label in ["1. Rewrite", "2. Patch", "3. Skip"] {
         assert!(
             joined.contains(label),
             "option {label:?} missing:\n{joined}"
@@ -123,12 +123,12 @@ fn views_question_prompt_renders_offscreen() {
         "an option description is missing, so the choice is unexplained:\n{joined}"
     );
     assert!(
-        joined.contains("type your own answer"),
-        "the typed-answer affordance is missing for an open question:\n{joined}"
+        joined.contains("4. Other"),
+        "the numbered custom-answer affordance is missing:\n{joined}"
     );
     assert!(
-        joined.contains(UNANSWERED),
-        "an unanswered question does not say so:\n{joined}"
+        !joined.lines().any(|line| line.trim() == UNANSWERED),
+        "the old redundant unanswered body row is still rendered:\n{joined}"
     );
 }
 
@@ -138,7 +138,7 @@ fn views_question_closed_question_hides_the_typed_answer_row() {
     request.custom = Some(false);
     let joined = render(prompt(request), 50, 14).join("\n");
     assert!(
-        !joined.contains("type your own answer"),
+        !joined.contains("Other"),
         "a closed question offered a typed answer:\n{joined}"
     );
 }
@@ -149,7 +149,7 @@ fn views_question_multiple_renders_checkboxes() {
     request.multiple = Some(true);
     let joined = render(prompt(request), 50, 16).join("\n");
     assert!(
-        joined.contains("[ ] Rewrite"),
+        joined.contains("1. [ ] Rewrite"),
         "a multi-select question has no checkboxes:\n{joined}"
     );
 }
@@ -181,6 +181,28 @@ fn views_question_single_select_can_be_chosen_with_the_mouse() {
         body,
     );
     assert_eq!(answered(step), vec![vec![String::from("Patch")]]);
+}
+
+#[test]
+fn views_question_number_keys_select_and_submit() {
+    let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
+    let answers = answered(prompt.handle_typed(&press(KeyCode::Char('2'))));
+    assert_eq!(answers, vec![vec![String::from("Patch")]]);
+}
+
+#[test]
+fn views_question_vim_keys_move_the_option_cursor() {
+    let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
+    prompt.handle_action(
+        action("dialog.question.next_option"),
+        &press(KeyCode::Char('j')),
+    );
+    assert_eq!(prompt.cursor(), 1);
+    prompt.handle_action(
+        action("dialog.question.prev_option"),
+        &press(KeyCode::Char('k')),
+    );
+    assert_eq!(prompt.cursor(), 0);
 }
 
 #[test]
@@ -331,9 +353,40 @@ fn views_question_title_counts_the_questions() {
             QuestionRequest::new("b", "Beta", options()),
         ],
     );
-    assert_eq!(prompt.title(), "Alpha (1/2)");
+    assert_eq!(prompt.title(), "Question 1/2 (2 unanswered) · Alpha");
     prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
-    assert_eq!(prompt.title(), "Beta (2/2)");
+    assert_eq!(prompt.title(), "Question 2/2 (1 unanswered) · Beta");
+}
+
+#[test]
+fn views_question_horizontal_navigation_preserves_each_questions_cursor() {
+    let mut prompt = QuestionPrompt::new(
+        ViewContext::defaults(),
+        vec![
+            QuestionRequest::new("a", "Alpha", options()),
+            QuestionRequest::new("b", "Beta", options()),
+        ],
+    );
+    prompt.handle_action(action("dialog.select.next"), &press(KeyCode::Down));
+    assert_eq!(prompt.cursor(), 1);
+    prompt.handle_action(
+        action("dialog.question.next_question"),
+        &press(KeyCode::Right),
+    );
+    assert_eq!(prompt.current(), 1);
+    prompt.handle_action(action("dialog.select.end"), &press(KeyCode::End));
+    assert_eq!(prompt.cursor(), 3);
+    prompt.handle_action(
+        action("dialog.question.prev_question"),
+        &press(KeyCode::Left),
+    );
+    assert_eq!(prompt.current(), 0);
+    assert_eq!(prompt.cursor(), 1);
+    prompt.handle_action(
+        action("dialog.question.next_question"),
+        &press(KeyCode::Right),
+    );
+    assert_eq!(prompt.cursor(), 3);
 }
 
 #[test]
@@ -361,6 +414,7 @@ fn views_question_render_answer_joins_several_labels() {
 #[test]
 fn views_question_hints_change_for_a_multi_select() {
     let single = prompt(QuestionRequest::new("q", "h", options()));
+    assert!(single.hints().contains(&("1-9", "choose")));
     assert!(
         !single.hints().iter().any(|(key, _)| *key == "space"),
         "a single-select question offered a toggle key"

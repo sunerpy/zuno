@@ -124,30 +124,29 @@ pub struct QuestionPrompt {
     questions: Vec<QuestionRequest>,
     /// Which question is showing.
     current: usize,
-    /// Highlighted option within the current question. `options.len()` is the
-    /// "type your own" row when the question allows one.
-    cursor: usize,
+    /// Highlighted row per question. `options.len()` is the custom-answer row.
+    cursors: Vec<usize>,
     /// Selected labels per question.
     answers: Vec<Vec<String>>,
-    /// Typed text for the current question.
-    typed: String,
-    /// Whether the typed row is being edited.
-    editing: bool,
+    /// Typed custom-answer draft per question.
+    drafts: Vec<String>,
+    /// Whether each question's custom-answer row is being edited.
+    editing: Vec<bool>,
 }
 
 impl QuestionPrompt {
     /// A prompt over `questions`.
     #[must_use]
     pub fn new(context: ViewContext, questions: Vec<QuestionRequest>) -> Self {
-        let answers = vec![Vec::new(); questions.len()];
+        let count = questions.len();
         Self {
             context,
             questions,
             current: 0,
-            cursor: 0,
-            answers,
-            typed: String::new(),
-            editing: false,
+            cursors: vec![0; count],
+            answers: vec![Vec::new(); count],
+            drafts: vec![String::new(); count],
+            editing: vec![false; count],
         }
     }
 
@@ -165,18 +164,31 @@ impl QuestionPrompt {
 
     /// The highlighted row.
     #[must_use]
-    pub const fn cursor(&self) -> usize {
-        self.cursor
+    pub fn cursor(&self) -> usize {
+        self.cursors.get(self.current).copied().unwrap_or_default()
     }
 
     /// Whether the typed-answer row is being edited.
     #[must_use]
-    pub const fn is_editing(&self) -> bool {
-        self.editing
+    pub fn is_editing(&self) -> bool {
+        self.editing.get(self.current).copied().unwrap_or(false)
     }
 
     fn question(&self) -> &QuestionRequest {
         &self.questions[self.current]
+    }
+
+    fn draft(&self) -> &str {
+        self.drafts
+            .get(self.current)
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
+    fn set_cursor(&mut self, cursor: usize) {
+        if let Some(current) = self.cursors.get_mut(self.current) {
+            *current = cursor;
+        }
     }
 
     fn rows(&self) -> usize {
@@ -185,11 +197,11 @@ impl QuestionPrompt {
     }
 
     fn is_custom_row(&self) -> bool {
-        self.question().allows_custom() && self.cursor == self.question().options.len()
+        self.question().allows_custom() && self.cursor() == self.question().options.len()
     }
 
     fn toggle(&mut self) {
-        let Some(option) = self.question().options.get(self.cursor) else {
+        let Some(option) = self.question().options.get(self.cursor()) else {
             return;
         };
         let label = option.label.clone();
@@ -205,9 +217,6 @@ impl QuestionPrompt {
     fn advance(&mut self) -> DialogStep {
         if self.current + 1 < self.questions.len() {
             self.current += 1;
-            self.cursor = 0;
-            self.typed.clear();
-            self.editing = false;
             return DialogStep::Redraw;
         }
         DialogStep::Resolved(DialogOutcome::Question(std::mem::take(&mut self.answers)))
@@ -215,9 +224,9 @@ impl QuestionPrompt {
 
     fn submit(&mut self) -> DialogStep {
         if self.is_custom_row() {
-            let typed = self.typed.trim();
+            let typed = self.draft().trim().to_owned();
             if !typed.is_empty() {
-                self.answers[self.current] = vec![typed.to_owned()];
+                self.answers[self.current] = vec![typed];
             }
             return self.advance();
         }
@@ -225,11 +234,94 @@ impl QuestionPrompt {
             self.answers[self.current] = self
                 .question()
                 .options
-                .get(self.cursor)
+                .get(self.cursor())
                 .map(|option| vec![option.label.clone()])
                 .unwrap_or_default();
         }
         self.advance()
+    }
+
+    fn move_cursor(&mut self, next: bool) -> DialogStep {
+        let rows = self.rows();
+        if rows == 0 {
+            return DialogStep::Ignored;
+        }
+        let cursor = self.cursor();
+        self.set_cursor(if next {
+            (cursor + 1) % rows
+        } else {
+            (cursor + rows - 1) % rows
+        });
+        DialogStep::Redraw
+    }
+
+    fn move_question(&mut self, next: bool) -> DialogStep {
+        let count = self.questions.len();
+        if count <= 1 {
+            return DialogStep::Ignored;
+        }
+        self.current = if next {
+            (self.current + 1) % count
+        } else {
+            (self.current + count - 1) % count
+        };
+        DialogStep::Redraw
+    }
+
+    fn choose_digit(&mut self, character: char) -> DialogStep {
+        let Some(digit) = character.to_digit(10) else {
+            return DialogStep::Ignored;
+        };
+        if digit == 0 {
+            return DialogStep::Ignored;
+        }
+        let choice = usize::try_from(digit - 1).unwrap_or_default();
+        if choice >= self.rows() {
+            return DialogStep::Ignored;
+        }
+        self.set_cursor(choice);
+        if self.is_custom_row() {
+            self.editing[self.current] = true;
+            return DialogStep::Redraw;
+        }
+        if self.question().is_multiple() {
+            self.toggle();
+            return DialogStep::Redraw;
+        }
+        self.submit()
+    }
+
+    fn option_prefix(&self, index: usize) -> String {
+        let marker = if index == self.cursor() { '›' } else { ' ' };
+        format!(" {marker} {}. ", index + 1)
+    }
+
+    fn description_rows(text: &str, width: u16, indent: usize) -> Vec<String> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        crate::views::message::wrap(
+            text,
+            width
+                .saturating_sub(u16::try_from(indent).unwrap_or(u16::MAX))
+                .max(1),
+        )
+    }
+
+    fn custom_input_rows(&self, width: u16) -> Vec<String> {
+        if !self.is_editing() && self.draft().is_empty() {
+            return Vec::new();
+        }
+        let mut rows = crate::views::message::wrap(self.draft(), width.saturating_sub(2).max(1));
+        if rows.is_empty() {
+            rows.push(String::new());
+        }
+        if self.is_editing()
+            && let Some(last) = rows.last_mut()
+        {
+            last.push('▏');
+        }
+        rows
     }
 
     fn choice_at_line(&self, width: u16, target: usize) -> Option<usize> {
@@ -237,19 +329,27 @@ impl QuestionPrompt {
         let mut line =
             crate::views::message::wrap(&question.question, width.saturating_sub(2)).len() + 1;
         for (index, option) in question.options.iter().enumerate() {
-            if target == line {
+            let prefix = self.option_prefix(index);
+            let description = Self::description_rows(
+                &option.description,
+                width,
+                crate::views::display_width(&prefix),
+            );
+            let end = line.saturating_add(1 + description.len());
+            if (line..end).contains(&target) {
                 return Some(index);
             }
-            line = line.saturating_add(1 + usize::from(!option.description.is_empty()));
+            line = end;
         }
         if question.allows_custom() {
-            let custom_rows = if self.editing || !self.typed.is_empty() {
-                crate::views::message::wrap(&self.typed, width.saturating_sub(4))
-                    .len()
-                    .max(1)
-            } else {
-                1
-            };
+            let index = question.options.len();
+            let prefix = self.option_prefix(index);
+            let description = Self::description_rows(
+                "Type a custom answer",
+                width,
+                crate::views::display_width(&prefix),
+            );
+            let custom_rows = 1 + description.len() + self.custom_input_rows(width).len();
             if (line..line.saturating_add(custom_rows)).contains(&target) {
                 return Some(question.options.len());
             }
@@ -265,129 +365,156 @@ impl Dialog for QuestionPrompt {
 
     fn title(&self) -> String {
         let question = self.question();
-        if self.questions.len() > 1 {
+        let unanswered = self
+            .answers
+            .iter()
+            .filter(|answer| answer.is_empty())
+            .count();
+        let progress = if unanswered == 0 {
+            format!("Question {}/{}", self.current + 1, self.questions.len())
+        } else {
             format!(
-                "{} ({}/{})",
-                question.header,
+                "Question {}/{} ({unanswered} unanswered)",
                 self.current + 1,
                 self.questions.len()
             )
-        } else {
-            question.header.clone()
-        }
+        };
+        format!("{progress} · {}", question.header)
     }
 
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
         let question = &self.questions[self.current];
         let selected = &self.answers[self.current];
         let mut lines = Vec::new();
+        let question_style = if selected.is_empty() {
+            self.context.accent()
+        } else {
+            self.context.text()
+        };
         for row in crate::views::message::wrap(&question.question, width.saturating_sub(2)) {
-            lines.push(padded(&format!(" {row}"), width, self.context.text()));
+            lines.push(padded(&format!(" {row}"), width, question_style));
         }
         lines.push(padded("", width, self.context.surface()));
         for (index, option) in question.options.iter().enumerate() {
-            let style = if index == self.cursor {
-                self.context.selected()
+            let prefix = self.option_prefix(index);
+            let label = if question.is_multiple() {
+                let check = if selected.contains(&option.label) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                format!("{check} {}", option.label)
+            } else {
+                option.label.clone()
+            };
+            let marker_style = if index == self.cursor() {
+                self.context.accent()
+            } else {
+                self.context.muted()
+            };
+            let label_style = if index == self.cursor() {
+                self.context.title()
+            } else if selected.contains(&option.label) {
+                self.context.accent()
             } else {
                 self.context.text()
             };
-            // A checkbox only for a multi-select question: showing one for a
-            // single-select question implies several answers are possible.
-            let marker = if question.is_multiple() {
-                if selected.contains(&option.label) {
-                    "[x] "
-                } else {
-                    "[ ] "
-                }
-            } else if index == self.cursor {
-                "> "
-            } else {
-                "  "
-            };
-            lines.push(padded(&format!(" {marker}{}", option.label), width, style));
-            if !option.description.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(prefix.clone(), marker_style),
+                Span::styled(label, label_style),
+            ]));
+            let indent = crate::views::display_width(&prefix);
+            for row in Self::description_rows(&option.description, width, indent) {
                 lines.push(padded(
-                    &format!("     {}", option.description),
+                    &format!("{}{row}", " ".repeat(indent)),
                     width,
                     self.context.muted(),
                 ));
             }
         }
         if question.allows_custom() {
-            let style = if self.is_custom_row() {
-                self.context.selected()
+            let index = question.options.len();
+            let prefix = self.option_prefix(index);
+            let marker_style = if self.is_custom_row() {
+                self.context.accent()
             } else {
                 self.context.muted()
             };
-            if self.editing || !self.typed.is_empty() {
-                let mut rows = crate::views::message::wrap(&self.typed, width.saturating_sub(4));
-                if self.editing
-                    && let Some(last) = rows.last_mut()
-                {
-                    last.push('▏');
-                }
-                for (index, row) in rows.into_iter().enumerate() {
-                    let prefix = if index == 0 { " > " } else { "   " };
-                    lines.push(padded(&format!("{prefix}{row}"), width, style));
-                }
+            let label_style = if self.is_custom_row() {
+                self.context.title()
             } else {
-                lines.push(padded(" > type your own answer", width, style));
+                self.context.text()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix.clone(), marker_style),
+                Span::styled("Other", label_style),
+            ]));
+            let indent = crate::views::display_width(&prefix);
+            for row in Self::description_rows("Type a custom answer", width, indent) {
+                lines.push(padded(
+                    &format!("{}{row}", " ".repeat(indent)),
+                    width,
+                    self.context.muted(),
+                ));
             }
-        }
-        if selected.is_empty() && !self.editing {
-            lines.push(Line::from(Span::styled(
-                format!(" {UNANSWERED}"),
-                self.context.muted(),
-            )));
+            for row in self.custom_input_rows(width) {
+                lines.push(padded(&format!(" {row}"), width, self.context.element()));
+            }
         }
         lines
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
-        if self.editing {
+        if self.is_editing() {
             return vec![
                 ("shift+enter", "newline"),
                 ("enter", "submit"),
                 ("esc", "cancel"),
             ];
         }
+        let mut hints = vec![("enter", "confirm"), ("1-9", "choose"), ("↑↓/jk", "move")];
         if self.question().is_multiple() {
-            vec![
-                ("↑↓", "move"),
-                ("space", "toggle"),
-                ("enter", "confirm"),
-                ("esc", "cancel"),
-            ]
-        } else {
-            vec![("↑↓", "move"), ("enter", "confirm"), ("esc", "cancel")]
+            hints.insert(1, ("space", "toggle"));
         }
+        if self.questions.len() > 1 {
+            hints.push(("←→", "question"));
+        }
+        hints.push(("esc", "cancel"));
+        hints
     }
 
     fn placement(&self) -> DialogPlacement {
         DialogPlacement::Composer
     }
 
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        vec!["dialog.question"]
+    }
+
     fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
-        if !self.editing {
-            return DialogStep::Ignored;
+        if !self.is_editing() {
+            return match key.code {
+                KeyCode::Char(character) => self.choose_digit(character),
+                _ => DialogStep::Ignored,
+            };
         }
         if let Some(character) = crate::views::permission::typed_character(key) {
-            self.typed.push(character);
+            self.drafts[self.current].push(character);
             return DialogStep::Redraw;
         }
         DialogStep::Ignored
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
-        if self.editing {
+        if self.is_editing() {
             match action.name {
                 "dialog.prompt.submit" | "dialog.select.submit" => return self.submit(),
                 "input_newline" => {
-                    self.typed.push('\n');
+                    self.drafts[self.current].push('\n');
                     return DialogStep::Redraw;
                 }
                 "input_backspace" => {
-                    self.typed.pop();
+                    self.drafts[self.current].pop();
                     return DialogStep::Redraw;
                 }
                 "app_exit" | "session_interrupt" => {
@@ -397,21 +524,23 @@ impl Dialog for QuestionPrompt {
             }
         }
         match action.name {
-            "dialog.select.prev" => {
-                let rows = self.rows();
-                self.cursor = (self.cursor + rows - 1) % rows;
-                DialogStep::Redraw
-            }
-            "dialog.select.next" => {
-                self.cursor = (self.cursor + 1) % self.rows();
-                DialogStep::Redraw
-            }
+            "dialog.select.prev" | "dialog.question.prev_option" => self.move_cursor(false),
+            "dialog.select.next" | "dialog.question.next_option" => self.move_cursor(true),
+            "dialog.question.prev_question" => self.move_question(false),
+            "dialog.question.next_question" => self.move_question(true),
             "dialog.select.home" => {
-                self.cursor = 0;
+                if self.rows() == 0 {
+                    return DialogStep::Ignored;
+                }
+                self.set_cursor(0);
                 DialogStep::Redraw
             }
             "dialog.select.end" => {
-                self.cursor = self.rows() - 1;
+                let rows = self.rows();
+                if rows == 0 {
+                    return DialogStep::Ignored;
+                }
+                self.set_cursor(rows - 1);
                 DialogStep::Redraw
             }
             "dialog.mcp.toggle" => {
@@ -425,8 +554,8 @@ impl Dialog for QuestionPrompt {
                 DialogStep::Ignored
             }
             "dialog.select.submit" | "dialog.prompt.submit" => {
-                if self.is_custom_row() && !self.editing && self.typed.is_empty() {
-                    self.editing = true;
+                if self.is_custom_row() && !self.is_editing() && self.draft().is_empty() {
+                    self.editing[self.current] = true;
                     return DialogStep::Redraw;
                 }
                 self.submit()
@@ -440,7 +569,10 @@ impl Dialog for QuestionPrompt {
                     self.toggle();
                     return DialogStep::Redraw;
                 }
-                DialogStep::Ignored
+                match event.code {
+                    KeyCode::Char(character) => self.choose_digit(character),
+                    _ => DialogStep::Ignored,
+                }
             }
         }
     }
@@ -454,20 +586,20 @@ impl Dialog for QuestionPrompt {
             return DialogStep::Ignored;
         }
         match event.kind {
-            MouseEventKind::ScrollUp if !self.editing => {
+            MouseEventKind::ScrollUp if !self.is_editing() => {
                 let rows = self.rows();
                 if rows == 0 {
                     return DialogStep::Ignored;
                 }
-                self.cursor = (self.cursor + rows - 1) % rows;
+                self.set_cursor((self.cursor() + rows - 1) % rows);
                 return DialogStep::Redraw;
             }
-            MouseEventKind::ScrollDown if !self.editing => {
+            MouseEventKind::ScrollDown if !self.is_editing() => {
                 let rows = self.rows();
                 if rows == 0 {
                     return DialogStep::Ignored;
                 }
-                self.cursor = (self.cursor + 1) % rows;
+                self.set_cursor((self.cursor() + 1) % rows);
                 return DialogStep::Redraw;
             }
             MouseEventKind::Up(MouseButton::Left) => {}
@@ -477,9 +609,9 @@ impl Dialog for QuestionPrompt {
         let Some(choice) = self.choice_at_line(body.width, target) else {
             return DialogStep::Ignored;
         };
-        self.cursor = choice;
+        self.set_cursor(choice);
         if self.is_custom_row() {
-            self.editing = true;
+            self.editing[self.current] = true;
             return DialogStep::Redraw;
         }
         if self.question().is_multiple() {

@@ -339,6 +339,72 @@ fn defaults_have_no_conflicts_and_cover_every_scope() {
 }
 
 #[test]
+fn permission_horizontal_arrows_resolve_only_in_the_permission_dialog_scope() {
+    let mut keymap = Keymap::defaults().expect("the shipped defaults must build");
+    let now = Instant::now();
+
+    for (spelling, expected) in [
+        ("left", "dialog.permission.prev"),
+        ("right", "dialog.permission.next"),
+    ] {
+        let Resolution::Action { definition, .. } = keymap.resolve(
+            &["dialog.permission"],
+            Chord::parse(spelling).expect("valid arrow"),
+            now,
+        ) else {
+            panic!("{spelling} did not resolve in the permission dialog");
+        };
+        assert_eq!(definition.name, expected);
+    }
+
+    assert!(
+        matches!(
+            keymap.resolve(
+                &["dialog.select"],
+                Chord::parse("left").expect("valid arrow"),
+                now
+            ),
+            Resolution::Unmatched
+        ),
+        "horizontal permission navigation leaked into vertical list dialogs"
+    );
+}
+
+#[test]
+fn question_navigation_resolves_only_in_the_question_dialog_scope() {
+    let mut keymap = Keymap::defaults().expect("the shipped defaults must build");
+    let now = Instant::now();
+
+    for (spelling, expected) in [
+        ("left", "dialog.question.prev_question"),
+        ("right", "dialog.question.next_question"),
+        ("k", "dialog.question.prev_option"),
+        ("j", "dialog.question.next_option"),
+    ] {
+        let Resolution::Action { definition, .. } = keymap.resolve(
+            &["dialog.question"],
+            Chord::parse(spelling).expect("valid question key"),
+            now,
+        ) else {
+            panic!("{spelling} did not resolve in the question dialog");
+        };
+        assert_eq!(definition.name, expected);
+    }
+
+    assert!(
+        matches!(
+            keymap.resolve(
+                &["dialog.select"],
+                Chord::parse("right").expect("valid arrow"),
+                now
+            ),
+            Resolution::Unmatched
+        ),
+        "question navigation leaked into other list dialogs"
+    );
+}
+
+#[test]
 fn a_leader_sequence_resolves_end_to_end() {
     let mut keymap = Keymap::defaults().expect("defaults build");
     let start = Instant::now();

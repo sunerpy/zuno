@@ -1,7 +1,7 @@
 //! End-to-end [`zuno_catalog::skill::load`] behaviour over real filesystem trees.
 //!
 //! The unit tests inside the crate cover each root and each frontmatter rule in
-//! isolation. These cover the assembly: that the six roots compose in the right
+//! isolation. These cover the assembly: that every root composes in the intended
 //! order, that the built-in is displaced rather than duplicated, and that the two
 //! de-duplication dimensions stay distinct.
 
@@ -101,8 +101,18 @@ fn located(skills: &Skills, name: &str) -> String {
 #[tokio::test]
 async fn every_root_contributes_and_the_builtin_comes_first() {
     let tree = Tree::new();
+    tree.skill(
+        "home/.config/opencode/skill/from-opencode",
+        "from-opencode",
+        Some("o"),
+    );
     tree.skill("home/.claude/skills/from-claude", "from-claude", Some("c"));
     tree.skill("home/.agents/skills/from-agents", "from-agents", Some("a"));
+    tree.skill(
+        "proj/.opencode/skills/from-project-opencode",
+        "from-project-opencode",
+        Some("po"),
+    );
     tree.skill(
         "proj/.agents/skills/from-project",
         "from-project",
@@ -131,8 +141,10 @@ async fn every_root_contributes_and_the_builtin_comes_first() {
         names(&skills),
         vec![
             builtin::NAME.to_string(),
+            "from-opencode".to_string(),
             "from-claude".to_string(),
             "from-agents".to_string(),
+            "from-project-opencode".to_string(),
             "from-project".to_string(),
             "from-config".to_string(),
             "from-config-plural".to_string(),
@@ -175,7 +187,11 @@ async fn a_skill_file_with_no_name_is_rejected_and_the_warning_names_the_file() 
 #[tokio::test]
 async fn a_duplicate_name_emits_exactly_one_warning_and_the_later_root_wins() {
     let tree = Tree::new();
-    tree.skill("home/.claude/skills/dupe", "dupe", Some("from claude"));
+    tree.skill(
+        "home/.config/opencode/skill/dupe",
+        "dupe",
+        Some("from opencode"),
+    );
     tree.skill("home/.agents/skills/dupe", "dupe", Some("from agents"));
 
     let skills = load(&tree.options("proj")).await;
@@ -200,7 +216,7 @@ async fn a_duplicate_name_emits_exactly_one_warning_and_the_later_root_wins() {
         &SkillWarningKind::DuplicateName {
             name: "dupe".to_string(),
             existing: tree
-                .at("home/.claude/skills/dupe/SKILL.md")
+                .at("home/.config/opencode/skill/dupe/SKILL.md")
                 .to_string_lossy()
                 .into_owned(),
         }

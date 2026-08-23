@@ -178,6 +178,17 @@ Prompt assembly is ordered data, not string concatenation spread across the CLI.
 
 The trigger policy makes a named or clearly matching skill a pre-action requirement: the model must load the complete body through the `skill` tool, use only the minimal matching set, and may not claim a skill was used unless that call completed successfully. The catalog remains discovery metadata rather than a substitute for the body.
 
+Skill discovery is Zuno-owned. In increasing precedence it includes global
+OpenCode `SKILL.md` imports, global Claude/Agent Skills, project OpenCode
+imports, project Claude/Agent Skills, Zuno config roots, configured paths, and
+pulled URL caches. OpenCode roots are
+`$XDG_CONFIG_HOME/opencode/{skill,skills}` and project
+`.opencode/{skill,skills}`. The bridge imports skill files only; it does not load
+another product's config, plugins, hooks, permission model, tools, or runtime.
+Later definitions replace a duplicate name with a warning, so same-scope
+Zuno-native and standard Agent Skills definitions remain authoritative while
+project definitions override global ones.
+
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 
 ## Auditable memory and reflection
@@ -265,9 +276,15 @@ only a wakeup and handoff path, not the queue of record.
 
 Tool-owned human input is projected separately from execution. A permission
 prompt reports `awaiting approval`; a structured question reports `awaiting
-answer`. The question surface replaces the composer region rather than becoming
-another transcript card. Cancelling either interaction resolves the tool as a
-typed denial and never fabricates an answer.
+answer`. Both surfaces replace the composer region rather than becoming another
+transcript card. Permission choices support Left/Right, the existing Up/Down
+aliases, Enter, and mouse selection; explicit expansion moves the prompt to the
+larger overlay. Questions show `Question i/n`, the remaining unanswered count,
+numbered choices, and a numbered `Other` input. They support Up/Down and `j/k`
+within a question, Left/Right and `h/l` across questions, number-key selection,
+Enter, Space for multi-select, and mouse selection. Per-question cursors and
+custom drafts survive navigation. Cancelling either interaction resolves the
+tool as a typed denial and never fabricates an answer.
 
 ## Compaction and hard interruption
 
@@ -363,8 +380,11 @@ permission request as human-only. Permission rules still evaluate first, so an
 explicit deny remains terminal; a model-authored argument cannot approve its own
 operation. A new static redirect target inside the working directory or the OS
 temporary directory is creation rather than overwrite and does not receive this
-extra risk prompt. The filesystem probe is advisory and does not turn `bash`
-into a sandbox.
+extra risk prompt. An exact, non-recursive forced removal of a statically named
+path that is currently absent below the OS temporary directory is likewise a
+no-op cleanup; existing targets, recursive removal, and dynamic targets remain
+human-only. The filesystem probe is advisory and does not turn `bash` into a
+sandbox.
 
 Refusal is a typed lifecycle outcome rather than an execution failure.
 Malformed or unsafe arguments, unavailable tools, and permission denials emit
@@ -425,8 +445,9 @@ containment, working directory, and time limits reduce accidental execution
 risk, but the child still inherits the Zuno process's filesystem, network, and
 credentials. Existing redirect targets and other confirmable destructive
 operations require a fresh attached-user decision; static creation under the
-working directory or OS temporary directory does not. Strict authorization adds
-HITL to every side-effecting shell call; neither mechanism adds confinement.
+working directory or OS temporary directory and exact non-recursive `rm -f`
+cleanup of an absent OS-temporary path do not. Strict authorization adds HITL to
+every side-effecting shell call; neither mechanism adds confinement.
 
 ## Resident process containment
 

@@ -141,6 +141,7 @@ impl Tool for RecordingTool {
 
 struct InternallyGatedTool {
     calls: Arc<AtomicUsize>,
+    manual: bool,
 }
 
 #[async_trait]
@@ -163,8 +164,13 @@ impl Tool for InternallyGatedTool {
     }
 
     async fn execute(&self, _args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        ctx.ask("bash", PermissionAsk::new("bash", "nested command"))
-            .await?;
+        let ask = PermissionAsk::new("bash", "nested command");
+        let ask = if self.manual {
+            ask.require_manual()
+        } else {
+            ask
+        };
+        ctx.ask("bash", ask).await?;
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(ToolOutput::text("bash", "done"))
     }
@@ -461,6 +467,7 @@ async fn strict_dispatch_approval_covers_the_same_tools_internal_gate_once() {
     let dispatcher = ToolRegistryDispatcher::new(
         vec![Arc::new(InternallyGatedTool {
             calls: Arc::clone(&calls),
+            manual: false,
         })],
         Vec::new(),
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
@@ -489,6 +496,7 @@ async fn strict_dispatch_approval_does_not_hide_a_later_explicit_resource_deny()
     let dispatcher = ToolRegistryDispatcher::new(
         vec![Arc::new(InternallyGatedTool {
             calls: Arc::clone(&calls),
+            manual: false,
         })],
         vec![deny_rule("bash", "nested command")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
@@ -516,6 +524,44 @@ async fn strict_dispatch_approval_does_not_hide_a_later_explicit_resource_deny()
         0,
         "an explicit nested resource deny was bypassed"
     );
+}
+
+#[tokio::test]
+async fn manual_tool_gate_requires_fresh_approval_despite_standard_allow() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(InternallyGatedTool {
+            calls: Arc::clone(&calls),
+            manual: true,
+        })],
+        vec![allow_all_rule()],
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+
+    for index in 0..2 {
+        let result = dispatcher
+            .dispatch(request(
+                &dispatcher,
+                &format!("call-manual-{index}"),
+                "bash",
+                json!({"command": "rm -f /tmp/existing", "intent": "clean up"}),
+            ))
+            .await;
+        assert!(!result.is_error, "{}", result.output.output);
+    }
+
+    let asks = approver.asks();
+    assert_eq!(
+        asks.len(),
+        2,
+        "a human-only risk decision was bypassed or remembered"
+    );
+    assert!(asks.iter().all(|ask| ask.manual));
+    assert!(asks.iter().all(|ask| ask.always.is_empty()));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

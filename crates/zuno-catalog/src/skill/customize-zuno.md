@@ -39,7 +39,8 @@ when that process exits.
 | Global skills                 | `~/.config/zuno/skill(s)/<name>/SKILL.md`                                                                                 |
 | Project static extensions     | `.zuno/extensions/<id>/extension.json`                                                                                    |
 | Global static extensions      | `~/.config/zuno/extensions/<id>/extension.json`                                                                           |
-| External skills (auto-loaded) | `~/.claude/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md`                                                    |
+| Imported OpenCode skills      | `$XDG_CONFIG_HOME/opencode/skill(s)/<name>/SKILL.md`, `.opencode/skill(s)/<name>/SKILL.md`                               |
+| Agent Skills (auto-loaded)    | `~/.claude/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md`, and matching project roots                      |
 
 Configs from each scope are deep-merged. Project overrides global. Unknown
 top-level keys in `zuno.json` are rejected with `ConfigInvalidError`.
@@ -306,6 +307,22 @@ description: One sentence covering what this skill does AND when to trigger it. 
 - `description` is effectively required: skills without one are filtered out and never surfaced to the model. Cover both _what_ the skill does and _when_ to use it. Write in third person ("Use when...", not "I help with..."). Front-load concrete trigger keywords and filenames; gate with "Use ONLY when..." if the skill should stay quiet on adjacent topics.
 - Optional: `license`, `compatibility`, `metadata` (string-string map).
 
+Zuno also imports `SKILL.md` files from
+`$XDG_CONFIG_HOME/opencode/{skill,skills}` and project
+`.opencode/{skill,skills}` directories. This is a skill-only bridge: OpenCode
+config, plugins, hooks, tools, permissions, and runtime behavior are not loaded.
+Within the same scope, imported OpenCode definitions have lower precedence than
+matching `.claude`, `.agents`, and Zuno-native definitions; project roots still
+override global roots. `ZUNO_DISABLE_EXTERNAL_SKILLS=1` disables every imported
+root.
+
+The phrase "follow skill guidance" does not name a skill by itself. The model
+receives the available names and descriptions, then must load the smallest
+clearly matching set. A generic release-readiness request therefore needs an
+installed skill whose description explicitly covers repository audit, public
+release, or the concrete files involved. Run `zuno debug skill` to inspect the
+exact catalog and source path visible to a new session.
+
 Register skills from non-default locations via `skills.paths` (scanned
 recursively for `**/SKILL.md`) and `skills.urls` (each URL serves a list of
 skills).
@@ -476,7 +493,10 @@ Zuno evaluates the LAST matching rule, so put broad rules first and narrow
 rules last.
 
 `permission: "allow"` (a string at the top level) is shorthand for "allow
-everything" and is rarely what the user wants.
+everything". Use it when the user explicitly wants ordinary tool calls to run
+without confirmation. A narrower prompt-free shell setup must allow both
+`bash` and `external_directory`, because paths outside the workspace have their
+own escalation. Confirm the merged result with `zuno debug config`.
 
 Known permission keys: `read, edit, glob, grep, list, bash, task,
 external_directory, todowrite, question, webfetch, web_search, lsp, doom_loop,
@@ -500,7 +520,10 @@ It adds a one-call-only prompt to side-effecting tools. Reads, native
 `glob`/`grep`, LSP inspection, MCP resource reads, `webfetch`, and `web_search`
 remain subject to their normal permission rules without the extra prompt.
 Unknown harness and MCP tools default to side-effecting. `bash` is always treated
-as side-effecting because command analysis is not an OS sandbox.
+as side-effecting because command analysis is not an OS sandbox. Independently,
+the shell risk gate keeps destructive or overwrite operations human-only even
+under `permission: "allow"`; exact non-recursive `rm -f` cleanup of an already
+absent path below the OS temporary directory is treated as a no-op.
 
 ## Escape hatches
 
@@ -513,8 +536,9 @@ When a user's config is broken and Zuno won't start, these env vars help:
 - `ZUNO_CONFIG_CONTENT='{}'`:
   inject inline JSON as a final local-scope merge.
 - `ZUNO_DISABLE_EXTERNAL_SKILLS=1`,
-  `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1`: skip the external skill scans under
-  `~/.claude/` and `~/.agents/`.
+  `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1`: the broad switch skips imported
+  OpenCode, Claude, and Agent Skills roots; the targeted switch skips only
+  Claude roots.
 
 ## When proposing edits
 

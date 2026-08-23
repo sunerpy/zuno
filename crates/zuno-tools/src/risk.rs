@@ -505,8 +505,9 @@ fn assess_resource(
         )));
         return Ok(());
     }
+    let absent_temp_file_cleanup = is_forced_non_recursive_rm(&program, tokens);
     for target in targets {
-        assess_destructive_target(&target, context, findings);
+        assess_destructive_target(&target, context, absent_temp_file_cleanup, findings);
     }
     Ok(())
 }
@@ -738,7 +739,7 @@ fn assess_find(
         return Ok(());
     }
     for root in roots {
-        assess_destructive_target(&root, context, findings);
+        assess_destructive_target(&root, context, false, findings);
     }
     for index in tokens.iter().enumerate().filter_map(|(index, token)| {
         matches!(unquote(token).as_str(), "-exec" | "-execdir").then_some(index)
@@ -801,11 +802,16 @@ fn option_consumes_value(program: &str, option: &str) -> bool {
     )
 }
 
-fn assess_destructive_target(raw: &str, context: &RiskContext, findings: &mut Vec<RiskFinding>) {
+fn assess_destructive_target(
+    raw: &str,
+    context: &RiskContext,
+    absent_temp_file_cleanup: bool,
+    findings: &mut Vec<RiskFinding>,
+) {
     match static_brace_expansions(raw) {
         BraceExpansions::Expanded(targets) => {
             for target in targets {
-                assess_destructive_target(&target, context, findings);
+                assess_destructive_target(&target, context, absent_temp_file_cleanup, findings);
             }
             return;
         }
@@ -856,10 +862,49 @@ fn assess_destructive_target(raw: &str, context: &RiskContext, findings: &mut Ve
         ));
         return;
     }
+    if absent_temp_file_cleanup
+        && is_inside_system_temp(&expanded)
+        && matches!(
+            std::fs::symlink_metadata(&expanded),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    {
+        return;
+    }
     findings.push(confirm_finding(
         "irreversibly removes or overwrites data".to_owned(),
         Some(expanded.display().to_string()),
     ));
+}
+
+fn is_forced_non_recursive_rm(program: &str, tokens: &[String]) -> bool {
+    if program != "rm" {
+        return false;
+    }
+    let mut force = false;
+    for token in tokens.iter().skip(1).map(|token| unquote(token)) {
+        if token == "--" {
+            break;
+        }
+        if token == "--force" {
+            force = true;
+            continue;
+        }
+        if matches!(token.as_str(), "--recursive" | "--dir") {
+            return false;
+        }
+        let Some(flags) = token
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+        else {
+            continue;
+        };
+        if flags.contains(['r', 'R', 'd']) {
+            return false;
+        }
+        force |= flags.contains('f');
+    }
+    force
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

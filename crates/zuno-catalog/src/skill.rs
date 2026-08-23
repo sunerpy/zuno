@@ -1,24 +1,23 @@
-//! Skill discovery across six roots, and the two model-facing render forms.
+//! Native Zuno skill discovery and the two model-facing render forms.
 //!
-//! Port of `packages/opencode/src/skill/index.ts` and `skill/discovery.ts`
-//! (opencode 1.18.13). A skill is a user-authored capability pack: a `SKILL.md`
-//! whose frontmatter carries a `name` and a `description`, and whose body is
-//! loaded on demand. The descriptions of every visible skill go into the system
-//! prompt of **every** request ([`fmt`]), so this module has two failure modes
-//! that are both silent and both expensive: discovering a skill the TypeScript
-//! binary would not discover gives the agent a capability the user did not
-//! install, and missing one takes a capability away. On a machine with ~120
-//! skills installed, either drift is invisible until behaviour changes.
+//! A skill is a user-authored capability pack: a `SKILL.md` whose frontmatter
+//! carries a `name` and a `description`, and whose body is loaded on demand.
+//! Zuno owns discovery and precedence. It also imports `SKILL.md` files from
+//! established Agent Skills, Claude, and OpenCode locations; that import does
+//! not imply compatibility with those products' config, plugins, hooks, tools,
+//! or runtimes. The descriptions of every visible skill go into the system
+//! prompt of **every** request ([`fmt`]), so missing or accidentally shadowing a
+//! skill is a silent and expensive capability change.
 //!
 //! # The shape of a load
 //!
 //! ```text
 //! SkillOptions ──discover──▶ SkillSources ──pull──▶ +remote dirs ──read──▶ Skills
-//!               (roots 1-5)   (paths, dirs)  (root 6)                (name-keyed)
+//!               (roots 1-7)   (paths, dirs)  (root 8)                (name-keyed)
 //! ```
 //!
 //! [`SkillSources::discover`] is synchronous and never touches the network;
-//! [`load`] adds the `skills.urls[]` pull and the file reads. The six roots and
+//! [`load`] adds the `skills.urls[]` pull and the file reads. The roots and
 //! their exact patterns are documented on [`discovery`].
 //!
 //! # Two de-duplications that are not the same thing

@@ -446,10 +446,11 @@ impl RulePermissionAsker {
     }
 
     fn requires_manual(&self, ask: &PermissionAsk) -> bool {
-        self.authorization.is_strict()
-            && ask
-                .tool_effect
-                .is_some_and(zuno_tool::ToolEffect::requires_manual_approval)
+        ask.manual
+            || self.authorization.is_strict()
+                && ask
+                    .tool_effect
+                    .is_some_and(zuno_tool::ToolEffect::requires_manual_approval)
     }
 
     async fn prompt_manual(

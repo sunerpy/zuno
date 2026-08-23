@@ -253,6 +253,55 @@ fn risk_new_file_in_the_system_temp_directory_is_not_an_overwrite() {
     );
 }
 
+#[test]
+fn risk_absent_forced_temp_file_cleanup_is_not_treated_as_data_loss() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let target = scratch.path().join("zuno-strip-probe");
+    let context = RiskContext {
+        working_dir: Some(workspace.path().to_owned()),
+        home_dir: None,
+    };
+    let command = format!(
+        "cp target/release/zuno '{}' && strip '{}' && rm -f '{}'",
+        target.display(),
+        target.display(),
+        target.display()
+    );
+    let assessment =
+        assess_command(&command, ShellSyntax::Bash, &context).expect("the command must parse");
+
+    assert_eq!(
+        gate(&assessment),
+        GateOutcome::Allow,
+        "removing an exact, currently absent non-directory temp path is cleanup, not data loss"
+    );
+
+    std::fs::write(&target, b"keep").expect("existing target");
+    let existing = assess_command(
+        &format!("rm -f '{}'", target.display()),
+        ShellSyntax::Bash,
+        &context,
+    )
+    .expect("the command must parse");
+    assert!(
+        matches!(gate(&existing), GateOutcome::Confirm { .. }),
+        "an existing temp file still requires fresh approval"
+    );
+
+    let absent_tree = scratch.path().join("absent-tree");
+    let recursive = assess_command(
+        &format!("rm -rf '{}'", absent_tree.display()),
+        ShellSyntax::Bash,
+        &context,
+    )
+    .expect("the command must parse");
+    assert!(
+        matches!(gate(&recursive), GateOutcome::Confirm { .. }),
+        "recursive deletion must not inherit the narrow absent-file exemption"
+    );
+}
+
 #[derive(Default)]
 struct RecordingDenial {
     asks: Mutex<Vec<PermissionAsk>>,

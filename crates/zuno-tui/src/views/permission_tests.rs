@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::app::render_offscreen;
-use crate::views::dialog::{DialogHost, ObservedBase};
+use crate::views::dialog::{DialogHost, DialogPlacement, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press as key, rows};
 use crossterm::event::{
@@ -64,6 +64,19 @@ fn views_permission_prompt_resolves_to_once() {
             message: None,
         }
     );
+}
+
+#[test]
+fn views_permission_prompt_uses_the_composer_unless_explicitly_expanded() {
+    let mut prompt = prompt("bash", json!({"command": "git status"}));
+    assert_eq!(prompt.placement(), DialogPlacement::Composer);
+    assert_eq!(prompt.focused_scopes(), ["dialog.permission"]);
+
+    prompt.handle_action(
+        action("permission.prompt.fullscreen"),
+        &key(KeyCode::Char('f')),
+    );
+    assert_eq!(prompt.placement(), DialogPlacement::Overlay);
 }
 
 #[test]
@@ -477,18 +490,19 @@ fn views_permission_external_directory_renders_a_non_empty_subject() {
 }
 
 #[test]
-fn views_permission_footer_advertises_the_arrow_keys_that_select() {
+fn views_permission_footer_advertises_horizontal_selection_and_keeps_vertical_aliases() {
     let mut prompt = prompt("bash", json!({"command": "true"}));
     assert!(
-        prompt.hints().contains(&("↑↓", "select")),
-        "the footer must advertise the Up/Down bindings that the prompt handles"
-    );
-    assert!(
-        !prompt.hints().iter().any(|(key, _)| *key == "⇆"),
-        "the footer still advertises an ambiguous key that does not select"
+        prompt.hints().contains(&("←→", "select")),
+        "the horizontal choice row must advertise Left/Right"
     );
 
     assert_eq!(prompt.highlighted(), ReplyKind::Once);
+    prompt.handle_action(action("dialog.permission.next"), &key(KeyCode::Right));
+    assert_eq!(prompt.highlighted(), ReplyKind::Always);
+    prompt.handle_action(action("dialog.permission.prev"), &key(KeyCode::Left));
+    assert_eq!(prompt.highlighted(), ReplyKind::Once);
+
     prompt.handle_action(action("dialog.select.next"), &key(KeyCode::Down));
     assert_eq!(prompt.highlighted(), ReplyKind::Always);
     prompt.handle_action(action("dialog.select.prev"), &key(KeyCode::Up));

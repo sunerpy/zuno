@@ -150,7 +150,8 @@ async fn question_round_trip_returns_multi_question_answers_in_order() {
     assert!(bridge.handle_event(&resize()).redraw);
     let frame = rendered_text(&mut bridge);
     assert!(
-        frame.contains("One (1/2)") && frame.contains("Choose for the first question"),
+        frame.contains("Question 1/2 (2 unanswered) · One")
+            && frame.contains("Choose for the first question"),
         "the parked request did not become the first dialog:\n{frame}"
     );
 

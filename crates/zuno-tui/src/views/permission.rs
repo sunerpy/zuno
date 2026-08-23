@@ -35,7 +35,7 @@
 //! bash" tells a user nothing they can decide on.
 
 use crate::keybind::Definition;
-use crate::views::dialog::{Dialog, DialogOutcome, DialogStep};
+use crate::views::dialog::{Dialog, DialogOutcome, DialogPlacement, DialogStep};
 use crate::views::diff::DiffView;
 use crate::views::{ViewContext, padded};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -619,6 +619,18 @@ impl Dialog for PermissionPrompt {
         crate::views::dialog::DialogWidth::XLarge
     }
 
+    fn placement(&self) -> DialogPlacement {
+        if self.expanded {
+            DialogPlacement::Overlay
+        } else {
+            DialogPlacement::Composer
+        }
+    }
+
+    fn focused_scopes(&self) -> Vec<&'static str> {
+        vec!["dialog.permission"]
+    }
+
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
         match self.stage {
             Stage::Choose => self.choose_lines(width),
@@ -630,7 +642,7 @@ impl Dialog for PermissionPrompt {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         match self.stage {
             Stage::Choose => vec![
-                ("↑↓", "select"),
+                ("←→", "select"),
                 ("enter", "confirm"),
                 (
                     "ctrl+f",
@@ -663,12 +675,12 @@ impl Dialog for PermissionPrompt {
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
         match self.stage {
             Stage::Choose => match action.name {
-                "dialog.select.prev" => {
+                "dialog.select.prev" | "dialog.permission.prev" => {
                     let len = self.options().len();
                     self.selected = (self.selected + len - 1) % len;
                     DialogStep::Redraw
                 }
-                "dialog.select.next" => {
+                "dialog.select.next" | "dialog.permission.next" => {
                     self.selected = (self.selected + 1) % self.options().len();
                     DialogStep::Redraw
                 }
@@ -691,7 +703,10 @@ impl Dialog for PermissionPrompt {
                 _ => DialogStep::Ignored,
             },
             Stage::ConfirmAlways => match action.name {
-                "dialog.select.prev" | "dialog.select.next" => {
+                "dialog.select.prev"
+                | "dialog.select.next"
+                | "dialog.permission.prev"
+                | "dialog.permission.next" => {
                     self.confirm = !self.confirm;
                     DialogStep::Redraw
                 }

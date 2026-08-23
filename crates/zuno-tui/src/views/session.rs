@@ -3335,7 +3335,10 @@ impl SessionScreen {
 
 impl ActionComponent for SessionScreen {
     fn dialog_region(&self, dialog: &'static str, area: Rect) -> Option<Rect> {
-        if dialog != crate::views::question::DIALOG_ID {
+        if !matches!(
+            dialog,
+            crate::views::question::DIALOG_ID | crate::views::permission::DIALOG_ID
+        ) {
             return None;
         }
         let empty = self.welcome_active();

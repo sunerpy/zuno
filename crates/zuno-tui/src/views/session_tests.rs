@@ -1053,6 +1053,23 @@ fn permission_prompt() -> Box<dyn crate::views::dialog::Dialog> {
     ))
 }
 
+#[test]
+fn session_screen_places_permission_prompts_in_the_composer_region() {
+    let (screen, _shutdown) = screen();
+    let area = Rect::new(0, 0, 120, 30);
+    let question = screen
+        .dialog_region(crate::views::question::DIALOG_ID, area)
+        .expect("question composer region");
+    let permission = screen
+        .dialog_region(crate::views::permission::DIALOG_ID, area)
+        .expect("permission composer region");
+
+    assert_eq!(
+        permission, question,
+        "approval should replace the composer instead of floating over the transcript"
+    );
+}
+
 /// An open modal must not be able to trap a user in a raw-mode terminal.
 ///
 /// The regression this pins was reachable and reported: with a permission prompt up,

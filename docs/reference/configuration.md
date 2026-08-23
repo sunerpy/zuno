@@ -144,6 +144,34 @@ environment access. Runtime tools use an explicitly granted WASI component or a
 contained `host.full` process. See [plugins, custom agents, and
 workflows](../plugins.md).
 
+## Ordinary permission prompts
+
+To run ordinary tool calls without confirmation, allow every permission and
+leave strict authorization disabled (the default):
+
+```json
+{
+  "permission": "allow"
+}
+```
+
+For a narrower shell-oriented configuration, allow both the shell and its
+external-path escalation:
+
+```json
+{
+  "permission": {
+    "bash": "allow",
+    "external_directory": "allow"
+  }
+}
+```
+
+An explicit `deny` still wins. These settings suppress normal `ask` rules; they
+do not let a standing grant approve a shell operation marked human-only by the
+destructive-command risk gate. Use `zuno debug config` to inspect the merged
+configuration that a session will actually use.
+
 ## Strict HITL authorization
 
 Strict authorization is off by default. Enable it when every side-effecting tool
@@ -180,8 +208,35 @@ tool when the intended operation is read-only.
 Independently of strict mode, the shell risk gate requires fresh approval before
 bounded destructive operations or replacing an existing redirect target. New
 static files under the working directory or OS temporary directory are treated
-as creation. There is no tool argument that lets a model approve its own risky
-call, and an explicit permission deny always wins.
+as creation. An exact, non-recursive `rm -f` of a statically named path that is
+currently absent below the OS temporary directory is treated as no-op cleanup;
+an existing target, recursive removal, dynamic target, or overwrite still
+requires approval. There is no tool argument that lets a model approve its own
+risky call, and an explicit permission deny always wins.
+
+## Skill discovery
+
+Zuno discovers native skills from project and global
+`.zuno/skill(s)` directories, explicit `skills.paths`, and configured remote
+indexes. It also imports `SKILL.md` files from:
+
+- `$XDG_CONFIG_HOME/opencode/skill` and `.../skills`;
+- project `.opencode/skill` and `.opencode/skills` roots from the current
+  directory up to the worktree;
+- global and project `.claude/skills` and `.agents/skills`.
+
+The OpenCode integration is intentionally limited to skill documents. Zuno does
+not read OpenCode config, plugins, hooks, tools, permissions, or runtime state.
+Within the same global or project scope, imported OpenCode skills load first, so
+a duplicate from `.claude`, `.agents`, Zuno config, or an explicit path wins and
+emits a warning; project roots still override global roots. Set
+`ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable all imported roots, or
+`ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` to disable only Claude skill roots.
+
+Use `zuno debug skill` after restarting to inspect the exact catalog, source
+location, and any duplicate warnings visible to a session. A generic prompt such
+as "follow skill guidance" does not select every skill; a skill is loaded only
+when its name is explicit or its description clearly matches the request.
 
 ## Memory learning
 
