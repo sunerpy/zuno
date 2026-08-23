@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
+use tracing::Instrument as _;
 use zuno_llm::cache::McpToolStatus;
+use zuno_observability::span;
+use zuno_observability::tool::ToolLifecycle;
 use zuno_permission::visibility::{is_tool_visible, permission_key};
 use zuno_permission::{PermissionAction, Rule, evaluate};
 use zuno_tool::{
@@ -122,6 +125,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
 
     async fn prepare(&self, mut request: DispatchRequest) -> PreparedToolDispatch {
         let requested_name = request.call.name.clone();
+        let observation = DispatchObservation::new(requested_name.clone(), request.call.id.clone());
         let resolved_name = requested_name.as_str();
         let available = available_names(&request.available_tools);
 
@@ -131,7 +135,10 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                 .iter()
                 .any(|definition| definition.id == resolved_name)
         }) else {
-            return PreparedToolDispatch::ready(unknown_tool_result(&requested_name, &available));
+            return observed_ready(
+                observation,
+                unknown_tool_result(&requested_name, &available),
+            );
         };
         let replay_policy = tool.replay_policy();
 
@@ -145,27 +152,33 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             )
             .await
         {
-            return PreparedToolDispatch::ready(error_result(resolved_name, error));
+            return observed_ready(observation, error_result(resolved_name, error));
         }
 
         if let Some(input_error) = &request.call.input_error {
-            return PreparedToolDispatch::ready(blocked_result(
-                resolved_name,
-                format!(
-                    "Malformed arguments for tool `{resolved_name}`: {input_error}. Raw input: {}",
-                    request.call.raw_input
+            return observed_ready(
+                observation,
+                blocked_result(
+                    resolved_name,
+                    format!(
+                        "Malformed arguments for tool `{resolved_name}`: {input_error}. Raw input: {}",
+                        request.call.raw_input
+                    ),
+                    ToolBlockKind::InvalidArguments,
                 ),
-                ToolBlockKind::InvalidArguments,
-            ));
+            );
         }
 
         let definition = tool.definition();
         if let Err(error) = validate_arguments(&definition.parameters, &request.call.input) {
-            return PreparedToolDispatch::ready(blocked_result(
-                resolved_name,
-                format!("Invalid arguments for tool `{resolved_name}`: {error}"),
-                ToolBlockKind::InvalidArguments,
-            ));
+            return observed_ready(
+                observation,
+                blocked_result(
+                    resolved_name,
+                    format!("Invalid arguments for tool `{resolved_name}`: {error}"),
+                    ToolBlockKind::InvalidArguments,
+                ),
+            );
         }
 
         let ask = permission_ask(resolved_name, &request.call.input)
@@ -181,15 +194,18 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         let plugin_permission = match self.hooks.permission(&permission_request).await {
             Ok(decision) => decision,
             Err(error) => {
-                return PreparedToolDispatch::ready(error_result(resolved_name, error));
+                return observed_ready(observation, error_result(resolved_name, error));
             }
         };
         if plugin_permission == PermissionHookDecision::Deny {
-            return PreparedToolDispatch::ready(blocked_result(
-                resolved_name,
-                format!("Tool `{resolved_name}` was denied by a plugin."),
-                ToolBlockKind::Denied,
-            ));
+            return observed_ready(
+                observation,
+                blocked_result(
+                    resolved_name,
+                    format!("Tool `{resolved_name}` was denied by a plugin."),
+                    ToolBlockKind::Denied,
+                ),
+            );
         }
         let permission = Arc::new(RulePermissionAsker::new(
             Arc::clone(&self.rules),
@@ -197,11 +213,10 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             self.authorization,
         ));
         if let Err(error) = permission.gate(resolved_name, ask, plugin_permission).await {
-            return PreparedToolDispatch::ready(tool_error_result(
-                resolved_name,
-                replay_policy,
-                &error,
-            ));
+            return observed_ready(
+                observation,
+                tool_error_result(resolved_name, replay_policy, &error),
+            );
         }
 
         let interrupt = request.interrupt.clone();
@@ -220,35 +235,85 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         let call_id = request.call.id;
         let hook_args = request.call.input;
         let hooks = Arc::clone(&self.hooks);
-        PreparedToolDispatch::new(Box::pin(async move {
-            let mut execution = tokio::spawn(async move { tool.invoke(args, context).await });
+        let DispatchObservation {
+            span,
+            mut lifecycle,
+        } = observation;
+        PreparedToolDispatch::new(Box::pin(
+            async move {
+                lifecycle.running();
+                let execution_span = tracing::Span::current();
+                let mut execution = tokio::spawn(
+                    async move { tool.invoke(args, context).await }.instrument(execution_span),
+                );
 
-            let mut result = tokio::select! {
-                biased;
-                joined = &mut execution => joined_result(&tool_name, replay_policy, joined),
-                () = interrupt.notified() => {
-                    execution.abort();
-                    let _cancelled = execution.await;
-                    error_result(
+                let mut result = tokio::select! {
+                    biased;
+                    joined = &mut execution => joined_result(&tool_name, replay_policy, joined),
+                    () = interrupt.notified() => {
+                        execution.abort();
+                        let _cancelled = execution.await;
+                        error_result(
+                            &tool_name,
+                            format!("Tool `{tool_name}` was interrupted before it completed."),
+                        )
+                    }
+                };
+                if let Err(error) = hooks
+                    .after(
                         &tool_name,
-                        format!("Tool `{tool_name}` was interrupted before it completed."),
+                        &session_id,
+                        &call_id,
+                        &hook_args,
+                        &mut result.output,
                     )
+                    .await
+                {
+                    result = error_result(&tool_name, error);
                 }
-            };
-            if let Err(error) = hooks
-                .after(
-                    &tool_name,
-                    &session_id,
-                    &call_id,
-                    &hook_args,
-                    &mut result.output,
-                )
-                .await
-            {
-                return error_result(&tool_name, error);
+                finish_observation(lifecycle, &result);
+                result
             }
+            .instrument(span),
+        ))
+    }
+}
+
+struct DispatchObservation {
+    span: tracing::Span,
+    lifecycle: ToolLifecycle,
+}
+
+impl DispatchObservation {
+    fn new(tool: String, call_id: String) -> Self {
+        Self {
+            span: span::tool_call(&tool, &call_id),
+            lifecycle: ToolLifecycle::pending(tool, call_id),
+        }
+    }
+}
+
+fn observed_ready(
+    observation: DispatchObservation,
+    result: ToolDispatchResult,
+) -> PreparedToolDispatch {
+    let DispatchObservation { span, lifecycle } = observation;
+    PreparedToolDispatch::new(Box::pin(
+        async move {
+            finish_observation(lifecycle, &result);
             result
-        }))
+        }
+        .instrument(span),
+    ))
+}
+
+fn finish_observation(lifecycle: ToolLifecycle, result: &ToolDispatchResult) {
+    if let Some(blocked) = result.blocked {
+        lifecycle.blocked(blocked.as_str());
+    } else if result.is_error {
+        lifecycle.errored("tool_result");
+    } else {
+        lifecycle.completed();
     }
 }
 

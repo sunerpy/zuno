@@ -5938,11 +5938,13 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
  "uuid",
  "zuno-config",
  "zuno-db",
  "zuno-error",
  "zuno-llm",
+ "zuno-observability",
  "zuno-paths",
  "zuno-permission",
  "zuno-runtime",
@@ -6127,12 +6129,14 @@ dependencies = [
 name = "zuno-observability"
 version = "0.1.0"
 dependencies = [
+ "rusqlite",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "walkdir",
  "zuno-error",
 ]

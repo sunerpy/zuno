@@ -35,12 +35,14 @@
 //! and the place it would go is the `if !accumulator.calls.is_empty()` continuation.
 
 use serde_json::Value;
+use tracing::Instrument as _;
 use zuno_db::message::{MessageRole, MessageStore, MessageWithParts, PartKind};
 use zuno_db::{Connection, open, session};
 use zuno_error::{DbError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools};
 use zuno_llm::event::{Message, Role, StreamEvent};
 use zuno_llm::registry::{CompletionRequest, Provider};
+use zuno_observability::span;
 use zuno_tool::ToolDefinition;
 
 use crate::compaction::{
@@ -265,7 +267,7 @@ pub async fn generate_title(
             .map(|projected| projected.message),
     );
 
-    let text = collect_text(provider.as_ref(), agent, messages)
+    let text = collect_text(session_id, "title", provider.as_ref(), agent, messages)
         .await
         .map_err(TitleSkipped::Reason)?;
     let Some(title) = clean_title(&text) else {
@@ -479,7 +481,7 @@ pub async fn summarize(
             .skip(1)
             .map(|projected| projected.message),
     );
-    let text = collect_text(provider.as_ref(), agent, messages).await?;
+    let text = collect_text(session_id, "summary", provider.as_ref(), agent, messages).await?;
     if text.trim().is_empty() {
         return Err("the summary model returned no text".to_owned());
     }
@@ -638,6 +640,8 @@ fn requested_agent(history: &[MessageWithParts]) -> Option<String> {
 /// `zuno_agent::builtin::internal`), and a request that offered one could come back
 /// with a call no dispatcher on this path would execute.
 async fn collect_text(
+    session_id: &str,
+    operation: &str,
     provider: &dyn Provider,
     agent: &InternalAgent,
     messages: Vec<Message>,
@@ -650,17 +654,46 @@ async fn collect_text(
         parameters: serde_json::Map::new(),
         headers: std::collections::BTreeMap::new(),
     };
-    let mut stream = provider.stream(request);
-    let mut chunks = Vec::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(StreamEvent::TextDelta(text)) => chunks.push(text),
-            Ok(StreamEvent::Error { message, .. }) => return Err(message),
-            Err(error) => return Err(error.to_string()),
-            Ok(_) => {}
+    let request_span = span::provider_request_for_session(
+        session_id,
+        &agent.model.catalog_provider_id,
+        &agent.model.catalog_model_id,
+        1,
+        true,
+        operation,
+    );
+    let operation_span = request_span.clone();
+    let result = async move {
+        let mut stream = provider.stream(request);
+        let mut chunks = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(text)) => chunks.push(text),
+                Ok(StreamEvent::Error { message, .. }) => return Err(message),
+                Err(error) => return Err(error.to_string()),
+                Ok(_) => {}
+            }
         }
+        Ok(chunks.concat())
     }
-    Ok(chunks.concat())
+    .instrument(operation_span)
+    .await;
+    let (outcome, error_kind) = if result.is_ok() {
+        ("completed", None)
+    } else {
+        ("error", Some("provider"))
+    };
+    span::record_provider_outcome(&request_span, outcome, error_kind, None);
+    request_span.in_scope(|| {
+        tracing::debug!(
+            target: "zuno_engine::provider",
+            event = "provider.request.finished",
+            operation,
+            outcome,
+            "internal provider request finished"
+        );
+    });
+    result
 }
 
 /// Reduce a model's answer to the one line that may become a title.

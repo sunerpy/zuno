@@ -73,7 +73,7 @@ const BUDGET_HELP: Duration = Duration::from_millis(30);
 /// `zuno session list`, the cheapest invocation that pays full startup.
 ///
 /// This is the budget with real content: it re-execs once to hand the command
-/// process its environment, builds the tracing subscriber, opens the rolling log
+/// process its environment, builds the tracing subscriber, opens the structured log
 /// file and opens the database. Measured debug-profile median 15.666 ms over nine
 /// runs (min 15.196, max 18.327, max/min 1.2061x); budget 100 ms, 6.4x headroom —
 /// the same multiple as the fast paths, so no invocation is held to a looser
@@ -301,7 +301,7 @@ fn startup_version_pays_for_no_log_file_and_no_reexec() {
     );
     assert!(
         !reached.contains(StartupPhase::Logging.as_str()),
-        "`--version` now initializes logging, so it opens the rolling log file \
+        "`--version` now initializes logging, so it opens the structured log store \
          before printing a constant: {reached:?}"
     );
     assert_eq!(
@@ -466,22 +466,27 @@ fn startup_a_completed_command_reports_no_stall() {
     );
 
     let logs = data.join("zuno").join("log");
-    let mut inspected = 0usize;
-    if let Ok(entries) = std::fs::read_dir(&logs) {
-        for entry in entries.flatten() {
-            let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
-            assert!(
-                !text.contains("watchdog.stalled"),
-                "{} records a stall for a command that completed",
-                entry.path().display()
-            );
-            inspected += 1;
-        }
-    }
+    let database = logs.join(zuno_observability::STRUCTURED_LOG_FILE);
     assert!(
-        inspected > 0,
-        "no log file was written under {}, so the absence of a stall line in it \
+        database.is_file(),
+        "no structured log database was written at {}, so the absence of a stall \
          proves nothing",
-        logs.display()
+        database.display()
+    );
+    let connection = rusqlite::Connection::open(&database).expect("open structured log");
+    let stalls: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM log_record
+             WHERE COALESCE(message, '') LIKE '%watchdog.stalled%'
+                OR fields_json LIKE '%watchdog.stalled%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query watchdog records");
+    assert_eq!(
+        stalls,
+        0,
+        "{} records a stall for a command that completed",
+        database.display()
     );
 }

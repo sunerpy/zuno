@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 use zuno_config::schema::CompactionConfig;
 use zuno_db::Connection;
 use zuno_db::message::{MessageRecord, MessageStore, PartRecord, now_millis};
@@ -18,6 +19,7 @@ use zuno_error::{DbError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools};
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{CompletionRequest, Provider};
+use zuno_observability::span;
 
 use crate::retry::{RecoveryBudget, RecoveryBudgets};
 
@@ -618,34 +620,62 @@ where
         .map(|entry| summary_safe_message_owned(entry.message))
         .collect::<Vec<_>>();
     model_messages.push(Message::new(Role::User, summary_prompt));
-    let mut stream = provider.stream(CompletionRequest::new(
+    let request_span = span::provider_request_for_session(
+        request.session_id,
+        request.provider_id,
         request.small_model_id,
-        model_messages,
-    ));
-    let mut chunks = Vec::new();
-    let mut provider_failure = None;
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(StreamEvent::TextDelta(text)) => chunks.push(text),
-            Ok(StreamEvent::Error {
-                message,
-                retry_after,
-            }) => {
-                provider_failure = Some((message, Recovery::Retry { after: retry_after }));
-                break;
+        1,
+        true,
+        "compaction",
+    );
+    let operation_span = request_span.clone();
+    let (chunks, provider_failure) = async move {
+        let mut stream = provider.stream(CompletionRequest::new(
+            request.small_model_id,
+            model_messages,
+        ));
+        let mut chunks = Vec::new();
+        let mut provider_failure = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::TextDelta(text)) => chunks.push(text),
+                Ok(StreamEvent::Error {
+                    message,
+                    retry_after,
+                }) => {
+                    provider_failure = Some((message, Recovery::Retry { after: retry_after }));
+                    break;
+                }
+                Err(error) => {
+                    let recovery = match error.recovery() {
+                        Recovery::Compact => Recovery::Fail,
+                        recovery => recovery,
+                    };
+                    provider_failure = Some((error.to_string(), recovery));
+                    break;
+                }
+                Ok(_) => {}
             }
-            Err(error) => {
-                let recovery = match error.recovery() {
-                    Recovery::Compact => Recovery::Fail,
-                    recovery => recovery,
-                };
-                provider_failure = Some((error.to_string(), recovery));
-                break;
-            }
-            Ok(_) => {}
         }
+        (chunks, provider_failure)
     }
-    drop(stream);
+    .instrument(operation_span)
+    .await;
+    let (outcome, error_kind) = if provider_failure.is_some() {
+        ("error", Some("provider"))
+    } else {
+        ("completed", None)
+    };
+    span::record_provider_outcome(&request_span, outcome, error_kind, None);
+    request_span.in_scope(|| {
+        tracing::debug!(
+            target: "zuno_engine::provider",
+            event = "provider.request.finished",
+            operation = "compaction",
+            outcome,
+            "compaction provider request finished"
+        );
+    });
 
     if let Some((message, recovery)) = provider_failure {
         persist_failure(connection, &mut summary_message, &message)?;

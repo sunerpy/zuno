@@ -15,6 +15,7 @@ This directory is organized so it can be projected into a documentation site wit
 
 ## Operate
 
+- [Operational logging](logging.md)
 - [Session retention](session-retention.md)
 - [Resource gates](resource-gates.md)
 - [Performance methodology](perf-methodology.md)

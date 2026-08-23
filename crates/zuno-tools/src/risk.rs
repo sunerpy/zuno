@@ -430,19 +430,22 @@ pub fn assess_and_gate(
         GateOutcome::Allow => tracing::info!(
             target: "zuno_tools::risk",
             verdict = "run",
-            command,
+            command_bytes = command.len(),
+            syntax = ?syntax,
             "destructive-command gate verdict"
         ),
         GateOutcome::Reflect { .. } => tracing::info!(
             target: "zuno_tools::risk",
             verdict = "reflect",
-            command,
+            command_bytes = command.len(),
+            syntax = ?syntax,
             "destructive-command gate verdict"
         ),
         GateOutcome::Deny { .. } => tracing::warn!(
             target: "zuno_tools::risk",
             verdict = "deny",
-            command,
+            command_bytes = command.len(),
+            syntax = ?syntax,
             "destructive-command gate verdict"
         ),
     }

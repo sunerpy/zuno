@@ -47,7 +47,7 @@ pub enum StartupPhase {
     /// Present only on invocations that dispatch a command. `--version` and a
     /// `clap` error return before it, which is why they are the fast paths.
     BootstrapRestart,
-    /// Building the tracing subscriber and opening the rolling log file.
+    /// Building the tracing subscriber and opening the structured log store.
     Logging,
     /// Everything from the last mark to process exit.
     Dispatch,

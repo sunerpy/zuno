@@ -26,7 +26,7 @@ pub const ZUNO: &str = "ZUNO";
 pub const ZUNO_PID: &str = "ZUNO_PID";
 /// Enables the additional stderr log sink.
 pub const ZUNO_PRINT_LOGS: &str = "ZUNO_PRINT_LOGS";
-/// Selects one of the four supported log levels.
+/// Selects one of the five supported log levels.
 pub const ZUNO_LOG_LEVEL: &str = "ZUNO_LOG_LEVEL";
 
 /// Environment values read by the CLI and its command implementations.

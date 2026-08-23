@@ -38,6 +38,7 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use tracing::Instrument as _;
 use uuid::Uuid;
 use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
 use zuno_agent::reflection::{
@@ -1204,50 +1205,88 @@ impl ReflectionRunner for ProviderReflectionRunner {
             description: definition.description,
             parameters: definition.parameters,
         };
-        let mut stream = self.provider.stream(
-            CompletionRequest::new(self.model.model_id.clone(), messages)
-                .on_surface(self.model.surface)
-                .with_tools(vec![schema]),
+        let request_span = zuno_observability::span::provider_request_for_session(
+            &request.source_session_id,
+            &self.model.catalog_provider_id,
+            &self.model.catalog_model_id,
+            1,
+            true,
+            "memory_reflection",
         );
-        let mut accumulator =
-            StreamAccumulator::for_stream(self.model.catalog_provider_id.clone(), "reflection");
-        let mut saw_message_end = false;
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(StreamEvent::Error { message, .. }) => {
-                    return Err(record_reflection_failure(
-                        &self.events,
-                        &request.source_session_id,
-                        message,
-                    ));
-                }
-                Ok(event) => {
-                    saw_message_end |= matches!(event, StreamEvent::MessageEnd { .. });
-                    if let Err(error) = accumulator.apply(&event) {
-                        return Err(record_reflection_failure(
-                            &self.events,
-                            &request.source_session_id,
-                            error.to_string(),
-                        ));
+        let operation_span = request_span.clone();
+        let streamed: Result<(StreamAccumulator, bool), String> = async {
+            let mut stream = self.provider.stream(
+                CompletionRequest::new(self.model.model_id.clone(), messages)
+                    .on_surface(self.model.surface)
+                    .with_tools(vec![schema]),
+            );
+            let mut accumulator =
+                StreamAccumulator::for_stream(self.model.catalog_provider_id.clone(), "reflection");
+            let mut saw_message_end = false;
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(StreamEvent::Error { message, .. }) => return Err(message),
+                    Ok(event) => {
+                        saw_message_end |= matches!(event, StreamEvent::MessageEnd { .. });
+                        accumulator
+                            .apply(&event)
+                            .map_err(|error| error.to_string())?;
                     }
-                }
-                Err(error) => {
-                    return Err(record_reflection_failure(
-                        &self.events,
-                        &request.source_session_id,
-                        error.to_string(),
-                    ));
+                    Err(error) => return Err(error.to_string()),
                 }
             }
+            Ok((accumulator, saw_message_end))
         }
-        drop(stream);
+        .instrument(operation_span)
+        .await;
+        let (accumulator, saw_message_end) = match streamed {
+            Ok(streamed) => streamed,
+            Err(error) => {
+                zuno_observability::span::record_provider_outcome(
+                    &request_span,
+                    "error",
+                    Some("provider"),
+                    None,
+                );
+                request_span.in_scope(|| {
+                    tracing::warn!(
+                        target: "zuno_cli::provider",
+                        event = "provider.request.finished",
+                        operation = "memory_reflection",
+                        outcome = "error",
+                        "memory reflection provider request failed"
+                    );
+                });
+                return Err(record_reflection_failure(
+                    &self.events,
+                    &request.source_session_id,
+                    error,
+                ));
+            }
+        };
         if !saw_message_end {
+            zuno_observability::span::record_provider_outcome(
+                &request_span,
+                "error",
+                Some("stream_incomplete"),
+                None,
+            );
             return Err(record_reflection_failure(
                 &self.events,
                 &request.source_session_id,
                 "memory reflection stream ended before MessageEnd",
             ));
         }
+        zuno_observability::span::record_provider_outcome(&request_span, "completed", None, None);
+        request_span.in_scope(|| {
+            tracing::debug!(
+                target: "zuno_cli::provider",
+                event = "provider.request.finished",
+                operation = "memory_reflection",
+                outcome = "completed",
+                "memory reflection provider request finished"
+            );
+        });
 
         let calls = accumulator.tool_calls().to_vec();
         for call in &calls {

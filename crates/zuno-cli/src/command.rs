@@ -14,9 +14,12 @@ use zuno_paths::Env;
 
 use crate::{StartupEnvironment, disposition_for};
 
-/// The four log levels accepted by upstream's CLI.
+/// Operational log levels accepted by the Zuno CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliLogLevel {
+    /// Maximum tracing detail.
+    #[value(name = "TRACE")]
+    Trace,
     /// Verbose diagnostic events.
     #[value(name = "DEBUG")]
     Debug,
@@ -36,6 +39,7 @@ impl CliLogLevel {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Trace => "TRACE",
             Self::Debug => "DEBUG",
             Self::Info => "INFO",
             Self::Warn => "WARN",
@@ -47,6 +51,7 @@ impl CliLogLevel {
     #[must_use]
     pub const fn log_level(self) -> LogLevel {
         match self {
+            Self::Trace => LogLevel::Trace,
             Self::Debug => LogLevel::Debug,
             Self::Info => LogLevel::Info,
             Self::Warn => LogLevel::Warn,
@@ -58,7 +63,7 @@ impl CliLogLevel {
 /// Global settings applied before any command handler is reached.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GlobalOptions {
-    /// Add logs to stderr while retaining file logs.
+    /// Add logs to stderr while retaining the structured local store.
     pub print_logs: bool,
     /// Override the environment's log level.
     pub log_level: Option<CliLogLevel>,
@@ -81,7 +86,7 @@ pub struct Cli {
     #[arg(long, global = true, hide = true, requires = "version", action = ArgAction::SetTrue)]
     pub long: bool,
 
-    /// Print logs to stderr in addition to the rolling log file.
+    /// Print logs to stderr in addition to the structured local log store.
     #[arg(long, global = true, action = ArgAction::SetTrue)]
     pub print_logs: bool,
 
@@ -1087,13 +1092,13 @@ mod tests {
     }
 
     #[test]
-    fn log_level_accepts_only_the_four_upstream_spellings() {
-        for level in ["DEBUG", "INFO", "WARN", "ERROR"] {
-            let cli = Cli::try_parse_from(["zuno", "--log-level", level, "run"])
-                .expect("upstream log level");
+    fn log_level_accepts_zunos_five_spellings() {
+        for level in ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] {
+            let cli =
+                Cli::try_parse_from(["zuno", "--log-level", level, "run"]).expect("zuno log level");
             assert!(cli.log_level.is_some());
         }
-        assert!(Cli::try_parse_from(["zuno", "--log-level", "TRACE", "run"]).is_err());
+        assert!(Cli::try_parse_from(["zuno", "--log-level", "VERBOSE", "run"]).is_err());
     }
 
     #[test]

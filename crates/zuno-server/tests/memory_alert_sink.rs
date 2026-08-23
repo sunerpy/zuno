@@ -15,11 +15,11 @@
 //!
 //! Three claims, none of which is "a sink we handed it received something":
 //!
-//! 1. **The shipped binary installs a file sink.** [`the_shipped_binary_writes_a_log_file`]
+//! 1. **The shipped binary installs a durable sink.** [`the_shipped_binary_writes_the_log_store`]
 //!    runs the real `zuno-server` executable against an isolated `XDG_DATA_HOME` and reads
 //!    the file off disk afterwards. No test harness is between the process and the file.
-//! 2. **A real incident reaches a real file through the production sink.**
-//!    [`a_memory_incident_reaches_the_log_file_through_the_production_sink`] composes the
+//! 2. **A real incident reaches the structured store through the production sink.**
+//!    [`a_memory_incident_reaches_the_structured_store`] composes the
 //!    two calls `main` makes, in `main`'s order, with `TracingSink` — the sink that ships —
 //!    and greps the resulting file for the incident. The only thing scripted is the byte
 //!    source, because a test process cannot be made to occupy 2 GiB.
@@ -34,10 +34,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::{Duration, Instant};
 
+use zuno_observability::LogConfig;
 use zuno_observability::memory::{
     MemorySample, MemorySampler, MemorySource, TracingSink, WARNING_RSS_KIB,
 };
-use zuno_observability::{LogConfig, Rotation};
 
 /// Longest any wait here takes before failing.
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -63,56 +63,47 @@ impl MemorySource for OverThreshold {
 }
 
 #[test]
-fn a_memory_incident_reaches_the_log_file_through_the_production_sink() {
-    // `Rotation::Never` so the file name is `zuno.log` and not today's date, which is
-    // what lets this assert on bytes rather than on a glob.
+fn a_memory_incident_reaches_the_structured_store() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let log_dir = directory.path().join("log");
     let logging =
-        zuno_observability::init(LogConfig::from_env(&log_dir).with_rotation(Rotation::Never))
-            .expect("logging initialises");
+        zuno_observability::init(LogConfig::from_env(&log_dir)).expect("logging initialises");
     assert!(
         logging.installed(),
         "this test owns the process's subscriber; another test in this binary took it \
-         first, so the file below would stay empty for a reason unrelated to the defect"
+         first, so the store below would stay empty for a reason unrelated to the defect"
     );
 
     let sampler = MemorySampler::spawn_with(Duration::from_millis(20), OverThreshold, TracingSink);
-    let log_path = log_dir.join("zuno.log");
+    let log_path = logging.database_path().to_path_buf();
     let deadline = Instant::now() + DEADLINE;
-    let mut contents = String::new();
     while Instant::now() < deadline {
-        contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if contents.contains("memory.incident") {
+        if log_contains(&log_path, "memory.incident") {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Joins the sampler thread and then flushes the appender, in that order, exactly as
-    // `main` does — so a record still in the writer's queue is on disk before the read.
     sampler.shutdown();
     drop(logging);
-    let contents = std::fs::read_to_string(&log_path).unwrap_or(contents);
-
     assert!(
-        contents.contains("memory.incident"),
-        "no incident reached the log file at {}. The sampler ran and judged the process \
-         over {WARNING_RSS_KIB} KiB, so an empty file means the alert went to a no-op \
-         dispatcher — which is exactly what the standalone server did.\nfile:\n{contents}",
+        log_contains(&log_path, "memory.incident"),
+        "no incident reached the structured log at {}. The sampler ran and judged the process \
+         over {WARNING_RSS_KIB} KiB, so an empty store means the alert went to a no-op \
+         dispatcher — which is exactly what the standalone server did.",
         log_path.display()
     );
     assert!(
-        contents.contains("severity=warning"),
-        "the incident reached the file without its severity:\n{contents}"
+        log_contains(&log_path, "warning"),
+        "the incident reached the store without its severity"
     );
     assert!(
-        contents.contains("WARN"),
-        "the record landed below warn level, so a default filter would hide it:\n{contents}"
+        level_for(&log_path, "memory.incident").as_deref() == Some("WARN"),
+        "the record landed below warn level, so a default filter would hide it"
     );
 }
 
 #[test]
-fn the_shipped_binary_writes_a_log_file() {
+fn the_shipped_binary_writes_the_log_store() {
     // The link to the *binary*. Nothing above proves `main` calls any of it, and a source
     // needle only proves the text is present. This starts the real executable, waits for it
     // to say it is listening, stops it, and reads the file it left behind.
@@ -129,6 +120,7 @@ fn the_shipped_binary_writes_a_log_file() {
         .env("HOME", directory.path())
         .env_remove("ZUNO_LOG_LEVEL")
         .env_remove("ZUNO_PRINT_LOGS")
+        .env_remove("ZUNO_PLAINTEXT_LOGS")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -145,6 +137,16 @@ fn the_shipped_binary_writes_a_log_file() {
         let _sent = found.send(line);
     });
     let url = receiver.recv_timeout(DEADLINE);
+    let log_path = directory
+        .path()
+        .join("data")
+        .join("zuno")
+        .join("log")
+        .join(zuno_observability::STRUCTURED_LOG_FILE);
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline && !log_contains(&log_path, "process.started") {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let stopped = child.kill();
     let output = child.wait_with_output().expect("the child is reaped");
 
@@ -157,18 +159,46 @@ fn the_shipped_binary_writes_a_log_file() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let log_dir = directory.path().join("data").join("zuno").join("log");
-    let written = std::fs::read_dir(&log_dir)
-        .map(|entries| entries.flatten().count())
-        .unwrap_or(0);
     assert!(
-        written > 0,
-        "the server bound to {} and left no log file in {}. With no subscriber installed \
+        log_contains(&log_path, "process.started"),
+        "the server bound to {} and left no structured process record in {}. With no subscriber installed \
          every memory alert it raises goes nowhere.\nstderr:\n{}",
         url.trim(),
-        log_dir.display(),
+        log_path.display(),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn log_contains(path: &std::path::Path, needle: &str) -> bool {
+    let Ok(connection) = rusqlite::Connection::open(path) else {
+        return false;
+    };
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM log_record
+                WHERE COALESCE(message, '') LIKE '%' || ?1 || '%'
+                   OR fields_json LIKE '%' || ?1 || '%'
+                   OR spans_json LIKE '%' || ?1 || '%'
+            )",
+            [needle],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+}
+
+fn level_for(path: &std::path::Path, needle: &str) -> Option<String> {
+    let connection = rusqlite::Connection::open(path).ok()?;
+    connection
+        .query_row(
+            "SELECT level FROM log_record
+             WHERE COALESCE(message, '') LIKE '%' || ?1 || '%'
+                OR fields_json LIKE '%' || ?1 || '%'
+             ORDER BY id DESC LIMIT 1",
+            [needle],
+            |row| row.get(0),
+        )
+        .ok()
 }
 
 #[test]

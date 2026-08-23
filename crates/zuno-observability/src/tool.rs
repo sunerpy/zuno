@@ -2,10 +2,11 @@
 //!
 //! # Why a helper rather than a convention
 //!
-//! A tool call has four observable moments — it was requested, it started, it
-//! finished, it failed — and each one is written by different code in a different
-//! crate. Left to ad-hoc `info!("running bash")` calls, the four moments arrive as
-//! four unrelated sentences that nothing can join, count, or time.
+//! A tool call has several observable moments — it was requested, it started, and
+//! then completed, was blocked, or failed — and each one can be written by
+//! different code in a different crate. Left to ad-hoc `info!("running bash")`
+//! calls, those moments arrive as unrelated sentences that nothing can join,
+//! count, or time.
 //!
 //! Every record this module emits carries the same three fields, so a log reader can
 //! group by [`FIELD_CALL_ID`] and get the whole life of one call:
@@ -42,7 +43,7 @@ pub const EVENT_TOOL_LIFECYCLE: &str = "TOOL_LIFECYCLE";
 /// The field naming the structured event kind.
 pub const FIELD_EVENT: &str = "event";
 
-/// The field naming which of the five phases a record reports.
+/// The field naming which lifecycle phase a record reports.
 pub const FIELD_PHASE: &str = "phase";
 
 /// Wall-clock milliseconds from [`ToolLifecycle::pending`] to the terminal phase.
@@ -66,6 +67,8 @@ pub enum ToolPhase {
     Running,
     /// The tool returned a result.
     Completed,
+    /// Validation or permission refused the call before its side effect started.
+    Blocked,
     /// The tool failed.
     Error,
     /// Tracking ended with no outcome. Emitted only from `Drop`.
@@ -80,6 +83,7 @@ impl ToolPhase {
             Self::Pending => "pending",
             Self::Running => "running",
             Self::Completed => "completed",
+            Self::Blocked => "blocked",
             Self::Error => "error",
             Self::Abandoned => "abandoned",
         }
@@ -88,7 +92,10 @@ impl ToolPhase {
     /// True once no further phase can follow.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Error | Self::Abandoned)
+        matches!(
+            self,
+            Self::Completed | Self::Blocked | Self::Error | Self::Abandoned
+        )
     }
 }
 
@@ -171,6 +178,34 @@ impl ToolLifecycle {
         );
     }
 
+    /// Records a model-visible error result that was produced without a typed
+    /// [`ToolError`] at this boundary, for example an invalid schema or hook
+    /// refusal.
+    pub fn errored(mut self, error_kind: &str) {
+        self.phase = ToolPhase::Error;
+        tracing::error!(
+            event = EVENT_TOOL_LIFECYCLE,
+            phase = ToolPhase::Error.as_str(),
+            tool = %self.tool,
+            call_id = %self.call_id,
+            elapsed_ms = self.elapsed_ms(),
+            error_kind,
+        );
+    }
+
+    /// Records a call refused before its side effect started.
+    pub fn blocked(mut self, block_kind: &str) {
+        self.phase = ToolPhase::Blocked;
+        tracing::warn!(
+            event = EVENT_TOOL_LIFECYCLE,
+            phase = ToolPhase::Blocked.as_str(),
+            tool = %self.tool,
+            call_id = %self.call_id,
+            elapsed_ms = self.elapsed_ms(),
+            block_kind,
+        );
+    }
+
     /// Records a failure, its variant discriminant, and the two recovery booleans a
     /// consumer would otherwise have to re-derive.
     pub fn failed(mut self, error: &ToolError) {
@@ -241,6 +276,7 @@ mod tests {
         assert_eq!(ToolPhase::Pending.as_str(), "pending");
         assert_eq!(ToolPhase::Running.as_str(), "running");
         assert_eq!(ToolPhase::Completed.as_str(), "completed");
+        assert_eq!(ToolPhase::Blocked.as_str(), "blocked");
         assert_eq!(ToolPhase::Error.as_str(), "error");
         assert_eq!(ToolPhase::Abandoned.as_str(), "abandoned");
     }
@@ -259,10 +295,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_outcomes_are_terminal() {
+    fn only_terminal_outcomes_are_marked_terminal() {
         assert!(!ToolPhase::Pending.is_terminal());
         assert!(!ToolPhase::Running.is_terminal());
         assert!(ToolPhase::Completed.is_terminal());
+        assert!(ToolPhase::Blocked.is_terminal());
         assert!(ToolPhase::Error.is_terminal());
         assert!(ToolPhase::Abandoned.is_terminal());
     }

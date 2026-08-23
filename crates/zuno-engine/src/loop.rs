@@ -22,6 +22,7 @@ use futures::future::BoxFuture;
 use futures::{StreamExt, stream};
 use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 use uuid::Uuid;
 use zuno_db::event_log::{NewSessionEvent, append_with_connection};
 use zuno_db::inbox::SessionInbox;
@@ -38,6 +39,7 @@ use zuno_llm::event::{
 };
 use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
+use zuno_observability::span;
 use zuno_tool::{
     ToolConcurrencyPolicy, ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
 };
@@ -1007,8 +1009,20 @@ impl StepAccumulator {
 /// this same loop and emits through the same bounded channel.
 pub async fn run_turn(
     request: RunTurnRequest,
+    context: TurnContext<'_>,
+    events: TurnEventSender,
+) -> Result<TurnOutcome, TurnError> {
+    let turn_span = span::turn(&request.session_id, &request.turn_id);
+    run_turn_in_span(request, context, events, turn_span.clone())
+        .instrument(turn_span)
+        .await
+}
+
+async fn run_turn_in_span(
+    request: RunTurnRequest,
     mut context: TurnContext<'_>,
     events: TurnEventSender,
+    turn_span: tracing::Span,
 ) -> Result<TurnOutcome, TurnError> {
     let events = events.with_hooks(Arc::clone(&context.hooks));
     let session = session::get(context.connection, &request.session_id)?;
@@ -1064,6 +1078,12 @@ pub async fn run_turn(
                 provider_id: requested.provider_id.clone(),
                 model_id: requested.model_id.clone(),
             })?;
+        span::record_turn_identity(
+            &turn_span,
+            &agent.name,
+            &model.catalog_provider_id,
+            &model.catalog_model_id,
+        );
 
         let step = steps.saturating_add(1);
         if step > agent.max_steps {
@@ -1201,83 +1221,100 @@ pub async fn run_turn(
         );
         let attempt = retry_provider(
             policy,
-            |_| {
+            |attempt| {
                 let provider = Arc::clone(&provider);
                 let completion = completion.clone();
                 let interrupt = context.interrupt.clone();
                 let events = events.clone();
                 let accumulator = Arc::clone(&accumulator);
+                let request_span = span::provider_request_for_session(
+                    &request.session_id,
+                    &model.catalog_provider_id,
+                    &model.catalog_model_id,
+                    attempt,
+                    true,
+                    "turn",
+                );
                 async move {
-                    let mut stream = provider.stream(completion);
-                    // `Some(n)` once the message has finished: how many more frames may be
-                    // read for their bookkeeping before the step ends regardless.
-                    let mut trailing: Option<u8> = None;
-                    loop {
-                        let next = tokio::select! {
-                            biased;
-                            _ = interrupt.notified() => return Ok(Ok(true)),
-                            event = stream.next() => event,
-                        };
-                        let Some(next) = next else {
-                            return Ok(Ok(false));
-                        };
-                        // An error *after* the message has finished is not the turn's
-                        // failure: the answer is already complete and persisted, and the
-                        // only thing still outstanding is bookkeeping. Failing the turn
-                        // over a truncated trailing frame would throw away a reply the
-                        // user has already read.
-                        if trailing.is_some() && next.is_err() {
-                            return Ok(Ok(false));
-                        }
-                        let event = match next {
-                            Ok(event) => event,
-                            Err(error @ ProviderError::Transient { status: None, .. })
-                                if accumulator
-                                    .lock()
-                                    .expect("step accumulator lock")
-                                    .has_generated_output() =>
-                            {
-                                return Ok(Err(TurnError::Provider(error)));
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let ended = matches!(event, StreamEvent::MessageEnd { .. });
-                        let apply = accumulator
-                            .lock()
-                            .expect("step accumulator lock")
-                            .apply(step, &event);
-                        if let Err(error) = apply {
-                            return Ok(Err(error));
-                        }
-                        if let Err(error) = events.send(TurnEvent::Provider { step, event }).await {
-                            return Ok(Err(error));
-                        }
-                        // `MessageEnd` is not the last frame an OpenAI-compatible endpoint
-                        // sends: `usage` arrives in a chunk *after* the one carrying the
-                        // finish reason, and `[DONE]` after that. Returning here read the
-                        // finish reason and discarded everything behind it, so
-                        // `StreamEvent::TokenUsage` — and therefore
-                        // `StepAccumulator`'s token fields, and therefore the `tokens`
-                        // column `update_usage` writes — could never be reached on those
-                        // providers. Measured: every assistant row in a nine-session
-                        // database had `input: 0, output: 0`.
-                        //
-                        // So a finished message starts a bounded trailing drain rather
-                        // than ending the step. Bounded because a provider that keeps
-                        // streaming after saying it finished must not hold the turn open:
-                        // the count is generous next to the one-or-two frames a real
-                        // endpoint sends, and the provider's own idle timeout still
-                        // governs how long any single frame may take to arrive.
-                        if ended {
-                            trailing = Some(TRAILING_FRAME_BUDGET);
-                        }
-                        if let Some(remaining) = trailing.as_mut() {
-                            if *remaining == 0 {
+                    let operation_span = request_span.clone();
+                    let result = async move {
+                        let mut stream = provider.stream(completion);
+                        // `Some(n)` once the message has finished: how many more frames may be
+                        // read for their bookkeeping before the step ends regardless.
+                        let mut trailing: Option<u8> = None;
+                        loop {
+                            let next = tokio::select! {
+                                biased;
+                                _ = interrupt.notified() => return Ok(Ok(true)),
+                                event = stream.next() => event,
+                            };
+                            let Some(next) = next else {
+                                return Ok(Ok(false));
+                            };
+                            // An error *after* the message has finished is not the turn's
+                            // failure: the answer is already complete and persisted, and the
+                            // only thing still outstanding is bookkeeping. Failing the turn
+                            // over a truncated trailing frame would throw away a reply the
+                            // user has already read.
+                            if trailing.is_some() && next.is_err() {
                                 return Ok(Ok(false));
                             }
-                            *remaining -= 1;
+                            let event = match next {
+                                Ok(event) => event,
+                                Err(error @ ProviderError::Transient { status: None, .. })
+                                    if accumulator
+                                        .lock()
+                                        .expect("step accumulator lock")
+                                        .has_generated_output() =>
+                                {
+                                    return Ok(Err(TurnError::Provider(error)));
+                                }
+                                Err(error) => return Err(error),
+                            };
+                            let ended = matches!(event, StreamEvent::MessageEnd { .. });
+                            let apply = accumulator
+                                .lock()
+                                .expect("step accumulator lock")
+                                .apply(step, &event);
+                            if let Err(error) = apply {
+                                return Ok(Err(error));
+                            }
+                            if let Err(error) =
+                                events.send(TurnEvent::Provider { step, event }).await
+                            {
+                                return Ok(Err(error));
+                            }
+                            // `MessageEnd` is not the last frame an OpenAI-compatible endpoint
+                            // sends: `usage` arrives in a chunk *after* the one carrying the
+                            // finish reason, and `[DONE]` after that. Returning here read the
+                            // finish reason and discarded everything behind it, so
+                            // `StreamEvent::TokenUsage` — and therefore
+                            // `StepAccumulator`'s token fields, and therefore the `tokens`
+                            // column `update_usage` writes — could never be reached on those
+                            // providers. Measured: every assistant row in a nine-session
+                            // database had `input: 0, output: 0`.
+                            //
+                            // So a finished message starts a bounded trailing drain rather
+                            // than ending the step. Bounded because a provider that keeps
+                            // streaming after saying it finished must not hold the turn open:
+                            // the count is generous next to the one-or-two frames a real
+                            // endpoint sends, and the provider's own idle timeout still
+                            // governs how long any single frame may take to arrive.
+                            if ended {
+                                trailing = Some(TRAILING_FRAME_BUDGET);
+                            }
+                            if let Some(remaining) = trailing.as_mut() {
+                                if *remaining == 0 {
+                                    return Ok(Ok(false));
+                                }
+                                *remaining -= 1;
+                            }
                         }
                     }
+                    .instrument(operation_span)
+                    .await;
+                    record_provider_attempt(&request_span, step, &result);
+                    result
                 }
             },
             |event| {
@@ -1555,6 +1592,55 @@ pub async fn run_turn(
             steps,
             unresolved_tool_failures: unresolved_tool_failures.into_values().collect(),
         });
+    }
+}
+
+fn record_provider_attempt(
+    request_span: &tracing::Span,
+    step: u32,
+    result: &Result<Result<bool, TurnError>, ProviderError>,
+) {
+    let (outcome, error_kind, status) = match result {
+        Ok(Ok(true)) => ("interrupted", None, None),
+        Ok(Ok(false)) => ("completed", None, None),
+        Ok(Err(TurnError::Provider(error))) | Err(error) => {
+            let (kind, status) = provider_error_metadata(error);
+            ("error", Some(kind), status)
+        }
+        Ok(Err(_)) => ("turn_error", Some("turn_processing"), None),
+    };
+    span::record_provider_outcome(request_span, outcome, error_kind, status);
+    request_span.in_scope(|| {
+        if let Some(error_kind) = error_kind {
+            tracing::warn!(
+                target: "zuno_engine::provider",
+                event = "provider.request.finished",
+                step,
+                outcome,
+                error_kind,
+                status,
+                "provider request attempt failed"
+            );
+        } else {
+            tracing::debug!(
+                target: "zuno_engine::provider",
+                event = "provider.request.finished",
+                step,
+                outcome,
+                "provider request attempt finished"
+            );
+        }
+    });
+}
+
+fn provider_error_metadata(error: &ProviderError) -> (&'static str, Option<u16>) {
+    match error {
+        ProviderError::ContextLimit { .. } => ("context_limit", None),
+        ProviderError::RateLimited { .. } => ("rate_limited", Some(429)),
+        ProviderError::Transient { status, .. } => ("transient", *status),
+        ProviderError::Auth { .. } => ("authentication", None),
+        ProviderError::Refused { .. } => ("refused", None),
+        ProviderError::Fatal { status, .. } => ("fatal", *status),
     }
 }
 

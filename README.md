@@ -179,6 +179,7 @@ Profile 中还可以挂载 provider、远程执行器、审批、评测或 bench
 | [docs/design/harness-comparison.md](docs/design/harness-comparison.md) | DSH、Codex、OMO、pi-agent、OpenCode 与 Claw Code 的借鉴决策 |
 | [docs/design/client-interfaces.md](docs/design/client-interfaces.md) | TUI、ACP、HTTP 与未来 GUI 共用的事件和投影接口 |
 | [docs/design/memory-learning.md](docs/design/memory-learning.md) | 可审计记忆候选、反思提取、审核、晋升与撤销 |
+| [docs/logging.md](docs/logging.md) | 多进程安全结构化日志、`RUST_LOG`、脱敏、保留与明文诊断 |
 | [docs/migration.md](docs/migration.md) | Zuno 数据库文件选择与 schema 演进 |
 | [docs/session-retention.md](docs/session-retention.md) | 清理操作指南：`--archive` 可逆，`--delete` 不可逆 |
 | [docs/resource-gates.md](docs/resource-gates.md) | 六项资源门禁的实测结果、opt-in 命令与已知限制 |

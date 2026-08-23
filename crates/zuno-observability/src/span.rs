@@ -41,10 +41,10 @@ pub const TOOL_CALL: &str = "tool_call";
 pub const PROVIDER_REQUEST: &str = "provider_request";
 
 /// The session identifier, present on every [`TURN`] span.
-pub const FIELD_SESSION: &str = "session";
+pub const FIELD_SESSION: &str = "session_id";
 
-/// The zero-based turn index within a session.
-pub const FIELD_TURN: &str = "turn";
+/// The durable identity assigned to one run through the turn loop.
+pub const FIELD_TURN_ID: &str = "turn_id";
 
 /// The agent name that owns a turn.
 pub const FIELD_AGENT: &str = "agent";
@@ -76,30 +76,40 @@ pub const FIELD_STATUS: &str = "status";
 /// support ticket asks for, so it is worth a field of its own.
 pub const FIELD_REQUEST_ID: &str = "request_id";
 
+/// Stable terminal class for a provider attempt.
+pub const FIELD_OUTCOME: &str = "outcome";
+
+/// Typed provider error variant, without provider response payloads.
+pub const FIELD_ERROR_KIND: &str = "error_kind";
+
+/// Logical use of the provider, such as `turn`, `title`, or `compaction`.
+pub const FIELD_OPERATION: &str = "operation";
+
 /// Opens the span covering one user turn.
 ///
-/// `model` and `provider` are declared but empty; call [`record_turn_model`] once
-/// the model is resolved.
+/// Agent, model, and provider are declared but empty; call
+/// [`record_turn_identity`] once resolution completes.
 ///
 /// ```
-/// let span = zuno_observability::span::turn("ses_01J", 0, "build");
+/// let span = zuno_observability::span::turn("ses_01J", "turn_01J");
 /// let _entered = span.enter();
-/// tracing::info!("this record carries session, turn and agent");
+/// tracing::info!("this record carries session and turn identity");
 /// ```
 #[must_use]
-pub fn turn(session: &str, index: u64, agent: &str) -> Span {
+pub fn turn(session_id: &str, turn_id: &str) -> Span {
     info_span!(
         TURN,
-        session = session,
-        turn = index,
-        agent = agent,
+        session_id,
+        turn_id,
+        agent = Empty,
         model = Empty,
         provider = Empty,
     )
 }
 
-/// Fills in the model and provider on a [`turn`] span once they are resolved.
-pub fn record_turn_model(span: &Span, provider: &str, model: &str) {
+/// Fills in the agent, model, and provider once turn resolution completes.
+pub fn record_turn_identity(span: &Span, agent: &str, provider: &str, model: &str) {
+    span.record(FIELD_AGENT, agent);
     span.record(FIELD_PROVIDER, provider);
     span.record(FIELD_MODEL, model);
 }
@@ -131,13 +141,33 @@ pub fn tool_call(tool: &str, call_id: &str) -> Span {
 pub fn provider_request(provider: &str, model: &str, attempt: u32, stream: bool) -> Span {
     info_span!(
         PROVIDER_REQUEST,
+        session_id = Empty,
         provider = provider,
         model = model,
         attempt = attempt,
         stream = stream,
+        operation = Empty,
         status = Empty,
         request_id = Empty,
+        outcome = Empty,
+        error_kind = Empty,
     )
+}
+
+/// Opens a provider span that is not already nested under a turn span.
+#[must_use]
+pub fn provider_request_for_session(
+    session_id: &str,
+    provider: &str,
+    model: &str,
+    attempt: u32,
+    stream: bool,
+    operation: &str,
+) -> Span {
+    let span = provider_request(provider, model, attempt, stream);
+    span.record(FIELD_SESSION, session_id);
+    span.record(FIELD_OPERATION, operation);
+    span
 }
 
 /// Fills in the status and, when the provider sent one, its request identifier.
@@ -145,6 +175,23 @@ pub fn record_provider_response(span: &Span, status: u16, request_id: Option<&st
     span.record(FIELD_STATUS, status);
     if let Some(request_id) = request_id {
         span.record(FIELD_REQUEST_ID, request_id);
+    }
+}
+
+/// Records the terminal class of one provider attempt without logging a body,
+/// prompt, credential, or rendered provider response.
+pub fn record_provider_outcome(
+    span: &Span,
+    outcome: &str,
+    error_kind: Option<&str>,
+    status: Option<u16>,
+) {
+    span.record(FIELD_OUTCOME, outcome);
+    if let Some(error_kind) = error_kind {
+        span.record(FIELD_ERROR_KIND, error_kind);
+    }
+    if let Some(status) = status {
+        span.record(FIELD_STATUS, status);
     }
 }
 
@@ -163,8 +210,8 @@ mod tests {
 
     #[test]
     fn the_field_names_are_pinned() {
-        assert_eq!(FIELD_SESSION, "session");
-        assert_eq!(FIELD_TURN, "turn");
+        assert_eq!(FIELD_SESSION, "session_id");
+        assert_eq!(FIELD_TURN_ID, "turn_id");
         assert_eq!(FIELD_AGENT, "agent");
         assert_eq!(FIELD_MODEL, "model");
         assert_eq!(FIELD_PROVIDER, "provider");
@@ -174,6 +221,9 @@ mod tests {
         assert_eq!(FIELD_STREAM, "stream");
         assert_eq!(FIELD_STATUS, "status");
         assert_eq!(FIELD_REQUEST_ID, "request_id");
+        assert_eq!(FIELD_OUTCOME, "outcome");
+        assert_eq!(FIELD_ERROR_KIND, "error_kind");
+        assert_eq!(FIELD_OPERATION, "operation");
     }
 
     /// `Span::record` on a field that was never declared is a silent no-op, so the
@@ -187,7 +237,7 @@ mod tests {
     fn the_late_bound_fields_are_declared_on_their_spans() {
         let turn_fields = [
             FIELD_SESSION,
-            FIELD_TURN,
+            FIELD_TURN_ID,
             FIELD_AGENT,
             FIELD_MODEL,
             FIELD_PROVIDER,
@@ -197,11 +247,15 @@ mod tests {
 
         let request_fields = [
             FIELD_PROVIDER,
+            FIELD_SESSION,
             FIELD_MODEL,
             FIELD_ATTEMPT,
             FIELD_STREAM,
             FIELD_STATUS,
             FIELD_REQUEST_ID,
+            FIELD_OUTCOME,
+            FIELD_ERROR_KIND,
+            FIELD_OPERATION,
         ];
         assert!(request_fields.contains(&FIELD_STATUS));
         assert!(request_fields.contains(&FIELD_REQUEST_ID));
@@ -212,8 +266,8 @@ mod tests {
     /// before `init` runs — or a test that never calls it — must still work.
     #[test]
     fn every_span_is_constructible_without_a_subscriber() {
-        let turn_span = turn("ses_01J", 3, "build");
-        record_turn_model(&turn_span, "anthropic", "claude-sonnet-4-5");
+        let turn_span = turn("ses_01J", "turn_01J");
+        record_turn_identity(&turn_span, "build", "anthropic", "claude-sonnet-4-5");
         let _turn_entered = turn_span.enter();
 
         let tool_span = tool_call("bash", "toolu_01A");
@@ -224,6 +278,7 @@ mod tests {
         let request_span = provider_request("anthropic", "claude-sonnet-4-5", 2, true);
         record_provider_response(&request_span, 429, Some("req_abc"));
         record_provider_response(&request_span, 200, None);
+        record_provider_outcome(&request_span, "error", Some("rate_limited"), Some(429));
         let _request_entered = request_span.enter();
     }
 }

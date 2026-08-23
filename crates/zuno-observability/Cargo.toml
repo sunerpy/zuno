@@ -1,6 +1,6 @@
 [package]
 name = "zuno-observability"
-description = "Tracing subscriber setup, log file rotation, and structured span conventions."
+description = "Bounded structured operational logs, secure debug sinks, and runtime span conventions."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,16 +9,17 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
-# `tracing-subscriber` inherits the workspace's `env-filter` and `fmt` features.
-# Neither `json` nor `local-time` is enabled: the file format is the plain `fmt`
-# format (which prints the span stack inline) and timestamps come from the
-# unconditional `fmt::time::SystemTime` writer, so no extra feature is needed.
+# `tracing-subscriber` provides target-aware filtering plus the optional plaintext
+# and stderr formatters. The authoritative store has its own SQLite layer.
 [dependencies]
 zuno-error = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 # Test-only. `serde_json` is what makes the stdout assertion structural rather than
 # a substring match: every captured stdout line has to *parse* as a protocol frame.
