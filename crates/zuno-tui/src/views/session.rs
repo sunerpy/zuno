@@ -31,8 +31,11 @@
 //!
 //! A single accidental escape must not discard a running turn. The session interrupt
 //! action therefore arms a short confirmation window; a second press inside it asks
-//! the driver to cancel. The arm is transient UI state and is cleared at turn
-//! boundaries.
+//! the driver to cancel. The arm is shown in a dedicated row immediately above the
+//! composer rather than in an expiring corner toast. When a modal or autocomplete
+//! surface owns the first press, it closes that surface and arms the same running turn,
+//! so the user's second physical press still confirms cancellation. The arm is
+//! transient UI state and is cleared at turn boundaries.
 //!
 //! The application exit chord keeps the older two-stage emergency behavior: first it
 //! cancels, then it leaves unconditionally. Reading
@@ -514,6 +517,12 @@ enum PointerGesture {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptNotice {
+    Confirm,
+    Stopping,
+}
+
 /// The transcript, the status strip and the prompt as one screen.
 pub struct SessionScreen {
     transcript: TranscriptView,
@@ -527,8 +536,10 @@ pub struct SessionScreen {
     status: StatusView,
     editor: InputEditor,
     autocomplete: AutocompleteView,
+    autocomplete_area: Option<Rect>,
     slash: SlashRouter,
     welcome: crate::views::welcome::WelcomeView,
+    welcome_enabled: bool,
     sidebar: crate::views::ambient::SidebarView,
     shutdown: mpsc::Sender<TerminalEvent>,
     prompts: Option<mpsc::Sender<PromptSubmission>>,
@@ -635,7 +646,10 @@ pub struct SessionScreen {
     selections: Option<mpsc::Sender<Selection>>,
     /// The dialog currently over this screen, as [`Self::observe_modal`] last saw it.
     ///
-    /// Recorded only so a bracketed paste can be refused while a modal is up.
+    /// Recorded so a bracketed paste can be refused while a modal is up and so the
+    /// escape that dismisses a human-input prompt can also arm interruption of the
+    /// active turn. Without the latter, the modal consumes the first physical escape
+    /// and the user's second press merely becomes the screen's first.
     /// [`crate::views::dialog::DialogHost`] forwards every *non-key* event to the base
     /// unconditionally — that single line is what keeps an open dialog from stalling
     /// the loop — and a paste is a non-key event, so without this the text would land
@@ -710,7 +724,7 @@ pub enum Selection {
 /// A prompt-channel message. Catalog invocations stay typed until the CLI host
 /// resolves their templates; plain text goes directly to the turn driver.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum PromptSubmission {
     /// Ordinary model input.
     Text(String),
@@ -783,12 +797,14 @@ impl SessionScreen {
             pointer: None,
             status: StatusView::new(context.clone()),
             welcome: crate::views::welcome::WelcomeView::new(context.clone()),
+            welcome_enabled: true,
             sidebar: crate::views::ambient::SidebarView::new(context.clone()),
             editor: InputEditor::new(context.clone()).with_placeholder(PROMPT_PLACEHOLDER),
             autocomplete: AutocompleteView::new(
                 context.clone(),
                 Box::new(SlashSource::new(slash.clone())),
             ),
+            autocomplete_area: None,
             slash,
             shutdown,
             prompts: None,
@@ -837,6 +853,20 @@ impl SessionScreen {
             // evaluates its fields in written order.
             context,
         }
+    }
+
+    /// Open a fresh in-app conversation shell without re-entering the launch welcome page.
+    ///
+    /// This changes presentation only. The transcript remains empty and the host still
+    /// materializes the durable session lazily on the first real model input.
+    #[must_use]
+    pub const fn without_welcome(mut self) -> Self {
+        self.welcome_enabled = false;
+        self
+    }
+
+    fn welcome_active(&self) -> bool {
+        self.welcome_enabled && !self.transcript.transcript().conversation_started()
     }
 
     /// Install prompts a previous run submitted, and record new ones to `records`.
@@ -1018,7 +1048,8 @@ impl SessionScreen {
                 }
             }
             zuno_engine::r#loop::TurnEvent::TurnCompleted { .. }
-            | zuno_engine::r#loop::TurnEvent::TurnInterrupted { .. } => {
+            | zuno_engine::r#loop::TurnEvent::TurnInterrupted { .. }
+            | zuno_engine::r#loop::TurnEvent::TurnFailed { .. } => {
                 if self.touched.is_empty() {
                     return;
                 }
@@ -1365,14 +1396,17 @@ impl SessionScreen {
                 submission,
                 PromptSubmission::Text(_) | PromptSubmission::Content { .. }
             );
+            let tracks_model_turn = !matches!(submission, PromptSubmission::Host(_));
             match prompts.try_send(submission) {
                 Ok(()) => {
-                    self.mark_turn_accepted();
+                    if tracks_model_turn {
+                        self.mark_turn_accepted();
+                    }
                     if was_running {
                         self.toasts.push(Toast::info(if steer_candidate {
-                            "message admitted; it will steer at the next safe point"
+                            "message queued; it will steer at the next safe point"
                         } else {
-                            "request admitted; it is queued for the next turn"
+                            "request queued for the next turn"
                         }));
                     }
                 }
@@ -1525,6 +1559,9 @@ impl SessionScreen {
 
 impl Component for SessionScreen {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let now_ms = self.now_ms();
+        self.prune_interrupt_at(now_ms);
+        self.autocomplete_area = None;
         // Recorded with the servers it belongs to, so the generation this frame claims to
         // have painted is the generation it did paint. See `Self::mcp_generation`.
         let (generation, servers) = self.mcp.observe();
@@ -1580,7 +1617,7 @@ impl Component for SessionScreen {
             );
             return;
         }
-        let empty = !self.transcript.transcript().conversation_started();
+        let empty = self.welcome_active();
         // Split the whole frame first. The transcript, prompt, status and info row now share
         // one left column, so none of those bands can run underneath the sidebar.
         let sidebar_drawn = sidebar_drawn(self.sidebar_visible, empty, area.width);
@@ -1604,6 +1641,7 @@ impl Component for SessionScreen {
             crate::views::fill(frame.buffer_mut(), gap, self.context.surface());
         }
         let (prompt_band, tail) = self.prompt_and_tail(content.width, content.height);
+        let interrupt_rows = self.interrupt_rows_at(now_ms);
         // Prompt above strip: the agent and the model are what the *composer* is set to, so they
         // belong under the box the way a caption belongs under a figure. See `welcome_tail_rows`,
         // which counts the strip among the rows below the band for exactly this reason.
@@ -1613,8 +1651,9 @@ impl Component for SessionScreen {
         // `opencode 1.18.18` frame carries its directory row on the terminal's final line,
         // under the composer on a used session and under the whole welcome surface on an empty
         // one. See `INFO_ROWS`.
-        let [body, prompt, status, tail, info] = Layout::vertical([
+        let [body, interrupt, prompt, status, tail, info] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(interrupt_rows),
             Constraint::Length(prompt_band),
             Constraint::Length(STATUS_ROWS),
             Constraint::Length(tail),
@@ -1721,6 +1760,7 @@ impl Component for SessionScreen {
         // colour seam the centring band's fill exists to avoid, reintroduced sideways.
         crate::views::fill(frame.buffer_mut(), prompt, self.context.surface());
         crate::views::fill(frame.buffer_mut(), status, self.context.surface());
+        self.render_interrupt(frame, interrupt, empty, now_ms);
         let composer = composer_region(prompt, empty);
         // The whole band is painted next, so the spacer row and the right inset carry the
         // prompt's own background rather than whatever the previous frame left there. `element`
@@ -1743,7 +1783,8 @@ impl Component for SessionScreen {
         // Last, and over `main` rather than inside the split above: the popup is a floating
         // layer, so opening it cannot reflow the transcript. It owns its own geometry —
         // see `AutocompleteView::overlay_frame`.
-        if let Some(overlay) = self.autocomplete.overlay_frame(main) {
+        self.autocomplete_area = self.autocomplete.overlay_frame(main);
+        if let Some(overlay) = self.autocomplete_area {
             self.autocomplete.render(frame, overlay);
         }
     }
@@ -1780,17 +1821,23 @@ impl Component for SessionScreen {
             }
             _ => EventResult::IGNORED,
         };
+        let interrupt = self.observe_interrupt(event, self.now_ms());
         // Drained on every event rather than only on a wake, for the reason the
         // permission bridge pumps on every event: a dropped nudge must not leave a
         // verdict the user is waiting for sitting in a channel forever.
         self.observe_edits(event);
-        wheel
+        let projections = wheel
+            .merge(interrupt)
             .merge(self.observe_session_materialized(event))
             .merge(self.observe_session_title())
             .merge(self.observe_mcp())
             .merge(self.observe_work_state())
             .merge(self.drain_editor_results())
-            .merge(self.drain_reports())
+            .merge(self.drain_reports());
+        if self.suppress_live_event_while_cancelling(event) {
+            return projections;
+        }
+        projections
             .merge(self.transcript.handle_event(event))
             .merge(self.status.handle_event(event))
     }
@@ -1877,6 +1924,34 @@ impl SessionScreen {
             ratatui::widgets::Paragraph::new(vec![self.info_line(area.width)])
                 .style(self.context.surface()),
             area,
+            frame.buffer_mut(),
+        );
+    }
+
+    fn render_interrupt(&self, frame: &mut Frame<'_>, area: Rect, welcome: bool, now_ms: u64) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        crate::views::fill(frame.buffer_mut(), area, self.context.surface());
+        let Some(notice) = self.interrupt_notice_at(now_ms) else {
+            return;
+        };
+        let region = composer_region(area, welcome);
+        let key = crate::views::key_label("session_interrupt", &self.context)
+            .unwrap_or_else(|| String::from("esc"));
+        let (text, style) = match notice {
+            InterruptNotice::Confirm => (
+                format!(" {key} again to stop the active turn"),
+                self.context.warning(),
+            ),
+            InterruptNotice::Stopping => (
+                String::from(" Stopping the active turn…"),
+                self.context.muted(),
+            ),
+        };
+        ratatui::widgets::Widget::render(
+            ratatui::widgets::Paragraph::new(crate::views::padded(&text, region.width, style)),
+            region,
             frame.buffer_mut(),
         );
     }
@@ -1994,7 +2069,8 @@ impl SessionScreen {
 
     pub(crate) fn prompt_and_tail(&self, width: u16, height: u16) -> (u16, u16) {
         let band = prompt_rows(self.editor.height(), height);
-        let empty = !self.transcript.transcript().conversation_started();
+        let interrupt = self.interrupt_rows_at(self.now_ms());
+        let empty = self.welcome_active();
         // At the *frame* height and the *frame* width — the same pair `WelcomeView::render`
         // decides the wordmark from. The width is no longer adjusted for the panel because the
         // panel is not drawn while this head is: see `sidebar_drawn`, and the head's own
@@ -2024,9 +2100,85 @@ impl SessionScreen {
         let body_max = height.saturating_sub(
             STATUS_ROWS
                 .saturating_add(info_rows(height))
+                .saturating_add(interrupt)
                 .saturating_add(band),
         );
         (band, welcome_tail_rows(empty, height, band, body_max, head))
+    }
+
+    fn interrupt_notice_at(&self, now_ms: u64) -> Option<InterruptNotice> {
+        if self.cancel_requested {
+            return Some(InterruptNotice::Stopping);
+        }
+        self.interrupt_armed_at_ms
+            .filter(|armed| now_ms.saturating_sub(*armed) <= INTERRUPT_CONFIRM_WINDOW_MS)
+            .map(|_| InterruptNotice::Confirm)
+    }
+
+    fn interrupt_rows_at(&self, now_ms: u64) -> u16 {
+        u16::from(self.interrupt_notice_at(now_ms).is_some())
+    }
+
+    fn prune_interrupt_at(&mut self, now_ms: u64) -> bool {
+        let expired = self
+            .interrupt_armed_at_ms
+            .is_some_and(|armed| now_ms.saturating_sub(armed) > INTERRUPT_CONFIRM_WINDOW_MS);
+        if expired {
+            self.interrupt_armed_at_ms = None;
+        }
+        expired
+    }
+
+    fn observe_interrupt(&mut self, event: &AppEvent, now_ms: u64) -> EventResult {
+        if matches!(
+            event,
+            AppEvent::Engine(
+                zuno_engine::r#loop::TurnEvent::TurnCompleted { .. }
+                    | zuno_engine::r#loop::TurnEvent::TurnInterrupted { .. }
+                    | zuno_engine::r#loop::TurnEvent::TurnFailed { .. }
+            )
+        ) {
+            let changed = self.cancel_requested || self.interrupt_armed_at_ms.is_some();
+            self.cancel_requested = false;
+            self.interrupt_armed_at_ms = None;
+            return if changed {
+                EventResult::REDRAW
+            } else {
+                EventResult::IGNORED
+            };
+        }
+        if matches!(event, AppEvent::AnimationFrame) && self.prune_interrupt_at(now_ms) {
+            return EventResult::REDRAW;
+        }
+        EventResult::IGNORED
+    }
+
+    /// Once a hard interrupt is accepted, keep late frames from the cancelled turn out
+    /// of the live projection until the engine reports its terminal boundary.
+    ///
+    /// Durable persistence and edit diagnostics still run. This is only a presentation
+    /// barrier for events that were already queued when the user confirmed cancellation.
+    fn suppress_live_event_while_cancelling(&self, event: &AppEvent) -> bool {
+        self.cancel_requested
+            && matches!(
+                event,
+                AppEvent::Engine(
+                    zuno_engine::r#loop::TurnEvent::TurnStarted { .. }
+                        | zuno_engine::r#loop::TurnEvent::HistoryRepaired { .. }
+                        | zuno_engine::r#loop::TurnEvent::AgentResolved { .. }
+                        | zuno_engine::r#loop::TurnEvent::ModelResolved { .. }
+                        | zuno_engine::r#loop::TurnEvent::AssistantMessageCreated { .. }
+                        | zuno_engine::r#loop::TurnEvent::ToolSnapshotLocked { .. }
+                        | zuno_engine::r#loop::TurnEvent::ProviderRequestStarted { .. }
+                        | zuno_engine::r#loop::TurnEvent::Provider { .. }
+                        | zuno_engine::r#loop::TurnEvent::AssistantCheckpointed { .. }
+                        | zuno_engine::r#loop::TurnEvent::ToolDispatchStarted { .. }
+                        | zuno_engine::r#loop::TurnEvent::ToolDispatchBlocked { .. }
+                        | zuno_engine::r#loop::TurnEvent::ToolDispatchCompleted { .. }
+                        | zuno_engine::r#loop::TurnEvent::ToolResultAppended { .. }
+                        | zuno_engine::r#loop::TurnEvent::StepCompleted { .. }
+                )
+            )
     }
 
     /// Report whether the MCP projection moved since this screen last painted.
@@ -2120,6 +2272,12 @@ impl SessionScreen {
     }
 
     fn begin_pointer(&mut self, column: u16, row: u16) -> EventResult {
+        if let Some(area) = self.autocomplete_area
+            && self.autocomplete.select_at(column, row, area)
+        {
+            self.pointer = None;
+            return self.complete_autocomplete();
+        }
         if self.sidebar.click(column, row) {
             self.transcript.clear_selection();
             self.sidebar.clear_selection();
@@ -2665,10 +2823,13 @@ impl SessionScreen {
     /// replace that answer with `request`'s generic "nothing to choose from here yet",
     /// which reads as a surface that failed rather than as a session with no subagents.
     fn subagent_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
-        Some(Box::new(crate::views::subagent::SubagentView::new(
-            self.context.clone(),
-            crate::views::subagent::delegations(self.transcript.transcript().messages()),
-        )))
+        Some(Box::new(
+            crate::views::subagent::SubagentView::new(
+                self.context.clone(),
+                crate::views::subagent::delegations(self.transcript.transcript().messages()),
+            )
+            .with_work_state(self.work.clone()),
+        ))
     }
 
     fn background_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
@@ -2844,8 +3005,6 @@ impl SessionScreen {
             return EventResult::IGNORED;
         }
         if self.cancel_requested {
-            self.toasts
-                .push(Toast::info("turn cancellation is already in progress"));
             return EventResult::REDRAW;
         }
         let confirmed = self
@@ -2853,11 +3012,6 @@ impl SessionScreen {
             .is_some_and(|armed| now_ms.saturating_sub(armed) <= INTERRUPT_CONFIRM_WINDOW_MS);
         if !confirmed {
             self.interrupt_armed_at_ms = Some(now_ms);
-            let key = crate::views::key_label("session_interrupt", &self.context)
-                .unwrap_or_else(|| String::from("esc"));
-            self.toasts.push(Toast::info(format!(
-                "press {key} again to stop the active turn"
-            )));
             return EventResult::REDRAW;
         }
 
@@ -2867,7 +3021,6 @@ impl SessionScreen {
         {
             self.cancel_requested = true;
             self.cancellations += 1;
-            self.toasts.push(Toast::info("stopping the active turn"));
         } else {
             self.toasts
                 .push(Toast::warning("the active turn could not be cancelled"));
@@ -3185,7 +3338,7 @@ impl ActionComponent for SessionScreen {
         if dialog != crate::views::question::DIALOG_ID {
             return None;
         }
-        let empty = !self.transcript.transcript().conversation_started();
+        let empty = self.welcome_active();
         let content = content_bounds(area, sidebar_drawn(self.sidebar_visible, empty, area.width));
         let composer = composer_region(content, empty);
         Some(Rect {
@@ -3464,6 +3617,9 @@ impl ActionComponent for SessionScreen {
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
+        if action.name == "session_interrupt" && self.modal.is_some() {
+            return self.request_interrupt_at(self.now_ms());
+        }
         if self.transcript_full {
             if matches!(action.name, "messages_transcript" | "session_interrupt") {
                 return self.toggle_transcript();
@@ -3489,7 +3645,11 @@ impl ActionComponent for SessionScreen {
                 _ => None,
             };
             if let Some(autocomplete_action) = autocomplete_action {
-                return self.autocomplete_step(autocomplete_action);
+                let autocomplete = self.autocomplete_step(autocomplete_action);
+                if action.name == "session_interrupt" {
+                    return autocomplete.merge(self.request_interrupt_at(self.now_ms()));
+                }
+                return autocomplete;
             }
         }
         if action.name == "session_interrupt" {

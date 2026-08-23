@@ -12,7 +12,9 @@ use zuno_engine::r#loop::{
     ResolvedModel, RunTurnRequest, ToolDispatcher, TurnContext, TurnEvent, TurnOutcome,
     event_channel, run_turn,
 };
-use zuno_engine::status::{SessionRunRegistry, SessionStatus, SoftInterruptAction};
+use zuno_engine::status::{
+    AbortDisposition, SessionRunRegistry, SessionStatus, SoftInterruptAction,
+};
 use zuno_error::ProviderError;
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::event::StreamEvent;
@@ -108,6 +110,25 @@ fn status_rejects_two_concurrent_prompts_for_one_session() {
     assert!(registry.active_sessions().is_empty());
 }
 
+#[test]
+fn status_abort_during_an_idle_handoff_interrupts_the_next_accepted_turn() {
+    let registry = SessionRunRegistry::new();
+    let control = registry.control(SESSION_ID);
+
+    assert_eq!(
+        control.abort(),
+        AbortDisposition::ArmedNext,
+        "a cancellation accepted between turn guards must be armed, not dropped",
+    );
+    let next = registry
+        .begin_turn(SESSION_ID)
+        .expect("the accepted follow-up starts its guard");
+    assert!(
+        next.interrupt_signal().is_set(),
+        "the handoff cancellation did not reach the next turn"
+    );
+}
+
 #[tokio::test]
 async fn status_abort_through_stale_handle_interrupts_the_live_turn() {
     let registry = SessionRunRegistry::new();
@@ -151,7 +172,10 @@ async fn status_abort_through_stale_handle_interrupts_the_live_turn() {
     .expect("abort must wake the hanging provider stream")
     .expect("turn result");
 
-    assert!(aborter.join().expect("abort worker"));
+    assert_eq!(
+        aborter.join().expect("abort worker"),
+        AbortDisposition::Active
+    );
     assert!(matches!(outcome, TurnOutcome::Interrupted { .. }));
     assert!(live_turn.interrupt_signal().is_set());
     assert!(
@@ -181,6 +205,10 @@ fn status_soft_interrupt_injects_at_safe_point_without_cancelling() {
         .queue_soft_interrupt(message.clone())
         .expect("queue soft interrupt");
     assert!(
+        turn.soft_interrupt_signal().is_set(),
+        "queuing a steer must wake a provider wait"
+    );
+    assert!(
         !turn.interrupt_signal().is_set(),
         "a soft interrupt must not fire the abort signal"
     );
@@ -188,6 +216,10 @@ fn status_soft_interrupt_injects_at_safe_point_without_cancelling() {
     let delivery = turn.take_soft_interrupts_at_safe_point();
     assert_eq!(delivery.messages, vec![message]);
     assert_eq!(delivery.action, SoftInterruptAction::Continue);
+    assert!(
+        !turn.soft_interrupt_signal().is_set(),
+        "draining the steer must clear its wake signal"
+    );
     assert!(
         turn.take_soft_interrupts_at_safe_point()
             .messages

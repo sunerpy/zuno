@@ -782,6 +782,7 @@ impl Component for EventRecorder {
             AppEvent::Engine(_) => {
                 self.engine_events.fetch_add(1, Ordering::SeqCst);
             }
+            AppEvent::AnimationFrame => {}
         }
         EventResult::REDRAW
     }
@@ -836,6 +837,7 @@ async fn wait_until_within(timeout: Duration, mut predicate: impl FnMut() -> boo
 
 const TEST_REDRAW_CONFIG: RedrawConfig = RedrawConfig {
     active: Duration::from_millis(10),
+    animation: Duration::from_millis(20),
     idle: Duration::from_millis(30),
     deep_idle_after: Duration::from_millis(60),
     deep_idle: Duration::from_millis(100),
@@ -1522,6 +1524,71 @@ async fn app_idle_schedule_backs_off_and_activity_wakes_it() {
         activity,
     );
     assert_eq!(schedule.cadence(), REDRAW_CONFIG.active);
+}
+
+#[tokio::test]
+async fn app_active_turn_keeps_animating_without_more_engine_events() {
+    let lifecycle = Arc::new(FakeLifecycle::default());
+    lifecycle.enter().expect("fake terminal enters");
+    let engine_events = Arc::new(AtomicUsize::new(0));
+    let root = EventRecorder {
+        terminal_events: Arc::new(AtomicUsize::new(0)),
+        engine_events: Arc::clone(&engine_events),
+    };
+    let (target, screen) = SharedTestTarget::new(10, 2);
+    let (terminal_tx, terminal_rx) = terminal_event_channel();
+    let (engine_tx, engine_rx) = mpsc::channel(2);
+    let (app, _owner) = App::new(
+        Box::new(root),
+        Box::new(target),
+        Arc::clone(&lifecycle) as Arc<_>,
+        terminal_rx,
+        engine_rx,
+    );
+    let mut app = app.with_redraw_config(TEST_REDRAW_CONFIG);
+    let task = tokio::spawn(async move { app.run().await });
+    wait_until(|| locked(&screen).draws == 1).await;
+
+    engine_tx
+        .send(TurnEvent::TurnStarted {
+            session_id: "ses_animation_clock".to_owned(),
+        })
+        .await
+        .expect("engine event channel is open");
+    wait_until(|| engine_events.load(Ordering::SeqCst) == 1).await;
+    wait_until(|| locked(&screen).draws >= 2).await;
+    tokio::time::sleep(Duration::from_millis(220)).await;
+    let active_draws = locked(&screen).draws;
+
+    engine_tx
+        .send(TurnEvent::TurnCompleted {
+            assistant_message_id: "msg_animation_clock".to_owned(),
+            steps: 1,
+        })
+        .await
+        .expect("engine event channel is open");
+    wait_until(|| engine_events.load(Ordering::SeqCst) == 2).await;
+    wait_until(|| locked(&screen).draws > active_draws).await;
+    let settled_draws = locked(&screen).draws;
+    tokio::time::sleep(TEST_REDRAW_CONFIG.idle * 3).await;
+    let after_idle = locked(&screen).draws;
+
+    terminal_tx
+        .send(TerminalEvent::Shutdown)
+        .await
+        .expect("terminal event channel is open");
+    task.await
+        .expect("the event loop task does not panic")
+        .expect("the event loop exits cleanly");
+
+    assert!(
+        active_draws >= 3,
+        "the active turn drew once for TurnStarted and then froze at {active_draws} frames"
+    );
+    assert_eq!(
+        after_idle, settled_draws,
+        "the animation clock kept repainting after the turn completed"
+    );
 }
 
 #[tokio::test]

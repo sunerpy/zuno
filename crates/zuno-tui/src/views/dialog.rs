@@ -1,6 +1,6 @@
 //! Dialogs, and why none of them blocks.
 //!
-//! # A modal owns the keyboard, but never the exit
+//! # A modal owns the keyboard and pointer, but never the exit
 //!
 //! Swallowing every action a dialog does not understand is what stops `session_new`
 //! from firing behind a permission prompt, and it must stay. Applied to the exit
@@ -10,10 +10,16 @@
 //! that sends [`crate::app::TerminalEvent::Shutdown`]. Raw mode having already taken
 //! `SIGINT` away, the application could not be left at all while a prompt was up.
 //!
-//! So exactly one class of ignored action is forwarded: one whose chord the table
-//! binds to [`crate::keybind::APP_EXIT`]. A dialog that wants the chord for itself
-//! still gets it first — the permission prompt resolves it to a rejection — and this
-//! only runs once the dialog has said it has no use for it.
+//! An ignored action whose chord the table binds to [`crate::keybind::APP_EXIT`] is
+//! therefore forwarded to the base. A dialog that wants the chord for itself still
+//! gets it first — the permission prompt resolves it to a rejection — and this path
+//! runs only once the dialog has said it has no use for it.
+//!
+//! `session_interrupt` is the deliberate second exception, with different semantics:
+//! the visible dialog handles it first and the base always sees it afterwards. During
+//! a running turn that makes one physical `Esc` both close the prompt and arm turn
+//! interruption; otherwise the advertised two-press contract becomes three presses
+//! whenever a question or permission prompt is open.
 //!
 //! # A dialog is state in the tree, not a call that waits
 //!
@@ -31,9 +37,11 @@
 //! - [`Dialog::handle_action`] returns immediately, always. It reports
 //!   [`DialogStep::Resolved`] when the user has decided, and the host records the
 //!   outcome in a queue for whoever asked.
-//! - [`DialogHost`] forwards **every non-key event to the base component even while
-//!   a dialog is open**. A dialog captures keys, not the world. This is the property
-//!   the no-stall test asserts, and it fails if the host is made modal.
+//! - [`DialogHost`] forwards engine, wake, resize, and lifecycle events to the base
+//!   component even while a dialog is open. Pointer events belong to the visible modal
+//!   instead, so a click cannot activate covered content. This is the property the
+//!   no-stall test asserts: background progress keeps moving without pointer
+//!   click-through.
 //!
 //! # Keys reach a dialog as actions
 //!
@@ -77,7 +85,7 @@ use crate::keybind::{ActionComponent, Definition, PendingPrefix, is_exit_request
 use crate::views::autocomplete::WhichKeyView;
 use crate::views::toast::ToastLayer;
 use crate::views::{ViewContext, fill, hint, padded};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
@@ -174,7 +182,7 @@ pub enum DialogWidth {
 /// Where a dialog belongs relative to the base surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogPlacement {
-    /// A conventional bottom-anchored overlay over the frame.
+    /// A conventional overlay centred over the frame.
     Overlay,
     /// The base component's composer region, replacing the input surface.
     Composer,
@@ -306,6 +314,17 @@ pub trait Dialog: Send {
         DialogStep::Ignored
     }
 
+    /// Act on one pointer event inside the rendered body.
+    ///
+    /// The host owns modal geometry and translates nothing: `body` is the exact
+    /// absolute rectangle used to draw [`Dialog::lines`]. The dialog owns the meaning
+    /// of rows and buttons within it. Events outside this rectangle may still be
+    /// reported so the dialog can deliberately support them, but the default ignores
+    /// every pointer event.
+    fn handle_mouse(&mut self, _event: &MouseEvent, _body: Rect) -> DialogStep {
+        DialogStep::Ignored
+    }
+
     /// Rows the dialog wants, given the rows its body produced and the rows the
     /// frame has.
     ///
@@ -331,6 +350,18 @@ pub struct DialogHost {
     pending: PendingPrefix,
     which_key: WhichKeyView,
     toasts: ToastLayer,
+    rendered_dialog: Option<RenderedDialog>,
+}
+
+/// Geometry from the last frame, paired with the dialog it belongs to.
+///
+/// Pointer events arrive after rendering, so keeping this in the host avoids every
+/// dialog independently reconstructing the width tier, placement, clipping, and
+/// composer-region rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderedDialog {
+    id: &'static str,
+    body: Rect,
 }
 
 impl DialogHost {
@@ -345,6 +376,7 @@ impl DialogHost {
             stack: Vec::new(),
             outcomes: Vec::new(),
             pending: PendingPrefix::default(),
+            rendered_dialog: None,
         }
     }
 
@@ -387,6 +419,7 @@ impl DialogHost {
     /// Push a dialog onto the stack.
     pub fn open(&mut self, dialog: Box<dyn Dialog>) {
         self.stack.push(dialog);
+        self.rendered_dialog = None;
     }
 
     /// Whether a dialog is showing.
@@ -417,7 +450,11 @@ impl DialogHost {
 
     /// Close the top dialog without an outcome.
     pub fn dismiss(&mut self) -> bool {
-        self.stack.pop().is_some()
+        let dismissed = self.stack.pop().is_some();
+        if dismissed {
+            self.rendered_dialog = None;
+        }
+        dismissed
     }
 
     /// Open whatever the base asked for, reporting whether anything opened.
@@ -427,7 +464,45 @@ impl DialogHost {
         for dialog in requested {
             self.stack.push(dialog);
         }
+        if opened {
+            self.rendered_dialog = None;
+        }
         opened
+    }
+
+    /// Apply one dialog step and keep every input path's lifecycle identical.
+    ///
+    /// Keys and pointer events both come through here. In particular, a resolved
+    /// message-action menu must be able to open the confirmation requested by its
+    /// base component regardless of whether the row was chosen with Enter or a click.
+    fn settle_dialog_step(&mut self, id: &'static str, step: DialogStep) -> EventResult {
+        match step {
+            DialogStep::Ignored => EventResult {
+                handled: true,
+                redraw: false,
+            },
+            DialogStep::Redraw => EventResult::REDRAW,
+            DialogStep::Emitted(outcome) => {
+                self.base.apply_dialog_outcome(id, &outcome);
+                self.outcomes.push((id, outcome));
+                self.take_toasts();
+                EventResult::REDRAW
+            }
+            DialogStep::Resolved(outcome) => {
+                self.stack.pop();
+                self.rendered_dialog = None;
+                // The base is told before the outcome is queued, so a component that
+                // asked for the dialog can act on the answer without owning the queue a
+                // host also drains.
+                self.base.apply_dialog_outcome(id, &outcome);
+                self.outcomes.push((id, outcome));
+                // Answering one dialog can request the next surface, as Revert does
+                // when it escalates into a destructive-action confirmation.
+                self.open_requested();
+                self.take_toasts();
+                EventResult::REDRAW
+            }
+        }
     }
 
     /// The pending leader sequence and its continuations.
@@ -465,6 +540,7 @@ impl DialogHost {
 
     fn render_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let Some(dialog) = self.stack.last() else {
+            self.rendered_dialog = None;
             return;
         };
         let id = dialog.id();
@@ -474,6 +550,7 @@ impl DialogHost {
             DialogPlacement::Composer => self.base.dialog_region(id, area).unwrap_or(area),
         };
         if area.width == 0 || area.height == 0 {
+            self.rendered_dialog = None;
             return;
         }
         let dialog = self
@@ -500,7 +577,10 @@ impl DialogHost {
         let height = desired.min(area.height).max(3).min(area.height);
         let region = Rect {
             x: area.x + (area.width.saturating_sub(columns)) / 2,
-            y: area.y + area.height.saturating_sub(height),
+            y: match placement {
+                DialogPlacement::Overlay => area.y + area.height.saturating_sub(height) / 2,
+                DialogPlacement::Composer => area.y + area.height.saturating_sub(height),
+            },
             width: columns,
             height,
         };
@@ -550,14 +630,18 @@ impl DialogHost {
         } else {
             body
         };
-        Paragraph::new(body).style(self.context.surface()).render(
-            Rect {
-                x: body_area.x + 1,
-                width: inner_width,
-                ..body_area
-            },
-            frame.buffer_mut(),
-        );
+        let rendered_body = Rect {
+            x: body_area.x + 1,
+            width: inner_width,
+            ..body_area
+        };
+        self.rendered_dialog = Some(RenderedDialog {
+            id,
+            body: rendered_body,
+        });
+        Paragraph::new(body)
+            .style(self.context.surface())
+            .render(rendered_body, frame.buffer_mut());
 
         let footer = Rect {
             x: footer_area.x + 1,
@@ -622,8 +706,6 @@ impl Component for DialogHost {
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> EventResult {
-        // Non-key events reach the base unconditionally. See the module docs: this
-        // single line is what keeps an open dialog from stalling the loop.
         match event {
             AppEvent::Terminal(crate::app::TerminalEvent::Input(crossterm::event::Event::Key(
                 key,
@@ -639,28 +721,43 @@ impl Component for DialogHost {
                 // the exit chord is forwarded, and that is handled in `handle_action`.
                 if let Some(dialog) = self.stack.last_mut() {
                     let id = dialog.id();
-                    return match dialog.handle_typed(key) {
-                        DialogStep::Resolved(outcome) => {
-                            self.stack.pop();
-                            self.base.apply_dialog_outcome(id, &outcome);
-                            self.outcomes.push((id, outcome));
-                            EventResult::REDRAW
-                        }
-                        DialogStep::Redraw => EventResult::REDRAW,
-                        DialogStep::Emitted(outcome) => {
-                            self.base.apply_dialog_outcome(id, &outcome);
-                            self.outcomes.push((id, outcome));
-                            EventResult::REDRAW
-                        }
-                        DialogStep::Ignored => EventResult {
-                            handled: true,
-                            redraw: false,
-                        },
-                    };
+                    let step = dialog.handle_typed(key);
+                    return self.settle_dialog_step(id, step);
                 }
                 self.base.handle_event(event)
             }
+            AppEvent::Terminal(crate::app::TerminalEvent::Input(
+                crossterm::event::Event::Mouse(mouse),
+            )) if self.is_open() => {
+                // A modal captures the pointer as well as the keyboard. If no frame has
+                // painted this dialog yet, absorb the event rather than guessing at
+                // geometry or allowing it to click through to covered content.
+                let Some(rendered) = self.rendered_dialog else {
+                    return EventResult {
+                        handled: true,
+                        redraw: false,
+                    };
+                };
+                let Some(dialog) = self.stack.last_mut() else {
+                    return EventResult {
+                        handled: true,
+                        redraw: false,
+                    };
+                };
+                if dialog.id() != rendered.id {
+                    return EventResult {
+                        handled: true,
+                        redraw: false,
+                    };
+                }
+                let id = dialog.id();
+                let step = dialog.handle_mouse(mouse, rendered.body);
+                self.settle_dialog_step(id, step)
+            }
             _ => {
+                // Engine, wake, resize, and lifecycle events still reach the base while
+                // a modal is open. See the module docs: this is what prevents a dialog
+                // from stalling the agent loop.
                 let mut result = self.base.handle_event(event);
                 // Both seams are serviced here as well as after an action, because not
                 // every request comes from a key. A wake is how the base learns its
@@ -703,44 +800,31 @@ impl ActionComponent for DialogHost {
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
         if let Some(dialog) = self.stack.last_mut() {
             let id = dialog.id();
-            return match dialog.handle_action(action, event) {
+            let step = dialog.handle_action(action, event);
+            let dialog_result = match step {
                 DialogStep::Ignored if is_exit_request(event) => {
                     // The one forwarded class. See the module docs: absorbing this
                     // leaves a user with no way out of a raw-mode terminal.
-                    self.base.handle_action(action, event)
+                    return self.base.handle_action(action, event);
                 }
-                DialogStep::Ignored => {
-                    // An action a dialog does not understand is *not* forwarded to
-                    // the base. A modal owns the keyboard; forwarding would let
-                    // `session_new` fire while a permission prompt is up.
-                    EventResult {
-                        handled: true,
-                        redraw: false,
-                    }
-                }
-                DialogStep::Redraw => EventResult::REDRAW,
-                DialogStep::Emitted(outcome) => {
-                    self.base.apply_dialog_outcome(id, &outcome);
-                    self.outcomes.push((id, outcome));
-                    self.take_toasts();
-                    EventResult::REDRAW
-                }
-                DialogStep::Resolved(outcome) => {
-                    self.stack.pop();
-                    // The base is told before the outcome is queued, so a component that
-                    // asked for the dialog can act on the answer without owning the
-                    // queue a host also drains.
-                    self.base.apply_dialog_outcome(id, &outcome);
-                    self.outcomes.push((id, outcome));
-                    // Both seams are serviced, and in this order: answering one dialog is
-                    // exactly how a confirmation escalates into the next surface, and how
-                    // it reports what it did. Servicing only one of the two is how a
-                    // confirmed action ends in silence.
-                    self.open_requested();
-                    self.take_toasts();
-                    EventResult::REDRAW
-                }
+                other => self.settle_dialog_step(id, other),
             };
+            if action.name == "session_interrupt" {
+                // One physical escape has two responsibilities while a running turn is
+                // parked behind a modal: dismiss the visible prompt and arm cancellation
+                // of the turn. Keeping only the first responsibility means two presses
+                // close the prompt and merely arm the turn, so the advertised "press Esc
+                // twice" contract needs a surprising third press.
+                let base_result = self.base.handle_action(action, event);
+                let opened = self.open_requested();
+                let raised = self.take_toasts();
+                return if opened || raised {
+                    EventResult::REDRAW.merge(dialog_result).merge(base_result)
+                } else {
+                    dialog_result.merge(base_result)
+                };
+            }
+            return dialog_result;
         }
         let result = self.base.handle_action(action, event);
         // Drained after the action, never before: the action is what asks.
@@ -834,6 +918,7 @@ impl<C: Component> Component for ObservedBase<C> {
         match event {
             AppEvent::Engine(_) => self.engine_events += 1,
             AppEvent::Terminal(_) => self.terminal_events += 1,
+            AppEvent::AnimationFrame => {}
         }
         self.inner.handle_event(event)
     }

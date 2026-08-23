@@ -32,7 +32,9 @@
 //! rather than left as a comment.
 
 use serde_json::Value;
+use std::collections::BTreeSet;
 use zuno_db::message::{MessageRole, MessageWithParts, PartKind, PartRecord};
+use zuno_engine::r#loop::INTERRUPTED_TURN_NOTICE;
 use zuno_tui::views::message::{Message, MessagePart, Role, ToolStatus};
 use zuno_tui::views::toast::ToastLevel;
 
@@ -88,39 +90,55 @@ pub(crate) fn project(history: Vec<MessageWithParts>) -> Replay {
     let messages = history
         .into_iter()
         .skip(omitted)
-        .filter_map(project_message)
+        .flat_map(project_message)
         .collect();
     Replay { messages, omitted }
 }
 
-/// One stored message as the transcript would hold it, or [`None`] when it renders empty.
-fn project_message(stored: MessageWithParts) -> Option<Message> {
+/// One stored message as the transcript would hold it.
+///
+/// A message-level failure becomes a separate session-owned notice. It is not assistant
+/// content and therefore must not be nested inside the partial reply it explains.
+fn project_message(stored: MessageWithParts) -> Vec<Message> {
     let role = match stored.info.role {
         MessageRole::User => Role::User,
         MessageRole::Assistant => Role::Assistant,
     };
-    let mut parts = stored
+    let failure = stored.info.data.get("error").and_then(error_notice);
+    let visible_reasoning = stored
+        .parts
+        .iter()
+        .filter(|part| part.kind == PartKind::Reasoning && !is_provider_reasoning(part))
+        .filter_map(|part| text(&part.data))
+        .collect::<BTreeSet<_>>();
+    let parts = stored
         .parts
         .into_iter()
+        .filter(|part| {
+            !(is_provider_reasoning(part)
+                && text(&part.data).is_some_and(|text| visible_reasoning.contains(&text)))
+        })
         .filter_map(project_part)
         .collect::<Vec<_>>();
-    // A turn the user interrupted, or one the provider failed, is persisted as an
-    // `error` on the message itself and is otherwise invisible. Reporting it beside the
-    // partial reply is what tells a resuming reader why the answer stops mid-sentence.
-    if let Some(failure) = stored.info.data.get("error").and_then(error_summary) {
-        parts.push(MessagePart::Notice {
-            text: failure,
-            level: ToastLevel::Error,
+    let mut messages = Vec::with_capacity(2);
+    if !parts.is_empty() {
+        messages.push(Message {
+            role,
+            id: Some(stored.info.id),
+            parts,
         });
     }
-    if parts.is_empty() {
-        return None;
+    if let Some(failure) = failure {
+        messages.push(Message::noticed(ToastLevel::Error, failure));
     }
-    Some(Message {
-        role,
-        id: Some(stored.info.id),
-        parts,
-    })
+    messages
+}
+
+fn is_provider_reasoning(part: &PartRecord) -> bool {
+    part.data
+        .get("metadata")
+        .and_then(Value::as_object)
+        .is_some_and(|metadata| metadata.contains_key("providerReasoning"))
 }
 
 /// One stored part as the transcript would hold it, or [`None`] when it has no on-screen form.
@@ -299,6 +317,23 @@ fn error_summary(error: &Value) -> Option<String> {
     (!text.is_empty()).then(|| format!("this turn ended early: {text}"))
 }
 
+/// The session-owned notice for a stored message-level failure.
+///
+/// Current Zuno checkpoints use `AbortError`; imported sessions may still carry
+/// `MessageAbortedError`. Both name the same user action and are normalised to the
+/// stable live marker instead of exposing provider/storage wording.
+fn error_notice(error: &Value) -> Option<String> {
+    let interruption = error
+        .as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(Value::as_str)
+        .is_some_and(|name| matches!(name, "AbortError" | "MessageAbortedError"));
+    if interruption {
+        Some(INTERRUPTED_TURN_NOTICE.to_owned())
+    } else {
+        error_summary(error)
+    }
+}
 /// The notice shown when a session's stored history could not be read at all.
 ///
 /// A resume must open. `hydrate_retained_history` fails whole rather than per part — one

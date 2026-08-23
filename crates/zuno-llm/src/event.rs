@@ -395,12 +395,19 @@ pub enum StreamEvent {
     TextDelta(String),
     /// A tool call began.
     ToolUseStart { id: String, name: String },
-    /// A raw JSON fragment for the current tool call.
-    ToolInputDelta(String),
-    /// The current tool call's input is complete.
-    ToolUseEnd,
-    /// Gemini's thought signature for the most recent tool call.
-    ToolUseSignature(ThoughtSignature),
+    /// A raw JSON fragment for one tool call.
+    ///
+    /// Providers may interleave multiple function-call items in one response, so
+    /// every fragment names its call instead of relying on a process-global
+    /// "current tool".
+    ToolInputDelta { id: String, delta: String },
+    /// One tool call's input is complete.
+    ToolUseEnd { id: String },
+    /// Gemini's thought signature for one tool call.
+    ToolUseSignature {
+        id: String,
+        signature: ThoughtSignature,
+    },
     /// A tool result produced inside the provider rather than by the turn loop.
     ToolResult {
         tool_use_id: String,

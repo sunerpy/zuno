@@ -42,12 +42,15 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
 use zuno_agent::reflection::{
-    CommandOutcome, ReflectionConfig, ReflectionError, ReflectionFork, ReflectionRequest,
-    ReflectionRunner, ReflectionTools, ReflectionTurn, TranscriptEvent, TurnDelivery,
-    TurnTranscript,
+    CommandOutcome, ReflectionError, ReflectionFork, ReflectionMemoryEntry, ReflectionMemoryScope,
+    ReflectionRequest, ReflectionRunner, ReflectionTools, ReflectionTurn, TranscriptEvent,
+    TurnDelivery, TurnTranscript,
 };
 use zuno_auth::{AuthStore, Credential, LoginMethodRegistry};
 use zuno_config::schema::provider::ProviderTransport;
+use zuno_db::memory_reflection::{
+    MemoryReflectionStore, ReflectionAdmission, ReflectionAdmissionResult, ReflectionJobStatus,
+};
 use zuno_engine::compaction::{CompactionState, TokenWindow};
 use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
@@ -88,6 +91,8 @@ use zuno_tool::{
 };
 
 use crate::environment::StartupEnvironment;
+
+const REFLECTION_LEASE_MILLIS: i64 = 60 * 60 * 1_000;
 
 const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 
@@ -1041,7 +1046,14 @@ pub(crate) struct TurnHost {
     title_sink: Option<Arc<dyn SessionTitleSink>>,
     work_changes: super::child_turn::ChangeNotifier,
     memory: Option<Arc<MemoryService>>,
-    reflection: Option<ReflectionFork>,
+    reflection: Option<ReflectionRuntime>,
+}
+
+struct ReflectionRuntime {
+    fork: ReflectionFork,
+    state: MemoryReflectionStore,
+    turn_interval: u64,
+    owner_id: String,
 }
 
 enum ExtensionOwnership {
@@ -1196,6 +1208,10 @@ impl ReflectionRunner for ProviderReflectionRunner {
                 "prompt": request.prompt.as_ref(),
                 "promptDigest": prompt_digest,
                 "compaction": "disabled",
+                "residentMemory": request.resident_memory.iter().map(|entry| json!({
+                    "scope": entry.scope.as_str(),
+                    "content": &entry.content,
+                })).collect::<Vec<_>>(),
                 "transcript": transcript,
                 "tool": {
                     "name": &definition.id,
@@ -1428,6 +1444,14 @@ fn reflection_transcript_json(transcript: &TurnTranscript) -> Vec<Value> {
             },
         })
         .collect()
+}
+
+fn job_result_text(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.get("text").and_then(Value::as_str).map(str::to_owned))
+        .or_else(|| (!value.is_null()).then(|| value.to_string()))
 }
 
 fn durable_reflection_transcript(
@@ -1773,18 +1797,27 @@ impl TurnHost {
             let mut notes = plan.notes;
             let reflection = match (memory.as_ref(), plan.reflection_model.take()) {
                 (Some(service), Some(model)) => match providers.resolve(model.provider.clone()) {
-                    Ok(provider) => Some(ReflectionFork::new(
-                        ReflectionConfig {
-                            enabled: memory_settings.reflection,
+                    Ok(provider) => {
+                        let state = MemoryReflectionStore::new(Arc::clone(&database));
+                        state
+                            .reconcile_expired(zuno_db::message::now_millis())
+                            .map_err(to_string)?;
+                        Some(ReflectionRuntime {
+                            fork: ReflectionFork::new(
+                                Arc::new(ProviderReflectionRunner {
+                                    provider,
+                                    model,
+                                    events: zuno_db::event_log::SessionEventLog::new(Arc::clone(
+                                        &database,
+                                    )),
+                                }),
+                                erase(zuno_tools::MemoryTool::reflection(Arc::clone(service))),
+                            ),
+                            state,
                             turn_interval: memory_settings.nudge_interval,
-                        },
-                        Arc::new(ProviderReflectionRunner {
-                            provider,
-                            model,
-                            events: zuno_db::event_log::SessionEventLog::new(Arc::clone(&database)),
-                        }),
-                        erase(zuno_tools::MemoryTool::reflection(Arc::clone(service))),
-                    )),
+                            owner_id: format!("reflection_owner_{}", Uuid::new_v4().simple()),
+                        })
+                    }
                     Err(error) => {
                         notes.push(format!(
                         "memory reflection disabled: small-model provider could not start ({error})"
@@ -2114,17 +2147,29 @@ impl TurnHost {
             .map(|job| {
                 let subject = match job.subject {
                     zuno_db::job::JobSubject::ChildSession { session_id } => {
-                        format!("child {session_id}")
+                        zuno_types::JobSubjectProjection::ChildSession { session_id }
                     }
                     zuno_db::job::JobSubject::ProductAgent {
-                        product, instance, ..
-                    } => format!("{product} · {instance}"),
+                        run_id,
+                        product,
+                        instance,
+                        tool,
+                    } => zuno_types::JobSubjectProjection::ProductAgent {
+                        run_id,
+                        product,
+                        instance,
+                        tool,
+                    },
                 };
                 zuno_types::JobProjection {
                     id: job.id,
                     subject,
                     status: job.status.as_str().to_owned(),
                     report_delivery: job.report_delivery.as_str().to_owned(),
+                    result: job.result.as_ref().and_then(job_result_text),
+                    error: job.error,
+                    time_created: job.time_created,
+                    time_completed: job.time_completed,
                 }
             })
             .collect();
@@ -2787,7 +2832,7 @@ impl TurnHost {
             .prepare_if_idle(&self.session_id, mode, queued_input)
             .map_err(to_string)?
         {
-            ContinuationAttempt::Prepared(prepared) => prepared,
+            ContinuationAttempt::Prepared(prepared) => *prepared,
             ContinuationAttempt::Suppressed(ContinuationSuppression::RetryBackoff {
                 remaining,
             }) => {
@@ -3016,27 +3061,152 @@ impl TurnHost {
                 return;
             }
         };
+        let now = zuno_db::message::now_millis();
+        if let Err(error) = reflection.state.reconcile_expired(now) {
+            let _ = events
+                .publish(TurnEvent::Provider {
+                    step: *steps,
+                    event: StreamEvent::StatusDetail {
+                        detail: format!(
+                            "warning: memory reflection reconciliation failed: {error}"
+                        ),
+                    },
+                })
+                .await;
+            return;
+        }
+        let eligibility = transcript.reflection_eligibility();
+        let admission = reflection.state.admit_and_start(ReflectionAdmission {
+            job_id: format!("reflection_{}", Uuid::new_v4().simple()),
+            session_id: self.session_id.clone(),
+            source_message_id: assistant_message_id.clone(),
+            turn_interval: reflection.turn_interval,
+            recovered: eligibility.recovered,
+            negative_learning: eligibility.negative_learning,
+            owner_id: reflection.owner_id.clone(),
+            lease_expires: now.saturating_add(REFLECTION_LEASE_MILLIS),
+            time_created: now,
+        });
+        let job = match admission {
+            Ok(ReflectionAdmissionResult::Started { job, .. }) => job,
+            Ok(
+                ReflectionAdmissionResult::AlreadyRecorded { .. }
+                | ReflectionAdmissionResult::NotScheduled { .. },
+            ) => return,
+            Err(error) => {
+                let _ = events
+                    .publish(TurnEvent::Provider {
+                        step: *steps,
+                        event: StreamEvent::StatusDetail {
+                            detail: format!(
+                                "warning: memory reflection was not scheduled because its durable state could not be written: {error}"
+                            ),
+                        },
+                    })
+                    .await;
+                return;
+            }
+        };
+        let resident_memory = match self.memory.as_ref() {
+            Some(memory) => match memory.entries() {
+                Ok(entries) => entries
+                    .into_iter()
+                    .map(|entry| {
+                        let scope = match entry.scope {
+                            zuno_types::MemoryScope::Global => ReflectionMemoryScope::Global,
+                            zuno_types::MemoryScope::Project => ReflectionMemoryScope::Project,
+                        };
+                        ReflectionMemoryEntry::new(scope, entry.content)
+                    })
+                    .collect(),
+                Err(error) => {
+                    let detail =
+                        format!("memory reflection could not read the resident snapshot: {error}");
+                    let _ = reflection.state.settle(
+                        &job.id,
+                        &reflection.owner_id,
+                        ReflectionJobStatus::Failed,
+                        Some(&detail),
+                        zuno_db::message::now_millis(),
+                    );
+                    let _ = events
+                        .publish(TurnEvent::Provider {
+                            step: *steps,
+                            event: StreamEvent::StatusDetail {
+                                detail: format!("warning: {detail}"),
+                            },
+                        })
+                        .await;
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
         let context = ToolContext::new(
             self.session_id.clone(),
             assistant_message_id.clone(),
-            format!("reflection_{}", Uuid::new_v4().simple()),
+            job.id.clone(),
             self.agent.clone(),
             Arc::new(AllowAll),
             Arc::new(NeverInterrupted),
         );
-        let task = reflection.spawn_after_turn(ReflectionTurn::new(
-            TurnDelivery::new(true, false),
-            transcript,
-            context,
-        ));
-        if let Some(task) = task {
-            self.background_jobs.supervise_handle(
-                format!("reflection_{assistant_message_id}"),
-                self.session_id.clone(),
-                tokio_util::sync::CancellationToken::new(),
-                task,
+        let task = reflection.fork.spawn_after_turn(
+            ReflectionTurn::new(TurnDelivery::new(true, false), transcript, context)
+                .with_resident_memory(resident_memory),
+        );
+        let Some(task) = task else {
+            let detail = "memory reflection was selected but the isolated runner could not start";
+            let _ = reflection.state.settle(
+                &job.id,
+                &reflection.owner_id,
+                ReflectionJobStatus::Failed,
+                Some(detail),
+                zuno_db::message::now_millis(),
             );
-        }
+            let _ = events
+                .publish(TurnEvent::Provider {
+                    step: *steps,
+                    event: StreamEvent::StatusDetail {
+                        detail: format!("warning: {detail}"),
+                    },
+                })
+                .await;
+            return;
+        };
+        let state = reflection.state.clone();
+        let owner_id = reflection.owner_id.clone();
+        let job_id = job.id.clone();
+        let supervised = tokio::spawn(async move {
+            let (status, error) = match task.await {
+                Ok(Ok(())) => (ReflectionJobStatus::Completed, None),
+                Ok(Err(error)) => (ReflectionJobStatus::Failed, Some(error.to_string())),
+                Err(error) => (
+                    ReflectionJobStatus::Uncertain,
+                    Some(format!(
+                        "reflection task ended without an authoritative outcome: {error}"
+                    )),
+                ),
+            };
+            if let Err(error) = state.settle(
+                &job_id,
+                &owner_id,
+                status,
+                error.as_deref(),
+                zuno_db::message::now_millis(),
+            ) {
+                tracing::warn!(
+                    job_id,
+                    error = %error,
+                    "memory reflection outcome could not be persisted"
+                );
+            }
+        });
+        self.background_jobs.supervise_handle(
+            job.id,
+            self.session_id.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            supervised,
+        );
     }
 
     fn finish_goal_error(

@@ -33,7 +33,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let mode = next_utf8(&mut arguments, "mode")?;
     match mode.as_str() {
-        "parent" => {
+        "parent" | "parent-guarded" => {
+            let include_mcp = mode == "parent";
             let ready = next_path(&mut arguments, "ready path")?;
             let stop = next_path(&mut arguments, "stop path")?;
             let root = next_path(&mut arguments, "workspace path")?;
@@ -41,7 +42,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .worker_threads(4)
                 .enable_all()
                 .build()?;
-            runtime.block_on(run_parent(&ready, &stop, &root))
+            runtime.block_on(run_parent(&ready, &stop, &root, include_mcp))
         }
         "lsp" => run_lsp(),
         "mcp" => run_mcp(),
@@ -53,7 +54,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn run_parent(ready: &Path, stop: &Path, root: &Path) -> Result<(), Box<dyn Error>> {
+async fn run_parent(
+    ready: &Path,
+    stop: &Path,
+    root: &Path,
+    include_mcp: bool,
+) -> Result<(), Box<dyn Error>> {
     let executable = std::env::current_exe()?;
     zuno_process::activate_guard_executable(&executable)?;
     std::fs::create_dir_all(root)?;
@@ -82,17 +88,19 @@ async fn run_parent(ready: &Path, stop: &Path, root: &Path) -> Result<(), Box<dy
         lsp.push(manager);
     }
 
-    let mut mcp = Vec::with_capacity(SESSION_COUNT);
-    for index in 0..SESSION_COUNT {
-        let config = McpLocal {
-            kind: LocalKind::Local,
-            command: vec![executable.to_string_lossy().into_owned(), "mcp".to_owned()],
-            cwd: None,
-            environment: None,
-            enabled: None,
-            timeout: None,
-        };
-        mcp.push(StdioClient::connect(format!("g6-mcp-{index}"), root, &config).await?);
+    let mut mcp = Vec::with_capacity(usize::from(include_mcp) * SESSION_COUNT);
+    if include_mcp {
+        for index in 0..SESSION_COUNT {
+            let config = McpLocal {
+                kind: LocalKind::Local,
+                command: vec![executable.to_string_lossy().into_owned(), "mcp".to_owned()],
+                cwd: None,
+                environment: None,
+                enabled: None,
+                timeout: None,
+            };
+            mcp.push(StdioClient::connect(format!("g6-mcp-{index}"), root, &config).await?);
+        }
     }
 
     let pty = PtyService::new(root);

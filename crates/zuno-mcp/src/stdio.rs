@@ -49,6 +49,7 @@ const NOTIFICATION_CAPACITY: usize = 64;
 const TOOLS_CHANGED_CAPACITY: usize = 16;
 const TASK_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const PROCESS_TERM_GRACE: Duration = Duration::from_millis(250);
 
 type DynReader = Pin<Box<dyn AsyncRead + Send>>;
 type DynWriter = Pin<Box<dyn AsyncWrite + Send>>;
@@ -142,8 +143,10 @@ pub struct ToolsChanged {
 /// A connected MCP stdio client.
 ///
 /// Clones share one child, one request-id sequence, one waiter map, and one tool
-/// cache. Dropping the final clone signals the supervisor, which kills and reaps
-/// the child. Call [`Self::close`] when shutdown ordering itself matters.
+/// cache. The configured command is the direct process-group leader; no Zuno helper
+/// process is inserted in front of it. Dropping the final clone kills the complete
+/// group and leaves its task to reap the direct child. Call [`Self::close`] when
+/// shutdown ordering matters.
 #[derive(Clone)]
 pub struct StdioClient {
     inner: Arc<Inner>,
@@ -241,6 +244,25 @@ impl StdioClient {
                 format!("could not spawn {command_name}: {source}"),
             )),
         })?;
+        let process_group = match child.id().map(zuno_process::DirectProcessGroup::register) {
+            Some(Ok(process_group)) => process_group,
+            Some(Err(source)) => {
+                let _kill = child.start_kill();
+                let _status = child.wait().await;
+                return Err(McpError::Connect {
+                    server,
+                    source: Box::new(source),
+                });
+            }
+            None => {
+                let _kill = child.start_kill();
+                let _status = child.wait().await;
+                return Err(McpError::Connect {
+                    server,
+                    source: Box::new(io::Error::other("spawned MCP child exposed no process id")),
+                });
+            }
+        };
         let stdin = child.stdin.take().ok_or_else(|| McpError::Connect {
             server: server.clone(),
             source: Box::new(io::Error::other("spawned MCP child has no stdin")),
@@ -253,7 +275,7 @@ impl StdioClient {
             .stderr
             .take()
             .map(|stderr| spawn_stderr_reader(server.clone(), stderr));
-        let process = ProcessControl::new(server.clone(), child);
+        let process = ProcessControl::new(server.clone(), child, process_group);
         let client = Self::from_io(server, stdout, stdin, timeout, Some(process));
         if let Some(stderr) = stderr {
             lock(&client.inner.tasks).stderr = Some(stderr);
@@ -700,15 +722,28 @@ struct ListToolsResult {
 struct ProcessControl {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    process_group: zuno_process::DirectProcessGroup,
 }
 
 impl ProcessControl {
-    fn new(server: String, mut child: Child) -> Self {
+    fn new(
+        server: String,
+        mut child: Child,
+        process_group: zuno_process::DirectProcessGroup,
+    ) -> Self {
         let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        let task_group = process_group;
         let task = tokio::spawn(async move {
             let result = tokio::select! {
-                status = child.wait() => status.map(|status| Some(status.code())),
-                _ = &mut shutdown_receiver => stop_guarded_child(&mut child).await.map(|()| None),
+                status = child.wait() => match status {
+                    Ok(status) => task_group
+                        .force_kill()
+                        .map(|()| Some(status.code())),
+                    Err(error) => Err(error),
+                },
+                _ = &mut shutdown_receiver => {
+                    stop_direct_child(&mut child, &task_group).await.map(|()| None)
+                }
             };
             match result {
                 Ok(Some(code)) => tracing::debug!(%server, ?code, "MCP child exited"),
@@ -719,6 +754,7 @@ impl ProcessControl {
         Self {
             shutdown: Mutex::new(Some(shutdown)),
             task: Mutex::new(Some(task)),
+            process_group,
         }
     }
 
@@ -732,25 +768,39 @@ impl ProcessControl {
         self.signal();
         let task = lock(&self.task).take();
         if let Some(task) = task {
-            finish_guard_task(task, PROCESS_SHUTDOWN_GRACE).await;
+            finish_process_task(task, PROCESS_SHUTDOWN_GRACE).await;
         }
     }
 }
 
-async fn stop_guarded_child(child: &mut Child) -> io::Result<()> {
-    if let Some(pid) = child.id() {
-        zuno_process::request_contained_process_shutdown(pid)?;
+async fn stop_direct_child(
+    child: &mut Child,
+    process_group: &zuno_process::DirectProcessGroup,
+) -> io::Result<()> {
+    process_group.request_termination()?;
+    match tokio::time::timeout(PROCESS_TERM_GRACE, child.wait()).await {
+        Ok(status) => {
+            let _status = status?;
+        }
+        Err(_) => {
+            process_group.force_kill()?;
+            let _status = child.wait().await?;
+        }
     }
-    child.wait().await.map(|_| ())
+    process_group.force_kill()
 }
 
 impl Drop for ProcessControl {
     fn drop(&mut self) {
+        // The Tokio runtime may be tearing down at the same time as the final client.
+        // Signal the complete group synchronously before relying on the detached task to
+        // reap the direct child.
+        let _killed = self.process_group.force_kill();
         if let Some(shutdown) = lock(&self.shutdown).take() {
             let _result = shutdown.send(());
         }
-        // Detach rather than abort: the guard must receive orderly shutdown and
-        // remain alive long enough to drain and reap its contained process group.
+        // Detach rather than abort: the task owns the direct child and its process-group
+        // registration until the complete tree has been terminated and reaped.
         let _detached = lock(&self.task).take();
     }
 }
@@ -860,10 +910,9 @@ fn build_command(workspace: &Path, config: &McpLocal) -> io::Result<Command> {
         )
     })?;
     let cwd = resolve_cwd(workspace, config.cwd.as_deref())?;
-    let (guarded_program, guarded_arguments) = zuno_process::guarded_argv(program, arguments);
-    let mut command = Command::new(guarded_program);
+    let mut command = Command::new(program);
     command
-        .args(guarded_arguments)
+        .args(arguments)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -947,11 +996,11 @@ async fn finish_task(mut task: JoinHandle<()>, grace: Duration) {
     }
 }
 
-async fn finish_guard_task(mut task: JoinHandle<()>, grace: Duration) {
+async fn finish_process_task(mut task: JoinHandle<()>, grace: Duration) {
     if tokio::time::timeout(grace, &mut task).await.is_err() {
         tracing::warn!(
             ?grace,
-            "MCP process guard cleanup exceeded its grace; reaper remains detached"
+            "MCP process-group cleanup exceeded its grace; reaper remains detached"
         );
     }
 }

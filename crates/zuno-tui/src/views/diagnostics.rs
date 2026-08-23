@@ -40,7 +40,8 @@ use crate::keybind::Definition;
 use crate::views::ambient::{Health, Service};
 use crate::views::dialog::{Dialog, DialogOutcome, DialogStep, DialogWidth};
 use crate::views::{ViewContext, display_width, padded, truncate};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 #[cfg(test)]
@@ -285,6 +286,27 @@ impl Dialog for StatusPanel {
             _ => DialogStep::Ignored,
         }
     }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.offset = self.offset.saturating_sub(1);
+                DialogStep::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                self.offset = self.offset.saturating_add(1);
+                DialogStep::Redraw
+            }
+            _ => DialogStep::Ignored,
+        }
+    }
 }
 
 /// The runtime facts D16 reports, each resolved by the host from a real source.
@@ -459,6 +481,27 @@ impl Dialog for DebugPanel {
             }),
             "app_exit" | "session_interrupt" | "debug_view" => {
                 DialogStep::Resolved(DialogOutcome::Cancelled)
+            }
+            _ => DialogStep::Ignored,
+        }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.offset = self.offset.saturating_sub(1);
+                DialogStep::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                self.offset = self.offset.saturating_add(1);
+                DialogStep::Redraw
             }
             _ => DialogStep::Ignored,
         }

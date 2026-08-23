@@ -2725,7 +2725,7 @@ fn production_registry_exposes_all_three_goal_tools() {
         tool_runtime::ToolSelection {
             provider_id: "provider",
             model_id: "model",
-            manifest: Arc::new(zuno_harness::ToolManifest::all()),
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
             background_executions: test_background_executions(directory.path()),
@@ -2939,8 +2939,22 @@ fn every_turn_error() -> Vec<TurnError> {
             provider_id: "empty-provider-in-the-message".to_owned(),
             step: 4,
         },
-        TurnError::NestedToolUse { step: 5 },
-        TurnError::ToolUseEndWithoutStart { step: 6 },
+        TurnError::DuplicateToolUse {
+            step: 5,
+            call_id: "duplicate-call-in-the-message".to_owned(),
+        },
+        TurnError::ToolInputWithoutStart {
+            step: 6,
+            call_id: "input-call-in-the-message".to_owned(),
+        },
+        TurnError::ToolUseEndWithoutStart {
+            step: 7,
+            call_id: "end-call-in-the-message".to_owned(),
+        },
+        TurnError::ToolSignatureWithoutStart {
+            step: 8,
+            call_id: "signature-call-in-the-message".to_owned(),
+        },
         TurnError::EventConsumerClosed,
         TurnError::Hook(
             "plugin `fixture-plugin` failed hook `chat.params`: fixture failure".to_owned(),
@@ -3016,8 +3030,10 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::StepLimit { .. } => "StepLimit",
             TurnError::StreamEndedWithoutMessageEnd { .. } => "StreamEndedWithoutMessageEnd",
             TurnError::EmptyAssistantMessage { .. } => "EmptyAssistantMessage",
-            TurnError::NestedToolUse { .. } => "NestedToolUse",
+            TurnError::DuplicateToolUse { .. } => "DuplicateToolUse",
+            TurnError::ToolInputWithoutStart { .. } => "ToolInputWithoutStart",
             TurnError::ToolUseEndWithoutStart { .. } => "ToolUseEndWithoutStart",
+            TurnError::ToolSignatureWithoutStart { .. } => "ToolSignatureWithoutStart",
             TurnError::EventConsumerClosed => "EventConsumerClosed",
             TurnError::Hook(_) => "Hook",
             TurnError::Database(_) => "Database",
@@ -3030,7 +3046,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        15,
+        17,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
@@ -3534,7 +3550,7 @@ mod production_registry {
             tool_runtime::ToolSelection {
                 provider_id: "provider",
                 model_id: "model",
-                manifest: Arc::new(zuno_harness::ToolManifest::all()),
+                manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
                 background_executions: test_background_executions(directory.path()),
@@ -3743,7 +3759,7 @@ mod production_registry {
             tool_runtime::ToolSelection {
                 provider_id: "provider",
                 model_id: "model",
-                manifest: Arc::new(zuno_harness::ToolManifest::all()),
+                manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
                 background_executions: test_background_executions(directory.path()),
@@ -4890,7 +4906,8 @@ mod reflection_runtime {
     use super::*;
     use futures::stream;
     use zuno_agent::reflection::{
-        ReflectionConfig, ReflectionTurn, TranscriptEvent, TurnDelivery, TurnTranscript,
+        ReflectionMemoryEntry, ReflectionMemoryScope, ReflectionTurn, TranscriptEvent,
+        TurnDelivery, TurnTranscript,
     };
     use zuno_llm::registry::{Capabilities, ProviderStream};
 
@@ -4967,10 +4984,6 @@ mod reflection_runtime {
             events: zuno_db::event_log::SessionEventLog::new(pool),
         };
         let fork = ReflectionFork::new(
-            ReflectionConfig {
-                enabled: true,
-                turn_interval: 1,
-            },
             Arc::new(runner),
             erase(zuno_tools::MemoryTool::reflection(Arc::clone(&memory))),
         );
@@ -4982,27 +4995,33 @@ mod reflection_runtime {
         }
     }
 
-    async fn run(fixture: &Fixture) {
+    async fn run(fixture: &Fixture) -> Result<(), ReflectionError> {
         fixture
             .fork
-            .spawn_after_turn(ReflectionTurn::new(
-                TurnDelivery::new(true, false),
-                TurnTranscript::new(vec![
-                    TranscriptEvent::user("remember the verified repository gate"),
-                    TranscriptEvent::assistant("The gate passed and is reusable."),
-                ]),
-                ToolContext::new(
-                    SESSION_ID,
-                    "msg_delivered",
-                    "call_reflection",
-                    "build",
-                    Arc::new(AllowAll),
-                    Arc::new(NeverInterrupted),
-                ),
-            ))
+            .spawn_after_turn(
+                ReflectionTurn::new(
+                    TurnDelivery::new(true, false),
+                    TurnTranscript::new(vec![
+                        TranscriptEvent::user("remember the verified repository gate"),
+                        TranscriptEvent::assistant("The gate passed and is reusable."),
+                    ]),
+                    ToolContext::new(
+                        SESSION_ID,
+                        "msg_delivered",
+                        "call_reflection",
+                        "build",
+                        Arc::new(AllowAll),
+                        Arc::new(NeverInterrupted),
+                    ),
+                )
+                .with_resident_memory(vec![ReflectionMemoryEntry::new(
+                    ReflectionMemoryScope::Project,
+                    "Use cargo check before the workspace test suite.",
+                )]),
+            )
             .expect("reflection task")
             .await
-            .expect("reflection supervisor task");
+            .expect("reflection supervisor task")
     }
 
     fn tool_events(name: &str, input: &str, with_end: bool) -> Vec<StreamEvent> {
@@ -5011,8 +5030,13 @@ mod reflection_runtime {
                 id: "call_memory".to_owned(),
                 name: name.to_owned(),
             },
-            StreamEvent::ToolInputDelta(input.to_owned()),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: "call_memory".to_owned(),
+                delta: input.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_memory".to_owned(),
+            },
         ];
         if with_end {
             events.push(StreamEvent::MessageEnd {
@@ -5030,7 +5054,7 @@ mod reflection_runtime {
             true,
         ));
 
-        run(&fixture).await;
+        run(&fixture).await.expect("reflection review");
 
         let candidates = fixture.memory.candidates().expect("memory candidates");
         assert_eq!(candidates.len(), 1);
@@ -5050,6 +5074,19 @@ mod reflection_runtime {
             ["memory.reflection.request", "memory.reflection.outcome"]
         );
         assert_eq!(events[0].properties["tool"]["name"], "memory_propose");
+        assert_eq!(
+            events[0].properties["residentMemory"][0]["scope"],
+            "project"
+        );
+        assert_eq!(
+            events[0].properties["residentMemory"][0]["content"],
+            "Use cargo check before the workspace test suite."
+        );
+        assert!(
+            events[0].properties["prompt"]
+                .as_str()
+                .is_some_and(|prompt| prompt.contains("prefer replace over add"))
+        );
         assert_eq!(events[1].properties["status"], "completed");
         assert_eq!(events[1].properties["toolCalls"], 1);
     }
@@ -5075,7 +5112,13 @@ mod reflection_runtime {
             ),
         ] {
             let fixture = fixture(events);
-            run(&fixture).await;
+            let error = run(&fixture)
+                .await
+                .expect_err("invalid reflection stream must fail the durable job");
+            assert!(
+                error.to_string().contains(expected),
+                "missing `{expected}` in {error}"
+            );
 
             assert!(
                 fixture.memory.candidates().expect("candidates").is_empty(),

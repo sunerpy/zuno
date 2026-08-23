@@ -1,6 +1,6 @@
 use super::*;
 use crate::views::testkit::{action, press};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 use zuno_types::{MemoryScope, MemorySource, WorkStateProjection};
 
 fn candidate(id: &str, status: MemoryCandidateStatus) -> MemoryCandidateProjection {
@@ -93,6 +93,30 @@ fn memory_view_renders_every_durable_candidate_state() {
             "missing `{expected}`:\n{details}"
         );
     }
+}
+
+#[test]
+fn memory_view_mouse_wheel_moves_the_selection() {
+    let mut view = view(WorkStateProjection {
+        memory_candidates: vec![
+            candidate("first", MemoryCandidateStatus::Pending),
+            candidate("second", MemoryCandidateStatus::Pending),
+        ],
+        ..WorkStateProjection::default()
+    });
+    assert_eq!(
+        view.handle_mouse(
+            &MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 4,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            ratatui::layout::Rect::new(0, 0, 80, 20),
+        ),
+        DialogStep::Redraw
+    );
+    assert_eq!(view.cursor, 1);
 }
 
 #[test]

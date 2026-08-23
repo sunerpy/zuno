@@ -26,7 +26,8 @@ use crate::theme::{Mode, Resolved, ThemeRegistry};
 use crate::views::autocomplete::score;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogStep};
 use crate::views::{ViewContext, padded};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -363,6 +364,39 @@ impl Dialog for McpDialog {
         } else {
             DialogStep::Ignored
         }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_cursor(-1);
+                return DialogStep::Redraw;
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_cursor(1);
+                return DialogStep::Redraw;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {}
+            _ => return DialogStep::Ignored,
+        }
+        let visible = self.visible();
+        let first = self.cursor.saturating_sub(self.rows.saturating_sub(1));
+        let position = first.saturating_add(usize::from(event.row.saturating_sub(body.top())));
+        let Some(server) = visible.get(position).cloned() else {
+            return DialogStep::Ignored;
+        };
+        self.cursor = position;
+        DialogStep::Emitted(DialogOutcome::McpToggle(McpToggleRequest {
+            server: server.name,
+            desired_enabled: !server.desired_enabled,
+        }))
     }
 }
 
@@ -742,6 +776,51 @@ impl SelectDialog {
         // the end of by going up, and upstream's select wraps.
         self.cursor = ((self.cursor as isize + delta).rem_euclid(length)) as usize;
     }
+
+    /// The filtered-item position painted at one body row.
+    ///
+    /// Group headings consume rows but are intentionally not selectable. Preview rows
+    /// live after the list and likewise map to no item.
+    fn position_at_display_row(&self, target: usize) -> Option<usize> {
+        if self.filtered.is_empty() || target >= self.rows {
+            return None;
+        }
+        let first = self.window_start();
+        let grouped = self.is_grouped();
+        let mut heading: Option<&str> = None;
+        let mut row = 0_usize;
+        for (position, index) in self.filtered.iter().enumerate().skip(first) {
+            if row >= self.rows {
+                break;
+            }
+            let item = &self.items[*index];
+            if grouped && heading != Some(item.group.as_str()) {
+                heading = Some(item.group.as_str());
+                if row == target {
+                    return None;
+                }
+                row += 1;
+                if row >= self.rows {
+                    break;
+                }
+            }
+            if row == target {
+                return Some(position);
+            }
+            row += 1;
+        }
+        None
+    }
+
+    fn selected_step(&self) -> DialogStep {
+        match self.selected() {
+            Some(item) => DialogStep::Resolved(DialogOutcome::Selected {
+                dialog: self.id,
+                value: item.value.clone(),
+            }),
+            None => DialogStep::Ignored,
+        }
+    }
 }
 
 impl Dialog for SelectDialog {
@@ -840,6 +919,37 @@ impl Dialog for SelectDialog {
         self.refresh_highlight();
         step
     }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_cursor(-1);
+                self.refresh_highlight();
+                return DialogStep::Redraw;
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_cursor(1);
+                self.refresh_highlight();
+                return DialogStep::Redraw;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {}
+            _ => return DialogStep::Ignored,
+        }
+        let target = usize::from(event.row.saturating_sub(body.top()));
+        let Some(position) = self.position_at_display_row(target) else {
+            return DialogStep::Ignored;
+        };
+        self.cursor = position;
+        self.refresh_highlight();
+        self.selected_step()
+    }
 }
 
 impl SelectDialog {
@@ -870,13 +980,7 @@ impl SelectDialog {
                 self.cursor = self.filtered.len().saturating_sub(1);
                 DialogStep::Redraw
             }
-            "dialog.select.submit" | "dialog.prompt.submit" => match self.selected() {
-                Some(item) => DialogStep::Resolved(DialogOutcome::Selected {
-                    dialog: self.id,
-                    value: item.value.clone(),
-                }),
-                None => DialogStep::Ignored,
-            },
+            "dialog.select.submit" | "dialog.prompt.submit" => self.selected_step(),
             // `session_interrupt` is the action the table binds to escape, and every
             // dialog footer here advertises `esc cancel`. Without this arm the dialog
             // ignored it, `DialogHost` absorbed it as an unrecognised action, and a
@@ -1064,6 +1168,11 @@ impl Dialog for SessionDialog {
                 self.select.handle_action(action, event)
             }
         }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        self.delete_confirmation = None;
+        self.select.handle_mouse(event, body)
     }
 
     fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {

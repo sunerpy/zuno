@@ -10,7 +10,7 @@ use zuno_tools::invalid::InvalidTool;
 use zuno_tools::registry::BuiltinSlot;
 
 #[tokio::test]
-async fn the_default_profile_publishes_the_driver_and_complete_native_tool_manifest() {
+async fn the_default_profile_publishes_only_complete_default_host_tools() {
     let runtime = HarnessRuntime::new("profile");
     runtime
         .activate_profile(default_profile())
@@ -28,7 +28,10 @@ async fn the_default_profile_publishes_the_driver_and_complete_native_tool_manif
     assert!(tools.contains(BuiltinSlot::Task));
     assert!(tools.contains(BuiltinSlot::Job));
     assert!(tools.contains(BuiltinSlot::Search));
-    assert_eq!(tools.slots(), zuno_tools::registry::BUILTIN_ORDER);
+    assert_eq!(tools.slots(), zuno_tools::registry::DEFAULT_BUILTINS);
+    assert!(!tools.contains(BuiltinSlot::Execute));
+    assert!(!tools.contains(BuiltinSlot::Lsp));
+    assert!(!tools.contains(BuiltinSlot::Plan));
     assert!(
         runtime
             .service::<ToolContributions>()

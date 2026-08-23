@@ -206,12 +206,20 @@ observed result; it never replays the write or undo. Any third state becomes
 
 Reflection runs only after a final response was delivered and uses an explicitly
 configured reachable `small_model`. Zuno persists the exact review prompt,
-replayed durable turn transcript, tool schema, model identity, digest, and
-terminal outcome as `memory.reflection.request` and
-`memory.reflection.outcome`. Stream truncation, malformed arguments, denied
-tools, and proposal failures are durable failed outcomes. The fork can call only
+replayed durable turn transcript, current resident-memory snapshot, tool schema,
+model identity, digest, and terminal outcome as `memory.reflection.request` and
+`memory.reflection.outcome`. Stream truncation, malformed arguments, denied tools,
+and proposal failures are durable failed outcomes. The fork can call only
 `memory_propose`; it cannot reach shell, files, normal tools, or foreground
 conversation state.
+
+Periodic cadence is admitted from a durable per-session delivery sequence rather
+than a process-local counter. The source assistant message is counted once across
+host rebuilds and restarts. A selected review owns a leased durable job; process
+loss changes an expired job to `uncertain` and never replays its model request.
+The reviewer compares the supplied resident snapshot before proposing changes,
+prefers replacement to duplicate additions, and can organize memory only through
+the same audited add/replace/remove candidate workflow.
 
 Candidate validation rejects prompt injection, credential literals, ambiguous
 locators, over-budget results, and external file drift. Automatic learning is
@@ -230,7 +238,9 @@ browsing, or leaving the welcome screen creates no durable session. The first mo
 submission inserts the session and its user message in one transaction, then emits
 `session.materialized` for clients. Existing and continued sessions still hydrate immediately.
 The TUI `/new` command selects another prepared `SessionChoice::New` in the same
-terminal activation; it does not bypass this lazy materialization boundary.
+terminal activation. It opens an empty conversation shell directly instead of
+returning to the launch welcome surface, and it does not bypass this lazy
+materialization boundary.
 
 Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt. A malformed input records a session error and does not strand later queue entries.
 
@@ -243,17 +253,47 @@ User prompts and subagent reports share this protocol:
 
 Interactive TUI input uses the same durable boundary. Text and rich content
 submitted during an active turn target `steer`, request a soft interrupt, and
-become model-visible at the nearest safe step boundary. Commands and host actions
-target `nextStep`. If the turn ends before a steer is consumed, the already
-admitted item remains pending and is promoted in FIFO order on the next turn; it
-is never lost or duplicated. The bounded in-process prompt channel is only a
-wakeup and handoff path, not the queue of record.
+become model-visible at the nearest safe step boundary. A provider stream or
+provider-retry delay is wakeable: Zuno checkpoints any partial assistant output
+with `finish: steer`, promotes the durable input, and starts the next model step
+without emitting `TurnInterrupted`. An executing tool is not abandoned merely to
+steer; its result reaches the next tool-safe point first. Commands and host
+actions target `nextStep`. If the turn ends before a steer is consumed, the
+already admitted item remains pending and is promoted in FIFO order on the next
+turn; it is never lost or duplicated. The bounded in-process prompt channel is
+only a wakeup and handoff path, not the queue of record.
 
 Tool-owned human input is projected separately from execution. A permission
 prompt reports `awaiting approval`; a structured question reports `awaiting
 answer`. The question surface replaces the composer region rather than becoming
 another transcript card. Cancelling either interaction resolves the tool as a
 typed denial and never fabricates an answer.
+
+## Compaction and hard interruption
+
+`/compact` invokes the hidden compaction agent through the live `TurnHost`; it
+does not synthesize a client-only summary. The summary, retained tail, marker,
+prompt provenance, and usage are durable. Proactive compaction uses the validated
+`compaction.threshold_percent` of the usable model window and can be disabled
+with `compaction.auto: false`. A provider-confirmed context-limit failure retains
+its bounded recovery compaction, while a manual command is always eligible.
+
+A hard interruption is session-scoped and linearizable across turn handoff. If
+the previous run guard has dropped but an already admitted follow-up has not yet
+acquired its guard, the registry arms that next guard instead of discarding the
+interrupt. The turn starts with its interrupt signal set, emits the normal
+terminal interruption event, and issues no provider request.
+
+After the TUI confirms a hard interruption, it keeps the stopping state visible
+and suppresses late provider or tool presentation until `TurnInterrupted` or
+`TurnCompleted` establishes the terminal boundary. Durable persistence and
+diagnostics still run; the client merely refuses to present post-cancel work as
+continued conversation. A side effect that completed before cancellation remains
+an observed result and is never mechanically replayed. `TurnInterrupted` adds a
+separate session-owned `Conversation interrupted by user.` row to the live
+transcript. If an assistant checkpoint exists, the same marker is persisted in
+its typed abort error and reconstructed as a separate row when the session is
+resumed; it is never presented as assistant prose.
 
 Assistant checkpoints reconcile message usage and the session usage projection in the same
 transaction. Repeated checkpoints subtract the previous message snapshot before adding the new
@@ -264,7 +304,7 @@ the context limit, and the latest accounting mode.
 
 ## Durable goal recovery
 
-An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. If that sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
+An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. If that sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
 
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
@@ -316,6 +356,16 @@ the human broker; headless surfaces deny the call. Approval covers the same
 tool's internal resource checks for that invocation only, while a later explicit
 resource deny still wins.
 
+The shell's destructive-command gate is independent of strict mode. A protected
+target is denied, while a bounded deletion, a dynamic destructive target, or a
+redirect that would replace an existing path marks the ordinary `bash`
+permission request as human-only. Permission rules still evaluate first, so an
+explicit deny remains terminal; a model-authored argument cannot approve its own
+operation. A new static redirect target inside the working directory or the OS
+temporary directory is creation rather than overwrite and does not receive this
+extra risk prompt. The filesystem probe is advisory and does not turn `bash`
+into a sandbox.
+
 Refusal is a typed lifecycle outcome rather than an execution failure.
 Malformed or unsafe arguments, unavailable tools, and permission denials emit
 `ToolDispatchBlocked` with `invalid_arguments`, `unavailable`, or `denied`
@@ -323,6 +373,11 @@ before the model-visible error result is appended. Durable tool state retains
 `outcome: "blocked"` and `blockKind`, so clients can use warning treatment and
 state that the requested effect never ran. Process, transport, and tool
 implementation failures remain error outcomes.
+
+Hard turn interruption is observed during tool hooks, permission waiting, and
+execution. Cancelling before permission resolves drops the pending approval
+future and guarantees that the tool body never starts; cancelling a running
+tool joins its cancelled task or process tree before the dispatch returns.
 
 Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, session search, job status, LSP inspection, goal status, and web search/fetch.
 
@@ -368,27 +423,29 @@ The `bash` tool is not an OS sandbox. Its tree-sitter command analysis,
 deterministic destructive-command gate, permission checks, process-tree
 containment, working directory, and time limits reduce accidental execution
 risk, but the child still inherits the Zuno process's filesystem, network, and
-credentials. Strict authorization adds HITL; it does not add confinement.
+credentials. Existing redirect targets and other confirmable destructive
+operations require a fresh attached-user decision; static creation under the
+working directory or OS temporary directory does not. Strict authorization adds
+HITL to every side-effecting shell call; neither mechanism adds confinement.
 
 ## Resident process containment
 
 Local MCP and LSP servers, process extensions, product agents, PTY sessions, and
-background commands share `zuno-process`. A resident Unix launch contains exactly
-one Zuno guard plus the payload process group; it does not add a second monitor
-process. On Linux the guard blocks on `SIGCHLD` and termination signals and uses
-the parent-death signal for abrupt Zuno exit, so an idle server has no timer
-polling loop. Other Unix systems retain a 250 ms parent-liveness fallback, and
-Windows uses a Job Object with the same bounded parent check.
+background commands share `zuno-process`, but their ownership shapes are
+explicit. Local stdio MCP commands are direct process-group leaders, matching
+Codex's ordinary MCP topology. They terminate with bounded `SIGTERM` to
+`SIGKILL` escalation. Zuno inserts no `__zuno_child_guard` process in front of
+or beside MCP.
 
-The direct child returned by `guarded_argv` is the guard, not the payload.
-Owners request shutdown through `request_contained_process_shutdown` and then reap
-the guard. They must not send an immediate hard kill: the guard remains alive
-long enough to kill and settle the payload group, including descendants that the
-payload orphaned. The same cleanup runs when the payload exits naturally or the
-Linux parent is killed. Interactive foreground programs use a separate terminal
-handoff path because foreground process-group ownership has a different
-lifecycle. The pinned Codex comparison and the reason Zuno retains one helper
-are recorded in [Resident process containment](design/process-containment.md).
+Other resident and interactive hosts retain dedicated guards where a surviving
+per-tree owner or terminal foreground transfer is required. The direct child
+returned by `guarded_argv` is the guard, not the payload; owners request
+shutdown through `request_contained_process_shutdown` and reap it only after
+the contained group settles. On Linux the guard blocks on signals and uses the
+parent-death signal. Direct MCP relies on owner close/Drop and therefore does
+not promise descendant cleanup after an uncatchable owner `SIGKILL`. The pinned
+Codex comparison and the split ownership decision are recorded in
+[Resident process containment](design/process-containment.md).
 
 ## Background command execution
 

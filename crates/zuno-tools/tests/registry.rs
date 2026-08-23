@@ -152,21 +152,16 @@ fn a_harness_manifest_filters_automatic_file_tools_and_registered_builtins_toget
 }
 
 #[test]
-fn registry_model_family_uses_the_shared_file_tool_projection() {
+fn registry_file_surface_is_provider_neutral_and_has_a_write_fallback() {
     let root = TempDir::new().expect("temporary workspace");
     let registry = registry(root.path(), RegistryFlags::default());
 
-    for model in ["claude-sonnet-4-5", "gpt-4.1", "gpt-oss-120b"] {
+    for model in ["claude-sonnet-4-5", "gpt-4.1", "gpt-oss-120b", "gpt-5.2"] {
         let offered = registry.resolved_ids(ResolveInput::new(model, "openai", &[]));
-        assert!(offered.contains(&"edit".to_owned()), "{model}");
         assert!(offered.contains(&"write".to_owned()), "{model}");
-        assert!(!offered.contains(&"apply_patch".to_owned()), "{model}");
+        assert!(offered.contains(&"apply_patch".to_owned()), "{model}");
+        assert!(!offered.contains(&"edit".to_owned()), "{model}");
     }
-
-    let offered = registry.resolved_ids(ResolveInput::new("gpt-5.2", "openai", &[]));
-    assert!(offered.contains(&"apply_patch".to_owned()));
-    assert!(!offered.contains(&"edit".to_owned()));
-    assert!(!offered.contains(&"write".to_owned()));
 }
 
 #[test]
@@ -356,6 +351,7 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "read",
             "glob",
             "grep",
+            "write",
             "task",
             "job",
             "webfetch",
@@ -380,13 +376,13 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "read",
             "glob",
             "grep",
-            "edit",
             "write",
             "task",
             "job",
             "webfetch",
             "todowrite",
             "skill",
+            "apply_patch",
         ],
     },
     DifferentialCase {
@@ -404,13 +400,13 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "read",
             "glob",
             "grep",
-            "edit",
             "write",
             "task",
             "job",
             "webfetch",
             "todowrite",
             "skill",
+            "apply_patch",
         ],
     },
     DifferentialCase {
@@ -429,7 +425,6 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "read",
             "glob",
             "grep",
-            "edit",
             "write",
             "task",
             "job",
@@ -437,6 +432,7 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "todowrite",
             "web_search",
             "skill",
+            "apply_patch",
             "lsp",
         ],
     },
@@ -456,6 +452,7 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
             "read",
             "glob",
             "grep",
+            "write",
             "task",
             "job",
             "webfetch",

@@ -612,6 +612,7 @@ async fn compact_soak_session(
         .collect();
     let config = CompactionConfig {
         auto: Some(true),
+        threshold_percent: None,
         prune: Some(false),
         tail_turns: Some(1),
         preserve_recent_tokens: Some(128),

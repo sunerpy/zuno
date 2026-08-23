@@ -147,10 +147,11 @@ impl Summary {
 /// same technique [`crate::views::views_tests`] already uses for the colour and keybind
 /// disciplines.
 pub const SUMMARISED: [&str; 23] = [
-    // The 17 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
+    // The 19 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
     "bash",
+    "bg",
     "read",
     "glob",
     "grep",
@@ -166,12 +167,11 @@ pub const SUMMARISED: [&str; 23] = [
     "execute",
     "lsp",
     "plan_exit",
-    // Built-ins registered outside the slot table: memory, and the three goal tools.
+    // Built-ins registered outside the slot table: memory and the three goal tools.
     "memory_propose",
     "get_goal",
     "create_goal",
     "update_goal",
-    "bg",
 ];
 
 /// What `name` should say about itself, given the arguments the model wrote.

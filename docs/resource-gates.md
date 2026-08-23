@@ -39,7 +39,7 @@ is the shape being avoided: a 164,552 KiB spread around a median that finished
 | G3 | 最终/中段峰值比 | 0.9938255268 | 1.5 | PASS |
 | G4 | soak 期间的活性 | 两个上限均未触发 | 120 秒无状态进展；每轮 1800 秒硬截止 | PASS |
 | G5 | 生产者/消费者边界的无界 channel | 17 个有界 + 2 个已声明例外，0 个未声明 | — | PASS |
-| G6 | 常驻进程守卫与父进程退出后的孤儿进程 | Linux 上每个 payload 仅 1 个 Zuno guard；250 ms 空闲窗口内 guard 自愿上下文切换增量不超过 3；正常关闭和父进程 `SIGKILL` 后均为 0 个孤儿 | — | Linux 上 PASS；Windows 部分未执行 |
+| G6 | 常驻进程守卫与父进程退出后的孤儿进程 | Linux 上 LSP/PTY 等 guarded payload 各 1 个 Zuno guard；MCP 为直接进程组且 0 个 Zuno helper；正常关闭均回收，父进程 `SIGKILL` 仅对 guarded host 承诺 0 个孤儿 | — | Linux 上 PASS；Windows 部分未执行 |
 
 ## 四项明确限制
 

@@ -43,11 +43,15 @@ fn every_ui_slash_action_lives_in_a_session_scope() {
 }
 
 #[test]
-fn undo_and_redo_are_host_commands_not_ui_actions_or_catalog_prompts() {
+fn compact_undo_and_redo_are_host_commands_not_ui_actions_or_catalog_prompts() {
+    assert_eq!(
+        route("/compact"),
+        SlashSubmission::Host(HostCommand::Compact)
+    );
     assert_eq!(route("/undo"), SlashSubmission::Host(HostCommand::Undo));
     assert_eq!(route("/redo"), SlashSubmission::Host(HostCommand::Redo));
     let router = SlashRouter::default();
-    for name in ["undo", "redo"] {
+    for name in ["compact", "undo", "redo"] {
         let command = router
             .commands()
             .iter()
@@ -60,9 +64,14 @@ fn undo_and_redo_are_host_commands_not_ui_actions_or_catalog_prompts() {
 #[test]
 fn host_commands_win_catalog_name_collisions() {
     let router = SlashRouter::new([
+        CatalogCommand::new("compact", None),
         CatalogCommand::new("undo", None),
         CatalogCommand::new("redo", None),
     ]);
+    assert_eq!(
+        router.resolve("/compact"),
+        SlashSubmission::Host(HostCommand::Compact)
+    );
     assert_eq!(
         router.resolve("/undo"),
         SlashSubmission::Host(HostCommand::Undo)
@@ -75,9 +84,9 @@ fn host_commands_win_catalog_name_collisions() {
         router
             .commands()
             .iter()
-            .filter(|command| command.name == "undo" || command.name == "redo")
+            .filter(|command| matches!(command.name.as_str(), "compact" | "undo" | "redo"))
             .count(),
-        2
+        3
     );
 }
 

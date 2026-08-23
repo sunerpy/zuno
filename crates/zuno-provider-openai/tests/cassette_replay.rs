@@ -169,12 +169,29 @@ fn recorded_chat_tool_call_matches_request_and_exact_events() {
                 id: "call_5wBV98AvGPwOyC6a2HtKh85w".to_owned(),
                 name: "get_weather".to_owned(),
             },
-            StreamEvent::ToolInputDelta("{\"".to_owned()),
-            StreamEvent::ToolInputDelta("city".to_owned()),
-            StreamEvent::ToolInputDelta("\":\"".to_owned()),
-            StreamEvent::ToolInputDelta("Paris".to_owned()),
-            StreamEvent::ToolInputDelta("\"}".to_owned()),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: "call_5wBV98AvGPwOyC6a2HtKh85w".to_owned(),
+                delta: "{\"".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_5wBV98AvGPwOyC6a2HtKh85w".to_owned(),
+                delta: "city".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_5wBV98AvGPwOyC6a2HtKh85w".to_owned(),
+                delta: "\":\"".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_5wBV98AvGPwOyC6a2HtKh85w".to_owned(),
+                delta: "Paris".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_5wBV98AvGPwOyC6a2HtKh85w".to_owned(),
+                delta: "\"}".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_5wBV98AvGPwOyC6a2HtKh85w".to_owned(),
+            },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::Stop),
             },
@@ -345,12 +362,29 @@ fn recorded_responses_tool_call_matches_request_and_exact_events() {
                 id: "call_ZAbAwsIFeJSyPqz3HaHRXBSn".to_owned(),
                 name: "get_weather".to_owned(),
             },
-            StreamEvent::ToolInputDelta("{\"".to_owned()),
-            StreamEvent::ToolInputDelta("city".to_owned()),
-            StreamEvent::ToolInputDelta("\":\"".to_owned()),
-            StreamEvent::ToolInputDelta("Paris".to_owned()),
-            StreamEvent::ToolInputDelta("\"}".to_owned()),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: "call_ZAbAwsIFeJSyPqz3HaHRXBSn".to_owned(),
+                delta: "{\"".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_ZAbAwsIFeJSyPqz3HaHRXBSn".to_owned(),
+                delta: "city".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_ZAbAwsIFeJSyPqz3HaHRXBSn".to_owned(),
+                delta: "\":\"".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_ZAbAwsIFeJSyPqz3HaHRXBSn".to_owned(),
+                delta: "Paris".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_ZAbAwsIFeJSyPqz3HaHRXBSn".to_owned(),
+                delta: "\"}".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_ZAbAwsIFeJSyPqz3HaHRXBSn".to_owned(),
+            },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::ToolCalls),
             },

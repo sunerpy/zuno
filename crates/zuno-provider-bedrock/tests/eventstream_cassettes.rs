@@ -79,13 +79,18 @@ fn recorded_text_and_tool_conversations_replay_to_shared_events() {
         tool.as_slice(),
         [
             StreamEvent::ToolUseStart { id, name },
-            StreamEvent::ToolInputDelta(input),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: input_id,
+                delta: input,
+            },
+            StreamEvent::ToolUseEnd { id: end_id },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::ToolCalls),
             },
             StreamEvent::TokenUsage { .. },
         ] if id == "tooluse_6a1pPvnc99GLKO3KGkUA2N"
+            && input_id == id
+            && end_id == id
             && name == "get_weather"
             && input == "{\"city\":\"Paris\"}"
     ));

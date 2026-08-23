@@ -1,7 +1,7 @@
 # Resident process containment
 
-This note records why Zuno uses one resident guard process instead of copying
-another harness's process topology. The Codex comparison is pinned to official
+This note records where Zuno uses direct process groups and where it retains a
+resident guard. The Codex comparison is pinned to official
 `openai/codex` commit `4582c0a498158063760309c48214a0416a81488a`
 (2026-08-23); paths below refer to that checkout.
 
@@ -26,17 +26,29 @@ can perform delayed group cleanup.
 
 ## Zuno decision
 
-Zuno keeps exactly one guard for every resident external payload:
+Local stdio MCP adopts Codex's direct-child topology:
 
 ```text
-zuno owner -> zuno guard -> payload process group -> descendants
+zuno owner -> MCP process-group leader -> descendants
 ```
 
-The extra process buys an explicit owner that survives abrupt parent death long
-enough to settle the payload group. On Linux the guard blocks on `SIGCHLD`,
-`SIGTERM`, `SIGINT`, and `SIGHUP`; it does not poll. `PR_SET_PDEATHSIG` converts
-parent death into the same cleanup path. Other Unix platforms use a 250 ms
-parent-liveness fallback, and Windows retains Job Object containment.
+Each configured MCP server still requires its own protocol process, but Zuno no
+longer inserts any `__zuno_child_guard` process in front of or beside it.
+The owner starts the configured command as a process-group leader, closes it with
+`SIGTERM`, escalates to `SIGKILL`, and reaps the direct child. Final-handle `Drop`
+synchronously kills the group before its detached task reaps the child, so Tokio
+runtime shutdown does not leave descendants alive during ordinary owner teardown.
+
+This deliberately matches Codex's zero-helper MCP topology. If the Zuno owner is
+itself killed with an uncatchable signal, no destructor can run and direct MCP
+descendants may survive. Zuno does not hide that operating-system limit behind an
+always-resident helper solely for MCP.
+
+LSP, PTY, foreground editor, process extension, product-agent, and shell paths
+retain their dedicated guards where terminal ownership or a surviving per-tree
+owner is part of the contract. On Linux those guards block on signals and use
+`PR_SET_PDEATHSIG`; other Unix platforms use a bounded parent-liveness fallback,
+and Windows retains Job Object containment.
 
 The prior `guard -> monitor -> payload` resident topology was rejected because
 the second Zuno process added memory and idle wakeups without adding a distinct
@@ -45,11 +57,13 @@ transfer and restore terminal foreground process-group ownership.
 
 ## Required invariants
 
-- A resident payload has exactly one Zuno guard.
+- MCP commands are direct children and never receive a per-server Zuno wrapper.
+- Starting local MCP does not create any additional Zuno helper process.
 - Owners request catchable guard shutdown and then reap it; they do not
   immediately hard-kill the guard.
-- Natural payload exit, explicit cancellation, and Linux parent `SIGKILL` all
-  settle descendants before the guard exits.
-- Tool, MCP, LSP, PTY, extension, and product-agent callers share this contract.
+- Natural MCP exit and explicit cancellation clean its complete process group.
+- Dedicated guards still clean their own payload groups after Linux parent
+  `SIGKILL`; direct MCP explicitly makes no such promise.
 - `crates/zuno-process/tests/containment.rs` pins topology, idle waiting, clean
-  shutdown, and abrupt-parent cleanup.
+  shutdown, and abrupt-parent cleanup for guarded hosts. The mixed-host G6 fixture
+  additionally pins zero MCP helpers and normal MCP process-group cleanup.

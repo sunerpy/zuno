@@ -113,6 +113,7 @@ pub fn error_kind(error: &ToolError) -> &'static str {
         ToolError::Transient { .. } => "transient",
         ToolError::NotFound { .. } => "not_found",
         ToolError::Failed { .. } => "failed",
+        ToolError::Uncertain { .. } => "uncertain",
     }
 }
 
@@ -334,6 +335,11 @@ mod tests {
                 tool: "bash".to_owned(),
                 source: Box::new(std::io::Error::other("exit 1")),
             },
+            ToolError::Uncertain {
+                tool: "write".to_owned(),
+                applied_paths: vec!["/workspace/file".to_owned()],
+                source: Box::new(std::io::Error::other("result lost")),
+            },
         ];
         let kinds: Vec<&str> = errors.iter().map(error_kind).collect();
         assert_eq!(
@@ -344,7 +350,8 @@ mod tests {
                 "timeout",
                 "transient",
                 "not_found",
-                "failed"
+                "failed",
+                "uncertain"
             ]
         );
 

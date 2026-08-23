@@ -1,7 +1,8 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
-use zuno_tools::risk::{GateOutcome, Justification, RiskContext, assess_command, gate};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use zuno_error::ToolError;
+use zuno_tool::{NeverInterrupted, PermissionAsk, PermissionAsker, ToolContext};
+use zuno_tools::risk::{GateOutcome, RiskContext, assess_command, gate};
 use zuno_tools::shell::{ShellParams, ShellSyntax, ShellTool};
 
 fn risk_context() -> RiskContext {
@@ -11,53 +12,28 @@ fn risk_context() -> RiskContext {
     }
 }
 
-fn risk_gate(command: &str, justification: Option<&str>) -> GateOutcome {
+fn risk_gate(command: &str) -> GateOutcome {
     let assessment = assess_command(command, ShellSyntax::Bash, &risk_context())
         .expect("the command must parse");
-    gate(
-        &assessment,
-        &Justification {
-            text: justification.map(str::to_owned),
-        },
-    )
+    gate(&assessment)
 }
 
 fn assert_risk_denied(command: &str) {
-    let outcome = risk_gate(command, None);
+    let outcome = risk_gate(command);
     assert!(
         matches!(outcome, GateOutcome::Deny { .. }),
         "expected permanent denial for {command:?}, got {outcome:?}"
-    );
-    assert!(
-        matches!(
-            risk_gate(
-                command,
-                Some("The user explicitly requested this exact destructive target")
-            ),
-            GateOutcome::Deny { .. }
-        ),
-        "a justification must never unlock catastrophic target {command:?}"
     );
 }
 
 fn assert_risk_denied_with_syntax(command: &str, syntax: ShellSyntax) {
     let assessment =
         assess_command(command, syntax, &risk_context()).expect("the command must parse");
-    for justification in [
-        None,
-        Some("The user explicitly requested this exact destructive target"),
-    ] {
-        let outcome = gate(
-            &assessment,
-            &Justification {
-                text: justification.map(str::to_owned),
-            },
-        );
-        assert!(
-            matches!(outcome, GateOutcome::Deny { .. }),
-            "expected permanent denial for {command:?} under {syntax:?}, got {outcome:?} from {assessment:#?}"
-        );
-    }
+    let outcome = gate(&assessment);
+    assert!(
+        matches!(outcome, GateOutcome::Deny { .. }),
+        "expected permanent denial for {command:?} under {syntax:?}, got {outcome:?} from {assessment:#?}"
+    );
 }
 
 #[test]
@@ -138,8 +114,8 @@ fn risk_denies_the_users_home_in_symbolic_and_literal_forms() {
         assert_risk_denied(&format!("rm -rf {target}"));
     }
     assert!(matches!(
-        risk_gate("rm -rf ~other", None),
-        GateOutcome::Reflect { .. }
+        risk_gate("rm -rf ~other"),
+        GateOutcome::Confirm { .. }
     ));
 }
 
@@ -164,7 +140,7 @@ fn risk_denies_credential_stores_recursively() {
 fn risk_denies_device_nodes_but_allows_the_null_redirect_sink() {
     assert_risk_denied("printf x > /dev/sda");
     assert_risk_denied("rm -f /dev/null");
-    assert_eq!(risk_gate("foo > /dev/null", None), GateOutcome::Allow);
+    assert_eq!(risk_gate("foo > /dev/null"), GateOutcome::Allow);
 }
 
 #[test]
@@ -205,53 +181,40 @@ fn risk_static_brace_expansion_checks_every_target() {
     assert_risk_denied("rm -rf /e''tc");
     assert_risk_denied("printf x > /e''tc/passwd");
     assert!(matches!(
-        risk_gate("rm -rf /tmp/{1..3}", None),
-        GateOutcome::Reflect { .. }
+        risk_gate("rm -rf /tmp/{1..3}"),
+        GateOutcome::Confirm { .. }
     ));
 }
 
 #[test]
-fn risk_reflection_requires_more_than_a_blind_retry_or_bare_yes() {
-    let first = risk_gate("rm -rf ./build", None);
-    let GateOutcome::Reflect { prompt } = first else {
-        panic!("a bounded destructive command must require reflection");
+fn risk_bounded_destructive_command_requires_human_confirmation() {
+    let first = risk_gate("rm -rf ./build");
+    let GateOutcome::Confirm { reason, target } = first else {
+        panic!("a bounded destructive command must require confirmation");
     };
-    assert!(prompt.contains("Which specific thing the user asked for requires deleting this?"));
-    assert!(prompt.contains("Did the user name this path, or did you infer it?"));
-
-    assert!(matches!(
-        risk_gate("rm -rf ./build", None),
-        GateOutcome::Reflect { .. }
-    ));
-    assert!(matches!(
-        risk_gate("rm -rf ./build", Some("yes")),
-        GateOutcome::Reflect { .. }
-    ));
-    assert_eq!(
-        risk_gate(
-            "rm -rf ./build",
-            Some("The user asked to remove the generated build directory before rebuilding")
-        ),
-        GateOutcome::Allow
+    assert!(
+        reason.contains("irreversibly removes or overwrites data"),
+        "{reason}"
     );
+    assert_eq!(target.as_deref(), Some("/work/project/build"));
 }
 
 #[test]
-fn risk_unknown_dynamic_delete_target_reflects_instead_of_guessing() {
+fn risk_unknown_dynamic_delete_target_requires_confirmation_instead_of_guessing() {
     for command in [
         "rm -rf \"$UNSET_VAR/\"",
         "find \"$TARGET\" -delete",
         "printf '%s' target | xargs rm -rf",
     ] {
         assert!(
-            matches!(risk_gate(command, None), GateOutcome::Reflect { .. }),
+            matches!(risk_gate(command), GateOutcome::Confirm { .. }),
             "unknown runtime target must be held: {command:?}"
         );
     }
-    let dynamic_command = risk_gate("$DELETE_COMMAND -rf /", None);
+    let dynamic_command = risk_gate("$DELETE_COMMAND -rf /");
     assert!(
-        matches!(dynamic_command, GateOutcome::Reflect { .. }),
-        "dynamic command names must reflect, got {dynamic_command:?}"
+        matches!(dynamic_command, GateOutcome::Confirm { .. }),
+        "dynamic command names must require confirmation, got {dynamic_command:?}"
     );
 }
 
@@ -263,8 +226,95 @@ fn risk_benign_command_is_never_gated() {
         "foo > /dev/null",
         "cat ~/.ssh/id_rsa",
     ] {
-        assert_eq!(risk_gate(command, None), GateOutcome::Allow);
+        assert_eq!(risk_gate(command), GateOutcome::Allow);
     }
+}
+
+#[test]
+fn risk_new_file_in_the_system_temp_directory_is_not_an_overwrite() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let target = scratch.path().join("fresh-puzzle.py");
+    let context = RiskContext {
+        working_dir: Some(workspace.path().to_owned()),
+        home_dir: None,
+    };
+    let assessment = assess_command(
+        &format!("printf puzzle > '{}'", target.display()),
+        ShellSyntax::Bash,
+        &context,
+    )
+    .expect("the command must parse");
+
+    assert_eq!(
+        gate(&assessment),
+        GateOutcome::Allow,
+        "a path that does not exist in the OS temp directory is creation, not truncation"
+    );
+}
+
+#[derive(Default)]
+struct RecordingDenial {
+    asks: Mutex<Vec<PermissionAsk>>,
+}
+
+#[async_trait::async_trait]
+impl PermissionAsker for RecordingDenial {
+    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+        self.asks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ask);
+        Err(ToolError::Denied {
+            tool: tool.to_owned(),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn risk_existing_redirect_target_requires_fresh_human_approval() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let target = root.path().join("existing.txt");
+    std::fs::write(&target, b"keep").expect("existing target");
+    let permission = Arc::new(RecordingDenial::default());
+    let tool = ShellTool::new(&workspace).expect("shell tool");
+
+    let error = tool
+        .run(
+            ShellParams {
+                command: format!("printf replacement > '{}'", target.display()),
+                timeout: None,
+                workdir: None,
+                background: false,
+            },
+            tool_context_with(permission.clone()),
+        )
+        .await
+        .expect_err("the attached user denied the overwrite");
+
+    assert!(
+        matches!(error, ToolError::Denied { .. }),
+        "the existing target must be protected by HITL: {error:?}"
+    );
+    assert_eq!(std::fs::read(&target).expect("target"), b"keep");
+    let asks = permission
+        .asks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(asks.len(), 1, "{asks:#?}");
+    assert!(asks[0].manual, "the overwrite accepted an automatic grant");
+    assert_eq!(asks[0].permission, "bash");
+    let target_text = target.to_string_lossy().into_owned();
+    assert_eq!(
+        asks[0]
+            .metadata
+            .get("target")
+            .and_then(serde_json::Value::as_str),
+        Some(target_text.as_str())
+    );
 }
 
 #[cfg(unix)]
@@ -275,6 +325,7 @@ async fn risk_gate_runs_before_explicit_background_dispatch() {
     std::fs::create_dir(&target).expect("build directory");
     std::fs::write(target.join("sentinel"), b"keep").expect("sentinel");
     let tool = ShellTool::new(directory.path()).expect("shell tool");
+    let permission = Arc::new(RecordingDenial::default());
 
     let error = tool
         .run(
@@ -283,26 +334,30 @@ async fn risk_gate_runs_before_explicit_background_dispatch() {
                 timeout: None,
                 workdir: None,
                 background: true,
-                justification: None,
             },
-            tool_context(directory.path()),
+            tool_context_with(permission.clone()),
         )
         .await
-        .expect_err("background execution must not bypass reflection");
+        .expect_err("background execution must not bypass manual approval");
 
-    let source = std::error::Error::source(&error).expect("reflection reason");
-    assert!(source.to_string().contains("This command was not run"));
+    assert!(matches!(error, ToolError::Denied { .. }));
+    let asks = permission
+        .asks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(asks.len(), 1, "{asks:#?}");
+    assert!(asks[0].manual);
     assert!(target.join("sentinel").is_file());
     assert!(!directory.path().join(".zuno/background").exists());
 }
 
-fn tool_context(_workspace: &Path) -> ToolContext {
+fn tool_context_with(permission: Arc<dyn PermissionAsker>) -> ToolContext {
     ToolContext::new(
         "ses_risk",
         "msg_risk",
         "call_risk",
         "build",
-        Arc::new(AllowAll),
+        permission,
         Arc::new(NeverInterrupted),
     )
 }

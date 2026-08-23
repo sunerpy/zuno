@@ -38,7 +38,8 @@ use crate::keybind::Definition;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogStep};
 use crate::views::diff::DiffView;
 use crate::views::{ViewContext, padded};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use zuno_permission::{PermissionRequest, ReplyKind};
@@ -464,6 +465,34 @@ impl PermissionPrompt {
         }))
     }
 
+    fn activate_selected(&mut self) -> DialogStep {
+        match self.options()[self.selected].reply {
+            ReplyKind::Always => {
+                self.stage = Stage::ConfirmAlways;
+                self.confirm = true;
+                DialogStep::Redraw
+            }
+            ReplyKind::Reject if self.reject_message_offered => {
+                self.stage = Stage::RejectMessage;
+                DialogStep::Redraw
+            }
+            reply => self.decide(reply, None),
+        }
+    }
+
+    fn horizontal_choice(&self, column: usize) -> Option<usize> {
+        let mut start = 0_usize;
+        for (index, option) in self.options().iter().enumerate() {
+            let end =
+                start.saturating_add(crate::views::display_width(&format!(" {} ", option.label)));
+            if (start..end).contains(&column) {
+                return Some(index);
+            }
+            start = end.saturating_add(1);
+        }
+        None
+    }
+
     fn choose_lines(&mut self, width: u16) -> Vec<Line<'static>> {
         let mut lines = vec![
             Line::from(vec![
@@ -655,20 +684,7 @@ impl Dialog for PermissionPrompt {
                     self.expanded = !self.expanded;
                     DialogStep::Redraw
                 }
-                "dialog.select.submit" | "dialog.prompt.submit" => {
-                    match self.options()[self.selected].reply {
-                        ReplyKind::Always => {
-                            self.stage = Stage::ConfirmAlways;
-                            self.confirm = true;
-                            DialogStep::Redraw
-                        }
-                        ReplyKind::Reject if self.reject_message_offered => {
-                            self.stage = Stage::RejectMessage;
-                            DialogStep::Redraw
-                        }
-                        reply => self.decide(reply, None),
-                    }
-                }
+                "dialog.select.submit" | "dialog.prompt.submit" => self.activate_selected(),
                 // Escape resolves to `reject`, never to the highlighted option: a
                 // prompt dismissed by accident must not have granted anything.
                 "app_exit" | "session_interrupt" => self.decide(ReplyKind::Reject, None),
@@ -732,6 +748,65 @@ impl Dialog for PermissionPrompt {
             return DialogStep::Redraw;
         }
         DialogStep::Ignored
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp if self.stage == Stage::Choose => {
+                let len = self.options().len();
+                self.selected = (self.selected + len - 1) % len;
+                return DialogStep::Redraw;
+            }
+            MouseEventKind::ScrollDown if self.stage == Stage::Choose => {
+                self.selected = (self.selected + 1) % self.options().len();
+                return DialogStep::Redraw;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {}
+            _ => return DialogStep::Ignored,
+        }
+        let row = usize::from(event.row.saturating_sub(body.top()));
+        let column = usize::from(event.column.saturating_sub(body.left()));
+        match self.stage {
+            Stage::Choose => {
+                let action_row = self.choose_lines(body.width).len().saturating_sub(1);
+                if row != action_row {
+                    return DialogStep::Ignored;
+                }
+                let Some(selected) = self.horizontal_choice(column) else {
+                    return DialogStep::Ignored;
+                };
+                self.selected = selected;
+                self.activate_selected()
+            }
+            Stage::ConfirmAlways => {
+                let action_row = self.always_lines(body.width).len().saturating_sub(1);
+                if row != action_row {
+                    return DialogStep::Ignored;
+                }
+                if column < crate::views::display_width(" Confirm ") {
+                    self.confirm = true;
+                    self.decide(ReplyKind::Always, None)
+                } else if column
+                    < crate::views::display_width(" Confirm ")
+                        + 1
+                        + crate::views::display_width(" Cancel ")
+                {
+                    self.confirm = false;
+                    self.stage = Stage::Choose;
+                    DialogStep::Redraw
+                } else {
+                    DialogStep::Ignored
+                }
+            }
+            Stage::RejectMessage => DialogStep::Ignored,
+        }
     }
 }
 

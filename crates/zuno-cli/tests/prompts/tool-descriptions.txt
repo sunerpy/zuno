@@ -12,9 +12,9 @@ An update may include `*** Move to: <path>` and uses `@@` hunks with context, re
 Every initial-content line in an Add File section must start with `+`.
 >>>
 
-## bash | crates/zuno-tools/src/description/bash.txt | 472 bytes | trailing-newline: no
+## bash | crates/zuno-tools/src/description/bash.txt | 706 bytes | trailing-newline: yes
 <<<
-Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. A deterministic destructive-command gate runs before every foreground or background spawn. This is not a sandbox: commands retain the user's full filesystem, network, and credentials; confinement is a future decision, not an implied guarantee. Use workdir instead of changing directories inside the command.
+Executes a command with the configured shell. Commands are parsed with tree-sitter before execution so each constituent command is permission-checked independently. A deterministic destructive-command gate runs before every foreground or background spawn. Replacing an existing redirect target requires fresh human approval; creating a new static file in the OS temp directory does not. For one-off scripts, prefer interpreter stdin such as `python3 - <<'PY'` over fixed `/tmp` filenames. This is not a sandbox: commands retain the user's full filesystem, network, and credentials; confinement is a future decision, not an implied guarantee. Use workdir instead of changing directories inside the command.
 >>>
 
 ## batch | crates/zuno-tools/src/description/batch.txt | 51 bytes | trailing-newline: no

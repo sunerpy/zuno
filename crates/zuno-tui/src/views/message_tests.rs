@@ -109,7 +109,7 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
         "the assistant's turn is missing its header:\n{joined}"
     );
     assert!(
-        joined.contains("thought for 2.5s"),
+        joined.contains("◇ Thought · 2.5s"),
         "the reasoning affordance did not render its duration:\n{joined}"
     );
     assert!(
@@ -121,7 +121,7 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
         "the assistant's text is missing:\n{joined}"
     );
     assert!(
-        joined.contains("✓ → Read src/main.rs"),
+        joined.contains("✓ Tool · → Read src/main.rs"),
         "the completed tool call did not render its status, icon, and title:\n{joined}"
     );
     assert!(
@@ -407,7 +407,7 @@ fn views_pending_tool_renders_its_placeholder_until_arguments_arrive() {
     })));
     let joined = draw(&mut view, 40, 6).join("\n");
     assert!(
-        joined.contains("~ $ Writing command..."),
+        joined.contains("~ Tool · $ Writing command..."),
         "a pending bash call did not render the oracle's placeholder:\n{joined}"
     );
 }
@@ -438,6 +438,38 @@ fn views_thinking_affordance_toggles_between_summary_and_full_text() {
     assert!(
         expanded.contains("second line"),
         "expanded reasoning is still summarised:\n{expanded}"
+    );
+}
+
+#[test]
+fn views_reasoning_and_tool_rows_name_their_different_content_types() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    for event in [
+        provider(StreamEvent::ReasoningDelta(String::from(
+            "checking the constraints",
+        ))),
+        provider(StreamEvent::ReasoningDone { duration_secs: 1.5 }),
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("call_1"),
+            name: String::from("bash"),
+        }),
+        provider(StreamEvent::ToolInputDelta {
+            id: String::from("call_1"),
+            delta: String::from(r#"{"command":"python3 - <<'PY'\nprint(1)\nPY"}"#),
+        }),
+    ] {
+        view.handle_event(&AppEvent::Engine(event));
+    }
+
+    let joined = draw(&mut view, 96, 16).join("\n");
+    assert!(
+        joined.contains("Thought"),
+        "reasoning has no explicit category label:\n{joined}"
+    );
+    assert!(
+        joined.contains("Tool · $ bash"),
+        "the tool row is visually indistinguishable from reasoning:\n{joined}"
     );
 }
 
@@ -509,11 +541,11 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
 
     let joined = draw(&mut view, 96, 18).join("\n");
     assert!(
-        joined.contains("! $ bash blocked"),
+        joined.contains("! Tool · $ bash blocked"),
         "the refusal still looks like an execution failure:\n{joined}"
     );
     assert!(
-        joined.contains("✗ $ bash failed"),
+        joined.contains("✗ Tool · $ bash failed"),
         "a process failure lost its error state:\n{joined}"
     );
 }
@@ -552,13 +584,27 @@ fn views_user_messages_render_commonmark_tables_instead_of_literal_pipes() {
 }
 
 #[test]
-fn views_thinking_style_is_the_theme_opacity_composite_not_the_raw_warning() {
+fn views_thinking_style_is_a_muted_composite_not_a_warning_composite() {
     let context = ViewContext::defaults();
+    let palette = context.palette();
     let thinking = context.thinking().fg.expect("a foreground");
-    let warning = ratatui::style::Color::from(context.palette().warning);
+    let expected = ratatui::style::Color::from(crate::theme::tint(
+        palette.background,
+        palette.text_muted,
+        palette.thinking_opacity,
+    ));
+    let warning = ratatui::style::Color::from(crate::theme::tint(
+        palette.background,
+        palette.warning,
+        palette.thinking_opacity,
+    ));
+    assert_eq!(
+        thinking, expected,
+        "reasoning does not use the theme's muted hierarchy"
+    );
     assert_ne!(
         thinking, warning,
-        "thinkingOpacity was ignored, so reasoning is indistinguishable from a warning"
+        "reasoning still occupies the same colour family as a warning"
     );
 }
 
@@ -1061,6 +1107,54 @@ fn views_transcript_tracks_the_running_flag() {
 }
 
 #[test]
+fn views_transcript_marks_an_interrupted_turn_once_as_session_state() {
+    let mut view = view();
+    view.transcript_mut().push(Message::user("stop this turn"));
+    for event in [
+        TurnEvent::TurnStarted {
+            session_id: String::from("s"),
+        },
+        started(),
+        provider(StreamEvent::TextDelta(String::from("partial reply"))),
+        TurnEvent::TurnInterrupted {
+            assistant_message_id: Some(String::from("msg_1")),
+            steps: 1,
+        },
+        // Terminal delivery can be retried by a client boundary. The transcript marker
+        // describes one turn and therefore remains exactly once.
+        TurnEvent::TurnInterrupted {
+            assistant_message_id: Some(String::from("msg_1")),
+            steps: 1,
+        },
+    ] {
+        view.handle_event(&AppEvent::Engine(event));
+    }
+
+    let notices = view
+        .transcript()
+        .messages()
+        .iter()
+        .filter_map(|message| {
+            let [MessagePart::Notice { text, level }] = message.parts.as_slice() else {
+                return None;
+            };
+            (text == "Conversation interrupted by user.").then_some((message.role, *level))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        notices,
+        vec![(Role::System, crate::views::toast::ToastLevel::Error)],
+        "the user interruption must be a single session-owned error marker"
+    );
+
+    let joined = draw(&mut view, 72, 12).join("\n");
+    assert!(
+        joined.contains("Conversation interrupted by user."),
+        "the interruption marker is not visible in the conversation:\n{joined}"
+    );
+}
+
+#[test]
 fn views_attachment_renders_its_mime_when_known() {
     let mut view = view();
     let mut message = Message::user("look at this");
@@ -1492,12 +1586,15 @@ fn views_task_results_render_as_a_child_session_instead_of_raw_envelope_markup()
         id: String::from("task_1"),
         name: String::from("renamed_delegate"),
     })));
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
-        String::from(
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
+        id: String::from("task_1"),
+        delta: String::from(
             r#"{"description":"trace the runtime","subagent_type":"deep","prompt":"inspect it"}"#,
         ),
-    ))));
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd)));
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd {
+        id: String::from("task_1"),
+    })));
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchStarted {
         step: 1,
         call_id: String::from("task_1"),
@@ -2250,7 +2347,7 @@ fn views_collapsed_reasoning_is_one_row_and_reports_its_tense() {
     let streaming = draw(&mut view, 60, 12);
     let live = streaming
         .iter()
-        .filter(|row| row.contains("thinking…") || row.contains("thought"))
+        .filter(|row| row.contains("◇ Thought"))
         .count();
     assert_eq!(
         live, 1,
@@ -2265,7 +2362,7 @@ fn views_collapsed_reasoning_is_one_row_and_reports_its_tense() {
         "the one row it gets does not say what the reasoning is about: {header:?}"
     );
     assert!(
-        !header.contains("thought for"),
+        !header.contains("12.0s"),
         "an unfinished block claimed a duration it has not been told: {header:?}"
     );
 
@@ -2274,7 +2371,7 @@ fn views_collapsed_reasoning_is_one_row_and_reports_its_tense() {
     })));
     let done = draw(&mut view, 60, 12).join("\n");
     assert!(
-        done.contains("thought for 12.0s"),
+        done.contains("◇ Thought · 12.0s"),
         "a finished block did not switch to the past tense with its duration:\n{done}"
     );
 }
@@ -2294,14 +2391,17 @@ fn views_collapsed_reasoning_drops_a_summary_that_would_not_fit() {
         duration_secs: 1.0,
     })));
     let narrow = draw(&mut view, 30, 10);
-    let rows_used = narrow.iter().filter(|row| row.contains("thought")).count();
+    let rows_used = narrow
+        .iter()
+        .filter(|row| row.contains("◇ Thought"))
+        .count();
     assert_eq!(
         rows_used, 1,
         "the summary took a row of its own:\n{narrow:#?}"
     );
     let joined = narrow.join("\n");
     assert!(
-        joined.contains("thought for 1.0s"),
+        joined.contains("◇ Thought · 1.0s"),
         "the duration was dropped instead of the summary:\n{joined}"
     );
     assert!(
@@ -2482,10 +2582,13 @@ fn tool_call_shown(
         id: String::from("c1"),
         name: name.to_owned(),
     })));
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
-        arguments.to_owned(),
-    ))));
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd)));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
+        id: String::from("c1"),
+        delta: arguments.to_owned(),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd {
+        id: String::from("c1"),
+    })));
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
@@ -2565,9 +2668,10 @@ fn views_tool_arguments_accumulate_across_the_deltas_that_carry_them() {
     }));
     for fragment in [r#"{"comm"#, r#"and":"cargo "#, r#"test"}"#] {
         assert!(
-            transcript.observe(&provider(StreamEvent::ToolInputDelta(String::from(
-                fragment
-            )))),
+            transcript.observe(&provider(StreamEvent::ToolInputDelta {
+                id: String::from("c1"),
+                delta: String::from(fragment),
+            })),
             "an argument fragment reported nothing changed, so the row would not redraw"
         );
     }
@@ -2607,9 +2711,10 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
             id: id.clone(),
             name: name.to_owned(),
         })));
-        view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
-            arguments.to_owned(),
-        ))));
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
+            id: id.clone(),
+            delta: arguments.to_owned(),
+        })));
         view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: id,
@@ -2652,9 +2757,10 @@ fn views_tool_row_is_inset_one_column_past_the_prose_it_belongs_to() {
         id: String::from("c1"),
         name: String::from("read"),
     })));
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
-        String::from(r#"{"filePath":"src/a.rs"}"#),
-    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
+        id: String::from("c1"),
+        delta: String::from(r#"{"filePath":"src/a.rs"}"#),
+    })));
     let rendered = draw(&mut view, 60, 12);
     let prose = rendered
         .iter()
@@ -2871,9 +2977,10 @@ fn views_a_failed_tool_paints_its_output_as_an_error_below_the_call_row() {
         id: String::from("c1"),
         name: String::from("bash"),
     })));
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
-        String::from(r#"{"command":"false"}"#),
-    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
+        id: String::from("c1"),
+        delta: String::from(r#"{"command":"false"}"#),
+    })));
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
@@ -2937,7 +3044,7 @@ fn views_reasoning_is_inset_past_the_answer_in_both_display_states() {
     let collapsed = draw(&mut view, 70, 16);
     let answer = indent(&collapsed, "the answer");
     assert!(
-        indent(&collapsed, "thought for") > answer,
+        indent(&collapsed, "◇ Thought") > answer,
         "the collapsed reasoning header is flush with the answer, so it competes with it:\n{}",
         collapsed.join("\n")
     );
@@ -2945,7 +3052,7 @@ fn views_reasoning_is_inset_past_the_answer_in_both_display_states() {
     view.toggle_thinking();
     let expanded = draw(&mut view, 70, 16);
     assert!(
-        indent(&expanded, "second thought") > indent(&expanded, "thought for"),
+        indent(&expanded, "second thought") > indent(&expanded, "◇ Thought"),
         "the reasoning body is not nested under its own header, so a long thought reads \
          as the reply:\n{}",
         expanded.join("\n")
@@ -3016,9 +3123,12 @@ fn views_a_cjk_tool_argument_stays_inside_the_frame_at_every_width() {
             id: String::from("c1"),
             name: String::from("read"),
         })));
-        view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
-            String::from(r#"{"filePath":"crates/文档/说明书/読み方.rs","offset":1,"limit":9}"#),
-        ))));
+        view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
+            id: String::from("c1"),
+            delta: String::from(
+                r#"{"filePath":"crates/文档/说明书/読み方.rs","offset":1,"limit":9}"#,
+            ),
+        })));
         view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c1"),
@@ -3052,9 +3162,14 @@ fn views_a_tool_call_survives_the_smallest_supported_frame() {
         id: String::from("c1"),
         name: String::from("edit"),
     })));
-    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta(
-        String::from(r#"{"filePath":"crates/zuno-tui/src/views/message.rs","oldString":"a","newString":"b"}"#),
-    ))));
+    view.handle_event(&AppEvent::Engine(provider(
+        StreamEvent::ToolInputDelta {
+            id: String::from("c1"),
+            delta: String::from(
+                r#"{"filePath":"crates/zuno-tui/src/views/message.rs","oldString":"a","newString":"b"}"#,
+            ),
+        },
+    )));
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
@@ -3110,10 +3225,15 @@ fn realistic() -> TranscriptView {
             id: String::from("c1"),
             name: String::from("read"),
         }),
-        provider(StreamEvent::ToolInputDelta(String::from(
-            r#"{"filePath":"crates/zuno-tui/src/views/diff.rs","offset":1,"limit":162}"#,
-        ))),
-        provider(StreamEvent::ToolUseEnd),
+        provider(StreamEvent::ToolInputDelta {
+            id: String::from("c1"),
+            delta: String::from(
+                r#"{"filePath":"crates/zuno-tui/src/views/diff.rs","offset":1,"limit":162}"#,
+            ),
+        }),
+        provider(StreamEvent::ToolUseEnd {
+            id: String::from("c1"),
+        }),
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c1"),
@@ -3128,10 +3248,13 @@ fn realistic() -> TranscriptView {
             id: String::from("c2"),
             name: String::from("glob"),
         }),
-        provider(StreamEvent::ToolInputDelta(String::from(
-            r#"{"pattern":"**/*.rs","path":"crates/zuno-tui/src/views"}"#,
-        ))),
-        provider(StreamEvent::ToolUseEnd),
+        provider(StreamEvent::ToolInputDelta {
+            id: String::from("c2"),
+            delta: String::from(r#"{"pattern":"**/*.rs","path":"crates/zuno-tui/src/views"}"#),
+        }),
+        provider(StreamEvent::ToolUseEnd {
+            id: String::from("c2"),
+        }),
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c2"),
@@ -3146,10 +3269,15 @@ fn realistic() -> TranscriptView {
             id: String::from("c3"),
             name: String::from("edit"),
         }),
-        provider(StreamEvent::ToolInputDelta(String::from(
-            r#"{"filePath":"crates/zuno-tui/src/views/session.rs","oldString":"old();","newString":"new();"}"#,
-        ))),
-        provider(StreamEvent::ToolUseEnd),
+        provider(StreamEvent::ToolInputDelta {
+            id: String::from("c3"),
+            delta: String::from(
+                r#"{"filePath":"crates/zuno-tui/src/views/session.rs","oldString":"old();","newString":"new();"}"#,
+            ),
+        }),
+        provider(StreamEvent::ToolUseEnd {
+            id: String::from("c3"),
+        }),
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c3"),
@@ -3511,12 +3639,15 @@ fn views_transcript_cache_recalls_the_prefix_across_a_streaming_append() {
 
 #[test]
 fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
-    // A running call renders `Transcript::spinner()`, which advances on every folded
-    // event. Recalling it would freeze the animation and, worse, claim a frame is current
-    // when its liveness signal is stale.
+    // A running call renders `Transcript::spinner()`, which advances on the app's
+    // independent animation clock. Recalling it would freeze the animation and, worse,
+    // claim a frame is current when its liveness signal is stale.
     let mut view = view();
     view.transcript_mut().push(Message::user("go"));
     for event in [
+        TurnEvent::TurnStarted {
+            session_id: String::from("s"),
+        },
         started(),
         provider(StreamEvent::ToolUseStart {
             id: String::from("c"),
@@ -3535,8 +3666,10 @@ fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
 
     let mut seen = std::collections::BTreeSet::new();
     for _ in 0..SPINNER.len() {
-        view.transcript_mut()
-            .observe(&provider(StreamEvent::TextDelta(String::new())));
+        assert!(
+            view.handle_event(&AppEvent::AnimationFrame).redraw,
+            "a running transcript ignored the animation clock"
+        );
         let frame = row_text(&view.cached_lines_for_test(80));
         let glyph = frame
             .iter()
@@ -3558,7 +3691,7 @@ fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
     }
     assert!(
         seen.len() > 1,
-        "the running call's glyph never changed across {} folded events, so its row was \
+        "the running call's glyph never changed across {} animation frames, so its row was \
          recalled: {seen:?}",
         SPINNER.len()
     );
@@ -3569,6 +3702,44 @@ fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
         1,
         "the message with the running call was stored, or the settled one was not"
     );
+}
+
+#[test]
+fn views_transcript_animation_clock_stops_at_turn_boundaries_and_human_prompts() {
+    let mut view = view();
+    view.transcript_mut().observe(&TurnEvent::TurnStarted {
+        session_id: String::from("s"),
+    });
+    view.transcript_mut().observe(&started());
+    let initial = view.transcript().spinner();
+
+    assert!(view.handle_event(&AppEvent::AnimationFrame).redraw);
+    assert_ne!(
+        view.transcript().spinner(),
+        initial,
+        "an animation frame did not advance the liveness glyph"
+    );
+
+    view.transcript_mut()
+        .set_awaiting_user(Some(AwaitingUser::Answer));
+    let waiting = view.transcript().spinner();
+    assert!(
+        !view.handle_event(&AppEvent::AnimationFrame).redraw,
+        "a prompt waiting on the user requested a pointless animation redraw"
+    );
+    assert_eq!(view.transcript().spinner(), waiting);
+
+    view.transcript_mut().set_awaiting_user(None);
+    view.transcript_mut().observe(&TurnEvent::TurnCompleted {
+        assistant_message_id: String::from("m"),
+        steps: 1,
+    });
+    let completed = view.transcript().spinner();
+    assert!(
+        !view.handle_event(&AppEvent::AnimationFrame).redraw,
+        "a completed turn kept the animation clock alive"
+    );
+    assert_eq!(view.transcript().spinner(), completed);
 }
 
 #[test]

@@ -29,6 +29,25 @@ fn open(text: &str) -> AutocompleteView {
     view
 }
 
+#[test]
+fn views_autocomplete_mouse_selects_a_visible_slash_command_row() {
+    let mut view = open("/");
+    let area = Rect::new(10, 5, 50, view.height());
+    assert!(
+        view.select_at(12, 6, area),
+        "a click on the second visible command was ignored"
+    );
+    assert_eq!(view.cursor(), 1);
+    assert_eq!(
+        view.selected().map(|candidate| candidate.insert.as_str()),
+        Some("/session ")
+    );
+    assert!(
+        !view.select_at(12, area.bottom().saturating_sub(1), area),
+        "the hint footer was treated as a selectable command"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Trigger detection
 // ---------------------------------------------------------------------------

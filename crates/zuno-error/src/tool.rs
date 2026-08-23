@@ -65,6 +65,18 @@ pub enum ToolError {
         #[source]
         source: BoxSource,
     },
+
+    /// A side effect was observed, but the call lost an authoritative final state.
+    ///
+    /// The applied paths are evidence for inspection, not permission to replay the
+    /// call. This variant is deliberately non-retryable.
+    #[error("tool {tool} has an uncertain outcome after applying changes to {applied_paths:?}")]
+    Uncertain {
+        tool: String,
+        applied_paths: Vec<String>,
+        #[source]
+        source: BoxSource,
+    },
 }
 
 impl ToolError {
@@ -77,7 +89,8 @@ impl ToolError {
             | Self::Timeout { tool, .. }
             | Self::Transient { tool, .. }
             | Self::NotFound { tool }
-            | Self::Failed { tool, .. } => tool,
+            | Self::Failed { tool, .. }
+            | Self::Uncertain { tool, .. } => tool,
         }
     }
 
@@ -112,7 +125,8 @@ impl ToolError {
             Self::Denied { .. }
             | Self::Timeout { .. }
             | Self::Transient { .. }
-            | Self::Failed { .. } => false,
+            | Self::Failed { .. }
+            | Self::Uncertain { .. } => false,
         }
     }
 }
@@ -127,7 +141,8 @@ impl Recoverable for ToolError {
             Self::Denied { .. }
             | Self::InvalidArgs { .. }
             | Self::NotFound { .. }
-            | Self::Failed { .. } => Recovery::Fail,
+            | Self::Failed { .. }
+            | Self::Uncertain { .. } => Recovery::Fail,
         }
     }
 }
@@ -160,6 +175,11 @@ mod tests {
             ToolError::Failed {
                 tool: "bash".to_owned(),
                 source: Box::new(std::io::Error::other("exit status 1")),
+            },
+            ToolError::Uncertain {
+                tool: "bash".to_owned(),
+                applied_paths: vec!["/workspace/output.txt".to_owned()],
+                source: Box::new(std::io::Error::other("response lost")),
             },
         ]
     }

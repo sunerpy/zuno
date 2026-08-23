@@ -214,7 +214,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         );
     }
 
-    let mut options = TurnOptions {
+    let options = TurnOptions {
         directory: None,
         model: args.model.clone(),
         agent: args.agent.clone(),
@@ -223,9 +223,8 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         effort: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
-    let mut launch_prompt = args.prompt.clone();
     let mut terminal = None;
-    let mut initial_dialog = None;
+    let mut request = RemountRequest::initial(options, args.prompt.clone());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -233,15 +232,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         .map_err(to_string)?;
 
     loop {
-        match execute_once(
-            args,
-            environment,
-            &runtime,
-            options,
-            launch_prompt.take(),
-            initial_dialog.take(),
-            &mut terminal,
-        ) {
+        match execute_once(args, environment, &runtime, request, &mut terminal) {
             Err(error) => {
                 drop(terminal.take());
                 return match shutdown_tui_background_jobs(&runtime, environment) {
@@ -263,8 +254,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
                 return Ok(());
             }
             Ok(TuiRunOutcome::Remount(next)) => {
-                options = next.options;
-                initial_dialog = next.initial_dialog;
+                request = next;
             }
         }
     }
@@ -299,21 +289,45 @@ enum RemountDialog {
 
 struct RemountRequest {
     options: TurnOptions,
+    launch_prompt: Option<String>,
     initial_dialog: Option<RemountDialog>,
+    show_welcome: bool,
 }
 
 impl RemountRequest {
+    fn initial(options: TurnOptions, launch_prompt: Option<String>) -> Self {
+        Self {
+            options,
+            launch_prompt,
+            initial_dialog: None,
+            show_welcome: true,
+        }
+    }
+
     fn plain(options: TurnOptions) -> Self {
         Self {
             options,
+            launch_prompt: None,
             initial_dialog: None,
+            show_welcome: true,
+        }
+    }
+
+    fn fresh_conversation(options: TurnOptions) -> Self {
+        Self {
+            options,
+            launch_prompt: None,
+            initial_dialog: None,
+            show_welcome: false,
         }
     }
 
     fn reopening_sessions(options: TurnOptions) -> Self {
         Self {
             options,
+            launch_prompt: None,
             initial_dialog: Some(RemountDialog::Sessions),
+            show_welcome: true,
         }
     }
 }
@@ -333,11 +347,15 @@ fn execute_once(
     args: &TuiArgs,
     environment: &StartupEnvironment,
     runtime: &tokio::runtime::Runtime,
-    options: TurnOptions,
-    launch_prompt: Option<String>,
-    initial_dialog: Option<RemountDialog>,
+    request: RemountRequest,
     terminal: &mut Option<MountedTerminal>,
 ) -> Result<TuiRunOutcome, String> {
+    let RemountRequest {
+        options,
+        launch_prompt,
+        initial_dialog,
+        show_welcome,
+    } = request;
     let (terminal_sender, terminal_receiver) = zuno_tui::app::terminal_event_channel();
     let (engine_sender, engine_receiver) = event_channel();
     let (prompt_sender, prompt_receiver) = mpsc::channel(PROMPT_CHANNEL_CAPACITY);
@@ -513,6 +531,9 @@ fn execute_once(
         // and the keybinding reference has to list what the *user's* keymap resolved
         // rather than the shipped defaults.
         .with_keymap(keymap.clone());
+    if !show_welcome {
+        screen = screen.without_welcome();
+    }
     facts.describe(
         &mut screen,
         host.tool_count(),
@@ -1345,9 +1366,9 @@ fn mcp_enabled(server: &zuno_config::schema::mcp::McpServerConfig) -> bool {
 ///
 /// A task rather than a call inside the component handler for the reason the turn
 /// driver is one: the render loop is the only consumer of the events an aborted turn
-/// produces, so it must not be the thing waiting on the abort. `abort` returning
-/// `false` means the turn had already finished, which is not a failure — the screen's
-/// next press leaves instead.
+/// produces, so it must not be the thing waiting on the abort. The registry retains an
+/// interrupt that arrives during the guard handoff, so an accepted follow-up turn cannot
+/// escape a cancellation merely because the previous guard dropped first.
 async fn forward_cancellations(
     control: zuno_engine::status::SessionControl,
     mut cancels: mpsc::Receiver<()>,
@@ -1366,7 +1387,20 @@ async fn forward_cancellations(
                 let Some(()) = cancellation else {
                     return;
                 };
-                let _aborted = control.abort();
+                match control.abort() {
+                    zuno_engine::status::AbortDisposition::Active => tracing::info!(
+                        target: "zuno::tui::cancellation",
+                        session_id = %control.session_id(),
+                        disposition = "active",
+                        "TUI interrupt request fired for the active turn"
+                    ),
+                    zuno_engine::status::AbortDisposition::ArmedNext => tracing::info!(
+                        target: "zuno::tui::cancellation",
+                        session_id = %control.session_id(),
+                        disposition = "armed_next",
+                        "TUI interrupt request was retained across the turn handoff"
+                    ),
+                }
             }
         }
     }
@@ -1569,7 +1603,7 @@ async fn apply_selection(
             next.directory = Some(PathBuf::from(host.session_directory()));
             next.session = SessionChoice::New;
             next.title = None;
-            return SelectionOutcome::Remount(RemountRequest::plain(next));
+            return SelectionOutcome::Remount(RemountRequest::fresh_conversation(next));
         }
         zuno_tui::views::session::Selection::Session(session_id) => {
             if session_id == host.session_id() {
@@ -2348,7 +2382,7 @@ async fn drive_one(
             let prompt =
                 super::tui_reference::resolve_submission(reference_root, submission).await?;
             if let PromptSubmission::Host(command) = prompt {
-                return restore_snapshot(command, snapshots, events).await;
+                return execute_host_command(host, command, snapshots, events).await;
             }
             let capture = begin_snapshot(&snapshots.store, events).await;
             let inbox = host.session_inbox();
@@ -2524,7 +2558,20 @@ async fn admit_followup(
     if delivery == zuno_db::inbox::InputDelivery::Steer
         && let Some(message) = soft_interrupt(&input_id, &prompt)
     {
-        let _queued_or_left_pending = control.queue_soft_interrupt(message);
+        match control.queue_soft_interrupt(message) {
+            Ok(()) => tracing::debug!(
+                target: "zuno::tui::steering",
+                session_id = %control.session_id(),
+                input_id,
+                "durable TUI input woke the active turn"
+            ),
+            Err(_) => tracing::debug!(
+                target: "zuno::tui::steering",
+                session_id = %control.session_id(),
+                input_id,
+                "turn ended before steering; durable TUI input remains pending"
+            ),
+        }
     }
     Ok(())
 }
@@ -2586,22 +2633,12 @@ async fn report_input_failure(events: &TurnEventSender, message: String) {
 
 async fn report_turn_failure(events: &TurnEventSender, message: String) {
     let reported = events
-        .publish(TurnEvent::TurnInterrupted {
+        .publish(TurnEvent::TurnFailed {
             assistant_message_id: None,
             steps: 0,
+            message,
         })
-        .await
-        .and(
-            events
-                .publish(TurnEvent::Provider {
-                    step: 0,
-                    event: StreamEvent::Error {
-                        message,
-                        retry_after: None,
-                    },
-                })
-                .await,
-        );
+        .await;
     // A closed event channel means the render loop has gone; there is nothing
     // left to report a failure to.
     let _closed = reported.is_err();
@@ -2666,6 +2703,9 @@ async fn restore_snapshot(
     let (source, restore) = match command {
         HostCommand::Undo => (&mut snapshots.undo, zuno_snapshot::TurnRestore::Undo),
         HostCommand::Redo => (&mut snapshots.redo, zuno_snapshot::TurnRestore::Redo),
+        HostCommand::Compact => {
+            return Err("context compaction must be handled by the turn host".to_owned());
+        }
         HostCommand::Stop(_) => {
             return Err("background stop must be handled by the TUI background service".to_owned());
         }
@@ -2687,6 +2727,30 @@ async fn restore_snapshot(
     }
     publish_restore_report(events, &report).await;
     Ok(())
+}
+
+async fn execute_host_command(
+    host: &mut TurnHost,
+    command: HostCommand,
+    snapshots: &mut SnapshotHistory,
+    events: &TurnEventSender,
+) -> Result<(), String> {
+    if command != HostCommand::Compact {
+        return restore_snapshot(command, snapshots, events).await;
+    }
+    if !host.is_session_materialized() {
+        return Err("nothing to compact; send a message first".to_owned());
+    }
+    host.compact(false).await?;
+    events
+        .publish(TurnEvent::Provider {
+            step: 0,
+            event: StreamEvent::StatusDetail {
+                detail: "context compacted; older history was summarized".to_owned(),
+            },
+        })
+        .await
+        .map_err(to_string)
 }
 
 async fn publish_restore_report(
@@ -2752,6 +2816,64 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn cancellation_forwarder_fires_the_active_sessions_interrupt_signal() {
+        let registry = SessionRunRegistry::new();
+        let guard = registry
+            .begin_turn("ses_cancel_from_tui")
+            .expect("the fixture owns the only live turn");
+        let signal = guard.interrupt_signal().clone();
+        let control = registry.control("ses_cancel_from_tui");
+        let (requests, receiver) = mpsc::channel(1);
+        let (shutdown, shutdown_source) = watch::channel(false);
+        let worker = tokio::spawn(forward_cancellations(control, receiver, shutdown_source));
+
+        requests
+            .send(())
+            .await
+            .expect("the cancellation bridge is listening");
+        tokio::time::timeout(Duration::from_secs(1), signal.notified())
+            .await
+            .expect("the cancellation bridge never fired the turn signal");
+        assert!(signal.is_set(), "the turn signal remained clear");
+
+        shutdown.send(true).expect("the worker observes shutdown");
+        worker.await.expect("the cancellation bridge exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn cancellation_forwarder_retains_an_interrupt_across_the_turn_handoff() {
+        let registry = SessionRunRegistry::new();
+        let control = registry.control("ses_cancel_handoff");
+        let (requests, receiver) = mpsc::channel(1);
+        let (shutdown, shutdown_source) = watch::channel(false);
+        let worker = tokio::spawn(forward_cancellations(control, receiver, shutdown_source));
+
+        requests
+            .send(())
+            .await
+            .expect("the cancellation bridge is listening");
+        tokio::task::yield_now().await;
+        let guard = registry
+            .begin_turn("ses_cancel_handoff")
+            .expect("the admitted follow-up acquires its guard");
+        tokio::time::timeout(Duration::from_secs(1), guard.interrupt_signal().notified())
+            .await
+            .expect("the handoff interrupt never reached the accepted follow-up");
+        assert!(guard.interrupt_signal().is_set());
+
+        shutdown.send(true).expect("the worker observes shutdown");
+        worker.await.expect("the cancellation bridge exits cleanly");
+    }
+
+    #[test]
+    fn fresh_conversation_remount_skips_the_launch_welcome_only() {
+        let request = RemountRequest::fresh_conversation(TurnOptions::default());
+        assert!(!request.show_welcome);
+        assert!(request.initial_dialog.is_none());
+        assert!(matches!(request.options.session, SessionChoice::New));
+    }
+
+    #[tokio::test]
     async fn prompt_history_shutdown_closes_the_live_sender_and_drains_queued_entries() {
         let directory = tempfile::tempdir().expect("history fixture");
         let path = directory.path().join("prompt-history.jsonl");
@@ -2796,6 +2918,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tui_followup_is_durable_and_wakes_the_active_turn_without_aborting_it() {
+        let pool = Arc::new(
+            zuno_db::pool::Pool::open(&zuno_paths::DbLocation::Memory)
+                .expect("open shared in-memory inbox"),
+        );
+        {
+            let mut connection = pool.get().expect("seed connection");
+            zuno_db::migration::apply(&mut connection).expect("apply schema");
+            connection
+                .execute_batch(
+                    "INSERT INTO project \
+                       (id, worktree, time_created, time_updated, sandboxes) \
+                     VALUES ('project-tui-steer', '/workspace', 1, 1, '[]');
+                     INSERT INTO session \
+                       (id, project_id, slug, directory, title, version, \
+                        time_created, time_updated) \
+                     VALUES ('ses_tui_steer', 'project-tui-steer', 'steer', \
+                             '/workspace', 'steer', '1', 1, 1);",
+                )
+                .expect("seed project and session");
+        }
+        let inbox = zuno_db::inbox::SessionInbox::new(pool);
+        let registry = SessionRunRegistry::new();
+        let guard = registry
+            .begin_turn("ses_tui_steer")
+            .expect("fixture owns the live turn");
+        let reference_root = tempfile::tempdir().expect("reference root");
+
+        admit_followup(
+            inbox.clone(),
+            registry.control("ses_tui_steer"),
+            reference_root.path().to_path_buf(),
+            PromptSubmission::Text("change direction now".to_owned()),
+        )
+        .await
+        .expect("admit follow-up");
+
+        let pending = inbox.pending("ses_tui_steer").expect("read durable inbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery, zuno_db::inbox::InputDelivery::Steer);
+        assert!(
+            guard.soft_interrupt_signal().is_set(),
+            "the durable admission did not wake the provider wait"
+        );
+        assert!(
+            !guard.interrupt_signal().is_set(),
+            "a steer accidentally became a hard turn cancellation"
+        );
+        let delivered = guard.take_soft_interrupts_at_safe_point();
+        assert_eq!(delivered.messages.len(), 1);
+        assert_eq!(
+            delivered.messages[0].input_id.as_deref(),
+            Some(pending[0].id.as_str())
+        );
+        assert_eq!(delivered.messages[0].content, "change direction now");
+    }
+
     #[test]
     fn tui_soft_interrupt_keeps_resolved_text_and_images() {
         let submission = PromptSubmission::Content {
@@ -2831,15 +3011,28 @@ mod tests {
 
     #[test]
     fn tui_prompt_submission_has_a_durable_round_trip() {
-        let submission = PromptSubmission::Command {
-            name: String::from("review"),
-            arguments: String::from("the queue"),
-        };
-        let stored = serde_json::to_value(&submission).expect("serialize submission");
-        let restored =
-            serde_json::from_value::<PromptSubmission>(stored).expect("decode submission");
+        let submissions = [
+            PromptSubmission::Text(String::from("change direction")),
+            PromptSubmission::Content {
+                text: String::from("inspect @diagram.png"),
+                content: vec![zuno_llm::event::RequestContentBlock::Image {
+                    media_type: String::from("image/png"),
+                    data: String::from("AAAA"),
+                }],
+            },
+            PromptSubmission::Command {
+                name: String::from("review"),
+                arguments: String::from("the queue"),
+            },
+            PromptSubmission::Host(HostCommand::Undo),
+        ];
 
-        assert_eq!(restored, submission);
+        for submission in submissions {
+            let stored = serde_json::to_value(&submission).expect("serialize submission");
+            let restored =
+                serde_json::from_value::<PromptSubmission>(stored).expect("decode submission");
+            assert_eq!(restored, submission);
+        }
     }
 
     struct BlockingMcpConnector {

@@ -448,6 +448,10 @@ pub struct CompactionConfig {
     /// Compact automatically when the context fills. Defaults to true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto: Option<bool>,
+    /// Percentage of the usable context window that triggers automatic compaction.
+    /// Defaults to 80.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold_percent: Option<CompactionThresholdPercent>,
     /// Prune old tool outputs. Defaults to false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prune: Option<bool>,
@@ -460,6 +464,41 @@ pub struct CompactionConfig {
     /// Token buffer left free so compaction itself cannot overflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u32>,
+}
+
+/// Default percentage of the usable context window consumed before auto compaction.
+pub const DEFAULT_COMPACTION_THRESHOLD_PERCENT: u8 = 80;
+
+/// A validated automatic-compaction percentage.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct CompactionThresholdPercent(#[schemars(range(min = 1, max = 100))] u8);
+
+impl CompactionThresholdPercent {
+    /// Construct a percentage accepted by the configuration boundary.
+    pub const fn new(value: u8) -> Result<Self, &'static str> {
+        if value >= 1 && value <= 100 {
+            Ok(Self(value))
+        } else {
+            Err("compaction threshold percent must be between 1 and 100")
+        }
+    }
+
+    /// The validated percentage.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactionThresholdPercent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Cross-cutting authorization behavior.

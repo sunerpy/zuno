@@ -293,9 +293,27 @@
             "integer",
             "null"
           ]
+        },
+        "threshold_percent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CompactionThresholdPercent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Percentage of the usable context window that triggers automatic compaction.\nDefaults to 80."
         }
       },
       "type": "object"
+    },
+    "CompactionThresholdPercent": {
+      "description": "A validated automatic-compaction percentage.",
+      "format": "uint8",
+      "maximum": 100,
+      "minimum": 1,
+      "type": "integer"
     },
     "ConcurrencyConfig": {
       "additionalProperties": false,

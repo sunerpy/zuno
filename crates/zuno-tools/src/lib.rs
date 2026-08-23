@@ -157,24 +157,19 @@ impl FileTools {
         })
     }
 
-    /// Return the model-visible file tools under the oracle's GPT patch rule.
-    pub fn exposed_for_model(&self, model_id: &str) -> Vec<Arc<dyn Tool>> {
-        if uses_apply_patch(model_id) {
-            vec![Arc::clone(&self.read), Arc::clone(&self.apply_patch)]
-        } else {
-            vec![
-                Arc::clone(&self.read),
-                Arc::clone(&self.edit),
-                Arc::clone(&self.write),
-            ]
-        }
+    /// Return Zuno's provider-neutral model-visible file surface.
+    ///
+    /// `apply_patch` owns structured edits and `write` is the explicit fallback for a
+    /// full replacement after `read`. The exact-string `edit` implementation remains
+    /// available to native profiles, but the default model surface does not advertise
+    /// two competing patch languages.
+    pub fn model_visible(&self) -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::clone(&self.read),
+            Arc::clone(&self.write),
+            Arc::clone(&self.apply_patch),
+        ]
     }
-}
-
-/// Match `registry.ts:292-295`: GPT models except OSS and GPT-4 use apply_patch.
-#[must_use]
-pub fn uses_apply_patch(model_id: &str) -> bool {
-    model_id.contains("gpt-") && !model_id.contains("oss") && !model_id.contains("gpt-4")
 }
 
 pub mod glob;

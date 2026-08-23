@@ -146,10 +146,21 @@ fn recorded_streams_tool_call_matches_request_and_exact_events() {
             StreamEvent::ConnectionPhase {
                 phase: ConnectionPhase::Streaming,
             },
-            StreamEvent::ToolInputDelta(String::new()),
-            StreamEvent::ToolInputDelta("{\"city\":".to_owned()),
-            StreamEvent::ToolInputDelta(" \"Paris\"}".to_owned()),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: "toolu_012rmAruviySvUXSjgCPWVRu".to_owned(),
+                delta: String::new(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "toolu_012rmAruviySvUXSjgCPWVRu".to_owned(),
+                delta: "{\"city\":".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "toolu_012rmAruviySvUXSjgCPWVRu".to_owned(),
+                delta: " \"Paris\"}".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "toolu_012rmAruviySvUXSjgCPWVRu".to_owned(),
+            },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::ToolCalls),
             },
@@ -185,11 +196,25 @@ fn recorded_two_turn_tool_loop_matches_both_exact_event_sequences() {
             StreamEvent::ConnectionPhase {
                 phase: ConnectionPhase::Streaming,
             },
-            StreamEvent::ToolInputDelta(String::new()),
-            StreamEvent::ToolInputDelta("{\"city\": ".to_owned()),
-            StreamEvent::ToolInputDelta("\"Pa".to_owned()),
-            StreamEvent::ToolInputDelta("ris\"}".to_owned()),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: "toolu_01M8nJQQMxqpv1VaPYuJKT4j".to_owned(),
+                delta: String::new(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "toolu_01M8nJQQMxqpv1VaPYuJKT4j".to_owned(),
+                delta: "{\"city\": ".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "toolu_01M8nJQQMxqpv1VaPYuJKT4j".to_owned(),
+                delta: "\"Pa".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "toolu_01M8nJQQMxqpv1VaPYuJKT4j".to_owned(),
+                delta: "ris\"}".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "toolu_01M8nJQQMxqpv1VaPYuJKT4j".to_owned(),
+            },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::ToolCalls),
             },

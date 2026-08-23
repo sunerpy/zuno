@@ -971,6 +971,30 @@ fn session_screen_the_exit_key_clears_a_typed_prompt_before_it_leaves() {
 }
 
 #[test]
+fn session_screen_ctrl_d_only_leaves_when_the_prompt_is_empty() {
+    let (mut screen, mut shutdown) = screen();
+    screen.editor.set_text("keep this prompt");
+
+    screen.handle_action(action("input_delete"), &key_event("ctrl+d"));
+    assert!(
+        shutdown.try_recv().is_err(),
+        "ctrl+d left while the prompt still contained text"
+    );
+    assert_eq!(
+        screen.editor.text(),
+        "keep this prompt",
+        "ctrl+d at the end of the prompt should remain an editor delete, not clear input"
+    );
+
+    screen.editor.set_text("");
+    screen.handle_action(action("input_delete"), &key_event("ctrl+d"));
+    assert!(
+        matches!(shutdown.try_recv(), Ok(TerminalEvent::Shutdown)),
+        "ctrl+d with an empty prompt did not request shutdown"
+    );
+}
+
+#[test]
 fn session_screen_scopes_shadow_the_exit_action_with_the_editor_bindings() {
     // Recording the shadowing rather than asserting the convenient answer. Both
     // `ctrl+c` and `ctrl+d` are bound twice in the shipped table, the `input` scope
@@ -1189,17 +1213,24 @@ fn session_screen_double_escape_cancels_without_leaving_the_application() {
         shutdown.try_recv().is_err(),
         "the first escape left the application"
     );
-    let first = ActionComponent::drain_toasts(&mut screen);
-    let interrupt_key = crate::views::key_label("session_interrupt", &ViewContext::defaults())
-        .unwrap_or_else(|| String::from("esc"));
+    let first = rows(&render_offscreen(&mut screen, 80, 24).expect("infallible"));
+    let hint = first
+        .iter()
+        .position(|row| row.contains("again to stop the active turn"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the first escape did not put its confirmation above the composer:\n{}",
+                first.join("\n")
+            )
+        });
+    let prompt = first
+        .iter()
+        .position(|row| row.contains(PROMPT_PLACEHOLDER))
+        .expect("the empty composer is visible");
     assert!(
-        first.iter().any(|toast| {
-            toast
-                .text()
-                .contains(&format!("press {interrupt_key} again"))
-                && toast.ttl() == crate::views::toast::TOAST_TTL
-        }),
-        "the first escape did not explain the second press: {first:?}"
+        hint < prompt,
+        "the interrupt confirmation belongs above the composer, not elsewhere:\n{}",
+        first.join("\n")
     );
 
     screen.handle_action(
@@ -1215,6 +1246,97 @@ fn session_screen_double_escape_cancels_without_leaving_the_application() {
     assert!(
         shutdown.try_recv().is_err(),
         "double escape cancelled the whole TUI instead of the active turn"
+    );
+}
+
+#[test]
+fn session_screen_two_escapes_cancel_even_when_the_first_closes_a_question_dialog() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (cancels, mut cancelled) = mpsc::channel(1);
+    let context = ViewContext::defaults();
+    let mut screen = SessionScreen::new(context.clone(), sender).with_cancel_sink(cancels);
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("choose a delivery mode"));
+    screen.status.mark_running();
+    let mut host = DialogHost::new(context.clone(), Box::new(screen));
+    host.open(Box::new(crate::views::question::QuestionPrompt::new(
+        context,
+        vec![crate::views::question::QuestionRequest::new(
+            "How should the result be delivered?",
+            "Delivery",
+            vec![crate::views::question::QuestionOption::new(
+                "Next step",
+                "Wake the parent on its next safe point",
+            )],
+        )],
+    )));
+    // Paint once so the base knows the running turn is waiting behind this modal.
+    let _ = render_offscreen(&mut host, 80, 24).expect("infallible");
+
+    host.handle_action(
+        action("session_interrupt"),
+        &press(crossterm::event::KeyCode::Esc),
+    );
+    assert_eq!(
+        host.active(),
+        None,
+        "the first escape did not close the dialog"
+    );
+    assert!(
+        cancelled.try_recv().is_err(),
+        "the first escape cancelled instead of arming confirmation"
+    );
+    let armed = rows(&render_offscreen(&mut host, 80, 24).expect("infallible")).join("\n");
+    assert!(
+        armed.contains("again to stop the active turn"),
+        "closing a modal consumed the escape instead of also arming the active turn:\n{armed}"
+    );
+
+    host.handle_action(
+        action("session_interrupt"),
+        &press(crossterm::event::KeyCode::Esc),
+    );
+    assert_eq!(
+        cancelled.try_recv(),
+        Ok(()),
+        "two physical escape presses did not cancel the active turn"
+    );
+}
+
+#[test]
+fn session_screen_two_escapes_cancel_even_when_the_first_rejects_permission() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (cancels, mut cancelled) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_cancel_sink(cancels);
+    screen.status.mark_running();
+    let mut host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    host.open(permission_prompt());
+    let _ = render_offscreen(&mut host, 80, 24).expect("infallible");
+
+    host.handle_action(
+        action("session_interrupt"),
+        &press(crossterm::event::KeyCode::Esc),
+    );
+    assert_eq!(
+        host.active(),
+        None,
+        "the first escape did not reject the permission prompt"
+    );
+    assert!(
+        cancelled.try_recv().is_err(),
+        "the first escape cancelled instead of arming confirmation"
+    );
+
+    host.handle_action(
+        action("session_interrupt"),
+        &press(crossterm::event::KeyCode::Esc),
+    );
+    assert_eq!(
+        cancelled.try_recv(),
+        Ok(()),
+        "two physical escape presses did not cancel the permission-blocked turn"
     );
 }
 
@@ -1925,6 +2047,75 @@ fn session_screen_shows_the_welcome_surface_only_while_the_transcript_is_empty()
         "the welcome surface survived the first message:\n{used}"
     );
     assert!(used.contains("first prompt"), "{used}");
+}
+
+#[test]
+fn session_screen_can_open_an_empty_conversation_without_returning_to_the_welcome_page() {
+    const WELCOME_ONLY: &str = "type / for commands";
+    let (sender, _shutdown) = terminal_event_channel();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).without_welcome();
+
+    let rendered = rows(&render_offscreen(&mut screen, 120, 32).expect("infallible")).join("\n");
+    assert!(
+        !rendered.contains(WELCOME_ONLY),
+        "an in-app /new remount returned to the welcome page:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(PROMPT_PLACEHOLDER),
+        "the empty conversation page has no composer:\n{rendered}"
+    );
+    assert!(
+        !screen.transcript_mut().transcript().conversation_started(),
+        "suppressing the welcome page must not fabricate a durable conversation"
+    );
+}
+
+#[test]
+fn session_screen_suppresses_late_provider_and_tool_events_after_cancellation_is_requested() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (cancels, mut cancelled) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_cancel_sink(cancels);
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("stop this turn"));
+    screen.status.mark_running();
+
+    for _ in 0..2 {
+        screen.handle_action(
+            action("session_interrupt"),
+            &press(crossterm::event::KeyCode::Esc),
+        );
+    }
+    assert_eq!(cancelled.try_recv(), Ok(()));
+
+    screen.handle_event(&AppEvent::Engine(TurnEvent::AssistantMessageCreated {
+        step: 2,
+        message_id: String::from("late"),
+    }));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::Provider {
+        step: 2,
+        event: StreamEvent::TextDelta(String::from("late model output")),
+    }));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchStarted {
+        step: 2,
+        call_id: String::from("late-tool"),
+        name: String::from("bash"),
+        ui_intent: zuno_tool::ToolUiIntent::Generic,
+    }));
+
+    let stopping = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible")).join("\n");
+    assert!(!stopping.contains("late model output"), "{stopping}");
+    assert!(!stopping.contains("late-tool"), "{stopping}");
+    assert!(stopping.contains("Stopping the active turn"), "{stopping}");
+
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
+        assistant_message_id: None,
+        steps: 2,
+    }));
+    let settled = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible")).join("\n");
+    assert!(!settled.contains("late model output"), "{settled}");
+    assert!(!settled.contains("Stopping the active turn"), "{settled}");
 }
 
 /// A screen wired to a pending-edit set, with the nudge receiver and the set itself.
@@ -3962,7 +4153,11 @@ fn prompt_band_rows(screen: &mut SessionScreen, width: u16, height: u16) -> usiz
 /// hit test — it was that nothing on this screen consumed a press at all. A test that called
 /// the hit test directly would pass against a screen whose `handle_event` still discards
 /// every mouse event, which is precisely the shipped state being fixed.
-fn click_at(screen: &mut SessionScreen, column: u16, row: u16) -> EventResult {
+fn click_at(
+    screen: &mut (impl crate::app::Component + ?Sized),
+    column: u16,
+    row: u16,
+) -> EventResult {
     pointer_at(
         screen,
         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -3979,7 +4174,7 @@ fn click_at(screen: &mut SessionScreen, column: u16, row: u16) -> EventResult {
 
 /// Deliver one pointer event through the same terminal-event path as the live app.
 fn pointer_at(
-    screen: &mut SessionScreen,
+    screen: &mut (impl crate::app::Component + ?Sized),
     kind: crossterm::event::MouseEventKind,
     column: u16,
     row: u16,
@@ -3992,6 +4187,29 @@ fn pointer_at(
             modifiers: crossterm::event::KeyModifiers::NONE,
         }),
     )))
+}
+
+/// The terminal coordinate occupied by an ASCII control label.
+///
+/// These tests click the rendered bytes rather than duplicate dialog geometry. Every
+/// label passed here is ASCII, so its byte offset is also its terminal-column offset.
+fn control_at(rendered: &[String], label: &str) -> (u16, u16) {
+    let row = rendered
+        .iter()
+        .position(|line| line.contains(label))
+        .unwrap_or_else(|| {
+            panic!(
+                "control `{label}` is not rendered:\n{}",
+                rendered.join("\n")
+            )
+        });
+    let column = rendered[row]
+        .find(label)
+        .expect("the row selected above contains the label");
+    (
+        u16::try_from(column).expect("control column fits the frame"),
+        u16::try_from(row).expect("control row fits the frame"),
+    )
 }
 
 #[test]
@@ -4015,10 +4233,13 @@ fn session_a_click_on_one_tool_header_expands_only_that_call() {
                 id: call_id.to_owned(),
                 name: String::from("bash"),
             }),
-            provider(StreamEvent::ToolInputDelta(format!(
-                r#"{{"command":"{command}"}}"#
-            ))),
-            provider(StreamEvent::ToolUseEnd),
+            provider(StreamEvent::ToolInputDelta {
+                id: call_id.to_owned(),
+                delta: format!(r#"{{"command":"{command}"}}"#),
+            }),
+            provider(StreamEvent::ToolUseEnd {
+                id: call_id.to_owned(),
+            }),
             TurnEvent::ToolDispatchCompleted {
                 step: 1,
                 call_id: call_id.to_owned(),
@@ -4138,7 +4359,7 @@ fn session_a_click_on_one_thought_reveals_its_full_text_without_opening_its_sibl
     );
     let first_header = after
         .iter()
-        .find(|row| row.contains("thought for 2.0s"))
+        .find(|row| row.contains("◇ Thought · 2.0s"))
         .expect("the first thought header remains");
     let second_header = after
         .iter()
@@ -4267,10 +4488,13 @@ fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skil
             id: String::from("skill_1"),
             name: String::from("skill"),
         }),
-        provider(StreamEvent::ToolInputDelta(String::from(
-            r#"{"name":"codegraph"}"#,
-        ))),
-        provider(StreamEvent::ToolUseEnd),
+        provider(StreamEvent::ToolInputDelta {
+            id: String::from("skill_1"),
+            delta: String::from(r#"{"name":"codegraph"}"#),
+        }),
+        provider(StreamEvent::ToolUseEnd {
+            id: String::from("skill_1"),
+        }),
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("skill_1"),
@@ -6979,11 +7203,11 @@ fn the_users_prompt_is_framed_and_the_reply_is_not() {
 
 /// Defect 4: a press on the prompt opens a menu offering copy and revert.
 ///
-/// # Driven through `handle_event`, and the copy is read back off a clipboard
+/// # Driven end to end through the hosted mouse path
 ///
-/// The press goes through the event loop's own path for the reason `click_at` exists: a test
-/// that called the hit test directly would pass against a screen that never consumes a press.
-/// And the copy is asserted by reading the text back out of an injected
+/// The prompt, menu row, and confirmation button all go through the event loop's own path.
+/// A test that called `apply_dialog_outcome` directly would pass while the visible controls
+/// remained impossible to click. Copy is asserted by reading the text back out of an injected
 /// [`crate::views::external::MemoryClipboard`], not by finding a toast — a toast saying
 /// `copied 18 characters` is exactly what a menu row that wrote nowhere would also produce.
 ///
@@ -6997,35 +7221,31 @@ fn a_press_on_the_prompt_opens_a_menu_that_copies_and_reverts() {
     for width in [120u16, 80] {
         let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
         let (screen, _shutdown) = mouse_conversing();
-        let mut screen = screen.with_clipboard(clipboard.clone());
-        let rendered = rows(&render_offscreen(&mut screen, width, 32).expect("infallible"));
-        let row = rendered
-            .iter()
-            .position(|row| row.contains("summarise the plan"))
-            .expect("the prompt is drawn");
-        let row = u16::try_from(row).expect("in frame");
+        let context = screen.context.clone();
+        let screen = screen.with_clipboard(clipboard.clone());
+        let mut host = DialogHost::new(context, Box::new(screen));
+        let rendered = rows(&render_offscreen(&mut host, width, 32).expect("infallible"));
+        let (column, row) = control_at(&rendered, "summarise the plan");
 
         assert!(
-            click_at(&mut screen, 3, row).redraw,
+            click_at(&mut host, column, row).redraw,
             "at {width} columns a press on the prompt was not consumed, so no menu can open"
         );
-        let opened = screen.drain_dialogs();
         assert_eq!(
-            opened.len(),
-            1,
-            "at {width} columns a press on the prompt opened {} dialogs",
-            opened.len()
+            host.active(),
+            Some(MESSAGE_ACTIONS_DIALOG_ID),
+            "at {width} columns a press on the prompt did not open the message menu"
         );
-        assert_eq!(opened[0].id(), MESSAGE_ACTIONS_DIALOG_ID);
 
-        // Copy: the text has to reach a clipboard, not just a toast.
-        screen.apply_dialog_outcome(
-            MESSAGE_ACTIONS_DIALOG_ID,
-            &crate::views::dialog::DialogOutcome::Selected {
-                dialog: MESSAGE_ACTIONS_DIALOG_ID,
-                value: String::from(MESSAGE_ACTION_COPY),
-            },
+        // Copy: click the rendered row, and the text has to reach a clipboard rather than
+        // merely produce a success toast.
+        let menu = rows(&render_offscreen(&mut host, width, 32).expect("infallible"));
+        let (column, row) = control_at(&menu, "Copy message");
+        assert!(
+            click_at(&mut host, column, row).redraw,
+            "at {width} columns the Copy message row did not accept a click"
         );
+        assert!(!host.is_open(), "the copied message menu stayed open");
         // Read back through the trait, which is what the screen wrote through: `read` returns
         // whatever `write` last stored, so this is the round trip rather than a claim about it.
         let held = crate::views::external::Clipboard::read(clipboard.as_ref())
@@ -7036,43 +7256,51 @@ fn a_press_on_the_prompt_opens_a_menu_that_copies_and_reverts() {
             "at {width} columns the copy row put nothing on the clipboard: {held:?}"
         );
 
-        // Revert: the row exists, and it confirms rather than submitting.
-        let (mut reverting, _shutdown) = mouse_conversing();
+        // Revert: click the menu row, prove it confirms without submitting, then click the
+        // rendered Restore button and observe the actual host command.
+        let (screen, _shutdown) = mouse_conversing();
+        let context = screen.context.clone();
+        let (prompts, mut submitted) = mpsc::channel(1);
+        let screen = screen.with_prompt_sink(prompts);
+        let mut reverting = DialogHost::new(context, Box::new(screen));
         let rendered = rows(&render_offscreen(&mut reverting, width, 32).expect("infallible"));
-        let row = u16::try_from(
-            rendered
-                .iter()
-                .position(|row| row.contains("summarise the plan"))
-                .expect("the prompt is drawn"),
-        )
-        .expect("in frame");
-        click_at(&mut reverting, 3, row);
-        let mut opened = reverting.drain_dialogs();
-        let offered = opened[0].lines(60).iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.content.contains("Revert"))
-        });
+        let (column, row) = control_at(&rendered, "summarise the plan");
+        click_at(&mut reverting, column, row);
+        let menu = rows(&render_offscreen(&mut reverting, width, 32).expect("infallible"));
+        let offered = menu.iter().any(|line| line.contains("Revert this turn"));
         assert!(
             offered,
             "at {width} columns the menu on the newest prompt offers no revert row"
         );
-        reverting.apply_dialog_outcome(
-            MESSAGE_ACTIONS_DIALOG_ID,
-            &crate::views::dialog::DialogOutcome::Selected {
-                dialog: MESSAGE_ACTIONS_DIALOG_ID,
-                value: String::from(MESSAGE_ACTION_REVERT),
-            },
+        let (column, row) = control_at(&menu, "Revert this turn");
+        assert!(
+            click_at(&mut reverting, column, row).redraw,
+            "at {width} columns the Revert row did not accept a click"
         );
-        let confirm = reverting.drain_dialogs();
         assert_eq!(
-            confirm.first().map(|dialog| dialog.id()),
+            reverting.active(),
             Some(UNDO_CONFIRM_DIALOG_ID),
             "at {width} columns revert did not ask before overwriting the worktree"
         );
         assert!(
-            reverting.submissions().iter().all(|sent| sent != "/undo"),
+            submitted.try_recv().is_err(),
             "at {width} columns revert reached the driver without a confirmation"
+        );
+
+        let confirmation = rows(&render_offscreen(&mut reverting, width, 32).expect("infallible"));
+        let (column, row) = control_at(&confirmation, "Restore");
+        assert!(
+            click_at(&mut reverting, column, row).redraw,
+            "at {width} columns the Restore button did not accept a click"
+        );
+        assert_eq!(
+            submitted.try_recv(),
+            Ok(PromptSubmission::Host(HostCommand::Undo)),
+            "at {width} columns clicking Restore did not reach the undo handler"
+        );
+        assert!(
+            !reverting.is_open(),
+            "at {width} columns the confirmation stayed open after Restore"
         );
     }
 }

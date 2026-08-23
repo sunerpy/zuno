@@ -32,7 +32,8 @@
 use crate::keybind::Definition;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogPlacement, DialogStep};
 use crate::views::{ViewContext, padded};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use serde::{Deserialize, Serialize};
 
@@ -230,6 +231,31 @@ impl QuestionPrompt {
         }
         self.advance()
     }
+
+    fn choice_at_line(&self, width: u16, target: usize) -> Option<usize> {
+        let question = self.question();
+        let mut line =
+            crate::views::message::wrap(&question.question, width.saturating_sub(2)).len() + 1;
+        for (index, option) in question.options.iter().enumerate() {
+            if target == line {
+                return Some(index);
+            }
+            line = line.saturating_add(1 + usize::from(!option.description.is_empty()));
+        }
+        if question.allows_custom() {
+            let custom_rows = if self.editing || !self.typed.is_empty() {
+                crate::views::message::wrap(&self.typed, width.saturating_sub(4))
+                    .len()
+                    .max(1)
+            } else {
+                1
+            };
+            if (line..line.saturating_add(custom_rows)).contains(&target) {
+                return Some(question.options.len());
+            }
+        }
+        None
+    }
 }
 
 impl Dialog for QuestionPrompt {
@@ -416,6 +442,51 @@ impl Dialog for QuestionPrompt {
                 }
                 DialogStep::Ignored
             }
+        }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp if !self.editing => {
+                let rows = self.rows();
+                if rows == 0 {
+                    return DialogStep::Ignored;
+                }
+                self.cursor = (self.cursor + rows - 1) % rows;
+                return DialogStep::Redraw;
+            }
+            MouseEventKind::ScrollDown if !self.editing => {
+                let rows = self.rows();
+                if rows == 0 {
+                    return DialogStep::Ignored;
+                }
+                self.cursor = (self.cursor + 1) % rows;
+                return DialogStep::Redraw;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {}
+            _ => return DialogStep::Ignored,
+        }
+        let target = usize::from(event.row.saturating_sub(body.top()));
+        let Some(choice) = self.choice_at_line(body.width, target) else {
+            return DialogStep::Ignored;
+        };
+        self.cursor = choice;
+        if self.is_custom_row() {
+            self.editing = true;
+            return DialogStep::Redraw;
+        }
+        if self.question().is_multiple() {
+            self.toggle();
+            DialogStep::Redraw
+        } else {
+            self.submit()
         }
     }
 }

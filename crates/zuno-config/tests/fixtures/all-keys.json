@@ -259,6 +259,7 @@
   "tool_output": { "max_lines": 2000, "max_bytes": 51200 },
   "compaction": {
     "auto": true,
+    "threshold_percent": 80,
     "prune": false,
     "tail_turns": 2,
     "preserve_recent_tokens": 20000,

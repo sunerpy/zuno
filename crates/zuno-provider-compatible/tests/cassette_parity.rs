@@ -162,8 +162,11 @@ fn tool_start(id: &str, name: &str) -> StreamEvent {
     }
 }
 
-fn tool_input(value: &str) -> StreamEvent {
-    StreamEvent::ToolInputDelta(value.to_owned())
+fn tool_input(id: &str, value: &str) -> StreamEvent {
+    StreamEvent::ToolInputDelta {
+        id: id.to_owned(),
+        delta: value.to_owned(),
+    }
 }
 
 /// Vendor 1 of 6 — DeepSeek, `api.deepseek.com`.
@@ -228,8 +231,10 @@ async fn groq_tool_call_replays_to_the_recorded_event_sequence() {
         events,
         vec![
             tool_start("mcf2d8nn1", "get_weather"),
-            tool_input(r#"{"city":"Paris"}"#),
-            StreamEvent::ToolUseEnd,
+            tool_input("mcf2d8nn1", r#"{"city":"Paris"}"#),
+            StreamEvent::ToolUseEnd {
+                id: "mcf2d8nn1".to_owned(),
+            },
             stop(FinishReason::ToolCalls),
             usage.clone(),
             // Groq repeats its usage on a final `choices: []` chunk. A second
@@ -299,8 +304,10 @@ async fn togetherai_tool_call_survives_a_split_tool_fragment() {
         events,
         vec![
             tool_start("call_yu1mxtmex7x48nximi9c8jpo", "get_weather"),
-            tool_input(r#"{"city":"Paris"}"#),
-            StreamEvent::ToolUseEnd,
+            tool_input("call_yu1mxtmex7x48nximi9c8jpo", r#"{"city":"Paris"}"#,),
+            StreamEvent::ToolUseEnd {
+                id: "call_yu1mxtmex7x48nximi9c8jpo".to_owned(),
+            },
             stop(FinishReason::ToolCalls),
             StreamEvent::TokenUsage {
                 input_tokens: Some(194),
@@ -395,7 +402,7 @@ fn assert_reasoning_then_tool_call(events: &[StreamEvent]) {
     let arguments: String = events
         .iter()
         .filter_map(|event| match event {
-            StreamEvent::ToolInputDelta(delta) => Some(delta.as_str()),
+            StreamEvent::ToolInputDelta { delta, .. } => Some(delta.as_str()),
             _ => None,
         })
         .collect();

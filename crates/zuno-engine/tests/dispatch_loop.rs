@@ -291,10 +291,13 @@ fn named_provider_events(tool: &str, calls: &[(&str, &str)]) -> Vec<Vec<StreamEv
             id: (*id).to_owned(),
             name: tool.to_owned(),
         });
-        first.push(StreamEvent::ToolInputDelta(
-            json!({ "command": command, "intent": "qa" }).to_string(),
-        ));
-        first.push(StreamEvent::ToolUseEnd);
+        first.push(StreamEvent::ToolInputDelta {
+            id: (*id).to_owned(),
+            delta: json!({ "command": command, "intent": "qa" }).to_string(),
+        });
+        first.push(StreamEvent::ToolUseEnd {
+            id: (*id).to_owned(),
+        });
     }
     first.push(StreamEvent::MessageEnd {
         stop_reason: Some(FinishReason::ToolCalls),

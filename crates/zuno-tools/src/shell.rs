@@ -1,5 +1,5 @@
 use crate::output_policy::OutputPolicy;
-use crate::risk::{GateOutcome, Justification, RiskContext, assess_and_gate};
+use crate::risk::{GateOutcome, RiskContext, assess_and_gate};
 use crate::timeout::{
     background_started_output, normalize_foreground_timeout, timeout_promoted_output,
 };
@@ -74,9 +74,6 @@ pub struct ShellParams {
     /// Start the command and return immediately while its lifecycle continues asynchronously.
     #[serde(default)]
     pub background: bool,
-    /// Only for resubmitting a reflected command; identify the actual user request it serves.
-    #[serde(default)]
-    pub justification: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,31 +229,25 @@ impl ShellTool {
         let cwd = self.resolve_workdir(params.workdir.as_deref())?;
         let analysis = analyze_command(&params.command, self.syntax())?;
         let risk_context = RiskContext::from_env(Some(cwd.clone()));
-        let justification = Justification {
-            text: params.justification.clone(),
-        };
-        match assess_and_gate(
+        let risk_confirmation =
+            match assess_and_gate(&params.command, self.syntax(), &risk_context)? {
+                GateOutcome::Allow => None,
+                GateOutcome::Confirm { reason, target } => Some((reason, target)),
+                GateOutcome::Deny { reason } => {
+                    return Err(ToolError::Failed {
+                        tool: TOOL_ID.to_owned(),
+                        source: Box::new(io::Error::new(io::ErrorKind::PermissionDenied, reason)),
+                    });
+                }
+            };
+        self.authorize(
             &params.command,
-            self.syntax(),
-            &risk_context,
-            &justification,
-        )? {
-            GateOutcome::Allow => {}
-            GateOutcome::Reflect { prompt } => {
-                return Err(ToolError::InvalidArgs {
-                    tool: TOOL_ID.to_owned(),
-                    source: Box::new(io::Error::new(io::ErrorKind::InvalidInput, prompt)),
-                });
-            }
-            GateOutcome::Deny { reason } => {
-                return Err(ToolError::Failed {
-                    tool: TOOL_ID.to_owned(),
-                    source: Box::new(io::Error::new(io::ErrorKind::PermissionDenied, reason)),
-                });
-            }
-        }
-        self.authorize(&params.command, &cwd, &analysis, &ctx)
-            .await?;
+            &cwd,
+            &analysis,
+            risk_confirmation.as_ref(),
+            &ctx,
+        )
+        .await?;
         if ctx.is_interrupted() {
             return Err(interrupted());
         }
@@ -327,6 +318,7 @@ impl ShellTool {
         command: &str,
         cwd: &Path,
         analysis: &ShellAnalysis,
+        risk_confirmation: Option<&(String, Option<String>)>,
         ctx: &ToolContext,
     ) -> Result<(), ToolError> {
         let mut directories = external_directories(analysis, cwd, &self.workspace);
@@ -367,28 +359,40 @@ impl ShellTool {
             .iter()
             .filter(|resource| !resource.changes_directory)
             .collect();
-        if resources.is_empty() {
+        if resources.is_empty() && risk_confirmation.is_none() {
             return Ok(());
         }
         let mut metadata = Map::new();
         metadata.insert("command".to_owned(), Value::String(command.to_owned()));
-        ctx.ask(
-            TOOL_ID,
-            PermissionAsk {
-                permission: TOOL_ID.to_owned(),
-                patterns: resources
+        if let Some((reason, target)) = risk_confirmation {
+            metadata.insert("reason".to_owned(), Value::String(reason.clone()));
+            if let Some(target) = target {
+                metadata.insert("target".to_owned(), Value::String(target.clone()));
+            }
+        }
+        let ask = PermissionAsk {
+            permission: TOOL_ID.to_owned(),
+            patterns: if resources.is_empty() {
+                vec![command.to_owned()]
+            } else {
+                resources
                     .iter()
                     .map(|resource| resource.source.clone())
-                    .collect(),
-                metadata,
-                always: resources
-                    .iter()
-                    .map(|resource| resource.always.clone())
-                    .collect(),
-                ..PermissionAsk::default()
+                    .collect()
             },
-        )
-        .await
+            metadata,
+            always: resources
+                .iter()
+                .map(|resource| resource.always.clone())
+                .collect(),
+            ..PermissionAsk::default()
+        };
+        let ask = if risk_confirmation.is_some() {
+            ask.require_manual()
+        } else {
+            ask
+        };
+        ctx.ask(TOOL_ID, ask).await
     }
 
     async fn environment(

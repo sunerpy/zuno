@@ -19,7 +19,7 @@ use zuno_engine::r#loop::{
     project_history_owned, retained_history, run_turn,
 };
 use zuno_engine::prompt::PromptAssembly;
-use zuno_engine::status::SessionRunRegistry;
+use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_error::ProviderError;
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role, StreamEvent};
@@ -638,8 +638,13 @@ fn full_turn_responses() -> Vec<ScriptedResponse> {
                 id: "call-1".to_owned(),
                 name: "echo".to_owned(),
             },
-            StreamEvent::ToolInputDelta(r#"{"text":"hello"}"#.to_owned()),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: "call-1".to_owned(),
+                delta: r#"{"text":"hello"}"#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call-1".to_owned(),
+            },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::ToolCalls),
             },
@@ -847,6 +852,352 @@ async fn loop_injects_a_durable_steer_at_the_tool_safe_point() {
     assert_eq!(provider.requests().len(), 2);
 }
 
+async fn collect_and_steer_hanging_provider(
+    mut receiver: mpsc::Receiver<TurnEvent>,
+    inbox: SessionInbox,
+    control: SessionControl,
+) -> Vec<TurnEvent> {
+    let mut events = Vec::new();
+    let mut steered = false;
+    while let Some(event) = receiver.recv().await {
+        if !steered
+            && matches!(
+                &event,
+                TurnEvent::Provider {
+                    event: StreamEvent::TextDelta(text),
+                    ..
+                } if text == "partial before steer"
+            )
+        {
+            inbox
+                .admit(NewSessionInput::new(
+                    "msg_live_steer",
+                    SESSION_ID,
+                    json!({"kind": "user", "prompt": {"text": "change direction now"}}),
+                    InputDelivery::Steer,
+                    11,
+                ))
+                .expect("admit live steer");
+            control
+                .queue_soft_interrupt(SoftInterruptMessage {
+                    input_id: Some("msg_live_steer".to_owned()),
+                    content: "change direction now".to_owned(),
+                    images: Vec::new(),
+                    urgent: false,
+                    source: SoftInterruptSource::User,
+                })
+                .expect("wake the active turn");
+            steered = true;
+        }
+        events.push(event);
+    }
+    assert!(steered, "the provider never produced the steering trigger");
+    events
+}
+
+#[tokio::test]
+async fn loop_live_steer_wakes_a_hanging_provider_and_restarts_with_the_new_input() {
+    let pool = Arc::new(
+        Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared in-memory loop pool"),
+    );
+    {
+        let mut connection = pool.get().expect("seed connection");
+        migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-loop', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('{SESSION_ID}', 'project-loop', 'loop', '/workspace', 'loop', '1', 1, 1);"
+            ))
+            .expect("seed project and session");
+    }
+    let mut connection = pool.get().expect("turn connection");
+    put_user(&connection, "msg_user", 10, "start the long answer");
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    let run_registry = SessionRunRegistry::new();
+    let control = run_registry.control(SESSION_ID);
+    let guard = run_registry.begin_turn(SESSION_ID).expect("live turn");
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::hanging(vec![StreamEvent::TextDelta(
+            "partial before steer".to_owned(),
+        )]),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("answer after steer".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-live-steer"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            guard.interrupt_signal(),
+        )
+        .with_live_inputs(&guard, &inbox),
+        sender,
+    );
+    let collector = collect_and_steer_hanging_provider(receiver, inbox.clone(), control);
+    let (outcome, events) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(turn, collector)
+    })
+    .await
+    .expect("a live steer must wake the hanging provider");
+
+    assert!(matches!(
+        outcome.expect("steered turn succeeds"),
+        TurnOutcome::Completed { steps: 2, .. }
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(TurnEvent::TurnCompleted { steps: 2, .. })
+    ));
+    assert!(inbox.pending(SESSION_ID).expect("pending inbox").is_empty());
+    assert_eq!(provider.requests().len(), 2);
+
+    let hydrated = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate live-steered turn");
+    let steer = hydrated
+        .iter()
+        .find(|message| message.info.id == "msg_live_steer")
+        .expect("live steer became a logged user message");
+    assert_eq!(steer.parts[0].data["text"], "change direction now");
+    let partial = hydrated
+        .iter()
+        .find(|message| message.info.id == "msg_turn-live-steer_0001")
+        .expect("partial assistant was checkpointed before steering");
+    assert_eq!(partial.info.data["finish"], "steer");
+    assert!(
+        partial.info.data.get("error").is_none(),
+        "steering is not a hard turn abort"
+    );
+}
+
+async fn collect_and_interrupt_retry_backoff(
+    mut receiver: mpsc::Receiver<TurnEvent>,
+    interrupt: InterruptSignal,
+) -> (Vec<TurnEvent>, Duration) {
+    let mut events = Vec::new();
+    let mut fired_at = None;
+    while let Some(event) = receiver.recv().await {
+        if fired_at.is_none()
+            && matches!(
+                &event,
+                TurnEvent::Provider {
+                    event: StreamEvent::RetryRollback { .. },
+                    ..
+                }
+            )
+        {
+            fired_at = Some(Instant::now());
+            interrupt.fire();
+        }
+        events.push(event);
+    }
+    let elapsed = fired_at
+        .expect("the retry rollback fires the interrupt")
+        .elapsed();
+    (events, elapsed)
+}
+
+#[tokio::test]
+async fn loop_hard_interrupt_wakes_provider_retry_backoff_without_replaying() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_retry_interrupt", 10, "retry slowly");
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::failed(
+            Vec::new(),
+            ProviderError::Transient {
+                status: Some(503),
+                source: None,
+            },
+        ),
+        ScriptedResponse::hanging(Vec::new()),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-retry-interrupt"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let collector = collect_and_interrupt_retry_backoff(receiver, interrupt.clone());
+    let (outcome, (events, elapsed)) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(turn, collector)
+    })
+    .await
+    .expect("hard interrupt must wake provider retry backoff");
+
+    assert!(matches!(
+        outcome.expect("interrupt is a normal turn outcome"),
+        TurnOutcome::Interrupted { steps: 1, .. }
+    ));
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "retry backoff ignored hard cancellation for {elapsed:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(TurnEvent::TurnInterrupted { steps: 1, .. })
+    ));
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "cancellation started another provider attempt before stopping"
+    );
+}
+
+async fn collect_and_steer_retry_backoff(
+    mut receiver: mpsc::Receiver<TurnEvent>,
+    inbox: SessionInbox,
+    control: SessionControl,
+) -> (Vec<TurnEvent>, Duration) {
+    let mut events = Vec::new();
+    let mut fired_at = None;
+    while let Some(event) = receiver.recv().await {
+        if fired_at.is_none()
+            && matches!(
+                &event,
+                TurnEvent::Provider {
+                    event: StreamEvent::RetryRollback { .. },
+                    ..
+                }
+            )
+        {
+            inbox
+                .admit(NewSessionInput::new(
+                    "msg_retry_steer",
+                    SESSION_ID,
+                    json!({"kind": "user", "prompt": {"text": "do this instead"}}),
+                    InputDelivery::Steer,
+                    11,
+                ))
+                .expect("admit retry steer");
+            fired_at = Some(Instant::now());
+            control
+                .queue_soft_interrupt(SoftInterruptMessage {
+                    input_id: Some("msg_retry_steer".to_owned()),
+                    content: "do this instead".to_owned(),
+                    images: Vec::new(),
+                    urgent: false,
+                    source: SoftInterruptSource::User,
+                })
+                .expect("wake retry backoff");
+        }
+        events.push(event);
+    }
+    let elapsed = fired_at
+        .expect("the retry rollback queues the steer")
+        .elapsed();
+    (events, elapsed)
+}
+
+#[tokio::test]
+async fn loop_live_steer_wakes_provider_retry_backoff_without_replaying_stale_input() {
+    let pool = Arc::new(
+        Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared in-memory loop pool"),
+    );
+    {
+        let mut connection = pool.get().expect("seed connection");
+        migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-loop', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('{SESSION_ID}', 'project-loop', 'loop', '/workspace', 'loop', '1', 1, 1);"
+            ))
+            .expect("seed project and session");
+    }
+    let mut connection = pool.get().expect("turn connection");
+    put_user(&connection, "msg_user", 10, "use the stale direction");
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    let run_registry = SessionRunRegistry::new();
+    let control = run_registry.control(SESSION_ID);
+    let guard = run_registry.begin_turn(SESSION_ID).expect("live turn");
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::failed(
+            Vec::new(),
+            ProviderError::Transient {
+                status: Some(503),
+                source: None,
+            },
+        ),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("new direction complete".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-retry-steer"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            guard.interrupt_signal(),
+        )
+        .with_live_inputs(&guard, &inbox),
+        sender,
+    );
+    let collector = collect_and_steer_retry_backoff(receiver, inbox.clone(), control);
+    let (outcome, (_events, elapsed)) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(turn, collector)
+    })
+    .await
+    .expect("live steer must wake provider retry backoff");
+
+    assert!(matches!(
+        outcome.expect("steered turn succeeds"),
+        TurnOutcome::Completed { steps: 2, .. }
+    ));
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "retry backoff ignored live steering for {elapsed:?}"
+    );
+    assert!(inbox.pending(SESSION_ID).expect("pending inbox").is_empty());
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "the stale provider request was replayed before the steered step"
+    );
+    let hydrated = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate retry-steered turn");
+    assert!(hydrated.iter().any(|message| {
+        message.info.id == "msg_retry_steer" && message.parts[0].data["text"] == "do this instead"
+    }));
+}
+
 fn expected_full_turn_events() -> Vec<TurnEvent> {
     vec![
         TurnEvent::TurnStarted {
@@ -887,11 +1238,16 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
         },
         TurnEvent::Provider {
             step: 1,
-            event: StreamEvent::ToolInputDelta(r#"{"text":"hello"}"#.to_owned()),
+            event: StreamEvent::ToolInputDelta {
+                id: "call-1".to_owned(),
+                delta: r#"{"text":"hello"}"#.to_owned(),
+            },
         },
         TurnEvent::Provider {
             step: 1,
-            event: StreamEvent::ToolUseEnd,
+            event: StreamEvent::ToolUseEnd {
+                id: "call-1".to_owned(),
+            },
         },
         TurnEvent::Provider {
             step: 1,
@@ -1022,6 +1378,86 @@ async fn loop_full_turn_emits_the_exact_sequence_deterministically() {
 }
 
 #[tokio::test]
+async fn loop_accepts_interleaved_parallel_tool_streams_and_dispatches_in_model_order() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_parallel_user", 10, "run two tools");
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::complete(vec![
+            StreamEvent::ToolUseStart {
+                id: "call-a".to_owned(),
+                name: "echo".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "call-b".to_owned(),
+                name: "echo".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call-b".to_owned(),
+                delta: r#"{"text":"second"}"#.to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call-a".to_owned(),
+                delta: r#"{"text":"first"}"#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call-b".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call-a".to_owned(),
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+        ]),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("done".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-parallel"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 2, .. })
+    ));
+    let calls = dispatcher.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].call.id, "call-a");
+    assert_eq!(calls[0].call.input, json!({ "text": "first" }));
+    assert_eq!(calls[1].call.id, "call-b");
+    assert_eq!(calls[1].call.input, json!({ "text": "second" }));
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::ToolDispatchStarted { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["call-a", "call-b"]
+    );
+}
+
+#[tokio::test]
 async fn loop_rejects_a_completed_assistant_message_with_zero_parts() {
     let mut connection = seeded();
     put_user(
@@ -1090,8 +1526,13 @@ async fn loop_accepts_a_tool_only_assistant_step_as_non_empty() {
                 id: "call-tool-only".to_owned(),
                 name: "echo".to_owned(),
             },
-            StreamEvent::ToolInputDelta(r#"{"text":"hello"}"#.to_owned()),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: "call-tool-only".to_owned(),
+                delta: r#"{"text":"hello"}"#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call-tool-only".to_owned(),
+            },
             StreamEvent::MessageEnd {
                 stop_reason: Some(FinishReason::ToolCalls),
             },
@@ -1259,6 +1700,94 @@ async fn loop_provider_retry_is_bounded_and_surfaces_the_final_transient_failure
         })
         .count();
     assert_eq!(rollbacks, 2);
+}
+
+#[tokio::test]
+async fn loop_checkpoints_partial_reasoning_and_tools_when_stream_processing_fails() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_partial_failure_user", 10, "start a tool");
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::failed(
+        vec![
+            StreamEvent::ReasoningStart,
+            StreamEvent::ReasoningDelta("checking".to_owned()),
+            StreamEvent::ToolUseStart {
+                id: "call-partial".to_owned(),
+                name: "echo".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call-partial".to_owned(),
+                delta: r#"{"text":"unfinished"#.to_owned(),
+            },
+        ],
+        ProviderError::Transient {
+            status: None,
+            source: None,
+        },
+    )]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-partial-failure"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Err(TurnError::Provider(ProviderError::Transient {
+            status: None,
+            ..
+        }))
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnEvent::AssistantCheckpointed {
+            message_id,
+            interrupted: false,
+            ..
+        } if message_id == "msg_turn-partial-failure_0001"
+    )));
+    assert!(
+        dispatcher.calls().is_empty(),
+        "partial tools must not execute"
+    );
+
+    let assistant = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate failed assistant")
+        .into_iter()
+        .find(|message| message.info.id == "msg_turn-partial-failure_0001")
+        .expect("failed assistant checkpoint");
+    assert_eq!(assistant.info.data["error"]["name"], "provider");
+    assert_eq!(assistant.info.data["finish"], "error");
+    assert!(
+        assistant
+            .parts
+            .iter()
+            .any(|part| { part.kind == PartKind::Reasoning && part.data["text"] == "checking" })
+    );
+    let tool = assistant
+        .parts
+        .iter()
+        .find(|part| part.kind == PartKind::Tool)
+        .expect("partial tool was durably closed");
+    assert_eq!(tool.data["callID"], "call-partial");
+    assert_eq!(tool.data["state"]["status"], "error");
+    assert_eq!(
+        tool.data["state"]["error"],
+        "[Tool execution skipped because the turn failed]"
+    );
 }
 
 #[tokio::test]
@@ -1746,6 +2275,10 @@ async fn loop_mid_stream_interrupt_finishes_within_100ms_and_checkpoints_db() {
         .expect("partial text was checkpointed");
     assert_eq!(text.data["text"], "partial checkpoint");
     assert_eq!(assistant.info.data["error"]["name"], "AbortError");
+    assert_eq!(
+        assistant.info.data["error"]["data"]["message"],
+        zuno_engine::r#loop::INTERRUPTED_TURN_NOTICE
+    );
     assert!(assistant.info.data["time"]["completed"].is_number());
     eprintln!(
         "INTERRUPT_QA elapsed={elapsed:?} db_message={:#?} db_parts={:#?}",

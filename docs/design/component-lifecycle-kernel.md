@@ -132,9 +132,9 @@ The following registrations must be acquired through an `EffectScope` adapter:
 | Typed service | Remove before stopping dependent activity |
 | Tool/provider/hook/route registration | Remove exact registration handle |
 | Tokio task | Cancel and await `JoinHandle` |
-| Process tree | Request guard shutdown, let it settle the contained group, then reap the guard |
+| Guarded process tree | Request guard shutdown, let it settle the contained group, then reap the guard |
 | Watcher/subscription | Unregister listener before producer shutdown |
-| MCP connection | Close protocol session, then request and reap the local guard |
+| Local MCP connection | Close protocol session, terminate and reap its direct process group; no helper process is registered |
 | LSP manager | Send shutdown, request guard shutdown, and reap all children |
 | Background job supervisor | Cancel or settle according to job policy, then join |
 

@@ -6,7 +6,10 @@ use crate::app::render_offscreen;
 use crate::views::dialog::{DialogHost, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press as key, rows};
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use serde_json::json;
 
 fn request(permission: &str) -> PermissionRequest {
@@ -60,6 +63,29 @@ fn views_permission_prompt_resolves_to_once() {
             reply: ReplyKind::Once,
             message: None,
         }
+    );
+}
+
+#[test]
+fn views_permission_prompt_can_be_decided_with_the_mouse() {
+    let mut prompt = prompt("bash", json!({"command": "ls -la"}));
+    let body = Rect::new(8, 4, 60, 12);
+    let outcome = prompt.handle_mouse(
+        &MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 10,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        },
+        body,
+    );
+    assert_eq!(
+        decision(match outcome {
+            DialogStep::Resolved(outcome) => outcome,
+            other => panic!("mouse did not resolve permission: {other:?}"),
+        })
+        .reply,
+        ReplyKind::Once
     );
 }
 

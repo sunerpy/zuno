@@ -154,6 +154,30 @@ pub const BUILTIN_ORDER: [BuiltinSlot; 19] = [
     BuiltinSlot::Plan,
 ];
 
+/// Built-ins whose interface, implementation, and default-host consumer are complete.
+///
+/// `execute`, `lsp`, and `plan_exit` remain extension slots. The default harness must
+/// not claim them until production assembly supplies their missing configuration or
+/// host collaborator.
+pub const DEFAULT_BUILTINS: [BuiltinSlot; 16] = [
+    BuiltinSlot::Invalid,
+    BuiltinSlot::Question,
+    BuiltinSlot::Shell,
+    BuiltinSlot::Background,
+    BuiltinSlot::Read,
+    BuiltinSlot::Glob,
+    BuiltinSlot::Grep,
+    BuiltinSlot::Edit,
+    BuiltinSlot::Write,
+    BuiltinSlot::Task,
+    BuiltinSlot::Job,
+    BuiltinSlot::Fetch,
+    BuiltinSlot::Todo,
+    BuiltinSlot::Search,
+    BuiltinSlot::Skill,
+    BuiltinSlot::Patch,
+];
+
 /// Process-wide flags consulted while the registry is assembled and resolved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegistryFlags {
@@ -213,8 +237,8 @@ pub struct ToolRegistryBuilder {
 impl ToolRegistryBuilder {
     /// Start with the four file implementations that share one runtime.
     ///
-    /// Requiring [`FileTools`] here makes the model-family decision reuse
-    /// [`FileTools::exposed_for_model`] instead of copying its substring rule.
+    /// Requiring [`FileTools`] here keeps the provider-neutral file surface in one
+    /// component instead of copying tool ids across hosts.
     #[must_use]
     pub fn new(directory: impl Into<PathBuf>, file_tools: FileTools, flags: RegistryFlags) -> Self {
         let mut builtins = BTreeMap::new();
@@ -482,7 +506,7 @@ impl ToolRegistry {
     pub fn resolve(&self, input: ResolveInput<'_>) -> Vec<Arc<dyn Tool>> {
         let exposed_file_ids: BTreeSet<String> = self
             .file_tools
-            .exposed_for_model(input.model_id)
+            .model_visible()
             .into_iter()
             .map(|tool| tool.id().to_owned())
             .collect();

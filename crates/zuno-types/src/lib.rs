@@ -221,13 +221,31 @@ pub struct TodoProjection {
     pub priority: String,
 }
 
+/// The typed subject owned by one durable background job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobSubjectProjection {
+    ChildSession {
+        session_id: String,
+    },
+    ProductAgent {
+        run_id: String,
+        product: String,
+        instance: String,
+        tool: String,
+    },
+}
+
 /// One durable background job shown by clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobProjection {
     pub id: String,
-    pub subject: String,
+    pub subject: JobSubjectProjection,
     pub status: String,
     pub report_delivery: String,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub time_created: i64,
+    pub time_completed: Option<i64>,
 }
 
 /// Frontend-neutral durable work state for one session and project.

@@ -16,8 +16,9 @@ durable review workflow before it becomes resident prompt content.
   server, ACP, and GUI surfaces.
 
 Foreground turns and reflection use the same proposal tool. Reflection receives
-only an owned durable transcript and one whitelisted tool; it cannot invoke shell,
-edit files, delegate, ask questions, or change foreground state.
+only an owned durable transcript, the current resident-memory snapshot, and one
+whitelisted tool; it cannot invoke shell, edit files, delegate, ask questions, or
+change foreground state.
 
 ## Candidate record
 
@@ -66,16 +67,41 @@ manual reconciliation.
 ## Reflection
 
 Reflection runs only after a final response is delivered. Periodic review uses
-`nudge_interval`; a verified non-trivial recovery may trigger review earlier.
+`nudge_interval`; the count is a durable, per-session sequence of delivered
+assistant messages, so rebuilding the host or restarting Zuno does not reset it.
+A verified non-trivial recovery may trigger review earlier. An interrupted turn
+does not enter the sequence. A negative-learning turn advances the durable count
+but is never sent to the reviewer.
+
+Admission and execution are separate durable records. The source message is
+admitted at most once, and a selected review creates a leased
+`memory_reflection_job`. On restart an expired running job becomes `uncertain`;
+Zuno never replays it because the prior model request may already have proposed or
+applied a candidate.
+
 The model must be an explicitly configured reachable `small_model`. If it is
 absent or unavailable, Zuno reports that reflection is disabled and does not fall
 back to the session model.
 
 Before the request, Zuno persists `memory.reflection.request` with the exact
-prompt, digest, replayed transcript, model identity, compaction mode, and tool
-schema. Completion or every terminal failure writes
+prompt, digest, replayed transcript, resident-memory snapshot, model identity,
+compaction mode, and tool schema. Completion or every terminal failure writes
 `memory.reflection.outcome`. Truncated streams, malformed tool JSON, denied tool
 names, and proposal failures therefore remain inspectable.
+
+The canonical reviewer instructions live in
+`crates/zuno-agent/src/reflection.rs::reflection_prompt`. They require comparison
+with current memory, prefer `replace` over a near-duplicate `add`, and permit
+`remove` only when the completed turn invalidates an existing entry. Embedded
+resident strings are JSON reference data, not executable instructions.
+
+This adapts Codex's extraction-and-consolidation split without granting a model
+direct ownership of a memory workspace. Zuno performs extraction and
+consolidation through the same atomic candidate state machine: every add,
+replacement, or removal remains attributable, reviewable, deduplicated by source
+and fingerprint, and undoable. `automatic` promotion can therefore organize
+resident memory automatically while still using the same safety and recovery
+boundary.
 
 ## Safety and user control
 

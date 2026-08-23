@@ -19,7 +19,7 @@ use zuno_db::event_log::SessionEventLog;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
 use zuno_db::session::SessionCreate;
 use zuno_engine::r#loop::TurnEventSender;
-use zuno_engine::status::SessionStatus;
+use zuno_engine::status::{AbortDisposition, SessionStatus};
 use zuno_paths::DbLocation;
 use zuno_permission::ReplyKind;
 use zuno_pty::{CreateInput, PtyId, TicketScope};
@@ -1339,7 +1339,7 @@ async fn api_busy_steer_is_durable_and_runs_after_the_active_prompt() {
         1
     );
 
-    assert!(services.runs.abort("ses_queued"));
+    assert_eq!(services.runs.abort("ses_queued"), AbortDisposition::Active);
     executor.wait_until_prompt_count(2).await;
     assert_eq!(
         executor
@@ -1355,7 +1355,7 @@ async fn api_busy_steer_is_durable_and_runs_after_the_active_prompt() {
             .expect("drained inbox reads")
             .is_empty()
     );
-    assert!(services.runs.abort("ses_queued"));
+    assert_eq!(services.runs.abort("ses_queued"), AbortDisposition::Active);
     services.runs.wait_until_idle("ses_queued").await;
 }
 
@@ -1401,7 +1401,7 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
     executor.wait_until_prompt_count(1).await;
     assert_eq!(executor.prompts()[0].message_id, "input_report");
     assert_eq!(executor.prompts()[0].prompt, "background result");
-    assert!(services.runs.abort("ses_report"));
+    assert_eq!(services.runs.abort("ses_report"), AbortDisposition::Active);
     executor.wait_until_prompt_count(2).await;
     assert_eq!(
         executor
@@ -1414,7 +1414,7 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
             ("msg_user".to_owned(), "user input".to_owned())
         ]
     );
-    assert!(services.runs.abort("ses_report"));
+    assert_eq!(services.runs.abort("ses_report"), AbortDisposition::Active);
     services.runs.wait_until_idle("ses_report").await;
 }
 
@@ -1454,7 +1454,10 @@ async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the
     executor.wait_until_prompt_count(1).await;
     assert_eq!(executor.prompts()[0].message_id, "msg_user");
     assert_eq!(executor.prompts()[0].prompt, "user input");
-    assert!(services.runs.abort("ses_malformed"));
+    assert_eq!(
+        services.runs.abort("ses_malformed"),
+        AbortDisposition::Active
+    );
     services.runs.wait_until_idle("ses_malformed").await;
 }
 

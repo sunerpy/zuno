@@ -932,7 +932,7 @@ impl GeminiStreamDecoder {
             let id = format!("tool_{}", self.next_tool_call_id);
             self.next_tool_call_id += 1;
             output.push(StreamEvent::ToolUseStart {
-                id,
+                id: id.clone(),
                 name: call.name,
             });
             let input = serde_json::to_string(&call.args).map_err(|source| {
@@ -948,13 +948,17 @@ impl GeminiStreamDecoder {
                 &self.model,
                 self.parser.limits().max_tool_input_bytes(),
             )?;
-            output.push(StreamEvent::ToolInputDelta(input));
+            output.push(StreamEvent::ToolInputDelta {
+                id: id.clone(),
+                delta: input,
+            });
             if let Some(signature) = part.thought_signature {
-                output.push(StreamEvent::ToolUseSignature(ThoughtSignature::new(
-                    signature,
-                )));
+                output.push(StreamEvent::ToolUseSignature {
+                    id: id.clone(),
+                    signature: ThoughtSignature::new(signature),
+                });
             }
-            output.push(StreamEvent::ToolUseEnd);
+            output.push(StreamEvent::ToolUseEnd { id });
             self.has_tool_calls = true;
         }
         Ok(())
@@ -1400,10 +1404,10 @@ pub struct AnthropicStreamDecoder {
     message_ended: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum AnthropicBlockKind {
     Text,
-    Tool,
+    Tool { id: String },
     Thinking,
 }
 
@@ -1476,13 +1480,15 @@ impl AnthropicStreamDecoder {
         let block = &value["content_block"];
         match block.get("type").and_then(Value::as_str) {
             Some("tool_use") => {
-                self.blocks.insert(index, AnthropicBlockKind::Tool);
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                self.blocks
+                    .insert(index, AnthropicBlockKind::Tool { id: id.clone() });
                 output.push(StreamEvent::ToolUseStart {
-                    id: block
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
+                    id,
                     name: block
                         .get("name")
                         .and_then(Value::as_str)
@@ -1510,7 +1516,15 @@ impl AnthropicStreamDecoder {
             }
             Some("input_json_delta") => {
                 if let Some(json) = delta.get("partial_json").and_then(Value::as_str) {
-                    output.push(StreamEvent::ToolInputDelta(json.to_owned()));
+                    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let id = match self.blocks.get(&index) {
+                        Some(AnthropicBlockKind::Tool { id }) => id.clone(),
+                        _ => String::new(),
+                    };
+                    output.push(StreamEvent::ToolInputDelta {
+                        id,
+                        delta: json.to_owned(),
+                    });
                 }
             }
             Some("thinking_delta") => {
@@ -1530,7 +1544,9 @@ impl AnthropicStreamDecoder {
     fn stop_block(&mut self, value: &Value, output: &mut Vec<StreamEvent>) {
         let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
         match self.blocks.remove(&index) {
-            Some(AnthropicBlockKind::Tool) => output.push(StreamEvent::ToolUseEnd),
+            Some(AnthropicBlockKind::Tool { id }) => {
+                output.push(StreamEvent::ToolUseEnd { id });
+            }
             Some(AnthropicBlockKind::Thinking) => output.push(StreamEvent::ReasoningEnd),
             Some(AnthropicBlockKind::Text) | None => {}
         }

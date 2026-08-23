@@ -122,12 +122,22 @@ fn gemini_request_and_stream_replay_the_real_tool_call_cassette() {
         events.as_slice(),
         [
             StreamEvent::ToolUseStart { name, .. },
-            StreamEvent::ToolInputDelta(input),
-            StreamEvent::ToolUseSignature(_),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: input_id,
+                delta: input,
+            },
+            StreamEvent::ToolUseSignature {
+                id: signature_id,
+                ..
+            },
+            StreamEvent::ToolUseEnd { id: end_id },
             StreamEvent::TokenUsage { .. },
             StreamEvent::MessageEnd { .. }
-        ] if name == "get_weather" && input == r#"{"city":"Paris"}"#
+        ] if name == "get_weather"
+            && input_id == "tool_0"
+            && signature_id == input_id
+            && end_id == input_id
+            && input == r#"{"city":"Paris"}"#
     ));
 }
 
@@ -162,7 +172,7 @@ fn captured_tool_thought_signature_is_replayed_byte_identically_next_turn() {
         events
             .iter()
             .find_map(|event| match event {
-                StreamEvent::ToolInputDelta(input) => Some(input.as_str()),
+                StreamEvent::ToolInputDelta { delta, .. } => Some(delta.as_str()),
                 _ => None,
             })
             .expect("tool input"),
@@ -171,7 +181,7 @@ fn captured_tool_thought_signature_is_replayed_byte_identically_next_turn() {
     let captured = events
         .iter()
         .find_map(|event| match event {
-            StreamEvent::ToolUseSignature(signature) => Some(signature.clone()),
+            StreamEvent::ToolUseSignature { signature, .. } => Some(signature.clone()),
             _ => None,
         })
         .expect("the real response carries a thought signature");

@@ -11,7 +11,7 @@ use crate::keybind::ActionComponent;
 use crate::views::dialog::{DialogHost, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 
 fn host() -> (DialogHost, ViewContext) {
     let context = ViewContext::defaults();
@@ -180,6 +180,25 @@ fn views_status_panel_scrolls_to_a_group_below_the_first_screenful() {
         after.contains("LSP servers"),
         "paging down never reached the last group:\n{after}"
     );
+}
+
+#[test]
+fn views_status_and_debug_panels_scroll_with_the_mouse_wheel() {
+    let event = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 5,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    let body = ratatui::layout::Rect::new(0, 0, 100, 20);
+
+    let mut status = StatusPanel::new(ViewContext::defaults(), census());
+    assert_eq!(status.handle_mouse(&event, body), DialogStep::Redraw);
+    assert_eq!(status.offset, 1);
+
+    let mut debug = DebugPanel::new(ViewContext::defaults(), facts());
+    assert_eq!(debug.handle_mouse(&event, body), DialogStep::Redraw);
+    assert_eq!(debug.offset, 1);
 }
 
 #[test]

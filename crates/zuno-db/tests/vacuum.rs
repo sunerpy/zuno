@@ -505,6 +505,8 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "event",
             "event_sequence",
             "memory_candidate",
+            "memory_reflection_delivery",
+            "memory_reflection_job",
             "message",
             "part",
             "permission",

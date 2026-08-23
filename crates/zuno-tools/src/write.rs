@@ -1,6 +1,6 @@
 use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
-    report_diff, report_formatting, write_with_dirs,
+    report_diff, report_formatting, report_post_write_warnings, uncertain, write_with_dirs,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -87,34 +87,55 @@ impl TypedTool for WriteTool {
         let (content, new_bom) = split_bom(&params.content);
         let bytes = encode_text(content, old_bom || new_bom);
         write_with_dirs(&target.canonical, &bytes).map_err(|error| failed("write", error))?;
-        check_interrupt("write", &ctx)?;
+        let applied = vec![target.canonical.clone()];
+        let mut warnings = Vec::new();
+        if ctx.is_interrupted() {
+            warnings.push(
+                "The file was written before cancellation; formatting was skipped.".to_owned(),
+            );
+        }
         // Past this point the write has landed, so nothing a formatter does may
         // turn into an `Err` from this tool.
-        let outcome = self
-            .runtime
-            .formatter
-            .format_reporting(&target.canonical)
-            .await
-            .map_err(|error| failed("write", error))?;
-        let final_bytes =
-            std::fs::read(&target.canonical).map_err(|error| failed("write", error))?;
+        let outcome = if ctx.is_interrupted() {
+            Default::default()
+        } else {
+            match self
+                .runtime
+                .formatter
+                .format_reporting(&target.canonical)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    warnings.push(format!(
+                        "The file was written, but the formatter service failed: {error}"
+                    ));
+                    Default::default()
+                }
+            }
+        };
+        let final_bytes = std::fs::read(&target.canonical)
+            .map_err(|error| uncertain("write", &applied, error))?;
         self.runtime
             .state
             .record_write(&ctx.session_id, &target.canonical, &final_bytes);
 
         let label = self.runtime.title(&target);
-        Ok(report_formatting(
-            report_diff(
-                ToolOutput::text(label.clone(), "Wrote file successfully.")
-                    .with_metadata("filepath", json!(target.canonical))
-                    .with_metadata("exists", json!(existing.is_some()))
-                    .with_metadata("formatted", outcome.changed)
-                    .with_written_path(&target.canonical),
-                &label,
-                existing.as_deref().unwrap_or_default(),
-                &final_bytes,
+        Ok(report_post_write_warnings(
+            report_formatting(
+                report_diff(
+                    ToolOutput::text(label.clone(), "Wrote file successfully.")
+                        .with_metadata("filepath", json!(target.canonical))
+                        .with_metadata("exists", json!(existing.is_some()))
+                        .with_metadata("formatted", outcome.changed)
+                        .with_written_path(&target.canonical),
+                    &label,
+                    existing.as_deref().unwrap_or_default(),
+                    &final_bytes,
+                ),
+                &outcome.failures,
             ),
-            &outcome.failures,
+            &warnings,
         ))
     }
 }

@@ -141,17 +141,36 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             );
         };
         let replay_policy = tool.replay_policy();
+        let interrupt = request.interrupt.clone();
+        if interrupt.is_set() {
+            return observed_ready(
+                observation,
+                error_result(
+                    resolved_name,
+                    format!("Tool `{resolved_name}` was interrupted before it started."),
+                ),
+            );
+        }
 
-        if let Err(error) = self
-            .hooks
-            .before(
+        let before = tokio::select! {
+            biased;
+            () = interrupt.notified() => {
+                return observed_ready(
+                    observation,
+                    error_result(
+                        resolved_name,
+                        format!("Tool `{resolved_name}` was interrupted before it started."),
+                    ),
+                );
+            }
+            result = self.hooks.before(
                 resolved_name,
                 &request.session_id,
                 &request.call.id,
                 &mut request.call.input,
-            )
-            .await
-        {
+            ) => result,
+        };
+        if let Err(error) = before {
             return observed_ready(observation, error_result(resolved_name, error));
         }
 
@@ -191,7 +210,19 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                 call_id: request.call.id.clone(),
             }),
         );
-        let plugin_permission = match self.hooks.permission(&permission_request).await {
+        let plugin_permission = match tokio::select! {
+            biased;
+            () = interrupt.notified() => {
+                return observed_ready(
+                    observation,
+                    error_result(
+                        resolved_name,
+                        format!("Tool `{resolved_name}` was interrupted before permission."),
+                    ),
+                );
+            }
+            result = self.hooks.permission(&permission_request) => result,
+        } {
             Ok(decision) => decision,
             Err(error) => {
                 return observed_ready(observation, error_result(resolved_name, error));
@@ -212,14 +243,26 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             Arc::clone(&self.approval),
             self.authorization,
         ));
-        if let Err(error) = permission.gate(resolved_name, ask, plugin_permission).await {
+        let gate = tokio::select! {
+            biased;
+            () = interrupt.notified() => {
+                return observed_ready(
+                    observation,
+                    error_result(
+                        resolved_name,
+                        format!("Tool `{resolved_name}` was interrupted before permission."),
+                    ),
+                );
+            }
+            result = permission.gate(resolved_name, ask, plugin_permission) => result,
+        };
+        if let Err(error) = gate {
             return observed_ready(
                 observation,
                 tool_error_result(resolved_name, replay_policy, &error),
             );
         }
 
-        let interrupt = request.interrupt.clone();
         let permission: Arc<dyn PermissionAsker> = permission;
         let context = ToolContext::new(
             request.session_id.clone(),
@@ -727,10 +770,16 @@ fn tool_error_result(
             zuno_error::ToolError::NotFound { .. } => Some(ToolBlockKind::Unavailable),
             zuno_error::ToolError::Timeout { .. }
             | zuno_error::ToolError::Transient { .. }
-            | zuno_error::ToolError::Failed { .. } => None,
+            | zuno_error::ToolError::Failed { .. }
+            | zuno_error::ToolError::Uncertain { .. } => None,
         };
         if let Some(kind) = blocked {
             return blocked_result(tool, message, kind);
+        }
+        if matches!(error, zuno_error::ToolError::Uncertain { .. }) {
+            message.push_str(
+                "\n\nRecovery: this call changed authoritative state before losing its final outcome. Inspect the listed paths and continue from what is actually on disk; do not replay the call mechanically.",
+            );
         }
         return error_result(tool, message);
     }

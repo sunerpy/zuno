@@ -329,6 +329,16 @@ fn event_json(event: TurnEvent) -> Value {
             assistant_message_id,
             steps,
         } => json!({"type":"turn_interrupted","messageID":assistant_message_id,"steps":steps}),
+        TurnEvent::TurnFailed {
+            assistant_message_id,
+            steps,
+            message,
+        } => json!({
+            "type":"turn_failed",
+            "messageID":assistant_message_id,
+            "steps":steps,
+            "message":message
+        }),
     }
 }
 
@@ -338,12 +348,14 @@ fn stream_event_json(step: u32, event: StreamEvent) -> Value {
         StreamEvent::ToolUseStart { id, name } => {
             json!({"type":"tool_use_start","step":step,"id":id,"name":name})
         }
-        StreamEvent::ToolInputDelta(delta) => {
-            json!({"type":"tool_input_delta","step":step,"delta":delta})
+        StreamEvent::ToolInputDelta { id, delta } => {
+            json!({"type":"tool_input_delta","step":step,"id":id,"delta":delta})
         }
-        StreamEvent::ToolUseEnd => json!({"type":"tool_use_end","step":step}),
-        StreamEvent::ToolUseSignature(signature) => {
-            json!({"type":"tool_use_signature","step":step,"signature":format!("{signature:?}")})
+        StreamEvent::ToolUseEnd { id } => {
+            json!({"type":"tool_use_end","step":step,"id":id})
+        }
+        StreamEvent::ToolUseSignature { id, signature } => {
+            json!({"type":"tool_use_signature","step":step,"id":id,"signature":format!("{signature:?}")})
         }
         StreamEvent::ToolResult {
             tool_use_id,

@@ -180,6 +180,28 @@ fn strict_authorization_defaults_off_and_can_be_enabled() {
 }
 
 #[test]
+fn compaction_threshold_percent_is_typed_and_bounded() {
+    let config = parse(r#"{"compaction":{"auto":true,"threshold_percent":80}}"#)
+        .expect("bounded compaction threshold parses");
+    assert_eq!(
+        config
+            .compaction
+            .as_ref()
+            .and_then(|compaction| compaction.threshold_percent)
+            .map(CompactionThresholdPercent::get),
+        Some(80)
+    );
+
+    for value in [0, 101] {
+        let error = parse(&format!(
+            r#"{{"compaction":{{"threshold_percent":{value}}}}}"#
+        ))
+        .expect_err("compaction percentage outside 1..=100 must fail");
+        assert_eq!(issue_path(&error), "compaction.threshold_percent");
+    }
+}
+
+#[test]
 fn authorization_rejects_unknown_nested_keys() {
     let error = parse(r#"{"authorization":{"strict":true,"remember":true}}"#)
         .expect_err("authorization must not silently ignore unknown policy");

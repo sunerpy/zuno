@@ -107,7 +107,7 @@ impl PreparedContinuation {
 #[derive(Debug)]
 pub enum ContinuationAttempt {
     /// All guards passed and the caller may run the prepared turn.
-    Prepared(PreparedContinuation),
+    Prepared(Box<PreparedContinuation>),
     /// A named guard suppressed automatic work.
     Suppressed(ContinuationSuppression),
 }
@@ -289,13 +289,15 @@ impl GoalContinuation {
                 ));
             }
         };
-        Ok(ContinuationAttempt::Prepared(PreparedContinuation {
-            session_id: goal.session_id.clone(),
-            goal_id: goal.goal_id.clone(),
-            entry: goal_entry(goal, retry.as_ref()),
-            run_guard,
-            _start_slot: start_slot,
-        }))
+        Ok(ContinuationAttempt::Prepared(Box::new(
+            PreparedContinuation {
+                session_id: goal.session_id.clone(),
+                goal_id: goal.goal_id.clone(),
+                entry: goal_entry(goal, retry.as_ref()),
+                run_guard,
+                _start_slot: start_slot,
+            },
+        )))
     }
 
     /// Persist one turn's progress signal and block only at three matching turns.

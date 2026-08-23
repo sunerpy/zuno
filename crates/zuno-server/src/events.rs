@@ -300,6 +300,18 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "turn.interrupted",
             object(json!({"assistantMessageID": assistant_message_id, "steps": steps})),
         ),
+        TurnEvent::TurnFailed {
+            assistant_message_id,
+            steps,
+            message,
+        } => (
+            "turn.failed",
+            object(json!({
+                "assistantMessageID": assistant_message_id,
+                "steps": steps,
+                "message": message
+            })),
+        ),
     };
     NewEvent::new(event_type, properties).expect("fixed turn event types are valid")
 }
@@ -310,12 +322,12 @@ fn provider_event(event: &ProviderEvent) -> Value {
         ProviderEvent::ToolUseStart { id, name } => {
             json!({"type": "tool.use.start", "id": id, "name": name})
         }
-        ProviderEvent::ToolInputDelta(delta) => {
-            json!({"type": "tool.input.delta", "delta": delta})
+        ProviderEvent::ToolInputDelta { id, delta } => {
+            json!({"type": "tool.input.delta", "id": id, "delta": delta})
         }
-        ProviderEvent::ToolUseEnd => json!({"type": "tool.use.end"}),
-        ProviderEvent::ToolUseSignature(signature) => {
-            json!({"type": "tool.use.signature", "signature": signature})
+        ProviderEvent::ToolUseEnd { id } => json!({"type": "tool.use.end", "id": id}),
+        ProviderEvent::ToolUseSignature { id, signature } => {
+            json!({"type": "tool.use.signature", "id": id, "signature": signature})
         }
         ProviderEvent::ToolResult {
             tool_use_id,

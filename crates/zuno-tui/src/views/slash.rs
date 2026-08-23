@@ -66,6 +66,8 @@ pub enum SlashCommandKind {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostCommand {
+    /// Summarize older durable history and keep the recent tail verbatim.
+    Compact,
     /// Restore the worktree boundary before the most recent completed turn.
     Undo,
     /// Reapply the most recently undone turn boundary.
@@ -324,6 +326,12 @@ fn ui_commands() -> Vec<SlashCommand> {
             })
         })
         .chain([
+            SlashCommand {
+                name: "compact".to_owned(),
+                aliases: Vec::new(),
+                description: "Summarize older context and keep the recent turn tail".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Compact),
+            },
             SlashCommand {
                 name: "undo".to_owned(),
                 aliases: Vec::new(),

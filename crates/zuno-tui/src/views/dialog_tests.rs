@@ -9,7 +9,9 @@ use crate::config::ResolvedTuiConfig;
 use crate::keybind::{Chord, Keymap};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
-use crossterm::event::{Event as CrosstermEvent, KeyCode};
+use crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -81,6 +83,20 @@ fn host() -> (DialogHost, ViewContext) {
     let context = ViewContext::defaults();
     let base = ObservedBase::new(TranscriptView::new(context.clone()));
     (DialogHost::new(context.clone(), Box::new(base)), context)
+}
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> AppEvent {
+    AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })))
+}
+
+fn click(host: &mut DialogHost, column: u16, row: u16) -> EventResult {
+    host.handle_event(&mouse(MouseEventKind::Down(MouseButton::Left), column, row))
+        .merge(host.handle_event(&mouse(MouseEventKind::Up(MouseButton::Left), column, row)))
 }
 
 struct FocusedBase;
@@ -375,6 +391,107 @@ fn views_dialog_renders_over_a_live_base() {
     assert!(
         joined.contains("move") && joined.contains("select") && joined.contains("cancel"),
         "the default footer hints are missing:\n{joined}"
+    );
+}
+
+#[test]
+fn views_dialog_overlay_is_centered_vertically_instead_of_bottom_anchored() {
+    let (mut host, _) = host();
+    let (probe, _) = Probe::new("probe", "dialog body");
+    host.open(Box::new(probe));
+
+    let rendered = rows(&render_offscreen(&mut host, 80, 20).expect("infallible"));
+    let top = rendered
+        .iter()
+        .position(|row| row.contains("probe probe"))
+        .expect("dialog title");
+    let dialog_height = 3_usize;
+    let bottom_air = rendered.len().saturating_sub(top + dialog_height);
+
+    assert!(
+        top.abs_diff(bottom_air) <= 1,
+        "the overlay is not vertically centred: top={top}, bottom={bottom_air}\n{}",
+        rendered.join("\n")
+    );
+}
+
+#[test]
+fn views_dialog_mouse_click_selects_a_picker_row_and_resolves_it() {
+    let context = ViewContext::defaults();
+    let mut host = DialogHost::new(
+        context.clone(),
+        Box::new(ObservedBase::new(TranscriptView::new(context.clone()))),
+    );
+    host.open(Box::new(crate::views::picker::SelectDialog::new(
+        "mouse-picker",
+        "Actions",
+        context,
+        vec![
+            crate::views::picker::Item::new("First").valued("first"),
+            crate::views::picker::Item::new("Second").valued("second"),
+        ],
+    )));
+    let rendered = rows(&render_offscreen(&mut host, 80, 20).expect("infallible"));
+    let row = rendered
+        .iter()
+        .position(|line| line.contains("Second"))
+        .expect("second picker row");
+    let column = rendered[row].find("Second").expect("second picker column");
+
+    let result = click(
+        &mut host,
+        u16::try_from(column).expect("column"),
+        u16::try_from(row).expect("row"),
+    );
+
+    assert!(result.handled && result.redraw);
+    assert!(!host.is_open(), "the clicked picker stayed open");
+    assert_eq!(
+        host.drain_outcomes(),
+        vec![(
+            "mouse-picker",
+            DialogOutcome::Selected {
+                dialog: "mouse-picker",
+                value: String::from("second"),
+            },
+        )]
+    );
+}
+
+#[test]
+fn views_dialog_mouse_click_chooses_the_exact_confirmation_button() {
+    let context = ViewContext::defaults();
+    let mut host = DialogHost::new(
+        context.clone(),
+        Box::new(ObservedBase::new(TranscriptView::new(context.clone()))),
+    );
+    host.open(Box::new(
+        crate::views::basics::ConfirmDialog::new(
+            context,
+            "confirm.mouse",
+            "Revert",
+            "Restore the worktree?",
+        )
+        .with_labels("Restore", "Keep"),
+    ));
+    let rendered = rows(&render_offscreen(&mut host, 80, 20).expect("infallible"));
+    let row = rendered
+        .iter()
+        .position(|line| line.contains("Restore") && line.contains("Keep"))
+        .expect("confirmation buttons");
+    let column = rendered[row].find("Keep").expect("Keep button");
+
+    click(
+        &mut host,
+        u16::try_from(column).expect("column"),
+        u16::try_from(row).expect("row"),
+    );
+
+    assert!(!host.is_open(), "the clicked confirmation stayed open");
+    assert_eq!(
+        host.drain_outcomes(),
+        vec![("confirm.mouse", DialogOutcome::Cancelled)],
+        "clicking Keep confirmed the destructive action"
     );
 }
 

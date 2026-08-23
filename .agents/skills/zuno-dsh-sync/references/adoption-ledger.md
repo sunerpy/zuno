@@ -68,6 +68,14 @@ audits, cancellable questions, and durable steer-versus-next-step delivery, but
 expresses those invariants through native Rust types and concise agent/tool
 prompts. The upstream delta is still empty, so the baseline does not move.
 
+Durable memory cadence and consolidation were classified `adapt` from the pinned
+DSH reflection design and Codex's two-stage memory writer. Zuno counts delivered
+assistant messages in SQLite, leases each selected reflection as a non-replayable
+job, and supplies the exact resident snapshot to an isolated reviewer. It rejects
+direct model ownership of a mutable memory workspace: consolidation remains an
+audited, deduplicated, and undoable add/replace/remove candidate. The upstream
+delta remains empty and the baseline does not move.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

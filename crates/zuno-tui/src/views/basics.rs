@@ -45,7 +45,8 @@
 use crate::keybind::Definition;
 use crate::views::dialog::{BodyAnchor, Dialog, DialogOutcome, DialogStep, DialogWidth};
 use crate::views::{ViewContext, display_width, padded, truncate};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 #[cfg(test)]
@@ -163,6 +164,17 @@ impl ConfirmDialog {
         self.cancel_label = cancel.into();
         self
     }
+
+    fn decision(&self) -> DialogStep {
+        if self.confirm {
+            DialogStep::Resolved(DialogOutcome::Selected {
+                dialog: self.id,
+                value: String::from(CONFIRM_VALUE),
+            })
+        } else {
+            DialogStep::Resolved(DialogOutcome::Cancelled)
+        }
+    }
 }
 
 impl Dialog for ConfirmDialog {
@@ -230,22 +242,41 @@ impl Dialog for ConfirmDialog {
                 self.confirm = !self.confirm;
                 DialogStep::Redraw
             }
-            "dialog.select.submit" | "dialog.prompt.submit" => {
-                if self.confirm {
-                    DialogStep::Resolved(DialogOutcome::Selected {
-                        dialog: self.id,
-                        value: String::from(CONFIRM_VALUE),
-                    })
-                } else {
-                    DialogStep::Resolved(DialogOutcome::Cancelled)
-                }
-            }
+            "dialog.select.submit" | "dialog.prompt.submit" => self.decision(),
             // `session_interrupt` is what the table binds escape to, and `app_exit` is
             // the chord a user in a raw-mode terminal reaches for. Both leave. See
             // `picker.rs`'s identical arm: without it the host absorbs the key and the
             // footer's `esc cancel` names a way out that does not exist.
             "app_exit" | "session_interrupt" => DialogStep::Resolved(DialogOutcome::Cancelled),
             _ => DialogStep::Ignored,
+        }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.kind != MouseEventKind::Up(MouseButton::Left)
+            || event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+            || event.row + 1 != body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+
+        let column = usize::from(event.column.saturating_sub(body.left()));
+        let confirm_start = 1_usize;
+        let confirm_end = confirm_start + display_width(&format!(" {} ", self.confirm_label));
+        let cancel_start = confirm_end + 1;
+        let cancel_end = cancel_start + display_width(&format!(" {} ", self.cancel_label));
+
+        if (confirm_start..confirm_end).contains(&column) {
+            self.confirm = true;
+            self.decision()
+        } else if (cancel_start..cancel_end).contains(&column) {
+            self.confirm = false;
+            self.decision()
+        } else {
+            DialogStep::Ignored
         }
     }
 }
@@ -321,6 +352,18 @@ impl Dialog for AlertDialog {
                 DialogStep::Resolved(DialogOutcome::Cancelled)
             }
             _ => DialogStep::Ignored,
+        }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.kind == MouseEventKind::Up(MouseButton::Left)
+            && event.column >= body.left()
+            && event.column < body.right()
+            && event.row + 1 == body.bottom()
+        {
+            DialogStep::Resolved(DialogOutcome::Cancelled)
+        } else {
+            DialogStep::Ignored
         }
     }
 }

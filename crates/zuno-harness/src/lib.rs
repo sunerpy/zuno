@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use zuno_engine::driver::{AgentDriver, AgentDriverComponent, DefaultAgentDriver};
 use zuno_runtime::{Component, HarnessProfile, PrepareContext, ProfileBundle, RuntimeError};
-use zuno_tools::registry::{BUILTIN_ORDER, BuiltinSlot, CustomTool};
+use zuno_tools::registry::{BuiltinSlot, CustomTool, DEFAULT_BUILTINS};
 
 const CORE_BUNDLE_ID: &str = "zuno.core";
 const TOOL_MANIFEST_COMPONENT_ID: &str = "zuno.tools";
@@ -31,11 +31,11 @@ impl ToolManifest {
         Ok(Self { slots: ordered })
     }
 
-    /// The complete native built-in surface.
+    /// The complete default-host built-in surface.
     #[must_use]
-    pub fn all() -> Self {
+    pub fn standard() -> Self {
         Self {
-            slots: BUILTIN_ORDER.to_vec(),
+            slots: DEFAULT_BUILTINS.to_vec(),
         }
     }
 
@@ -202,7 +202,7 @@ pub fn default_profile_with_tools(contributions: ToolContributions) -> HarnessPr
     profile_with_tools(
         "default",
         Arc::new(DefaultAgentDriver),
-        ToolManifest::all(),
+        ToolManifest::standard(),
         contributions,
     )
 }

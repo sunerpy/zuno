@@ -5,7 +5,7 @@
 //! [`DELTA_BATCH_BYTES`] or a part reaches a terminal event. A retry rollback
 //! deletes any already-flushed parts from the abandoned attempt before replay.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{Map, Value, json};
 use zuno_db::message::{MessageStore, PartRecord, now_millis};
@@ -163,17 +163,18 @@ pub struct ProjectionOutcome {
 /// A classified projection failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionError {
-    /// A tool start arrived while another tool input was still open.
-    #[error("tool `{active_id}` is still receiving input when `{next_id}` starts")]
-    NestedToolUse {
-        /// Currently active provider tool id.
-        active_id: String,
-        /// Newly received provider tool id.
-        next_id: String,
-    },
+    /// A provider reused a call id in one projected step.
+    #[error("duplicate ToolUseStart for `{call_id}`")]
+    DuplicateToolUse { call_id: String },
+    /// A tool-input fragment arrived without a matching start.
+    #[error("ToolInputDelta for unknown call `{call_id}`")]
+    ToolInputWithoutStart { call_id: String },
     /// A tool-input end arrived without a matching start.
-    #[error("ToolUseEnd arrived without ToolUseStart")]
-    ToolUseEndWithoutStart,
+    #[error("ToolUseEnd for unknown call `{call_id}`")]
+    ToolUseEndWithoutStart { call_id: String },
+    /// A tool signature arrived without a matching call.
+    #[error("ToolUseSignature for unknown call `{call_id}`")]
+    ToolSignatureWithoutStart { call_id: String },
     /// An event arrived after the projector had already terminated.
     #[error("stream projection already finished")]
     AlreadyFinished,
@@ -236,7 +237,7 @@ where
     text: Option<TextBuffer>,
     reasoning: Option<ReasoningBuffer>,
     tools: HashMap<String, StoredTool>,
-    active_tool: Option<ActiveTool>,
+    active_tools: BTreeMap<String, ActiveTool>,
     tool_input_limit: usize,
     last_tool_id: Option<String>,
     attempt_part_ids: Vec<String>,
@@ -268,7 +269,7 @@ where
             text: None,
             reasoning: None,
             tools: HashMap::new(),
-            active_tool: None,
+            active_tools: BTreeMap::new(),
             tool_input_limit: StreamLimits::from_environment().max_tool_input_bytes(),
             last_tool_id: None,
             attempt_part_ids: Vec::new(),
@@ -302,19 +303,24 @@ where
         match event {
             StreamEvent::TextDelta(delta) => self.push_text(&delta)?,
             StreamEvent::ToolUseStart { id, name } => self.start_tool(id, name)?,
-            StreamEvent::ToolInputDelta(delta) => {
-                if let Some(tool) = &mut self.active_tool {
-                    append_tool_input(
-                        &mut tool.raw_input,
-                        &delta,
-                        "stream-projector",
-                        &self.context.message_id,
-                        self.tool_input_limit,
-                    )?;
-                }
+            StreamEvent::ToolInputDelta { id, delta } => {
+                let tool = self.active_tools.get_mut(&id).ok_or_else(|| {
+                    ProjectionError::ToolInputWithoutStart {
+                        call_id: id.clone(),
+                    }
+                })?;
+                append_tool_input(
+                    &mut tool.raw_input,
+                    &delta,
+                    "stream-projector",
+                    &self.context.message_id,
+                    self.tool_input_limit,
+                )?;
             }
-            StreamEvent::ToolUseEnd => self.finish_active_tool()?,
-            StreamEvent::ToolUseSignature(signature) => self.attach_tool_signature(signature)?,
+            StreamEvent::ToolUseEnd { id } => self.finish_tool(&id)?,
+            StreamEvent::ToolUseSignature { id, signature } => {
+                self.attach_tool_signature(&id, signature)?;
+            }
             StreamEvent::ToolResult {
                 tool_use_id,
                 content,
@@ -402,7 +408,7 @@ where
         if self.finished {
             return Err(ProjectionError::AlreadyFinished);
         }
-        if let Some(tool) = self.active_tool.take() {
+        for (_, tool) in std::mem::take(&mut self.active_tools) {
             self.persist_tool_error(tool, error)?;
         }
         self.finish_reasoning(None)?;
@@ -538,27 +544,28 @@ where
     }
 
     fn start_tool(&mut self, call_id: String, name: String) -> Result<(), ProjectionError> {
-        if let Some(active) = &self.active_tool {
-            return Err(ProjectionError::NestedToolUse {
-                active_id: active.call_id.clone(),
-                next_id: call_id,
-            });
+        if self.active_tools.contains_key(&call_id) || self.tools.contains_key(&call_id) {
+            return Err(ProjectionError::DuplicateToolUse { call_id });
         }
-        self.active_tool = Some(ActiveTool {
-            call_id,
-            name,
-            raw_input: String::new(),
-            signature: None,
-            started_at: now_millis(),
-        });
+        self.active_tools.insert(
+            call_id.clone(),
+            ActiveTool {
+                call_id,
+                name,
+                raw_input: String::new(),
+                signature: None,
+                started_at: now_millis(),
+            },
+        );
         Ok(())
     }
 
-    fn finish_active_tool(&mut self) -> Result<(), ProjectionError> {
-        let tool = self
-            .active_tool
-            .take()
-            .ok_or(ProjectionError::ToolUseEndWithoutStart)?;
+    fn finish_tool(&mut self, call_id: &str) -> Result<(), ProjectionError> {
+        let tool = self.active_tools.remove(call_id).ok_or_else(|| {
+            ProjectionError::ToolUseEndWithoutStart {
+                call_id: call_id.to_owned(),
+            }
+        })?;
         match parse_tool_input(&tool.raw_input) {
             Ok(input) => self.persist_pending_tool(tool, input),
             Err(error) => {
@@ -624,17 +631,17 @@ where
 
     fn attach_tool_signature(
         &mut self,
+        call_id: &str,
         signature: ThoughtSignature,
     ) -> Result<(), ProjectionError> {
-        if let Some(tool) = &mut self.active_tool {
+        if let Some(tool) = self.active_tools.get_mut(call_id) {
             tool.signature = Some(signature);
             return Ok(());
         }
-        let Some(call_id) = &self.last_tool_id else {
-            return Ok(());
-        };
         let Some(tool) = self.tools.get_mut(call_id) else {
-            return Ok(());
+            return Err(ProjectionError::ToolSignatureWithoutStart {
+                call_id: call_id.to_owned(),
+            });
         };
         tool.signature = Some(signature);
         let tool = tool.clone();
@@ -849,7 +856,7 @@ where
         self.text = None;
         self.reasoning = None;
         self.tools.clear();
-        self.active_tool = None;
+        self.active_tools.clear();
         self.last_tool_id = None;
         self.dirty_delta_bytes = 0;
         self.usage = StepUsage::default();
@@ -880,7 +887,7 @@ where
     }
 
     fn finish_step(&mut self, stop_reason: Option<FinishReason>) -> Result<(), ProjectionError> {
-        if let Some(tool) = self.active_tool.take() {
+        for (_, tool) in std::mem::take(&mut self.active_tools) {
             match parse_tool_input(&tool.raw_input) {
                 Ok(input) => self.persist_pending_tool(tool, input)?,
                 Err(error) => {

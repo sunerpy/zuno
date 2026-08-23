@@ -380,10 +380,10 @@ pub struct BedrockPayloadError {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BlockKind {
     Text,
-    Tool,
+    Tool { id: String },
     Reasoning,
 }
 
@@ -525,7 +525,8 @@ impl BedrockEventDecoder {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
-            self.blocks.insert(index, BlockKind::Tool);
+            self.blocks
+                .insert(index, BlockKind::Tool { id: id.to_owned() });
             self.queued.push_back(StreamEvent::ToolUseStart {
                 id: id.to_owned(),
                 name: name.to_owned(),
@@ -553,12 +554,16 @@ impl BedrockEventDecoder {
         if let Some(input) = value
             .pointer("/delta/toolUse/input")
             .and_then(Value::as_str)
+            && !input.is_empty()
         {
-            self.blocks.insert(index, BlockKind::Tool);
-            if !input.is_empty() {
-                self.queued
-                    .push_back(StreamEvent::ToolInputDelta(input.to_owned()));
-            }
+            let id = match self.blocks.get(&index) {
+                Some(BlockKind::Tool { id }) => id.clone(),
+                _ => String::new(),
+            };
+            self.queued.push_back(StreamEvent::ToolInputDelta {
+                id,
+                delta: input.to_owned(),
+            });
         }
         if let Some(text) = value
             .pointer("/delta/reasoningContent/text")
@@ -588,7 +593,9 @@ impl BedrockEventDecoder {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         match self.blocks.remove(&index) {
-            Some(BlockKind::Tool) => self.queued.push_back(StreamEvent::ToolUseEnd),
+            Some(BlockKind::Tool { id }) => {
+                self.queued.push_back(StreamEvent::ToolUseEnd { id });
+            }
             Some(BlockKind::Reasoning) => self.queued.push_back(StreamEvent::ReasoningEnd),
             Some(BlockKind::Text) | None => {}
         }
@@ -624,13 +631,15 @@ impl BedrockEventDecoder {
                 let block = value.get("content_block").unwrap_or(&Value::Null);
                 match block.get("type").and_then(Value::as_str) {
                     Some("tool_use") => {
-                        self.blocks.insert(index, BlockKind::Tool);
+                        let id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        self.blocks
+                            .insert(index, BlockKind::Tool { id: id.clone() });
                         self.queued.push_back(StreamEvent::ToolUseStart {
-                            id: block
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned(),
+                            id,
                             name: block
                                 .get("name")
                                 .and_then(Value::as_str)
@@ -687,11 +696,23 @@ impl BedrockEventDecoder {
                 delta.get("text").and_then(Value::as_str),
                 StreamEvent::TextDelta,
             ),
-            Some("input_json_delta") => push_nonempty(
-                &mut self.queued,
-                delta.get("partial_json").and_then(Value::as_str),
-                StreamEvent::ToolInputDelta,
-            ),
+            Some("input_json_delta") => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(fragment) = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .filter(|fragment| !fragment.is_empty())
+                {
+                    let id = match self.blocks.get(&index) {
+                        Some(BlockKind::Tool { id }) => id.clone(),
+                        _ => String::new(),
+                    };
+                    self.queued.push_back(StreamEvent::ToolInputDelta {
+                        id,
+                        delta: fragment.to_owned(),
+                    });
+                }
+            }
             Some("thinking_delta") => push_nonempty(
                 &mut self.queued,
                 delta.get("thinking").and_then(Value::as_str),

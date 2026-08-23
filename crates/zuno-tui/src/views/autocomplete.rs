@@ -472,7 +472,10 @@ impl AutocompleteView {
                 // The exact-match requirement upstream gives `/` (`threshold: 0`)
                 // becomes "must be a prefix": a slash command the user half-typed
                 // should not match by scattered letters.
-                if activation.trigger == Trigger::Command && score < 500 {
+                if activation.trigger == Trigger::Command
+                    && !activation.query.is_empty()
+                    && score < 500
+                {
                     return None;
                 }
                 Some((score, candidate))
@@ -544,6 +547,30 @@ impl AutocompleteView {
             }
             _ => AutocompleteStep::Ignored,
         }
+    }
+
+    /// Highlight the candidate painted under one absolute pointer coordinate.
+    ///
+    /// The final overlay row is the hint bar and is intentionally not selectable.
+    pub fn select_at(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        if !self.is_open()
+            || column < area.left()
+            || column >= area.right()
+            || row < area.top()
+            || row >= area.bottom().saturating_sub(OVERLAY_HINT_ROWS)
+        {
+            return false;
+        }
+        let target = usize::from(row.saturating_sub(area.top()));
+        let first = self
+            .cursor
+            .saturating_sub(self.visible_rows.saturating_sub(1));
+        let index = first.saturating_add(target);
+        if index >= self.matches.len() || target >= self.visible_rows {
+            return false;
+        }
+        self.cursor = index;
+        true
     }
 
     /// Rows the popup needs, its hint row included.

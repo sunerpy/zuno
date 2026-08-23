@@ -44,6 +44,11 @@ pub const ENGINE_EVENT_CHANNEL_CAPACITY: usize = TURN_EVENT_CHANNEL_CAPACITY;
 // paced events produced 15 frames; five 25-keystroke runs retained median
 // p50=8.572 us / p95=19.848 us because input bypasses this ceiling.
 const ACTIVE_REDRAW_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+// A liveness glyph needs its own clock. Advancing it only when the provider emits an
+// event freezes the exact moment a slow request, shell command, or MCP call most needs
+// a liveness signal. Twelve and a half frames per second reads as motion without
+// repainting the whole terminal at the 60 FPS stream ceiling.
+const ACTIVE_ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
 // The plan's 250 ms idle starting point drops timer wakeups from 60/s to 4/s once
 // a turn ends. This project's deep-idle wake fixture measured 250.199 ms from a
 // new idle event to its frame, matching the intended quarter-second backoff.
@@ -53,13 +58,14 @@ const IDLE_REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 // that terminal or engine activity immediately resets the tier.
 const DEEP_IDLE_AFTER: Duration = Duration::from_secs(30);
 // The plan's 5 s deep-idle starting point cuts an inactive loop from 4 timer wakeups/s
-// to 0.2/s. This project has no decorative animation; its wake fixture entered the
-// 5 s tier, then activity selected the measured 250.199 ms idle frame instead.
+// to 0.2/s. Active liveness animation is gated separately and stops at the turn boundary,
+// so it does not prevent this tier from being reached.
 const DEEP_IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 struct RedrawConfig {
     active: Duration,
+    animation: Duration,
     idle: Duration,
     deep_idle_after: Duration,
     deep_idle: Duration,
@@ -67,6 +73,7 @@ struct RedrawConfig {
 
 const REDRAW_CONFIG: RedrawConfig = RedrawConfig {
     active: ACTIVE_REDRAW_INTERVAL,
+    animation: ACTIVE_ANIMATION_INTERVAL,
     idle: IDLE_REDRAW_INTERVAL,
     deep_idle_after: DEEP_IDLE_AFTER,
     deep_idle: DEEP_IDLE_REDRAW_INTERVAL,
@@ -77,6 +84,7 @@ struct RedrawSchedule {
     interval: Interval,
     cadence: Duration,
     last_activity: TokioInstant,
+    last_animation: TokioInstant,
     turn_active: bool,
 }
 
@@ -88,6 +96,7 @@ impl RedrawSchedule {
             interval: redraw_interval(now, cadence),
             cadence,
             last_activity: now,
+            last_animation: now,
             turn_active: false,
         }
     }
@@ -104,11 +113,31 @@ impl RedrawSchedule {
 
     fn record_engine_activity(&mut self, event: &TurnEvent, now: TokioInstant) {
         self.last_activity = now;
-        self.turn_active = !matches!(
+        let active = !matches!(
             event,
-            TurnEvent::TurnCompleted { .. } | TurnEvent::TurnInterrupted { .. }
+            TurnEvent::TurnCompleted { .. }
+                | TurnEvent::TurnInterrupted { .. }
+                | TurnEvent::TurnFailed { .. }
         );
+        if active && !self.turn_active {
+            self.last_animation = now;
+        }
+        self.turn_active = active;
         self.refresh(now);
+    }
+
+    /// Consume one animation deadline while a turn is active.
+    ///
+    /// The deadline is independent from provider activity. A stream delta may arrive
+    /// every millisecond or a tool may say nothing for a minute; either way the liveness
+    /// glyph advances at this bounded cadence. Missed frames collapse to one by anchoring
+    /// the next deadline at `now`, matching the redraw interval's `Skip` policy.
+    fn take_animation_frame(&mut self, now: TokioInstant) -> bool {
+        if !self.turn_active || now.duration_since(self.last_animation) < self.config.animation {
+            return false;
+        }
+        self.last_animation = now;
+        true
     }
 
     fn refresh(&mut self, now: TokioInstant) {
@@ -184,6 +213,11 @@ pub enum AppEvent {
     Terminal(TerminalEvent),
     /// A state transition from the engine turn loop.
     Engine(TurnEvent),
+    /// One bounded liveness-animation step while a turn is active.
+    ///
+    /// This carries no model or terminal state. Components that own an animated
+    /// affordance advance it and request a redraw; every other component ignores it.
+    AnimationFrame,
 }
 
 /// What a component asks the event loop to do after handling an event.
@@ -1369,6 +1403,10 @@ impl App {
                     }
                 }
                 () = redraw.tick() => {
+                    let now = TokioInstant::now();
+                    if !suspended && redraw.take_animation_frame(now) {
+                        needs_redraw |= self.handle_animation();
+                    }
                     if needs_redraw && self.draw_if_owned(cause::SCHEDULED)? {
                         needs_redraw = false;
                         // Skip prevents multiple stale ticks; resetting from frame end
@@ -1510,6 +1548,14 @@ impl App {
             deferred: None,
             redraw: result.redraw,
         })
+    }
+
+    fn handle_animation(&mut self) -> bool {
+        let mut ui = locked(&self.ui);
+        if self.owner.suspended.load(Ordering::SeqCst) {
+            return false;
+        }
+        ui.root.handle_event(&AppEvent::AnimationFrame).redraw
     }
 }
 

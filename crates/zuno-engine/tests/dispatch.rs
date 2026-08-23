@@ -909,6 +909,40 @@ async fn dispatch_waits_for_argument_derived_permission_before_execution() {
 }
 
 #[tokio::test]
+async fn dispatch_interrupt_cancels_a_pending_permission_before_execution() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let approver = Arc::new(BlockingApprover::new(events));
+    let dispatcher = Arc::new(dispatcher(
+        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        Vec::new(),
+        approver.clone(),
+    ));
+    let call = request(
+        &dispatcher,
+        "call_cancel_permission",
+        "bash",
+        json!({ "command": "git push origin main", "intent": "publish" }),
+    );
+    let interrupt = call.interrupt.clone();
+    let task = {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move { dispatcher.dispatch(call).await })
+    };
+
+    approver.entered.notified().await;
+    interrupt.fire();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("turn cancellation must wake a pending permission")
+        .expect("dispatch task");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(result.is_error);
+    assert!(result.output.output.contains("interrupted"));
+}
+
+#[tokio::test]
 async fn dispatch_passes_argument_pattern_to_permission_approver() {
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = dispatcher(

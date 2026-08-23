@@ -81,6 +81,14 @@ replay, input admission, goal state, and lifecycle remain typed runtime policy.
 The TUI similarly distinguishes live steering from queued follow-up work and
 projects human waits as approval or answer states.
 
+Codex's memory writer separates rollout extraction from workspace consolidation.
+Zuno adapts the learning goal but keeps a narrower mutation boundary: durable
+delivered-turn admission selects an isolated reviewer, the reviewer receives the
+current resident snapshot, and every consolidation is still an atomic
+`MemoryCandidate` add/replace/remove operation. Zuno therefore retains source
+provenance, deduplication, promotion policy, undo, and uncertain non-replay
+instead of allowing a model to rewrite a memory directory directly.
+
 ### oh-my-openagent
 
 oh-my-openagent contributes a useful orchestration lesson: a bounded roster is easier for a primary agent to route than a large collection of overlapping personas. Each Zuno specialist therefore carries both a responsibility and a negative delegation boundary. `build` is the only recursive coordinator; `deep` and `worker` can implement but cannot fan out.
@@ -121,7 +129,8 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | Model-visible means logged | adopt | durable inbox, tool results, retry notices, `session.prompt.assembled` |
 | Stable client projections | adopt | cursor replay plus snapshots shared by TUI/server/ACP/future GUI |
 | Goal persistence | adopt and extend | separate goal DB, typed recovery reason, persisted exponential backoff |
-| Concise agent and tool prompt contracts | adapt | Evidence-oriented `build`/`plan`/`deep` roles, explicit delegation ownership, goal terminal audits, cancellable question semantics, and byte-pinned tool descriptions |
+| Concise agent and tool prompt contracts | adapt | Evidence-oriented role contracts, explicit delegation ownership, bounded edit/write fallback, goal terminal audits, cancellable question semantics, and byte-pinned tool descriptions |
+| Durable memory extraction and consolidation | adapt | Per-session delivered-turn cadence, isolated small-model review with the resident snapshot, and audited add/replace/remove candidates instead of direct model-owned file rewrites |
 | Tool replay after failure | adapt | `Never` by default; explicit `Safe` only for read-only/idempotent tools |
 | Codex and Claude Code product subagents | adapt | Native app-server/stream-json providers, static configured tools, durable jobs, explicit cancellation, and uncertain non-replay |
 | Bounded specialist roster | adopt | `build`, `plan`, `deep`, `explorer`, `librarian`, `advisor`, `worker`, `looker` |

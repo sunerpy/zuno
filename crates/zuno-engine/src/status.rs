@@ -20,6 +20,15 @@ pub enum SessionStatus {
     Busy,
 }
 
+/// Where a hard interrupt request was installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbortDisposition {
+    /// The current live turn's signal was fired.
+    Active,
+    /// No guard was live, so the next accepted turn will start interrupted.
+    ArmedNext,
+}
+
 /// The action a turn loop takes after injecting queued messages at a safe point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoftInterruptAction {
@@ -87,12 +96,14 @@ struct RegistryInner {
 #[derive(Debug, Default)]
 struct RegistryState {
     active: HashMap<String, ActiveSession>,
+    pending_interrupts: BTreeSet<String>,
 }
 
 #[derive(Debug)]
 struct ActiveSession {
     token: u64,
     interrupt: InterruptSignal,
+    soft_interrupt: InterruptSignal,
     soft_interrupts: VecDeque<SoftInterruptMessage>,
 }
 
@@ -125,11 +136,16 @@ impl SessionRunRegistry {
 
         let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
         let interrupt = InterruptSignal::new();
+        let soft_interrupt = InterruptSignal::new();
+        if state.pending_interrupts.remove(&session_id) {
+            interrupt.fire();
+        }
         state.active.insert(
             session_id.clone(),
             ActiveSession {
                 token,
                 interrupt: interrupt.clone(),
+                soft_interrupt: soft_interrupt.clone(),
                 soft_interrupts: VecDeque::new(),
             },
         );
@@ -139,6 +155,7 @@ impl SessionRunRegistry {
             session_id,
             token,
             interrupt,
+            soft_interrupt,
         })
     }
 
@@ -185,17 +202,20 @@ impl SessionRunRegistry {
         }
     }
 
-    /// Fires the live turn's interrupt signal without waiting for an event consumer.
+    /// Fires the live turn's interrupt signal or arms the next accepted turn.
     ///
-    /// The signal is fired while the registry lock still protects the active entry,
-    /// making abort and guard removal linearizable. `false` means the session was idle.
-    pub fn abort(&self, session_id: &str) -> bool {
-        let state = self.lock_state();
-        let Some(active) = state.active.get(session_id) else {
-            return false;
-        };
-        active.interrupt.fire();
-        true
+    /// The registry lock makes the handoff linearizable: a cancellation arriving after
+    /// one guard is removed but before the accepted follow-up acquires the next guard is
+    /// retained and that next guard starts interrupted.
+    pub fn abort(&self, session_id: &str) -> AbortDisposition {
+        let mut state = self.lock_state();
+        if let Some(active) = state.active.get(session_id) {
+            active.interrupt.fire();
+            AbortDisposition::Active
+        } else {
+            state.pending_interrupts.insert(session_id.to_owned());
+            AbortDisposition::ArmedNext
+        }
     }
 
     /// Queues a message for the live turn's next safe point without firing abort.
@@ -212,6 +232,7 @@ impl SessionRunRegistry {
                 session_id: session_id.to_owned(),
             })?;
         active.soft_interrupts.push_back(message);
+        active.soft_interrupt.fire();
         Ok(())
     }
 
@@ -224,7 +245,9 @@ impl SessionRunRegistry {
             return SoftInterruptDelivery::empty();
         }
 
+        let signal_epoch = active.soft_interrupt.epoch();
         let messages: Vec<_> = active.soft_interrupts.drain(..).collect();
+        let _cleared = active.soft_interrupt.reset_if_epoch(signal_epoch);
         let action = if messages.iter().any(|message| message.urgent) {
             SoftInterruptAction::SkipRemainingTools
         } else {
@@ -274,7 +297,7 @@ impl SessionControl {
     }
 
     /// Aborts whichever turn is live now, not the turn that created this handle.
-    pub fn abort(&self) -> bool {
+    pub fn abort(&self) -> AbortDisposition {
         self.registry.abort(&self.session_id)
     }
 
@@ -298,6 +321,7 @@ pub struct SessionRunGuard {
     session_id: String,
     token: u64,
     interrupt: InterruptSignal,
+    soft_interrupt: InterruptSignal,
 }
 
 impl SessionRunGuard {
@@ -310,6 +334,16 @@ impl SessionRunGuard {
     #[must_use]
     pub fn interrupt_signal(&self) -> &InterruptSignal {
         &self.interrupt
+    }
+
+    /// Returns the wake-only signal used to stop a provider wait at a steering boundary.
+    ///
+    /// This is deliberately distinct from [`Self::interrupt_signal`]: firing it never
+    /// cancels a tool or ends the turn. The loop checkpoints any partial model output,
+    /// injects the queued durable input, and starts the next model step.
+    #[must_use]
+    pub fn soft_interrupt_signal(&self) -> &InterruptSignal {
+        &self.soft_interrupt
     }
 
     /// Drains messages queued before this safe point in FIFO order.

@@ -98,8 +98,7 @@ pub struct ChunkTranslator {
     provider: String,
     model: String,
     reasoning_open: bool,
-    tool_open: bool,
-    tool_index: Option<u32>,
+    tools: BTreeMap<u32, ActiveChatTool>,
     upstream_reported: bool,
     ended: bool,
     done: bool,
@@ -116,8 +115,7 @@ impl ChunkTranslator {
             provider: provider.into(),
             model: model.into(),
             reasoning_open: false,
-            tool_open: false,
-            tool_index: None,
+            tools: BTreeMap::new(),
             upstream_reported: false,
             ended: false,
             done: false,
@@ -233,38 +231,43 @@ impl ChunkTranslator {
         }
 
         for call in &delta.tool_calls {
+            let index = call.index.unwrap_or(0);
             let function = call.function.as_ref();
             let name = function.and_then(|function| function.name.as_deref());
-            let starts_new = name.is_some() || (call.index != self.tool_index && !self.tool_open);
-            if starts_new || (call.index.is_some() && call.index != self.tool_index) {
-                if self.tool_open {
-                    self.tool_open = false;
-                    events.push(StreamEvent::ToolUseEnd);
-                }
+            if !self.tools.contains_key(&index) {
                 if self.reasoning_open {
                     self.reasoning_open = false;
                     events.push(StreamEvent::ReasoningEnd);
                 }
-                self.tool_index = call.index;
-                self.tool_open = true;
+                let id = call.id.clone().unwrap_or_default();
+                let name = name.unwrap_or_default().to_owned();
                 events.push(StreamEvent::ToolUseStart {
-                    id: call.id.clone().unwrap_or_default(),
-                    name: name.unwrap_or_default().to_owned(),
+                    id: id.clone(),
+                    name: name.clone(),
                 });
+                self.tools.insert(index, ActiveChatTool { id });
+            } else if let Some(tool) = self.tools.get_mut(&index)
+                && let Some(id) = call.id.as_deref()
+                && !id.is_empty()
+            {
+                tool.id = id.to_owned();
             }
             if let Some(arguments) = function.and_then(|function| function.arguments.as_deref())
                 && !arguments.is_empty()
+                && let Some(tool) = self.tools.get(&index)
             {
-                events.push(StreamEvent::ToolInputDelta(arguments.to_owned()));
+                events.push(StreamEvent::ToolInputDelta {
+                    id: tool.id.clone(),
+                    delta: arguments.to_owned(),
+                });
             }
         }
     }
 
     fn close_open_blocks(&mut self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
-        if self.tool_open {
-            self.tool_open = false;
-            events.push(StreamEvent::ToolUseEnd);
+        for (_, tool) in std::mem::take(&mut self.tools) {
+            events.push(StreamEvent::ToolUseEnd { id: tool.id });
         }
         if self.reasoning_open {
             self.reasoning_open = false;
@@ -377,8 +380,12 @@ impl ResponsesTranslator {
                         &self.model,
                         self.tool_input_limit,
                     )?;
+                    return Ok(vec![StreamEvent::ToolInputDelta {
+                        id: tool.call_id.clone(),
+                        delta,
+                    }]);
                 }
-                Ok(vec![StreamEvent::ToolInputDelta(delta)])
+                Ok(Vec::new())
             }
             ResponsesEvent::OutputItemDone { item } => self.item_done(item),
             ResponsesEvent::Completed { response } => Ok(self.complete(response, false)),
@@ -418,7 +425,13 @@ impl ResponsesTranslator {
                     &self.model,
                     self.tool_input_limit,
                 )?;
-                self.tools.insert(item_id, ActiveTool { arguments });
+                self.tools.insert(
+                    item_id,
+                    ActiveTool {
+                        call_id: call_id.clone(),
+                        arguments,
+                    },
+                );
                 Ok(vec![StreamEvent::ToolUseStart { id: call_id, name }])
             }
             _ => Ok(Vec::new()),
@@ -455,8 +468,11 @@ impl ResponsesTranslator {
                         self.tool_input_limit,
                     )?;
                 }
-                self.tools.remove(&item.id);
-                Ok(vec![StreamEvent::ToolUseEnd])
+                let call_id = self
+                    .tools
+                    .remove(&item.id)
+                    .map_or_else(|| item.call_id.unwrap_or_default(), |tool| tool.call_id);
+                Ok(vec![StreamEvent::ToolUseEnd { id: call_id }])
             }
             _ => Ok(Vec::new()),
         }
@@ -503,7 +519,13 @@ struct ActiveReasoning {
 }
 
 #[derive(Debug)]
+struct ActiveChatTool {
+    id: String,
+}
+
+#[derive(Debug)]
 struct ActiveTool {
+    call_id: String,
     arguments: String,
 }
 
@@ -753,8 +775,13 @@ mod tests {
                     id: "call_1".to_owned(),
                     name: "lookup".to_owned(),
                 },
-                StreamEvent::ToolInputDelta("{\"q\":1}".to_owned()),
-                StreamEvent::ToolUseEnd,
+                StreamEvent::ToolInputDelta {
+                    id: "call_1".to_owned(),
+                    delta: "{\"q\":1}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd {
+                    id: "call_1".to_owned(),
+                },
                 StreamEvent::MessageEnd {
                     stop_reason: Some(FinishReason::ToolCalls),
                 },
@@ -805,14 +832,20 @@ mod tests {
                     id: "a".to_owned(),
                     name: "f".to_owned()
                 },
-                StreamEvent::ToolInputDelta("{\"x\":1}".to_owned()),
-                StreamEvent::ToolUseEnd,
+                StreamEvent::ToolInputDelta {
+                    id: "a".to_owned(),
+                    delta: "{\"x\":1}".to_owned(),
+                },
                 StreamEvent::ToolUseStart {
                     id: "b".to_owned(),
                     name: "g".to_owned()
                 },
-                StreamEvent::ToolInputDelta("{}".to_owned()),
-                StreamEvent::ToolUseEnd,
+                StreamEvent::ToolInputDelta {
+                    id: "b".to_owned(),
+                    delta: "{}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: "a".to_owned() },
+                StreamEvent::ToolUseEnd { id: "b".to_owned() },
                 StreamEvent::MessageEnd {
                     stop_reason: Some(FinishReason::ToolCalls)
                 },

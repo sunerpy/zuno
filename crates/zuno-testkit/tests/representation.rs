@@ -95,9 +95,9 @@ fn stream_event_payloads() -> Vec<VariantPayload> {
     vec![
         payload("TextDelta", size_of::<(String,)>()),
         payload("ToolUseStart", size_of::<(String, String)>()),
-        payload("ToolInputDelta", size_of::<(String,)>()),
-        payload("ToolUseEnd", size_of::<()>()),
-        payload("ToolUseSignature", size_of::<(ThoughtSignature,)>()),
+        payload("ToolInputDelta", size_of::<(String, String)>()),
+        payload("ToolUseEnd", size_of::<(String,)>()),
+        payload("ToolUseSignature", size_of::<(String, ThoughtSignature)>()),
         payload("ToolResult", size_of::<(String, String, bool)>()),
         payload(
             "GeneratedImage",
@@ -141,9 +141,9 @@ fn stream_event_variant_name(event: &StreamEvent) -> &'static str {
     match event {
         StreamEvent::TextDelta(_) => "TextDelta",
         StreamEvent::ToolUseStart { .. } => "ToolUseStart",
-        StreamEvent::ToolInputDelta(_) => "ToolInputDelta",
-        StreamEvent::ToolUseEnd => "ToolUseEnd",
-        StreamEvent::ToolUseSignature(_) => "ToolUseSignature",
+        StreamEvent::ToolInputDelta { .. } => "ToolInputDelta",
+        StreamEvent::ToolUseEnd { .. } => "ToolUseEnd",
+        StreamEvent::ToolUseSignature { .. } => "ToolUseSignature",
         StreamEvent::ToolResult { .. } => "ToolResult",
         StreamEvent::GeneratedImage { .. } => "GeneratedImage",
         StreamEvent::ReasoningStart => "ReasoningStart",
@@ -201,6 +201,7 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
         payload("StepCompleted", size_of::<(u32, Option<FinishReason>)>()),
         payload("TurnCompleted", size_of::<(String, u32)>()),
         payload("TurnInterrupted", size_of::<(Option<String>, u32)>()),
+        payload("TurnFailed", size_of::<(Option<String>, u32, String)>()),
     ]
 }
 
@@ -224,6 +225,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::StepCompleted { .. } => "StepCompleted",
         TurnEvent::TurnCompleted { .. } => "TurnCompleted",
         TurnEvent::TurnInterrupted { .. } => "TurnInterrupted",
+        TurnEvent::TurnFailed { .. } => "TurnFailed",
     }
 }
 
@@ -295,7 +297,7 @@ fn d0_enum_boxing_baseline() {
     // The exhaustive matches are what couple the tables to the enums. Calling
     // them keeps them live code rather than dead helpers a later cleanup deletes.
     assert_eq!(
-        stream_event_variant_name(&StreamEvent::ToolUseEnd),
+        stream_event_variant_name(&StreamEvent::ToolUseEnd { id: String::new() }),
         "ToolUseEnd"
     );
     assert_eq!(

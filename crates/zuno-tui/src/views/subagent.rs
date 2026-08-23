@@ -9,7 +9,8 @@ use crate::keybind::Definition;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogStep, DialogWidth};
 use crate::views::message::{Message, MessagePart, ToolStatus};
 use crate::views::{ViewContext, truncate};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -156,6 +157,21 @@ pub fn delegations(messages: &[Message]) -> Vec<Delegation> {
             }
         }
     }
+    found
+}
+
+/// Merge the durable job projection into transcript-derived delegations.
+///
+/// A background job changes after its original tool result was persisted. Reading the
+/// current SQLite-backed projection here keeps `/subagents` authoritative without
+/// requiring the user to call `job` merely to refresh the dialog.
+#[must_use]
+pub fn delegations_with_jobs(
+    messages: &[Message],
+    jobs: &[zuno_types::JobProjection],
+) -> Vec<Delegation> {
+    let mut found = delegations(messages);
+    merge_job_projections(&mut found, jobs);
     found
 }
 
@@ -415,6 +431,66 @@ fn refine_from_job_output(tasks: &mut [Delegation], output: &str) {
     }
 }
 
+fn merge_job_projections(tasks: &mut Vec<Delegation>, jobs: &[zuno_types::JobProjection]) {
+    for job in jobs {
+        let (tool, product, target, session_id, run_id) = match &job.subject {
+            zuno_types::JobSubjectProjection::ChildSession { session_id } => (
+                "task".to_owned(),
+                "zuno".to_owned(),
+                None,
+                Some(session_id.clone()),
+                None,
+            ),
+            zuno_types::JobSubjectProjection::ProductAgent {
+                run_id,
+                product,
+                instance,
+                tool,
+            } => (
+                tool.clone(),
+                product.clone(),
+                Some(instance.clone()),
+                None,
+                Some(run_id.clone()),
+            ),
+        };
+        if let Some(task) = tasks
+            .iter_mut()
+            .find(|task| task.job_id.as_deref() == Some(job.id.as_str()))
+        {
+            task.tool = tool;
+            task.product = product;
+            task.target = target.or_else(|| task.target.clone());
+            task.session_id = session_id.or_else(|| task.session_id.clone());
+            task.run_id = run_id.or_else(|| task.run_id.clone());
+            task.state = job.status.clone();
+            task.report_delivery = Some(job.report_delivery.clone());
+            task.result = job.result.clone().or_else(|| task.result.clone());
+            task.diagnostic = job.error.clone().or_else(|| task.diagnostic.clone());
+            task.time_created = Some(job.time_created);
+            task.time_completed = job.time_completed;
+            continue;
+        }
+        tasks.push(Delegation {
+            call_id: format!("job:{}", job.id),
+            tool,
+            product,
+            target,
+            objective: None,
+            dispatch_status: ToolStatus::Completed,
+            state: job.status.clone(),
+            session_id,
+            run_id,
+            job_id: Some(job.id.clone()),
+            report_delivery: Some(job.report_delivery.clone()),
+            result: job.result.clone(),
+            diagnostic: job.error.clone(),
+            time_created: Some(job.time_created),
+            time_completed: job.time_completed,
+        });
+    }
+}
+
 fn result_text(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -499,7 +575,10 @@ fn format_duration(milliseconds: i64) -> String {
 /// Cursor, detail disclosure, and in-place cancellation confirmation.
 pub struct SubagentView {
     context: ViewContext,
+    base_tasks: Vec<Delegation>,
     tasks: Vec<Delegation>,
+    work: Option<crate::views::ambient::WorkState>,
+    work_generation: u64,
     cursor: usize,
     expanded: bool,
     confirm_cancel: Option<String>,
@@ -510,11 +589,23 @@ impl SubagentView {
     pub fn new(context: ViewContext, tasks: Vec<Delegation>) -> Self {
         Self {
             context,
+            base_tasks: tasks.clone(),
             tasks,
+            work: None,
+            work_generation: 0,
             cursor: 0,
             expanded: false,
             confirm_cancel: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_work_state(mut self, work: crate::views::ambient::WorkState) -> Self {
+        let (generation, state) = work.observe();
+        merge_job_projections(&mut self.tasks, &state.jobs);
+        self.work_generation = generation;
+        self.work = Some(work);
+        self
     }
 
     #[must_use]
@@ -535,6 +626,28 @@ impl SubagentView {
     #[must_use]
     pub fn selected(&self) -> Option<&Delegation> {
         self.tasks.get(self.cursor)
+    }
+
+    fn refresh(&mut self) {
+        let Some(work) = &self.work else {
+            return;
+        };
+        let (generation, state) = work.observe();
+        if generation == self.work_generation {
+            return;
+        }
+        let selected_job = self.selected().and_then(|task| task.job_id.clone());
+        self.tasks = self.base_tasks.clone();
+        merge_job_projections(&mut self.tasks, &state.jobs);
+        self.work_generation = generation;
+        self.cursor = selected_job
+            .and_then(|job| {
+                self.tasks
+                    .iter()
+                    .position(|task| task.job_id.as_deref() == Some(job.as_str()))
+            })
+            .unwrap_or_else(|| self.cursor.min(self.tasks.len().saturating_sub(1)));
+        self.confirm_cancel = None;
     }
 
     fn step(&mut self, step: isize) -> DialogStep {
@@ -642,6 +755,7 @@ impl Dialog for SubagentView {
     }
 
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        self.refresh();
         let body = usize::from(width.saturating_sub(2)).max(1);
         let mut lines = Vec::new();
         for (index, task) in self.tasks.iter().enumerate() {
@@ -696,6 +810,7 @@ impl Dialog for SubagentView {
     }
 
     fn handle_action(&mut self, action: &'static Definition, _event: &KeyEvent) -> DialogStep {
+        self.refresh();
         match action.name {
             "session_child_cycle" | "dialog.select.next" => self.step(1),
             "session_child_cycle_reverse" | "dialog.select.prev" => self.step(-1),
@@ -720,5 +835,30 @@ impl Dialog for SubagentView {
             }
             _ => DialogStep::Ignored,
         }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        self.refresh();
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => return self.step(-1),
+            MouseEventKind::ScrollDown => return self.step(1),
+            MouseEventKind::Up(MouseButton::Left) => {}
+            _ => return DialogStep::Ignored,
+        }
+        let index = usize::from(event.row.saturating_sub(body.top()));
+        if index >= self.tasks.len() {
+            return DialogStep::Ignored;
+        }
+        self.cursor = index;
+        self.expanded = true;
+        self.confirm_cancel = None;
+        DialogStep::Redraw
     }
 }

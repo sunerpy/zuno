@@ -5,7 +5,8 @@ use crate::app::render_offscreen;
 use crate::views::dialog::{DialogHost, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 fn options() -> Vec<QuestionOption> {
     vec![
@@ -164,6 +165,22 @@ fn views_question_single_select_answers_with_one_label() {
     let answers =
         answered(prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter)));
     assert_eq!(answers, vec![vec![String::from("Patch")]]);
+}
+
+#[test]
+fn views_question_single_select_can_be_chosen_with_the_mouse() {
+    let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
+    let body = Rect::new(10, 5, 40, 10);
+    let step = prompt.handle_mouse(
+        &MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 12,
+            row: 9,
+            modifiers: KeyModifiers::NONE,
+        },
+        body,
+    );
+    assert_eq!(answered(step), vec![vec![String::from("Patch")]]);
 }
 
 #[test]

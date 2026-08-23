@@ -323,6 +323,55 @@ fn a_replayed_reasoning_block_carries_its_duration_and_is_never_still_streaming(
 }
 
 #[test]
+fn a_provider_replay_capsule_does_not_duplicate_its_visible_reasoning() {
+    let connection = seeded();
+    put_message(&connection, "msg_a", "assistant", 100, Value::Null);
+    put_part(
+        &connection,
+        "msg_a",
+        "prt_reasoning",
+        100,
+        json!({
+            "type": "reasoning",
+            "text": "checking the guard",
+            "time": { "start": 1_000, "end": 3_500 }
+        }),
+    );
+    put_part(
+        &connection,
+        "msg_a",
+        "prt_reasoning_0000",
+        101,
+        json!({
+            "type": "reasoning",
+            "text": "checking the guard",
+            "metadata": {
+                "providerReasoning": {
+                    "type": "reasoning",
+                    "encrypted_content": "opaque-provider-state"
+                }
+            }
+        }),
+    );
+
+    let replay = project(history(&connection));
+    let reasoning = replay.messages[0]
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            MessagePart::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        reasoning,
+        vec!["checking the guard"],
+        "provider replay state is durable input, not a second user-visible thought"
+    );
+}
+
+#[test]
 fn an_empty_text_part_is_not_replayed_as_a_blank_row() {
     let connection = seeded();
     put_message(&connection, "msg_a", "assistant", 100, Value::Null);
@@ -402,15 +451,20 @@ fn an_interrupted_turn_reports_its_failure_beside_the_partial_reply() {
 
     let replay = project(history(&connection));
 
-    let parts = &replay.messages[0].parts;
-    assert_eq!(texts(&replay.messages[0]), vec!["I was part way through"]);
-    let Some(MessagePart::Notice { text, level }) = parts.last() else {
-        panic!("expected a trailing failure notice: {parts:?}");
-    };
-    assert!(
-        text.contains("aborted by the user"),
-        "the notice must name why the reply stops: {text}",
+    assert_eq!(
+        replay.messages.len(),
+        2,
+        "the partial model output and session-owned interruption marker are separate"
     );
+    assert_eq!(texts(&replay.messages[0]), vec!["I was part way through"]);
+    assert_eq!(replay.messages[1].role, Role::System);
+    let [MessagePart::Notice { text, level }] = replay.messages[1].parts.as_slice() else {
+        panic!(
+            "expected a standalone interruption notice: {:?}",
+            replay.messages[1].parts
+        );
+    };
+    assert_eq!(text, "Conversation interrupted by user.");
     assert_eq!(*level, ToastLevel::Error);
 }
 

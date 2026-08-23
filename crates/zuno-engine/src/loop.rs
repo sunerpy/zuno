@@ -48,7 +48,7 @@ use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks}
 use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
 use crate::prompt::{PromptAssembly, PromptTraceSet};
 use crate::retry::{
-    PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, retry_provider,
+    PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, retry_provider_with_wake,
 };
 use crate::status::SessionRunGuard;
 
@@ -57,6 +57,14 @@ pub const TURN_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Text used to close an unanswered tool call before its transcript is replayed.
 pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
+
+/// Stable user-facing marker for a turn the user explicitly stopped.
+///
+/// The engine persists this exact text on the interrupted assistant checkpoint,
+/// while live and replay clients render it as a session-owned notice. Keeping one
+/// value prevents a resumed transcript from describing the same interruption
+/// differently from the screen that observed it.
+pub const INTERRUPTED_TURN_NOTICE: &str = "Conversation interrupted by user.";
 
 /// Producer half of the engine's bounded event channel.
 ///
@@ -218,6 +226,11 @@ pub enum TurnEvent {
         assistant_message_id: Option<String>,
         steps: u32,
     },
+    TurnFailed {
+        assistant_message_id: Option<String>,
+        steps: u32,
+        message: String,
+    },
 }
 
 /// Why a tool call was stopped before its requested effect ran.
@@ -301,10 +314,14 @@ pub enum TurnError {
     StreamEndedWithoutMessageEnd { step: u32 },
     #[error("provider `{provider_id}` returned an empty assistant response during step {step}")]
     EmptyAssistantMessage { provider_id: String, step: u32 },
-    #[error("provider emitted ToolUseStart before ending the active tool in step {step}")]
-    NestedToolUse { step: u32 },
-    #[error("provider emitted ToolUseEnd without ToolUseStart in step {step}")]
-    ToolUseEndWithoutStart { step: u32 },
+    #[error("provider started duplicate tool call `{call_id}` in step {step}")]
+    DuplicateToolUse { step: u32, call_id: String },
+    #[error("provider emitted input for unknown tool call `{call_id}` in step {step}")]
+    ToolInputWithoutStart { step: u32, call_id: String },
+    #[error("provider ended unknown tool call `{call_id}` in step {step}")]
+    ToolUseEndWithoutStart { step: u32, call_id: String },
+    #[error("provider emitted a signature for unknown tool call `{call_id}` in step {step}")]
+    ToolSignatureWithoutStart { step: u32, call_id: String },
     #[error("the turn event consumer closed")]
     EventConsumerClosed,
     #[error("plugin hook failed: {0}")]
@@ -357,6 +374,53 @@ pub enum TurnRecovery {
 }
 
 impl TurnError {
+    /// Stable diagnostic label for logs, storage, and client projections.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::NoUserMessage { .. } => "no_user_message",
+            Self::MissingUserField { .. } => "missing_user_field",
+            Self::AgentNotFound { .. } => "agent_not_found",
+            Self::ModelNotFound { .. } => "model_not_found",
+            Self::StepLimit { .. } => "step_limit",
+            Self::StreamEndedWithoutMessageEnd { .. } => "stream_ended_without_message_end",
+            Self::EmptyAssistantMessage { .. } => "empty_assistant_message",
+            Self::DuplicateToolUse { .. } => "duplicate_tool_use",
+            Self::ToolInputWithoutStart { .. } => "tool_input_without_start",
+            Self::ToolUseEndWithoutStart { .. } => "tool_end_without_start",
+            Self::ToolSignatureWithoutStart { .. } => "tool_signature_without_start",
+            Self::EventConsumerClosed => "event_consumer_closed",
+            Self::Hook(_) => "hook",
+            Self::Database(_) => "database",
+            Self::Provider(_) => "provider",
+            Self::ProviderRetryDeadlineExceeded { .. } => "provider_retry_deadline",
+            Self::Cache(_) => "cache",
+        }
+    }
+
+    fn durable_message(&self) -> String {
+        match self {
+            Self::Provider(ProviderError::Auth { .. }) => {
+                "Provider authentication failed before the turn completed.".to_owned()
+            }
+            Self::Provider(ProviderError::ContextLimit { .. }) => {
+                "The provider rejected the request because its context limit was exceeded."
+                    .to_owned()
+            }
+            Self::Provider(ProviderError::RateLimited { .. }) => {
+                "The provider rate limited the request before the turn completed.".to_owned()
+            }
+            Self::Provider(ProviderError::Transient { .. }) => {
+                "The provider connection failed before the turn completed.".to_owned()
+            }
+            Self::Provider(ProviderError::Refused { .. } | ProviderError::Fatal { .. }) => {
+                "The provider rejected or malformed the response before the turn completed."
+                    .to_owned()
+            }
+            _ => self.to_string(),
+        }
+    }
+
     /// Classify the failure without inspecting its rendered message.
     #[must_use]
     pub fn recovery(&self) -> TurnRecovery {
@@ -402,8 +466,10 @@ impl TurnError {
             | Self::MissingUserField { .. }
             | Self::AgentNotFound { .. }
             | Self::ModelNotFound { .. }
-            | Self::NestedToolUse { .. }
+            | Self::DuplicateToolUse { .. }
+            | Self::ToolInputWithoutStart { .. }
             | Self::ToolUseEndWithoutStart { .. }
+            | Self::ToolSignatureWithoutStart { .. }
             | Self::Hook(_)
             | Self::Cache(_) => TurnRecovery::Fail,
             Self::ProviderRetryDeadlineExceeded { .. } => TurnRecovery::Retry {
@@ -786,6 +852,7 @@ struct ToolBuilder {
     name: String,
     raw_input: String,
     thought_signature: Option<ThoughtSignature>,
+    ordinal: usize,
 }
 
 #[derive(Debug)]
@@ -797,8 +864,9 @@ struct StepAccumulator {
     reasoning: String,
     reasoning_signature: String,
     provider_reasoning: Vec<RequestContentBlock>,
-    calls: Vec<ToolCall>,
-    active_tool: Option<ToolBuilder>,
+    calls: BTreeMap<usize, ToolCall>,
+    active_tools: BTreeMap<String, ToolBuilder>,
+    next_tool_ordinal: usize,
     finish_reason: Option<FinishReason>,
     saw_message_end: bool,
     input_tokens: Option<u64>,
@@ -818,8 +886,9 @@ impl StepAccumulator {
             reasoning: String::new(),
             reasoning_signature: String::new(),
             provider_reasoning: Vec::new(),
-            calls: Vec::new(),
-            active_tool: None,
+            calls: BTreeMap::new(),
+            active_tools: BTreeMap::new(),
+            next_tool_ordinal: 0,
             finish_reason: None,
             saw_message_end: false,
             input_tokens: None,
@@ -834,32 +903,52 @@ impl StepAccumulator {
         match event {
             StreamEvent::TextDelta(text) => self.text.push_str(text),
             StreamEvent::ToolUseStart { id, name } => {
-                if self.active_tool.is_some() {
-                    return Err(TurnError::NestedToolUse { step });
+                if self.active_tools.contains_key(id)
+                    || self.calls.values().any(|call| call.id == *id)
+                {
+                    return Err(TurnError::DuplicateToolUse {
+                        step,
+                        call_id: id.clone(),
+                    });
                 }
-                self.active_tool = Some(ToolBuilder {
-                    id: id.clone(),
-                    name: name.clone(),
-                    ..ToolBuilder::default()
-                });
+                let ordinal = self.next_tool_ordinal;
+                self.next_tool_ordinal = self.next_tool_ordinal.saturating_add(1);
+                self.active_tools.insert(
+                    id.clone(),
+                    ToolBuilder {
+                        id: id.clone(),
+                        name: name.clone(),
+                        ordinal,
+                        ..ToolBuilder::default()
+                    },
+                );
             }
-            StreamEvent::ToolInputDelta(delta) => {
-                if let Some(tool) = &mut self.active_tool {
-                    append_tool_input(
-                        &mut tool.raw_input,
-                        delta,
-                        &self.provider,
-                        &self.stream,
-                        self.tool_input_limit,
-                    )?;
-                }
+            StreamEvent::ToolInputDelta { id, delta } => {
+                let tool = self.active_tools.get_mut(id).ok_or_else(|| {
+                    TurnError::ToolInputWithoutStart {
+                        step,
+                        call_id: id.clone(),
+                    }
+                })?;
+                append_tool_input(
+                    &mut tool.raw_input,
+                    delta,
+                    &self.provider,
+                    &self.stream,
+                    self.tool_input_limit,
+                )?;
             }
-            StreamEvent::ToolUseEnd => self.finish_active_tool(step)?,
-            StreamEvent::ToolUseSignature(signature) => {
-                if let Some(tool) = &mut self.active_tool {
+            StreamEvent::ToolUseEnd { id } => self.finish_tool(step, id)?,
+            StreamEvent::ToolUseSignature { id, signature } => {
+                if let Some(tool) = self.active_tools.get_mut(id) {
                     tool.thought_signature = Some(signature.clone());
-                } else if let Some(tool) = self.calls.last_mut() {
+                } else if let Some(tool) = self.calls.values_mut().find(|tool| tool.id == *id) {
                     tool.thought_signature = Some(signature.clone());
+                } else {
+                    return Err(TurnError::ToolSignatureWithoutStart {
+                        step,
+                        call_id: id.clone(),
+                    });
                 }
             }
             StreamEvent::ToolResult { .. }
@@ -903,8 +992,14 @@ impl StepAccumulator {
                 }
             }
             StreamEvent::MessageEnd { stop_reason } => {
-                if self.active_tool.is_some() {
-                    self.finish_active_tool(step)?;
+                let mut active = self
+                    .active_tools
+                    .values()
+                    .map(|tool| (tool.ordinal, tool.id.clone()))
+                    .collect::<Vec<_>>();
+                active.sort_by_key(|(ordinal, _)| *ordinal);
+                for (_, id) in active {
+                    self.finish_tool(step, &id)?;
                 }
                 self.finish_reason = *stop_reason;
                 self.saw_message_end = true;
@@ -927,23 +1022,33 @@ impl StepAccumulator {
                 request_id,
                 tool_name,
                 input,
-            } => self.calls.push(ToolCall {
-                id: request_id.clone(),
-                name: tool_name.clone(),
-                input: input.clone(),
-                raw_input: input.to_string(),
-                input_error: None,
-                thought_signature: None,
-            }),
+            } => {
+                let ordinal = self.next_tool_ordinal;
+                self.next_tool_ordinal = self.next_tool_ordinal.saturating_add(1);
+                self.calls.insert(
+                    ordinal,
+                    ToolCall {
+                        id: request_id.clone(),
+                        name: tool_name.clone(),
+                        input: input.clone(),
+                        raw_input: input.to_string(),
+                        input_error: None,
+                        thought_signature: None,
+                    },
+                );
+            }
         }
         Ok(())
     }
 
-    fn finish_active_tool(&mut self, step: u32) -> Result<(), TurnError> {
-        let tool = self
-            .active_tool
-            .take()
-            .ok_or(TurnError::ToolUseEndWithoutStart { step })?;
+    fn finish_tool(&mut self, step: u32, call_id: &str) -> Result<(), TurnError> {
+        let tool =
+            self.active_tools
+                .remove(call_id)
+                .ok_or_else(|| TurnError::ToolUseEndWithoutStart {
+                    step,
+                    call_id: call_id.to_owned(),
+                })?;
         let raw = tool.raw_input.trim();
         let (input, input_error) = if raw.is_empty() {
             (json!({}), None)
@@ -956,15 +1061,48 @@ impl StepAccumulator {
                 ),
             }
         };
-        self.calls.push(ToolCall {
-            id: tool.id,
-            name: tool.name,
-            input,
-            raw_input: tool.raw_input,
-            input_error,
-            thought_signature: tool.thought_signature,
-        });
+        self.calls.insert(
+            tool.ordinal,
+            ToolCall {
+                id: tool.id,
+                name: tool.name,
+                input,
+                raw_input: tool.raw_input,
+                input_error,
+                thought_signature: tool.thought_signature,
+            },
+        );
         Ok(())
+    }
+
+    fn checkpoint_calls(&self) -> Vec<ToolCall> {
+        let mut calls = self.calls.clone();
+        for tool in self.active_tools.values() {
+            let raw = tool.raw_input.trim();
+            let (input, input_error) = if raw.is_empty() {
+                (json!({}), None)
+            } else {
+                match serde_json::from_str(raw) {
+                    Ok(value) => (value, None),
+                    Err(error) => (
+                        Value::String(tool.raw_input.clone()),
+                        Some(error.to_string()),
+                    ),
+                }
+            };
+            calls.insert(
+                tool.ordinal,
+                ToolCall {
+                    id: tool.id.clone(),
+                    name: tool.name.clone(),
+                    input,
+                    raw_input: tool.raw_input.clone(),
+                    input_error,
+                    thought_signature: tool.thought_signature.clone(),
+                },
+            );
+        }
+        calls.into_values().collect()
     }
 
     fn reset_generated(&mut self) {
@@ -973,7 +1111,8 @@ impl StepAccumulator {
         self.reasoning_signature.clear();
         self.provider_reasoning.clear();
         self.calls.clear();
-        self.active_tool = None;
+        self.active_tools.clear();
+        self.next_tool_ordinal = 0;
         self.finish_reason = None;
         self.saw_message_end = false;
         self.input_tokens = None;
@@ -997,7 +1136,7 @@ impl StepAccumulator {
             || !self.reasoning.is_empty()
             || !self.provider_reasoning.is_empty()
             || !self.calls.is_empty()
-            || self.active_tool.is_some()
+            || !self.active_tools.is_empty()
     }
 
     fn has_assistant_parts(&self) -> bool {
@@ -1065,6 +1204,9 @@ async fn run_turn_in_span(
 
         let history = hydrate_retained_history(context.connection, &request.session_id)?;
         let requested = requested_turn(&request.session_id, &history)?;
+        if inject_live_inputs(&mut context, &request, &requested)?.count > 0 {
+            continue;
+        }
         let agent = context
             .resolver
             .resolve_agent(&requested.agent)
@@ -1219,12 +1361,19 @@ async fn run_turn_in_span(
             NonZeroU32::new(PROVIDER_RETRY_MAX_ATTEMPTS)
                 .expect("provider retry maximum is non-zero"),
         );
-        let attempt = retry_provider(
+        let soft_interrupt = context
+            .live_inputs
+            .as_ref()
+            .map(|live| live.guard.soft_interrupt_signal().clone());
+        let retry_interrupt = context.interrupt.clone();
+        let retry_soft_interrupt = soft_interrupt.clone();
+        let attempt = retry_provider_with_wake(
             policy,
             |attempt| {
                 let provider = Arc::clone(&provider);
                 let completion = completion.clone();
                 let interrupt = context.interrupt.clone();
+                let soft_interrupt = soft_interrupt.clone();
                 let events = events.clone();
                 let accumulator = Arc::clone(&accumulator);
                 let request_span = span::provider_request_for_session(
@@ -1243,13 +1392,18 @@ async fn run_turn_in_span(
                         // read for their bookkeeping before the step ends regardless.
                         let mut trailing: Option<u8> = None;
                         loop {
+                            let control = wait_for_provider_control(
+                                interrupt.clone(),
+                                soft_interrupt.clone(),
+                            );
+                            tokio::pin!(control);
                             let next = tokio::select! {
                                 biased;
-                                _ = interrupt.notified() => return Ok(Ok(true)),
+                                exit = &mut control => return Ok(Ok(exit)),
                                 event = stream.next() => event,
                             };
                             let Some(next) = next else {
-                                return Ok(Ok(false));
+                                return Ok(Ok(ProviderStreamExit::Completed));
                             };
                             // An error *after* the message has finished is not the turn's
                             // failure: the answer is already complete and persisted, and the
@@ -1257,7 +1411,7 @@ async fn run_turn_in_span(
                             // over a truncated trailing frame would throw away a reply the
                             // user has already read.
                             if trailing.is_some() && next.is_err() {
-                                return Ok(Ok(false));
+                                return Ok(Ok(ProviderStreamExit::Completed));
                             }
                             let event = match next {
                                 Ok(event) => event,
@@ -1305,7 +1459,7 @@ async fn run_turn_in_span(
                             }
                             if let Some(remaining) = trailing.as_mut() {
                                 if *remaining == 0 {
-                                    return Ok(Ok(false));
+                                    return Ok(Ok(ProviderStreamExit::Completed));
                                 }
                                 *remaining -= 1;
                             }
@@ -1328,18 +1482,23 @@ async fn run_turn_in_span(
                     events.send(TurnEvent::Provider { step, event }).await
                 }
             },
+            move || {
+                let interrupt = retry_interrupt.clone();
+                let soft_interrupt = retry_soft_interrupt.clone();
+                async move { Ok(wait_for_provider_control(interrupt, soft_interrupt).await) }
+            },
         )
         .await;
-        let interrupted = match attempt {
-            Ok(result) => result?,
+        let provider_result = match attempt {
+            Ok(result) => result,
             Err(ProviderRetryError::Provider(error))
             | Err(ProviderRetryError::AttemptsExhausted { source: error, .. }) => {
-                return Err(TurnError::Provider(error));
+                Err(TurnError::Provider(error))
             }
             Err(ProviderRetryError::DeadlineExceeded { attempt, elapsed }) => {
-                return Err(TurnError::ProviderRetryDeadlineExceeded { attempt, elapsed });
+                Err(TurnError::ProviderRetryDeadlineExceeded { attempt, elapsed })
             }
-            Err(ProviderRetryError::RollbackEmission { source }) => return Err(*source),
+            Err(ProviderRetryError::RollbackEmission { source }) => Err(*source),
         };
         let mut accumulator = {
             let mut accumulator = accumulator.lock().expect("step accumulator lock");
@@ -1350,9 +1509,31 @@ async fn run_turn_in_span(
             );
             std::mem::replace(&mut *accumulator, replacement)
         };
+        let provider_exit = match provider_result {
+            Ok(exit) => exit,
+            Err(error) => {
+                checkpoint_assistant(
+                    context.connection,
+                    &request,
+                    step,
+                    &mut assistant,
+                    &accumulator,
+                    &locked_tools,
+                    AssistantCheckpointDisposition::Failed(&error),
+                )?;
+                events
+                    .send(TurnEvent::AssistantCheckpointed {
+                        step,
+                        message_id: assistant_id,
+                        interrupted: false,
+                    })
+                    .await?;
+                return Err(error);
+            }
+        };
 
         if !accumulator.text.is_empty() {
-            context
+            let hook_result = context
                 .hooks
                 .text_complete(
                     &request.session_id,
@@ -1360,11 +1541,30 @@ async fn run_turn_in_span(
                     &text_part_id(&request.turn_id, step),
                     &mut accumulator.text,
                 )
-                .await
-                .map_err(TurnError::Hook)?;
+                .await;
+            if let Err(message) = hook_result {
+                let error = TurnError::Hook(message);
+                checkpoint_assistant(
+                    context.connection,
+                    &request,
+                    step,
+                    &mut assistant,
+                    &accumulator,
+                    &locked_tools,
+                    AssistantCheckpointDisposition::Failed(&error),
+                )?;
+                events
+                    .send(TurnEvent::AssistantCheckpointed {
+                        step,
+                        message_id: assistant_id,
+                        interrupted: false,
+                    })
+                    .await?;
+                return Err(error);
+            }
         }
 
-        if interrupted {
+        if provider_exit == ProviderStreamExit::Interrupted {
             checkpoint_assistant(
                 context.connection,
                 &request,
@@ -1372,7 +1572,7 @@ async fn run_turn_in_span(
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
-                true,
+                AssistantCheckpointDisposition::Interrupted,
             )?;
             events
                 .send(TurnEvent::AssistantCheckpointed {
@@ -1393,7 +1593,7 @@ async fn run_turn_in_span(
             });
         }
 
-        if !accumulator.saw_message_end {
+        if provider_exit == ProviderStreamExit::Steered && !accumulator.saw_message_end {
             checkpoint_assistant(
                 context.connection,
                 &request,
@@ -1401,11 +1601,69 @@ async fn run_turn_in_span(
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
-                false,
+                AssistantCheckpointDisposition::Steered,
             )?;
-            return Err(TurnError::StreamEndedWithoutMessageEnd { step });
+            events
+                .send(TurnEvent::AssistantCheckpointed {
+                    step,
+                    message_id: assistant_id,
+                    interrupted: true,
+                })
+                .await?;
+            let _injected = inject_live_inputs(&mut context, &request, &requested)?;
+            events
+                .send(TurnEvent::StepCompleted {
+                    step,
+                    finish_reason: None,
+                })
+                .await?;
+            continue;
         }
 
+        if !accumulator.saw_message_end {
+            let error = TurnError::StreamEndedWithoutMessageEnd { step };
+            checkpoint_assistant(
+                context.connection,
+                &request,
+                step,
+                &mut assistant,
+                &accumulator,
+                &locked_tools,
+                AssistantCheckpointDisposition::Failed(&error),
+            )?;
+            events
+                .send(TurnEvent::AssistantCheckpointed {
+                    step,
+                    message_id: assistant_id,
+                    interrupted: false,
+                })
+                .await?;
+            return Err(error);
+        }
+
+        if !accumulator.has_assistant_parts() {
+            let error = TurnError::EmptyAssistantMessage {
+                provider_id: model.catalog_provider_id,
+                step,
+            };
+            checkpoint_assistant(
+                context.connection,
+                &request,
+                step,
+                &mut assistant,
+                &accumulator,
+                &locked_tools,
+                AssistantCheckpointDisposition::Failed(&error),
+            )?;
+            events
+                .send(TurnEvent::AssistantCheckpointed {
+                    step,
+                    message_id: assistant_id,
+                    interrupted: false,
+                })
+                .await?;
+            return Err(error);
+        }
         checkpoint_assistant(
             context.connection,
             &request,
@@ -1413,14 +1671,8 @@ async fn run_turn_in_span(
             &mut assistant,
             &accumulator,
             &locked_tools,
-            false,
+            AssistantCheckpointDisposition::Completed,
         )?;
-        if !accumulator.has_assistant_parts() {
-            return Err(TurnError::EmptyAssistantMessage {
-                provider_id: model.catalog_provider_id,
-                step,
-            });
-        }
         events
             .send(TurnEvent::AssistantCheckpointed {
                 step,
@@ -1429,12 +1681,13 @@ async fn run_turn_in_span(
             })
             .await?;
 
+        let calls = accumulator.calls.values().cloned().collect::<Vec<_>>();
         let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
         if !injected.skip_remaining_tools {
             let mut next_call = 0;
-            while next_call < accumulator.calls.len() && !injected.skip_remaining_tools {
+            while next_call < calls.len() && !injected.skip_remaining_tools {
                 let first_request = dispatch_request(
-                    accumulator.calls[next_call].clone(),
+                    calls[next_call].clone(),
                     &request,
                     &assistant_id,
                     &agent.name,
@@ -1444,9 +1697,9 @@ async fn run_turn_in_span(
                 let first_policy = context.dispatcher.concurrency_policy(&first_request);
                 let mut group_end = next_call.saturating_add(1);
                 if first_policy != ToolConcurrencyPolicy::Exclusive {
-                    while group_end < accumulator.calls.len() {
+                    while group_end < calls.len() {
                         let candidate = dispatch_request(
-                            accumulator.calls[group_end].clone(),
+                            calls[group_end].clone(),
                             &request,
                             &assistant_id,
                             &agent.name,
@@ -1463,8 +1716,13 @@ async fn run_turn_in_span(
                 }
 
                 let mut prepared = Vec::with_capacity(group_end.saturating_sub(next_call));
-                for call_index in next_call..group_end {
-                    let call = accumulator.calls[call_index].clone();
+                for (call_index, call) in calls
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .take(group_end)
+                    .skip(next_call)
+                {
                     let ui_intent = tool_ui_intent(&locked_tools, &call.name);
                     events
                         .send(TurnEvent::ToolDispatchStarted {
@@ -1577,7 +1835,7 @@ async fn run_turn_in_span(
             })
             .await?;
 
-        if !accumulator.calls.is_empty() || injected.count > 0 {
+        if !calls.is_empty() || injected.count > 0 {
             continue;
         }
 
@@ -1595,19 +1853,43 @@ async fn run_turn_in_span(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderStreamExit {
+    Completed,
+    Interrupted,
+    Steered,
+}
+
+async fn wait_for_provider_control(
+    interrupt: InterruptSignal,
+    soft_interrupt: Option<InterruptSignal>,
+) -> ProviderStreamExit {
+    if let Some(soft_interrupt) = soft_interrupt {
+        tokio::select! {
+            biased;
+            () = interrupt.notified() => ProviderStreamExit::Interrupted,
+            () = soft_interrupt.notified() => ProviderStreamExit::Steered,
+        }
+    } else {
+        interrupt.notified().await;
+        ProviderStreamExit::Interrupted
+    }
+}
+
 fn record_provider_attempt(
     request_span: &tracing::Span,
     step: u32,
-    result: &Result<Result<bool, TurnError>, ProviderError>,
+    result: &Result<Result<ProviderStreamExit, TurnError>, ProviderError>,
 ) {
     let (outcome, error_kind, status) = match result {
-        Ok(Ok(true)) => ("interrupted", None, None),
-        Ok(Ok(false)) => ("completed", None, None),
+        Ok(Ok(ProviderStreamExit::Interrupted)) => ("interrupted", None, None),
+        Ok(Ok(ProviderStreamExit::Steered)) => ("steered", None, None),
+        Ok(Ok(ProviderStreamExit::Completed)) => ("completed", None, None),
         Ok(Err(TurnError::Provider(error))) | Err(error) => {
             let (kind, status) = provider_error_metadata(error);
             ("error", Some(kind), status)
         }
-        Ok(Err(_)) => ("turn_error", Some("turn_processing"), None),
+        Ok(Err(error)) => ("turn_error", Some(error.kind()), None),
     };
     span::record_provider_outcome(request_span, outcome, error_kind, status);
     request_span.in_scope(|| {
@@ -2576,6 +2858,14 @@ fn hook_messages(history: &[MessageWithParts]) -> Vec<HookMessageWithParts> {
         .collect()
 }
 
+#[derive(Debug)]
+enum AssistantCheckpointDisposition<'error> {
+    Completed,
+    Interrupted,
+    Steered,
+    Failed(&'error TurnError),
+}
+
 fn checkpoint_assistant(
     connection: &Connection,
     request: &RunTurnRequest,
@@ -2583,7 +2873,7 @@ fn checkpoint_assistant(
     assistant: &mut MessageRecord,
     accumulator: &StepAccumulator,
     locked_tools: &[ToolDefinition],
-    interrupted: bool,
+    disposition: AssistantCheckpointDisposition<'_>,
 ) -> Result<(), TurnError> {
     let completed = now_millis();
     let time = assistant
@@ -2598,14 +2888,34 @@ fn checkpoint_assistant(
             .data
             .insert("finish".to_owned(), Value::String(reason.to_string()));
     }
-    if interrupted {
-        assistant.data.insert(
-            "error".to_owned(),
-            json!({
-                "name": "AbortError",
-                "data": { "message": "The operation was aborted." }
-            }),
-        );
+    match &disposition {
+        AssistantCheckpointDisposition::Completed => {}
+        AssistantCheckpointDisposition::Interrupted => {
+            assistant.data.insert(
+                "error".to_owned(),
+                json!({
+                    "name": "AbortError",
+                    "data": { "message": INTERRUPTED_TURN_NOTICE }
+                }),
+            );
+        }
+        AssistantCheckpointDisposition::Steered => {
+            assistant
+                .data
+                .insert("finish".to_owned(), Value::String("steer".to_owned()));
+        }
+        AssistantCheckpointDisposition::Failed(error) => {
+            assistant
+                .data
+                .insert("finish".to_owned(), Value::String("error".to_owned()));
+            assistant.data.insert(
+                "error".to_owned(),
+                json!({
+                    "name": error.kind(),
+                    "data": { "message": error.durable_message() }
+                }),
+            );
+        }
     }
     update_usage(&mut assistant.data, accumulator);
 
@@ -2664,14 +2974,25 @@ fn checkpoint_assistant(
         )?;
         store.put_part_at(&part, completed)?;
     }
-    for (call_index, call) in accumulator.calls.iter().enumerate() {
-        let tool = pending_tool_part(
+    let tool_failure = match &disposition {
+        AssistantCheckpointDisposition::Completed => None,
+        AssistantCheckpointDisposition::Interrupted => Some(INTERRUPTED_TOOL_RESULT),
+        AssistantCheckpointDisposition::Steered => {
+            Some("[Tool execution skipped because newer user input arrived]")
+        }
+        AssistantCheckpointDisposition::Failed(_) => {
+            Some("[Tool execution skipped because the turn failed]")
+        }
+    };
+    for (call_index, call) in accumulator.checkpoint_calls().iter().enumerate() {
+        let tool = checkpoint_tool_part(
             request,
             step,
             call_index,
             &assistant.id,
             call,
             tool_ui_intent(locked_tools, &call.name),
+            tool_failure,
         )?;
         store.put_part_at(&tool, completed)?;
     }
@@ -2766,14 +3087,31 @@ fn provider_reasoning_part(
     .map_err(TurnError::from)
 }
 
-fn pending_tool_part(
+fn checkpoint_tool_part(
     request: &RunTurnRequest,
     step: u32,
     call_index: usize,
     message_id: &str,
     call: &ToolCall,
     ui_intent: ToolUiIntent,
+    failure: Option<&str>,
 ) -> Result<PartRecord, TurnError> {
+    let state = if let Some(error) = failure {
+        json!({
+            "status": "error",
+            "input": call.input,
+            "raw": call.raw_input,
+            "error": error,
+            "metadata": { "synthetic": true },
+            "time": { "end": now_millis() }
+        })
+    } else {
+        json!({
+            "status": "pending",
+            "input": call.input,
+            "raw": call.raw_input
+        })
+    };
     let mut payload = json!({
         "id": tool_part_id(&request.turn_id, step, call_index),
         "sessionID": request.session_id,
@@ -2782,11 +3120,7 @@ fn pending_tool_part(
         "callID": call.id,
         "tool": call.name,
         "uiIntent": ui_intent,
-        "state": {
-            "status": "pending",
-            "input": call.input,
-            "raw": call.raw_input
-        }
+        "state": state
     });
     if let Some(signature) = &call.thought_signature {
         payload["metadata"] = json!({ "thoughtSignature": signature.as_str() });

@@ -47,6 +47,49 @@ pub fn activate_guard_executable(executable: impl Into<PathBuf>) -> io::Result<(
     }
 }
 
+/// One directly spawned process group owned by the current process.
+///
+/// This is the zero-helper topology used by local stdio MCP: the configured
+/// command is the direct child and process-group leader. The owner is responsible
+/// for TERM/KILL escalation and reaping during normal shutdown.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectProcessGroup {
+    pid: u32,
+}
+
+impl DirectProcessGroup {
+    /// Validate and retain a directly spawned process-group leader.
+    pub fn register(pid: u32) -> io::Result<Self> {
+        validate_process_id(pid)?;
+        validate_process_group_leader(pid)?;
+        Ok(Self { pid })
+    }
+
+    /// Requests cooperative shutdown of the complete process group.
+    pub fn request_termination(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            signal_direct_process_group(self.pid, rustix::process::Signal::TERM)
+        }
+        #[cfg(windows)]
+        {
+            terminate_windows_process_tree(self.pid)
+        }
+    }
+
+    /// Forces every remaining member of the process group to stop.
+    pub fn force_kill(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            signal_direct_process_group(self.pid, rustix::process::Signal::KILL)
+        }
+        #[cfg(windows)]
+        {
+            terminate_windows_process_tree(self.pid)
+        }
+    }
+}
+
 /// Rewrites one program and argument vector through the active containment guard.
 ///
 /// Before activation this is an identity operation, which keeps library-only
@@ -183,6 +226,53 @@ pub fn run_guard_from_args() -> Option<ExitCode> {
             ExitCode::FAILURE
         }
     })
+}
+
+fn validate_process_id(pid: u32) -> io::Result<u32> {
+    if pid == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process id must be positive",
+        ))
+    } else {
+        Ok(pid)
+    }
+}
+
+fn validate_process_group_leader(pid: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let process = process_pid(pid)?;
+        match rustix::process::getpgid(Some(process)) {
+            Ok(group) if group == process => Ok(()),
+            Ok(group) => Err(io::Error::other(format!(
+                "process {pid} belongs to group {} instead of leading its own group",
+                group.as_raw_nonzero()
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _pid = pid;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn process_pid(pid: u32) -> io::Result<rustix::process::Pid> {
+    let pid = validate_process_id(pid)?;
+    rustix::process::Pid::from_raw(pid as i32)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "process id must be positive"))
+}
+
+#[cfg(unix)]
+fn signal_direct_process_group(pid: u32, signal: rustix::process::Signal) -> io::Result<()> {
+    let group = process_pid(pid)?;
+    match rustix::process::kill_process_group(group, signal) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 struct GuardRequest {

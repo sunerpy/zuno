@@ -772,14 +772,20 @@ fn exact_parallel_tools() -> Vec<StreamEvent> {
             id: "a".to_owned(),
             name: "alpha".to_owned(),
         },
-        StreamEvent::ToolInputDelta("{\"x\":1}".to_owned()),
-        StreamEvent::ToolUseEnd,
+        StreamEvent::ToolInputDelta {
+            id: "a".to_owned(),
+            delta: "{\"x\":1}".to_owned(),
+        },
+        StreamEvent::ToolUseEnd { id: "a".to_owned() },
         StreamEvent::ToolUseStart {
             id: "b".to_owned(),
             name: "beta".to_owned(),
         },
-        StreamEvent::ToolInputDelta("{\"y\":2}".to_owned()),
-        StreamEvent::ToolUseEnd,
+        StreamEvent::ToolInputDelta {
+            id: "b".to_owned(),
+            delta: "{\"y\":2}".to_owned(),
+        },
+        StreamEvent::ToolUseEnd { id: "b".to_owned() },
         StreamEvent::MessageEnd {
             stop_reason: Some(FinishReason::ToolCalls),
         },
@@ -796,10 +802,16 @@ fn exact_openai_parallel_tools() -> Vec<StreamEvent> {
             id: "b".to_owned(),
             name: "beta".to_owned(),
         },
-        StreamEvent::ToolInputDelta("{\"x\":1}".to_owned()),
-        StreamEvent::ToolInputDelta("{\"y\":2}".to_owned()),
-        StreamEvent::ToolUseEnd,
-        StreamEvent::ToolUseEnd,
+        StreamEvent::ToolInputDelta {
+            id: "a".to_owned(),
+            delta: "{\"x\":1}".to_owned(),
+        },
+        StreamEvent::ToolInputDelta {
+            id: "b".to_owned(),
+            delta: "{\"y\":2}".to_owned(),
+        },
+        StreamEvent::ToolUseEnd { id: "a".to_owned() },
+        StreamEvent::ToolUseEnd { id: "b".to_owned() },
         StreamEvent::MessageEnd {
             stop_reason: Some(FinishReason::ToolCalls),
         },
@@ -813,20 +825,56 @@ fn exact_openai_parallel_tools() -> Vec<StreamEvent> {
     ]
 }
 
+fn exact_compatible_parallel_tools() -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ToolUseStart {
+            id: "a".to_owned(),
+            name: "alpha".to_owned(),
+        },
+        StreamEvent::ToolInputDelta {
+            id: "a".to_owned(),
+            delta: "{\"x\":1}".to_owned(),
+        },
+        StreamEvent::ToolUseStart {
+            id: "b".to_owned(),
+            name: "beta".to_owned(),
+        },
+        StreamEvent::ToolInputDelta {
+            id: "b".to_owned(),
+            delta: "{\"y\":2}".to_owned(),
+        },
+        StreamEvent::ToolUseEnd { id: "a".to_owned() },
+        StreamEvent::ToolUseEnd { id: "b".to_owned() },
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::ToolCalls),
+        },
+    ]
+}
+
 fn exact_gemini_parallel_tools() -> Vec<StreamEvent> {
     vec![
         StreamEvent::ToolUseStart {
             id: "tool_0".to_owned(),
             name: "alpha".to_owned(),
         },
-        StreamEvent::ToolInputDelta("{\"x\":1}".to_owned()),
-        StreamEvent::ToolUseEnd,
+        StreamEvent::ToolInputDelta {
+            id: "tool_0".to_owned(),
+            delta: "{\"x\":1}".to_owned(),
+        },
+        StreamEvent::ToolUseEnd {
+            id: "tool_0".to_owned(),
+        },
         StreamEvent::ToolUseStart {
             id: "tool_1".to_owned(),
             name: "beta".to_owned(),
         },
-        StreamEvent::ToolInputDelta("{\"y\":2}".to_owned()),
-        StreamEvent::ToolUseEnd,
+        StreamEvent::ToolInputDelta {
+            id: "tool_1".to_owned(),
+            delta: "{\"y\":2}".to_owned(),
+        },
+        StreamEvent::ToolUseEnd {
+            id: "tool_1".to_owned(),
+        },
         StreamEvent::MessageEnd {
             stop_reason: Some(FinishReason::ToolCalls),
         },
@@ -1153,8 +1201,9 @@ fn replay_parallel_tools(family: Family, reason: &str) {
     };
     let expected = match family {
         Family::OpenAi => exact_openai_parallel_tools(),
+        Family::Compatible => exact_compatible_parallel_tools(),
         Family::Gemini => exact_gemini_parallel_tools(),
-        Family::Anthropic | Family::Compatible | Family::Bedrock => exact_parallel_tools(),
+        Family::Anthropic | Family::Bedrock => exact_parallel_tools(),
     };
     assert_eq!(actual, expected, "authored {family:?} parallel-tool replay");
 }
@@ -1407,9 +1456,17 @@ fn cassettes_gemini_tool_signature_keeps_opaque_recorded_bytes() {
                 id: "tool_0".to_owned(),
                 name: "get_weather".to_owned(),
             },
-            StreamEvent::ToolInputDelta("{\"city\":\"Paris\"}".to_owned()),
-            StreamEvent::ToolUseSignature(ThoughtSignature::new(expected_signature)),
-            StreamEvent::ToolUseEnd,
+            StreamEvent::ToolInputDelta {
+                id: "tool_0".to_owned(),
+                delta: "{\"city\":\"Paris\"}".to_owned(),
+            },
+            StreamEvent::ToolUseSignature {
+                id: "tool_0".to_owned(),
+                signature: ThoughtSignature::new(expected_signature),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "tool_0".to_owned(),
+            },
             StreamEvent::TokenUsage {
                 input_tokens: Some(55),
                 output_tokens: Some(60),

@@ -46,8 +46,11 @@ Every submitted input receives an admission identifier before execution. A clien
 
 During an active turn, ordinary text and rich content target the nearest safe
 step as steering. Commands and explicit next-turn work remain queued. A steer
-that misses the final safe point stays durably pending and becomes the next FIFO
-turn; client channel capacity or reconnect timing never decides its fate.
+interrupts a provider wait or provider-retry delay, checkpoints partial assistant
+output without ending the turn, and starts the next model step with the promoted
+input. It does not cancel a side-effecting tool already in flight. A steer that
+misses the final safe point stays durably pending and becomes the next FIFO turn;
+client channel capacity or reconnect timing never decides its fate.
 
 Human input has priority over an automatic goal retry. The client may show the persisted retry deadline and reason, but cancellation, pause, and resume are explicit commands rather than local timer changes.
 
@@ -71,8 +74,18 @@ The TUI favors dense, keyboard-first operation:
   synthetic answer;
 - visible permission, retry, diagnostics, and background-job states;
 - explicit `working`, `awaiting approval`, and `awaiting answer` states. During a
-  running turn the first `Esc` arms interruption and the second within the
-  confirmation window cancels it;
+  running turn the first `Esc` arms interruption and shows the confirmation
+  immediately above the composer; the second within the confirmation window
+  cancels it. If a modal or autocomplete surface owns the first press, that same
+  press closes the surface and arms the turn, so two physical presses remain
+  sufficient. `Stopping the active turn…` remains visible until the terminal turn
+  event clears it; `TurnInterrupted` then appends one session-owned interruption
+  marker, and replay reconstructs that marker from a persisted assistant abort
+  rather than nesting it inside partial assistant output;
+- liveness animation advances from a bounded UI clock, not from provider event
+  arrival. A slow provider, shell command, or MCP call therefore keeps moving
+  while producing no output; the clock stops while waiting for human input and
+  at the completed or interrupted turn boundary;
 - generic rendering for unknown future events;
 - a `system` theme that reads non-invasive terminal color hints when available
   and otherwise preserves the terminal's foreground and background defaults;
@@ -84,14 +97,31 @@ The TUI favors dense, keyboard-first operation:
   success or failure is reported without clearing the highlight.
   `mouse: false` opts back into terminal-native selection and alternate-scroll
   translation;
+- ordinary modal overlays are centred in both axes; composer-owned questions
+  remain anchored to the composer region. An open modal captures pointer input
+  so clicks cannot activate covered transcript or sidebar content. Picker rows
+  and confirmation buttons accept left-click selection as well as keyboard
+  actions. Slash autocomplete, structured questions, permissions, sessions,
+  models, agents, themes, MCP servers, subagents, background jobs, and memory
+  entries are mouse-selectable; list and reference panels accept the wheel as
+  well as keyboard navigation;
+- clicking a user prompt opens its message actions. `Copy message` writes the
+  complete prompt through the shared clipboard path and reports the result.
+  `Revert this turn` is offered only when the live newest prompt has a restorable
+  boundary; choosing it opens the same explicit Restore/Keep confirmation as
+  `/undo`, and only Restore admits the typed undo command;
 - step-level activity summaries for completed routine commands, reads, searches,
   images, and delegations. Running work, approvals, failures, and important
   results remain visible. `Ctrl+T` opens the complete scrollable durable
   transcript and preserves manual scroll position; `Alt+T` changes reasoning
-  effort. Each thinking block remains folded by default, uses muted styling when
-  expanded, and owns an independent disclosure target: clicking its header opens
-  the complete persisted body without changing sibling blocks. `/thinking`
-  remains the keyboard-wide fallback;
+  effort. Each thinking block remains folded by default, uses muted styling in
+  both states, and owns an independent disclosure target. Its header is
+  explicitly labelled `◇ Thought`; tool rows are explicitly labelled `Tool`, so
+  the two secondary content types do not share an ambiguous visual shape.
+  Clicking a thought header opens the complete persisted body without changing
+  sibling blocks. `/thinking` remains the keyboard-wide fallback. If replay
+  contains both the visible reasoning event and an identical provider-reasoning
+  capsule, the client projects one block while retaining both durable records;
 - user and assistant prose use the same CommonMark renderer, including GFM
   tables, lists, headings, code, quotes, and links. Rendering never changes the
   durable source text;
@@ -109,9 +139,10 @@ The TUI favors dense, keyboard-first operation:
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
   row `✓ skill-name · loaded`;
-- an independently scrollable and selectable sidebar whose location/version
-  footer stays fixed. It projects goal, todos, jobs, pending memory, token usage,
-  LSP, MCP, and skills from shared state rather than polling;
+- an independently scrollable and selectable sidebar whose current-session title
+  is a fixed header and whose location/version footer stays fixed. Only the
+  projection body scrolls. It projects goal, todos, jobs, pending memory, token
+  usage, LSP, MCP, and skills from shared state rather than polling;
 - `/ps` for process-owned background terminals and `/memory` for auditable
   candidate review. Both keep their list mounted after an action so several
   entries can be handled consecutively;
@@ -133,8 +164,14 @@ The TUI favors dense, keyboard-first operation:
   history. The physical terminal activation remains mounted throughout, so a
   switch never leaves and re-enters the alternate screen;
 - `/new` performs the same in-process remount to a fresh prepared identity. The
-  command itself creates no row; the first model-bound prompt materializes
-  exactly one new session through the normal durable-input transaction;
+  command opens a blank conversation shell directly rather than returning to the
+  launch welcome page. It creates no row; the first model-bound prompt
+  materializes exactly one new session through the normal durable-input
+  transaction;
+- `/compact` invokes the runtime compaction agent and persists the resulting
+  summary. `compaction.threshold_percent` controls proactive compaction against
+  the usable model window, while `compaction.auto: false` disables that proactive
+  trigger without removing manual compaction or bounded context-limit recovery;
 - the same session list owns row actions: `Ctrl+R` opens a pre-filled rename
   prompt, while `Ctrl+D` must be pressed twice on the same row before deletion.
   Both actions are revalidated by the host and use the transactional session

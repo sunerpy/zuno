@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use zuno_agent::reflection::{
-    CommandOutcome, CompactionMode, ReflectionConfig, ReflectionError, ReflectionFork,
-    ReflectionRequest, ReflectionRunner, ReflectionTools, TranscriptEvent, TurnDelivery,
-    TurnTranscript,
+    CommandOutcome, CompactionMode, ReflectionError, ReflectionFork, ReflectionMemoryEntry,
+    ReflectionMemoryScope, ReflectionRequest, ReflectionRunner, ReflectionTools, TranscriptEvent,
+    TurnDelivery, TurnTranscript,
 };
 
 use super::support::{
@@ -50,7 +50,7 @@ async fn fork_spawns_only_after_a_delivered_response_when_turn_is_eligible() {
     // Given
     let memory = MemoryProbe::default();
     let runner = Arc::new(WritingRunner::default());
-    let fork = fork(1, Arc::clone(&runner), &memory);
+    let fork = fork(Arc::clone(&runner), &memory);
 
     // When
     let missing_response =
@@ -68,50 +68,11 @@ async fn fork_spawns_only_after_a_delivered_response_when_turn_is_eligible() {
 }
 
 #[tokio::test]
-async fn default_counter_triggers_on_the_tenth_delivered_user_turn() {
+async fn selected_failure_then_success_turn_is_reflected() {
     // Given
     let memory = MemoryProbe::default();
     let runner = Arc::new(WritingRunner::default());
-    let fork = ReflectionFork::new(
-        ReflectionConfig::default(),
-        runner.clone(),
-        Arc::new(memory.clone()),
-    );
-
-    // When
-    for turn_number in 1..10 {
-        let task = fork.spawn_after_turn(delivered(neutral_transcript()));
-        assert!(task.is_none(), "turn {turn_number} must not trigger early");
-    }
-    await_spawned(fork.spawn_after_turn(delivered(neutral_transcript()))).await;
-
-    // Then
-    assert_eq!(runner.review_count(), 1);
-    assert_eq!(memory.call_count(), 1);
-}
-
-#[tokio::test]
-async fn zero_interval_disables_only_the_periodic_trigger() {
-    // Given
-    let memory = MemoryProbe::default();
-    let runner = Arc::new(WritingRunner::default());
-    let fork = fork(0, Arc::clone(&runner), &memory);
-
-    // When
-    let task = fork.spawn_after_turn(delivered(neutral_transcript()));
-
-    // Then
-    assert!(task.is_none());
-    assert_eq!(runner.review_count(), 0);
-    assert_eq!(memory.call_count(), 0);
-}
-
-#[tokio::test]
-async fn failure_then_success_of_the_same_command_triggers_with_counter_disabled() {
-    // Given
-    let memory = MemoryProbe::default();
-    let runner = Arc::new(WritingRunner::default());
-    let fork = fork(0, Arc::clone(&runner), &memory);
+    let fork = fork(Arc::clone(&runner), &memory);
     let transcript = TurnTranscript::new(vec![
         TranscriptEvent::command(
             "cargo test -p zuno-agent",
@@ -137,19 +98,37 @@ async fn fork_replays_an_owned_transcript_with_compaction_disabled() {
     // Given
     let memory = MemoryProbe::default();
     let runner = Arc::new(CaptureRunner::default());
-    let fork = fork(1, Arc::clone(&runner), &memory);
+    let fork = fork(Arc::clone(&runner), &memory);
     let transcript = TurnTranscript::new(vec![
         TranscriptEvent::user("Use cargo nextest for this repository."),
         TranscriptEvent::assistant("Understood."),
     ]);
 
     // When
-    await_spawned(fork.spawn_after_turn(delivered(transcript.clone()))).await;
+    let resident_memory = vec![ReflectionMemoryEntry::new(
+        ReflectionMemoryScope::Project,
+        "Run cargo nextest before the workspace gate.",
+    )];
+    await_spawned(fork.spawn_after_turn(
+        delivered(transcript.clone()).with_resident_memory(resident_memory.clone()),
+    ))
+    .await;
     let request = runner.take_request();
 
     // Then
     assert_eq!(request.transcript, transcript);
     assert_eq!(request.compaction, CompactionMode::Disabled);
+    assert_eq!(request.resident_memory, resident_memory);
+    assert!(
+        request
+            .prompt
+            .contains("prefer replace over add when a new fact refines")
+    );
+    assert!(
+        request
+            .prompt
+            .contains("Run cargo nextest before the workspace gate.")
+    );
     assert_eq!(request.source_session_id, "ses_reflection");
     assert_eq!(request.source_message_id, "msg_reflection");
     assert_eq!(memory.call_count(), 0);
@@ -159,15 +138,21 @@ async fn fork_replays_an_owned_transcript_with_compaction_disabled() {
 async fn panicking_fork_leaves_the_main_turn_result_untouched() {
     // Given
     let memory = MemoryProbe::default();
-    let fork = fork(1, Arc::new(PanickingRunner), &memory);
+    let fork = fork(Arc::new(PanickingRunner), &memory);
     let main_result = String::from("answer already delivered");
 
     // When
-    await_spawned(fork.spawn_after_turn(delivered(neutral_transcript()))).await;
+    let error = fork
+        .spawn_after_turn(delivered(neutral_transcript()))
+        .expect("reflection starts")
+        .await
+        .expect("reflection task joins")
+        .expect_err("runner panic is surfaced to the durable owner");
 
     // Then
     assert_eq!(main_result, "answer already delivered");
     assert_eq!(memory.call_count(), 0);
+    assert!(error.to_string().contains("task failed"));
 }
 
 #[tokio::test]
@@ -176,10 +161,6 @@ async fn aborting_the_returned_task_cancels_the_nested_review() {
     let entered = Arc::new(tokio::sync::Notify::new());
     let dropped = Arc::new(AtomicBool::new(false));
     let fork = ReflectionFork::new(
-        ReflectionConfig {
-            enabled: true,
-            turn_interval: 1,
-        },
         Arc::new(BlockingRunner {
             entered: Arc::clone(&entered),
             dropped: Arc::clone(&dropped),
@@ -204,16 +185,22 @@ async fn aborting_the_returned_task_cancels_the_nested_review() {
 }
 
 #[tokio::test]
-async fn ordinary_reflection_error_is_swallowed_after_delivery() {
+async fn ordinary_reflection_error_is_reported_after_delivery() {
     // Given
     let memory = MemoryProbe::default();
-    let fork = fork(1, Arc::new(FailingRunner), &memory);
+    let fork = fork(Arc::new(FailingRunner), &memory);
 
     // When
-    await_spawned(fork.spawn_after_turn(delivered(neutral_transcript()))).await;
+    let error = fork
+        .spawn_after_turn(delivered(neutral_transcript()))
+        .expect("reflection starts")
+        .await
+        .expect("reflection task joins")
+        .expect_err("runner failure is returned to the durable owner");
 
     // Then
     assert_eq!(memory.call_count(), 0);
+    assert_eq!(error.to_string(), "reflection failed");
 }
 
 #[tokio::test]
@@ -221,7 +208,7 @@ async fn one_user_correction_produces_exactly_one_memory_write() {
     // Given
     let memory = MemoryProbe::default();
     let runner = Arc::new(WritingRunner::default());
-    let fork = fork(1, Arc::clone(&runner), &memory);
+    let fork = fork(Arc::clone(&runner), &memory);
     let transcript = TurnTranscript::new(vec![TranscriptEvent::user(
         "Correction: use cargo nextest instead of cargo test in this repository.",
     )]);

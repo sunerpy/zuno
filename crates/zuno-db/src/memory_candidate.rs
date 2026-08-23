@@ -10,8 +10,8 @@ use zuno_types::{
 
 const TABLE: &str = "memory_candidate";
 const COLUMNS: &str = "id, target, target_path, action, content, old_text, reason, confidence, \
-    source_kind, source_session_id, source_message_id, status, before_entries, after_entries, \
-    error, time_created, time_updated, time_applied";
+    source_kind, source_session_id, source_message_id, fingerprint, status, before_entries, \
+    after_entries, error, time_created, time_updated, time_applied";
 
 /// A validated candidate waiting to be inserted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +27,7 @@ pub struct NewMemoryCandidate {
     pub source: MemorySource,
     pub source_session_id: Option<String>,
     pub source_message_id: Option<String>,
+    pub fingerprint: Option<String>,
     pub time_created: i64,
 }
 
@@ -35,6 +36,7 @@ pub struct NewMemoryCandidate {
 pub struct MemoryCandidateRecord {
     pub projection: MemoryCandidateProjection,
     pub target_path: String,
+    pub fingerprint: Option<String>,
     pub before_entries: Option<Vec<String>>,
     pub after_entries: Option<Vec<String>>,
     pub time_applied: Option<i64>,
@@ -45,6 +47,13 @@ impl MemoryCandidateRecord {
     pub fn id(&self) -> &str {
         &self.projection.id
     }
+}
+
+/// Whether an idempotent candidate call inserted a new row or reused its source twin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryCandidateInsert {
+    pub record: MemoryCandidateRecord,
+    pub inserted: bool,
 }
 
 /// Candidate access over the initialized session database.
@@ -60,14 +69,27 @@ impl MemoryCandidateStore {
     }
 
     pub fn create(&self, candidate: NewMemoryCandidate) -> Result<MemoryCandidateRecord, DbError> {
+        self.create_or_get(candidate).map(|insert| insert.record)
+    }
+
+    pub fn create_or_get(
+        &self,
+        candidate: NewMemoryCandidate,
+    ) -> Result<MemoryCandidateInsert, DbError> {
         self.pool.transaction(|transaction| {
-            transaction
+            let changed = transaction
                 .execute(
                     "INSERT INTO memory_candidate (
                         id, target, target_path, action, content, old_text, reason, confidence,
-                        source_kind, source_session_id, source_message_id, status,
+                        source_kind, source_session_id, source_message_id, fingerprint, status,
                         time_created, time_updated
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?12)",
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        'pending', ?13, ?13
+                     )
+                     ON CONFLICT (source_session_id, source_message_id, fingerprint)
+                     WHERE source_kind = 'reflection' AND fingerprint IS NOT NULL
+                     DO NOTHING",
                     params![
                         candidate.id,
                         candidate.target.as_str(),
@@ -80,11 +102,31 @@ impl MemoryCandidateStore {
                         candidate.source.as_str(),
                         candidate.source_session_id,
                         candidate.source_message_id,
+                        candidate.fingerprint,
                         candidate.time_created,
                     ],
                 )
                 .map_err(open::map_error)?;
-            read_required(transaction, &candidate.id)
+            if changed == 1 {
+                return Ok(MemoryCandidateInsert {
+                    record: read_required(transaction, &candidate.id)?,
+                    inserted: true,
+                });
+            }
+            let fingerprint = candidate.fingerprint.as_deref().ok_or_else(|| {
+                query_error(std::io::Error::other(
+                    "memory candidate insert changed no rows without an idempotency fingerprint",
+                ))
+            })?;
+            Ok(MemoryCandidateInsert {
+                record: read_by_fingerprint(
+                    transaction,
+                    candidate.source_session_id.as_deref(),
+                    candidate.source_message_id.as_deref(),
+                    fingerprint,
+                )?,
+                inserted: false,
+            })
         })
     }
 
@@ -154,7 +196,7 @@ impl MemoryCandidateStore {
                 .execute(
                     "UPDATE memory_candidate
                      SET content = ?2, old_text = ?3, reason = ?4, confidence = ?5,
-                         error = NULL, time_updated = ?6
+                         fingerprint = NULL, error = NULL, time_updated = ?6
                      WHERE id = ?1 AND status IN ('pending','failed')",
                     params![
                         id,
@@ -257,6 +299,38 @@ fn read_required(
         .and_then(decode_record)
 }
 
+fn read_by_fingerprint(
+    connection: &rusqlite::Connection,
+    source_session_id: Option<&str>,
+    source_message_id: Option<&str>,
+    fingerprint: &str,
+) -> Result<MemoryCandidateRecord, DbError> {
+    let (Some(source_session_id), Some(source_message_id)) = (source_session_id, source_message_id)
+    else {
+        return Err(query_error(std::io::Error::other(
+            "reflection candidate fingerprint requires source session and message ids",
+        )));
+    };
+    connection
+        .query_row(
+            &format!(
+                "SELECT {COLUMNS} FROM {TABLE}
+                 WHERE source_kind = 'reflection' AND source_session_id = ?1
+                   AND source_message_id = ?2 AND fingerprint = ?3"
+            ),
+            params![source_session_id, source_message_id, fingerprint],
+            decode_row,
+        )
+        .optional()
+        .map_err(open::map_error)?
+        .ok_or_else(|| {
+            query_error(std::io::Error::other(
+                "idempotent memory candidate disappeared during insertion",
+            ))
+        })
+        .and_then(decode_record)
+}
+
 type StoredRow = (
     String,
     String,
@@ -267,6 +341,7 @@ type StoredRow = (
     String,
     i64,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     String,
@@ -298,6 +373,7 @@ fn decode_row(row: &Row<'_>) -> rusqlite::Result<StoredRow> {
         row.get(15)?,
         row.get(16)?,
         row.get(17)?,
+        row.get(18)?,
     ))
 }
 
@@ -314,6 +390,7 @@ fn decode_record(row: StoredRow) -> Result<MemoryCandidateRecord, DbError> {
         source,
         source_session_id,
         source_message_id,
+        fingerprint,
         status,
         before_entries,
         after_entries,
@@ -352,6 +429,7 @@ fn decode_record(row: StoredRow) -> Result<MemoryCandidateRecord, DbError> {
             time_updated,
         },
         target_path,
+        fingerprint,
         before_entries: decode_entries(before_entries)?,
         after_entries: decode_entries(after_entries)?,
         time_applied,

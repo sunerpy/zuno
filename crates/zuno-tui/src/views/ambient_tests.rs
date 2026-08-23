@@ -134,9 +134,18 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
         }],
         jobs: vec![zuno_types::JobProjection {
             id: "job_1".to_owned(),
-            subject: "codex · review patch".to_owned(),
+            subject: zuno_types::JobSubjectProjection::ProductAgent {
+                run_id: "run_1".to_owned(),
+                product: "codex".to_owned(),
+                instance: "review patch".to_owned(),
+                tool: "subagent_codex".to_owned(),
+            },
             status: "running".to_owned(),
             report_delivery: "quiet".to_owned(),
+            result: None,
+            error: None,
+            time_created: 1,
+            time_completed: None,
         }],
         memory_candidates: vec![zuno_types::MemoryCandidateProjection {
             id: "mem_1".to_owned(),
@@ -328,6 +337,7 @@ fn views_sidebar_skill_names_appear_only_once_expanded() {
 #[test]
 fn views_sidebar_scrolls_its_body_independently_and_keeps_the_footer_pinned() {
     let mut view = view();
+    view.ambient_mut().title = Some(String::from("Investigating the frozen turn"));
     view.ambient_mut().skills = (0..24)
         .map(|index| SkillSummary {
             name: format!("skill-{index:02}"),
@@ -353,6 +363,11 @@ fn views_sidebar_scrolls_its_body_independently_and_keeps_the_footer_pinned() {
     assert!(
         after.join("\n").contains("skill-23 · loaded"),
         "the loaded skill is not labelled after scrolling:\n{}",
+        after.join("\n")
+    );
+    assert!(
+        after.join("\n").contains("Investigating the frozen turn"),
+        "scrolling the sidebar moved the current session title off its fixed header:\n{}",
         after.join("\n")
     );
     assert_eq!(

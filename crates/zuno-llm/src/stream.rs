@@ -98,8 +98,13 @@ impl StreamAccumulator {
             StreamEvent::ToolUseStart { id, name } => self
                 .tool_calls
                 .push(ToolCallAccumulator::new(id.clone(), name.clone())),
-            StreamEvent::ToolInputDelta(delta) => {
-                if let Some(tool_call) = self.tool_calls.last_mut() {
+            StreamEvent::ToolInputDelta { id, delta } => {
+                if let Some(tool_call) = self
+                    .tool_calls
+                    .iter_mut()
+                    .rev()
+                    .find(|tool_call| tool_call.id == *id)
+                {
                     append_tool_input(
                         &mut tool_call.raw_input,
                         delta,
@@ -109,9 +114,14 @@ impl StreamAccumulator {
                     )?;
                 }
             }
-            StreamEvent::ToolUseEnd => {}
-            StreamEvent::ToolUseSignature(signature) => {
-                if let Some(tool_call) = self.tool_calls.last_mut() {
+            StreamEvent::ToolUseEnd { .. } => {}
+            StreamEvent::ToolUseSignature { id, signature } => {
+                if let Some(tool_call) = self
+                    .tool_calls
+                    .iter_mut()
+                    .rev()
+                    .find(|tool_call| tool_call.id == *id)
+                {
                     tool_call.thought_signature = Some(signature.clone());
                 }
             }

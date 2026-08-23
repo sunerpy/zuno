@@ -6,7 +6,7 @@ use crate::config::{BindingValue, ResolvedTuiConfig};
 use crate::views::dialog::{DialogHost, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 
 fn keymap() -> Keymap {
     Keymap::defaults().expect("the shipped table builds")
@@ -208,6 +208,24 @@ fn views_help_unbound_row_is_muted_from_the_palette() {
 // ---------------------------------------------------------------------------
 // Filtering and scrolling
 // ---------------------------------------------------------------------------
+
+#[test]
+fn views_help_scrolls_with_the_mouse_wheel() {
+    let mut view = help();
+    assert_eq!(
+        view.handle_mouse(
+            &MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            ratatui::layout::Rect::new(0, 0, 80, 20),
+        ),
+        DialogStep::Redraw
+    );
+    assert_eq!(view.offset, 1);
+}
 
 #[test]
 fn views_help_filter_matches_action_description_and_keys() {

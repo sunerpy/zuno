@@ -1,6 +1,7 @@
 //! Durable candidate workflow for resident memory.
 
 use crate::{MemoryError, MemoryStore, Operation, Scope, ScopeLimits};
+use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -162,12 +163,13 @@ impl MemoryService {
             proposal.content.as_deref(),
             proposal.old_text.as_deref(),
         )?;
+        let fingerprint = proposal_fingerprint(&proposal)?;
         let scope = Scope::from(proposal.scope);
         let mut resident = self.open(scope)?;
         resident.preview_batch(std::slice::from_ref(&operation))?;
 
         let now = zuno_db::message::now_millis();
-        let candidate = self.store.create(NewMemoryCandidate {
+        let insert = self.store.create_or_get(NewMemoryCandidate {
             id: format!("mem_{}", Uuid::new_v4().simple()),
             target: proposal.scope,
             target_path: self.paths.wire_path(scope),
@@ -179,8 +181,13 @@ impl MemoryService {
             source: proposal.source,
             source_session_id: proposal.source_session_id,
             source_message_id: proposal.source_message_id,
+            fingerprint,
             time_created: now,
         })?;
+        let candidate = insert.record;
+        if !insert.inserted {
+            return Ok(candidate);
+        }
         self.notify();
         if self.promotion.applies(confidence) {
             return self.apply(candidate.id());
@@ -542,4 +549,35 @@ fn confidence_basis_points(confidence: f64) -> Result<u16, MemoryServiceError> {
         ));
     }
     Ok((confidence * 10_000.0).round() as u16)
+}
+
+fn proposal_fingerprint(proposal: &MemoryProposal) -> Result<Option<String>, MemoryServiceError> {
+    if proposal.source != MemorySource::Reflection {
+        return Ok(None);
+    }
+    if proposal
+        .source_session_id
+        .as_deref()
+        .is_none_or(str::is_empty)
+        || proposal
+            .source_message_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err(MemoryServiceError::Invalid(
+            "reflection candidates require source session and message ids".to_owned(),
+        ));
+    }
+    let normalized = [
+        proposal.scope.as_str(),
+        proposal.action.as_str(),
+        normalize_fingerprint_text(proposal.content.as_deref()),
+        normalize_fingerprint_text(proposal.old_text.as_deref()),
+    ]
+    .join("\u{0}");
+    Ok(Some(hex::encode(Sha256::digest(normalized.as_bytes()))))
+}
+
+fn normalize_fingerprint_text(value: Option<&str>) -> &str {
+    value.map_or("", str::trim)
 }

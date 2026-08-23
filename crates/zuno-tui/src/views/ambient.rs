@@ -843,10 +843,30 @@ impl SidebarView {
     /// surface to assert against, and the buffer test then proves the rows land.
     #[must_use]
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.rows(width).lines
+        let mut lines = self.title_lines(width);
+        lines.extend(self.rows(width).lines);
+        lines
     }
 
-    /// The rows and, in the same pass, which of them is a section heading.
+    /// The current session's fixed header.
+    ///
+    /// Kept outside [`Self::rows`] because that collection is the independently
+    /// scrollable body. Putting the title in it technically placed the name first, but
+    /// scrolling an expanded Skills section moved the name off-screen — exactly when a
+    /// user needs the panel to keep saying which session the remaining facts belong to.
+    fn title_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(name) = &self.ambient.title else {
+            return Vec::new();
+        };
+        let mut lines = wrap(name, usize::from(width), TITLE_MAX_ROWS)
+            .into_iter()
+            .map(|row| padded(&row, width, self.context.title()))
+            .collect::<Vec<_>>();
+        lines.push(padded("", width, self.context.surface()));
+        lines
+    }
+
+    /// The scrollable rows and, in the same pass, which of them is a section heading.
     ///
     /// One pass rather than a second method that recomputes the offsets: two collectors
     /// over one fact is how this panel came to advertise `0 lsp` while twenty servers ran,
@@ -855,20 +875,6 @@ impl SidebarView {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut headers: Vec<(usize, Section)> = Vec::new();
         let blank = || padded("", width, self.context.surface());
-
-        // Above `Context`, and above it specifically because this is the one row that says
-        // *which* session the numbers below belong to. Everything else in the panel
-        // describes the machine — token spend, servers, skills — and is true of any session
-        // this build could be running; the name is the only fact that identifies this one,
-        // so it reads first for the same reason a document's title precedes its body.
-        //
-        // Styled `title()` rather than `text()` so it does not read as another data row.
-        if let Some(name) = &self.ambient.title {
-            for row in wrap(name, usize::from(width), TITLE_MAX_ROWS) {
-                lines.push(padded(&row, width, self.context.title()));
-            }
-            lines.push(blank());
-        }
 
         lines.push(self.heading("Context", "", None, width));
         if self.ambient.usage_state == crate::views::message::UsageState::Unavailable {
@@ -987,8 +993,18 @@ impl SidebarView {
                         "cancelled" => self.context.muted(),
                         _ => self.context.text(),
                     };
+                    let subject = match &job.subject {
+                        zuno_types::JobSubjectProjection::ChildSession { session_id } => {
+                            format!("child {session_id}")
+                        }
+                        zuno_types::JobSubjectProjection::ProductAgent {
+                            product,
+                            instance,
+                            ..
+                        } => format!("{product} · {instance}"),
+                    };
                     lines.push(padded(
-                        &format!("  {} · {}", job.subject, job.status),
+                        &format!("  {subject} · {}", job.status),
                         width,
                         style,
                     ));
@@ -1252,12 +1268,18 @@ impl Component for SidebarView {
             return;
         }
 
+        let title = self.title_lines(inner.width);
+        let title_height = title.len().min(usize::from(inner.height));
+        let remaining = inner
+            .height
+            .saturating_sub(u16::try_from(title_height).unwrap_or(inner.height));
         let footer_height = self
             .footer_lines(inner.width)
             .len()
-            .min(usize::from(inner.height));
+            .min(usize::from(remaining));
         let body_height = inner
             .height
+            .saturating_sub(u16::try_from(title_height).unwrap_or(inner.height))
             .saturating_sub(u16::try_from(footer_height).unwrap_or(inner.height));
         let provisional = self.rows(inner.width);
         let scrollable = provisional.lines.len() > usize::from(body_height) && inner.width > 1;
@@ -1269,10 +1291,24 @@ impl Component for SidebarView {
         };
         let footer = self.footer_lines(body_width);
         let body = Rect {
+            y: inner
+                .y
+                .saturating_add(u16::try_from(title_height).unwrap_or(inner.height)),
             width: body_width,
             height: body_height,
             ..inner
         };
+        if title_height > 0 {
+            Paragraph::new(title.into_iter().take(title_height).collect::<Vec<_>>())
+                .style(self.context.surface())
+                .render(
+                    Rect {
+                        height: u16::try_from(title_height).unwrap_or(inner.height),
+                        ..inner
+                    },
+                    frame.buffer_mut(),
+                );
+        }
         self.body_area = Some(body);
         self.content_height = rows.lines.len();
         self.viewport_height = usize::from(body.height);

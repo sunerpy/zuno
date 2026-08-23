@@ -1,6 +1,6 @@
 use crate::read::{
     FileToolRuntime, PathKind, check_interrupt, decode_text, encode_text, failed, invalid,
-    report_diff, report_formatting, write_with_dirs,
+    report_diff, report_formatting, report_post_write_warnings, uncertain, write_with_dirs,
 };
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -95,34 +95,55 @@ impl TypedTool for EditTool {
         };
         let bytes = encode_text(&next, decoded.bom);
         write_with_dirs(&target.canonical, &bytes).map_err(|error| failed("edit", error))?;
-        check_interrupt("edit", &ctx)?;
+        let applied = vec![target.canonical.clone()];
+        let mut warnings = Vec::new();
+        if ctx.is_interrupted() {
+            warnings.push(
+                "The edit was written before cancellation; formatting was skipped.".to_owned(),
+            );
+        }
         // Past this point the edit has landed, so nothing a formatter does may
         // turn into an `Err` from this tool.
-        let outcome = self
-            .runtime
-            .formatter
-            .format_reporting(&target.canonical)
-            .await
-            .map_err(|error| failed("edit", error))?;
+        let outcome = if ctx.is_interrupted() {
+            Default::default()
+        } else {
+            match self
+                .runtime
+                .formatter
+                .format_reporting(&target.canonical)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    warnings.push(format!(
+                        "The edit was written, but the formatter service failed: {error}"
+                    ));
+                    Default::default()
+                }
+            }
+        };
         let final_bytes =
-            std::fs::read(&target.canonical).map_err(|error| failed("edit", error))?;
+            std::fs::read(&target.canonical).map_err(|error| uncertain("edit", &applied, error))?;
         self.runtime
             .state
             .record_write(&ctx.session_id, &target.canonical, &final_bytes);
 
         let label = self.runtime.title(&target);
-        Ok(report_formatting(
-            report_diff(
-                ToolOutput::text(label.clone(), "Edit applied successfully.")
-                    .with_metadata("filepath", target.canonical.to_string_lossy().into_owned())
-                    .with_metadata("replacements", replacements)
-                    .with_metadata("formatted", outcome.changed)
-                    .with_written_path(&target.canonical),
-                &label,
-                &source,
-                &final_bytes,
+        Ok(report_post_write_warnings(
+            report_formatting(
+                report_diff(
+                    ToolOutput::text(label.clone(), "Edit applied successfully.")
+                        .with_metadata("filepath", target.canonical.to_string_lossy().into_owned())
+                        .with_metadata("replacements", replacements)
+                        .with_metadata("formatted", outcome.changed)
+                        .with_written_path(&target.canonical),
+                    &label,
+                    &source,
+                    &final_bytes,
+                ),
+                &outcome.failures,
             ),
-            &outcome.failures,
+            &warnings,
         ))
     }
 }

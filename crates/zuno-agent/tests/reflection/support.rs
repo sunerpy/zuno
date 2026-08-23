@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use zuno_agent::reflection::{
-    ReflectionConfig, ReflectionError, ReflectionFork, ReflectionRequest, ReflectionRunner,
-    ReflectionToolCall, ReflectionTools, ReflectionTurn, TurnDelivery, TurnTranscript,
+    ReflectionError, ReflectionFork, ReflectionRequest, ReflectionRunner, ReflectionToolCall,
+    ReflectionTools, ReflectionTurn, TurnDelivery, TurnTranscript,
 };
 use zuno_error::ToolError;
 use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext, ToolOutput};
@@ -168,18 +168,11 @@ impl ReflectionRunner for FailingRunner {
     }
 }
 
-pub fn fork<R>(turn_interval: u64, runner: Arc<R>, memory: &MemoryProbe) -> ReflectionFork
+pub fn fork<R>(runner: Arc<R>, memory: &MemoryProbe) -> ReflectionFork
 where
     R: ReflectionRunner + 'static,
 {
-    ReflectionFork::new(
-        ReflectionConfig {
-            enabled: true,
-            turn_interval,
-        },
-        runner,
-        Arc::new(memory.clone()),
-    )
+    ReflectionFork::new(runner, Arc::new(memory.clone()))
 }
 
 pub fn turn(delivery: TurnDelivery, transcript: TurnTranscript) -> ReflectionTurn {
@@ -201,8 +194,9 @@ pub fn context() -> ToolContext {
     )
 }
 
-pub async fn await_spawned(task: Option<tokio::task::JoinHandle<()>>) {
+pub async fn await_spawned(task: Option<tokio::task::JoinHandle<Result<(), ReflectionError>>>) {
     task.expect("reflection should be spawned")
         .await
-        .expect("reflection task failures are swallowed")
+        .expect("reflection task joins")
+        .expect("reflection review succeeds")
 }

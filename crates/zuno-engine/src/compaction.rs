@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tracing::Instrument as _;
-use zuno_config::schema::CompactionConfig;
+use zuno_config::schema::{CompactionConfig, DEFAULT_COMPACTION_THRESHOLD_PERCENT};
 use zuno_db::Connection;
 use zuno_db::message::{MessageRecord, MessageStore, PartRecord, now_millis};
 use zuno_error::{DbError, Recovery};
@@ -95,6 +95,8 @@ pub enum CompactionTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionPolicy {
     pub auto: bool,
+    pub threshold_percent: u8,
+    pub threshold_tokens: u64,
     pub prune: bool,
     pub tail_turns: u32,
     pub preserve_recent_tokens: u64,
@@ -114,6 +116,14 @@ impl CompactionPolicy {
         let usable_tokens = window
             .context
             .saturating_sub(window.max_output.max(reserved));
+        let threshold_percent = config
+            .threshold_percent
+            .map_or(DEFAULT_COMPACTION_THRESHOLD_PERCENT, |percent| {
+                percent.get()
+            });
+        let threshold_tokens =
+            u64::try_from(u128::from(usable_tokens) * u128::from(threshold_percent) / 100)
+                .unwrap_or(u64::MAX);
         let preserve_recent_tokens =
             config
                 .preserve_recent_tokens
@@ -124,6 +134,8 @@ impl CompactionPolicy {
                 });
         Self {
             auto: config.auto.unwrap_or(true),
+            threshold_percent,
+            threshold_tokens,
             prune: config.prune.unwrap_or(false),
             tail_turns: config.tail_turns.unwrap_or(DEFAULT_TAIL_TURNS),
             preserve_recent_tokens,
@@ -139,7 +151,7 @@ impl CompactionPolicy {
     pub const fn should_compact(self, trigger: CompactionTrigger) -> bool {
         match trigger {
             CompactionTrigger::Threshold { used_tokens } => {
-                self.context_enabled && self.auto && used_tokens >= self.usable_tokens
+                self.context_enabled && self.auto && used_tokens >= self.threshold_tokens
             }
             CompactionTrigger::ContextLimit { .. } => true,
             CompactionTrigger::Manual => true,

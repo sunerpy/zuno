@@ -229,9 +229,10 @@ fn stream_ending_mid_tool_input_synthesizes_an_error_without_panicking() {
         })
         .expect("start tool input");
     projector
-        .apply(StreamEvent::ToolInputDelta(
-            r#"{"filePath":"README.md""#.to_owned(),
-        ))
+        .apply(StreamEvent::ToolInputDelta {
+            id: "call-incomplete".to_owned(),
+            delta: r#"{"filePath":"README.md""#.to_owned(),
+        })
         .expect("accumulate incomplete JSON without parsing it");
     projector
         .finish_incomplete("provider stream ended before ToolUseEnd")
@@ -266,12 +267,15 @@ fn stream_tool_input_is_parsed_once_at_end_with_a_trailing_comma_repair() {
         })
         .expect("start tool input");
     projector
-        .apply(StreamEvent::ToolInputDelta(
-            r#"{"filePath":"README.md",}"#.to_owned(),
-        ))
+        .apply(StreamEvent::ToolInputDelta {
+            id: "call-lenient".to_owned(),
+            delta: r#"{"filePath":"README.md",}"#.to_owned(),
+        })
         .expect("accumulate malformed fragment");
     projector
-        .apply(StreamEvent::ToolUseEnd)
+        .apply(StreamEvent::ToolUseEnd {
+            id: "call-lenient".to_owned(),
+        })
         .expect("parse complete accumulated input leniently");
     drop(projector);
 
@@ -376,9 +380,17 @@ fn stream_event_families_project_to_their_terminal_part_shapes() {
             id: "provider-call".to_owned(),
             name: "read".to_owned(),
         },
-        StreamEvent::ToolInputDelta(r#"{"filePath":"README.md"}"#.to_owned()),
-        StreamEvent::ToolUseEnd,
-        StreamEvent::ToolUseSignature(ThoughtSignature::new("tool-signature")),
+        StreamEvent::ToolInputDelta {
+            id: "provider-call".to_owned(),
+            delta: r#"{"filePath":"README.md"}"#.to_owned(),
+        },
+        StreamEvent::ToolUseEnd {
+            id: "provider-call".to_owned(),
+        },
+        StreamEvent::ToolUseSignature {
+            id: "provider-call".to_owned(),
+            signature: ThoughtSignature::new("tool-signature"),
+        },
         StreamEvent::ToolResult {
             tool_use_id: "provider-call".to_owned(),
             content: "contents".to_owned(),

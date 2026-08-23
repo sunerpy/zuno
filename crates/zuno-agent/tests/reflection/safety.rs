@@ -11,7 +11,7 @@ async fn non_memory_tool_call_is_denied_at_reflection_dispatch() {
     // Given
     let memory = MemoryProbe::default();
     let runner = Arc::new(DeniedToolRunner::default());
-    let fork = fork(1, Arc::clone(&runner), &memory);
+    let fork = fork(Arc::clone(&runner), &memory);
     let transcript = TurnTranscript::new(vec![TranscriptEvent::user(
         "Remember that this repository uses cargo nextest.",
     )]);
@@ -30,7 +30,7 @@ async fn non_memory_tool_call_is_denied_at_reflection_dispatch() {
 async fn assert_transcript_is_not_learned(transcript: TurnTranscript) {
     let memory = MemoryProbe::default();
     let runner = Arc::new(WritingRunner::default());
-    let fork = fork(1, Arc::clone(&runner), &memory);
+    let fork = fork(Arc::clone(&runner), &memory);
 
     let task = fork.spawn_after_turn(delivered(transcript));
 

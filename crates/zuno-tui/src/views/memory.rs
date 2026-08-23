@@ -4,7 +4,8 @@ use crate::keybind::Definition;
 use crate::views::ambient::WorkState;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogStep, DialogWidth};
 use crate::views::{ViewContext, truncate};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use zuno_types::{
     MemoryAction, MemoryCandidateProjection, MemoryCandidateStatus, MemoryEntryProjection,
@@ -350,5 +351,30 @@ impl Dialog for MemoryView {
             }
             _ => DialogStep::Ignored,
         }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => return self.step(-1),
+            MouseEventKind::ScrollDown => return self.step(1),
+            MouseEventKind::Up(MouseButton::Left) => {}
+            _ => return DialogStep::Ignored,
+        }
+        let items = self.items();
+        let index = usize::from(event.row.saturating_sub(body.top()));
+        if index >= items.len() {
+            return DialogStep::Ignored;
+        }
+        self.cursor = index;
+        self.expanded = true;
+        self.confirm_remove = None;
+        DialogStep::Redraw
     }
 }

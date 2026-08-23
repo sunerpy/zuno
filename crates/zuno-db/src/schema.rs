@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 21;
+pub const TABLE_COUNT: usize = 23;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -231,6 +231,37 @@ CREATE TABLE `todo` (
   CONSTRAINT `todo_pk` PRIMARY KEY(`session_id`, `position`),
   CONSTRAINT `fk_todo_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
 );
+CREATE TABLE `memory_reflection_delivery` (
+  `session_id` text NOT NULL,
+  `source_message_id` text NOT NULL,
+  `ordinal` integer NOT NULL,
+  `recovered` integer NOT NULL,
+  `negative_learning` integer NOT NULL,
+  `time_created` integer NOT NULL,
+  CONSTRAINT `memory_reflection_delivery_pk` PRIMARY KEY (`session_id`,`source_message_id`),
+  CONSTRAINT `memory_reflection_delivery_ordinal` UNIQUE (`session_id`,`ordinal`),
+  CONSTRAINT `memory_reflection_delivery_positive_ordinal` CHECK (`ordinal` > 0),
+  CONSTRAINT `memory_reflection_delivery_recovered` CHECK (`recovered` IN (0,1)),
+  CONSTRAINT `memory_reflection_delivery_negative_learning` CHECK (`negative_learning` IN (0,1)),
+  CONSTRAINT `fk_memory_reflection_delivery_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
+);
+CREATE TABLE `memory_reflection_job` (
+  `id` text PRIMARY KEY,
+  `session_id` text NOT NULL,
+  `source_message_id` text NOT NULL,
+  `trigger` text NOT NULL,
+  `status` text NOT NULL,
+  `owner_id` text NOT NULL,
+  `lease_expires` integer NOT NULL,
+  `error` text,
+  `time_created` integer NOT NULL,
+  `time_updated` integer NOT NULL,
+  `time_completed` integer,
+  CONSTRAINT `memory_reflection_job_source` UNIQUE (`session_id`,`source_message_id`),
+  CONSTRAINT `memory_reflection_job_trigger` CHECK (`trigger` IN ('periodic','recovery','periodic-recovery')),
+  CONSTRAINT `memory_reflection_job_status` CHECK (`status` IN ('running','completed','failed','uncertain')),
+  CONSTRAINT `fk_memory_reflection_job_delivery_fk` FOREIGN KEY (`session_id`,`source_message_id`) REFERENCES `memory_reflection_delivery`(`session_id`,`source_message_id`) ON DELETE CASCADE
+);
 CREATE TABLE `memory_candidate` (
   `id` text PRIMARY KEY,
   `target` text NOT NULL,
@@ -243,6 +274,7 @@ CREATE TABLE `memory_candidate` (
   `source_kind` text NOT NULL,
   `source_session_id` text,
   `source_message_id` text,
+  `fingerprint` text,
   `status` text NOT NULL,
   `before_entries` text,
   `after_entries` text,
@@ -286,8 +318,12 @@ CREATE INDEX `session_project_idx` ON `session` (`project_id`);
 CREATE INDEX `session_workspace_idx` ON `session` (`workspace_id`);
 CREATE INDEX `session_parent_idx` ON `session` (`parent_id`);
 CREATE INDEX `todo_session_idx` ON `todo` (`session_id`);
+CREATE INDEX `memory_reflection_job_session_status_time_idx` ON `memory_reflection_job` (`session_id`,`status`,`time_created`);
 CREATE INDEX `memory_candidate_path_status_time_idx` ON `memory_candidate` (`target_path`,`status`,`time_created`);
 CREATE INDEX `memory_candidate_session_time_idx` ON `memory_candidate` (`source_session_id`,`time_created`);
+CREATE UNIQUE INDEX `memory_candidate_reflection_source_fingerprint_idx`
+  ON `memory_candidate` (`source_session_id`,`source_message_id`,`fingerprint`)
+  WHERE `source_kind` = 'reflection' AND `fingerprint` IS NOT NULL;
 "#;
 
 /// Create every application table and explicit index in the current schema.

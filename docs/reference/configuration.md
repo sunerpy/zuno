@@ -101,6 +101,32 @@ Independent runtime work has three bounded controls:
 Each field accepts `1..=64`; omission uses the values above. Set a field to `1`
 to restore serial behavior for that layer.
 
+## Context compaction
+
+Zuno can compact older conversation history before the model window is exhausted:
+
+```json
+{
+  "compaction": {
+    "auto": true,
+    "threshold_percent": 80,
+    "tail_turns": 2,
+    "reserved": 12000
+  }
+}
+```
+
+- `threshold_percent` accepts `1..=100` and defaults to `80`. It is applied to
+  the usable context window after the model's output allowance and configured
+  reserve are removed.
+- `auto: false` disables proactive threshold compaction. Manual `/compact`
+  remains available.
+- A provider-confirmed context-limit failure still uses the bounded compaction
+  recovery path before retrying; this is recovery from an already failed
+  request, not the proactive threshold.
+- `/compact` persists the summary through the same durable compaction pipeline,
+  so subsequent turns and resumed clients see the same retained history.
+
 ## Plugin packages
 
 Plugins are package directories, not `zuno.json` fields. Install them globally
@@ -151,6 +177,12 @@ are side-effecting by default.
 the shell is not an operating-system sandbox. Use the native `grep` or `glob`
 tool when the intended operation is read-only.
 
+Independently of strict mode, the shell risk gate requires fresh approval before
+bounded destructive operations or replacing an existing redirect target. New
+static files under the working directory or OS temporary directory are treated
+as creation. There is no tool argument that lets a model approve its own risky
+call, and an explicit permission deny always wins.
+
 ## Memory learning
 
 Resident memory is enabled by default, but model and reflection writes enter an
@@ -176,11 +208,18 @@ auditable candidate queue first:
 - `reflection` reviews completed delivered turns with `small_model`. Reflection
   is disabled with a visible diagnostic when no explicit reachable small model
   is configured; Zuno does not silently spend the session model.
-- `nudge_interval` triggers periodic review every N delivered turns. A verified
-  recovery can trigger review earlier; zero disables only the periodic trigger.
+- `nudge_interval` triggers periodic review every N durably recorded delivered
+  assistant messages. The count survives host rebuilds and process restarts. A
+  verified recovery can trigger review earlier; zero disables only the periodic
+  trigger.
 - `promotion` is `review` (default), `high_confidence`, or `automatic`.
   `high_confidence` applies only candidates at or above `auto_confidence`.
 - `auto_confidence` is a finite value in `0..=1` and defaults to `0.9`.
+
+Each reflection request contains the exact resident-memory snapshot so the
+reviewer can propose audited `replace` or `remove` operations instead of adding
+duplicates. An expired running reflection job becomes `uncertain` and is never
+automatically replayed.
 
 `memory: false` disables resident injection, proposal tools, and reflection.
 `/memory` reviews, edits, approves, rejects, removes, and undoes durable changes.

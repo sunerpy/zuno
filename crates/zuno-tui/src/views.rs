@@ -311,7 +311,7 @@ impl ViewContext {
         let palette = self.palette();
         let color = crate::theme::tint(
             palette.background,
-            palette.warning,
+            palette.text_muted,
             palette.thinking_opacity,
         );
         Style::new()

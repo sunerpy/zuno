@@ -22,7 +22,8 @@
 use crate::keybind::{DEFINITIONS, Definition, Keymap};
 use crate::views::dialog::{Dialog, DialogOutcome, DialogStep};
 use crate::views::{ViewContext, padded};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use std::collections::BTreeMap;
 
@@ -265,5 +266,26 @@ impl Dialog for HelpView {
             return DialogStep::Redraw;
         }
         DialogStep::Ignored
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        if event.column < body.left()
+            || event.column >= body.right()
+            || event.row < body.top()
+            || event.row >= body.bottom()
+        {
+            return DialogStep::Ignored;
+        }
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.offset = self.offset.saturating_sub(1);
+                DialogStep::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                self.offset = self.offset.saturating_add(1);
+                DialogStep::Redraw
+            }
+            _ => DialogStep::Ignored,
+        }
     }
 }

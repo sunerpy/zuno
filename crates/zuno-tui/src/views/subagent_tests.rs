@@ -1,7 +1,7 @@
 use super::*;
 use crate::views::message::{Message, Role};
 use crate::views::testkit::{action, press};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
 
 fn message(parts: Vec<MessagePart>) -> Message {
     Message {
@@ -63,6 +63,24 @@ fn job_observation(job: &str, status: &str) -> MessagePart {
     }
 }
 
+fn durable_job(status: &str, result: Option<&str>) -> zuno_types::JobProjection {
+    zuno_types::JobProjection {
+        id: "job_1".to_owned(),
+        subject: zuno_types::JobSubjectProjection::ProductAgent {
+            run_id: "run_1".to_owned(),
+            product: "codex".to_owned(),
+            instance: "reviewer".to_owned(),
+            tool: "company_codex".to_owned(),
+        },
+        status: status.to_owned(),
+        report_delivery: "quiet".to_owned(),
+        result: result.map(str::to_owned),
+        error: None,
+        time_created: 1_000,
+        time_completed: (status != "running").then_some(3_500),
+    }
+}
+
 fn joined(view: &mut SubagentView) -> String {
     view.lines(100)
         .iter()
@@ -120,6 +138,27 @@ fn durable_job_output_refines_status_result_timing_and_subject() {
 }
 
 #[test]
+fn live_durable_projection_refreshes_an_open_subagent_view() {
+    let state = crate::views::ambient::WorkState::new(zuno_types::WorkStateProjection {
+        jobs: vec![durable_job("running", None)],
+        ..zuno_types::WorkStateProjection::default()
+    });
+    let tasks = delegations(&[message(vec![product("running", Some("job_1"))])]);
+    let mut view = SubagentView::new(ViewContext::defaults(), tasks).with_work_state(state.clone());
+    view.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+    assert!(joined(&mut view).contains("status running"));
+
+    state.replace(zuno_types::WorkStateProjection {
+        jobs: vec![durable_job("completed", Some("durable final result"))],
+        ..zuno_types::WorkStateProjection::default()
+    });
+    let body = joined(&mut view);
+    assert!(body.contains("status completed"), "{body}");
+    assert!(body.contains("result durable final result"), "{body}");
+    assert!(body.contains("elapsed 2s"), "{body}");
+}
+
+#[test]
 fn next_step_report_refines_a_running_row() {
     let messages = vec![
         message(vec![native("running", Some("job_native"))]),
@@ -154,6 +193,28 @@ fn enter_opens_details_with_product_job_delivery_result_and_safety() {
     ] {
         assert!(body.contains(expected), "missing `{expected}`:\n{body}");
     }
+}
+
+#[test]
+fn subagent_view_mouse_wheel_moves_the_selection() {
+    let tasks = delegations(&[message(vec![
+        native("running", Some("job_1")),
+        product("running", Some("job_2")),
+    ])]);
+    let mut view = SubagentView::new(ViewContext::defaults(), tasks);
+    assert_eq!(
+        view.handle_mouse(
+            &MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 4,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            ratatui::layout::Rect::new(0, 0, 80, 20),
+        ),
+        DialogStep::Redraw
+    );
+    assert_eq!(view.cursor(), 1);
 }
 
 #[test]

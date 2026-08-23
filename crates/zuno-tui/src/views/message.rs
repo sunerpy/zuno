@@ -46,7 +46,7 @@ use ratatui::{Frame, symbols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use zuno_engine::r#loop::TurnEvent;
+use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, TurnEvent};
 use zuno_llm::event::StreamEvent;
 
 #[cfg(test)]
@@ -624,6 +624,11 @@ pub struct Transcript {
     streaming: Option<usize>,
     /// Whether the turn is still running, for the status affordance.
     running: bool,
+    /// Whether this live turn already emitted its session-owned interruption marker.
+    ///
+    /// Terminal delivery can be repeated across a client boundary. The marker describes
+    /// the turn, not the number of times the boundary delivered its terminal event.
+    interruption_noted: bool,
     /// Session-cumulative provider token accounting.
     ///
     /// The same [`TokenUsage`] the status strip carries, folded from the same event.
@@ -643,7 +648,11 @@ pub struct Transcript {
     last_prompt_tokens: u64,
     /// The model's context ceiling, when the catalog states one.
     context_limit: u64,
-    /// How many events have been folded, which is what advances the spinner.
+    /// How many animation-clock frames have elapsed.
+    ///
+    /// Provider and tool events deliberately do not advance this. A slow request can
+    /// produce no event for seconds, which is exactly when an event-driven spinner
+    /// freezes and falsely looks hung.
     ticks: usize,
     /// Why a mounted prompt is asking the user to decide right now.
     ///
@@ -804,6 +813,19 @@ impl Transcript {
         SPINNER[self.ticks % SPINNER.len()]
     }
 
+    /// Advance the liveness animation if it is currently visible.
+    ///
+    /// A turn parked on a permission or question dialog is waiting for the user, not
+    /// working. Suppressing the frame there avoids both a contradictory spinner and a
+    /// pointless whole-screen repaint.
+    pub fn advance_animation(&mut self) -> bool {
+        if !self.running || self.awaiting_user.is_some() {
+            return false;
+        }
+        self.ticks = self.ticks.wrapping_add(1);
+        true
+    }
+
     /// The most recent patch a tool reported.
     ///
     /// Searched newest-first because the interesting patch is the one just produced. Two
@@ -879,10 +901,10 @@ impl Transcript {
     /// Returns whether anything visible changed, which is what the component turns
     /// into a redraw request.
     pub fn observe(&mut self, event: &TurnEvent) -> bool {
-        self.ticks = self.ticks.wrapping_add(1);
         match event {
             TurnEvent::TurnStarted { .. } => {
                 self.running = true;
+                self.interruption_noted = false;
                 true
             }
             TurnEvent::AssistantMessageCreated { message_id, .. } => {
@@ -961,10 +983,42 @@ impl Transcript {
                     *patch = diff.clone();
                 }
             }),
-            TurnEvent::TurnCompleted { .. } | TurnEvent::TurnInterrupted { .. } => {
+            TurnEvent::TurnCompleted { .. } => {
                 self.running = false;
                 self.streaming = None;
                 self.close_reasoning();
+                true
+            }
+            TurnEvent::TurnInterrupted { .. } => {
+                self.running = false;
+                self.streaming = None;
+                self.close_reasoning();
+                if !self.interruption_noted {
+                    self.messages.push(Message::noticed(
+                        crate::views::toast::ToastLevel::Error,
+                        INTERRUPTED_TURN_NOTICE,
+                    ));
+                    self.interruption_noted = true;
+                }
+                true
+            }
+            TurnEvent::TurnFailed { message, .. } => {
+                self.running = false;
+                self.streaming = None;
+                self.close_reasoning();
+                for transcript_message in &mut self.messages {
+                    for part in &mut transcript_message.parts {
+                        if let MessagePart::Tool { status, .. } = part
+                            && matches!(status, ToolStatus::Pending | ToolStatus::Running)
+                        {
+                            *status = ToolStatus::Error;
+                        }
+                    }
+                }
+                self.messages.push(Message::noticed(
+                    crate::views::toast::ToastLevel::Error,
+                    format!("this turn ended early: {message}"),
+                ));
                 true
             }
             // Everything else is bookkeeping the transcript does not render:
@@ -1041,19 +1095,13 @@ impl Transcript {
                 });
                 true
             }
-            // The provider writes the arguments one fragment at a time, and this is the
-            // only place they are ever visible to the view layer — see
-            // [`MessagePart::Tool::arguments`]. Reporting a redraw on every fragment is
-            // right rather than chatty: the summary grows as the JSON completes, so the
-            // row genuinely changes.
-            StreamEvent::ToolInputDelta(delta) => {
-                if let Some(MessagePart::Tool { arguments, .. }) = self.last_tool_mut() {
+            // Providers may interleave arguments for several calls. The event's id keeps
+            // each fragment attached to the row opened by its own ToolUseStart.
+            StreamEvent::ToolInputDelta { id, delta } => self.update_tool(id, |part| {
+                if let MessagePart::Tool { arguments, .. } = part {
                     arguments.push_str(delta);
-                    true
-                } else {
-                    false
                 }
-            }
+            }),
             StreamEvent::GeneratedImage { path, .. } => {
                 self.append(MessagePart::Attachment {
                     filename: path.clone(),
@@ -1124,22 +1172,6 @@ impl Transcript {
     fn last_part_mut(&mut self) -> Option<&mut MessagePart> {
         let index = self.streaming?;
         self.messages.get_mut(index)?.parts.last_mut()
-    }
-
-    /// The tool part currently receiving argument fragments.
-    ///
-    /// Searched backwards for a `Tool` rather than taking the last part outright, the same
-    /// way [`StreamEvent::ToolUseSignature`] is handled: a provider that interleaves a
-    /// text delta between `ToolUseStart` and the input deltas would otherwise append the
-    /// arguments to the prose.
-    fn last_tool_mut(&mut self) -> Option<&mut MessagePart> {
-        let index = self.streaming?;
-        self.messages
-            .get_mut(index)?
-            .parts
-            .iter_mut()
-            .rev()
-            .find(|part| matches!(part, MessagePart::Tool { .. }))
     }
 
     fn close_reasoning(&mut self) {
@@ -2203,10 +2235,10 @@ impl TranscriptView {
                 // stop. `thought for 2.5s` printed beside a block that is still growing is
                 // a claim about a finished action that has not finished, and the duration
                 // it quotes is the one the provider has not reported yet.
-                let header = match (duration_secs, streaming) {
+                let state = match (duration_secs, streaming) {
                     (_, true) => String::from("thinking…"),
-                    (Some(secs), false) => format!("thought for {secs:.1}s"),
-                    (None, false) => String::from("thought"),
+                    (Some(secs), false) => format!("{secs:.1}s"),
+                    (None, false) => String::from("complete"),
                 };
                 // Inset one column past the prose, the same inset a tool call takes. Both are
                 // things that happened *inside* the reply rather than being the reply, so
@@ -2219,7 +2251,7 @@ impl TranscriptView {
                 } else {
                     "/thinking"
                 };
-                let header = format!(" {} {header}", thinking.glyph());
+                let header = format!(" {} ◇ Thought · {state}", thinking.glyph());
                 match thinking {
                     ThinkingDisplay::Collapsed => {
                         // One row, not two. Reasoning is secondary content that recurs on
@@ -2296,7 +2328,7 @@ impl TranscriptView {
                 // The disclosure is part of the header rather than an overflow notice:
                 // clicking this exact row changes this exact call and leaves every sibling
                 // alone.
-                let head = format!(" {} {glyph} {icon} {name}", display.glyph());
+                let head = format!(" {} {glyph} Tool · {icon} {name}", display.glyph());
                 // The tool's wire name plus the argument that matters, which is the whole of
                 // §7.5. `title` is no longer preferred over the arguments: a completed
                 // `read` reported `Read diff.rs`, which names the kind of work and drops the
@@ -2319,10 +2351,10 @@ impl TranscriptView {
                         format!("{head} {}", summary.fit(room))
                     }
                     (None, Some(title), _) => {
-                        format!(" {} {glyph} {icon} {title}", display.glyph())
+                        format!(" {} {glyph} Tool · {icon} {title}", display.glyph())
                     }
                     (None, None, ToolStatus::Pending) => {
-                        format!(" {} {glyph} {icon} {placeholder}", display.glyph())
+                        format!(" {} {glyph} Tool · {icon} {placeholder}", display.glyph())
                     }
                     (None, None, _) => head,
                 };
@@ -2989,6 +3021,13 @@ impl Component for TranscriptView {
                     EventResult::IGNORED
                 }
             }
+            AppEvent::AnimationFrame => {
+                if self.transcript.advance_animation() {
+                    EventResult::REDRAW
+                } else {
+                    EventResult::IGNORED
+                }
+            }
             AppEvent::Terminal(_) => EventResult::IGNORED,
         }
     }
@@ -3640,7 +3679,9 @@ impl Component for StatusView {
                 self.detail = Some(message.clone());
                 EventResult::REDRAW
             }
-            TurnEvent::TurnCompleted { .. } | TurnEvent::TurnInterrupted { .. } => {
+            TurnEvent::TurnCompleted { .. }
+            | TurnEvent::TurnInterrupted { .. }
+            | TurnEvent::TurnFailed { .. } => {
                 self.reset(false);
                 EventResult::REDRAW
             }

@@ -79,6 +79,13 @@ pub struct TurnTranscript {
     events: Vec<TranscriptEvent>,
 }
 
+/// Durable scheduling facts derived from one completed transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReflectionEligibility {
+    pub recovered: bool,
+    pub negative_learning: bool,
+}
+
 impl TurnTranscript {
     /// Construct a transcript in chronological order.
     #[must_use]
@@ -92,7 +99,16 @@ impl TurnTranscript {
         &self.events
     }
 
-    pub(crate) fn has_failure_recovery(&self) -> bool {
+    /// Classify one transcript before the SQLite scheduler advances its cadence.
+    #[must_use]
+    pub fn reflection_eligibility(&self) -> ReflectionEligibility {
+        ReflectionEligibility {
+            recovered: self.has_failure_recovery(),
+            negative_learning: self.is_negative_learning(),
+        }
+    }
+
+    fn has_failure_recovery(&self) -> bool {
         let mut failed = HashSet::new();
         for event in &self.events {
             let TranscriptEvent::Command { command, outcome } = event else {
@@ -111,7 +127,7 @@ impl TurnTranscript {
         false
     }
 
-    pub(crate) fn is_negative_learning(&self) -> bool {
+    fn is_negative_learning(&self) -> bool {
         self.has_environment_failure()
             || self.has_negative_tool_claim()
             || self.has_transient_retry()

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use proptest::prelude::*;
 use serde_json::json;
-use zuno_config::schema::CompactionConfig;
+use zuno_config::schema::{CompactionConfig, CompactionThresholdPercent};
 use zuno_db::message::{MessageStore, PartKind};
 use zuno_db::{Connection, migration, open};
 use zuno_engine::compaction::{
@@ -267,9 +267,10 @@ fn compaction_boundary_walks_back_when_the_raw_split_lands_on_a_tool_result() {
 }
 
 #[test]
-fn compaction_policy_honors_all_five_configuration_fields() {
+fn compaction_policy_honors_all_configuration_fields() {
     let config = CompactionConfig {
         auto: Some(false),
+        threshold_percent: Some(CompactionThresholdPercent::new(80).expect("valid percentage")),
         prune: Some(true),
         tail_turns: Some(7),
         preserve_recent_tokens: Some(3_456),
@@ -289,12 +290,54 @@ fn compaction_policy_honors_all_five_configuration_fields() {
     assert_eq!(policy.preserve_recent_tokens, 3_456);
     assert_eq!(policy.reserved, 12_000);
     assert_eq!(policy.usable_tokens, 88_000);
+    assert_eq!(policy.threshold_percent, 80);
+    assert_eq!(policy.threshold_tokens, 70_400);
     assert!(!policy.should_compact(CompactionTrigger::Threshold {
         used_tokens: 99_999
     }));
     assert!(policy.should_compact(CompactionTrigger::ContextLimit {
         used_tokens: Some(100_001),
         limit_tokens: Some(100_000),
+    }));
+}
+
+#[test]
+fn compaction_threshold_triggers_at_the_configured_percentage_and_auto_can_be_disabled() {
+    let window = TokenWindow {
+        context: 100_000,
+        max_output: 10_000,
+    };
+    let automatic = CompactionPolicy::resolve(
+        &CompactionConfig {
+            threshold_percent: Some(CompactionThresholdPercent::new(80).expect("valid percentage")),
+            ..CompactionConfig::default()
+        },
+        window,
+    );
+    assert_eq!(automatic.usable_tokens, 90_000);
+    assert_eq!(automatic.threshold_tokens, 72_000);
+    assert!(!automatic.should_compact(CompactionTrigger::Threshold {
+        used_tokens: 71_999,
+    }));
+    assert!(automatic.should_compact(CompactionTrigger::Threshold {
+        used_tokens: 72_000,
+    }));
+
+    let disabled = CompactionPolicy::resolve(
+        &CompactionConfig {
+            auto: Some(false),
+            threshold_percent: Some(CompactionThresholdPercent::new(80).expect("valid percentage")),
+            ..CompactionConfig::default()
+        },
+        window,
+    );
+    assert!(!disabled.should_compact(CompactionTrigger::Threshold {
+        used_tokens: u64::MAX,
+    }));
+    assert!(disabled.should_compact(CompactionTrigger::Manual));
+    assert!(disabled.should_compact(CompactionTrigger::ContextLimit {
+        used_tokens: None,
+        limit_tokens: None,
     }));
 }
 
@@ -332,6 +375,7 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
     let hooks = RecordingHooks::new(true);
     let config = CompactionConfig {
         auto: Some(true),
+        threshold_percent: None,
         prune: Some(false),
         tail_turns: Some(2),
         preserve_recent_tokens: Some(200),

@@ -410,11 +410,12 @@ mod tests {
             (
                 "build",
                 PROMPT_BUILD,
-                220,
+                270,
                 [
                     "Do not declare completion from intent",
                     "authoritative evidence",
                     "Do not duplicate delegated discovery",
+                    "use apply_patch",
                 ],
             ),
             (
@@ -425,16 +426,18 @@ mod tests {
                     "without modifying product files",
                     "authoritative evidence",
                     "implementation decision",
+                    "Remove obsolete paths",
                 ],
             ),
             (
                 "deep",
                 PROMPT_DEEP,
-                170,
+                210,
                 [
                     "without delegating",
                     "owning abstraction",
                     "interruption and recovery",
+                    "use write only for a new file",
                 ],
             ),
         ];
@@ -451,6 +454,60 @@ mod tests {
                 words <= word_limit,
                 "{name} prompt grew to {words} words; concise role policy belongs here, not a \
                  second harness manual"
+            );
+        }
+    }
+
+    #[test]
+    fn specialist_prompts_define_evidence_output_and_scope_boundaries() {
+        let cases = [
+            (
+                "explorer",
+                PROMPT_EXPLORER,
+                130,
+                [
+                    "actual runtime path",
+                    "what the code proves",
+                    "Do not browse",
+                ],
+            ),
+            (
+                "librarian",
+                PROMPT_LIBRARIAN,
+                130,
+                ["exact version", "final authority", "may drift over time"],
+            ),
+            (
+                "advisor",
+                PROMPT_ADVISOR,
+                150,
+                ["ownership boundaries", "demonstrated defect", "Do not edit"],
+            ),
+            (
+                "worker",
+                PROMPT_WORKER,
+                160,
+                ["scope boundary", "use write only", "uncertain side effect"],
+            ),
+            (
+                "looker",
+                PROMPT_LOOKER,
+                130,
+                ["full artifact", "direct observation", "Do not edit"],
+            ),
+        ];
+
+        for (name, prompt, word_limit, clauses) in cases {
+            for clause in clauses {
+                assert!(
+                    prompt.contains(clause),
+                    "{name} prompt is missing `{clause}`:\n{prompt}"
+                );
+            }
+            let words = prompt.split_whitespace().count();
+            assert!(
+                words <= word_limit,
+                "{name} prompt grew to {words} words; keep role guidance compact"
             );
         }
     }

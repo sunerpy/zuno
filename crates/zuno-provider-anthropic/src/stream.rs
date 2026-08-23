@@ -259,7 +259,7 @@ impl AnthropicDecoder {
                 complete.push_str(&text);
                 Ok(vec![StreamEvent::TextDelta(text)])
             }
-            (ActiveBlock::ToolUse { input_json, .. }, ApiDelta::InputJson { partial_json }) => {
+            (ActiveBlock::ToolUse { id, input_json, .. }, ApiDelta::InputJson { partial_json }) => {
                 append_tool_input(
                     input_json,
                     &partial_json,
@@ -267,7 +267,10 @@ impl AnthropicDecoder {
                     &self.state.requested_model,
                     self.parser.limits().max_tool_input_bytes(),
                 )?;
-                Ok(vec![StreamEvent::ToolInputDelta(partial_json)])
+                Ok(vec![StreamEvent::ToolInputDelta {
+                    id: id.clone(),
+                    delta: partial_json,
+                }])
             }
             (
                 ActiveBlock::Thinking {
@@ -350,12 +353,12 @@ impl AnthropicDecoder {
                     })?
                 };
                 self.completed.push(RequestContentBlock::ToolUse {
-                    id,
+                    id: id.clone(),
                     name,
                     input,
                     thought_signature: None,
                 });
-                Ok(vec![StreamEvent::ToolUseEnd])
+                Ok(vec![StreamEvent::ToolUseEnd { id }])
             }
             ActiveBlock::Unknown => Ok(Vec::new()),
         }
@@ -767,14 +770,24 @@ mod tests {
                     id: "toolu_a".to_owned(),
                     name: "alpha".to_owned(),
                 },
-                StreamEvent::ToolInputDelta("{\"x\":1}".to_owned()),
-                StreamEvent::ToolUseEnd,
+                StreamEvent::ToolInputDelta {
+                    id: "toolu_a".to_owned(),
+                    delta: "{\"x\":1}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd {
+                    id: "toolu_a".to_owned(),
+                },
                 StreamEvent::ToolUseStart {
                     id: "toolu_b".to_owned(),
                     name: "beta".to_owned(),
                 },
-                StreamEvent::ToolInputDelta("{\"y\":2}".to_owned()),
-                StreamEvent::ToolUseEnd,
+                StreamEvent::ToolInputDelta {
+                    id: "toolu_b".to_owned(),
+                    delta: "{\"y\":2}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd {
+                    id: "toolu_b".to_owned(),
+                },
                 StreamEvent::MessageEnd {
                     stop_reason: Some(FinishReason::ToolCalls),
                 },

@@ -116,9 +116,15 @@ fn event_vocabulary_has_twenty_four_distinct_variants() {
             id: String::new(),
             name: String::new(),
         },
-        StreamEvent::ToolInputDelta(String::new()),
-        StreamEvent::ToolUseEnd,
-        StreamEvent::ToolUseSignature(ThoughtSignature::new("signature")),
+        StreamEvent::ToolInputDelta {
+            id: String::new(),
+            delta: String::new(),
+        },
+        StreamEvent::ToolUseEnd { id: String::new() },
+        StreamEvent::ToolUseSignature {
+            id: String::new(),
+            signature: ThoughtSignature::new("signature"),
+        },
         StreamEvent::ToolResult {
             tool_use_id: String::new(),
             content: String::new(),
@@ -198,9 +204,10 @@ fn retry_rollback_event_clears_text_and_tool_call_accumulators() {
         })
         .expect("tool start remains within stream limits");
     accumulator
-        .apply(&StreamEvent::ToolInputDelta(
-            r#"{"command":"cargo test"}"#.to_owned(),
-        ))
+        .apply(&StreamEvent::ToolInputDelta {
+            id: "call-1".to_owned(),
+            delta: r#"{"command":"cargo test"}"#.to_owned(),
+        })
         .expect("tool input remains within stream limits");
     accumulator
         .apply(&StreamEvent::ReasoningDelta("partial reasoning".to_owned()))
@@ -241,7 +248,10 @@ fn tool_input_accumulator_rejects_json_over_its_cap() {
         .expect("tool call starts");
 
     let error = accumulator
-        .apply(&StreamEvent::ToolInputDelta("123456789".to_owned()))
+        .apply(&StreamEvent::ToolInputDelta {
+            id: "call-1".to_owned(),
+            delta: "123456789".to_owned(),
+        })
         .expect_err("the ninth byte must exceed an eight-byte cap");
     let detail = error
         .source()

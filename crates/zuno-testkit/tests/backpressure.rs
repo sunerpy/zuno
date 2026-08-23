@@ -1,9 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
@@ -12,8 +11,9 @@ use zuno_engine::r#loop::{TURN_EVENT_CHANNEL_CAPACITY, TurnEvent, event_channel}
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(1);
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_SESSION_COUNT: usize = 2;
-const HOST_KIND_COUNT: usize = 3;
-const CONTAINED_PROCESSES_PER_HOST: usize = 4;
+const GUARDED_HOST_KIND_COUNT: usize = 2;
+const GUARDED_PROCESSES_PER_HOST: usize = 3;
+const DIRECT_MCP_PROCESSES_PER_HOST: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Policy {
@@ -270,7 +270,7 @@ const CHANNELS: &[ChannelGate] = &[
         "PROMPT_CHANNEL_CAPACITY=1",
         Policy::RefuseNewest,
         "zuno-tui/src/views/session.rs",
-        "match prompts.try_send(submission) { Ok(()) => self.mark_turn_accepted(),",
+        "match prompts.try_send(submission) {",
     ),
     gate(
         "tui-mcp-toggles",
@@ -565,9 +565,9 @@ channel_gate!(
 #[test]
 fn clean_shutdown_reaps_every_host_process_tree() {
     let directory = tempfile::tempdir().expect("G6 fixture directory");
-    let (mut parent, ready, stop) = spawn_reaping_parent(directory.path());
+    let (mut parent, ready, stop) = spawn_reaping_parent(directory.path(), true);
     wait_for_reaping_ready(&mut parent, &ready);
-    let pids = snapshot_fixture_tree(&mut parent);
+    let pids = snapshot_fixture_tree(&mut parent, true);
 
     std::fs::write(&stop, b"stop").expect("request clean host shutdown");
     let status = parent.wait().expect("wait for clean fixture parent");
@@ -577,17 +577,56 @@ fn clean_shutdown_reaps_every_host_process_tree() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn parent_sigkill_reaps_every_host_process_tree() {
+fn parent_sigkill_reaps_every_guarded_host_process_tree() {
     let directory = tempfile::tempdir().expect("G6 fixture directory");
-    let (mut parent, ready, _stop) = spawn_reaping_parent(directory.path());
+    let (mut parent, ready, _stop) = spawn_reaping_parent(directory.path(), false);
     wait_for_reaping_ready(&mut parent, &ready);
-    let pids = snapshot_fixture_tree(&mut parent);
+    let pids = snapshot_fixture_tree(&mut parent, false);
 
     let pid = rustix::process::Pid::from_raw(parent.id() as i32).expect("non-zero parent PID");
     rustix::process::kill_process(pid, rustix::process::Signal::KILL)
         .expect("SIGKILL G6 fixture parent");
     let _status = parent.wait().expect("reap killed G6 fixture parent");
     assert_all_fixture_pids_exit(&pids);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mcp_hosts_spawn_no_zuno_helper_processes() {
+    let directory = tempfile::tempdir().expect("G6 fixture directory");
+    let (mut parent, ready, stop) = spawn_reaping_parent(directory.path(), true);
+    wait_for_reaping_ready(&mut parent, &ready);
+    let pids = snapshot_fixture_tree(&mut parent, true);
+    let commands = pids
+        .iter()
+        .map(|pid| (*pid, process_command_line(*pid)))
+        .collect::<Vec<_>>();
+
+    std::fs::write(&stop, b"stop").expect("request clean host shutdown");
+    let status = parent.wait().expect("wait for clean fixture parent");
+    assert!(status.success(), "clean G6 fixture failed: {status}");
+    assert_all_fixture_pids_exit(&pids);
+
+    let watchdogs = commands
+        .iter()
+        .filter(|(_, command)| command.contains("__zuno_child_guard watch-groups"))
+        .collect::<Vec<_>>();
+    assert!(
+        watchdogs.is_empty(),
+        "direct MCP must not start a Zuno watchdog: {commands:?}"
+    );
+    let mcp_supervisors = commands
+        .iter()
+        .filter(|(_, command)| {
+            command.contains("__zuno_child_guard supervise")
+                && command.split_whitespace().last() == Some("mcp")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        mcp_supervisors.is_empty(),
+        "MCP commands should be direct children rather than per-server Zuno wrappers: \
+         {mcp_supervisors:?}"
+    );
 }
 
 async fn run_channel_gate(id: &str) {
@@ -698,12 +737,16 @@ async fn observe_independent_progress() {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_reaping_parent(directory: &Path) -> (Child, PathBuf, PathBuf) {
+fn spawn_reaping_parent(directory: &Path, include_mcp: bool) -> (Child, PathBuf, PathBuf) {
     let ready = directory.join("ready");
     let stop = directory.join("stop");
     let workspace = directory.join("workspace");
     let child = Command::new(reaping_fixture_binary())
-        .arg("parent")
+        .arg(if include_mcp {
+            "parent"
+        } else {
+            "parent-guarded"
+        })
         .arg(&ready)
         .arg(&stop)
         .arg(workspace)
@@ -763,19 +806,25 @@ fn wait_for_reaping_ready(parent: &mut Child, ready: &Path) {
 /// Wait until every process the fixture will fork exists, then snapshot the tree.
 ///
 /// `ready` proves each host answered its handshake, which is weaker than "the
-/// fork storm finished": a guarded host is a four-process chain (`supervise`
-/// guard, `monitor` guard, host, grandchild) and `PtyService::create` returns
-/// once only the outermost guard is spawned, so a PTY chain can still owe three
-/// PIDs. A loaded CI runner observed 27 of 33 and failed a reaping test on a
-/// forking symptom.
+/// fork storm finished": LSP and PTY use three-process chains (`supervise`
+/// guard, host, grandchild), while MCP uses a direct host plus grandchild and no
+/// Zuno helper. `PtyService::create` returns once
+/// only its guard is spawned, so a PTY chain can still owe two PIDs. A loaded
+/// runner can therefore observe a partial tree even after every host API has returned.
 ///
 /// The threshold must stay at the full topology. Lowering it to whatever a slow
 /// machine reaches would run the reaping assertion against a tree that was never
 /// fully built, which is exactly what this gate exists to catch.
 #[cfg(target_os = "linux")]
-fn snapshot_fixture_tree(parent: &mut Child) -> Vec<u32> {
+fn snapshot_fixture_tree(parent: &mut Child, include_mcp: bool) -> Vec<u32> {
     let root = parent.id();
-    let minimum = 1 + HOST_SESSION_COUNT * HOST_KIND_COUNT * CONTAINED_PROCESSES_PER_HOST;
+    let direct_mcp = if include_mcp {
+        DIRECT_MCP_PROCESSES_PER_HOST
+    } else {
+        0
+    };
+    let per_session = GUARDED_HOST_KIND_COUNT * GUARDED_PROCESSES_PER_HOST + direct_mcp;
+    let minimum = 1 + HOST_SESSION_COUNT * per_session;
     let started = Instant::now();
     loop {
         let sample = zuno_testkit::perf::sample_process_tree(root, Instant::now())
@@ -825,6 +874,17 @@ fn remaining_fixture_pids(pids: &[u32]) -> Vec<u32> {
         .copied()
         .filter(|pid| Path::new(&format!("/proc/{pid}")).exists())
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn process_command_line(pid: u32) -> String {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_else(|error| panic!("read command line for process {pid}: {error}"))
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(target_os = "linux")]

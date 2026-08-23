@@ -1,4 +1,4 @@
-//! Deterministic destructive-command assessment and its reflection gate.
+//! Deterministic destructive-command assessment and its execution gate.
 //!
 //! This is **not a sandbox**. A command that passes this gate still has the
 //! user's full filesystem, network, and credentials. The gate is a static,
@@ -10,9 +10,9 @@
 //! every constituent and nested command visible while retaining the parser's
 //! guarantee that assessment executes nothing.
 //!
-//! A reflected retry must explain which actual user request needs the destructive
-//! action. Catastrophic targets are absolute denials, so no justification unlocks
-//! them.
+//! Confirmable operations require a fresh attached-user decision. Model-authored
+//! arguments can describe the operation, but cannot authorize it. Catastrophic
+//! targets are absolute denials.
 //!
 //! # Static-analysis boundary
 //!
@@ -22,9 +22,9 @@
 //! The assessor also walks command resources in lexical order and conservatively
 //! simulates `cd`, `chdir`, `pushd`/`popd`, and PowerShell location commands. A
 //! dynamic location makes subsequent relative destructive targets unknown, so they
-//! are denied rather than unlocked by a justification. Conditional and nested-shell scope is
-//! deliberately over-approximated: if a destructive constituent can run, it is
-//! assessed, even when another constituent may prevent it at runtime.
+//! require confirmation. Conditional and nested-shell scope is deliberately
+//! over-approximated: if a destructive constituent can run, it is assessed, even
+//! when another constituent may prevent it at runtime.
 //!
 //! This gate recognizes destruction; it does not detect read-based exfiltration.
 //! For example, `cat ~/.ssh/id_rsa` is intentionally allowed by this gate because it
@@ -32,15 +32,14 @@
 //! govern whether such a read may execute or transmit its output.
 //!
 //! Static analysis still cannot prove arbitrary interpreter or application
-//! semantics, shell aliases or functions, encoded or downloaded scripts, symlink
-//! resolution, or time-of-check/time-of-use behavior. Those require confinement;
-//! they are not claimed as covered here.
+//! semantics, shell aliases or functions, encoded or downloaded scripts, or
+//! time-of-check/time-of-use behavior. Static redirect targets are inspected only
+//! to distinguish creation from replacement; that probe is not confinement.
 
 use crate::shell::{CommandResource, ShellSyntax, analyze_command};
 use std::path::{Component, Path, PathBuf};
 use zuno_error::ToolError;
 
-const MIN_JUSTIFICATION_LEN: usize = 25;
 const MAX_EMBEDDED_SCRIPT_DEPTH: usize = 4;
 
 const DESTRUCTIVE_COMMANDS: &[&str] = &[
@@ -178,9 +177,9 @@ impl RiskAssessment {
 
 /// Environment facts needed for lexical path resolution.
 ///
-/// Keeping these as values makes assessment deterministic and avoids filesystem
-/// probes. [`RiskContext::from_env`] snapshots only `HOME`; it performs no `stat`,
-/// canonicalization, or glob expansion.
+/// Keeping these as values makes lexical resolution deterministic.
+/// [`RiskContext::from_env`] snapshots only `HOME`; redirect assessment may still
+/// inspect one fully resolved static target to distinguish creation from replacement.
 #[derive(Debug, Clone, Default)]
 pub struct RiskContext {
     pub working_dir: Option<PathBuf>,
@@ -199,45 +198,16 @@ impl RiskContext {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Justification {
-    pub text: Option<String>,
-}
-
-impl Justification {
-    /// A deliberately low information floor that still rejects token retries.
-    #[must_use]
-    pub fn is_substantive(&self) -> bool {
-        let Some(text) = self.text.as_deref().map(str::trim) else {
-            return false;
-        };
-        if text.len() < MIN_JUSTIFICATION_LEN {
-            return false;
-        }
-        const EMPTY_AFFIRMATIONS: &[&str] = &[
-            "yes",
-            "ok",
-            "okay",
-            "sure",
-            "confirmed",
-            "proceed",
-            "do it",
-            "continue",
-            "y",
-            "approved",
-            "go ahead",
-        ];
-        let lowered = text.to_lowercase();
-        let stripped = lowered.trim_end_matches(['.', '!', '?']).trim();
-        !EMPTY_AFFIRMATIONS.contains(&stripped)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateOutcome {
     Allow,
-    Reflect { prompt: String },
-    Deny { reason: String },
+    Confirm {
+        reason: String,
+        target: Option<String>,
+    },
+    Deny {
+        reason: String,
+    },
 }
 
 pub fn assess_command(
@@ -401,7 +371,7 @@ fn resolve_directory_target(raw: &str, context: &RiskContext) -> Option<PathBuf>
 }
 
 #[must_use]
-pub fn gate(assessment: &RiskAssessment, justification: &Justification) -> GateOutcome {
+pub fn gate(assessment: &RiskAssessment) -> GateOutcome {
     match assessment.level {
         RiskLevel::Safe => GateOutcome::Allow,
         RiskLevel::Catastrophic => GateOutcome::Deny {
@@ -411,9 +381,12 @@ pub fn gate(assessment: &RiskAssessment, justification: &Justification) -> GateO
                 assessment.explanation()
             ),
         },
-        RiskLevel::Confirm if justification.is_substantive() => GateOutcome::Allow,
-        RiskLevel::Confirm => GateOutcome::Reflect {
-            prompt: reflection_prompt(assessment),
+        RiskLevel::Confirm => GateOutcome::Confirm {
+            reason: assessment.explanation().trim_end().to_owned(),
+            target: assessment
+                .findings
+                .iter()
+                .find_map(|finding| finding.target.clone()),
         },
     }
 }
@@ -422,10 +395,9 @@ pub fn assess_and_gate(
     command: &str,
     syntax: ShellSyntax,
     context: &RiskContext,
-    justification: &Justification,
 ) -> Result<GateOutcome, ToolError> {
     let assessment = assess_command(command, syntax, context)?;
-    let outcome = gate(&assessment, justification);
+    let outcome = gate(&assessment);
     match &outcome {
         GateOutcome::Allow => tracing::info!(
             target: "zuno_tools::risk",
@@ -434,9 +406,9 @@ pub fn assess_and_gate(
             syntax = ?syntax,
             "destructive-command gate verdict"
         ),
-        GateOutcome::Reflect { .. } => tracing::info!(
+        GateOutcome::Confirm { .. } => tracing::info!(
             target: "zuno_tools::risk",
-            verdict = "reflect",
+            verdict = "confirm",
             command_bytes = command.len(),
             syntax = ?syntax,
             "destructive-command gate verdict"
@@ -956,12 +928,43 @@ fn assess_redirect_target(raw: &str, context: &RiskContext, findings: &mut Vec<R
         .working_dir
         .as_deref()
         .is_none_or(|cwd| !expanded.starts_with(normalize_path(cwd)));
-    if outside_working_dir {
-        findings.push(confirm_finding(
-            "output redirection truncates a path outside the working directory".to_owned(),
+    match std::fs::symlink_metadata(&expanded) {
+        Ok(_) => findings.push(confirm_finding(
+            "output redirection would replace an existing path".to_owned(),
             Some(expanded.display().to_string()),
-        ));
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if outside_working_dir && !is_inside_system_temp(&expanded) {
+                findings.push(confirm_finding(
+                    "output redirection would create a file outside the working directory"
+                        .to_owned(),
+                    Some(expanded.display().to_string()),
+                ));
+            }
+        }
+        Err(_) => findings.push(confirm_finding(
+            "output redirection target could not be inspected safely".to_owned(),
+            Some(expanded.display().to_string()),
+        )),
     }
+}
+
+fn is_inside_system_temp(path: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    let temp = temp
+        .canonicalize()
+        .unwrap_or_else(|_| normalize_path(&temp));
+    let mut ancestor = path.parent();
+    while let Some(candidate) = ancestor {
+        match candidate.canonicalize() {
+            Ok(resolved) => return resolved.starts_with(&temp),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = candidate.parent();
+            }
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn truncating_redirect_targets(source: &str) -> Vec<String> {
@@ -1217,19 +1220,4 @@ fn confirm_finding(reason: String, target: Option<String>) -> RiskFinding {
 
 fn unknown_target_finding(reason: String) -> RiskFinding {
     confirm_finding(reason, None)
-}
-
-fn reflection_prompt(assessment: &RiskAssessment) -> String {
-    format!(
-        "This command was not run. It is irreversible:\n\n{}\
-         Before it can proceed, stop and check it against the user's actual request:\n\
-         - Which specific thing the user asked for requires deleting this?\n\
-         - Did the user name this path, or did you infer it?\n\
-         - If you inferred it, is a narrower target enough?\n\
-         - If this is wrong, nothing here can be recovered.\n\n\
-         If it is genuinely what the user asked for, re-issue the same call with a \
-         `justification` field explaining which request it serves. If you are not sure, \
-         ask the user instead: that costs one message, and being wrong costs their data.",
-        assessment.explanation()
-    )
 }

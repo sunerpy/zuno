@@ -56,8 +56,25 @@ fn candidate(id: &str) -> NewMemoryCandidate {
         source: MemorySource::Reflection,
         source_session_id: Some(SESSION_ID.to_owned()),
         source_message_id: Some("msg_memory".to_owned()),
+        fingerprint: Some(format!("fingerprint-{id}")),
         time_created: 10,
     }
+}
+
+#[test]
+fn reflection_candidate_source_and_fingerprint_are_idempotent() {
+    let store = MemoryCandidateStore::new(initialized());
+    let first = store
+        .create_or_get(candidate("mem_first"))
+        .expect("insert first candidate");
+    assert!(first.inserted);
+
+    let mut replay = candidate("mem_replay");
+    replay.fingerprint = first.record.fingerprint.clone();
+    let replay = store.create_or_get(replay).expect("replay candidate");
+
+    assert!(!replay.inserted);
+    assert_eq!(replay.record.id(), "mem_first");
 }
 
 #[test]

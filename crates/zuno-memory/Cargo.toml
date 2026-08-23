@@ -14,8 +14,10 @@ zuno-db = { workspace = true }
 zuno-error = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-types = { workspace = true }
+hex = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

@@ -220,7 +220,15 @@ impl ChatDecoder {
                             &self.model,
                             self.tool_input_limit,
                         )?;
-                        events.push(StreamEvent::ToolInputDelta(arguments));
+                        let id = self
+                            .tools
+                            .get(&index)
+                            .map(|tool| tool.id.clone())
+                            .unwrap_or_default();
+                        events.push(StreamEvent::ToolInputDelta {
+                            id,
+                            delta: arguments,
+                        });
                     }
                 }
             }
@@ -258,6 +266,7 @@ impl ChatDecoder {
             });
         }
         for (_, tool) in std::mem::take(&mut self.tools) {
+            let id = tool.id.clone();
             let input = serde_json::from_str(&tool.arguments).unwrap_or(Value::Null);
             self.completed.push(RequestContentBlock::ToolUse {
                 id: tool.id,
@@ -265,7 +274,7 @@ impl ChatDecoder {
                 input,
                 thought_signature: None,
             });
-            events.push(StreamEvent::ToolUseEnd);
+            events.push(StreamEvent::ToolUseEnd { id });
         }
         events.push(StreamEvent::MessageEnd {
             stop_reason: reason,
@@ -359,8 +368,12 @@ impl ResponsesDecoder {
                         &self.model,
                         self.tool_input_limit,
                     )?;
+                    return Ok(vec![StreamEvent::ToolInputDelta {
+                        id: tool.call_id.clone(),
+                        delta,
+                    }]);
                 }
-                Ok(vec![StreamEvent::ToolInputDelta(delta)])
+                Ok(Vec::new())
             }
             ResponsesEvent::OutputItemDone { item } => self.item_done(item),
             ResponsesEvent::Completed { response } => Ok(self.completed_response(response)),
@@ -452,13 +465,14 @@ impl ResponsesDecoder {
                         source,
                     })
                 })?;
+                let call_id = active.call_id;
                 self.completed.push(RequestContentBlock::ToolUse {
-                    id: active.call_id,
+                    id: call_id.clone(),
                     name: active.name,
                     input,
                     thought_signature: None,
                 });
-                Ok(vec![StreamEvent::ToolUseEnd])
+                Ok(vec![StreamEvent::ToolUseEnd { id: call_id }])
             }
             _ => Ok(Vec::new()),
         }

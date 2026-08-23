@@ -6,9 +6,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
 use zuno_agent::reflection::{
-    ReflectionConfig, ReflectionError, ReflectionFork, ReflectionRequest, ReflectionRunner,
-    ReflectionToolCall, ReflectionTools, ReflectionTurn, TranscriptEvent, TurnDelivery,
-    TurnTranscript,
+    ReflectionError, ReflectionFork, ReflectionRequest, ReflectionRunner, ReflectionToolCall,
+    ReflectionTools, ReflectionTurn, TranscriptEvent, TurnDelivery, TurnTranscript,
 };
 use zuno_memory::{
     MemoryProposal, MemoryService, MemoryStore, PromotionPolicy, Scope, ScopeLimits, ScopePaths,
@@ -114,10 +113,6 @@ async fn reflection_creates_a_pending_candidate_and_approval_changes_the_next_pr
     let directory = TempDir::new().expect("temp dir");
     let service = service(&directory, PromotionPolicy::Review);
     let fork = ReflectionFork::new(
-        ReflectionConfig {
-            enabled: true,
-            turn_interval: 1,
-        },
         Arc::new(CorrectionRunner),
         erase(MemoryTool::reflection(Arc::clone(&service))),
     );
@@ -130,7 +125,9 @@ async fn reflection_creates_a_pending_candidate_and_approval_changes_the_next_pr
             context(),
         ))
         .expect("reflection spawned");
-    task.await.expect("reflection task");
+    task.await
+        .expect("reflection task joins")
+        .expect("reflection review succeeds");
 
     let candidates = service.candidates().expect("candidates");
     assert_eq!(candidates.len(), 1);

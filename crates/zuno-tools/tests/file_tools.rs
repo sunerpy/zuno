@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use zuno_error::ToolError;
 use zuno_tool::{InterruptHandle, NeverInterrupted, PermissionAsk, PermissionAsker, ToolContext};
-use zuno_tools::{FileFormatter, FileTools, NoopFormatter, uses_apply_patch};
+use zuno_tools::{FileFormatter, FileTools, NoopFormatter};
 
 #[derive(Default)]
 struct RecordingPermission {
@@ -59,6 +59,40 @@ impl FileFormatter for RecordingFormatter {
             .expect("formatter recording lock")
             .push(path.to_owned());
         Ok(false)
+    }
+}
+
+struct FailingFormatter {
+    fail_on_call: usize,
+    calls: Mutex<usize>,
+}
+
+impl FailingFormatter {
+    fn always() -> Self {
+        Self {
+            fail_on_call: 1,
+            calls: Mutex::new(0),
+        }
+    }
+
+    fn on_call(fail_on_call: usize) -> Self {
+        Self {
+            fail_on_call,
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl FileFormatter for FailingFormatter {
+    async fn format(&self, _path: &Path) -> io::Result<bool> {
+        let mut calls = self.calls.lock().expect("formatter call lock");
+        *calls += 1;
+        if *calls == self.fail_on_call {
+            Err(io::Error::other("formatter transport was lost"))
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -239,6 +273,50 @@ async fn file_edit_unique_match_succeeds_and_exercises_the_formatter_seam() {
     assert_eq!(output.output, "Edit applied successfully.");
     assert_eq!(output.metadata["replacements"], 1);
     assert_eq!(formatter.paths(), vec![path]);
+}
+
+#[tokio::test]
+async fn file_edit_keeps_a_written_change_when_the_formatter_service_fails() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tools = FileTools::with_formatter(workspace.path(), Arc::new(FailingFormatter::always()))
+        .expect("file tools");
+    let permission = Arc::new(RecordingPermission::default());
+    let path = workspace.path().join("formatter-error.txt");
+    std::fs::write(&path, "before\n").expect("fixture");
+
+    tools
+        .read
+        .execute(
+            json!({ "filePath": path }),
+            normal_context(permission.clone()),
+        )
+        .await
+        .expect("read first");
+    let output = tools
+        .edit
+        .execute(
+            json!({
+                "filePath": path,
+                "oldString": "before",
+                "newString": "after"
+            }),
+            normal_context(permission),
+        )
+        .await
+        .expect("the edit landed, so formatter transport failure is diagnostic");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("written edit"),
+        "after\n"
+    );
+    assert!(
+        output
+            .output
+            .contains("formatter service failed: formatter transport was lost"),
+        "{}",
+        output.output
+    );
+    assert_eq!(output.written_paths(), vec![slash(&path)]);
 }
 
 #[tokio::test]
@@ -424,6 +502,37 @@ async fn file_write_creates_and_overwrites_after_read() {
 }
 
 #[tokio::test]
+async fn file_write_keeps_a_created_file_when_the_formatter_service_fails() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tools = FileTools::with_formatter(workspace.path(), Arc::new(FailingFormatter::always()))
+        .expect("file tools");
+    let permission = Arc::new(RecordingPermission::default());
+    let path = workspace.path().join("formatter-error.txt");
+
+    let output = tools
+        .write
+        .execute(
+            json!({ "filePath": path, "content": "written\n" }),
+            normal_context(permission),
+        )
+        .await
+        .expect("the write landed, so formatter transport failure is diagnostic");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("written file"),
+        "written\n"
+    );
+    assert!(
+        output
+            .output
+            .contains("formatter service failed: formatter transport was lost"),
+        "{}",
+        output.output
+    );
+    assert_eq!(output.written_paths(), vec![slash(&path)]);
+}
+
+#[tokio::test]
 async fn file_apply_patch_adds_updates_moves_and_deletes_files() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     let formatter = Arc::new(RecordingFormatter::default());
@@ -486,6 +595,63 @@ async fn file_apply_patch_adds_updates_moves_and_deletes_files() {
 }
 
 #[tokio::test]
+async fn file_apply_patch_reports_an_uncertain_multi_file_outcome_after_a_late_failure() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tools = FileTools::with_formatter(workspace.path(), Arc::new(FailingFormatter::on_call(2)))
+        .expect("file tools");
+
+    let error = tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Add File: first.txt\n",
+                    "+first\n",
+                    "*** Add File: second.txt\n",
+                    "+second\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(Arc::new(RecordingPermission::default())),
+        )
+        .await
+        .expect_err("the formatter connection was lost after both writes");
+
+    let ToolError::Uncertain {
+        tool,
+        applied_paths,
+        source,
+    } = error
+    else {
+        panic!("expected uncertain outcome, got {error:?}");
+    };
+    assert_eq!(tool, "apply_patch");
+    assert_eq!(
+        applied_paths,
+        vec![
+            slash(&workspace.path().join("first.txt")),
+            slash(&workspace.path().join("second.txt")),
+        ]
+    );
+    assert_eq!(source.to_string(), "tool apply_patch failed");
+    assert!(
+        source
+            .source()
+            .is_some_and(|cause| cause.to_string().contains("formatter transport was lost")),
+        "the uncertain outcome lost the formatter cause: {source:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("first.txt")).expect("first write"),
+        "first\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("second.txt")).expect("second write"),
+        "second\n"
+    );
+}
+
+#[tokio::test]
 async fn file_every_writing_tool_a_model_can_see_reports_the_paths_it_wrote() {
     // The defect this pins: a downstream host — the TUI's language-server check — decided
     // which completions had changed a file by matching the tool's *name* against a
@@ -493,7 +659,7 @@ async fn file_every_writing_tool_a_model_can_see_reports_the_paths_it_wrote() {
     // and a GPT model is shown only `read` and `apply_patch`, so on those models a
     // successful patch matched nothing and no file was ever checked.
     //
-    // Driven off `exposed_for_model` — the very function that decides what a model sees —
+    // Driven off `model_visible` — the very function that decides what a model sees —
     // rather than a literal list here, so a tool added or renamed cannot quietly stop
     // reporting. Every exposed tool is invoked for real and answered against the disk: a
     // tool that wrote something must name it, and one that wrote nothing must name
@@ -504,18 +670,13 @@ async fn file_every_writing_tool_a_model_can_see_reports_the_paths_it_wrote() {
             .expect("file tools");
         std::fs::write(workspace.path().join("existing.txt"), "old\n").expect("fixture");
 
-        for tool in tools.exposed_for_model(model) {
+        for tool in tools.model_visible() {
             let id = tool.definition().id.clone();
             let arguments = match id.as_str() {
                 "read" => json!({ "filePath": workspace.path().join("existing.txt") }),
                 "write" => json!({
                     "filePath": workspace.path().join("written.txt"),
                     "content": "fresh\n",
-                }),
-                "edit" => json!({
-                    "filePath": workspace.path().join("existing.txt"),
-                    "oldString": "old\n",
-                    "newString": "edited\n",
                 }),
                 "apply_patch" => json!({
                     "patchText": concat!(
@@ -545,7 +706,6 @@ async fn file_every_writing_tool_a_model_can_see_reports_the_paths_it_wrote() {
             let expected: Vec<String> = match id.as_str() {
                 "read" => Vec::new(),
                 "write" => vec![slash(&workspace.path().join("written.txt"))],
-                "edit" => vec![slash(&workspace.path().join("existing.txt"))],
                 "apply_patch" => vec![
                     slash(&workspace.path().join("patched-one.txt")),
                     slash(&workspace.path().join("patched-two.txt")),
@@ -633,12 +793,16 @@ async fn file_walks_honor_an_already_set_interrupt() {
 }
 
 #[test]
-fn file_model_condition_matches_the_oracle_registry_rule() {
-    assert!(uses_apply_patch("gpt-5"));
-    assert!(uses_apply_patch("openai/gpt-5.2-codex"));
-    assert!(!uses_apply_patch("gpt-4.1"));
-    assert!(!uses_apply_patch("openai/gpt-oss-120b"));
-    assert!(!uses_apply_patch("claude-sonnet-4"));
+fn file_model_surface_has_one_structured_editor_and_one_full_write_fallback() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tools = FileTools::new(workspace.path()).expect("file tools");
+    let ids = tools
+        .model_visible()
+        .into_iter()
+        .map(|tool| tool.id().to_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, ["read", "write", "apply_patch"]);
 }
 
 /// Defect: the TUI diff viewer was permanently empty for every tool that edits code,

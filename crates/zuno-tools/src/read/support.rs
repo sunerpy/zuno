@@ -301,6 +301,22 @@ pub(crate) fn report_formatting(mut output: ToolOutput, failures: &[FormatFailur
     )
 }
 
+/// Report a post-write problem without claiming that the already-applied write failed.
+pub(crate) fn report_post_write_warnings(
+    mut output: ToolOutput,
+    warnings: &[String],
+) -> ToolOutput {
+    if warnings.is_empty() {
+        return output;
+    }
+    output.output.push_str("\n\n");
+    output.output.push_str(&warnings.join("\n"));
+    output.with_metadata(
+        "postWriteWarnings",
+        Value::Array(warnings.iter().cloned().map(Value::String).collect()),
+    )
+}
+
 /// Attach the patch of `old` → `new` to a mutation's result, when there is one.
 ///
 /// The post-image is the bytes re-read *after* the formatter ran, so the patch describes
@@ -340,6 +356,17 @@ where
 {
     ToolError::Failed {
         tool: tool.to_owned(),
+        source: Box::new(error),
+    }
+}
+
+pub(crate) fn uncertain<E>(tool: &str, paths: &[PathBuf], error: E) -> ToolError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    ToolError::Uncertain {
+        tool: tool.to_owned(),
+        applied_paths: paths.iter().map(|path| slash(path)).collect(),
         source: Box::new(error),
     }
 }

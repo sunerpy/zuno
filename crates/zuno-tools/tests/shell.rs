@@ -57,7 +57,6 @@ fn params(command: impl Into<String>) -> ShellParams {
         timeout: None,
         workdir: None,
         background: false,
-        justification: None,
     }
 }
 

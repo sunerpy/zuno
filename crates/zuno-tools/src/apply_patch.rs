@@ -3,7 +3,7 @@ mod parser;
 use crate::format::FormatFailure;
 use crate::read::{
     FileToolRuntime, PathKind, ResolvedPath, check_interrupt, decode_text, encode_text, failed,
-    interrupted, invalid, report_formatting, slash, write_with_dirs,
+    interrupted, invalid, report_formatting, slash, uncertain, write_with_dirs,
 };
 use async_trait::async_trait;
 use parser::{ChunkLine, PatchOperation, PatchParseError, UpdateChunk, parse_patch};
@@ -124,13 +124,14 @@ impl TypedTool for ApplyPatchTool {
         let mut written = Vec::<PathBuf>::new();
         let mut formatted_files = Vec::<Value>::new();
         let mut failures = Vec::<FormatFailure>::new();
+        let mut applied = Vec::<PathBuf>::new();
         // One patch covering every file this call touched, in application order. A
         // unified diff concatenates by construction — each file re-labels itself with its
         // own `---`/`+++` pair — so the viewer scrolls through the whole change rather
         // than showing whichever file happened to be last.
         let mut patches = Vec::<String>::new();
         for change in changes {
-            check_interrupt("apply_patch", &ctx)?;
+            after_effect(check_interrupt("apply_patch", &ctx), &applied)?;
             let source_path = change.source.canonical.clone();
             let target = change.destination.as_ref().unwrap_or(&change.source);
             let target_path = target.canonical.clone();
@@ -139,28 +140,46 @@ impl TypedTool for ApplyPatchTool {
             // uncooperative formatter must not abandon a patch mid-way.
             let formatted = match change.kind {
                 ChangeKind::Add | ChangeKind::Update => {
-                    write_with_dirs(&target_path, &change.new_bytes)
-                        .map_err(|error| failed("apply_patch", error))?;
-                    self.format(&target_path, &mut failures).await?
+                    after_effect(
+                        write_with_dirs(&target_path, &change.new_bytes)
+                            .map_err(|error| failed("apply_patch", error)),
+                        &applied,
+                    )?;
+                    applied.push(target_path.clone());
+                    after_effect(self.format(&target_path, &mut failures).await, &applied)?
                 }
                 ChangeKind::Move => {
-                    write_with_dirs(&target_path, &change.new_bytes)
-                        .map_err(|error| failed("apply_patch", error))?;
-                    std::fs::remove_file(&source_path)
-                        .map_err(|error| failed("apply_patch", error))?;
+                    after_effect(
+                        write_with_dirs(&target_path, &change.new_bytes)
+                            .map_err(|error| failed("apply_patch", error)),
+                        &applied,
+                    )?;
+                    applied.push(target_path.clone());
+                    after_effect(
+                        std::fs::remove_file(&source_path)
+                            .map_err(|error| failed("apply_patch", error)),
+                        &applied,
+                    )?;
+                    applied.push(source_path.clone());
                     self.runtime.state.forget(&source_path);
-                    self.format(&target_path, &mut failures).await?
+                    after_effect(self.format(&target_path, &mut failures).await, &applied)?
                 }
                 ChangeKind::Delete => {
-                    std::fs::remove_file(&source_path)
-                        .map_err(|error| failed("apply_patch", error))?;
+                    after_effect(
+                        std::fs::remove_file(&source_path)
+                            .map_err(|error| failed("apply_patch", error)),
+                        &applied,
+                    )?;
+                    applied.push(source_path.clone());
                     self.runtime.state.forget(&source_path);
                     false
                 }
             };
             if change.kind != ChangeKind::Delete {
-                let final_bytes =
-                    std::fs::read(&target_path).map_err(|error| failed("apply_patch", error))?;
+                let final_bytes = after_effect(
+                    std::fs::read(&target_path).map_err(|error| failed("apply_patch", error)),
+                    &applied,
+                )?;
                 written.push(target_path.clone());
                 self.runtime
                     .state
@@ -181,7 +200,10 @@ impl TypedTool for ApplyPatchTool {
             let post = if change.kind == ChangeKind::Delete {
                 Vec::new()
             } else {
-                std::fs::read(&target_path).map_err(|error| failed("apply_patch", error))?
+                after_effect(
+                    std::fs::read(&target_path).map_err(|error| failed("apply_patch", error)),
+                    &applied,
+                )?
             };
             if let Some(patch) =
                 crate::diff::unified_diff_bytes(&relative, &change.old_bytes, &post)
@@ -211,6 +233,16 @@ impl TypedTool for ApplyPatchTool {
         }
         Ok(report_formatting(result, &failures))
     }
+}
+
+fn after_effect<T>(result: Result<T, ToolError>, applied: &[PathBuf]) -> Result<T, ToolError> {
+    result.map_err(|error| {
+        if applied.is_empty() {
+            error
+        } else {
+            uncertain("apply_patch", applied, error)
+        }
+    })
 }
 
 impl ApplyPatchTool {
