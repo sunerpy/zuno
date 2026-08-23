@@ -157,6 +157,34 @@ fn session_screen_submitting_moves_the_prompt_into_the_transcript() {
     );
 }
 
+#[test]
+fn session_screen_a_submission_during_work_is_forwarded_as_a_steer_candidate() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(2);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+    screen.status.mark_running();
+
+    screen.submit_prompt("change direction");
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Text(String::from("change direction"))),
+        "the active turn caused the follow-up to be refused instead of admitted"
+    );
+    let notices = ActionComponent::drain_toasts(&mut screen);
+    assert!(
+        notices
+            .iter()
+            .any(|toast| toast.text().contains("next safe point")),
+        "the user was not told whether the accepted input would steer or queue: {notices:?}"
+    );
+    let rendered = rows(&render_offscreen(&mut screen, 72, 10).expect("infallible")).join("\n");
+    assert!(
+        !rendered.contains("not sent: a turn is already running"),
+        "the old channel-capacity refusal remained visible:\n{rendered}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Bracketed paste
 // ---------------------------------------------------------------------------
@@ -717,7 +745,7 @@ fn session_an_mcp_status_change_after_the_panel_opened_reaches_the_panel_and_the
 }
 
 #[test]
-fn session_screen_unknown_slash_is_visible_and_never_reaches_the_prompt_sink() {
+fn session_screen_unknown_slash_is_a_short_toast_and_never_reaches_the_prompt_sink() {
     let (sender, _shutdown) = terminal_event_channel();
     let (prompts, mut submitted) = mpsc::channel(1);
     let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
@@ -730,14 +758,17 @@ fn session_screen_unknown_slash_is_visible_and_never_reaches_the_prompt_sink() {
         "unknown slash input was forwarded to the model"
     );
     assert!(screen.submissions().is_empty());
+    let toasts = ActionComponent::drain_toasts(&mut screen);
+    let toast = toasts
+        .iter()
+        .find(|toast| toast.text().contains("unknown command `/not-a-command`"))
+        .expect("the refusal is raised as a transient notice");
+    assert_eq!(toast.level(), ToastLevel::Warning);
+    assert_eq!(toast.ttl(), crate::views::toast::TOAST_TTL);
     let rendered = rows(&render_offscreen(&mut screen, 100, 12).expect("infallible")).join("\n");
     assert!(
-        rendered.contains("unknown command `/not-a-command`"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("type `/`") && rendered.contains("ctrl+p"),
-        "{rendered}"
+        !rendered.contains("unknown command"),
+        "a transient command refusal leaked into durable transcript rows:\n{rendered}"
     );
 }
 
@@ -1137,6 +1168,71 @@ fn session_screen_the_second_exit_chord_leaves_even_if_the_cancelled_turn_never_
         1,
         "the second press must leave, not cancel again"
     );
+}
+
+#[test]
+fn session_screen_double_escape_cancels_without_leaving_the_application() {
+    let (sender, mut shutdown) = terminal_event_channel();
+    let (cancels, mut cancelled) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_cancel_sink(cancels);
+    screen.status.mark_running();
+
+    screen.handle_action(
+        action("session_interrupt"),
+        &press(crossterm::event::KeyCode::Esc),
+    );
+    assert!(
+        cancelled.try_recv().is_err(),
+        "the first escape cancelled instead of asking for confirmation"
+    );
+    assert!(
+        shutdown.try_recv().is_err(),
+        "the first escape left the application"
+    );
+    let first = ActionComponent::drain_toasts(&mut screen);
+    let interrupt_key = crate::views::key_label("session_interrupt", &ViewContext::defaults())
+        .unwrap_or_else(|| String::from("esc"));
+    assert!(
+        first.iter().any(|toast| {
+            toast
+                .text()
+                .contains(&format!("press {interrupt_key} again"))
+                && toast.ttl() == crate::views::toast::TOAST_TTL
+        }),
+        "the first escape did not explain the second press: {first:?}"
+    );
+
+    screen.handle_action(
+        action("session_interrupt"),
+        &press(crossterm::event::KeyCode::Esc),
+    );
+    assert_eq!(
+        cancelled.try_recv(),
+        Ok(()),
+        "the second escape did not cancel"
+    );
+    assert_eq!(screen.cancellations(), 1);
+    assert!(
+        shutdown.try_recv().is_err(),
+        "double escape cancelled the whole TUI instead of the active turn"
+    );
+}
+
+#[test]
+fn session_screen_escape_confirmation_expires_before_a_later_press() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (cancels, mut cancelled) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_cancel_sink(cancels);
+    screen.status.mark_running();
+
+    screen.request_interrupt_at(1_000);
+    screen.request_interrupt_at(1_000 + INTERRUPT_CONFIRM_WINDOW_MS + 1);
+
+    assert!(
+        cancelled.try_recv().is_err(),
+        "an old escape arm cancelled a turn after the confirmation window"
+    );
+    assert_eq!(screen.cancellations(), 0);
 }
 
 /// A later turn is cancellable again; only the turn already asked about is remembered.
@@ -3229,6 +3325,42 @@ fn session_stops_spinning_while_a_permission_prompt_is_mounted_over_it() {
     assert!(
         resumed.contains("working"),
         "the wait notice outlived the prompt that justified it:\n{resumed}"
+    );
+}
+
+#[test]
+fn session_reports_that_a_question_is_waiting_for_the_user() {
+    let (mut screen, _shutdown) = screen();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("choose a delivery mode"));
+    let context = ViewContext::defaults();
+    let mut host = crate::views::dialog::DialogHost::new(context.clone(), Box::new(screen));
+    host.handle_event(&AppEvent::Engine(TurnEvent::TurnStarted {
+        session_id: String::from("s"),
+    }));
+    host.open(Box::new(crate::views::question::QuestionPrompt::new(
+        context,
+        vec![crate::views::question::QuestionRequest::new(
+            "How should the result be delivered?",
+            "Delivery",
+            vec![crate::views::question::QuestionOption::new(
+                "Next step",
+                "Wake the parent on its next safe point",
+            )],
+        )],
+    )));
+
+    let waiting = rows(&render_offscreen(&mut host, 70, 20).expect("infallible")).join("\n");
+    assert!(
+        !waiting.contains("working"),
+        "the spinner claimed the process was busy while the question waited for an answer:\n\
+         {waiting}"
+    );
+    assert!(
+        waiting.contains("waiting for your answer"),
+        "the running-state surface did not name what it needs from the user:\n{waiting}"
     );
 }
 

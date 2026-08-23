@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 pub const GUARD_MARKER: &str = "__zuno_child_guard";
 const SUPERVISE_MODE: &str = "supervise";
 const SUPERVISE_FOREGROUND_MODE: &str = "supervise-foreground";
-const MONITOR_MODE: &str = "monitor";
 const MONITOR_FOREGROUND_MODE: &str = "monitor-foreground";
 const EXEC_MODE: &str = "exec";
 const EXEC_FOREGROUND_MODE: &str = "exec-foreground";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a teardown waits for the contained group to stop being able to run.
 ///
 /// The wait begins only after `SIGKILL` has reached the whole group, so what remains is
@@ -74,15 +75,15 @@ where
     guarded_argv_for_mode(program, arguments, SUPERVISE_FOREGROUND_MODE)
 }
 
-/// Terminates one process and every descendant contained in its process group.
+/// Requests shutdown from a direct child returned by [`guarded_argv`].
 ///
-/// Callers must launch the process as a process-group leader on Unix. Zuno's
-/// resident process hosts do that at spawn time; on Windows the operating system
-/// does not expose the same primitive, so `taskkill /T` is used.
-///
-/// A graceful signal is followed by a bounded hard kill. The function is
-/// intentionally idempotent: asking to stop an already-exited process succeeds.
-pub fn terminate_process_tree(pid: u32) -> io::Result<()> {
+/// With an active resident guard, the guard receives a catchable signal so it can
+/// stop and reap the process group it owns. Before guard activation, library-only
+/// consumers launch the program directly; an isolated process-group leader is then
+/// killed as a group, while a non-leader is killed individually so Zuno never
+/// signals its own process group. The request is idempotent when the process already
+/// exited.
+pub fn request_contained_process_shutdown(pid: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
         let Some(process) = rustix::process::Pid::from_raw(pid as i32) else {
@@ -91,16 +92,19 @@ pub fn terminate_process_tree(pid: u32) -> io::Result<()> {
                 "process id must be positive",
             ));
         };
-        for signal in [rustix::process::Signal::TERM, rustix::process::Signal::KILL] {
-            match rustix::process::kill_process_group(process, signal) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+        let result = if GUARD_EXECUTABLE.get().is_some() {
+            rustix::process::kill_process(process, rustix::process::Signal::TERM)
+        } else {
+            match rustix::process::getpgid(Some(process)) {
+                Ok(group) if group == process => {
+                    rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+                }
+                Ok(_) => rustix::process::kill_process(process, rustix::process::Signal::KILL),
+                Err(rustix::io::Errno::SRCH) => return Ok(()),
                 Err(error) => return Err(error.into()),
             }
-            if signal == rustix::process::Signal::TERM {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-        match rustix::process::kill_process(process, rustix::process::Signal::KILL) {
+        };
+        match result {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -108,26 +112,30 @@ pub fn terminate_process_tree(pid: u32) -> io::Result<()> {
 
     #[cfg(windows)]
     {
-        let status = Command::new("taskkill")
-            .args(["/pid", &pid.to_string(), "/f", "/t"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            // `taskkill` uses a non-zero status for a process that already exited.
-            // Checking again makes cancellation idempotent without hiding a live
-            // process that genuinely refused termination.
-            if windows_process_exists(pid) {
-                Err(io::Error::other(format!(
-                    "taskkill failed for process tree {pid} with status {status}"
-                )))
-            } else {
-                Ok(())
-            }
-        }
+        terminate_windows_process_tree(pid)
+    }
+}
+
+#[cfg(windows)]
+fn terminate_windows_process_tree(pid: u32) -> io::Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/pid", &pid.to_string(), "/f", "/t"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    // `taskkill` uses a non-zero status for a process that already exited.
+    // Checking again makes cancellation idempotent without hiding a live
+    // process that genuinely refused termination.
+    if windows_process_exists(pid) {
+        Err(io::Error::other(format!(
+            "taskkill failed for process tree {pid} with status {status}"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -188,7 +196,6 @@ fn parse_guard(arguments: &[OsString]) -> io::Result<GuardRequest> {
     let mode = match arguments.get(2).and_then(|value| value.to_str()) {
         Some(SUPERVISE_MODE) => SUPERVISE_MODE,
         Some(SUPERVISE_FOREGROUND_MODE) => SUPERVISE_FOREGROUND_MODE,
-        Some(MONITOR_MODE) => MONITOR_MODE,
         Some(MONITOR_FOREGROUND_MODE) => MONITOR_FOREGROUND_MODE,
         Some(EXEC_MODE) => EXEC_MODE,
         Some(EXEC_FOREGROUND_MODE) => EXEC_FOREGROUND_MODE,
@@ -217,15 +224,121 @@ fn parse_guard(arguments: &[OsString]) -> io::Result<GuardRequest> {
 
 fn run_guard(request: GuardRequest) -> io::Result<ExitStatus> {
     match request.mode {
-        SUPERVISE_MODE | SUPERVISE_FOREGROUND_MODE => supervise(request),
-        MONITOR_MODE | MONITOR_FOREGROUND_MODE => monitor(request),
+        SUPERVISE_MODE => supervise_resident(request),
+        SUPERVISE_FOREGROUND_MODE => supervise_foreground(request),
+        MONITOR_FOREGROUND_MODE => monitor_foreground(request),
         EXEC_MODE | EXEC_FOREGROUND_MODE => exec_guarded(request),
         _ => unreachable!("guard mode was validated while parsing"),
     }
 }
 
 #[cfg(unix)]
-fn supervise(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_resident(request: GuardRequest) -> io::Result<ExitStatus> {
+    #[cfg(target_os = "linux")]
+    {
+        supervise_resident_with_signals(request)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        supervise_resident_with_parent_poll(request)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn supervise_resident_with_signals(request: GuardRequest) -> io::Result<ExitStatus> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGCHLD,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ])?;
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))?;
+    if parent_pid() != Some(request.expected_parent) {
+        return Err(io::Error::other(
+            "guard parent exited before containment was armed",
+        ));
+    }
+
+    let mut child = spawn_resident_payload(&request)?;
+    let child_pid = child.id();
+    loop {
+        if let Some(status) = observe_resident_payload(&mut child, child_pid)? {
+            return Ok(status);
+        }
+
+        let terminate = signals.wait().any(|signal| {
+            matches!(
+                signal,
+                signal_hook::consts::SIGTERM
+                    | signal_hook::consts::SIGINT
+                    | signal_hook::consts::SIGHUP
+            )
+        });
+        if terminate || parent_pid() != Some(request.expected_parent) {
+            return terminate_guarded_process_group(&mut child, child_pid, false);
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn supervise_resident_with_parent_poll(request: GuardRequest) -> io::Result<ExitStatus> {
+    let terminate = termination_flag()?;
+    if parent_pid() != Some(request.expected_parent) {
+        return Err(io::Error::other(
+            "guard parent exited before containment was armed",
+        ));
+    }
+
+    let mut child = spawn_resident_payload(&request)?;
+    let child_pid = child.id();
+    loop {
+        if let Some(status) = observe_resident_payload(&mut child, child_pid)? {
+            return Ok(status);
+        }
+        if terminate.load(std::sync::atomic::Ordering::Acquire)
+            || parent_pid() != Some(request.expected_parent)
+        {
+            return terminate_guarded_process_group(&mut child, child_pid, false);
+        }
+        std::thread::sleep(PARENT_POLL_INTERVAL);
+    }
+}
+
+#[cfg(unix)]
+fn observe_resident_payload(
+    child: &mut std::process::Child,
+    child_pid: u32,
+) -> io::Result<Option<ExitStatus>> {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            terminate_process_group(child_pid);
+            settle_contained_process_group(child_pid);
+            Ok(Some(status))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(with_cleanup_error(
+            error,
+            terminate_guarded_process_group(child, child_pid, false),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn spawn_resident_payload(request: &GuardRequest) -> io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = Command::new(&request.program);
+    command
+        .args(&request.arguments)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .process_group(0);
+    command.spawn()
+}
+
+#[cfg(unix)]
+fn supervise_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
     #[cfg(target_os = "linux")]
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))?;
     let terminate = termination_flag()?;
@@ -236,14 +349,9 @@ fn supervise(request: GuardRequest) -> io::Result<ExitStatus> {
     }
 
     let executable = std::env::current_exe()?;
-    let monitor_mode = if request.mode == SUPERVISE_FOREGROUND_MODE {
-        MONITOR_FOREGROUND_MODE
-    } else {
-        MONITOR_MODE
-    };
     let mut child = Command::new(executable)
         .arg(GUARD_MARKER)
-        .arg(monitor_mode)
+        .arg(MONITOR_FOREGROUND_MODE)
         .arg(std::process::id().to_string())
         .arg("--")
         .arg(&request.program)
@@ -269,7 +377,7 @@ fn supervise(request: GuardRequest) -> io::Result<ExitStatus> {
 }
 
 #[cfg(unix)]
-fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
+fn monitor_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
     use std::io::IsTerminal as _;
 
     #[cfg(target_os = "linux")]
@@ -281,8 +389,7 @@ fn monitor(request: GuardRequest) -> io::Result<ExitStatus> {
         ));
     }
 
-    let transfer_foreground =
-        request.mode == MONITOR_FOREGROUND_MODE && std::io::stdin().is_terminal();
+    let transfer_foreground = std::io::stdin().is_terminal();
     if transfer_foreground && !terminal_foreground_is_process_group_of(request.expected_parent)? {
         return Err(io::Error::other(
             "guard supervisor does not own the terminal foreground process group",
@@ -735,7 +842,17 @@ fn with_cleanup_error(error: io::Error, cleanup: io::Result<ExitStatus>) -> io::
 }
 
 #[cfg(windows)]
-fn supervise(request: GuardRequest) -> io::Result<ExitStatus> {
+fn supervise_resident(request: GuardRequest) -> io::Result<ExitStatus> {
+    supervise_windows(request)
+}
+
+#[cfg(windows)]
+fn supervise_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
+    supervise_windows(request)
+}
+
+#[cfg(windows)]
+fn supervise_windows(request: GuardRequest) -> io::Result<ExitStatus> {
     use process_wrap::std::{ChildWrapper as _, CommandWrap, JobObject};
 
     let mut command = Command::new(request.program);
@@ -759,12 +876,12 @@ fn supervise(request: GuardRequest) -> io::Result<ExitStatus> {
             child.start_kill()?;
             return child.wait();
         }
-        std::thread::sleep(POLL_INTERVAL);
+        std::thread::sleep(PARENT_POLL_INTERVAL);
     }
 }
 
 #[cfg(windows)]
-fn monitor(_request: GuardRequest) -> io::Result<ExitStatus> {
+fn monitor_foreground(_request: GuardRequest) -> io::Result<ExitStatus> {
     Err(io::Error::other("monitor guard mode is Unix-only"))
 }
 

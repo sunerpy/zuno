@@ -587,6 +587,35 @@ impl Message {
     }
 }
 
+/// Why a running turn is currently waiting on the user.
+///
+/// This is UI state rather than an engine event: a tool blocked in `ctx.ask` emits no
+/// progress while the dialog is open, so only the mounted client surface can distinguish
+/// an approval from an ordinary slow tool or a structured question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AwaitingUser {
+    /// A side effect needs permission.
+    Approval,
+    /// A structured question needs an answer.
+    Answer,
+}
+
+impl AwaitingUser {
+    const fn transcript_text(self) -> &'static str {
+        match self {
+            Self::Approval => "△ waiting for your approval",
+            Self::Answer => "△ waiting for your answer",
+        }
+    }
+
+    const fn status_text(self) -> &'static str {
+        match self {
+            Self::Approval => "awaiting approval",
+            Self::Answer => "awaiting answer",
+        }
+    }
+}
+
 /// The transcript: every message, folded from engine events.
 #[derive(Debug, Clone, Default)]
 pub struct Transcript {
@@ -616,14 +645,14 @@ pub struct Transcript {
     context_limit: u64,
     /// How many events have been folded, which is what advances the spinner.
     ticks: usize,
-    /// Whether a permission prompt is asking the user to decide right now.
+    /// Why a mounted prompt is asking the user to decide right now.
     ///
     /// Not folded from an engine event, because a parked ask produces none: the
     /// dispatcher blocks inside `ctx.ask` and the engine's last word was
     /// `ToolDispatchStarted`, which is equally true of a shell command that is simply
     /// slow. The dialog stack is the only thing that knows the difference, so it is what
     /// sets this.
-    awaiting_permission: bool,
+    awaiting_user: Option<AwaitingUser>,
     /// How many leading messages were read back from the database rather than lived through.
     ///
     /// A count rather than a flag per message, because [`Self::replay`] refuses a
@@ -639,31 +668,25 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// What the transcript says instead of the spinner while a permission ask is open.
-    ///
-    /// Phrased as an instruction rather than a state — "waiting" alone leaves the user
-    /// looking for what to wait for, when they are the thing being waited on.
-    pub const AWAITING_PERMISSION: &'static str = "△ waiting for your approval";
-
     /// An empty transcript.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record whether a permission prompt is asking the user to decide.
+    /// Record why a mounted prompt is asking the user to decide.
     ///
     /// Returns whether the answer changed, which is what a caller turns into a redraw.
-    pub const fn set_awaiting_permission(&mut self, awaiting: bool) -> bool {
-        let changed = self.awaiting_permission != awaiting;
-        self.awaiting_permission = awaiting;
+    pub fn set_awaiting_user(&mut self, awaiting: Option<AwaitingUser>) -> bool {
+        let changed = self.awaiting_user != awaiting;
+        self.awaiting_user = awaiting;
         changed
     }
 
-    /// Whether a permission prompt is currently asking the user to decide.
+    /// Why a mounted prompt is currently asking the user to decide.
     #[must_use]
-    pub const fn is_awaiting_permission(&self) -> bool {
-        self.awaiting_permission
+    pub const fn awaiting_user(&self) -> Option<AwaitingUser> {
+        self.awaiting_user
     }
 
     /// The messages so far.
@@ -1896,9 +1919,9 @@ impl TranscriptView {
         // turn is blocked on, so exactly one of them may be on screen. A spinner beside
         // an open permission prompt says the process is busy while it is in fact idle,
         // waiting for the very key press the prompt is asking for.
-        if self.transcript.awaiting_permission {
+        if let Some(awaiting) = self.transcript.awaiting_user {
             lines.push(padded(
-                Transcript::AWAITING_PERMISSION,
+                awaiting.transcript_text(),
                 width,
                 self.context.warning(),
             ));
@@ -3000,12 +3023,12 @@ pub struct StatusView {
     /// "connected". It is the same reasoning that put the shadowing warning in the
     /// transcript.
     diagnostics: Option<String>,
-    /// Whether a permission prompt is asking the user to decide.
+    /// Why a mounted prompt is asking the user to decide.
     ///
     /// The strip is the one row always on screen, so it is where a user looks when a
     /// turn seems stuck. Saying `working` there while the process is parked on an ask
     /// points them at the wrong thing to wait for.
-    awaiting_permission: bool,
+    awaiting_user: Option<AwaitingUser>,
     /// The checkout's branch, as the host measured it.
     ///
     /// Not folded from an engine event, because no engine event carries it: the branch
@@ -3156,13 +3179,6 @@ impl StatusView {
     /// The word the strip shows the instant a turn starts, before anything resolves.
     pub const WORKING: &'static str = "working";
 
-    /// What the strip says while a permission prompt is waiting on the user.
-    ///
-    /// It replaces [`Self::WORKING`] rather than sitting beside it: the two are opposite
-    /// answers to "who is this turn blocked on", and a strip that printed both would make
-    /// the user read the prompt as background noise.
-    pub const AWAITING_PERMISSION: &'static str = "awaiting approval";
-
     /// What the exit hint says the key *does*, appended to whichever key
     /// [`Self::exit_hint`] resolved.
     ///
@@ -3219,7 +3235,7 @@ impl StatusView {
             configured_model: None,
             usage: TokenUsage::default(),
             diagnostics: None,
-            awaiting_permission: false,
+            awaiting_user: None,
             git_branch: None,
             effort: None,
         }
@@ -3235,12 +3251,12 @@ impl StatusView {
         self.git_branch = (!branch.is_empty()).then_some(branch);
     }
 
-    /// Record whether a permission prompt is waiting on the user.
+    /// Record why a mounted prompt is waiting on the user.
     ///
     /// Returns whether the answer changed, which is what a caller turns into a redraw.
-    pub const fn set_awaiting_permission(&mut self, awaiting: bool) -> bool {
-        let changed = self.awaiting_permission != awaiting;
-        self.awaiting_permission = awaiting;
+    pub fn set_awaiting_user(&mut self, awaiting: Option<AwaitingUser>) -> bool {
+        let changed = self.awaiting_user != awaiting;
+        self.awaiting_user = awaiting;
         changed
     }
 
@@ -3430,29 +3446,53 @@ impl StatusView {
     /// [`Self::trailers`] and not in [`Self::state`].
     #[must_use]
     pub fn line(&self, width: u16) -> Line<'static> {
-        let state = format!(" {}", self.state());
         let columns = usize::from(width);
-        // Terminal columns, not `chars().count()`: the cache glyph `⚡` and a CJK model
-        // name each occupy two cells, so counting characters here claims the row is
-        // narrower than it is and over-fills it by one column per wide glyph.
-        let state_columns = display_width(&state);
-        for trailer in self.trailers() {
-            let used = state_columns + display_width(&trailer) + 1;
-            if used < columns {
-                return Line::from(vec![
-                    Span::styled(state, self.context.element()),
-                    Span::styled(" ".repeat(columns - used), self.context.element()),
-                    Span::styled(
-                        trailer,
-                        Style::new()
-                            .fg(self.context.palette().text_muted.into())
-                            .bg(self.context.palette().background_element.into()),
-                    ),
-                    Span::styled(String::from(" "), self.context.element()),
-                ]);
+        let full_state = self.state();
+        let compact_state = self.compact_state(&full_state);
+        for state in compact_state.as_ref().map_or_else(
+            || vec![full_state.as_str()],
+            |compact| vec![full_state.as_str(), compact.as_str()],
+        ) {
+            let state = format!(" {state}");
+            // Terminal columns, not `chars().count()`: the cache glyph `⚡` and a CJK
+            // model name each occupy two cells, so counting characters here claims the
+            // row is narrower than it is and over-fills it by one column per wide glyph.
+            let state_columns = display_width(&state);
+            for trailer in self.trailers() {
+                let used = state_columns + display_width(&trailer) + 1;
+                if used < columns {
+                    return Line::from(vec![
+                        Span::styled(state, self.context.element()),
+                        Span::styled(" ".repeat(columns - used), self.context.element()),
+                        Span::styled(
+                            trailer,
+                            Style::new()
+                                .fg(self.context.palette().text_muted.into())
+                                .bg(self.context.palette().background_element.into()),
+                        ),
+                        Span::styled(String::from(" "), self.context.element()),
+                    ]);
+                }
             }
         }
+        let state = compact_state.unwrap_or(full_state);
+        let state = format!(" {state}");
         padded(&state, width, self.context.element())
+    }
+
+    /// A narrower state that yields the transient `working` word to the exit hint.
+    ///
+    /// The configured agent and model still identify the active turn, while a missing
+    /// cancel key can trap the user. `working` therefore remains visible whenever it
+    /// fits, but it is the first part of the left side to go when no trailer can coexist
+    /// with it. A bare `working` has no more informative compact form and is retained.
+    fn compact_state(&self, full: &str) -> Option<String> {
+        if !self.running || self.awaiting_user.is_some() {
+            return None;
+        }
+        full.strip_suffix(&format!(" · {}", Self::WORKING))
+            .filter(|state| !state.is_empty())
+            .map(str::to_owned)
     }
 
     fn state(&self) -> String {
@@ -3495,20 +3535,21 @@ impl StatusView {
             }
             text.push_str(diagnostics);
         }
-        if self.awaiting_permission {
+        if let Some(awaiting) = self.awaiting_user {
             // Appended even beside a resolved agent and model, because those describe the
             // turn's configuration while this describes what it is stopped on. It also
             // displaces `working`/`idle` below: an outstanding ask outranks both.
             if !text.is_empty() {
                 text.push_str(" · ");
             }
-            text.push_str(Self::AWAITING_PERMISSION);
+            text.push_str(awaiting.status_text());
+        } else if self.running {
+            if !text.is_empty() {
+                text.push_str(" · ");
+            }
+            text.push_str(Self::WORKING);
         } else if text.is_empty() {
-            text.push_str(if self.running {
-                Self::WORKING
-            } else {
-                Self::IDLE
-            });
+            text.push_str(Self::IDLE);
         } else if !self.running && self.agent.is_none() && self.model.is_none() && self.step == 0 {
             // Only when every field came from configuration. Saying `idle` beside a
             // resolved agent, model and step would contradict the state it sits next

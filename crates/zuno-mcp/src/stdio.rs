@@ -708,7 +708,7 @@ impl ProcessControl {
         let task = tokio::spawn(async move {
             let result = tokio::select! {
                 status = child.wait() => status.map(|status| Some(status.code())),
-                _ = &mut shutdown_receiver => child.kill().await.map(|()| None),
+                _ = &mut shutdown_receiver => stop_guarded_child(&mut child).await.map(|()| None),
             };
             match result {
                 Ok(Some(code)) => tracing::debug!(%server, ?code, "MCP child exited"),
@@ -732,9 +732,16 @@ impl ProcessControl {
         self.signal();
         let task = lock(&self.task).take();
         if let Some(task) = task {
-            finish_task(task, PROCESS_SHUTDOWN_GRACE).await;
+            finish_guard_task(task, PROCESS_SHUTDOWN_GRACE).await;
         }
     }
+}
+
+async fn stop_guarded_child(child: &mut Child) -> io::Result<()> {
+    if let Some(pid) = child.id() {
+        zuno_process::request_contained_process_shutdown(pid)?;
+    }
+    child.wait().await.map(|_| ())
 }
 
 impl Drop for ProcessControl {
@@ -742,9 +749,8 @@ impl Drop for ProcessControl {
         if let Some(shutdown) = lock(&self.shutdown).take() {
             let _result = shutdown.send(());
         }
-        // Detach rather than abort: the supervisor owns the child and must reach
-        // `kill().await` to reap it. Aborting would make kill-on-drop signal the
-        // process but give nobody a chance to collect its exit status.
+        // Detach rather than abort: the guard must receive orderly shutdown and
+        // remain alive long enough to drain and reap its contained process group.
         let _detached = lock(&self.task).take();
     }
 }
@@ -863,6 +869,8 @@ fn build_command(workspace: &Path, config: &McpLocal) -> io::Result<Command> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     // `Command` inherits process env unless `env_clear` is called.
     if let Some(environment) = &config.environment {
         command.envs(environment);
@@ -936,6 +944,15 @@ async fn finish_task(mut task: JoinHandle<()>, grace: Duration) {
     if tokio::time::timeout(grace, &mut task).await.is_err() {
         task.abort();
         let _result = task.await;
+    }
+}
+
+async fn finish_guard_task(mut task: JoinHandle<()>, grace: Duration) {
+    if tokio::time::timeout(grace, &mut task).await.is_err() {
+        tracing::warn!(
+            ?grace,
+            "MCP process guard cleanup exceeded its grace; reaper remains detached"
+        );
     }
 }
 

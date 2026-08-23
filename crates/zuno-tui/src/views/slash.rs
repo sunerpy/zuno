@@ -63,7 +63,8 @@ pub enum SlashCommandKind {
 }
 
 /// A slash command executed by the runtime host rather than the model or view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HostCommand {
     /// Restore the worktree boundary before the most recent completed turn.
     Undo,

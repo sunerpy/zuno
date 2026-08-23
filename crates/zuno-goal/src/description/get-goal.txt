@@ -1,1 +1,1 @@
-Get the current goal for this session, including status, budget, usage, and remaining tokens.
+Read the current durable goal, including its objective, status, budget, usage, and remaining tokens. Use this before deciding whether a goal may be completed or reported blocked.

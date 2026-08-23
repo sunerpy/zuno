@@ -1083,6 +1083,15 @@ pub trait ActionComponent: Component {
         Vec::new()
     }
 
+    /// Region a dialog may use when it belongs to a base-owned surface.
+    ///
+    /// Overlay dialogs return `None` and use the whole frame. Composer prompts ask for
+    /// their base's input region so they align with the transcript column, avoid the
+    /// sidebar, and grow upward from the same bottom edge as the editor they replace.
+    fn dialog_region(&self, _dialog: &'static str, _area: Rect) -> Option<Rect> {
+        None
+    }
+
     /// Observe the answer to a dialog this component asked for.
     fn apply_dialog_outcome(
         &mut self,

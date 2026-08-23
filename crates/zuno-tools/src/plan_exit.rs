@@ -475,5 +475,13 @@ mod tests {
         assert!(DESCRIPTION.starts_with(
             "Use this tool when you have completed the planning phase and are ready to exit plan agent."
         ));
+        assert!(
+            DESCRIPTION.contains("Do not duplicate the approval question"),
+            "{DESCRIPTION}"
+        );
+        assert!(
+            DESCRIPTION.contains("no unresolved implementation decision remains"),
+            "{DESCRIPTION}"
+        );
     }
 }

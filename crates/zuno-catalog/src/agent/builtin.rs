@@ -403,4 +403,55 @@ mod tests {
         assert_eq!(get("plan").expect("plan").mode, AgentMode::Primary);
         assert_eq!(get("deep").expect("deep").mode, AgentMode::Subagent);
     }
+
+    #[test]
+    fn delivery_prompts_require_evidence_without_becoming_policy_dumps() {
+        let cases = [
+            (
+                "build",
+                PROMPT_BUILD,
+                220,
+                [
+                    "Do not declare completion from intent",
+                    "authoritative evidence",
+                    "Do not duplicate delegated discovery",
+                ],
+            ),
+            (
+                "plan",
+                PROMPT_PLAN,
+                190,
+                [
+                    "without modifying product files",
+                    "authoritative evidence",
+                    "implementation decision",
+                ],
+            ),
+            (
+                "deep",
+                PROMPT_DEEP,
+                170,
+                [
+                    "without delegating",
+                    "owning abstraction",
+                    "interruption and recovery",
+                ],
+            ),
+        ];
+
+        for (name, prompt, word_limit, clauses) in cases {
+            for clause in clauses {
+                assert!(
+                    prompt.contains(clause),
+                    "{name} prompt is missing `{clause}`:\n{prompt}"
+                );
+            }
+            let words = prompt.split_whitespace().count();
+            assert!(
+                words <= word_limit,
+                "{name} prompt grew to {words} words; concise role policy belongs here, not a \
+                 second harness manual"
+            );
+        }
+    }
 }

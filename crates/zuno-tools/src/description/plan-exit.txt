@@ -4,10 +4,13 @@ This tool will ask the user if they want to switch to build agent to start imple
 
 Call this tool:
 - After you have written a complete plan to the plan file
-- After you have clarified any questions with the user
-- When you are confident the plan is ready for implementation
+- After every material question is resolved and no unresolved implementation decision remains
+- When another agent can execute the plan without repeating discovery
 
 Do NOT call this tool:
 - Before you have created or finalized the plan
 - If you still have unanswered questions about the implementation
 - If the user has indicated they want to continue planning
+- Merely because you have reached the end of a turn
+
+Do not duplicate the approval question in chat; this tool owns that interaction. A cancellation or "No" keeps the session in plan mode.

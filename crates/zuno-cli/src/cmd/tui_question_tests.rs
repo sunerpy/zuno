@@ -179,7 +179,7 @@ async fn question_round_trip_returns_multi_question_answers_in_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn question_escape_skips_with_an_empty_answer_and_never_hangs() {
+async fn question_escape_cancels_the_tool_and_never_hangs() {
     let (broker, mut wake) = broker();
     let asking = {
         let broker = Arc::clone(&broker);
@@ -194,14 +194,19 @@ async fn question_escape_skips_with_an_empty_answer_and_never_hangs() {
     let mut bridge = bridge(&broker);
     bridge.handle_event(&resize());
     bridge.handle_action(
-        action("app_exit"),
+        action("session_interrupt"),
         &key(zuno_tui::crossterm::event::KeyCode::Esc),
     );
 
-    let answers = tokio::time::timeout(Duration::from_millis(250), asking)
+    let outcome = tokio::time::timeout(Duration::from_millis(250), asking)
         .await
-        .expect("skipping must not leave the turn parked forever")
-        .expect("the asking task")
-        .expect("skip is an unanswered result, not a rejection");
-    assert_eq!(answers, vec![Vec::<String>::new()]);
+        .expect("cancelling must not leave the turn parked forever")
+        .expect("the asking task");
+    assert!(
+        matches!(
+            outcome,
+            Err(ToolError::Denied { ref tool }) if tool == "question"
+        ),
+        "escape returned a fabricated answer instead of cancelling: {outcome:?}"
+    );
 }

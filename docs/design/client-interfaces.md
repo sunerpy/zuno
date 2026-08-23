@@ -44,6 +44,11 @@ Capability negotiation must not alter agent semantics. An unsupported renderer f
 
 Every submitted input receives an admission identifier before execution. A client may optimistically render a pending row keyed by that identifier, then replace it when the committed event arrives. Reconnecting with the same identifier must not create a duplicate input.
 
+During an active turn, ordinary text and rich content target the nearest safe
+step as steering. Commands and explicit next-turn work remain queued. A steer
+that misses the final safe point stays durably pending and becomes the next FIFO
+turn; client channel capacity or reconnect timing never decides its fate.
+
 Human input has priority over an automatic goal retry. The client may show the persisted retry deadline and reason, but cancellation, pause, and resume are explicit commands rather than local timer changes.
 
 ## Backpressure and disconnects
@@ -61,8 +66,13 @@ The TUI favors dense, keyboard-first operation:
 
 - stable transcript and status-strip dimensions;
 - a composer that uses the available left pane with only a one-column gutter;
-- multiline question input with bounded growth;
+- multiline question input with bounded growth that replaces the composer area
+  while the tool waits; `Esc` cancels it as a refusal rather than returning a
+  synthetic answer;
 - visible permission, retry, diagnostics, and background-job states;
+- explicit `working`, `awaiting approval`, and `awaiting answer` states. During a
+  running turn the first `Esc` arms interruption and the second within the
+  confirmation window cancels it;
 - generic rendering for unknown future events;
 - a `system` theme that reads non-invasive terminal color hints when available
   and otherwise preserves the terminal's foreground and background defaults;
@@ -109,12 +119,11 @@ The TUI favors dense, keyboard-first operation:
   session until the first model-bound submission commits the session and user
   message together. `session.materialized` updates the in-place session catalog,
   so `/session` sees the new row without remounting;
-- cumulative token and context usage comes from the durable `SessionUsage`
-  projection on resume. A history whose provider accounting cannot be recovered
-  displays an unavailable marker rather than a fabricated zero. Labels keep
-  cumulative session totals separate from the latest whole prompt: the sidebar
-  shows `session total`, input/output/cache buckets, `current prompt / model
-  window`, and a decimal percentage of that model window;
+- usage comes from the durable `SessionUsage` projection on resume. A history
+  whose provider accounting cannot be recovered displays an unavailable marker
+  rather than a fabricated zero. Cumulative input/output/cache buckets remain
+  available for accounting and history, but the live sidebar shows only the
+  latest whole prompt, model-window limit, and decimal occupancy percentage;
 - no empty LSP status or setup prompt; the sidebar adds LSP only for configured
   services or real diagnostics;
 - `/session` lists active root sessions from the current durable database and
@@ -136,7 +145,9 @@ The TUI favors dense, keyboard-first operation:
   the existing list mounted. A current session with background subagents still
   running is refused rather than deleting state those tasks can still write;
 - warning and error notices wrap inside the viewport and remain visible long
-  enough to inspect or select;
+  enough to inspect or select. Ephemeral command guidance, such as an unknown
+  slash command, is a short-lived toast and does not become durable transcript
+  content;
 - no blocking network, LSP, or provider work in the render loop.
 
 ## Future GUI

@@ -56,7 +56,7 @@ fn parent(ready: &Path, stop: Option<&Path>) -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    child.kill()?;
+    zuno_process::request_contained_process_shutdown(child.id())?;
     let _status = child.wait()?;
     Ok(())
 }

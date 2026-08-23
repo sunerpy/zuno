@@ -886,20 +886,24 @@ impl SessionHandle {
             })
     }
 
-    /// Kills a still-running child and ends every subscription.
+    /// Requests shutdown from a still-running child and ends every subscription.
     ///
     /// Mirrors `teardown` (`pty.ts:121-129`). Non-blocking: it signals and returns
     /// rather than reaping, and the session's own waiter thread observes the death
-    /// and finishes. The kill failing is deliberately ignored — the only reasons
-    /// are that the child already died or is unkillable, and neither leaves
+    /// and finishes. Signalling failure falls back to the PTY backend's kill;
+    /// failure there is ignored because the child either already died or is
+    /// unkillable, and neither leaves
     /// anything for a caller to do.
     pub(crate) fn shutdown(&self) {
         if self.shared.info().status == PtyStatus::Running {
-            let mut killer = self
-                .killer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _outcome = killer.kill();
+            let pid = self.shared.info().pid;
+            if zuno_process::request_contained_process_shutdown(pid).is_err() {
+                let mut killer = self
+                    .killer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _outcome = killer.kill();
+            }
         }
         self.shared.detach_all();
     }

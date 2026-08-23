@@ -611,5 +611,13 @@ mod tests {
         assert!(DESCRIPTION.starts_with(
             "Use this tool when you need to ask the user questions during execution."
         ));
+        assert!(
+            DESCRIPTION.contains("cannot be discovered from available evidence"),
+            "{DESCRIPTION}"
+        );
+        assert!(
+            DESCRIPTION.contains("Cancellation is a refusal"),
+            "{DESCRIPTION}"
+        );
     }
 }

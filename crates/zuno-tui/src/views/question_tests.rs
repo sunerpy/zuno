@@ -260,26 +260,22 @@ fn views_question_multiline_answer_preserves_the_newline_on_submit() {
 }
 
 #[test]
-fn views_question_escaping_the_typed_row_returns_to_the_options() {
+fn views_question_escape_cancels_even_while_the_custom_answer_is_being_edited() {
     let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
     prompt.handle_action(action("dialog.select.end"), &press(KeyCode::End));
     prompt.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
     prompt.handle_action(action("messages_next"), &press(KeyCode::Char('x')));
-    let step = prompt.handle_action(action("app_exit"), &press(KeyCode::Esc));
-    assert_eq!(step, DialogStep::Redraw);
-    assert!(!prompt.is_editing());
+    let step = prompt.handle_action(action("session_interrupt"), &press(KeyCode::Esc));
+    assert_eq!(step, DialogStep::Resolved(DialogOutcome::Cancelled));
 }
 
 #[test]
-fn views_question_skipping_answers_nothing_rather_than_rejecting() {
+fn views_question_escape_cancels_instead_of_fabricating_an_unanswered_reply() {
     let mut prompt = prompt(QuestionRequest::new("q", "h", options()));
-    let answers = answered(prompt.handle_action(action("app_exit"), &press(KeyCode::Esc)));
     assert_eq!(
-        answers,
-        vec![Vec::<String>::new()],
-        "a skipped question must answer with an empty list, not be dropped"
+        prompt.handle_action(action("session_interrupt"), &press(KeyCode::Esc)),
+        DialogStep::Resolved(DialogOutcome::Cancelled)
     );
-    assert_eq!(render_answer(&answers[0]), UNANSWERED);
 }
 
 #[test]

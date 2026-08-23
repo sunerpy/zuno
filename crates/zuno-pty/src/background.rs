@@ -389,9 +389,11 @@ impl BackgroundExecutionService {
         };
         if let Err(error) = persist_info(&info) {
             if let Some(pid) = pid {
-                let _terminated = zuno_process::terminate_process_tree(pid);
+                let _terminated = zuno_process::request_contained_process_shutdown(pid);
             }
-            let _kill = child.start_kill();
+            let _reaper = tokio::spawn(async move {
+                let _status = child.wait().await;
+            });
             return Err(error);
         }
 
@@ -704,10 +706,7 @@ async fn terminate(child: &mut Child) {
     let Some(pid) = child.id() else {
         return;
     };
-    let terminated = tokio::task::spawn_blocking(move || zuno_process::terminate_process_tree(pid))
-        .await
-        .is_ok_and(|result| result.is_ok());
-    if !terminated {
+    if zuno_process::request_contained_process_shutdown(pid).is_err() {
         let _kill = child.start_kill();
     }
 }

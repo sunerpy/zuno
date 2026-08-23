@@ -112,6 +112,14 @@ impl QuestionBridge {
         EventResult::REDRAW
     }
 
+    pub(crate) fn cancel(&mut self) -> EventResult {
+        if self.active.take().is_some() {
+            EventResult::REDRAW
+        } else {
+            EventResult::IGNORED
+        }
+    }
+
     pub(crate) fn open_next(&mut self, host: &mut DialogHost) -> EventResult {
         if self.active.is_some() || host.is_open() {
             return EventResult::IGNORED;

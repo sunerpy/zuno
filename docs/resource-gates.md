@@ -39,7 +39,7 @@ is the shape being avoided: a 164,552 KiB spread around a median that finished
 | G3 | 最终/中段峰值比 | 0.9938255268 | 1.5 | PASS |
 | G4 | soak 期间的活性 | 两个上限均未触发 | 120 秒无状态进展；每轮 1800 秒硬截止 | PASS |
 | G5 | 生产者/消费者边界的无界 channel | 17 个有界 + 2 个已声明例外，0 个未声明 | — | PASS |
-| G6 | 父进程退出后的孤儿进程 | Linux 上 0 个孤儿，正常关闭和 `SIGKILL` 均验证 | — | Linux 上 PASS；Windows 部分未执行 |
+| G6 | 常驻进程守卫与父进程退出后的孤儿进程 | Linux 上每个 payload 仅 1 个 Zuno guard；250 ms 空闲窗口内 guard 自愿上下文切换增量不超过 3；正常关闭和父进程 `SIGKILL` 后均为 0 个孤儿 | — | Linux 上 PASS；Windows 部分未执行 |
 
 ## 四项明确限制
 
@@ -47,7 +47,7 @@ is the shape being avoided: a 164,552 KiB spread around a median that finished
 因此，即使代码不变，换成明显更大的 session 也可能使门禁转为 FAIL。上方 margin 与五次运行
 spread 决定真实余量，两者的大小关系比任何单个数字更重要。
 
-**G6 的 Windows 部分从未执行。** 上方实测结果来自
+**G6 的 Windows 部分从未执行。** 上方守卫拓扑、空闲等待和孤儿回收结果来自
 `crates/zuno-process/tests/containment.rs`，该文件受 `#![cfg(target_os = "linux")]` 限制。
 Windows Job Object 路径位于 `crates/zuno-process/tests/windows_containment.rs`，受
 `#![cfg(windows)]` 限制；它在 Linux 主机上是 **NOT EXECUTED**，不是“跳过但视为通过”，也不能

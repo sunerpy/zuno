@@ -171,6 +171,15 @@ pub enum DialogWidth {
     XLarge,
 }
 
+/// Where a dialog belongs relative to the base surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogPlacement {
+    /// A conventional bottom-anchored overlay over the frame.
+    Overlay,
+    /// The base component's composer region, replacing the input surface.
+    Composer,
+}
+
 impl DialogWidth {
     /// This tier's width in terminal columns.
     #[must_use]
@@ -272,6 +281,11 @@ pub trait Dialog: Send {
     /// without thinking about it. The two forms that want something else say so.
     fn width(&self) -> DialogWidth {
         DialogWidth::Large
+    }
+
+    /// Where this dialog is laid out.
+    fn placement(&self) -> DialogPlacement {
+        DialogPlacement::Overlay
     }
 
     /// Additional keybind scopes active only while this dialog owns the keyboard.
@@ -450,12 +464,28 @@ impl DialogHost {
     }
 
     fn render_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let Some(dialog) = self.stack.last_mut() else {
+        let Some(dialog) = self.stack.last() else {
             return;
         };
+        let id = dialog.id();
+        let placement = dialog.placement();
+        let area = match placement {
+            DialogPlacement::Overlay => area,
+            DialogPlacement::Composer => self.base.dialog_region(id, area).unwrap_or(area),
+        };
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let dialog = self
+            .stack
+            .last_mut()
+            .expect("the dialog observed above remains on the stack");
         // `§11.4`'s tier, clamped once here rather than by each dialog. Everything below
         // measures from `columns`, so a dialog cannot disagree with its own frame.
-        let columns = dialog_columns(dialog.width(), area.width);
+        let columns = match placement {
+            DialogPlacement::Overlay => dialog_columns(dialog.width(), area.width),
+            DialogPlacement::Composer => area.width,
+        };
         let inner_width = columns.saturating_sub(2);
         let title = dialog.title();
         let hints = dialog.hints();
@@ -735,6 +765,10 @@ impl ActionComponent for DialogHost {
         } else {
             self.base.focused_scopes()
         }
+    }
+
+    fn dialog_region(&self, dialog: &'static str, area: Rect) -> Option<Rect> {
+        self.base.dialog_region(dialog, area)
     }
 
     fn pending_changed(&mut self, pending: &PendingPrefix) -> EventResult {

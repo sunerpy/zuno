@@ -43,6 +43,8 @@ pub(super) async fn start(spec: RuntimeSpec) -> Result<Arc<dyn PluginHost>, Plug
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn().map_err(|error| PluginHostError::Start {
         package: spec.package.clone(),
         message: error.to_string(),
@@ -477,10 +479,9 @@ async fn terminate(state: &mut ProcessState) -> Result<(), String> {
     {
         return Ok(());
     }
-    state
-        .child
-        .start_kill()
-        .map_err(|error| error.to_string())?;
+    if let Some(pid) = state.child.id() {
+        zuno_process::request_contained_process_shutdown(pid).map_err(|error| error.to_string())?;
+    }
     tokio::time::timeout(STOP_WAIT, state.child.wait())
         .await
         .map_err(|_| format!("process did not exit within {STOP_WAIT:?}"))?

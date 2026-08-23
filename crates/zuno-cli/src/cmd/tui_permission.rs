@@ -220,7 +220,7 @@ impl PermissionBridge {
             )));
             result = EventResult::REDRAW;
         }
-        for (_dialog, outcome) in self.host.drain_outcomes() {
+        for (dialog, outcome) in self.host.drain_outcomes() {
             match outcome {
                 DialogOutcome::Permission(decision) => {
                     self.broker.resolve(&decision.request_id, decision.reply);
@@ -229,6 +229,11 @@ impl PermissionBridge {
                 DialogOutcome::Question(answers) => {
                     if let Some(question) = self.question.as_mut() {
                         result = result.merge(question.resolve(answers));
+                    }
+                }
+                DialogOutcome::Cancelled if dialog == zuno_tui::views::question::DIALOG_ID => {
+                    if let Some(question) = self.question.as_mut() {
+                        result = result.merge(question.cancel());
                     }
                 }
                 _ => {}

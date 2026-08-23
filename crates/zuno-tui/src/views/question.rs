@@ -30,7 +30,7 @@
 //! needing a separate sentinel.
 
 use crate::keybind::Definition;
-use crate::views::dialog::{Dialog, DialogOutcome, DialogStep};
+use crate::views::dialog::{Dialog, DialogOutcome, DialogPlacement, DialogStep};
 use crate::views::{ViewContext, padded};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::{Line, Span};
@@ -330,11 +330,15 @@ impl Dialog for QuestionPrompt {
                 ("↑↓", "move"),
                 ("space", "toggle"),
                 ("enter", "confirm"),
-                ("esc", "skip"),
+                ("esc", "cancel"),
             ]
         } else {
-            vec![("↑↓", "move"), ("enter", "confirm"), ("esc", "skip")]
+            vec![("↑↓", "move"), ("enter", "confirm"), ("esc", "cancel")]
         }
+    }
+
+    fn placement(&self) -> DialogPlacement {
+        DialogPlacement::Composer
     }
 
     fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
@@ -360,10 +364,8 @@ impl Dialog for QuestionPrompt {
                     self.typed.pop();
                     return DialogStep::Redraw;
                 }
-                "app_exit" => {
-                    self.editing = false;
-                    self.typed.clear();
-                    return DialogStep::Redraw;
+                "app_exit" | "session_interrupt" => {
+                    return DialogStep::Resolved(DialogOutcome::Cancelled);
                 }
                 _ => return self.handle_typed(event),
             }
@@ -403,11 +405,7 @@ impl Dialog for QuestionPrompt {
                 }
                 self.submit()
             }
-            // Skipping leaves the answer empty, which the tool renders as
-            // `Unanswered` rather than treating as a rejection.
-            "app_exit" => {
-                DialogStep::Resolved(DialogOutcome::Question(std::mem::take(&mut self.answers)))
-            }
+            "app_exit" | "session_interrupt" => DialogStep::Resolved(DialogOutcome::Cancelled),
             _ => {
                 if let KeyCode::Char(' ') = event.code
                     && self.question().is_multiple()

@@ -151,6 +151,24 @@ fn views_toast_keeps_actionable_warnings_visible_longer() {
 }
 
 #[test]
+fn views_toast_can_keep_warning_semantics_with_the_short_notice_ttl() {
+    let mut layer = ToastLayer::new(ViewContext::defaults());
+    let shown = std::time::Instant::now();
+    let toast = Toast::warning_for("unknown command", TOAST_TTL);
+    assert_eq!(toast.level(), ToastLevel::Warning);
+    layer.show_at(toast, shown);
+
+    assert!(
+        !layer.prune(shown + TOAST_TTL - std::time::Duration::from_millis(1)),
+        "the short warning expired before its explicit TTL"
+    );
+    assert!(
+        layer.prune(shown + TOAST_TTL),
+        "an explicitly short warning inherited the attention timeout"
+    );
+}
+
+#[test]
 fn views_toast_wraps_a_long_notice_without_losing_its_actionable_tail() {
     let text = "myopenai/us.anthropic.claude-opus-5 does not support selectable reasoning \
                 effort. Choose a reasoning-capable model to change the effort level.";

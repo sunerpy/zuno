@@ -79,7 +79,7 @@ fn views_sidebar_states_tokens_servers_and_skills() {
     let joined = drawn(&mut view);
     for needle in [
         "Context",
-        "16,400",
+        "64.0k / 100.0k current prompt",
         "LSP",
         "rust-analyzer",
         "MCP",
@@ -87,6 +87,33 @@ fn views_sidebar_states_tokens_servers_and_skills() {
         "Skills",
     ] {
         assert!(joined.contains(needle), "`{needle}` is missing:\n{joined}");
+    }
+}
+
+#[test]
+fn views_sidebar_prioritizes_the_live_context_over_cumulative_accounting() {
+    let mut view = view();
+    let joined = drawn(&mut view);
+
+    assert!(
+        joined.contains("64.0k / 100.0k current prompt"),
+        "the live prompt size is missing:\n{joined}"
+    );
+    assert!(
+        joined.contains("64.0% of model window"),
+        "the model-window pressure is missing:\n{joined}"
+    );
+    for cumulative in [
+        "session total",
+        "input ·",
+        "output",
+        "cache read",
+        "cache write",
+    ] {
+        assert!(
+            !joined.contains(cumulative),
+            "the sidebar still exposes cumulative accounting `{cumulative}`:\n{joined}"
+        );
     }
 }
 

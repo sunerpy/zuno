@@ -870,7 +870,6 @@ impl SidebarView {
             lines.push(blank());
         }
 
-        let tokens = &self.ambient.tokens;
         lines.push(self.heading("Context", "", None, width));
         if self.ambient.usage_state == crate::views::message::UsageState::Unavailable {
             lines.push(padded("  — usage unavailable", width, self.context.muted()));
@@ -880,56 +879,32 @@ impl SidebarView {
                 width,
                 self.context.muted(),
             ));
-        } else {
+        } else if let Some(context) = self.ambient.context {
+            let percent = context.percent();
             lines.push(padded(
                 &format!(
-                    "  {} session total",
-                    crate::views::message::thousands(tokens.total())
+                    "  {} / {} current prompt",
+                    compact(context.prompt_tokens),
+                    compact(context.limit)
                 ),
                 width,
                 self.context.text(),
             ));
             lines.push(padded(
-                &format!(
-                    "  {} input · {} output",
-                    compact(tokens.input),
-                    compact(tokens.output)
-                ),
+                &format!("  {percent:.1}% of model window"),
+                width,
+                if percent >= 80.0 {
+                    self.context.warning()
+                } else {
+                    self.context.muted()
+                },
+            ));
+        } else {
+            lines.push(padded(
+                "  — current prompt unavailable",
                 width,
                 self.context.muted(),
             ));
-            if tokens.cache_read > 0 || tokens.cache_write > 0 {
-                lines.push(padded(
-                    &format!(
-                        "  {} cache read · {} cache write",
-                        compact(tokens.cache_read),
-                        compact(tokens.cache_write)
-                    ),
-                    width,
-                    self.context.muted(),
-                ));
-            }
-            if let Some(context) = self.ambient.context {
-                let percent = context.percent();
-                lines.push(padded(
-                    &format!(
-                        "  {} / {} current prompt",
-                        compact(context.prompt_tokens),
-                        compact(context.limit)
-                    ),
-                    width,
-                    self.context.muted(),
-                ));
-                lines.push(padded(
-                    &format!("  {percent:.1}% of model window"),
-                    width,
-                    if percent >= 80.0 {
-                        self.context.warning()
-                    } else {
-                        self.context.muted()
-                    },
-                ));
-            }
         }
 
         if let Some(goal) = &self.ambient.work.goal {

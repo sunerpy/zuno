@@ -27,12 +27,15 @@
 //! terminal channel already has 64 events queued, and blocking here would stall the
 //! render loop that has to drain them.
 //!
-//! # An exit chord during a running turn cancels the turn, but only once
+//! # Escape confirms interruption; an exit chord remains the emergency way out
 //!
-//! Tearing the application down mid-turn discards work the user is waiting for, so
-//! the first exit chord asks the driver to cancel rather than leaving.
+//! A single accidental escape must not discard a running turn. The session interrupt
+//! action therefore arms a short confirmation window; a second press inside it asks
+//! the driver to cancel. The arm is transient UI state and is cleared at turn
+//! boundaries.
 //!
-//! The second one leaves unconditionally, and that is the load-bearing part. Reading
+//! The application exit chord keeps the older two-stage emergency behavior: first it
+//! cancels, then it leaves unconditionally. Reading
 //! "has a turn been cancelled already" off the status strip's running state looks
 //! equivalent and is not: a turn parked on a permission ask never reaches the
 //! engine's interrupt check, so it stays running after an abort and the strip never
@@ -246,6 +249,9 @@ const PROMPT_MARKER: &str = "›";
 /// One sentence rather than a list of keys: the band is a single row at its floor, and a
 /// hint long enough to be truncated there teaches less than a short one that fits.
 const PROMPT_PLACEHOLDER: &str = "ask anything, or / for commands";
+
+/// How long the first session-interrupt action arms the second.
+const INTERRUPT_CONFIRM_WINDOW_MS: u64 = 1_500;
 
 /// What separates the info row's right-hand facts from each other.
 ///
@@ -579,6 +585,7 @@ pub struct SessionScreen {
     submissions: Vec<String>,
     cancellations: usize,
     cancel_requested: bool,
+    interrupt_armed_at_ms: Option<u64>,
     sidebar_visible: bool,
     /// The resolved palette and configuration, for the pickers this screen builds.
     context: ViewContext,
@@ -702,7 +709,8 @@ pub enum Selection {
 
 /// A prompt-channel message. Catalog invocations stay typed until the CLI host
 /// resolves their templates; plain text goes directly to the turn driver.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PromptSubmission {
     /// Ordinary model input.
     Text(String),
@@ -802,6 +810,7 @@ impl SessionScreen {
             submissions: Vec::new(),
             cancellations: 0,
             cancel_requested: false,
+            interrupt_armed_at_ms: None,
             sidebar_visible: true,
             keymap: None,
             catalog: SessionCatalog::default(),
@@ -1336,11 +1345,12 @@ impl SessionScreen {
                 } else {
                     format!("/{name}")
                 };
-                self.transcript
-                    .transcript_mut()
-                    .push(Message::notice(format!(
+                self.toasts.push(Toast::warning_for(
+                    format!(
                         "unknown command `{shown}`; type `/` to browse commands or press ctrl+p"
-                    )));
+                    ),
+                    crate::views::toast::TOAST_TTL,
+                ));
             }
         }
     }
@@ -1350,11 +1360,25 @@ impl SessionScreen {
             .transcript_mut()
             .push(Message::user(shown.clone()));
         if let Some(prompts) = self.prompts.as_ref() {
+            let was_running = self.status.is_running();
+            let steer_candidate = matches!(
+                submission,
+                PromptSubmission::Text(_) | PromptSubmission::Content { .. }
+            );
             match prompts.try_send(submission) {
-                Ok(()) => self.mark_turn_accepted(),
+                Ok(()) => {
+                    self.mark_turn_accepted();
+                    if was_running {
+                        self.toasts.push(Toast::info(if steer_candidate {
+                            "message admitted; it will steer at the next safe point"
+                        } else {
+                            "request admitted; it is queued for the next turn"
+                        }));
+                    }
+                }
                 Err(error) => {
                     let reason = match error {
-                        mpsc::error::TrySendError::Full(_) => "a turn is already running",
+                        mpsc::error::TrySendError::Full(_) => "the durable input queue is full",
                         mpsc::error::TrySendError::Closed(_) => "the turn driver has stopped",
                     };
                     self.transcript
@@ -2044,6 +2068,7 @@ impl SessionScreen {
 
     fn mark_turn_accepted(&mut self) {
         self.cancel_requested = false;
+        self.interrupt_armed_at_ms = None;
         self.status.mark_running();
     }
 
@@ -2798,16 +2823,55 @@ impl SessionScreen {
             && cancels.try_send(()).is_ok()
         {
             self.cancel_requested = true;
+            self.interrupt_armed_at_ms = None;
             self.cancellations += 1;
-            // `Info`: the cancel was accepted and is under way. Nothing was refused, so the
-            // warning colour would claim the keypress had failed.
-            self.transcript.transcript_mut().push(Message::noticed(
-                ToastLevel::Info,
-                "cancelling the turn; press the same key again to exit",
+            self.toasts.push(Toast::info(
+                "cancelling the turn; press the same exit key again to leave",
             ));
             return EventResult::REDRAW;
         }
         let _requested = self.shutdown.try_send(TerminalEvent::Shutdown);
+        EventResult::REDRAW
+    }
+
+    /// Arm or confirm cancellation of the running turn.
+    ///
+    /// `now_ms` is supplied by the screen's monotonic clock so the confirmation window
+    /// can be tested without sleeping.
+    fn request_interrupt_at(&mut self, now_ms: u64) -> EventResult {
+        if !self.status.is_running() {
+            self.interrupt_armed_at_ms = None;
+            return EventResult::IGNORED;
+        }
+        if self.cancel_requested {
+            self.toasts
+                .push(Toast::info("turn cancellation is already in progress"));
+            return EventResult::REDRAW;
+        }
+        let confirmed = self
+            .interrupt_armed_at_ms
+            .is_some_and(|armed| now_ms.saturating_sub(armed) <= INTERRUPT_CONFIRM_WINDOW_MS);
+        if !confirmed {
+            self.interrupt_armed_at_ms = Some(now_ms);
+            let key = crate::views::key_label("session_interrupt", &self.context)
+                .unwrap_or_else(|| String::from("esc"));
+            self.toasts.push(Toast::info(format!(
+                "press {key} again to stop the active turn"
+            )));
+            return EventResult::REDRAW;
+        }
+
+        self.interrupt_armed_at_ms = None;
+        if let Some(cancels) = self.cancels.as_ref()
+            && cancels.try_send(()).is_ok()
+        {
+            self.cancel_requested = true;
+            self.cancellations += 1;
+            self.toasts.push(Toast::info("stopping the active turn"));
+        } else {
+            self.toasts
+                .push(Toast::warning("the active turn could not be cancelled"));
+        }
         EventResult::REDRAW
     }
 }
@@ -3117,6 +3181,21 @@ impl SessionScreen {
 }
 
 impl ActionComponent for SessionScreen {
+    fn dialog_region(&self, dialog: &'static str, area: Rect) -> Option<Rect> {
+        if dialog != crate::views::question::DIALOG_ID {
+            return None;
+        }
+        let empty = !self.transcript.transcript().conversation_started();
+        let content = content_bounds(area, sidebar_drawn(self.sidebar_visible, empty, area.width));
+        let composer = composer_region(content, empty);
+        Some(Rect {
+            height: composer
+                .height
+                .saturating_sub(STATUS_ROWS.saturating_add(info_rows(content.height))),
+            ..composer
+        })
+    }
+
     fn focused_scopes(&self) -> Vec<&'static str> {
         if self.autocomplete.is_open() {
             vec!["prompt.autocomplete"]
@@ -3364,18 +3443,24 @@ impl ActionComponent for SessionScreen {
 
     fn observe_modal(&mut self, active: Option<&'static str>) {
         self.modal = active;
-        // Only a permission prompt makes the turn wait on the user; a picker or the help
-        // view is something the user opened *while* work continued, and suppressing the
+        // Only tool-owned human-input prompts make the turn wait on the user. A picker or
+        // help view is something the user opened while work continued, so suppressing the
         // spinner behind those would claim the turn had stopped when it had not.
-        let awaiting = active == Some(crate::views::permission::DIALOG_ID);
+        let awaiting = match active {
+            Some(crate::views::permission::DIALOG_ID) => {
+                Some(crate::views::message::AwaitingUser::Approval)
+            }
+            Some(crate::views::question::DIALOG_ID) => {
+                Some(crate::views::message::AwaitingUser::Answer)
+            }
+            _ => None,
+        };
         // Both surfaces, from one answer. The transcript's spinner is only on screen once
         // a turn has produced a message — before that the welcome surface has the area and
         // the strip is the only row saying anything about state, so fixing one and not the
         // other leaves the claim on whichever surface the user is actually looking at.
-        self.transcript
-            .transcript_mut()
-            .set_awaiting_permission(awaiting);
-        self.status.set_awaiting_permission(awaiting);
+        self.transcript.transcript_mut().set_awaiting_user(awaiting);
+        self.status.set_awaiting_user(awaiting);
     }
 
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
@@ -3406,6 +3491,9 @@ impl ActionComponent for SessionScreen {
             if let Some(autocomplete_action) = autocomplete_action {
                 return self.autocomplete_step(autocomplete_action);
             }
+        }
+        if action.name == "session_interrupt" {
+            return self.request_interrupt_at(self.now_ms());
         }
         // `ctrl+c` and `ctrl+d` are each claimed by the `input` scope before `app`,
         // so a screen that only watched for `app_exit` could never be left. Asking

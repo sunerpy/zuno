@@ -103,9 +103,90 @@ impl ActionComponent for FocusedBase {
     }
 }
 
+struct ComposerBase {
+    region: Rect,
+}
+
+impl Component for ComposerBase {
+    fn render(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        fill(frame.buffer_mut(), area, ViewContext::defaults().surface());
+    }
+
+    fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
+        EventResult::IGNORED
+    }
+}
+
+impl ActionComponent for ComposerBase {
+    fn handle_action(&mut self, _action: &'static Definition, _event: &KeyEvent) -> EventResult {
+        EventResult::IGNORED
+    }
+
+    fn dialog_region(&self, dialog: &'static str, _area: Rect) -> Option<Rect> {
+        (dialog == "composer").then_some(self.region)
+    }
+}
+
+struct ComposerProbe;
+
+impl Dialog for ComposerProbe {
+    fn id(&self) -> &'static str {
+        "composer"
+    }
+
+    fn title(&self) -> String {
+        String::from("Question")
+    }
+
+    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        vec![padded("Choose one", width, ViewContext::defaults().text())]
+    }
+
+    fn placement(&self) -> DialogPlacement {
+        DialogPlacement::Composer
+    }
+
+    fn handle_action(&mut self, _action: &'static Definition, _event: &KeyEvent) -> DialogStep {
+        DialogStep::Ignored
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The stack
 // ---------------------------------------------------------------------------
+
+#[test]
+fn views_dialog_composer_placement_uses_the_bases_prompt_region() {
+    let context = ViewContext::defaults();
+    let region = Rect::new(3, 2, 32, 12);
+    let mut host = DialogHost::new(context, Box::new(ComposerBase { region }));
+    host.open(Box::new(ComposerProbe));
+
+    let rendered = render_offscreen(&mut host, 80, 20).expect("infallible");
+    let rows = rows(&rendered);
+    let title_row = rows
+        .iter()
+        .position(|row| row.contains("Question"))
+        .expect("composer dialog title");
+
+    assert_eq!(
+        title_row,
+        usize::from(region.bottom().saturating_sub(3)),
+        "the question was not bottom-anchored where the composer lives"
+    );
+    assert_eq!(
+        rendered[(region.x, u16::try_from(title_row).expect("row"))].symbol(),
+        symbols::line::VERTICAL,
+        "the dialog was centred over the transcript instead of aligned to the prompt"
+    );
+    let title_y = u16::try_from(title_row).expect("row");
+    assert!(
+        (region.right()..rendered.area.width)
+            .all(|x| rendered[(x, title_y)].symbol().trim().is_empty()),
+        "the composer dialog painted into the sidebar/right side: {:?}",
+        rows[title_row]
+    );
+}
 
 #[test]
 fn views_dialog_host_starts_closed_and_reports_its_stack() {

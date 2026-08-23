@@ -31,6 +31,26 @@ impl Fixture {
     }
 }
 
+#[test]
+fn goal_descriptions_encode_creation_authority_and_terminal_audits() {
+    assert!(
+        CREATE_DESCRIPTION.contains("only when explicitly requested"),
+        "{CREATE_DESCRIPTION}"
+    );
+    assert!(
+        CREATE_DESCRIPTION.contains("Do not infer a goal from ordinary work"),
+        "{CREATE_DESCRIPTION}"
+    );
+    assert!(
+        UPDATE_DESCRIPTION.contains("Read the current goal before changing it"),
+        "{UPDATE_DESCRIPTION}"
+    );
+    assert!(
+        UPDATE_DESCRIPTION.contains("Do not use this tool merely because a turn is ending"),
+        "{UPDATE_DESCRIPTION}"
+    );
+}
+
 #[tokio::test]
 async fn all_three_tools_share_one_authoritative_goal() {
     let fixture = Fixture::new();

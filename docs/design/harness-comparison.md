@@ -74,11 +74,23 @@ Codex demonstrates the value of a focused Rust core, explicit sandbox and approv
 
 Zuno extends the goal idea with cross-turn exponential backoff. Provider retries remain bounded inside one request, while an active goal can schedule another turn indefinitely for typed recoverable failures. Unknown side-effect outcomes are never blindly replayed.
 
+Codex also keeps its durable harness contract distinct from shorter role and
+mode instructions. Zuno follows that separation: native agent prompts state
+ownership, evidence standards, and negative boundaries, while permissions,
+replay, input admission, goal state, and lifecycle remain typed runtime policy.
+The TUI similarly distinguishes live steering from queued follow-up work and
+projects human waits as approval or answer states.
+
 ### oh-my-openagent
 
 oh-my-openagent contributes a useful orchestration lesson: a bounded roster is easier for a primary agent to route than a large collection of overlapping personas. Each Zuno specialist therefore carries both a responsibility and a negative delegation boundary. `build` is the only recursive coordinator; `deep` and `worker` can implement but cannot fan out.
 
 Zuno keeps agent identity, permissions, delegation boundaries, and prompt policy as data so validation and rendered prompts cannot drift apart. It adapts OMO's explicit positive and negative role boundaries, but rejects unconsumed XML reply envelopes: user-facing agents return concise natural Markdown, while structured output is reserved for typed runtime consumers.
+
+Zuno also rejects model-specific prompt inflation and universal mandatory
+delegation. The useful invariant is explicit child ownership and parent
+integration, not repeated all-caps policy or a rule that every implementation
+must fan out. Prompt word-count tests keep the primary role contracts concise.
 
 ### pi-agent
 
@@ -109,6 +121,7 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | Model-visible means logged | adopt | durable inbox, tool results, retry notices, `session.prompt.assembled` |
 | Stable client projections | adopt | cursor replay plus snapshots shared by TUI/server/ACP/future GUI |
 | Goal persistence | adopt and extend | separate goal DB, typed recovery reason, persisted exponential backoff |
+| Concise agent and tool prompt contracts | adapt | Evidence-oriented `build`/`plan`/`deep` roles, explicit delegation ownership, goal terminal audits, cancellable question semantics, and byte-pinned tool descriptions |
 | Tool replay after failure | adapt | `Never` by default; explicit `Safe` only for read-only/idempotent tools |
 | Codex and Claude Code product subagents | adapt | Native app-server/stream-json providers, static configured tools, durable jobs, explicit cancellation, and uncertain non-replay |
 | Bounded specialist roster | adopt | `build`, `plan`, `deep`, `explorer`, `librarian`, `advisor`, `worker`, `looker` |

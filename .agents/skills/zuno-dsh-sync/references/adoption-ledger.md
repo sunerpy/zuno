@@ -20,6 +20,7 @@ This ledger records reviewed upstream behavior. It does not promise API compatib
 | Static profile/bundle loading | `zuno.extension/v1` manifests under config-root `extensions/<id>/extension.json` | `adapt`: use the same validated agent/workflow/skill package as the dynamic path; compiled services remain Rust profiles. |
 | Codex and Claude Code product subagents | `zuno-product-agent`, configured static tools, generic durable jobs, `job_cancel`, and the shared TUI subagent projection | `adapt`: retain native product protocols, authentication, configuration, and model choice; reject the TypeScript API as a compatibility target. |
 | Reflection, memory review, and durable work state | `memory_propose`, `MemoryCandidate`, `WorkStateProjection`, reflection request/outcome events, and `/memory` | `adapt`: preserve isolated post-delivery learning and live work tracking, but require an auditable review path, explicit promotion policy, typed uncertainty, and no automatic code/prompt/agent/skill rewrites. |
+| Goal-tool authority, cancellable questions, and prompt guidance | Typed goal statuses and blocked audit, composer-owned `question` dialog, durable steer/next-step inbox, concise role prompts, and prompt golden tests | `adapt`: keep direct authority and terminal evidence in typed runtime policy, surface cancellation as denial, and use short role/tool guidance instead of copying DSH's TypeScript prompt assembly. |
 
 ## 2026-08-22 no-delta review
 
@@ -60,6 +61,12 @@ the same native model, permission, file, network, environment, child-session, an
 strict-HITL paths as built-ins, and `subagent`/`all` agents enter the exact `task`
 target roster. Workflows invoke that public delegation path rather than acquiring
 a private loop.
+
+Goal and human-input guidance was classified `adapt` against the same pinned
+release. Zuno keeps explicit goal-creation authority, truthful complete/blocked
+audits, cancellable questions, and durable steer-versus-next-step delivery, but
+expresses those invariants through native Rust types and concise agent/tool
+prompts. The upstream delta is still empty, so the baseline does not move.
 
 ## dsh-v0.1.1-rc.1
 

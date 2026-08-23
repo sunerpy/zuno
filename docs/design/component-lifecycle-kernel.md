@@ -132,10 +132,10 @@ The following registrations must be acquired through an `EffectScope` adapter:
 | Typed service | Remove before stopping dependent activity |
 | Tool/provider/hook/route registration | Remove exact registration handle |
 | Tokio task | Cancel and await `JoinHandle` |
-| Process tree | Signal complete tree, wait, then force and reap if needed |
+| Process tree | Request guard shutdown, let it settle the contained group, then reap the guard |
 | Watcher/subscription | Unregister listener before producer shutdown |
-| MCP connection | Close protocol session, then stop transport |
-| LSP manager | Send shutdown, kill and reap all children |
+| MCP connection | Close protocol session, then request and reap the local guard |
+| LSP manager | Send shutdown, request guard shutdown, and reap all children |
 | Background job supervisor | Cancel or settle according to job policy, then join |
 
 `Drop` remains a last-resort safety net and is not accepted as proof of graceful
@@ -232,7 +232,9 @@ The native foundation and critical product boundaries are now in place:
   interruption joins the cancelled invocation. The obsolete unowned tool-detach
   signal was removed in favor of `BackgroundExecutionService`.
 - MCP remote shutdown reaches protocol `DELETE`; local stdio readers, refresh,
-  stderr, and child supervision have explicit owners.
+  stderr, and child supervision have explicit owners. Resident local transports
+  use one signal-driven guard per payload on Linux; owners never hard-kill that
+  guard before it has settled the payload group.
 - Dynamic extensions separate committed and desired state, use scope-local
   revisions and active-consumer leases, and commit only after a reserved candidate
   host starts. TUI and server entry paths both use that transaction.

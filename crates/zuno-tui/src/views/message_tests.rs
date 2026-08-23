@@ -981,7 +981,9 @@ fn views_status_strip_never_reads_idle_while_a_turn_is_under_way() {
         assert!(status.handle_event(&AppEvent::Engine(event)).redraw);
     }
     assert!(status.is_running());
-    assert_eq!(rendered(&mut status), " build");
+    let running = rendered(&mut status);
+    assert!(running.contains("build"), "{running}");
+    assert!(running.contains(StatusView::WORKING), "{running}");
 
     assert!(
         status
@@ -1538,6 +1540,22 @@ fn views_task_results_render_as_a_child_session_instead_of_raw_envelope_markup()
 }
 
 #[test]
+fn views_status_strip_names_work_even_when_agent_and_model_are_preconfigured() {
+    let mut status = StatusView::new(ViewContext::defaults());
+    status.describe("build", "myopenai/gpt-5.6-sol");
+    status.mark_running();
+
+    let state = strip(&status, 120);
+    assert!(state.contains("build"), "{state}");
+    assert!(state.contains("myopenai/gpt-5.6-sol"), "{state}");
+    assert!(
+        state.contains(StatusView::WORKING),
+        "the configured identity hid the active run state: {state}"
+    );
+    assert!(!state.contains(StatusView::IDLE), "{state}");
+}
+
+#[test]
 fn views_status_strip_keeps_a_resolved_model_after_the_turn_that_resolved_it_ends() {
     // Measured live: choosing a model in the picker printed
     // `session: model is now myopenai/…` on the strip while the strip's own model field
@@ -1962,7 +1980,8 @@ fn views_transcript_stops_claiming_it_is_working_while_a_permission_ask_is_open(
     );
 
     assert!(
-        view.transcript_mut().set_awaiting_permission(true),
+        view.transcript_mut()
+            .set_awaiting_user(Some(AwaitingUser::Approval)),
         "the first ask is a change, which is what a caller turns into a redraw"
     );
     let waiting = draw(&mut view, 60, 12).join("\n");
@@ -1976,7 +1995,7 @@ fn views_transcript_stops_claiming_it_is_working_while_a_permission_ask_is_open(
     );
 
     // Answered: the turn is running again and the spinner is the honest signal.
-    assert!(view.transcript_mut().set_awaiting_permission(false));
+    assert!(view.transcript_mut().set_awaiting_user(None));
     let resumed = draw(&mut view, 60, 12).join("\n");
     assert!(
         resumed.contains("working"),
@@ -1989,9 +2008,9 @@ fn views_transcript_stops_claiming_it_is_working_while_a_permission_ask_is_open(
 #[test]
 fn views_transcript_reports_an_unchanged_permission_state_as_no_change() {
     let mut transcript = Transcript::new();
-    assert!(transcript.set_awaiting_permission(true));
-    assert!(!transcript.set_awaiting_permission(true));
-    assert!(transcript.is_awaiting_permission());
+    assert!(transcript.set_awaiting_user(Some(AwaitingUser::Approval)));
+    assert!(!transcript.set_awaiting_user(Some(AwaitingUser::Approval)));
+    assert_eq!(transcript.awaiting_user(), Some(AwaitingUser::Approval));
 }
 
 /// The strip must not say `working` while a permission prompt is waiting on the user.
@@ -2013,23 +2032,20 @@ fn views_status_strip_says_it_is_waiting_rather_than_working_during_a_permission
     status.mark_running();
     assert_eq!(state(&mut status), StatusView::WORKING);
 
-    assert!(status.set_awaiting_permission(true));
+    assert!(status.set_awaiting_user(Some(AwaitingUser::Approval)));
     assert_eq!(
         state(&mut status),
-        StatusView::AWAITING_PERMISSION,
+        AwaitingUser::Approval.status_text(),
         "the always-visible row still pointed the user at the wrong thing to wait for"
     );
 
-    assert!(status.set_awaiting_permission(false));
+    assert!(status.set_awaiting_user(None));
     assert_eq!(
         state(&mut status),
         StatusView::WORKING,
         "the notice outlived the prompt"
     );
-    assert!(
-        !status.set_awaiting_permission(false),
-        "no change, no redraw"
-    );
+    assert!(!status.set_awaiting_user(None), "no change, no redraw");
 }
 
 /// An outstanding ask outranks a resolved agent and model rather than being hidden by
@@ -2050,11 +2066,11 @@ fn views_status_strip_names_an_outstanding_ask_beside_a_resolved_turn() {
     ] {
         status.handle_event(&AppEvent::Engine(event));
     }
-    status.set_awaiting_permission(true);
+    status.set_awaiting_user(Some(AwaitingUser::Approval));
     let row = rows(&render_offscreen(&mut status, 80, 1).expect("infallible")).remove(0);
     assert!(row.contains("build"), "{row:?}");
     assert!(
-        row.contains(StatusView::AWAITING_PERMISSION),
+        row.contains(AwaitingUser::Approval.status_text()),
         "a resolved turn hid the fact that it is blocked on the user: {row:?}"
     );
     assert!(
@@ -3205,7 +3221,9 @@ fn row_spans(lines: &[Line<'static>]) -> Vec<Vec<(String, Style)>> {
 /// Every transcript shape the cache has to be right about.
 fn cache_subjects() -> Vec<(&'static str, TranscriptView)> {
     let mut empty = view();
-    empty.transcript_mut().set_awaiting_permission(true);
+    empty
+        .transcript_mut()
+        .set_awaiting_user(Some(AwaitingUser::Approval));
 
     let mut running = view();
     for event in [

@@ -638,6 +638,8 @@ fn contained_command(program: OsString, arguments: Vec<OsString>, directory: &Pa
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     command
 }
 
@@ -875,8 +877,10 @@ async fn finish_stderr(task: tokio::task::JoinHandle<String>) -> String {
 }
 
 async fn terminate(child: &mut Child) {
-    if child.try_wait().ok().flatten().is_none() {
-        let _ignored = child.start_kill();
+    if child.try_wait().ok().flatten().is_none()
+        && let Some(pid) = child.id()
+    {
+        let _ignored = zuno_process::request_contained_process_shutdown(pid);
     }
     let _ignored = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
 }

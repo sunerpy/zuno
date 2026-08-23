@@ -155,6 +155,7 @@ impl ToastLevel {
 pub struct Toast {
     level: ToastLevel,
     text: String,
+    ttl: Option<Duration>,
 }
 
 impl Toast {
@@ -164,6 +165,7 @@ impl Toast {
         Self {
             level,
             text: text.into(),
+            ttl: None,
         }
     }
 
@@ -185,6 +187,16 @@ impl Toast {
         Self::new(ToastLevel::Warning, text)
     }
 
+    /// A warning that uses an explicit visibility window.
+    ///
+    /// Some refusals need the warning glyph and colour but are still momentary facts.
+    /// Unknown command input is one: it must be noticeable, but keeping it for the
+    /// attention timeout makes a typo look like durable session state.
+    #[must_use]
+    pub fn warning_for(text: impl Into<String>, ttl: Duration) -> Self {
+        Self::warning(text).with_ttl(ttl)
+    }
+
     /// A failure.
     #[must_use]
     pub fn error(text: impl Into<String>) -> Self {
@@ -203,10 +215,20 @@ impl Toast {
         &self.text
     }
 
+    /// Override the level's default visibility window.
+    #[must_use]
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
     /// How long this notice remains visible.
     #[must_use]
     pub const fn ttl(&self) -> Duration {
-        self.level.ttl()
+        match self.ttl {
+            Some(ttl) => ttl,
+            None => self.level.ttl(),
+        }
     }
 }
 

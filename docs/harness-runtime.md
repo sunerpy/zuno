@@ -36,6 +36,27 @@ provided/required service types, and scrubbed diagnostics without coupling a
 client to the runtime implementation. The TUI projects this inventory today; the
 same value is available to future server, ACP, and GUI surfaces.
 
+## Agent and prompt contracts
+
+Agent prompts define role ownership, not a second copy of the runtime manual.
+`build` owns delivery and requirement-by-requirement completion evidence; `plan`
+owns repository-grounded implementation decisions without product mutation; and
+`deep` owns one cross-cutting implementation without recursive delegation. Each
+specialist states both its positive responsibility and its delegation boundary.
+
+The primary prompt requires authoritative evidence before mutation, forbids
+duplicate delegated discovery, and treats interruption, restart, and uncertain
+side effects as verification concerns rather than presentation details. The plan
+prompt ties each implementation decision to an observed constraint or explicit
+user choice. Goal tools separately enforce creation authority and terminal-state
+audits, so prompt wording is guidance over typed runtime policy rather than the
+only safety mechanism.
+
+Static tool descriptions live in dedicated text files and are byte-pinned by the
+prompt golden test. Prompt changes are therefore reviewed as model-visible
+behavior, while schemas, permission policy, replay policy, and execution remain
+independently testable.
+
 ## Extension packages and executable plugin hosts
 
 Zuno exposes one validated package protocol for agents, slash-command workflows,
@@ -220,6 +241,20 @@ User prompts and subagent reports share this protocol:
 - An idle parent is claimed and driven immediately.
 - A restarted process recovers pending reports from the durable inbox.
 
+Interactive TUI input uses the same durable boundary. Text and rich content
+submitted during an active turn target `steer`, request a soft interrupt, and
+become model-visible at the nearest safe step boundary. Commands and host actions
+target `nextStep`. If the turn ends before a steer is consumed, the already
+admitted item remains pending and is promoted in FIFO order on the next turn; it
+is never lost or duplicated. The bounded in-process prompt channel is only a
+wakeup and handoff path, not the queue of record.
+
+Tool-owned human input is projected separately from execution. A permission
+prompt reports `awaiting approval`; a structured question reports `awaiting
+answer`. The question surface replaces the composer region rather than becoming
+another transcript card. Cancelling either interaction resolves the tool as a
+typed denial and never fabricates an answer.
+
 Assistant checkpoints reconcile message usage and the session usage projection in the same
 transaction. Repeated checkpoints subtract the previous message snapshot before adding the new
 one. Provider accounting is persisted with each snapshot so cache tokens are counted exactly once;
@@ -334,6 +369,26 @@ deterministic destructive-command gate, permission checks, process-tree
 containment, working directory, and time limits reduce accidental execution
 risk, but the child still inherits the Zuno process's filesystem, network, and
 credentials. Strict authorization adds HITL; it does not add confinement.
+
+## Resident process containment
+
+Local MCP and LSP servers, process extensions, product agents, PTY sessions, and
+background commands share `zuno-process`. A resident Unix launch contains exactly
+one Zuno guard plus the payload process group; it does not add a second monitor
+process. On Linux the guard blocks on `SIGCHLD` and termination signals and uses
+the parent-death signal for abrupt Zuno exit, so an idle server has no timer
+polling loop. Other Unix systems retain a 250 ms parent-liveness fallback, and
+Windows uses a Job Object with the same bounded parent check.
+
+The direct child returned by `guarded_argv` is the guard, not the payload.
+Owners request shutdown through `request_contained_process_shutdown` and then reap
+the guard. They must not send an immediate hard kill: the guard remains alive
+long enough to kill and settle the payload group, including descendants that the
+payload orphaned. The same cleanup runs when the payload exits naturally or the
+Linux parent is killed. Interactive foreground programs use a separate terminal
+handoff path because foreground process-group ownership has a different
+lifecycle. The pinned Codex comparison and the reason Zuno retains one helper
+are recorded in [Resident process containment](design/process-containment.md).
 
 ## Background command execution
 

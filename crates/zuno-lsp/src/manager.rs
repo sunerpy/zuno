@@ -753,6 +753,8 @@ async fn launch(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn().map_err(|source| ManagerError::Spawn {
         server_id: server.spec.id.clone(),
         command: argv.join(" "),
@@ -925,7 +927,9 @@ async fn wait_backoff_or_shutdown(
 }
 
 async fn kill_and_reap(child: &mut Child) {
-    let _result = child.kill().await;
+    if let Some(pid) = child.id() {
+        let _result = zuno_process::request_contained_process_shutdown(pid);
+    }
     let _result = child.wait().await;
 }
 

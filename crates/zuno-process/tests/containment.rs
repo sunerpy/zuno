@@ -58,8 +58,8 @@ fn clean_parent_shutdown_reaps_the_guarded_process_tree() {
     wait_until_ready(&mut parent, &ready);
     let pids = collect_process_tree(parent.id()).expect("fixture process tree");
     assert!(
-        pids.len() >= 5,
-        "expected parent, guard, monitor, payload, and grandchild: {pids:?}"
+        pids.len() >= 4,
+        "expected parent, guard, payload, and grandchild: {pids:?}"
     );
 
     fs::write(&stop, b"stop").expect("request clean fixture shutdown");
@@ -69,14 +69,115 @@ fn clean_parent_shutdown_reaps_the_guarded_process_tree() {
 }
 
 #[test]
+fn resident_payload_uses_exactly_one_guard_process() {
+    let directory = tempfile::tempdir().expect("temporary fixture directory");
+    let (mut parent, ready, stop) = spawn_parent(directory.path());
+    wait_until_ready(&mut parent, &ready);
+    let pids = collect_process_tree(parent.id()).expect("fixture process tree");
+    let guards = guard_processes(&pids).expect("inspect fixture guard processes");
+
+    fs::write(&stop, b"stop").expect("request clean fixture shutdown");
+    let status = parent.wait().expect("wait for clean parent shutdown");
+    assert!(status.success(), "fixture parent failed: {status}");
+    assert_processes_exit(&pids);
+
+    assert_eq!(
+        guards.len(),
+        1,
+        "resident payload should use one Zuno guard process: {guards:?}"
+    );
+}
+
+#[test]
+fn resident_guard_waits_for_signals_instead_of_polling() {
+    let directory = tempfile::tempdir().expect("temporary fixture directory");
+    let (mut parent, ready, stop) = spawn_parent(directory.path());
+    wait_until_ready(&mut parent, &ready);
+    let pids = collect_process_tree(parent.id()).expect("fixture process tree");
+    let guards = guard_processes(&pids).expect("inspect fixture guard processes");
+    let before = guards
+        .iter()
+        .map(|pid| {
+            voluntary_context_switches(*pid)
+                .map(|switches| (*pid, switches))
+                .expect("read initial guard context switches")
+        })
+        .collect::<Vec<_>>();
+    std::thread::sleep(Duration::from_millis(250));
+    let deltas = before
+        .into_iter()
+        .map(|(pid, switches)| {
+            voluntary_context_switches(pid)
+                .map(|current| (pid, current.saturating_sub(switches)))
+                .expect("read final guard context switches")
+        })
+        .collect::<Vec<_>>();
+
+    fs::write(&stop, b"stop").expect("request clean fixture shutdown");
+    let status = parent.wait().expect("wait for clean parent shutdown");
+    assert!(status.success(), "fixture parent failed: {status}");
+    assert_processes_exit(&pids);
+
+    assert_eq!(
+        guards.len(),
+        1,
+        "resident payload should use one Zuno guard process: {guards:?}"
+    );
+    assert!(
+        deltas.iter().all(|(_, delta)| *delta <= 3),
+        "idle guards should block on signals instead of polling: {deltas:?}"
+    );
+}
+
+#[test]
+fn resident_guard_exits_when_its_payload_exits() {
+    let directory = tempfile::tempdir().expect("temporary fixture directory");
+    let ready = directory.path().join("ready");
+    let executable = env!("CARGO_BIN_EXE_zuno-process-fixture");
+    let mut guard = Command::new(executable)
+        .arg(zuno_process::GUARD_MARKER)
+        .arg("supervise")
+        .arg(std::process::id().to_string())
+        .arg("--")
+        .arg(executable)
+        .arg("exiting-payload")
+        .arg(&ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn resident guard");
+
+    wait_until_ready(&mut guard, &ready);
+    let grandchild = fs::read_to_string(&ready)
+        .expect("read descendant PID")
+        .parse::<u32>()
+        .expect("descendant PID");
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = guard.try_wait().expect("poll resident guard") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "resident guard did not observe its payload exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(status.success(), "resident guard failed: {status}");
+    assert_processes_exit(&[grandchild]);
+}
+
+#[test]
 fn parent_sigkill_reaps_the_guarded_process_tree() {
     let directory = tempfile::tempdir().expect("temporary fixture directory");
     let (mut parent, ready, _stop) = spawn_parent(directory.path());
     wait_until_ready(&mut parent, &ready);
     let pids = collect_process_tree(parent.id()).expect("fixture process tree");
     assert!(
-        pids.len() >= 5,
-        "expected parent, guard, monitor, payload, and grandchild: {pids:?}"
+        pids.len() >= 4,
+        "expected parent, guard, payload, and grandchild: {pids:?}"
     );
 
     let parent_pid =
@@ -139,6 +240,34 @@ fn collect_process_tree(root: u32) -> io::Result<Vec<u32>> {
         }
     }
     Ok(seen.into_iter().collect())
+}
+
+fn guard_processes(pids: &[u32]) -> io::Result<Vec<u32>> {
+    let mut guards = Vec::new();
+    for pid in pids {
+        let command_line = match fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(command_line) => command_line,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if command_line
+            .split(|byte| *byte == 0)
+            .any(|argument| argument == zuno_process::GUARD_MARKER.as_bytes())
+        {
+            guards.push(*pid);
+        }
+    }
+    Ok(guards)
+}
+
+fn voluntary_context_switches(pid: u32) -> io::Result<u64> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:").map(str::trim))
+        .ok_or_else(|| io::Error::other("voluntary context switches are missing"))?
+        .parse()
+        .map_err(io::Error::other)
 }
 
 fn assert_processes_exit(pids: &[u32]) {

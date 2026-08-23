@@ -187,6 +187,12 @@ enum SessionMaterializer {
     Pending(Box<zuno_db::session::SessionCreate>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserInputPersistence {
+    AdmitAndPromote,
+    AlreadyPromoted,
+}
+
 /// Session facts resolved before a [`TurnHost`] is assembled.
 ///
 /// Existing sessions carry their durable row immediately. A new TUI session carries only
@@ -2337,6 +2343,14 @@ impl TurnHost {
         self.runs.control(self.session_id.clone())
     }
 
+    /// Durable inbox shared with interactive admission workers.
+    ///
+    /// The clone carries only the pool. It does not borrow this host's connection, so a
+    /// TUI can admit a follow-up while the host is awaiting a provider or tool.
+    pub(crate) fn session_inbox(&self) -> zuno_db::inbox::SessionInbox {
+        self.inbox.clone()
+    }
+
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
         let session = self.runtime.shutdown().await.map_err(to_string);
         let profile = self.profile_runtime.shutdown().await.map_err(to_string);
@@ -2416,8 +2430,15 @@ impl TurnHost {
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(to_string)?;
-        self.drive_input(prompt, None, Some(content), &guard, events)
-            .await
+        self.drive_input(
+            prompt,
+            None,
+            Some(content),
+            UserInputPersistence::AdmitAndPromote,
+            &guard,
+            events,
+        )
+        .await
     }
 
     pub(crate) async fn drive_command(
@@ -2447,8 +2468,15 @@ impl TurnHost {
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(to_string)?;
-        self.drive_input(&resolved.prompt, None, None, &guard, events)
-            .await
+        self.drive_input(
+            &resolved.prompt,
+            None,
+            None,
+            UserInputPersistence::AdmitAndPromote,
+            &guard,
+            events,
+        )
+        .await
     }
 
     pub(crate) async fn drive_with_message_id(
@@ -2461,8 +2489,15 @@ impl TurnHost {
             .runs
             .begin_turn(self.session_id.clone())
             .map_err(to_string)?;
-        self.drive_input(prompt, message_id, None, &guard, events)
-            .await
+        self.drive_input(
+            prompt,
+            message_id,
+            None,
+            UserInputPersistence::AdmitAndPromote,
+            &guard,
+            events,
+        )
+        .await
     }
 
     async fn recover_background_reports(&mut self) -> Result<(), String> {
@@ -2486,8 +2521,100 @@ impl TurnHost {
         guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.drive_input(prompt, message_id, None, &guard, events)
-            .await
+        self.drive_input(
+            prompt,
+            message_id,
+            None,
+            UserInputPersistence::AdmitAndPromote,
+            &guard,
+            events,
+        )
+        .await
+    }
+
+    /// Drive an input whose durable inbox row was already promoted by the caller.
+    pub(crate) async fn drive_promoted(
+        &mut self,
+        prompt: &str,
+        message_id: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input(
+            prompt,
+            Some(message_id),
+            None,
+            UserInputPersistence::AlreadyPromoted,
+            &guard,
+            events,
+        )
+        .await
+    }
+
+    /// Drive rich input whose durable inbox row was already promoted by the caller.
+    pub(crate) async fn drive_promoted_content(
+        &mut self,
+        prompt: &str,
+        content: &[RequestContentBlock],
+        message_id: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input(
+            prompt,
+            Some(message_id),
+            Some(content),
+            UserInputPersistence::AlreadyPromoted,
+            &guard,
+            events,
+        )
+        .await
+    }
+
+    /// Resolve and drive a catalog command whose inbox row was already promoted.
+    pub(crate) async fn drive_promoted_command(
+        &mut self,
+        command: &str,
+        arguments: &str,
+        message_id: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let resolved = match self
+            .commands
+            .resolve(command, arguments)
+            .map_err(to_string)?
+        {
+            zuno_catalog::command::Resolution::Ready(resolved) => resolved,
+            zuno_catalog::command::Resolution::PendingMcp(_) => {
+                return Err(format!(
+                    "command `{command}` requires a connected MCP prompt provider"
+                ));
+            }
+        };
+        if resolved.subtask == Some(true) {
+            return Err(format!(
+                "command `{command}` requires subtask execution, which this surface cannot host"
+            ));
+        }
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input(
+            &resolved.prompt,
+            Some(message_id),
+            None,
+            UserInputPersistence::AlreadyPromoted,
+            &guard,
+            events,
+        )
+        .await
     }
 
     async fn drive_input(
@@ -2495,6 +2622,7 @@ impl TurnHost {
         prompt: &str,
         message_id: Option<&str>,
         content: Option<&[RequestContentBlock]>,
+        persistence: UserInputPersistence,
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
@@ -2514,7 +2642,13 @@ impl TurnHost {
             },
             content,
         )?;
-        let materialized = self.persist_user_input(&message, &parts)?;
+        let materialized = match persistence {
+            UserInputPersistence::AdmitAndPromote => self.persist_user_input(&message, &parts)?,
+            UserInputPersistence::AlreadyPromoted => {
+                self.persist_promoted_user_input(&message, &parts)?;
+                false
+            }
+        };
         if materialized {
             events
                 .publish(TurnEvent::SessionMaterialized {
@@ -2602,6 +2736,22 @@ impl TurnHost {
                 Ok(true)
             }
         }
+    }
+
+    fn persist_promoted_user_input(
+        &self,
+        message: &zuno_db::message::MessageRecord,
+        parts: &[zuno_db::message::PartRecord],
+    ) -> Result<(), String> {
+        if !self.session_identity.is_materialized() {
+            return Err(format!(
+                "promoted input `{}` belongs to an unmaterialized session",
+                message.id
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction().map_err(to_string)?;
+        persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+        transaction.commit().map_err(to_string)
     }
 
     pub(crate) async fn continue_goal_if_idle(
