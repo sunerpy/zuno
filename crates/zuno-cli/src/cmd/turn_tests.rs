@@ -4400,9 +4400,19 @@ fn generation_catalog(
     output_limit: Option<u64>,
     provider_options: serde_json::Value,
 ) -> Catalog {
+    generation_catalog_with_temperature(model_id, output_limit, provider_options, true)
+}
+
+fn generation_catalog_with_temperature(
+    model_id: &str,
+    output_limit: Option<u64>,
+    provider_options: serde_json::Value,
+    temperature: bool,
+) -> Catalog {
     let mut model = serde_json::Map::from_iter([
         ("id".to_owned(), serde_json::json!(model_id)),
         ("name".to_owned(), serde_json::json!("Generation fixture")),
+        ("temperature".to_owned(), serde_json::json!(temperature)),
         // Declared for every fixture model, not just the reasoning ones: a model
         // whose catalog entry omits it resolves to no reasoning controls whatever
         // level is chosen, which would make a variant assertion pass for the wrong
@@ -4531,6 +4541,7 @@ fn generation_body(
     let spec = with_agent_options(
         model_spec(catalog, model, &Env::empty()).expect("the generation fixture spec resolves"),
         agent,
+        model.capabilities.temperature,
     );
     let provider = zuno_provider_compatible::CompatibleProvider::new(
         spec,
@@ -4744,6 +4755,30 @@ fn an_agents_sampling_declarations_reach_the_request_body() {
 }
 
 #[test]
+fn an_agent_temperature_is_omitted_when_the_model_rejects_it() {
+    let catalog = generation_catalog_with_temperature(
+        "no-temperature",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+        false,
+    );
+    let tuned = configured_agent(serde_json::json!({
+        "model": "stub/no-temperature",
+        "temperature": 0.21
+    }));
+    let body = generation_body(&catalog, "no-temperature", &tuned);
+
+    assert_eq!(
+        body.get("temperature"),
+        None,
+        "a native or configured agent temperature must not be sent to a model whose \
+         catalog capability explicitly rejects it"
+    );
+}
+
+#[test]
 fn an_agents_option_bag_reaches_the_provider_and_can_override_the_cap() {
     let catalog = generation_catalog(
         "capped",
@@ -4884,11 +4919,14 @@ fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
     .expect("turn.rs is readable");
 
     assert!(
-        turn.contains("spec: with_agent_options(model_spec("),
+        turn.contains("spec: with_agent_options(")
+            && turn.contains("model_spec(&catalog, catalog_model, env)?")
+            && turn.contains("catalog_model.capabilities.temperature"),
         "`TurnPlan::resolve` no longer overlays the agent's options onto the resolved \
-         spec, so `temperature`, `top_p` and `options` are parsed, listed, and dropped \
-         — the defect this pair of tests exists to catch. A behavioural test alone \
-         cannot see it, because it calls the helper the turn stopped calling."
+         spec under the selected model's capabilities, so `temperature`, `top_p` and \
+         `options` are parsed, listed, and dropped — the defect this pair of tests \
+         exists to catch. A behavioural test alone cannot see it, because it calls \
+         the helper the turn stopped calling."
     );
     assert!(
         turn.contains("turn_effort(options.effort, &agent,"),

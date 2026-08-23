@@ -517,7 +517,11 @@ impl TurnPlan {
                 catalog_model,
                 &agent.options,
             ),
-            spec: with_agent_options(model_spec(&catalog, catalog_model, env)?, &agent),
+            spec: with_agent_options(
+                model_spec(&catalog, catalog_model, env)?,
+                &agent,
+                catalog_model.capabilities.temperature,
+            ),
         };
         let window = TokenWindow {
             context: token_count(catalog_model.limit.context),
@@ -4431,14 +4435,20 @@ fn credential_value(credential: &Credential) -> String {
 ///
 /// A field the agent left unset writes nothing, so an agent that declares no
 /// sampling leaves the request byte-identical to one resolved without an agent.
-fn with_agent_options(mut spec: Spec, agent: &zuno_catalog::agent::Agent) -> Spec {
+/// Model capabilities remain authoritative: a native agent's compatibility
+/// temperature must not make an otherwise valid model request fail.
+fn with_agent_options(
+    mut spec: Spec,
+    agent: &zuno_catalog::agent::Agent,
+    supports_temperature: bool,
+) -> Spec {
     for (name, value) in &agent.options {
         if resolved_elsewhere(name) {
             continue;
         }
         spec = spec.with_option(name.clone(), value.clone());
     }
-    if let Some(temperature) = agent.temperature {
+    if supports_temperature && let Some(temperature) = agent.temperature {
         spec = spec.with_option(generation::TEMPERATURE, json!(temperature));
     }
     if let Some(top_p) = agent.top_p {
