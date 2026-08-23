@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::app::render_offscreen;
-use crate::views::message::{TokenUsage, UsageState};
+use crate::views::message::{ContextWindowUsage, TokenUsage, UsageState};
 use crate::views::testkit::rows;
 
 fn ambient() -> Ambient {
@@ -22,7 +22,10 @@ fn ambient() -> Ambient {
             cache_write: 200,
         },
         usage_state: UsageState::Known,
-        context_used: Some(64),
+        context: Some(ContextWindowUsage {
+            prompt_tokens: 64_000,
+            limit: 100_000,
+        }),
         lsp: vec![
             Service::new("rust-analyzer", Health::Ready).detailed("/config/workspace/zuno"),
             Service::new("typescript-language-server", Health::Pending).detailed("starting"),
@@ -234,7 +237,10 @@ fn views_sidebar_says_so_when_no_usage_has_arrived() {
 #[test]
 fn views_sidebar_warns_once_the_context_window_is_nearly_full() {
     let mut view = view();
-    view.ambient_mut().context_used = Some(91);
+    view.ambient_mut().context = Some(ContextWindowUsage {
+        prompt_tokens: 91_000,
+        limit: 100_000,
+    });
     let buffer = render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible");
     let warning = ratatui::style::Color::from(ViewContext::defaults().palette().warning);
     let row = (0..40)
@@ -242,7 +248,7 @@ fn views_sidebar_warns_once_the_context_window_is_nearly_full() {
             (0..SIDEBAR_WIDTH)
                 .map(|x| buffer[(x, *y)].symbol())
                 .collect::<String>()
-                .contains("91%")
+                .contains("91.0%")
         })
         .expect("the percentage row is drawn");
     let coloured = (0..SIDEBAR_WIDTH).any(|x| buffer[(x, row)].fg == warning);

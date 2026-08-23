@@ -237,6 +237,10 @@ const UI_SPECS: &[UiSpec] = &[
         aliases: &["resume", "continue"],
     },
     UiSpec {
+        action: "session_new",
+        aliases: &[],
+    },
+    UiSpec {
         action: "diff_open",
         aliases: &[],
     },

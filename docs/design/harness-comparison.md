@@ -78,7 +78,7 @@ Zuno extends the goal idea with cross-turn exponential backoff. Provider retries
 
 oh-my-openagent contributes a useful orchestration lesson: a bounded roster is easier for a primary agent to route than a large collection of overlapping personas. Each Zuno specialist therefore carries both a responsibility and a negative delegation boundary. `build` is the only recursive coordinator; `deep` and `worker` can implement but cannot fan out.
 
-Zuno keeps agent identity, permissions, output expectations, and prompt policy as data so validation and rendered prompts cannot drift apart.
+Zuno keeps agent identity, permissions, delegation boundaries, and prompt policy as data so validation and rendered prompts cannot drift apart. It adapts OMO's explicit positive and negative role boundaries, but rejects unconsumed XML reply envelopes: user-facing agents return concise natural Markdown, while structured output is reserved for typed runtime consumers.
 
 ### pi-agent
 

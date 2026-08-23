@@ -1426,9 +1426,7 @@ fn session_screen_opens_a_picker_through_the_dialog_host() {
 }
 
 #[test]
-fn session_screen_says_so_when_a_picker_would_be_empty() {
-    // An empty picker that opened would say `no matches`, which a user cannot tell from
-    // a surface that failed to load its list.
+fn session_screen_reports_an_unavailable_generic_picker_without_polluting_the_transcript() {
     let (mut screen, _shutdown) = screen();
     let result = screen.handle_action(action("model_list"), &press_none());
     assert!(result.redraw);
@@ -1438,8 +1436,30 @@ fn session_screen_says_so_when_a_picker_would_be_empty() {
     );
     let joined = rows(&render_offscreen(&mut screen, 80, 12).expect("infallible")).join("\n");
     assert!(
-        joined.contains("nothing to choose from"),
-        "the refusal was silent:\n{joined}"
+        !joined.contains("nothing to choose from") && !joined.contains("Nothing is available"),
+        "transient picker state leaked into the transcript:\n{joined}"
+    );
+    let toasts = ActionComponent::drain_toasts(&mut screen);
+    assert!(
+        toasts
+            .iter()
+            .any(|toast| toast.text().contains("Nothing is available")),
+        "the refusal was silent: {toasts:?}"
+    );
+}
+
+#[test]
+fn empty_session_list_opens_an_explicit_empty_state_without_writing_a_message() {
+    let (mut screen, _shutdown) = screen();
+    let result = screen.handle_action(action("session_list"), &press_none());
+    assert!(result.redraw);
+    assert_eq!(screen.drain_dialogs().len(), 1);
+
+    let transcript = rows(&render_offscreen(&mut screen, 80, 12).expect("infallible")).join("\n");
+    assert!(
+        !transcript.contains("nothing to choose from")
+            && !transcript.contains("No saved sessions yet"),
+        "opening /session wrote interface state into the conversation:\n{transcript}"
     );
 }
 
@@ -1456,6 +1476,25 @@ fn session_materialization_makes_the_new_session_discoverable_without_a_remount(
     assert_eq!(screen.catalog.sessions.len(), 1);
     assert_eq!(screen.catalog.sessions[0].id, "ses_new");
     assert_eq!(screen.catalog.sessions[0].when, "now");
+}
+
+#[test]
+fn session_new_action_requests_a_fresh_lazy_session_from_the_host() {
+    let (sender, _receiver) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(1);
+    let mut screen =
+        SessionScreen::new(ViewContext::defaults(), sender).with_selection_sink(selections);
+
+    let result = screen.handle_action(action("session_new"), &press_none());
+
+    assert!(result.redraw);
+    assert_eq!(chosen.try_recv(), Ok(Selection::NewSession));
+    assert!(
+        ActionComponent::drain_toasts(&mut screen)
+            .iter()
+            .any(|toast| toast.text().contains("starting a new session")),
+        "the in-process remount was silent"
+    );
 }
 
 #[test]
@@ -3910,6 +3949,76 @@ fn session_a_click_on_one_tool_header_expands_only_that_call() {
 }
 
 #[test]
+fn session_a_click_on_one_thought_reveals_its_full_text_without_opening_its_sibling() {
+    let (mut screen, _shutdown) = mouse_screen();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("solve the constraints"));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::AssistantMessageCreated {
+        step: 1,
+        message_id: String::from("assistant"),
+    }));
+    let provider = |event| TurnEvent::Provider { step: 1, event };
+    for event in [
+        provider(StreamEvent::ReasoningStart),
+        provider(StreamEvent::ReasoningDelta(String::from(
+            "first compact topic\nfirst private detail\nFIRST_FULL_THOUGHT_SENTINEL",
+        ))),
+        provider(StreamEvent::ReasoningDone { duration_secs: 2.0 }),
+        provider(StreamEvent::TextDelta(String::from(
+            "intermediate answer\n",
+        ))),
+        provider(StreamEvent::ReasoningStart),
+        provider(StreamEvent::ReasoningDelta(String::from(
+            "second compact topic\nsecond private detail\nSECOND_FULL_THOUGHT_SENTINEL",
+        ))),
+        provider(StreamEvent::ReasoningDone { duration_secs: 3.0 }),
+    ] {
+        screen.handle_event(&AppEvent::Engine(event));
+    }
+
+    let before = rows(&render_offscreen(&mut screen, 100, 28).expect("infallible"));
+    let before_joined = before.join("\n");
+    assert!(
+        !before_joined.contains("FIRST_FULL_THOUGHT_SENTINEL")
+            && !before_joined.contains("SECOND_FULL_THOUGHT_SENTINEL"),
+        "the fixture did not start with both thought blocks collapsed:\n{before_joined}"
+    );
+    let first_row = u16::try_from(
+        before
+            .iter()
+            .position(|row| row.contains("first compact topic"))
+            .expect("the first thought header is drawn"),
+    )
+    .expect("in frame");
+
+    assert!(click_at(&mut screen, 5, first_row).redraw);
+    let after = rows(&render_offscreen(&mut screen, 100, 28).expect("infallible"));
+    let joined = after.join("\n");
+    assert!(
+        joined.contains("FIRST_FULL_THOUGHT_SENTINEL"),
+        "clicking the thought header did not reveal the complete persisted body:\n{joined}"
+    );
+    assert!(
+        !joined.contains("SECOND_FULL_THOUGHT_SENTINEL"),
+        "clicking one thought expanded its sibling too:\n{joined}"
+    );
+    let first_header = after
+        .iter()
+        .find(|row| row.contains("thought for 2.0s"))
+        .expect("the first thought header remains");
+    let second_header = after
+        .iter()
+        .find(|row| row.contains("second compact topic"))
+        .expect("the second thought header remains");
+    assert!(
+        first_header.contains('▾') && second_header.contains('▸'),
+        "the disclosure glyphs do not describe the two independent states:\n{joined}"
+    );
+}
+
+#[test]
 fn session_a_transcript_drag_auto_copies_and_right_click_repeats_the_pane_bounded_copy() {
     let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
     let (screen, _shutdown) = mouse_conversing();
@@ -4656,7 +4765,6 @@ const PRESSABLE_BUT_DEAD: &[&str] = &[
     "session_compact",
     "session_delete",
     "session_export",
-    "session_new",
     "session_pin_toggle",
     "session_queued_prompts",
     "session_quick_switch_1",
@@ -4745,7 +4853,7 @@ fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_nam
     // did, by giving `ctrl+x down` the delegated-task view to open.
     assert_eq!(
         PRESSABLE_BUT_DEAD.len(),
-        47,
+        46,
         "the pressable-but-dead census changed size; that is a real event either way and the \
          count is pinned so it cannot pass unremarked"
     );
@@ -4835,8 +4943,18 @@ fn composer_span(screen: &SessionScreen, width: u16, height: u16) -> (usize, usi
     // every assertion below the wrong columns and read the margin instead of the band.
     let empty = !screen.transcript.transcript().conversation_started();
     let sidebar = sidebar_drawn(screen.sidebar_visible(), empty, width);
-    let region = composer_region(content_bounds(Rect::new(0, 0, width, height), sidebar));
+    let region = composer_region(
+        content_bounds(Rect::new(0, 0, width, height), sidebar),
+        empty,
+    );
     (usize::from(region.x), usize::from(region.width))
+}
+
+fn expected_welcome_composer_span(width: u16) -> (usize, usize) {
+    let margin = usize::from(width > 2);
+    let available = usize::from(width).saturating_sub(margin * 2);
+    let columns = available.min(usize::from(WELCOME_COMPOSER_MAX_COLS));
+    (margin + (available - columns) / 2, columns)
 }
 
 /// The prompt band's spacer, which is its last row whenever the band has more than one.
@@ -5850,10 +5968,10 @@ fn the_agent_and_model_strip_is_the_composers_footer() {
 ///   it rather than an unpainted seam holding ratatui's `Color::Reset`.
 /// * The two columns immediately outside the box carry the rule glyphs, which is what closes it.
 ///
-/// The composer now uses all available left-column width except one cell on each side. This is
-/// enough to close the box without imposing an arbitrary prose-width cap on pasted input.
+/// The welcome composer is bounded for readability; a separate assertion below proves that the
+/// cap disappears after the first user message.
 #[test]
-fn the_composer_occupies_a_centred_region_with_visible_edges() {
+fn the_welcome_composer_has_a_readable_maximum_width_and_visible_edges() {
     for (width, height) in [
         (200u16, 50u16),
         (120, 32),
@@ -5874,9 +5992,9 @@ fn the_composer_occupies_a_centred_region_with_visible_edges() {
 
         assert_eq!(
             (x, columns),
-            (1, usize::from(width.saturating_sub(2))),
-            "at {width}x{height} the composer did not fill the content column with one-cell \
-             margins"
+            expected_welcome_composer_span(width),
+            "at {width}x{height} the welcome composer did not stay centred within its readable \
+             maximum width"
         );
         let right = usize::from(width) - x - columns;
         assert!(
@@ -5911,6 +6029,29 @@ fn the_composer_occupies_a_centred_region_with_visible_edges() {
             );
         }
     }
+}
+
+#[test]
+fn a_started_conversation_removes_the_welcome_width_cap() {
+    let width = 200;
+    let height = 50;
+    let (screen, _shutdown) = conversing();
+    let (x, columns) = composer_span(&screen, width, height);
+    let sidebar = sidebar_drawn(screen.sidebar_visible(), false, width);
+    let content = content_bounds(Rect::new(0, 0, width, height), sidebar);
+
+    assert_eq!(
+        (x, columns),
+        (
+            usize::from(content.x.saturating_add(1)),
+            usize::from(content.width.saturating_sub(2)),
+        ),
+        "a conversation should use its whole left content column with one-cell margins"
+    );
+    assert!(
+        columns > usize::from(WELCOME_COMPOSER_MAX_COLS),
+        "the active composer is still capped at the welcome width: {columns}"
+    );
 }
 
 /// The whole input band is painted in a surface of its own, so a reader can see how tall it is.
@@ -6129,7 +6270,7 @@ fn the_input_band_grows_on_both_input_paths_and_stays_centred() {
         // Every fixture here has an empty transcript, so the panel is not drawn and the composer
         // is centred on the whole frame. Taken from the production narrowing rather than
         // re-derived.
-        let probe = composer_region(content_bounds(Rect::new(0, 0, width, height), false)).x;
+        let probe = composer_region(content_bounds(Rect::new(0, 0, width, height), false), true).x;
         // The chord path. `shift+return` cannot be delivered through a real terminal — the
         // legacy encoding gives it the same bytes as `return` — so `ctrl+j` is the spelling
         // driven here, and it is the same binding.
@@ -6278,8 +6419,8 @@ fn the_welcome_surface_survives_a_startup_notice() {
         );
         assert_eq!(
             (x, columns),
-            (1, usize::from(width.saturating_sub(2))),
-            "at {width}x{height} the composer did not retain its one-cell margins"
+            expected_welcome_composer_span(width),
+            "at {width}x{height} the composer did not retain its welcome-page width policy"
         );
         let first = content_row(&rendered, &warned, width, height);
         let full = &rendered[prompt_first(&rendered, &warned, width, height)];
@@ -6597,7 +6738,7 @@ fn the_composer_stays_inside_the_body_and_gains_an_info_row() {
             "at {width} columns the info row does not name the command key: {info:?}"
         );
         assert!(
-            info.contains("37% context"),
+            info.contains("ctx 37.0k/100.0k (37.0%)"),
             "at {width} columns the info row does not report the context spend: {info:?}"
         );
         let palette = screen.context.palette();

@@ -265,7 +265,8 @@ impl EffortResolution {
 ///   and writes `reasoning_effort`.
 /// - `packages/llm/src/protocols/openai-responses.ts:459,472` reads the same
 ///   option and writes `reasoning: { effort }` — **the same name, a different
-///   wire shape, chosen by the surface.**
+///   wire shape, chosen by the surface.** `reasoningSummary` joins that object as
+///   `summary`; Chat Completions has no equivalent field, so it is omitted there.
 /// - `packages/llm/src/protocols/anthropic-messages.ts:494-503` (`lowerThinking`)
 ///   accepts `budgetTokens` or `budget_tokens` and always writes `budget_tokens`.
 /// - `packages/llm/src/protocols/gemini.ts:292-330` reads `thinkingConfig` from
@@ -297,6 +298,7 @@ pub fn lower_to_wire(options: &Map<String, Value>, surface: ApiSurface) -> Map<S
     for (name, value) in options {
         match name.as_str() {
             OPEN_AI_EFFORT_OPTION => lower_open_ai_effort(&mut wire, value.clone(), surface),
+            OPEN_AI_SUMMARY_OPTION => lower_open_ai_summary(&mut wire, value.clone(), surface),
             ANTHROPIC_THINKING_OPTION => {
                 merge_objects(&mut wire, &object_entry(name, lower_thinking(value)));
             }
@@ -320,9 +322,11 @@ pub fn lower_to_wire(options: &Map<String, Value>, surface: ApiSurface) -> Map<S
 // `_OPTION` names are SDK provider-option spellings; `_FIELD` names are wire
 // spellings. `GOOGLE_THINKING_OPTION` is deliberately both.
 const OPEN_AI_EFFORT_OPTION: &str = "reasoningEffort";
+const OPEN_AI_SUMMARY_OPTION: &str = "reasoningSummary";
 const OPEN_AI_CHAT_EFFORT_FIELD: &str = "reasoning_effort";
 const OPEN_AI_RESPONSES_REASONING_FIELD: &str = "reasoning";
 const OPEN_AI_RESPONSES_EFFORT_FIELD: &str = "effort";
+const OPEN_AI_RESPONSES_SUMMARY_FIELD: &str = "summary";
 const ANTHROPIC_THINKING_OPTION: &str = "thinking";
 const ANTHROPIC_BUDGET_OPTION: &str = "budgetTokens";
 const ANTHROPIC_BUDGET_FIELD: &str = "budget_tokens";
@@ -341,6 +345,18 @@ fn lower_open_ai_effort(wire: &mut Map<String, Value>, effort: Value, surface: A
         ApiSurface::Default | ApiSurface::Chat | ApiSurface::Messages => {
             wire.insert(OPEN_AI_CHAT_EFFORT_FIELD.to_owned(), effort);
         }
+    }
+}
+
+fn lower_open_ai_summary(wire: &mut Map<String, Value>, summary: Value, surface: ApiSurface) {
+    if surface == ApiSurface::Responses {
+        merge_objects(
+            wire,
+            &object_entry(
+                OPEN_AI_RESPONSES_REASONING_FIELD,
+                json!({ OPEN_AI_RESPONSES_SUMMARY_FIELD: summary }),
+            ),
+        );
     }
 }
 
@@ -879,6 +895,24 @@ mod tests {
                 "the SDK option name must not survive onto the body: {medium:?}"
             );
         }
+    }
+
+    #[test]
+    fn reasoning_summary_is_nested_only_on_the_responses_surface() {
+        let options = object(json!({
+            "reasoningEffort": "max",
+            "reasoningSummary": "auto"
+        }));
+
+        assert_eq!(
+            Value::Object(lower_to_wire(&options, ApiSurface::Responses)),
+            json!({"reasoning": {"effort": "max", "summary": "auto"}})
+        );
+        assert_eq!(
+            Value::Object(lower_to_wire(&options, ApiSurface::Chat)),
+            json!({"reasoning_effort": "max"}),
+            "Chat Completions has no reasoning-summary request field"
+        );
     }
 
     #[test]

@@ -445,6 +445,11 @@ async fn strict_authorization_keeps_explicit_denies_terminal() {
         .await;
 
     assert!(result.is_error);
+    assert_eq!(
+        result.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::Denied),
+        "an explicit deny must be distinguishable from an execution failure"
+    );
     assert!(approver.asks().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
@@ -539,6 +544,11 @@ async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
         result.is_error,
         "a plugin allow crossed the user's explicit deny rule: {}",
         result.output.output
+    );
+    assert_eq!(
+        result.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::Denied),
+        "the client must be able to render a refusal as blocked rather than failed"
     );
     assert!(
         result.output.output.contains("denied"),
@@ -729,6 +739,11 @@ async fn dispatch_unknown_tool_returns_ranked_suggestion_and_available_list() {
         .await;
 
     assert!(result.is_error);
+    assert_eq!(
+        result.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::Unavailable),
+        "a name with no registered implementation is unavailable, not an execution failure"
+    );
     assert!(
         result.output.output.contains("Did you mean: tool_search?"),
         "{}",
@@ -764,6 +779,11 @@ async fn dispatch_malformed_json_synthesizes_error_without_running_tool() {
     let result = dispatcher.dispatch(malformed).await;
 
     assert!(result.is_error);
+    assert_eq!(
+        result.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::InvalidArguments),
+        "malformed JSON is refused before execution"
+    );
     assert!(
         result
             .output
@@ -797,6 +817,11 @@ async fn dispatch_schema_error_is_a_result_and_does_not_run_tool() {
         .await;
 
     assert!(result.is_error);
+    assert_eq!(
+        result.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::InvalidArguments),
+        "schema rejection happened before the tool ran"
+    );
     assert!(
         result
             .output
@@ -834,6 +859,10 @@ async fn dispatch_denial_is_an_error_result_and_a_later_call_still_runs() {
         .await;
 
     assert!(denied.is_error);
+    assert_eq!(
+        denied.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::Denied)
+    );
     assert!(denied.output.output.contains("denied"));
     assert!(!continued.is_error, "{}", continued.output.output);
     assert_eq!(calls.load(Ordering::SeqCst), 1);

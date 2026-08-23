@@ -456,6 +456,7 @@ fn dispatch_state(status: ToolStatus) -> &'static str {
         ToolStatus::Pending => "pending",
         ToolStatus::Running => "running",
         ToolStatus::Completed => "completed",
+        ToolStatus::Blocked => "blocked",
         ToolStatus::Error => "failed",
     }
 }

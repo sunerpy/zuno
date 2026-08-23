@@ -595,10 +595,7 @@ fn execute_once(
     // event. It is the terminal channel that already exists, not a new one; see
     // `zuno_tui::views::toast` for why one deadline and one wake was chosen over giving
     // the redraw scheduler a fourth tier.
-    let initial_dialog = match initial_dialog {
-        Some(RemountDialog::Sessions) => screen.session_picker(),
-        None => None,
-    };
+    let initial_dialog = initial_dialog.map(|RemountDialog::Sessions| screen.session_picker());
     let mut dialogs =
         DialogHost::new(context.clone(), Box::new(screen)).with_waker(terminal_sender.clone());
     if let Some(dialog) = initial_dialog {
@@ -1564,6 +1561,12 @@ async fn apply_selection(
         // shape. That is also what makes a level chosen here survive a later model
         // switch, and what silently drops it when the new model does not reason.
         zuno_tui::views::session::Selection::Effort(effort) => next.effort = Some(effort),
+        zuno_tui::views::session::Selection::NewSession => {
+            next.directory = Some(PathBuf::from(host.session_directory()));
+            next.session = SessionChoice::New;
+            next.title = None;
+            return SelectionOutcome::Remount(RemountRequest::plain(next));
+        }
         zuno_tui::views::session::Selection::Session(session_id) => {
             if session_id == host.session_id() {
                 return SelectionOutcome::Unchanged;

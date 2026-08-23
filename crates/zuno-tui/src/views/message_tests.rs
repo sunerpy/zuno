@@ -442,6 +442,83 @@ fn views_thinking_affordance_toggles_between_summary_and_full_text() {
 }
 
 #[test]
+fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    for event in [
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("blocked"),
+            name: String::from("bash"),
+        }),
+        TurnEvent::ToolDispatchBlocked {
+            step: 1,
+            call_id: String::from("blocked"),
+            kind: zuno_engine::r#loop::ToolBlockKind::InvalidArguments,
+        },
+        TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("blocked"),
+            name: String::from("bash"),
+            title: String::from("bash blocked"),
+            output: String::from("redirection outside the worktree was refused; nothing ran"),
+            diff: None,
+            written_paths: Vec::new(),
+            is_error: true,
+        },
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("failed"),
+            name: String::from("bash"),
+        }),
+        TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("failed"),
+            name: String::from("bash"),
+            title: String::from("bash failed"),
+            output: String::from("process exited with status 1"),
+            diff: None,
+            written_paths: Vec::new(),
+            is_error: true,
+        },
+    ] {
+        view.handle_event(&AppEvent::Engine(event));
+    }
+
+    let lines = view.lines(96);
+    let blocked = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("bash blocked"))
+        .expect("blocked tool header");
+    let failed = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("bash failed"))
+        .expect("failed tool header");
+    assert_eq!(
+        blocked.style.fg,
+        Some(ratatui::style::Color::from(
+            ViewContext::defaults().palette().warning
+        ))
+    );
+    assert_eq!(
+        failed.style.fg,
+        Some(ratatui::style::Color::from(
+            ViewContext::defaults().palette().error
+        ))
+    );
+
+    let joined = draw(&mut view, 96, 18).join("\n");
+    assert!(
+        joined.contains("! $ bash blocked"),
+        "the refusal still looks like an execution failure:\n{joined}"
+    );
+    assert!(
+        joined.contains("✗ $ bash failed"),
+        "a process failure lost its error state:\n{joined}"
+    );
+}
+
+#[test]
 fn views_reasoning_summary_drops_a_markdown_heading_and_truncates() {
     assert_eq!(summary("### Plan\nbody"), Some(String::from("Plan")));
     assert_eq!(summary("\n\n   \nreal"), Some(String::from("real")));
@@ -450,6 +527,28 @@ fn views_reasoning_summary_drops_a_markdown_heading_and_truncates() {
     let summarised = summary(&long).expect("non-empty");
     assert_eq!(summarised.chars().count(), 72);
     assert!(summarised.ends_with('…'));
+}
+
+#[test]
+fn views_user_messages_render_commonmark_tables_instead_of_literal_pipes() {
+    let mut view = view();
+    view.transcript_mut().push(Message::user(
+        "| # | 约束 | 形式 |\n| ---: | --- | --- |\n| 1 | Web 不在 A/E | `Web ∉ {A,E}` |\n",
+    ));
+
+    let joined = draw(&mut view, 72, 12).join("\n");
+    assert!(
+        joined.contains("Web") && joined.contains("A/E") && joined.contains("{A,E}"),
+        "the table content was lost:\n{joined}"
+    );
+    assert!(
+        joined.contains('┼') && joined.contains('│'),
+        "the user message was not rendered as a table:\n{joined}"
+    );
+    assert!(
+        !joined.contains("| ---: |"),
+        "the user-facing transcript leaked CommonMark table syntax:\n{joined}"
+    );
 }
 
 #[test]
@@ -1068,7 +1167,13 @@ fn views_transcript_restores_durable_usage_and_marks_unknown_history() {
         crate::views::message::UsageState::Known
     );
     assert_eq!(transcript.tokens().total(), 1_200);
-    assert_eq!(transcript.context_used(), Some(11));
+    assert_eq!(
+        transcript.context_window(),
+        Some(crate::views::message::ContextWindowUsage {
+            prompt_tokens: 1_100,
+            limit: 10_000,
+        })
+    );
 
     transcript.restore_usage(
         crate::views::message::TokenUsage::default(),
@@ -1147,10 +1252,12 @@ fn views_transcript_context_percentage_measures_the_last_prompt_not_the_session(
         })));
     }
 
-    assert_eq!(
-        view.transcript().context_used(),
-        Some(62),
-        "80,000 of a 128,000-token window is 62%, however many turns have run"
+    let context = view.transcript().context_window().expect("declared window");
+    assert_eq!(context.prompt_tokens, 80_000);
+    assert_eq!(context.limit, 128_000);
+    assert!(
+        (context.percent() - 62.5).abs() < f64::EPSILON,
+        "80,000 of a 128,000-token window is 62.5%, however many turns have run"
     );
     assert_eq!(
         view.transcript().tokens().input,
@@ -1176,7 +1283,8 @@ fn views_transcript_context_percentage_counts_cached_prompt_tokens_as_occupying_
         accounting: PromptAccounting::CacheInsideInput,
     })));
 
-    assert_eq!(view.transcript().context_used(), Some(78));
+    let context = view.transcript().context_window().expect("declared window");
+    assert!((context.percent() - 78.125).abs() < f64::EPSILON);
     assert_eq!(view.transcript().tokens().input, 4_000);
     assert_eq!(view.transcript().tokens().cache_read, 96_000);
 }
@@ -1193,15 +1301,16 @@ fn views_transcript_context_percentage_needs_a_declared_window() {
         accounting: PromptAccounting::CacheInsideInput,
     })));
     assert_eq!(
-        view.transcript().context_used(),
+        view.transcript().context_window(),
         None,
         "a model that declares no window must not produce a percentage"
     );
     view.transcript_mut().set_context_limit(20_000);
-    assert_eq!(view.transcript().context_used(), Some(25));
+    let context = view.transcript().context_window().expect("declared window");
+    assert_eq!(context.percent(), 25.0);
     // Output is excluded: the window bounds the prompt, and including completions would
     // climb past 100 on a long session.
-    assert!(view.transcript().context_used().unwrap() <= 100);
+    assert!(context.percent() <= 100.0);
 }
 
 #[test]
@@ -1505,9 +1614,9 @@ fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hi
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(text.contains("↑2,955"), "[{text}]");
-    assert!(text.contains("↓750"), "[{text}]");
-    assert!(text.contains("⚡45"), "[{text}]");
+    assert!(text.contains("in 2,955"), "[{text}]");
+    assert!(text.contains("out 750"), "[{text}]");
+    assert!(text.contains("cache 45"), "[{text}]");
     assert!(text.contains(StatusView::EXIT_HINT), "[{text}]");
 
     // Under width pressure the counts go before the exit key, never the other way round.
@@ -1521,7 +1630,7 @@ fn views_status_strip_reports_cumulative_token_usage_and_never_loses_the_exit_hi
         narrow.contains(StatusView::EXIT_HINT),
         "the exit hint was dropped before the token counts: [{narrow}]"
     );
-    assert!(!narrow.contains("↑2,955"), "[{narrow}]");
+    assert!(!narrow.contains("in 2,955"), "[{narrow}]");
 }
 
 #[test]
@@ -1540,9 +1649,9 @@ fn views_status_strip_omits_a_cache_column_a_provider_never_reported() {
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(text.contains("↑12 ↓3"), "[{text}]");
+    assert!(text.contains("in 12 · out 3"), "[{text}]");
     assert!(
-        !text.contains('⚡'),
+        !text.contains("cache"),
         "a permanent `cache 0` is a column of noise: [{text}]"
     );
 }
@@ -1607,15 +1716,18 @@ fn views_status_strip_sheds_the_branch_then_the_counts_before_the_exit_key() {
         wide.contains(&branch),
         "the branch never rendered: [{wide}]"
     );
-    assert!(wide.contains("↑2,955 ↓750 ⚡45"), "[{wide}]");
+    assert!(wide.contains("in 2,955 · out 750 · cache 45"), "[{wide}]");
     assert!(wide.trim_end().ends_with(StatusView::EXIT_HINT), "[{wide}]");
 
-    // 80: the narrowest width that still holds everything. Asserted so the rung below
+    // 110: the narrowest width that still holds everything. Asserted so the rung below
     // measures the branch being shed rather than a row that never fitted to begin with.
-    let at_80 = strip(&view, 80);
-    assert!(at_80.contains(&branch), "[{at_80}]");
-    assert!(at_80.contains("↑2,955 ↓750 ⚡45"), "[{at_80}]");
-    assert!(at_80.contains(StatusView::EXIT_HINT), "[{at_80}]");
+    let at_110 = strip(&view, 110);
+    assert!(at_110.contains(&branch), "[{at_110}]");
+    assert!(
+        at_110.contains("in 2,955 · out 750 · cache 45"),
+        "[{at_110}]"
+    );
+    assert!(at_110.contains(StatusView::EXIT_HINT), "[{at_110}]");
 
     // 76: the branch goes first. It is the only field the ambient sidebar also prints,
     // so it is the only one whose loss costs the user nothing they cannot read elsewhere.
@@ -1624,13 +1736,13 @@ fn views_status_strip_sheds_the_branch_then_the_counts_before_the_exit_key() {
         !at_76.contains(&branch),
         "the branch outranked the counts it should yield to: [{at_76}]"
     );
-    assert!(at_76.contains("↑2,955 ↓750 ⚡45"), "[{at_76}]");
+    assert!(at_76.contains("in 2,955 · out 750 · cache 45"), "[{at_76}]");
     assert!(at_76.contains(StatusView::EXIT_HINT), "[{at_76}]");
 
     // 50: the counts go next. Between a report and the way out, the way out stays.
     let at_50 = strip(&view, 50);
     assert!(
-        !at_50.contains("↑2,955"),
+        !at_50.contains("in 2,955"),
         "the counts outranked the exit key they should yield to: [{at_50}]"
     );
     assert!(at_50.contains(StatusView::EXIT_HINT), "[{at_50}]");
@@ -1643,7 +1755,7 @@ fn views_status_strip_sheds_the_branch_then_the_counts_before_the_exit_key() {
         "a field was kept at the exit key's expense: [{at_40}]"
     );
     assert!(!at_40.contains(&branch), "[{at_40}]");
-    assert!(!at_40.contains("↑2,955"), "[{at_40}]");
+    assert!(!at_40.contains("in 2,955"), "[{at_40}]");
 
     // 20: 18 of the 20 columns are the exit key itself, so it cannot share the row with
     // even the 6-column state — the pre-existing last rung drops it whole rather than
@@ -1686,7 +1798,7 @@ fn views_status_strip_never_shows_a_price_and_shows_no_branch_until_one_is_pushe
     })));
     let text = strip(&view, 200);
     assert!(
-        text.contains("↑2,955 ↓750 ⚡45"),
+        text.contains("in 2,955 · out 750 · cache 45"),
         "the counts a cost would be derived from are not even there: [{text}]"
     );
     assert!(
@@ -1723,10 +1835,8 @@ fn views_status_strip_draws_the_branch_and_the_counts_onto_the_frame() {
         )),
         "the branch reached no cell of the frame:\n{row}"
     );
-    // Asserted piecewise: the cell grid may space a double-width glyph, so `⚡45` can
-    // reach the frame as `⚡ 45` and a joined needle would fail on a correct frame.
     assert!(
-        row.contains("↑2,955") && row.contains("↓750"),
+        row.contains("in 2,955") && row.contains("out 750") && row.contains("cache 45"),
         "the token counts reached no cell:\n{row}"
     );
     assert!(row.contains(StatusView::EXIT_HINT), "\n{row}");
@@ -1806,13 +1916,13 @@ fn views_status_strip_sheds_fields_in_the_same_order_when_the_exit_key_is_reboun
 
     let wide = strip(&view, 200);
     assert!(wide.contains(&branch), "[{wide}]");
-    assert!(wide.contains("↑2,955 ↓750 ⚡45"), "[{wide}]");
+    assert!(wide.contains("in 2,955 · out 750 · cache 45"), "[{wide}]");
     assert!(wide.trim_end().ends_with(hint), "[{wide}]");
 
     // 76: the branch first, exactly as with the shipped spelling.
     let at_76 = strip(&view, 76);
     assert!(!at_76.contains(&branch), "[{at_76}]");
-    assert!(at_76.contains("↑2,955 ↓750 ⚡45"), "[{at_76}]");
+    assert!(at_76.contains("in 2,955 · out 750 · cache 45"), "[{at_76}]");
     assert!(at_76.contains(hint), "[{at_76}]");
 
     // 40: only the exit key is left, and it is the rebound one.
@@ -1821,7 +1931,7 @@ fn views_status_strip_sheds_fields_in_the_same_order_when_the_exit_key_is_reboun
         at_40.contains(hint),
         "a field was kept at the rebound exit key's expense: [{at_40}]"
     );
-    assert!(!at_40.contains("↑2,955"), "[{at_40}]");
+    assert!(!at_40.contains("in 2,955"), "[{at_40}]");
 
     // 20: dropped whole, never truncated — a rebound key name must not be halved either.
     let at_20 = strip(&view, 20);
@@ -1993,7 +2103,8 @@ fn views_transcript_wraps_wide_glyph_prose_without_losing_any_of_it() {
             .join("");
         for fragment in [
             "帮我把",
-            "diff viewer",
+            "diff",
+            "viewer",
             "接上文件树",
             "一下",
             "wrap",
@@ -3459,7 +3570,7 @@ fn views_transcript_cache_stays_inside_its_row_bound() {
     let messages = MAX_CACHED_ROWS / rows_each + 8;
     for index in 0..messages {
         let body = (0..rows_each)
-            .map(|row| format!("line {row} of prompt {index}"))
+            .map(|row| format!("- line {row} of prompt {index}"))
             .collect::<Vec<_>>()
             .join("\n");
         view.transcript_mut().push(Message::user(body));

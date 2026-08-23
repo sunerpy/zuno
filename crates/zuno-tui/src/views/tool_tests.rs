@@ -442,6 +442,7 @@ fn tool_status_style_paints_from_the_palette_and_separates_the_terminal_states()
     let context = ViewContext::defaults();
     let generic = zuno_tool::ToolUiIntent::Generic;
     let error = status_style(ToolStatus::Error, generic, &context);
+    let blocked = status_style(ToolStatus::Blocked, generic, &context);
     let completed = status_style(ToolStatus::Completed, generic, &context);
     let delegated = status_style(
         ToolStatus::Completed,
@@ -462,6 +463,15 @@ fn tool_status_style_paints_from_the_palette_and_separates_the_terminal_states()
         error.fg,
         Some(ratatui::style::Color::from(context.palette().error)),
         "the error style did not come from the palette's error colour"
+    );
+    assert_eq!(
+        blocked.fg,
+        Some(ratatui::style::Color::from(context.palette().warning)),
+        "a call refused before execution must use the warning colour"
+    );
+    assert_ne!(
+        blocked.fg, error.fg,
+        "a blocked call still looks like a command that ran and failed"
     );
     assert_eq!(
         running.fg,

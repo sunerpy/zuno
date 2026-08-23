@@ -14,8 +14,7 @@
 //! `designer` is dropped (this is not a UI-first tool, and its 0.7 temperature was
 //! the only thing the roster spent taste on); `council`/`councillor` are dropped —
 //! slim's own note prices multi-model consensus at "3x slower … 3x or more cost"
-//! (`src/agents/orchestrator.ts:95`) and the advisor's `<alternatives>` section
-//! covers the reason it existed.
+//! (`src/agents/orchestrator.ts:95`) and the advisor owns explicit alternatives.
 //!
 //! # Why every agent carries a *negative* boundary
 //!
@@ -28,14 +27,13 @@
 //! a required field rather than a paragraph convention, so
 //! [`tests`] can assert its presence instead of a reviewer noticing its absence.
 //!
-//! # Why the output contract is data, not prose
+//! # Natural output by default
 //!
-//! Slim's envelopes are literal text inside each prompt
-//! (`src/agents/explorer.ts:20-28`, `src/agents/fixer.ts:23-34`). A Rust harness
-//! has to *parse* the child's reply to route it, so the tags cannot live only in
-//! prose that a prompt edit can silently rename. [`Envelope`] holds the tags and
-//! [`Envelope::render`] derives the prompt text from them — one source of truth,
-//! and a parser built later reads the same constant the prompt was rendered from.
+//! User-facing agents answer in ordinary Markdown. Earlier drafts required XML-like
+//! envelopes even though no runtime consumer parsed them; that added tokens and leaked
+//! orchestration markup into final answers. Structured output belongs only where a typed
+//! consumer exists. The three engine internals remain prompt-owned because their raw
+//! completions are consumed directly.
 //!
 //! # No model ids
 //!
@@ -216,83 +214,11 @@ impl Boundary {
     }
 }
 
-/// One tagged section of an output envelope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Section {
-    /// The XML-ish tag the harness matches on.
-    pub tag: &'static str,
-    /// What belongs inside it, shown to the model as the section's body.
-    pub hint: &'static str,
-    /// Whether a reply missing this section is malformed.
-    pub required: bool,
-}
-
-/// The structured reply shape the harness parses.
-///
-/// Both the prompt text and the parser derive from this, so a renamed tag cannot
-/// desynchronise them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Envelope {
-    /// The outermost tag.
-    pub root: &'static str,
-    /// Inner sections, in the order the model should emit them.
-    pub sections: &'static [Section],
-}
-
-impl Envelope {
-    /// Every tag, root first — what a parser needs to recognise a reply.
-    #[must_use]
-    pub fn tags(&self) -> Vec<&'static str> {
-        let mut tags = vec![self.root];
-        tags.extend(self.sections.iter().map(|section| section.tag));
-        tags
-    }
-
-    /// The sections a well-formed reply must contain.
-    #[must_use]
-    pub fn required_tags(&self) -> Vec<&'static str> {
-        self.sections
-            .iter()
-            .filter(|section| section.required)
-            .map(|section| section.tag)
-            .collect()
-    }
-
-    /// The prompt block, in the shape slim writes by hand at
-    /// `.omo/refs/omo-slim/src/agents/explorer.ts:20-28`.
-    #[must_use]
-    pub fn render(&self) -> String {
-        let mut out = String::from("**Output Format**:\n<");
-        out.push_str(self.root);
-        out.push_str(">\n");
-        for section in self.sections {
-            out.push('<');
-            out.push_str(section.tag);
-            out.push_str(">\n");
-            out.push_str(section.hint);
-            if !section.required {
-                out.push_str(" (omit when empty)");
-            }
-            out.push_str("\n</");
-            out.push_str(section.tag);
-            out.push_str(">\n");
-        }
-        out.push_str("</");
-        out.push_str(self.root);
-        out.push_str(">\n");
-        out
-    }
-}
-
-/// What the agent's reply is for, or why it has no envelope.
-///
-/// The second variant is the internals' exemption, and like [`Boundary`] it is
-/// checked rather than trusted: [`tests`] only accepts it for [`Role::Internal`]
-/// entries, and requires it to name the upstream prompt that owns the format.
+/// What consumes an agent's reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputContract {
-    /// A tagged envelope this crate defines and a later todo parses.
-    Envelope(Envelope),
+    /// User-facing Markdown with no harness-only wrapper.
+    Natural,
     /// The engine consumes the raw completion — a title string, a compacted
     /// transcript, a session summary. Wrapping those in tags would mean stripping
     /// the tags again at the only call site.
@@ -300,17 +226,6 @@ pub enum OutputContract {
         /// The upstream prompt constant that specifies the format instead.
         prompt: &'static str,
     },
-}
-
-impl OutputContract {
-    /// The envelope, when the agent has one.
-    #[must_use]
-    pub const fn envelope(&self) -> Option<&Envelope> {
-        match self {
-            Self::Envelope(envelope) => Some(envelope),
-            Self::EnginePrompt { .. } => None,
-        }
-    }
 }
 
 /// A deny-by-default permission set.
@@ -447,7 +362,7 @@ impl Agent {
             self.boundary.render(),
         ];
         match self.output {
-            OutputContract::Envelope(envelope) => strings.push(envelope.render()),
+            OutputContract::Natural => {}
             OutputContract::EnginePrompt { prompt } => strings.push(prompt.to_owned()),
         }
         strings.push(self.summary_line());
@@ -457,17 +372,10 @@ impl Agent {
     /// The model-visible policy derived from the roster.
     ///
     /// The catalog owns the base role prompt. This block adds the negative
-    /// delegation boundary and the output format from the same data the `task`
-    /// validator reads, so documentation, validation, and actual child behavior
-    /// cannot silently disagree.
+    /// delegation boundary from the same data the `task` validator reads.
     #[must_use]
     pub fn prompt_policy(&self) -> String {
-        let mut policy = self.boundary.render();
-        if let OutputContract::Envelope(envelope) = self.output {
-            policy.push_str("\n\n");
-            policy.push_str(&envelope.render());
-        }
-        policy
+        self.boundary.render()
     }
 }
 
@@ -487,158 +395,6 @@ pub const LEAN_NAMES: [&str; 7] = [
 /// The visible catalog entries are Zuno-native and align with this roster. `plan`
 /// remains a primary mode rather than a delegation target; see [`internals`].
 pub const INTERNAL_NAMES: [&str; 3] = ["compaction", "title", "summary"];
-
-const ORCHESTRATOR_ENVELOPE: Envelope = Envelope {
-    root: "orchestration",
-    sections: &[
-        Section {
-            tag: "outcome",
-            hint: "What is now true that was not true before, in the user's terms.",
-            required: true,
-        },
-        Section {
-            tag: "delegation",
-            hint: "One line per child: agent, what it was asked for, what came back.",
-            required: true,
-        },
-        Section {
-            tag: "next",
-            hint: "Work deliberately left undone, and why.",
-            required: false,
-        },
-    ],
-};
-
-const DEEP_ENVELOPE: Envelope = Envelope {
-    root: "deep-work",
-    sections: &[
-        Section {
-            tag: "assessment",
-            hint: "The established current behavior and the owning implementation.",
-            required: true,
-        },
-        Section {
-            tag: "changes",
-            hint: "One line per material file or module changed.",
-            required: true,
-        },
-        Section {
-            tag: "verification",
-            hint: "Commands run, outcomes, and important recovery paths exercised.",
-            required: true,
-        },
-        Section {
-            tag: "residual",
-            hint: "Unverified assumptions or remaining risk.",
-            required: false,
-        },
-    ],
-};
-
-const EXPLORER_ENVELOPE: Envelope = Envelope {
-    root: "results",
-    sections: &[
-        Section {
-            tag: "files",
-            hint: "One line per hit: path, line number, and what is there.",
-            required: true,
-        },
-        Section {
-            tag: "answer",
-            hint: "The question, answered in prose, without restating the hits.",
-            required: true,
-        },
-    ],
-};
-
-const LIBRARIAN_ENVELOPE: Envelope = Envelope {
-    root: "research",
-    sections: &[
-        Section {
-            tag: "sources",
-            hint: "One line per source: what it is, and how current it is.",
-            required: true,
-        },
-        Section {
-            tag: "findings",
-            hint: "What the sources actually say, quoted where the wording matters.",
-            required: true,
-        },
-        Section {
-            tag: "caveats",
-            hint: "Version skew, contradictions between sources, gaps left open.",
-            required: false,
-        },
-    ],
-};
-
-const ADVISOR_ENVELOPE: Envelope = Envelope {
-    root: "advice",
-    sections: &[
-        Section {
-            tag: "assessment",
-            hint: "What the code or design does, stated back before it is judged.",
-            required: true,
-        },
-        Section {
-            tag: "risks",
-            hint: "Concrete failure modes, each with the condition that triggers it.",
-            required: true,
-        },
-        Section {
-            tag: "alternatives",
-            hint: "At least two options, each with what it costs.",
-            required: true,
-        },
-        Section {
-            tag: "recommendation",
-            hint: "One option, chosen, with the trade-off accepted by choosing it.",
-            required: true,
-        },
-    ],
-};
-
-const WORKER_ENVELOPE: Envelope = Envelope {
-    root: "implementation",
-    sections: &[
-        Section {
-            tag: "summary",
-            hint: "What was implemented, in one paragraph.",
-            required: true,
-        },
-        Section {
-            tag: "changes",
-            hint: "One line per file: path, and what changed in it.",
-            required: true,
-        },
-        Section {
-            tag: "verification",
-            hint: "Commands run and their result. \"Not run\" is an answer; silence is not.",
-            required: true,
-        },
-    ],
-};
-
-const LOOKER_ENVELOPE: Envelope = Envelope {
-    root: "observation",
-    sections: &[
-        Section {
-            tag: "media",
-            hint: "One line per file examined: path, and what kind of artifact it is.",
-            required: true,
-        },
-        Section {
-            tag: "extracted",
-            hint: "Text, labels, numbers, and structure read off the artifact verbatim.",
-            required: true,
-        },
-        Section {
-            tag: "answer",
-            hint: "What the caller asked about the artifact, answered.",
-            required: true,
-        },
-    ],
-};
 
 /// Tools denied by name to a reader confined to this repository.
 ///
@@ -680,7 +436,7 @@ pub const BUILD: Agent = Agent {
          through.",
     ),
     temperature: 0.1,
-    output: OutputContract::Envelope(ORCHESTRATOR_ENVELOPE),
+    output: OutputContract::Natural,
     permissions: Permissions {
         denied: &["plan_exit"],
         allowed: &[
@@ -721,7 +477,7 @@ pub const DEEP: Agent = Agent {
          decisions from the primary session • the work can be verified in one small edit.",
     ),
     temperature: 0.1,
-    output: OutputContract::Envelope(DEEP_ENVELOPE),
+    output: OutputContract::Natural,
     permissions: Permissions {
         denied: &["task", "question", "plan_exit"],
         allowed: &[
@@ -760,7 +516,7 @@ pub const EXPLORER: Agent = Agent {
          external library rather than this tree.",
     ),
     temperature: 0.1,
-    output: OutputContract::Envelope(EXPLORER_ENVELOPE),
+    output: OutputContract::Natural,
     permissions: Permissions {
         denied: READ_ONLY_DENIED,
         allowed: READ_ONLY_ALLOWED,
@@ -787,7 +543,7 @@ pub const LIBRARIAN: Agent = Agent {
          conversation • the question is about this repository's own code.",
     ),
     temperature: 0.1,
-    output: OutputContract::Envelope(LIBRARIAN_ENVELOPE),
+    output: OutputContract::Natural,
     permissions: Permissions {
         denied: &[
             "bash",
@@ -832,7 +588,7 @@ pub const ADVISOR: Agent = Agent {
     // enough divergence to surface a second option and well short of the 0.7 slim
     // spent on prose taste, where review starts inventing facts.
     temperature: 0.4,
-    output: OutputContract::Envelope(ADVISOR_ENVELOPE),
+    output: OutputContract::Natural,
     permissions: Permissions {
         denied: READ_ONLY_DENIED,
         allowed: READ_ONLY_ALLOWED,
@@ -860,7 +616,7 @@ pub const WORKER: Agent = Agent {
          finish.",
     ),
     temperature: 0.1,
-    output: OutputContract::Envelope(WORKER_ENVELOPE),
+    output: OutputContract::Natural,
     permissions: Permissions {
         // `task` is the one capability a worker must not have: without it the lane
         // is bounded by construction, and with it the depth limit becomes the only
@@ -905,7 +661,7 @@ pub const LOOKER: Agent = Agent {
     // freedom, and at 0.1 descriptions collapse into clipped, templated phrases
     // that lose the detail the caller delegated for.
     temperature: 0.2,
-    output: OutputContract::Envelope(LOOKER_ENVELOPE),
+    output: OutputContract::Natural,
     permissions: Permissions {
         denied: READ_ONLY_DENIED,
         allowed: READ_ONLY_ALLOWED,

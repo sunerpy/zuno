@@ -17,6 +17,7 @@
     "myopenai": {
       "name": "My OpenAI gateway",
       "transport": "openai",
+      "surface": "responses",
       "env": ["MYOPENAI_API_KEY"],
       "options": {
         "baseURL": "https://gateway.example.com/v1"

@@ -510,7 +510,10 @@ impl<'palette> Builder<'palette> {
                 } else {
                     self.palette.markdown_list_item
                 };
-                spans.push(Span::styled(marker.to_owned(), self.tinted(color)));
+                spans.push(Span::styled(
+                    marker.to_owned(),
+                    self.tinted(color).add_modifier(Modifier::BOLD),
+                ));
             }
             (_, Some(marker)) => {
                 spans.push(Span::styled(" ".repeat(display_width(marker)), self.base()));
@@ -854,7 +857,7 @@ impl<'palette> Builder<'palette> {
         }
 
         let widths = self.table_widths(&table, columns, available);
-        let separator_style = self.tinted(self.palette.border_subtle);
+        let separator_style = self.tinted(self.palette.border_active);
 
         let mut first = true;
         if !table.head.is_empty() {
@@ -927,7 +930,17 @@ impl<'palette> Builder<'palette> {
 
     /// One row of cells padded to `widths` and joined with ` │ `.
     fn grid_row(&self, cells: &[Cell], widths: &[usize], head: bool) -> Row {
-        let separator_style = self.tinted(self.palette.border_subtle);
+        let separator_style = if head {
+            Style::new()
+                .fg(self.palette.border_active.into())
+                .bg(self.palette.background_element.into())
+        } else {
+            self.tinted(self.palette.border_subtle)
+        };
+        let head_style = Style::new()
+            .fg(self.palette.markdown_heading.into())
+            .bg(self.palette.background_element.into())
+            .add_modifier(Modifier::BOLD);
         let mut out = Vec::new();
         for (index, width) in widths.iter().enumerate() {
             if index > 0 {
@@ -942,7 +955,13 @@ impl<'palette> Builder<'palette> {
                 .into_iter()
                 .map(|span| {
                     if head {
-                        Span::styled(span.content, span.style.add_modifier(Modifier::BOLD))
+                        Span::styled(
+                            span.content,
+                            span.style
+                                .fg(self.palette.markdown_heading.into())
+                                .bg(self.palette.background_element.into())
+                                .add_modifier(Modifier::BOLD),
+                        )
                     } else {
                         span
                     }
@@ -951,7 +970,10 @@ impl<'palette> Builder<'palette> {
             let mut spans = truncate_row(spans, *width);
             let used = row_width(&spans);
             if used < *width {
-                spans.push(Span::styled(" ".repeat(width - used), self.base()));
+                spans.push(Span::styled(
+                    " ".repeat(width - used),
+                    if head { head_style } else { self.base() },
+                ));
             }
             out.extend(spans);
         }

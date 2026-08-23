@@ -971,8 +971,8 @@ fn markdown_leaves_the_left_rule_and_the_role_header_alone() {
         "a two-step turn printed its header twice:\n{out}"
     );
     assert!(
-        out.contains("**not** reinterpreted"),
-        "the user's own asterisks were rewritten, so the surface edited their input:\n{out}"
+        out.contains("not reinterpreted") && !out.contains("**not**"),
+        "the user's CommonMark was not rendered consistently with the assistant:\n{out}"
     );
     // `Role::marker` draws the user's turn with `▌` and the assistant's with `│`, and the
     // rule runs down every row of a turn rather than only its header.

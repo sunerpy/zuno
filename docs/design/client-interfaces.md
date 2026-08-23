@@ -78,11 +78,18 @@ The TUI favors dense, keyboard-first operation:
   images, and delegations. Running work, approvals, failures, and important
   results remain visible. `Ctrl+T` opens the complete scrollable durable
   transcript and preserves manual scroll position; `Alt+T` changes reasoning
-  effort. Thinking remains folded by default and uses muted styling when
-  expanded;
+  effort. Each thinking block remains folded by default, uses muted styling when
+  expanded, and owns an independent disclosure target: clicking its header opens
+  the complete persisted body without changing sibling blocks. `/thinking`
+  remains the keyboard-wide fallback;
+- user and assistant prose use the same CommonMark renderer, including GFM
+  tables, lists, headings, code, quotes, and links. Rendering never changes the
+  durable source text;
 - per-call tool disclosure in the complete transcript, with subagent rendering
   selected by persisted `ToolUiIntent::Subagent` rather than hard-coded tool
-  names;
+  names. A call refused before execution is projected as `blocked` with warning
+  styling and a durable block kind; only a call that actually ran and failed is
+  projected as an error;
 - one subagent view for native child sessions and configured Codex or Claude Code
   product agents. It shows product/target, objective, status, elapsed time,
   session/run, job, report delivery, result, and safety diagnostics without
@@ -104,7 +111,10 @@ The TUI favors dense, keyboard-first operation:
   so `/session` sees the new row without remounting;
 - cumulative token and context usage comes from the durable `SessionUsage`
   projection on resume. A history whose provider accounting cannot be recovered
-  displays an unavailable marker rather than a fabricated zero;
+  displays an unavailable marker rather than a fabricated zero. Labels keep
+  cumulative session totals separate from the latest whole prompt: the sidebar
+  shows `session total`, input/output/cache buckets, `current prompt / model
+  window`, and a decimal percentage of that model window;
 - no empty LSP status or setup prompt; the sidebar adds LSP only for configured
   services or real diagnostics;
 - `/session` lists active root sessions from the current durable database and
@@ -113,6 +123,9 @@ The TUI favors dense, keyboard-first operation:
   replay, permissions, cancellation ownership, LSP/MCP workers, and snapshot
   history. The physical terminal activation remains mounted throughout, so a
   switch never leaves and re-enters the alternate screen;
+- `/new` performs the same in-process remount to a fresh prepared identity. The
+  command itself creates no row; the first model-bound prompt materializes
+  exactly one new session through the normal durable-input transaction;
 - the same session list owns row actions: `Ctrl+R` opens a pre-filled rename
   prompt, while `Ctrl+D` must be pressed twice on the same row before deletion.
   Both actions are revalidated by the host and use the transactional session

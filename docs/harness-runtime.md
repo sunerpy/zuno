@@ -136,6 +136,13 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 
 `compaction`, `title`, and `summary` are hidden engine agents. A user-defined agent may be declared under `agent.<name>` or as Markdown under `.zuno/agent/**/*.md`; it enters the same resolution, permission, prompt, and provenance pipeline as a native agent.
 
+User-facing agents answer in natural Markdown. Zuno does not require XML-like
+reply envelopes unless a typed runtime consumer exists for that exact structure.
+The built-in prompts emphasize intent matching, deliberate tool use, scoped
+changes, proportional verification, and concise outcome-first reporting. In
+particular, self-contained reasoning or writing does not justify a shell call or
+a throwaway file.
+
 ## Prompt provenance
 
 Prompt assembly is ordered data, not string concatenation spread across the CLI. Every section has a stable identifier, source, exact content, and SHA-256 digest. The composition root currently orders:
@@ -201,6 +208,8 @@ process-local identity is stable across model, agent, MCP, and theme changes, bu
 browsing, or leaving the welcome screen creates no durable session. The first model-bound
 submission inserts the session and its user message in one transaction, then emits
 `session.materialized` for clients. Existing and continued sessions still hydrate immediately.
+The TUI `/new` command selects another prepared `SessionChoice::New` in the same
+terminal activation; it does not bypass this lazy materialization boundary.
 
 Drivers promote inputs in FIFO order. Promotion is transactional and can target one input identifier for a live soft interrupt. A malformed input records a session error and does not strand later queue entries.
 
@@ -271,6 +280,14 @@ grant or automatic approval and offers no "always" choice. TUI `--auto` yields t
 the human broker; headless surfaces deny the call. Approval covers the same
 tool's internal resource checks for that invocation only, while a later explicit
 resource deny still wins.
+
+Refusal is a typed lifecycle outcome rather than an execution failure.
+Malformed or unsafe arguments, unavailable tools, and permission denials emit
+`ToolDispatchBlocked` with `invalid_arguments`, `unavailable`, or `denied`
+before the model-visible error result is appended. Durable tool state retains
+`outcome: "blocked"` and `blockKind`, so clients can use warning treatment and
+state that the requested effect never ran. Process, transport, and tool
+implementation failures remain error outcomes.
 
 Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, session search, job status, LSP inspection, goal status, and web search/fetch.
 

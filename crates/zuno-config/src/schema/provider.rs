@@ -31,6 +31,9 @@ pub struct ProviderConfig {
     /// Native request transport implemented by Zuno.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<ProviderTransport>,
+    /// Default request surface for this provider's models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<ProviderSurface>,
     /// Models to keep, to the exclusion of the rest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub whitelist: Option<Vec<String>>,
@@ -86,6 +89,22 @@ impl ProviderTransport {
             Self::Openrouter => "openrouter",
         }
     }
+}
+
+/// Native API surface selected independently from the wire transport.
+///
+/// `transport: "openai"` says which protocol family Zuno implements. `surface`
+/// selects the concrete endpoint shape within that family, so a custom gateway can
+/// explicitly use Responses instead of falling back to Chat Completions.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderSurface {
+    /// OpenAI Chat Completions.
+    Chat,
+    /// OpenAI Responses.
+    Responses,
+    /// Anthropic Messages.
+    Messages,
 }
 
 impl std::fmt::Display for ProviderTransport {
@@ -253,6 +272,9 @@ pub struct ModelProvider {
     /// Native request transport implemented by Zuno.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<ProviderTransport>,
+    /// Request surface override for this model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surface: Option<ProviderSurface>,
     /// API endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,

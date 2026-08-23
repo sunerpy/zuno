@@ -95,6 +95,7 @@ Every field is optional.
   "provider": {
     "myopenai": {
       "transport": "openai",
+      "surface": "responses",
       "env": ["MYOPENAI_API_KEY"],
       "options": { "baseURL": "https://gateway.example.com/v1" },
       "models": {

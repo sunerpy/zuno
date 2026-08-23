@@ -464,6 +464,7 @@ pub fn status_style(
     use crate::views::message::ToolStatus;
     match status {
         ToolStatus::Error => context.error(),
+        ToolStatus::Blocked => context.warning(),
         ToolStatus::Completed if intent == zuno_tool::ToolUiIntent::Subagent => context.secondary(),
         ToolStatus::Completed => context.accent(),
         // Muted while in flight: an unfinished call has not earned the reader's attention

@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use zuno_db::message::{MessageRecord, MessageRole, MessageWithParts, PartKind, PartRecord};
 use zuno_engine::r#loop::{
-    ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, TurnEvent, project_history,
+    ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, ToolBlockKind, TurnEvent, project_history,
     project_history_owned,
 };
 use zuno_llm::event::{
@@ -181,6 +181,10 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
         payload("AssistantCheckpointed", size_of::<(u32, String, bool)>()),
         payload("ToolDispatchStarted", size_of::<(u32, String, String)>()),
         payload(
+            "ToolDispatchBlocked",
+            size_of::<(u32, String, ToolBlockKind)>(),
+        ),
+        payload(
             "ToolDispatchCompleted",
             size_of::<(
                 u32,
@@ -214,6 +218,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::Provider { .. } => "Provider",
         TurnEvent::AssistantCheckpointed { .. } => "AssistantCheckpointed",
         TurnEvent::ToolDispatchStarted { .. } => "ToolDispatchStarted",
+        TurnEvent::ToolDispatchBlocked { .. } => "ToolDispatchBlocked",
         TurnEvent::ToolDispatchCompleted { .. } => "ToolDispatchCompleted",
         TurnEvent::ToolResultAppended { .. } => "ToolResultAppended",
         TurnEvent::StepCompleted { .. } => "StepCompleted",

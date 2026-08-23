@@ -202,6 +202,14 @@ fn tool(data: &serde_json::Map<String, Value>) -> Option<MessagePart> {
         .and_then(Value::as_str)
     {
         Some("completed") => ToolStatus::Completed,
+        Some("error")
+            if state
+                .and_then(|state| state.get("outcome"))
+                .and_then(Value::as_str)
+                == Some("blocked") =>
+        {
+            ToolStatus::Blocked
+        }
         Some("error") => ToolStatus::Error,
         Some("running") => ToolStatus::Running,
         // `pending`, an unknown status, and a missing `state` all mean the same thing on

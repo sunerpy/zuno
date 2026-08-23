@@ -160,6 +160,17 @@ pub enum TurnEvent {
         name: String,
         ui_intent: ToolUiIntent,
     },
+    /// A call that was refused before its requested effect could run.
+    ///
+    /// Kept separate from [`Self::ToolDispatchCompleted`] because the latter is the
+    /// model-visible result append and still carries `is_error` for provider protocol
+    /// semantics. A blocked call is not an execution failure: clients render it as a
+    /// warning and can say that nothing ran, while a real failure remains an error.
+    ToolDispatchBlocked {
+        step: u32,
+        call_id: String,
+        kind: ToolBlockKind,
+    },
     ToolDispatchCompleted {
         step: u32,
         call_id: String,
@@ -205,6 +216,29 @@ pub enum TurnEvent {
         assistant_message_id: Option<String>,
         steps: u32,
     },
+}
+
+/// Why a tool call was stopped before its requested effect ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolBlockKind {
+    /// A permission rule, plugin, or human refused the call.
+    Denied,
+    /// The model supplied malformed or unsafe arguments.
+    InvalidArguments,
+    /// No callable implementation was available under the requested name.
+    Unavailable,
+}
+
+impl ToolBlockKind {
+    /// Stable wire/storage spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::InvalidArguments => "invalid_arguments",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 /// Frames read after a message finishes, for the bookkeeping that follows it.
@@ -531,6 +565,8 @@ pub struct ToolDispatchResult {
     pub output: ToolOutput,
     pub is_error: bool,
     pub recovery: Option<ToolFailureRecovery>,
+    /// Present only when execution was refused before the requested effect ran.
+    pub blocked: Option<ToolBlockKind>,
 }
 
 impl ToolDispatchResult {
@@ -540,6 +576,7 @@ impl ToolDispatchResult {
             output,
             is_error: false,
             recovery: None,
+            blocked: None,
         }
     }
 
@@ -549,6 +586,17 @@ impl ToolDispatchResult {
             output,
             is_error: true,
             recovery: None,
+            blocked: None,
+        }
+    }
+
+    #[must_use]
+    pub fn blocked(output: ToolOutput, kind: ToolBlockKind) -> Self {
+        Self {
+            output,
+            is_error: true,
+            recovery: None,
+            blocked: Some(kind),
         }
     }
 
@@ -558,6 +606,7 @@ impl ToolDispatchResult {
             output,
             is_error: true,
             recovery: Some(recovery),
+            blocked: None,
         }
     }
 }
@@ -1438,6 +1487,15 @@ pub async fn run_turn(
                         },
                         &dispatch,
                     )?;
+                    if let Some(kind) = dispatch.blocked {
+                        events
+                            .send(TurnEvent::ToolDispatchBlocked {
+                                step,
+                                call_id: call.id.clone(),
+                                kind,
+                            })
+                            .await?;
+                    }
                     events
                         .send(TurnEvent::ToolDispatchCompleted {
                             step,
@@ -2678,6 +2736,10 @@ fn persist_tool_result(
         "attachments": dispatch.output.attachments,
         "time": { "start": now_millis(), "end": now_millis() }
     });
+    if let Some(kind) = dispatch.blocked {
+        state["outcome"] = Value::String("blocked".to_owned());
+        state["blockKind"] = Value::String(kind.as_str().to_owned());
+    }
     if dispatch.is_error {
         state["error"] = Value::String(dispatch.output.output.clone());
     } else {

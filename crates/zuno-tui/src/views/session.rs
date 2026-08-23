@@ -220,8 +220,10 @@ const PROMPT_MAX_SHARE: u16 = 3;
 /// you type into", because a fill that runs the frame's whole width is a *band* rather than a
 /// box — it has no left or right edge for the eye to close. That is what was reported as an
 /// input box indistinguishable from its surroundings, and no colour choice fixes it while the
-/// region is edge to edge. [`COMPOSER_MAX_COLS`] gives the composer two margins, and
-/// [`SessionScreen::composer_rules`] paints the two edges into them.
+/// region is edge to edge. [`WELCOME_COMPOSER_MAX_COLS`] keeps the empty-session
+/// composer readable on a very wide terminal, while an active conversation still
+/// uses its whole content column. [`SessionScreen::composer_rules`] paints the two
+/// edges into the space around either form.
 ///
 /// A fill rather than the border this constant's note rejects, because the objection to the
 /// border was that it costs two rows of a two-row floor. A background costs none.
@@ -385,17 +387,32 @@ const fn content_bounds(area: Rect, sidebar: bool) -> Rect {
 const COMPOSER_LEFT_RULE: &str = "▌";
 const COMPOSER_RIGHT_RULE: &str = "▐";
 
-/// Give the composer the left content column with one column of breathing room per side.
+/// Maximum input width on the welcome surface.
+///
+/// The empty screen is a centred, bounded composition rather than a transcript, so a prompt
+/// spanning two hundred columns reads as a page-wide divider instead of an input. Ninety-six
+/// columns hold ordinary prompts and the agent/model footer without making the eye travel across
+/// the terminal. Once a conversation starts the cap is removed: long edits should use all of the
+/// left content column, including on frames with a sidebar.
+const WELCOME_COMPOSER_MAX_COLS: u16 = 96;
+
+/// Give the composer one column of breathing room per side and optionally cap the welcome form.
 ///
 /// [`Component::render`] applies [`content_bounds`] before its vertical split, so `bounds`
-/// cannot include sidebar or gap columns. Narrow panes keep every column; otherwise the two
-/// outside columns carry the focus rules without imposing an arbitrary prose-width cap on user
-/// input.
-const fn composer_region(bounds: Rect) -> Rect {
-    let margin = if bounds.width > 2 { 1 } else { 0 };
+/// cannot include sidebar or gap columns. Narrow panes keep every usable column. Wide welcome
+/// panes centre a bounded composer; active conversations do not impose a prose-width cap.
+const fn composer_region(bounds: Rect, welcome: bool) -> Rect {
+    let margin: u16 = if bounds.width > 2 { 1 } else { 0 };
+    let available = bounds.width.saturating_sub(margin.saturating_mul(2));
+    let width = if welcome && available > WELCOME_COMPOSER_MAX_COLS {
+        WELCOME_COMPOSER_MAX_COLS
+    } else {
+        available
+    };
+    let centring = available.saturating_sub(width) / 2;
     Rect {
-        x: bounds.x + margin,
-        width: bounds.width.saturating_sub(margin.saturating_mul(2)),
+        x: bounds.x.saturating_add(margin).saturating_add(centring),
+        width,
         ..bounds
     }
 }
@@ -656,6 +673,8 @@ pub enum Selection {
     Agent(String),
     /// A different session to continue in.
     Session(String),
+    /// A fresh lazily materialized session in the current directory.
+    NewSession,
     /// Rename a session after its prompt has supplied a non-empty title.
     SessionRename { id: String, title: String },
     /// Delete a session after the list has confirmed the destructive action.
@@ -1635,7 +1654,7 @@ impl Component for SessionScreen {
         ambient.title = title;
         ambient.tokens = self.transcript.transcript().tokens();
         ambient.usage_state = self.transcript.transcript().usage_state();
-        ambient.context_used = self.transcript.transcript().context_used();
+        ambient.context = self.transcript.transcript().context_window();
         let loaded_skills = self.transcript.loaded_skills();
         for skill in &mut ambient.skills {
             skill.loaded = loaded_skills.contains(&skill.name);
@@ -1678,7 +1697,7 @@ impl Component for SessionScreen {
         // colour seam the centring band's fill exists to avoid, reintroduced sideways.
         crate::views::fill(frame.buffer_mut(), prompt, self.context.surface());
         crate::views::fill(frame.buffer_mut(), status, self.context.surface());
-        let composer = composer_region(prompt);
+        let composer = composer_region(prompt, empty);
         // The whole band is painted next, so the spacer row and the right inset carry the
         // prompt's own background rather than whatever the previous frame left there. `element`
         // rather than `text`: they differ only in background, and `text`'s is the surface the
@@ -1688,7 +1707,7 @@ impl Component for SessionScreen {
         // Narrowed to the same region as the band it describes, and by the same call: a
         // full-width strip under a centred box would put the composer's own footer on a
         // different axis from the composer.
-        self.status.render(frame, composer_region(status));
+        self.status.render(frame, composer_region(status, empty));
         self.composer_rules(frame, prompt.union(status), composer);
         self.render_info(frame, info);
         let (gutter, buffer) = prompt_frame(composer);
@@ -1843,8 +1862,13 @@ impl SessionScreen {
         let ambient = self.sidebar.ambient();
         let directory = ambient.directory.clone().unwrap_or_default();
         let mut trailing = Vec::new();
-        if let Some(used) = ambient.context_used {
-            trailing.push(format!("{used}% context"));
+        if let Some(context) = ambient.context {
+            trailing.push(format!(
+                "ctx {}/{} ({:.1}%)",
+                crate::views::ambient::compact(context.prompt_tokens),
+                crate::views::ambient::compact(context.limit),
+                context.percent()
+            ));
         }
         if let Some(key) = crate::views::pressable_label("command_list", &self.context) {
             trailing.push(format!("{key} commands"));
@@ -2212,6 +2236,9 @@ impl SessionScreen {
             self.transcript.toggle_tool(&call_id);
             return EventResult::REDRAW;
         }
+        if self.transcript.toggle_reasoning_at(column, row) {
+            return EventResult::REDRAW;
+        }
         // The panel first so its heading cells remain owned by the disclosure controls even
         // if a future layout puts another clickable surface beside or beneath them.
         if let Some(dialog) = self.message_actions(column, row) {
@@ -2407,6 +2434,11 @@ impl SessionScreen {
         let half = isize::try_from(viewport / 2).unwrap_or(1).max(1);
         let page = isize::try_from(viewport).unwrap_or(1);
         match action.name {
+            "session_new" => {
+                let (notice, level) = self.commit_selection(Selection::NewSession);
+                self.toasts.push(Toast::new(level, notice));
+                EventResult::REDRAW
+            }
             "display_thinking" => {
                 self.transcript.toggle_thinking();
                 EventResult::REDRAW
@@ -2470,7 +2502,7 @@ impl SessionScreen {
             "agent_cycle_reverse" => self.cycle_agent(-1),
             "variant_cycle" => self.cycle_effort(1),
             "messages_transcript" => self.toggle_transcript(),
-            "session_list" => self.request(self.session_picker()),
+            "session_list" => self.request(Some(self.session_picker())),
             // Two statements because opening the theme picker also records the theme to
             // put back on escape, which needs `&mut self` while `request` does too.
             "theme_list" => {
@@ -2531,11 +2563,12 @@ impl SessionScreen {
         self.handle_action(definition, &event)
     }
 
-    /// Ask the host to open `dialog`, or say why it cannot be opened.
+    /// Ask the host to open `dialog`, or report why it cannot be opened.
     ///
     /// A picker with nothing in it is the failure mode that reads as a broken key: the
     /// dialog opens, says `no matches`, and the user cannot tell an empty catalog from
-    /// a surface that did not load. Saying so in the transcript keeps the two apart.
+    /// a surface that did not load. This is transient interface state, not conversation
+    /// content, so it must never enter the durable/model-visible transcript.
     fn request(&mut self, dialog: Option<Box<dyn crate::views::dialog::Dialog>>) -> EventResult {
         match dialog {
             Some(dialog) => {
@@ -2543,9 +2576,8 @@ impl SessionScreen {
                 EventResult::REDRAW
             }
             None => {
-                self.transcript
-                    .transcript_mut()
-                    .push(Message::notice("nothing to choose from here yet"));
+                self.toasts
+                    .push(Toast::info("Nothing is available in this view yet."));
                 EventResult::REDRAW
             }
         }
@@ -2580,10 +2612,7 @@ impl SessionScreen {
     /// Client hosts use this after a session-deletion remount so the refreshed list is
     /// already open on the replacement composition. Keeping construction here prevents
     /// clients from duplicating the active-row and empty-catalog rules.
-    pub fn session_picker(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
-        if self.catalog.sessions.is_empty() {
-            return None;
-        }
+    pub fn session_picker(&self) -> Box<dyn crate::views::dialog::Dialog> {
         let mut picker = crate::views::picker::session_picker(
             self.context.clone(),
             self.catalog.sessions.clone(),
@@ -2591,7 +2620,7 @@ impl SessionScreen {
         if let Some(session) = &self.catalog.session {
             picker = picker.selecting(session);
         }
-        Some(Box::new(picker))
+        Box::new(picker)
     }
 
     fn mcp_list(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
@@ -2894,6 +2923,7 @@ impl SessionScreen {
             Selection::Model(model) => format!("model set to {model} for the next turn"),
             Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
             Selection::Session(id) => format!("switching to session {id}"),
+            Selection::NewSession => String::from("starting a new session"),
             Selection::SessionRename { id, title } => {
                 format!("renaming session {id} to {title}")
             }

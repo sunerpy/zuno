@@ -19,7 +19,8 @@ use zuno_tool::{
 
 use crate::hooks::{NoopHooks, PermissionHookDecision, ToolHooks};
 use crate::r#loop::{
-    AvailableTools, DispatchRequest, PreparedToolDispatch, ToolDispatchResult, ToolDispatcher,
+    AvailableTools, DispatchRequest, PreparedToolDispatch, ToolBlockKind, ToolDispatchResult,
+    ToolDispatcher,
 };
 
 /// Executable tools plus the policy collaborators needed at the dispatch boundary.
@@ -148,20 +149,22 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         }
 
         if let Some(input_error) = &request.call.input_error {
-            return PreparedToolDispatch::ready(error_result(
+            return PreparedToolDispatch::ready(blocked_result(
                 resolved_name,
                 format!(
                     "Malformed arguments for tool `{resolved_name}`: {input_error}. Raw input: {}",
                     request.call.raw_input
                 ),
+                ToolBlockKind::InvalidArguments,
             ));
         }
 
         let definition = tool.definition();
         if let Err(error) = validate_arguments(&definition.parameters, &request.call.input) {
-            return PreparedToolDispatch::ready(error_result(
+            return PreparedToolDispatch::ready(blocked_result(
                 resolved_name,
                 format!("Invalid arguments for tool `{resolved_name}`: {error}"),
+                ToolBlockKind::InvalidArguments,
             ));
         }
 
@@ -182,9 +185,10 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             }
         };
         if plugin_permission == PermissionHookDecision::Deny {
-            return PreparedToolDispatch::ready(error_result(
+            return PreparedToolDispatch::ready(blocked_result(
                 resolved_name,
                 format!("Tool `{resolved_name}` was denied by a plugin."),
+                ToolBlockKind::Denied,
             ));
         }
         let permission = Arc::new(RulePermissionAsker::new(
@@ -558,7 +562,7 @@ fn unknown_tool_result(name: &str, available: &[String]) -> ToolDispatchResult {
         message.push_str(&format!(" Did you mean: {}?", suggestions.join(", ")));
     }
     message.push_str(&format!(" Available tools: {}.", available.join(", ")));
-    error_result(name, message)
+    blocked_result(name, message, ToolBlockKind::Unavailable)
 }
 
 fn closest_tool_names(name: &str, available: &[&str]) -> Vec<String> {
@@ -652,6 +656,17 @@ fn tool_error_result(
 ) -> ToolDispatchResult {
     let mut message = zuno_error::source::describe(error);
     if !error.is_retryable() {
+        let blocked = match error {
+            zuno_error::ToolError::Denied { .. } => Some(ToolBlockKind::Denied),
+            zuno_error::ToolError::InvalidArgs { .. } => Some(ToolBlockKind::InvalidArguments),
+            zuno_error::ToolError::NotFound { .. } => Some(ToolBlockKind::Unavailable),
+            zuno_error::ToolError::Timeout { .. }
+            | zuno_error::ToolError::Transient { .. }
+            | zuno_error::ToolError::Failed { .. } => None,
+        };
+        if let Some(kind) = blocked {
+            return blocked_result(tool, message, kind);
+        }
         return error_result(tool, message);
     }
     match replay_policy {
@@ -674,6 +689,10 @@ fn tool_error_result(
 
 fn error_result(tool: &str, message: String) -> ToolDispatchResult {
     ToolDispatchResult::error(ToolOutput::text(format!("{tool} error"), message))
+}
+
+fn blocked_result(tool: &str, message: String, kind: ToolBlockKind) -> ToolDispatchResult {
+    ToolDispatchResult::blocked(ToolOutput::text(format!("{tool} blocked"), message), kind)
 }
 
 #[cfg(test)]

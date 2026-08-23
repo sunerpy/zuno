@@ -67,6 +67,10 @@ fn models_verbose_uses_the_public_field_names_and_order() {
         .current_dir(root.path());
     isolated(&mut command, root.path());
     configure_models(&mut command);
+    command.env(
+        "ZUNO_CONFIG_CONTENT",
+        r#"{"provider":{"anyapi":{"surface":"responses"}}}"#,
+    );
     let output = command.output().expect("run verbose models");
     assert!(
         output.status.success(),
@@ -104,6 +108,10 @@ fn models_verbose_uses_the_public_field_names_and_order() {
         previous = position + key.len();
     }
     assert!(!stdout.contains("\"provider_id\""));
+    assert!(
+        stdout.contains("\"endpoint\": \"responses\""),
+        "the resolved API surface is not inspectable:\n{stdout}"
+    );
 }
 
 #[test]

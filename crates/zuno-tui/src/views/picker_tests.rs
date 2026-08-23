@@ -93,6 +93,18 @@ fn views_session_picker_renders_offscreen() {
 }
 
 #[test]
+fn views_empty_session_picker_explains_lazy_session_creation() {
+    let joined = render(session_picker(ViewContext::defaults(), Vec::new()), 72, 8).join("\n");
+    assert!(joined.contains("Sessions (0)"), "{joined}");
+    assert!(
+        joined.contains("No saved sessions yet. Send a message to create one."),
+        "{joined}"
+    );
+    assert!(joined.contains("esc close"), "{joined}");
+    assert!(!joined.contains("ctrl+d"), "{joined}");
+}
+
+#[test]
 fn views_session_picker_keeps_management_hints_visible_at_narrow_width() {
     let joined = render(session_picker(ViewContext::defaults(), sessions()), 40, 8).join("\n");
 

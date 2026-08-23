@@ -155,8 +155,8 @@ pub struct Ambient {
     pub tokens: crate::views::message::TokenUsage,
     /// Whether those token figures are durable, unavailable, or not reported yet.
     pub usage_state: crate::views::message::UsageState,
-    /// How full the context window is, when the model declares one.
-    pub context_used: Option<u64>,
+    /// Most recent prompt occupancy, kept separate from cumulative session usage.
+    pub context: Option<crate::views::message::ContextWindowUsage>,
     /// Language servers.
     pub lsp: Vec<Service>,
     /// MCP servers.
@@ -883,7 +883,7 @@ impl SidebarView {
         } else {
             lines.push(padded(
                 &format!(
-                    "  {} tokens",
+                    "  {} session total",
                     crate::views::message::thousands(tokens.total())
                 ),
                 width,
@@ -891,7 +891,7 @@ impl SidebarView {
             ));
             lines.push(padded(
                 &format!(
-                    "  {} in · {} out",
+                    "  {} input · {} output",
                     compact(tokens.input),
                     compact(tokens.output)
                 ),
@@ -901,7 +901,7 @@ impl SidebarView {
             if tokens.cache_read > 0 || tokens.cache_write > 0 {
                 lines.push(padded(
                     &format!(
-                        "  {} cached · {} written",
+                        "  {} cache read · {} cache write",
                         compact(tokens.cache_read),
                         compact(tokens.cache_write)
                     ),
@@ -909,11 +909,21 @@ impl SidebarView {
                     self.context.muted(),
                 ));
             }
-            if let Some(percent) = self.ambient.context_used {
+            if let Some(context) = self.ambient.context {
+                let percent = context.percent();
                 lines.push(padded(
-                    &format!("  {percent}% of the window"),
+                    &format!(
+                        "  {} / {} current prompt",
+                        compact(context.prompt_tokens),
+                        compact(context.limit)
+                    ),
                     width,
-                    if percent >= 80 {
+                    self.context.muted(),
+                ));
+                lines.push(padded(
+                    &format!("  {percent:.1}% of model window"),
+                    width,
+                    if percent >= 80.0 {
                         self.context.warning()
                     } else {
                         self.context.muted()

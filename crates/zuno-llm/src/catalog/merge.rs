@@ -12,6 +12,7 @@
 //! |---|---|---|
 //! | wire id | `config.id` → `E.api.id` → `K` | `:1438` |
 //! | transport | model config → provider config → existing resolved model → imported catalog → `openai-compatible` |
+//! | surface | model config → provider config → existing resolved model |
 //! | url | `config.provider.api` → `provider.api` → `E.api.url` → catalog provider `api` → `""` | `:1455` |
 //! | name | `config.name` → (`K` when `config.id` renames) → `E.name` → `K` | `:1445-1449` |
 //! | toolcall | `config.tool_call` → `E` → **`true`** | `:1464` |
@@ -48,15 +49,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use zuno_config::schema::provider::{
     Modality as ConfigModality, ModelConfig, ModelStatus as ConfigModelStatus, ProviderConfig,
-    ProviderTransport,
+    ProviderSurface as ConfigProviderSurface, ProviderTransport,
 };
 
 use crate::catalog::models_dev::{
     CatalogCost, CatalogModel, CatalogProvider, CatalogStatus, Interleaved, Modality,
 };
 use crate::catalog::resolved::{
-    CacheCost, JsonMap, ModalityFlags, ModelApi, ModelCapabilities, ModelCost, ModelLimit,
-    ResolvedModel, ResolvedProvider,
+    CacheCost, JsonMap, ModalityFlags, ModelApi, ModelCapabilities, ModelCost, ModelEndpoint,
+    ModelLimit, ResolvedModel, ResolvedProvider,
 };
 
 /// Native transport a model falls back to when no source names one.
@@ -315,6 +316,13 @@ pub fn apply_config(
         .map(|provider| provider.models.clone())
         .unwrap_or_default();
 
+    if let Some(surface) = config.surface {
+        let endpoint = config_surface(surface);
+        for model in models.values_mut() {
+            model.api.endpoint = Some(endpoint);
+        }
+    }
+
     if let Some(declared) = &config.models {
         for (model_key, model_config) in declared.iter() {
             // `:1437` looks the existing model up by the *wire* id when config
@@ -440,6 +448,13 @@ fn merge_model(
         .or_else(|| existing.map(|model| model.api.url.clone()))
         .or_else(|| catalog.and_then(|provider| provider.api.clone()))
         .unwrap_or_default();
+    let api_endpoint = config
+        .provider
+        .as_ref()
+        .and_then(|api| api.surface)
+        .or(provider_config.surface)
+        .map(config_surface)
+        .or_else(|| existing.and_then(|model| model.api.endpoint));
 
     // `:1445-1449`. The middle rung is the surprising one: an `id` that renames
     // makes the map key the display name.
@@ -597,7 +612,7 @@ fn merge_model(
             id: api_id,
             transport: api_transport,
             url: api_url,
-            endpoint: existing.and_then(|model| model.api.endpoint),
+            endpoint: api_endpoint,
         },
         capabilities,
         cost,
@@ -605,6 +620,14 @@ fn merge_model(
         options,
         headers,
         variants,
+    }
+}
+
+const fn config_surface(surface: ConfigProviderSurface) -> ModelEndpoint {
+    match surface {
+        ConfigProviderSurface::Chat => ModelEndpoint::Chat,
+        ConfigProviderSurface::Responses => ModelEndpoint::Responses,
+        ConfigProviderSurface::Messages => ModelEndpoint::Messages,
     }
 }
 
@@ -855,6 +878,73 @@ mod tests {
         // And with nothing anywhere, the documented default.
         let resolved = apply_config("acme", &config, None, None, &mut outcome);
         assert_eq!(resolved.models["m"].api.transport, Some(DEFAULT_TRANSPORT));
+    }
+
+    #[test]
+    fn the_surface_ladder_prefers_the_model_then_the_provider_then_the_catalog() {
+        let catalog = catalog_provider();
+        let mut existing = from_catalog("deepseek", &catalog);
+        existing
+            .models
+            .get_mut("deepseek-chat")
+            .expect("catalog fixture model")
+            .api
+            .endpoint = Some(ModelEndpoint::Messages);
+
+        let config = provider_config(
+            r#"{
+                "surface":"responses",
+                "models":{
+                    "deepseek-chat":{"provider":{"surface":"chat"}},
+                    "provider-default":{}
+                }
+            }"#,
+        );
+        let resolved = apply_config(
+            "deepseek",
+            &config,
+            Some(&existing),
+            Some(&catalog),
+            &mut MergeOutcome::default(),
+        );
+        assert_eq!(
+            resolved.models["deepseek-chat"].api.endpoint,
+            Some(ModelEndpoint::Chat),
+            "a model-level surface must override the provider default"
+        );
+        assert_eq!(
+            resolved.models["provider-default"].api.endpoint,
+            Some(ModelEndpoint::Responses),
+            "a provider surface must apply to newly configured models"
+        );
+
+        let provider_only = provider_config(r#"{"surface":"responses"}"#);
+        let resolved = apply_config(
+            "deepseek",
+            &provider_only,
+            Some(&existing),
+            Some(&catalog),
+            &mut MergeOutcome::default(),
+        );
+        assert_eq!(
+            resolved.models["deepseek-chat"].api.endpoint,
+            Some(ModelEndpoint::Responses),
+            "a provider surface must also apply to catalog models not repeated in config"
+        );
+
+        let inherited = provider_config(r#"{"models":{"deepseek-chat":{}}}"#);
+        let resolved = apply_config(
+            "deepseek",
+            &inherited,
+            Some(&existing),
+            Some(&catalog),
+            &mut MergeOutcome::default(),
+        );
+        assert_eq!(
+            resolved.models["deepseek-chat"].api.endpoint,
+            Some(ModelEndpoint::Messages),
+            "an existing catalog surface remains the fallback"
+        );
     }
 
     #[test]

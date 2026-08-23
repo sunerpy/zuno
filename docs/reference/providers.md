@@ -12,6 +12,7 @@
     "myopenai": {
       "name": "My OpenAI gateway",
       "transport": "openai",
+      "surface": "responses",
       "env": ["MYOPENAI_API_KEY"],
       "options": {
         "baseURL": "https://gateway.example.com/v1"
@@ -40,7 +41,7 @@
 }
 ```
 
-The checked starter file is [`examples/config/zuno.json`](../../examples/config/zuno.json). `transport` names a native Rust wire implementation; it is not the provider type, provider identity, or authentication method. Use `openai` for an OpenAI Responses or Chat Completions endpoint. Use `openai-compatible` only when a gateway implements a generic compatible protocol whose behavior differs from OpenAI. Neither transport loads npm packages, starts Node, or runs an AI SDK.
+The checked starter file is [`examples/config/zuno.json`](../../examples/config/zuno.json). `transport` names a native Rust wire implementation; it is not the provider type, provider identity, authentication method, or concrete endpoint. `surface` selects `responses`, `chat`, or `messages`; an OpenAI-wire gateway should normally declare `"transport": "openai", "surface": "responses"`. A model may override the provider default under `models.<id>.provider.surface`. Use `openai-compatible` only when a gateway's behavior differs from OpenAI. Neither transport loads npm packages, starts Node, or runs an AI SDK.
 
 ## First-run initialization
 
@@ -143,8 +144,8 @@ The request path is native Rust:
 
 1. `zuno-config` parses and merges `provider.myopenai`.
 2. `zuno-llm` resolves the model catalog and builds a typed provider `Spec`.
-3. `zuno-cli` selects `zuno-provider-openai` for the recommended `openai` transport.
-4. `zuno-provider-openai` builds Responses or Chat Completions JSON, applies model capabilities and provider options, then sends the request with `reqwest`.
+3. `zuno-cli` resolves the explicit `surface`; a custom OpenAI base URL is carried by the native compatible provider with OpenAI request semantics.
+4. The provider builds Responses or Chat Completions JSON for that surface, applies request-local reasoning controls, then sends the request with `reqwest`.
 5. `zuno-llm` parses SSE framing and the provider crate translates chunks into shared stream events consumed by the engine.
 
 The `openai-compatible` transport is implemented separately by `zuno-provider-compatible` and defaults to `/chat/completions`; rule-driven compatible providers may select `/responses`. `anthropic`, `bedrock`, and the Google transports use separate native crates because their request and stream protocols are not OpenAI-compatible.
@@ -155,13 +156,20 @@ Important options include:
 
 | Key | Meaning |
 | --- | --- |
-| `baseURL` or `endpoint` | API base URL; `endpoint` wins when both are set |
+| provider `surface` | Concrete API shape: `responses`, `chat`, or `messages` |
+| `baseURL` or option `endpoint` | API base URL; option `endpoint` wins when both are set |
 | `apiKey` | config-local credential, preferred over the credential store |
 | `timeout` | whole-request timeout in milliseconds, or `false` |
 | `headerTimeout` | response-header timeout in milliseconds, or `false` |
 | `chunkTimeout` | maximum gap between streamed chunks in milliseconds |
 | `maxTokens`, `temperature`, `topP`, `toolChoice` | generation controls forwarded by the native provider |
 | `extraBody` | additional request fields after protected fields are assembled |
+
+Model `options.reasoningEffort` is the default when neither the live session nor
+the selected agent chooses a level. On the Responses surface,
+`options.reasoningSummary` is lowered beside it as
+`reasoning: { effort, summary }`; Chat Completions receives only
+`reasoning_effort` because it has no reasoning-summary request field.
 
 Run `zuno models myopenai --verbose` to inspect resolved models and `zuno debug config` to confirm the merged provider block without opening the credential file.
 

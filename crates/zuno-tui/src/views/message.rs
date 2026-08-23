@@ -96,6 +96,8 @@ pub enum ToolStatus {
     Running,
     /// Finished successfully.
     Completed,
+    /// Refused before the requested effect ran.
+    Blocked,
     /// Finished with a failure.
     Error,
 }
@@ -108,6 +110,7 @@ impl ToolStatus {
             Self::Pending => "~",
             Self::Running => "…",
             Self::Completed => "✓",
+            Self::Blocked => "!",
             Self::Error => "✗",
         }
     }
@@ -212,6 +215,14 @@ impl ThinkingDisplay {
         match self {
             Self::Collapsed => "▸",
             Self::Expanded => "▾",
+        }
+    }
+
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Expanded,
+            Self::Expanded => Self::Collapsed,
         }
     }
 }
@@ -742,7 +753,7 @@ impl Transcript {
         self.last_prompt_tokens
     }
 
-    /// How full the context window is, as a percentage, when a ceiling is known.
+    /// The most recent prompt and its model-declared context ceiling.
     ///
     /// Computed from [`Self::last_prompt_tokens`] — the last request's whole prompt —
     /// never from [`Self::tokens`], which is cumulative over the session. This used to
@@ -754,11 +765,14 @@ impl Transcript {
     /// plan, which maps a non-finite catalog limit to zero — so it yields `None`
     /// rather than dividing.
     #[must_use]
-    pub const fn context_used(&self) -> Option<u64> {
+    pub const fn context_window(&self) -> Option<ContextWindowUsage> {
         if self.context_limit == 0 {
             return None;
         }
-        Some(self.last_prompt_tokens.saturating_mul(100) / self.context_limit)
+        Some(ContextWindowUsage {
+            prompt_tokens: self.last_prompt_tokens,
+            limit: self.context_limit,
+        })
     }
 
     /// The spinner frame this transcript is on.
@@ -891,6 +905,11 @@ impl Transcript {
                     true
                 }
             }
+            TurnEvent::ToolDispatchBlocked { call_id, .. } => self.update_tool(call_id, |part| {
+                if let MessagePart::Tool { status, .. } = part {
+                    *status = ToolStatus::Blocked;
+                }
+            }),
             TurnEvent::ToolDispatchCompleted {
                 call_id,
                 title,
@@ -907,8 +926,10 @@ impl Transcript {
                     ..
                 } = part
                 {
-                    *status = if *is_error {
+                    *status = if *is_error && *status != ToolStatus::Blocked {
                         ToolStatus::Error
+                    } else if *is_error {
+                        ToolStatus::Blocked
                     } else {
                         ToolStatus::Completed
                     };
@@ -1127,6 +1148,14 @@ impl Transcript {
 struct MessageRows {
     lines: Vec<Line<'static>>,
     tools: Vec<(usize, String)>,
+    reasoning: Vec<(usize, ReasoningKey)>,
+}
+
+/// Stable identity of one reasoning part in the append-only transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ReasoningKey {
+    message: usize,
+    part: usize,
 }
 
 /// The chat transcript as a component.
@@ -1139,6 +1168,10 @@ pub struct TranscriptView {
     thinking: ThinkingDisplay,
     tool_output: ToolDisplay,
     activity: ActivityDisplay,
+    /// Per-block overrides applied on top of [`Self::thinking`].
+    reasoning_overrides: BTreeMap<ReasoningKey, ThinkingDisplay>,
+    /// Cache invalidation for one-block disclosure changes.
+    reasoning_revision: u64,
     /// Per-call overrides applied on top of [`Self::tool_output`].
     tool_overrides: BTreeMap<String, ToolDisplay>,
     /// Cache invalidation for per-call affordance changes.
@@ -1173,6 +1206,8 @@ pub struct TranscriptView {
     line_owners: Vec<Option<usize>>,
     /// Which tool header produced each row of the last measured line list.
     line_tools: Vec<Option<String>>,
+    /// Which reasoning header produced each row of the last measured line list.
+    line_reasoning: Vec<Option<ReasoningKey>>,
     /// Where each message was drawn in the frame that **was drawn**.
     ///
     /// Absolute screen rows, recorded by [`Component::render`] from the same slice it paints,
@@ -1183,6 +1218,8 @@ pub struct TranscriptView {
     hits: Vec<(Rect, usize)>,
     /// Tool-header targets from the frame that was drawn.
     tool_hits: Vec<(Rect, String)>,
+    /// Reasoning-header targets from the frame that was drawn.
+    reasoning_hits: Vec<(Rect, ReasoningKey)>,
     /// The transcript rectangle from the frame that was drawn.
     area: Option<Rect>,
     /// The user's application-owned selection, in content coordinates.
@@ -1199,6 +1236,8 @@ impl TranscriptView {
             thinking: ThinkingDisplay::Collapsed,
             tool_output: ToolDisplay::Collapsed,
             activity: ActivityDisplay::Detailed,
+            reasoning_overrides: BTreeMap::new(),
+            reasoning_revision: 0,
             tool_overrides: BTreeMap::new(),
             tool_revision: 0,
             offset: 0,
@@ -1208,8 +1247,10 @@ impl TranscriptView {
             cache: RowCache::default(),
             line_owners: Vec::new(),
             line_tools: Vec::new(),
+            line_reasoning: Vec::new(),
             hits: Vec::new(),
             tool_hits: Vec::new(),
+            reasoning_hits: Vec::new(),
             area: None,
             selection: None,
         }
@@ -1253,6 +1294,31 @@ impl TranscriptView {
             .map(|(_, call_id)| call_id.as_str())
     }
 
+    /// Toggle the reasoning header occupying `(column, row)`.
+    ///
+    /// The key stays private to the transcript so callers cannot retain an identity after
+    /// replacing the transcript. Returning a boolean lets the session screen route a click
+    /// without learning the append-only message/part coordinate scheme.
+    pub fn toggle_reasoning_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(key) = self
+            .reasoning_hits
+            .iter()
+            .find(|(area, _)| {
+                column >= area.left()
+                    && column < area.right()
+                    && row >= area.top()
+                    && row < area.bottom()
+            })
+            .map(|(_, key)| *key)
+        else {
+            return false;
+        };
+        let next = self.reasoning_display(key).toggled();
+        self.reasoning_overrides.insert(key, next);
+        self.reasoning_revision = self.reasoning_revision.wrapping_add(1);
+        true
+    }
+
     /// Discard the recorded message positions.
     ///
     /// Called by the owner on any frame that draws the welcome surface instead of this view,
@@ -1262,6 +1328,7 @@ impl TranscriptView {
     pub fn forget_hit_targets(&mut self) {
         self.hits.clear();
         self.tool_hits.clear();
+        self.reasoning_hits.clear();
         self.area = None;
         self.selection = None;
     }
@@ -1304,6 +1371,13 @@ impl TranscriptView {
             .get(call_id)
             .copied()
             .unwrap_or(self.tool_output)
+    }
+
+    fn reasoning_display(&self, key: ReasoningKey) -> ThinkingDisplay {
+        self.reasoning_overrides
+            .get(&key)
+            .copied()
+            .unwrap_or(self.thinking)
     }
 
     /// Skill names whose `skill` tool call completed successfully in this transcript.
@@ -1466,11 +1540,13 @@ impl TranscriptView {
     }
 
     /// Flip the reasoning affordance, the `display_thinking` action.
-    pub const fn toggle_thinking(&mut self) {
+    pub fn toggle_thinking(&mut self) {
         self.thinking = match self.thinking {
             ThinkingDisplay::Collapsed => ThinkingDisplay::Expanded,
             ThinkingDisplay::Expanded => ThinkingDisplay::Collapsed,
         };
+        self.reasoning_overrides.clear();
+        self.reasoning_revision = self.reasoning_revision.wrapping_add(1);
     }
 
     /// The current reasoning affordance.
@@ -1526,8 +1602,8 @@ impl TranscriptView {
     pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let mut previous: Option<Role> = None;
-        for message in &self.transcript.messages {
-            lines.append(&mut self.message_rows(message, previous, width).lines);
+        for (index, message) in self.transcript.messages.iter().enumerate() {
+            lines.append(&mut self.message_rows(index, message, previous, width).lines);
             previous = Some(message.role);
         }
         self.push_trailer(&mut lines, previous.is_some(), width);
@@ -1541,9 +1617,16 @@ impl TranscriptView {
     /// structurally rather than by inspection. Both callers reach the frame through
     /// exactly this function, so the only difference between them is whether the rows
     /// were computed now or recalled.
-    fn message_rows(&self, message: &Message, previous: Option<Role>, width: u16) -> MessageRows {
+    fn message_rows(
+        &self,
+        message_index: usize,
+        message: &Message,
+        previous: Option<Role>,
+        width: u16,
+    ) -> MessageRows {
         let mut lines = Vec::new();
         let mut tools = Vec::new();
+        let mut reasoning = Vec::new();
         let rule = self.rule_style(message.role);
         // A multi-step turn opens one assistant message per step, so a header per
         // message printed `Assistant` five times for what the user experienced as
@@ -1564,33 +1647,58 @@ impl TranscriptView {
             lines.push(padded("", width, self.context.surface()));
         }
         if message.role == Role::User {
-            self.push_boxed(message, rule, width, &mut lines);
-            return MessageRows { lines, tools };
+            self.push_boxed(
+                message_index,
+                message,
+                rule,
+                width,
+                &mut lines,
+                &mut reasoning,
+            );
+            return MessageRows {
+                lines,
+                tools,
+                reasoning,
+            };
         }
         if previous != Some(message.role)
             && let Some(label) = self.role_label(message.role)
         {
             lines.push(self.ruled(message.role, rule, label, self.context.title(), width));
         }
-        let mut parts = message.parts.iter().peekable();
-        while let Some(part) = parts.next() {
+        let mut parts = message.parts.iter().enumerate().peekable();
+        while let Some((part_index, part)) = parts.next() {
             if self.activity == ActivityDisplay::Summary
                 && let Some(kind) = compact_activity(part)
             {
                 let mut activity = zuno_types::ActivityProjection::default();
                 let mut compacted = vec![part];
                 activity.record(kind);
-                while let Some(next) = parts.peek()
+                while let Some((_, next)) = parts.peek()
                     && let Some(kind) = compact_activity(next)
                 {
                     activity.record(kind);
-                    compacted.push(parts.next().expect("peeked part exists"));
+                    compacted.push(parts.next().expect("peeked part exists").1);
                 }
                 if compacted.len() == 1 {
                     if let MessagePart::Tool { call_id, .. } = part {
                         tools.push((lines.len(), call_id.clone()));
                     }
-                    self.part_lines(message.role, rule, part, width, &mut lines);
+                    let key = ReasoningKey {
+                        message: message_index,
+                        part: part_index,
+                    };
+                    if matches!(part, MessagePart::Reasoning { .. }) {
+                        reasoning.push((lines.len(), key));
+                    }
+                    self.part_lines(
+                        message.role,
+                        rule,
+                        part,
+                        self.reasoning_display(key),
+                        width,
+                        &mut lines,
+                    );
                 } else {
                     self.activity_lines(message.role, rule, activity, width, &mut lines);
                 }
@@ -1599,9 +1707,27 @@ impl TranscriptView {
             if let MessagePart::Tool { call_id, .. } = part {
                 tools.push((lines.len(), call_id.clone()));
             }
-            self.part_lines(message.role, rule, part, width, &mut lines);
+            let key = ReasoningKey {
+                message: message_index,
+                part: part_index,
+            };
+            if matches!(part, MessagePart::Reasoning { .. }) {
+                reasoning.push((lines.len(), key));
+            }
+            self.part_lines(
+                message.role,
+                rule,
+                part,
+                self.reasoning_display(key),
+                width,
+                &mut lines,
+            );
         }
-        MessageRows { lines, tools }
+        MessageRows {
+            lines,
+            tools,
+            reasoning,
+        }
     }
 
     fn activity_lines(
@@ -1668,7 +1794,15 @@ impl TranscriptView {
     /// The rule is dropped rather than the label when the pane cannot hold both: a
     /// truncated `Yo` names nobody, while a label with no dashes beside it is still a
     /// heading.
-    fn push_boxed(&self, message: &Message, rule: Style, width: u16, out: &mut Vec<Line<'static>>) {
+    fn push_boxed(
+        &self,
+        message_index: usize,
+        message: &Message,
+        rule: Style,
+        width: u16,
+        out: &mut Vec<Line<'static>>,
+        reasoning: &mut Vec<(usize, ReasoningKey)>,
+    ) {
         let marker = Role::User.marker();
         // The columns the frame itself spends: the marker, the space after it, and the
         // right edge. Everything below is measured against what is left, so a pane too
@@ -1684,15 +1818,43 @@ impl TranscriptView {
             if let Some(label) = self.role_label(Role::User) {
                 out.push(self.ruled(Role::User, rule, label, self.context.title(), width));
             }
-            for part in &message.parts {
-                self.part_lines(Role::User, rule, part, width, out);
+            for (part_index, part) in message.parts.iter().enumerate() {
+                let key = ReasoningKey {
+                    message: message_index,
+                    part: part_index,
+                };
+                if matches!(part, MessagePart::Reasoning { .. }) {
+                    reasoning.push((out.len(), key));
+                }
+                self.part_lines(
+                    Role::User,
+                    rule,
+                    part,
+                    self.reasoning_display(key),
+                    width,
+                    out,
+                );
             }
             return;
         }
         out.push(self.boxed_edge(rule, self.role_label(Role::User), inner));
         let mut body = Vec::new();
-        for part in &message.parts {
-            self.part_lines(Role::User, rule, part, gutter + inner, &mut body);
+        for (part_index, part) in message.parts.iter().enumerate() {
+            let key = ReasoningKey {
+                message: message_index,
+                part: part_index,
+            };
+            if matches!(part, MessagePart::Reasoning { .. }) {
+                reasoning.push((out.len() + body.len(), key));
+            }
+            self.part_lines(
+                Role::User,
+                rule,
+                part,
+                self.reasoning_display(key),
+                gutter + inner,
+                &mut body,
+            );
         }
         for mut line in body {
             line.spans
@@ -1811,12 +1973,14 @@ impl TranscriptView {
         // list it did not build.
         self.line_owners.clear();
         self.line_tools.clear();
+        self.line_reasoning.clear();
         let mut previous: Option<Role> = None;
         for index in 0..self.transcript.messages.len() {
             let message = &self.transcript.messages[index];
             let key = RowKey {
                 width,
                 thinking: self.thinking,
+                reasoning_revision: self.reasoning_revision,
                 tool_output: self.tool_output,
                 activity: self.activity,
                 tool_revision: self.tool_revision,
@@ -1834,10 +1998,18 @@ impl TranscriptView {
                     }
                 }
                 self.line_tools.extend(tools);
+                let mut reasoning = vec![None; rows.lines.len()];
+                for (row, key) in &rows.reasoning {
+                    if let Some(slot) = reasoning.get_mut(*row) {
+                        *slot = Some(*key);
+                    }
+                }
+                self.line_reasoning.extend(reasoning);
                 lines.extend(rows.lines.iter().cloned());
                 continue;
             }
-            let rows = self.message_rows(&self.transcript.messages[index], key.previous, width);
+            let rows =
+                self.message_rows(index, &self.transcript.messages[index], key.previous, width);
             self.line_owners
                 .extend(std::iter::repeat_n(Some(index), rows.lines.len()));
             let mut tools = vec![None; rows.lines.len()];
@@ -1847,6 +2019,13 @@ impl TranscriptView {
                 }
             }
             self.line_tools.extend(tools);
+            let mut reasoning = vec![None; rows.lines.len()];
+            for (row, key) in &rows.reasoning {
+                if let Some(slot) = reasoning.get_mut(*row) {
+                    *slot = Some(*key);
+                }
+            }
+            self.line_reasoning.extend(reasoning);
             lines.extend(rows.lines.iter().cloned());
             if is_recallable(&self.transcript.messages[index]) {
                 self.cache.put(index, key, Arc::clone(&theme), rows);
@@ -1862,6 +2041,7 @@ impl TranscriptView {
         // know which rows are chrome.
         self.line_owners.resize(lines.len(), None);
         self.line_tools.resize(lines.len(), None);
+        self.line_reasoning.resize(lines.len(), None);
         lines
     }
 
@@ -1966,6 +2146,7 @@ impl TranscriptView {
         role: Role,
         rule: Style,
         part: &MessagePart,
+        thinking: ThinkingDisplay,
         width: u16,
         out: &mut Vec<Line<'static>>,
     ) {
@@ -1975,12 +2156,11 @@ impl TranscriptView {
             out.push(self.ruled(role, rule, body, style, width));
         };
         match part {
-            // Only the assistant's prose is parsed as markdown. A user's prompt is taken
-            // literally: someone typing `**maybe**` about a shell glob meant the
-            // asterisks, and re-rendering their own input in a shape they did not write
-            // is the surface editing them. A session notice is composed here rather than
-            // by a model, so there is no markup in it to find.
-            MessagePart::Text { text } if role == Role::Assistant => {
+            // Both parties author CommonMark on this surface. Rendering the user's source
+            // with the same parser is what keeps pasted tables, constraint lists and code
+            // fences legible instead of showing their punctuation as an unaligned wall.
+            // The durable part still retains the exact source for export and replay.
+            MessagePart::Text { text } if role != Role::System => {
                 for row in crate::views::markdown::render(text, body_width, &self.context.palette())
                 {
                     out.push(self.ruled_spans(role, rule, row, width));
@@ -2011,8 +2191,13 @@ impl TranscriptView {
                 // then reads column 2 as "the answer" and column 3 as "the work". Flush with
                 // the prose, a `thought for 12.0s` header sat exactly where the first
                 // sentence of the answer sits and competed with it for the eye.
-                let header = format!(" {} {header}", self.thinking.glyph());
-                match self.thinking {
+                let action = if self.context.config.mouse {
+                    "click"
+                } else {
+                    "/thinking"
+                };
+                let header = format!(" {} {header}", thinking.glyph());
+                match thinking {
                     ThinkingDisplay::Collapsed => {
                         // One row, not two. Reasoning is secondary content that recurs on
                         // every step of every turn, so a collapsed block that spent two
@@ -2021,19 +2206,29 @@ impl TranscriptView {
                         // than wrapped when it does not fit: the glyph and the duration
                         // are what the row is for, and a summary continued onto a second
                         // row would spend exactly the row this form exists to save.
-                        let row = match summary(text) {
-                            Some(gist)
-                                if display_width(&header) + 3 + display_width(&gist)
-                                    <= usize::from(body_width) =>
-                            {
-                                format!("{header} · {gist}")
-                            }
-                            _ => header,
-                        };
+                        let row = summary(text).map_or_else(
+                            || format!("{header} · {action}"),
+                            |gist| {
+                                let with_both = format!("{header} · {gist} · {action}");
+                                if display_width(&with_both) <= usize::from(body_width) {
+                                    return with_both;
+                                }
+                                let with_summary = format!("{header} · {gist}");
+                                if display_width(&with_summary) <= usize::from(body_width) {
+                                    with_summary
+                                } else {
+                                    format!("{header} · {action}")
+                                }
+                            },
+                        );
                         push(&row, self.context.thinking(), out);
                     }
                     ThinkingDisplay::Expanded => {
-                        push(&header, self.context.thinking(), out);
+                        push(
+                            &format!("{header} · {action} to collapse"),
+                            self.context.thinking(),
+                            out,
+                        );
                         // Aligned under the header's glyph, the same relationship a tool
                         // result has to its call row. Expanded reasoning is routinely longer
                         // than the answer, so its body has to be unmistakably a nested block
@@ -2255,10 +2450,12 @@ impl TranscriptView {
         // read as ordinary output two shades quieter than the red row above it, which is
         // backwards: §7.5 asks for the error to hang below the tool row, and hanging it
         // there in the colour of success-adjacent noise is only half of that.
-        let body = if status == ToolStatus::Error {
-            self.context.error()
-        } else {
-            self.context.muted()
+        let body = match status {
+            ToolStatus::Error => self.context.error(),
+            ToolStatus::Blocked => self.context.warning(),
+            ToolStatus::Pending | ToolStatus::Running | ToolStatus::Completed => {
+                self.context.muted()
+            }
         };
         let rows = wrap(result, body_width);
         let total = rows.len();
@@ -2360,6 +2557,7 @@ const MAX_CACHED_ROWS: usize = 32_768;
 struct RowKey {
     width: u16,
     thinking: ThinkingDisplay,
+    reasoning_revision: u64,
     tool_output: ToolDisplay,
     activity: ActivityDisplay,
     tool_revision: u64,
@@ -2565,7 +2763,8 @@ fn fingerprint(message: &Message) -> u64 {
                     ToolStatus::Pending => 0_u8,
                     ToolStatus::Running => 1,
                     ToolStatus::Completed => 2,
-                    ToolStatus::Error => 3,
+                    ToolStatus::Blocked => 3,
+                    ToolStatus::Error => 4,
                 }
                 .hash(&mut hasher);
                 output.hash(&mut hasher);
@@ -2648,6 +2847,7 @@ impl Component for TranscriptView {
         // reason: stale geometry answers clicks aimed at whatever now occupies those rows.
         self.hits.clear();
         self.tool_hits.clear();
+        self.reasoning_hits.clear();
         let lines = self.cached_lines(area.width);
         self.content_height = lines.len();
         self.viewport_height = usize::from(area.height);
@@ -2711,6 +2911,26 @@ impl Component for TranscriptView {
                             height: 1,
                         },
                         call_id,
+                    ))
+                })
+                .collect();
+            self.reasoning_hits = self
+                .line_reasoning
+                .iter()
+                .skip(self.offset)
+                .take(self.viewport_height)
+                .enumerate()
+                .filter_map(|(row, key)| {
+                    let key = (*key)?;
+                    let y = area.y.checked_add(u16::try_from(row).ok()?)?;
+                    Some((
+                        Rect {
+                            x: area.x,
+                            y,
+                            width: area.width,
+                            height: 1,
+                        },
+                        key,
                     ))
                 })
                 .collect();
@@ -2826,6 +3046,26 @@ pub struct TokenUsage {
     pub cache_write: u64,
 }
 
+/// Occupancy of the model window for the most recent provider request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextWindowUsage {
+    /// Tokens in the complete most recent prompt, using provider accounting semantics.
+    pub prompt_tokens: u64,
+    /// Model-declared maximum prompt window.
+    pub limit: u64,
+}
+
+impl ContextWindowUsage {
+    /// Percentage with one decimal place, without discarding the denominator.
+    #[must_use]
+    pub fn percent(self) -> f64 {
+        if self.limit == 0 {
+            return 0.0;
+        }
+        self.prompt_tokens as f64 * 100.0 / self.limit as f64
+    }
+}
+
 /// Availability of the durable session usage projection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UsageState {
@@ -2879,10 +3119,14 @@ impl TokenUsage {
     pub fn compact(&self) -> String {
         let cached = self.cache_read + self.cache_write;
         if cached == 0 {
-            format!("↑{} ↓{}", thousands(self.input), thousands(self.output))
+            format!(
+                "in {} · out {}",
+                thousands(self.input),
+                thousands(self.output)
+            )
         } else {
             format!(
-                "↑{} ↓{} ⚡{}",
+                "in {} · out {} · cache {}",
                 thousands(self.input),
                 thousands(self.output),
                 thousands(cached)

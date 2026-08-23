@@ -97,6 +97,7 @@ fn supported_ui_commands_and_aliases_dispatch_actions() {
         ("/session", "session_list"),
         ("/resume", "session_list"),
         ("/continue", "session_list"),
+        ("/new", "session_new"),
         ("/diff", "diff_open"),
         ("/themes", "theme_list"),
         ("/theme", "theme_list"),

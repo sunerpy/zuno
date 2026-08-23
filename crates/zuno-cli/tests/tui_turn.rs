@@ -528,6 +528,146 @@ fn session_picker_pool(env: &ScriptedEnv) -> zuno_db::Pool {
     zuno_db::Pool::open(&zuno_paths::DbLocation::File(database)).expect("picker database opens")
 }
 
+fn active_root_session_count(env: &ScriptedEnv) -> Result<usize, std::io::Error> {
+    let pool = session_picker_pool(env);
+    let store = zuno_db::session::Store::new(&pool);
+    let mut query =
+        zuno_db::session::ListQuery::directory(env.working_dir().to_string_lossy().into_owned())
+            .active_only();
+    query.roots = true;
+    store
+        .list(&query)
+        .map(|sessions| sessions.len())
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// Run `/new`, prove the remount itself writes nothing, then submit the first prompt.
+///
+/// This covers the seam component tests cannot: the slash router, session screen,
+/// selection channel and CLI remount loop all have to agree before the prompt can
+/// materialize exactly one fresh durable session.
+fn run_new_session_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::Error> {
+    let script = which::which("script").map_err(|_| {
+        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
+    })?;
+    let command = format!(
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto -s {PICKER_SECOND_ID}",
+        shell_quote(&binary().to_string_lossy())
+    );
+    let mut child = Command::new(&script)
+        .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(variables(env, "http://127.0.0.1:9"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("new-session stdout was not piped"))?;
+    let (chunks, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if chunks.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let initial_count = active_root_session_count(env)?;
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut command_typed = false;
+    let mut command_typed_at = None;
+    let mut command_submitted = false;
+    let mut remount_requested_at = None;
+    let mut count_before_prompt = None;
+    let mut prompt_sent = false;
+    let mut materialized = false;
+    let mut exit_sent_at = None;
+    let mut second_exit_sent = false;
+
+    while started.elapsed() < PICKER_BUDGET {
+        match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if prompt_sent && active_root_session_count(env)? == initial_count + 1 {
+            materialized = true;
+        }
+
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("new-session stdin was not piped"))?;
+        if !command_typed && text.contains("ask anything, or / for commands") {
+            stdin.write_all(b"/new\r")?;
+            stdin.flush()?;
+            command_typed = true;
+            command_typed_at = Some(Instant::now());
+        } else if command_typed
+            && !command_submitted
+            && command_typed_at.is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
+        {
+            // The first Enter accepts the autocomplete row; the second submits it.
+            stdin.write_all(b"\r")?;
+            stdin.flush()?;
+            command_submitted = true;
+            remount_requested_at = Some(Instant::now());
+        } else if command_submitted
+            && !prompt_sent
+            && remount_requested_at.is_some_and(|sent| sent.elapsed() >= Duration::from_millis(750))
+        {
+            let count = active_root_session_count(env)?;
+            count_before_prompt = Some(count);
+            if count != initial_count {
+                break;
+            }
+            stdin.write_all(b"first prompt in a fresh session\r")?;
+            stdin.flush()?;
+            prompt_sent = true;
+        } else if materialized && exit_sent_at.is_none() {
+            stdin.write_all(b"\x03")?;
+            stdin.flush()?;
+            exit_sent_at = Some(Instant::now());
+        } else if exit_sent_at.is_some_and(|sent| sent.elapsed() >= Duration::from_millis(300))
+            && !second_exit_sent
+        {
+            // The first Ctrl+C interrupts an in-flight provider request; the second exits.
+            stdin.write_all(b"\x03")?;
+            stdin.flush()?;
+            second_exit_sent = true;
+        }
+
+        if second_exit_sent && child.try_wait()?.is_some() {
+            while let Ok(chunk) = received.recv_timeout(Duration::from_millis(50)) {
+                text.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            break;
+        }
+    }
+
+    if child.try_wait()?.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let final_count = active_root_session_count(env)?;
+    let saw_wanted = count_before_prompt == Some(initial_count)
+        && materialized
+        && final_count == initial_count + 1;
+    Ok(Transcript { text, saw_wanted })
+}
+
 fn run_session_picker_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::Error> {
     let script = which::which("script").map_err(|_| {
         std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
@@ -1057,6 +1197,24 @@ fn opening_and_leaving_the_welcome_screen_creates_no_session() {
         transcript.saw_wanted,
         "opening and leaving the welcome screen either created a durable session, printed an \
          unusable resume hint, or failed to exit cleanly\ntranscript:\n{}",
+        transcript.text
+    );
+}
+
+#[test]
+fn slash_new_is_lazy_until_the_first_prompt_and_then_creates_exactly_one_session() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    seed_session_picker(&env);
+
+    let transcript =
+        run_new_session_under_pty(&env).expect("the real TUI starts a new session under a PTY");
+
+    assert!(
+        transcript.saw_wanted,
+        "`/new` either materialized before model input, failed to remount, or created more than \
+         one durable session for the first prompt\ntranscript:\n{}",
         transcript.text
     );
 }

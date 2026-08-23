@@ -117,32 +117,17 @@ fn every_agent_states_every_column() {
         );
 
         match agent.output {
-            OutputContract::Envelope(envelope) => {
+            OutputContract::Natural => {
                 assert!(
-                    envelope.sections.len() >= 2,
-                    "{name}: a one-section envelope is a string with extra steps"
+                    agent.role != Role::Internal,
+                    "{name}: an engine-internal completion needs its prompt-owned contract"
                 );
-                assert!(
-                    !envelope.required_tags().is_empty(),
-                    "{name}: an envelope with nothing required cannot be validated"
-                );
-                let rendered = envelope.render();
-                assert!(
-                    rendered.contains(&format!("<{}>", envelope.root)),
-                    "{name}: the rendered envelope must open its own root tag"
-                );
-                for tag in envelope.tags() {
-                    assert!(
-                        rendered.contains(&format!("</{tag}>")),
-                        "{name}: tag `{tag}` is declared but never rendered"
-                    );
-                }
             }
             OutputContract::EnginePrompt { prompt } => {
                 assert_eq!(
                     agent.role,
                     Role::Internal,
-                    "{name}: only an engine-internal agent may skip the output envelope"
+                    "{name}: only an engine-internal agent may expose a raw engine prompt"
                 );
                 assert!(
                     prompt.len() > 200,
@@ -581,14 +566,14 @@ fn the_advisor_is_the_only_agent_above_the_low_band() {
         "exactly one agent spends temperature, and it is the one that has to disagree"
     );
 
-    // The advisor absorbs the council's job of producing more than one reading, so
-    // its envelope requires the alternatives that justify the higher temperature.
-    let envelope = ADVISOR
-        .output
-        .envelope()
-        .expect("the advisor has an envelope");
-    assert!(envelope.required_tags().contains(&"alternatives"));
-    assert!(envelope.required_tags().contains(&"recommendation"));
+    assert_eq!(ADVISOR.output, OutputContract::Natural);
+    let prompt = zuno_catalog::agent::builtin::get("advisor")
+        .and_then(|agent| agent.prompt)
+        .expect("the advisor prompt");
+    assert!(
+        prompt.contains("compare at least two viable options") && prompt.contains("recommend one"),
+        "the higher-temperature review lane must still require alternatives and a decision"
+    );
 }
 
 #[test]
@@ -657,55 +642,39 @@ fn plan_mode_is_not_reproduced_and_no_agent_can_leave_it() {
 }
 
 #[test]
-fn the_envelope_renders_in_the_shape_the_reference_writes_by_hand() {
-    let rendered = EXPLORER
-        .output
-        .envelope()
-        .expect("the explorer has an envelope")
-        .render();
-    assert_eq!(
-        rendered,
-        "**Output Format**:\n<results>\n<files>\nOne line per hit: path, line number, and \
-         what is there.\n</files>\n<answer>\nThe question, answered in prose, without \
-         restating the hits.\n</answer>\n</results>\n"
-    );
-
-    let optional = BUILD
-        .output
-        .envelope()
-        .expect("the build agent has an envelope")
-        .render();
-    assert!(
-        optional.contains("(omit when empty)"),
-        "an optional section must say so, or the model pads it"
-    );
-    assert_eq!(
-        EXPLORER.output.envelope().expect("present").tags(),
-        vec!["results", "files", "answer"]
-    );
+fn user_facing_agents_use_natural_output_without_harness_markup() {
+    for agent in lean() {
+        assert_eq!(
+            agent.output,
+            OutputContract::Natural,
+            "{}: user-facing output must remain ordinary Markdown",
+            agent.name
+        );
+        let policy = agent.prompt_policy();
+        assert!(
+            !policy.contains("Output Format")
+                && !policy.contains("<orchestration>")
+                && !policy.contains("<results>"),
+            "{}: harness-only markup leaked into the model prompt: {policy}",
+            agent.name
+        );
+    }
 }
 
 #[test]
-fn every_envelope_tag_is_unique_within_its_agent_and_the_roots_are_distinct() {
-    let mut roots = BTreeSet::new();
-    for agent in roster(true) {
-        let Some(envelope) = agent.output.envelope() else {
-            continue;
-        };
-        let tags = envelope.tags();
-        let unique: BTreeSet<&str> = tags.iter().copied().collect();
-        assert_eq!(
-            tags.len(),
-            unique.len(),
-            "{}: a repeated tag makes the reply ambiguous to parse",
-            agent.name
-        );
+fn build_prompt_does_not_turn_self_contained_reasoning_into_shell_work() {
+    let prompt = zuno_catalog::agent::builtin::get("build")
+        .and_then(|agent| agent.prompt)
+        .expect("the build prompt");
+    for required in [
+        "self-contained reasoning or writing question should be answered directly",
+        "do not call the shell",
+        "throwaway files",
+        "Use natural Markdown",
+    ] {
         assert!(
-            roots.insert(envelope.root),
-            "{}: root `{}` is already used by another agent, so a stray reply cannot be \
-             attributed",
-            agent.name,
-            envelope.root
+            prompt.contains(required),
+            "the build prompt lost its deliberate-tool boundary: missing `{required}`"
         );
     }
 }

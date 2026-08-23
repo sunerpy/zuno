@@ -986,6 +986,13 @@ impl Dialog for SessionDialog {
     }
 
     fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        if self.select.items.is_empty() {
+            return vec![padded(
+                " No saved sessions yet. Send a message to create one.",
+                width,
+                self.select.context.muted(),
+            )];
+        }
         let armed = self.delete_confirmation.as_deref();
         let selected = self.select.selected().map(|item| item.value.as_str());
         let selected_row = (armed == selected && armed.is_some()).then(|| {
@@ -1007,6 +1014,9 @@ impl Dialog for SessionDialog {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.select.items.is_empty() {
+            return vec![("esc", "close")];
+        }
         // Session-specific operations come first because the dialog footer keeps whole
         // pairs from the head until the next one no longer fits. Putting generic
         // navigation first made ordinary narrow terminals show move/page/search while

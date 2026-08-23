@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use zuno_config::schema::provider::ProviderTransport;
 use zuno_llm::catalog::resolved::{
-    JsonMap, ModelApi, ModelCapabilities, ModelCost, ModelLimit, ResolvedModel,
+    JsonMap, ModelApi, ModelCapabilities, ModelCost, ModelEndpoint, ModelLimit, ResolvedModel,
 };
 use zuno_llm::catalog::{Catalog, CatalogSource, CatalogStatus, ResolveInput};
 
@@ -153,6 +153,8 @@ struct VerboseApi<'a> {
     id: &'a str,
     url: &'a str,
     transport: Option<ProviderTransport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<ModelEndpoint>,
 }
 
 impl<'a> From<&'a ModelApi> for VerboseApi<'a> {
@@ -161,6 +163,7 @@ impl<'a> From<&'a ModelApi> for VerboseApi<'a> {
             id: &api.id,
             url: &api.url,
             transport: api.transport,
+            endpoint: api.endpoint,
         }
     }
 }

@@ -503,6 +503,7 @@ impl TurnPlan {
             reasoning_options: session_reasoning_options(
                 turn_effort(options.effort, &agent, &provider_id, &model_id),
                 catalog_model,
+                &agent.options,
             ),
             spec: with_agent_options(model_spec(&catalog, catalog_model, env)?, &agent),
         };
@@ -1927,6 +1928,11 @@ impl TurnHost {
     /// The session every turn this host drives belongs to.
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Directory a fresh sibling session should inherit.
+    pub(crate) fn session_directory(&self) -> &str {
+        &self.session_directory
     }
 
     /// Stable identity used by the TUI's exit handoff and rebuild paths.
@@ -4084,10 +4090,10 @@ fn with_agent_options(mut spec: Spec, agent: &zuno_catalog::agent::Agent) -> Spe
 
 /// The effort level this turn should resolve, session choice first.
 ///
-/// # Why the agent's variant is a fallback and not an override
+/// # Why configured values are fallbacks and not overrides
 ///
 /// A session-level choice is a live user action — the effort picker — and the
-/// agent's `variant` is a configured default, so the live choice wins. That is also
+/// agent's `variant` or `reasoningEffort` is a configured default, so the live choice wins. That is also
 /// the oracle's order: `input.variant ?? (ag.variant && ...)`
 /// (`session/prompt.ts:654`).
 ///
@@ -4108,13 +4114,27 @@ fn turn_effort(
     provider_id: &str,
     model_id: &str,
 ) -> Option<zuno_llm::effort::ReasoningEffort> {
-    session.or_else(|| {
-        let declared = agent.model.as_deref()?;
-        let (declared_provider, declared_model) = declared.split_once('/')?;
-        (declared_provider == provider_id && declared_model == model_id)
-            .then(|| agent.variant.as_deref()?.parse().ok())
-            .flatten()
-    })
+    session
+        .or_else(|| {
+            let declared = agent.model.as_deref()?;
+            let (declared_provider, declared_model) = declared.split_once('/')?;
+            (declared_provider == provider_id && declared_model == model_id)
+                .then(|| agent.variant.as_deref()?.parse().ok())
+                .flatten()
+        })
+        .or_else(|| configured_reasoning_effort(&agent.options))
+}
+
+const REASONING_EFFORT_OPTION: &str = "reasoningEffort";
+const REASONING_SUMMARY_OPTION: &str = "reasoningSummary";
+
+fn configured_reasoning_effort(
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Option<zuno_llm::effort::ReasoningEffort> {
+    options
+        .get(REASONING_EFFORT_OPTION)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse().ok())
 }
 
 /// Canonical effort variants a model explicitly declares, weakest first.
@@ -4145,10 +4165,16 @@ fn selectable_reasoning_efforts(
 
 /// The provider-native reasoning controls for `effort` on `model`, if any.
 ///
-/// Empty when the session chose no level, or when the catalog says the model does not
-/// reason. The capability check is what stops a level chosen on one model leaking onto
-/// the next: [`TurnPlan::resolve`] runs again on every model switch, so a model without
-/// reasoning resolves to no controls even while the session still remembers a level.
+/// The live session or agent choice wins; otherwise `model.options.reasoningEffort`
+/// supplies the default. The result is empty only when no source chooses a level or
+/// when the catalog says the model does not reason. The capability check stops a
+/// level chosen on one model leaking onto the next: [`TurnPlan::resolve`] runs again
+/// on every model switch, so a model without reasoning resolves to no controls even
+/// while the session still remembers a level.
+///
+/// On the Responses surface, an agent-level or model-level `reasoningSummary` joins
+/// the resolved effort. Chat Completions receives no summary field because it has no
+/// corresponding request control.
 ///
 /// [`EffortCapabilities::default`] is passed for the same reason [`delegation_facts`]
 /// passes it: the resolved catalog carries no adaptive or token-budget shape. The
@@ -4158,8 +4184,10 @@ fn selectable_reasoning_efforts(
 fn session_reasoning_options(
     effort: Option<zuno_llm::effort::ReasoningEffort>,
     model: &zuno_llm::catalog::ResolvedModel,
+    agent_options: &serde_json::Map<String, serde_json::Value>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let declared_efforts = declared_reasoning_efforts(model);
+    let effort = effort.or_else(|| configured_reasoning_effort(&model.options));
     let Some(effort) =
         effort.filter(|effort| model.capabilities.reasoning || declared_efforts.contains(effort))
     else {
@@ -4174,13 +4202,22 @@ fn session_reasoning_options(
             declared = declared.with(level, options.clone());
         }
     }
-    zuno_llm::effort::resolve_effort(
+    let mut options = zuno_llm::effort::resolve_effort(
         family,
         effort,
         zuno_llm::effort::EffortCapabilities::default(),
         &declared,
     )
-    .options
+    .options;
+    if effort != zuno_llm::effort::ReasoningEffort::Off
+        && model.api.endpoint == Some(ModelEndpoint::Responses)
+        && let Some(summary) = agent_options
+            .get(REASONING_SUMMARY_OPTION)
+            .or_else(|| model.options.get(REASONING_SUMMARY_OPTION))
+    {
+        options.insert(REASONING_SUMMARY_OPTION.to_owned(), summary.clone());
+    }
+    options
 }
 
 struct Resolver {

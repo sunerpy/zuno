@@ -4473,8 +4473,12 @@ fn declared_reasoning_variants_enable_selection_without_a_coarse_capability_flag
         ]
     );
     assert_eq!(
-        session_reasoning_options(Some(zuno_llm::effort::ReasoningEffort::Xhigh), model)
-            .get("reasoningEffort"),
+        session_reasoning_options(
+            Some(zuno_llm::effort::ReasoningEffort::Xhigh),
+            model,
+            &serde_json::Map::new(),
+        )
+        .get("reasoningEffort"),
         Some(&serde_json::json!("xhigh")),
         "an explicitly declared level must reach the native provider request"
     );
@@ -4534,9 +4538,85 @@ fn generation_body(
         description: "Read a file".to_owned(),
         parameters: serde_json::json!({"type": "object", "properties": {}}),
     }]);
-    request.parameters =
-        session_reasoning_options(turn_effort(None, agent, "stub", model_id), model);
+    request.parameters = session_reasoning_options(
+        turn_effort(None, agent, "stub", model_id),
+        model,
+        &agent.options,
+    );
     provider.body_for(&request)
+}
+
+#[test]
+fn model_defaults_reach_a_responses_request_as_reasoning_effort_and_summary() {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "myopenai": {
+                "transport": "openai",
+                "surface": "responses",
+                "options": {"baseURL": "https://gateway.example/v1"},
+                "models": {
+                    "reasoner": {
+                        "reasoning": true,
+                        "options": {
+                            "reasoningEffort": "max",
+                            "reasoningSummary": "auto"
+                        },
+                        "variants": {
+                            "max": {"reasoningEffort": "max"},
+                            "low": {"reasoningEffort": "low"}
+                        }
+                    }
+                }
+            }
+        }
+    }))
+    .expect("Responses provider config");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let model = catalog
+        .model("myopenai", "reasoner")
+        .expect("configured model");
+    let agent = agent("build");
+    let provider = zuno_provider_compatible::CompatibleProvider::new(
+        model_spec(&catalog, model, &Env::empty()).expect("provider spec"),
+        Arc::new(zuno_provider_compatible::ReqwestTransport::new(
+            "responses-reasoning",
+        )),
+        None,
+    )
+    .expect("compatible provider");
+    let mut request = zuno_llm::registry::CompletionRequest::new(
+        model.api.id.clone(),
+        vec![zuno_llm::event::Message::new(
+            zuno_llm::event::Role::User,
+            "Solve this carefully.",
+        )],
+    );
+    request.parameters = session_reasoning_options(None, model, &agent.options);
+
+    let body = provider.body_for(&request);
+    assert_eq!(
+        body["reasoning"],
+        serde_json::json!({"effort": "max", "summary": "auto"})
+    );
+    assert!(
+        body.get("input").is_some(),
+        "Responses must use `input`: {body}"
+    );
+    assert!(
+        body.get("messages").is_none(),
+        "the configured Responses surface fell back to Chat Completions: {body}"
+    );
+
+    let selected = session_reasoning_options(
+        Some(zuno_llm::effort::ReasoningEffort::Low),
+        model,
+        &agent.options,
+    );
+    assert_eq!(selected["reasoningEffort"], serde_json::json!("low"));
+    assert_eq!(selected["reasoningSummary"], serde_json::json!("auto"));
 }
 
 #[test]

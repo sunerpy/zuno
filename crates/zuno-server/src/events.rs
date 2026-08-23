@@ -237,6 +237,18 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "tool.dispatch.started",
             object(json!({"step": step, "callID": call_id, "name": name})),
         ),
+        TurnEvent::ToolDispatchBlocked {
+            step,
+            call_id,
+            kind,
+        } => (
+            "tool.dispatch.blocked",
+            object(json!({
+                "step": step,
+                "callID": call_id,
+                "kind": kind.as_str(),
+            })),
+        ),
         TurnEvent::ToolDispatchCompleted {
             step,
             call_id,

@@ -12,8 +12,9 @@ use zuno_db::{Connection, migration, open};
 use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{
-    AgentModelResolver, ResolvedAgent, ResolvedModel, RunTurnRequest, ToolConcurrencyLimit,
-    ToolFailureRecovery, TurnContext, TurnEvent, TurnOutcome, event_channel, run_turn,
+    AgentModelResolver, ResolvedAgent, ResolvedModel, RunTurnRequest, ToolBlockKind,
+    ToolConcurrencyLimit, ToolFailureRecovery, TurnContext, TurnEvent, TurnOutcome, event_channel,
+    run_turn,
 };
 use zuno_error::{ProviderError, ToolError};
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -328,6 +329,14 @@ fn lifecycle(events: &[TurnEvent]) -> Vec<String> {
         .iter()
         .filter_map(|event| match event {
             TurnEvent::ToolDispatchStarted { call_id, .. } => Some(format!("{call_id}:running")),
+            TurnEvent::ToolDispatchBlocked { call_id, kind, .. } => Some(format!(
+                "{call_id}:blocked:{}",
+                match kind {
+                    ToolBlockKind::Denied => "denied",
+                    ToolBlockKind::InvalidArguments => "invalid-arguments",
+                    ToolBlockKind::Unavailable => "unavailable",
+                }
+            )),
             TurnEvent::ToolDispatchCompleted {
                 call_id, is_error, ..
             } => Some(format!(
@@ -349,7 +358,7 @@ async fn run_scenario(
     turn_id: &str,
     calls: &[(&str, &str)],
     rules: Vec<Rule>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
     let mut connection = seeded();
     let provider = Arc::new(ScriptedProvider::new(provider_events(calls)));
     let providers = registry(provider);
@@ -403,9 +412,23 @@ async fn run_scenario(
                 .expect("tool status")
                 .to_owned()
         })
+        .collect::<Vec<_>>();
+    let outcomes = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate turn outcomes")
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .filter(|part| part.kind == PartKind::Tool)
+        .map(|part| {
+            part.data["state"]["outcome"]
+                .as_str()
+                .or_else(|| part.data["state"]["status"].as_str())
+                .expect("tool outcome or status")
+                .to_owned()
+        })
         .collect();
     let execution_order = order.lock().expect("order lock").clone();
-    (lifecycle(&events), statuses, execution_order)
+    (lifecycle(&events), statuses, outcomes, execution_order)
 }
 
 #[tokio::test]
@@ -415,7 +438,7 @@ async fn dispatch_loop_runs_three_calls_sequentially_with_complete_transitions()
         ("call-two", "second"),
         ("call-three", "third"),
     ];
-    let (transcript, statuses, order) = run_scenario(
+    let (transcript, statuses, outcomes, order) = run_scenario(
         "turn-dispatch-happy",
         &calls,
         vec![Rule {
@@ -441,6 +464,7 @@ async fn dispatch_loop_runs_three_calls_sequentially_with_complete_transitions()
         ]
     );
     assert_eq!(statuses, ["completed", "completed", "completed"]);
+    assert_eq!(outcomes, ["completed", "completed", "completed"]);
     assert_eq!(order, ["first", "second", "third"]);
     eprintln!("HAPPY_QA transcript={transcript:?} persisted={statuses:?} order={order:?}");
 }
@@ -531,7 +555,7 @@ async fn parallel_safe_calls_overlap_but_persist_and_emit_in_model_order() {
 #[tokio::test]
 async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
     let calls = [("call-denied", "rm -rf /"), ("call-safe", "git status")];
-    let (transcript, statuses, order) = run_scenario(
+    let (transcript, statuses, outcomes, order) = run_scenario(
         "turn-dispatch-denied",
         &calls,
         vec![
@@ -553,6 +577,7 @@ async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
         transcript,
         [
             "call-denied:running",
+            "call-denied:blocked:denied",
             "call-denied:error",
             "call-denied:result:error",
             "call-safe:running",
@@ -561,6 +586,7 @@ async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
         ]
     );
     assert_eq!(statuses, ["error", "completed"]);
+    assert_eq!(outcomes, ["blocked", "completed"]);
     assert_eq!(order, ["git status"]);
     eprintln!("DENIAL_QA transcript={transcript:?} persisted={statuses:?} order={order:?}");
 }
@@ -618,6 +644,7 @@ async fn dispatch_loop_rejects_namespaced_or_historical_tool_aliases() {
         lifecycle(&events),
         [
             "call-alias:running",
+            "call-alias:blocked:unavailable",
             "call-alias:error",
             "call-alias:result:error",
         ]
@@ -635,6 +662,8 @@ async fn dispatch_loop_rejects_namespaced_or_historical_tool_aliases() {
             .is_some_and(|error| error.contains("Unknown tool: functions.bash")),
         "{tool_part:?}"
     );
+    assert_eq!(tool_part.data["state"]["outcome"], "blocked");
+    assert_eq!(tool_part.data["state"]["blockKind"], "unavailable");
 }
 
 #[tokio::test]

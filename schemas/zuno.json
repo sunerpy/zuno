@@ -1415,6 +1415,17 @@
             "null"
           ]
         },
+        "surface": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderSurface"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Request surface override for this model."
+        },
         "transport": {
           "anyOf": [
             {
@@ -1837,6 +1848,17 @@
           ],
           "description": "Provider-level options, including SDK options this schema does not name."
         },
+        "surface": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderSurface"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Default request surface for this provider's models."
+        },
         "transport": {
           "anyOf": [
             {
@@ -1926,6 +1948,26 @@
         }
       },
       "type": "object"
+    },
+    "ProviderSurface": {
+      "description": "Native API surface selected independently from the wire transport.\n\n`transport: \"openai\"` says which protocol family Zuno implements. `surface`\nselects the concrete endpoint shape within that family, so a custom gateway can\nexplicitly use Responses instead of falling back to Chat Completions.",
+      "oneOf": [
+        {
+          "const": "chat",
+          "description": "OpenAI Chat Completions.",
+          "type": "string"
+        },
+        {
+          "const": "responses",
+          "description": "OpenAI Responses.",
+          "type": "string"
+        },
+        {
+          "const": "messages",
+          "description": "Anthropic Messages.",
+          "type": "string"
+        }
+      ]
     },
     "ProviderTransport": {
       "description": "Native provider transports implemented by the Rust workspace.",

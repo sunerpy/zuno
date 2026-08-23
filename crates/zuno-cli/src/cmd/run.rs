@@ -291,6 +291,13 @@ fn event_json(event: TurnEvent) -> Value {
             name,
             ..
         } => json!({"type":"tool_dispatch_started","step":step,"callID":call_id,"name":name}),
+        TurnEvent::ToolDispatchBlocked {
+            step,
+            call_id,
+            kind,
+        } => {
+            json!({"type":"tool_dispatch_blocked","step":step,"callID":call_id,"kind":kind.as_str()})
+        }
         TurnEvent::ToolDispatchCompleted {
             step,
             call_id,

@@ -83,6 +83,7 @@
       "env": ["ANTHROPIC_API_KEY"],
       "id": "anthropic",
       "transport": "anthropic",
+      "surface": "messages",
       "whitelist": ["claude-sonnet-4-5"],
       "blacklist": ["claude-2"],
       "options": {
@@ -125,7 +126,11 @@
           },
           "experimental": false,
           "status": "active",
-          "provider": { "transport": "anthropic", "api": "https://api.anthropic.com" },
+          "provider": {
+            "transport": "anthropic",
+            "surface": "messages",
+            "api": "https://api.anthropic.com"
+          },
           "options": { "thinking": { "type": "enabled", "budgetTokens": 32000 } },
           "headers": { "anthropic-beta": "context-1m-2025-08-07" },
           "variants": {
