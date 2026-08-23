@@ -8,6 +8,7 @@ mod export;
 mod mcp;
 mod mcp_runtime;
 mod models;
+mod plugin;
 mod product_agent;
 mod providers;
 mod run;
@@ -54,6 +55,9 @@ impl CommandDispatcher for HeadlessCommandDispatcher {
             }
             DispatchArguments::Mcp(args) => {
                 mcp::execute(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Plugin(args) => {
+                plugin::execute(args, &request.environment).map_err(to_error)
             }
             DispatchArguments::Debug(args) => {
                 debug::execute(args, &request.environment).map_err(to_error)

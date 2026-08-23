@@ -75,8 +75,13 @@ impl ResolvedExtensions {
                 PackageOrigin::Static { manifest } => manifest.display().to_string(),
                 PackageOrigin::Process => "current process".to_owned(),
             };
+            let runtime = resolved
+                .package
+                .runtime
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), runtime_summary);
             output.push_str(&format!(
-                "\n- `{}` from {}: agents [{}]; workflows [{}]; skills [{}]",
+                "\n- `{}` from {}: agents [{}]; workflows [{}]; skills [{}]; tools [{}]; runtime [{}]",
                 resolved.package.id,
                 source,
                 joined(resolved.package.agents.keys()),
@@ -88,9 +93,29 @@ impl ResolvedExtensions {
                         .iter()
                         .map(|skill| skill.name.as_str())
                 ),
+                joined(resolved.package.tools.keys()),
+                runtime,
             ));
         }
         output
+    }
+}
+
+fn runtime_summary(runtime: &crate::PluginRuntime) -> String {
+    let capabilities = joined(
+        runtime
+            .capabilities()
+            .iter()
+            .map(|capability| capability.as_str()),
+    );
+    match runtime {
+        crate::PluginRuntime::Wasi { environment, .. } => format!(
+            "wasi; capabilities: {capabilities}; environment: {}",
+            joined(environment.iter().map(String::as_str))
+        ),
+        crate::PluginRuntime::Process { .. } => {
+            format!("process; capabilities: {capabilities}")
+        }
     }
 }
 
@@ -147,6 +172,9 @@ pub(crate) fn resolve_active_packages(
     for resolved in &packages {
         let package = &resolved.package;
         package.validate().map_err(ResolveError::Manifest)?;
+        if matches!(resolved.origin, PackageOrigin::Process) && package.runtime.is_some() {
+            return Err(ResolveError::DynamicExecutable(package.id.clone()));
+        }
         if !package_ids.insert(package.id.clone()) {
             return Err(ResolveError::DuplicatePackage(package.id.clone()));
         }
@@ -180,6 +208,9 @@ pub(crate) fn resolve_active_packages(
                 location,
                 content: skill.content.clone(),
             });
+        }
+        for (name, _tool) in package.tools.iter() {
+            claim(&mut owners, "tool", name, &package.id)?;
         }
     }
 
@@ -215,6 +246,10 @@ pub enum ResolveError {
     Manifest(#[from] crate::manifest::ManifestError),
     #[error("extension package `{0}` is active more than once")]
     DuplicatePackage(String),
+    #[error(
+        "process-local extension package `{0}` cannot declare executable runtime code; install it as a static package"
+    )]
+    DynamicExecutable(String),
     #[error(
         "extension {kind} `{name}` is contributed by both package `{first}` and package `{second}`"
     )]

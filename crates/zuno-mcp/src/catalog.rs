@@ -41,7 +41,7 @@ use zuno_error::{McpError, ToolError};
 use zuno_llm::cache::{LockedTools, McpToolStatus, ToolSnapshot};
 use zuno_permission::Rule;
 use zuno_permission::visibility::retain_visible_tools;
-use zuno_tool::{Attachment, Tool, ToolContext, ToolOutput};
+use zuno_tool::{Attachment, Tool, ToolContext, ToolEffect, ToolOutput};
 use zuno_tools::registry::{CustomTool, McpToolLoader};
 
 use crate::protocol::lock;
@@ -884,6 +884,10 @@ impl Tool for ListResourcesTool {
         )
     }
 
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         let requested = optional_server(self.id(), &args)?;
         let servers = self
@@ -930,6 +934,10 @@ impl Tool for ListResourceTemplatesTool {
         optional_server_schema(
             "Optional MCP server name. When omitted, lists resource templates from every connected server.",
         )
+    }
+
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -990,6 +998,10 @@ impl Tool for ReadResourceTool {
             "required": ["server", "uri"],
             "additionalProperties": false,
         })
+    }
+
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {

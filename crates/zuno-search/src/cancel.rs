@@ -1,16 +1,14 @@
-//! The cancellation signal a running search polls.
+//! The cancellation signal a running `rg` process polls.
 //!
 //! Deliberately a local trait rather than a dependency on `zuno-tool`'s
 //! `InterruptHandle`: a search is useful outside a tool call (the LSP file walk in
 //! todo 48 wants the same engine), and this crate should not need the tool layer to
 //! be linked in to run. `zuno-tools` supplies a one-method adapter.
 //!
-//! The method is **synchronous** for the same reason `InterruptHandle::is_set` is:
-//! the directory walk and the file search are blocking code with no Tokio runtime in
-//! scope, and a search over a large tree that cannot be cancelled is precisely the
-//! hang this port exists to remove.
+//! The method is synchronous because process supervision runs at a platform
+//! boundary with no dependency on the tool layer or a Tokio runtime.
 
-/// A cancellation signal a blocking search can poll.
+/// A cancellation signal process supervision can poll.
 pub trait Cancellation: Send + Sync {
     /// Whether cancellation has been requested.
     fn is_cancelled(&self) -> bool;
@@ -47,14 +45,6 @@ impl<T: Cancellation + ?Sized> Cancellation for std::sync::Arc<T> {
         (**self).is_cancelled()
     }
 }
-
-/// How often the walk checks the signal.
-///
-/// Checking on every entry would be correct but adds an atomic load per directory
-/// entry; checking every `CANCEL_POLL_INTERVAL` entries bounds the latency of an
-/// interrupt to a few hundred `stat` calls, which is well under a human's
-/// perception, while keeping the walk's inner loop free of a per-entry load.
-pub(crate) const CANCEL_POLL_INTERVAL: usize = 256;
 
 #[cfg(test)]
 mod tests {

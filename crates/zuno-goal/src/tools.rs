@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use zuno_error::ToolError;
-use zuno_tool::{Tool, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool, erase};
+use zuno_tool::{Tool, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool, erase};
 
 /// Wire name of the goal reader.
 pub const GET_GOAL_TOOL_ID: &str = "get_goal";
@@ -97,6 +97,10 @@ impl TypedTool for GetGoalTool {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Safe
+    }
+
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     async fn run(&self, _params: GetGoalParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {

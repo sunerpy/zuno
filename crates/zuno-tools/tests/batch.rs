@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zuno_error::ToolError;
 use zuno_tool::{
-    NeverInterrupted, PermissionAsk, PermissionAsker, Tool, ToolContext, ToolOutput, erase,
+    NeverInterrupted, PermissionAsk, PermissionAsker, Tool, ToolContext, ToolEffect, ToolOutput,
+    erase,
 };
 use zuno_tools::registry::{
     BuiltinSlot, CustomTool, RegistryFlags, ToolRegistry, ToolRegistryBuilder,
@@ -150,6 +151,22 @@ impl PermissionAsker for DenyNamed {
     }
 }
 
+#[derive(Default)]
+struct RecordingPermissions {
+    asks: Mutex<Vec<(String, PermissionAsk)>>,
+}
+
+#[async_trait]
+impl PermissionAsker for RecordingPermissions {
+    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+        self.asks
+            .lock()
+            .expect("permission lock")
+            .push((tool.to_owned(), ask));
+        Ok(())
+    }
+}
+
 fn context(permission: Arc<dyn PermissionAsker>) -> ToolContext {
     ToolContext::new(
         "ses_batch",
@@ -210,6 +227,40 @@ fn batch_schema_requires_intent_and_keeps_subtool_arguments_inline() {
     assert_eq!(calls["maxItems"], MAX_CALLS);
     assert_eq!(calls["items"]["required"], json!(["tool", "intent"]));
     assert_eq!(calls["items"]["additionalProperties"], true);
+}
+
+#[tokio::test]
+async fn batch_marks_itself_delegating_and_child_calls_with_their_real_effect() {
+    let root = tempfile::tempdir().expect("temporary workspace");
+    let (probe, _) = probe("probe");
+    let registry = registry(root.path(), vec![probe]);
+    let permission = Arc::new(RecordingPermissions::default());
+
+    registry
+        .execute(
+            "execute",
+            json!({
+                "tool_calls": [{
+                    "tool": "probe",
+                    "intent": "exercise effect propagation",
+                    "label": "one"
+                }]
+            }),
+            context(Arc::clone(&permission) as Arc<dyn PermissionAsker>),
+        )
+        .await
+        .expect("batch succeeds");
+
+    let asks = permission.asks.lock().expect("permission lock");
+    assert_eq!(asks.len(), 2);
+    assert_eq!(asks[0].0, "execute");
+    assert_eq!(asks[0].1.tool_effect, Some(ToolEffect::Delegating));
+    assert_eq!(asks[1].0, "probe");
+    assert_eq!(
+        asks[1].1.tool_effect,
+        Some(ToolEffect::SideEffecting),
+        "unclassified harness tools must fail closed under strict authorization"
+    );
 }
 
 #[tokio::test]

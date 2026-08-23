@@ -175,11 +175,11 @@ const CHANNELS: &[ChannelGate] = &[
     ),
     gate(
         "turn-work-state-changes",
-        "zuno-cli/src/cmd/turn.rs",
-        "let (sender, _receiver) = tokio::sync::watch::channel(0);",
+        "zuno-cli/src/cmd/child_turn.rs",
+        "let (sender, _receiver) = watch::channel(0);",
         "latest value",
         Policy::LatestValue,
-        "zuno-cli/src/cmd/turn.rs",
+        "zuno-cli/src/cmd/child_turn.rs",
         "self.sender.send_modify(|generation| {",
     ),
     gate(
@@ -359,6 +359,15 @@ const CHANNELS: &[ChannelGate] = &[
         "results.send(outcome).await",
     ),
     gate(
+        "tui-worker-shutdown",
+        "zuno-cli/src/cmd/tui.rs",
+        "let (worker_shutdown, worker_shutdown_source) = watch::channel(false);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-cli/src/cmd/tui.rs",
+        "worker_shutdown.send(true)",
+    ),
+    gate(
         "tui-editor-shutdown",
         "zuno-cli/src/cmd/tui.rs",
         "let (editor_shutdown, editor_shutdown_source) = watch::channel(false);",
@@ -397,7 +406,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 36);
+    assert_eq!(CHANNELS.len(), 37);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -543,6 +552,10 @@ channel_gate!(tui_mcp_toggles_refuse_the_newest_request, "tui-mcp-toggles");
 channel_gate!(tui_questions_apply_backpressure, "tui-questions");
 channel_gate!(tui_editor_requests_refuse_the_newest, "tui-editor-requests");
 channel_gate!(tui_editor_results_apply_backpressure, "tui-editor-results");
+channel_gate!(
+    tui_worker_shutdown_keeps_latest_value,
+    "tui-worker-shutdown"
+);
 channel_gate!(
     tui_editor_shutdown_keeps_latest_value,
     "tui-editor-shutdown"

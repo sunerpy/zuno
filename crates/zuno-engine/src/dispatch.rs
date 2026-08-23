@@ -27,8 +27,31 @@ pub struct ToolRegistryDispatcher {
     tools: Vec<Arc<dyn Tool>>,
     rules: Arc<[Rule]>,
     approval: Arc<dyn PermissionAsker>,
+    authorization: AuthorizationPolicy,
     mcp_status: McpToolStatus,
     hooks: Arc<dyn ToolHooks>,
+}
+
+/// Cross-cutting authorization policy applied after explicit deny rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AuthorizationPolicy {
+    /// Configured rules and permission hooks decide whether a prompt is needed.
+    #[default]
+    Standard,
+    /// Every side-effecting invocation requires a fresh attached-user decision.
+    Strict,
+}
+
+impl AuthorizationPolicy {
+    /// Resolve the configuration boolean without leaking config types into the engine.
+    #[must_use]
+    pub const fn from_strict(strict: bool) -> Self {
+        if strict { Self::Strict } else { Self::Standard }
+    }
+
+    const fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
 }
 
 impl ToolRegistryDispatcher {
@@ -41,6 +64,7 @@ impl ToolRegistryDispatcher {
         tools: Vec<Arc<dyn Tool>>,
         rules: Vec<Rule>,
         approval: Arc<dyn PermissionAsker>,
+        authorization: AuthorizationPolicy,
         mcp_status: McpToolStatus,
     ) -> Self {
         let rules: Arc<[Rule]> = rules.into();
@@ -48,6 +72,7 @@ impl ToolRegistryDispatcher {
             tools,
             rules,
             approval,
+            authorization,
             mcp_status,
             hooks: Arc::new(NoopHooks),
         }
@@ -140,7 +165,8 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             ));
         }
 
-        let ask = permission_ask(resolved_name, &request.call.input);
+        let ask = permission_ask(resolved_name, &request.call.input)
+            .with_tool_effect(tool.effect(&request.call.input));
         let permission_request = ask.clone().into_request(
             format!("per_{}", request.call.id),
             &request.session_id,
@@ -164,6 +190,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         let permission = Arc::new(RulePermissionAsker::new(
             Arc::clone(&self.rules),
             Arc::clone(&self.approval),
+            self.authorization,
         ));
         if let Err(error) = permission.gate(resolved_name, ask, plugin_permission).await {
             return PreparedToolDispatch::ready(tool_error_result(
@@ -224,7 +251,9 @@ impl ToolDispatcher for ToolRegistryDispatcher {
 struct RulePermissionAsker {
     rules: Arc<[Rule]>,
     approval: Arc<dyn PermissionAsker>,
+    authorization: AuthorizationPolicy,
     approved_once: Mutex<BTreeSet<(String, String)>>,
+    approved_permissions: Mutex<BTreeSet<String>>,
 }
 
 /// What the configured rules decided about one ask, before anyone is prompted.
@@ -235,15 +264,26 @@ enum RuleOutcome {
 }
 
 impl RulePermissionAsker {
-    fn new(rules: Arc<[Rule]>, approval: Arc<dyn PermissionAsker>) -> Self {
+    fn new(
+        rules: Arc<[Rule]>,
+        approval: Arc<dyn PermissionAsker>,
+        authorization: AuthorizationPolicy,
+    ) -> Self {
         Self {
             rules,
             approval,
+            authorization,
             approved_once: Mutex::new(BTreeSet::new()),
+            approved_permissions: Mutex::new(BTreeSet::new()),
         }
     }
 
     fn evaluate_patterns(&self, ask: &PermissionAsk) -> RuleOutcome {
+        let permission_approved = self
+            .approved_permissions
+            .lock()
+            .expect("approved permission lock")
+            .contains(&ask.permission);
         let mut pending = Vec::new();
         for pattern in &ask.patterns {
             match evaluate(&ask.permission, pattern, &self.rules) {
@@ -255,7 +295,7 @@ impl RulePermissionAsker {
                         .lock()
                         .expect("approved permission lock")
                         .contains(&(ask.permission.clone(), pattern.clone()));
-                    if !approved {
+                    if !permission_approved && !approved {
                         pending.push(pattern.clone());
                     }
                 }
@@ -281,14 +321,37 @@ impl RulePermissionAsker {
         plugin: PermissionHookDecision,
     ) -> Result<(), zuno_error::ToolError> {
         normalize_patterns(&mut ask);
-        match self.evaluate_patterns(&ask) {
+        let outcome = self.evaluate_patterns(&ask);
+        match outcome {
             RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
                 tool: tool.to_owned(),
             }),
+            _ if self.requires_manual(&ask) => self.prompt_manual(tool, ask).await,
             RuleOutcome::Permitted => Ok(()),
             RuleOutcome::Pending(_) if plugin == PermissionHookDecision::Allow => Ok(()),
             RuleOutcome::Pending(pending) => self.prompt(tool, ask, pending).await,
         }
+    }
+
+    fn requires_manual(&self, ask: &PermissionAsk) -> bool {
+        self.authorization.is_strict()
+            && ask
+                .tool_effect
+                .is_some_and(zuno_tool::ToolEffect::requires_manual_approval)
+    }
+
+    async fn prompt_manual(
+        &self,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), zuno_error::ToolError> {
+        let permission = ask.permission.clone();
+        self.approval.ask(tool, ask.require_manual()).await?;
+        self.approved_permissions
+            .lock()
+            .expect("approved permission lock")
+            .insert(permission);
+        Ok(())
     }
 
     async fn prompt(
@@ -320,10 +383,12 @@ fn normalize_patterns(ask: &mut PermissionAsk) {
 impl PermissionAsker for RulePermissionAsker {
     async fn ask(&self, tool: &str, mut ask: PermissionAsk) -> Result<(), zuno_error::ToolError> {
         normalize_patterns(&mut ask);
-        match self.evaluate_patterns(&ask) {
+        let outcome = self.evaluate_patterns(&ask);
+        match outcome {
             RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
                 tool: tool.to_owned(),
             }),
+            _ if self.requires_manual(&ask) => self.prompt_manual(tool, ask).await,
             RuleOutcome::Permitted => Ok(()),
             RuleOutcome::Pending(pending) => self.prompt(tool, ask, pending).await,
         }
@@ -340,6 +405,7 @@ fn permission_ask(tool: &str, args: &Value) -> PermissionAsk {
         always: patterns.clone(),
         patterns,
         metadata,
+        ..PermissionAsk::default()
     }
 }
 

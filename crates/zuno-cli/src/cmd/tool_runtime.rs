@@ -103,6 +103,10 @@ pub(crate) struct Delegation {
     pub(crate) host: Arc<dyn zuno_tools::task::ChildTurnHost>,
     /// Catalog facts for the models a delegation may name.
     pub(crate) facts: Arc<dyn zuno_tools::task::ProviderFacts>,
+    /// Exact configured/native agent roster the child host can resolve.
+    pub(crate) targets: zuno_tools::task::DelegationTargets,
+    /// Per-agent model choices resolved from the same catalog entries.
+    pub(crate) agent_models: Vec<(String, zuno_agent::model_policy::ModelChoice)>,
     /// The parent session's model, the precedence ladder's floor.
     pub(crate) session_model: zuno_agent::model_policy::ModelChoice,
     /// The hop budget from `subagent_depth`.
@@ -153,7 +157,7 @@ pub(crate) fn assemble(
         directory: directory.to_path_buf(),
         worktree: worktree.map_or_else(|| directory.to_path_buf(), Path::to_path_buf),
     };
-    let tooling = SearchTooling::with_backend(scope, zuno_search::Backend::from_env());
+    let tooling = SearchTooling::discover(scope).map_err(to_string)?;
     let shell = zuno_tools::shell::ShellTool::new(directory)
         .map_err(to_string)?
         .with_background_executions(Arc::clone(&selection.background_executions));
@@ -165,11 +169,23 @@ pub(crate) fn assemble(
             .map_err(|error| error.to_string())?;
     }
     if selection.manifest.contains(BuiltinSlot::Task) {
-        let delegation = selection.delegation;
-        let task = zuno_tools::task::TaskTool::new(delegation.host, delegation.facts)
-            .with_session_model(delegation.session_model)
-            .with_limits(delegation.limits)
-            .with_vision_available(delegation.vision_available);
+        let Delegation {
+            host,
+            facts,
+            targets,
+            agent_models,
+            session_model,
+            limits,
+            vision_available,
+        } = selection.delegation;
+        let mut task = zuno_tools::task::TaskTool::new(host, facts)
+            .with_targets(targets)
+            .with_session_model(session_model)
+            .with_limits(limits)
+            .with_vision_available(vision_available);
+        for (agent, model) in agent_models {
+            task = task.with_agent_override(agent, model);
+        }
         builder
             .register_builtin(BuiltinSlot::Task, erase(task))
             .map_err(|error| error.to_string())?;
@@ -310,13 +326,20 @@ pub(crate) struct HeadlessApproval;
 impl PermissionAsker for HeadlessApproval {
     async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
         let patterns = ask.patterns.join(", ");
-        eprintln!(
-            "denied `{tool}`: permission `{}` resolves to ask for {patterns}, and this \
-             non-interactive run has nobody to ask; add `\"permission\": {{\"{}\": \
-             {{\"{patterns}\": \"allow\"}}}}` to your configuration to authorize it",
-            ask.permission,
-            permission_key(tool),
-        );
+        if ask.manual {
+            eprintln!(
+                "denied `{tool}`: strict authorization requires a fresh human approval for \
+                 {patterns}, and this non-interactive run has nobody to ask"
+            );
+        } else {
+            eprintln!(
+                "denied `{tool}`: permission `{}` resolves to ask for {patterns}, and this \
+                 non-interactive run has nobody to ask; add `\"permission\": {{\"{}\": \
+                 {{\"{patterns}\": \"allow\"}}}}` to your configuration to authorize it",
+                ask.permission,
+                permission_key(tool),
+            );
+        }
         Err(ToolError::Denied {
             tool: tool.to_owned(),
         })

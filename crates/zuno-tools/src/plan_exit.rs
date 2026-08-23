@@ -44,7 +44,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex, PoisonError};
 use zuno_error::ToolError;
-use zuno_tool::{ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{ToolContext, ToolEffect, ToolOutput, TypedTool};
 
 /// The id the model calls.
 ///
@@ -225,6 +225,10 @@ impl TypedTool for PlanExitTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
+        ToolEffect::UserMediated
     }
 
     async fn run(

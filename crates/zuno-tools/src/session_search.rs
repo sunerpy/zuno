@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use zuno_db::fts;
 use zuno_db::{Connection, open};
 use zuno_error::{DbError, ToolError};
-use zuno_tool::{ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
+use zuno_tool::{ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool};
 
 const DEFAULT_LIMIT: u32 = 3;
 const MAX_LIMIT: u32 = 10;
@@ -104,6 +104,10 @@ impl TypedTool for SessionSearchTool {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Safe
+    }
+
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     async fn run(

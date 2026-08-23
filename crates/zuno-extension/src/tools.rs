@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zuno_error::ToolError;
-use zuno_tool::{Tool, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool, erase};
+use zuno_tool::{Tool, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool, erase};
 
 use crate::{
     ExtensionRegistry, Package, PackageOrigin, Scope, StageOutcome, StaticPackage, resolve_active,
@@ -84,6 +84,10 @@ impl TypedTool for InspectTool {
         ToolReplayPolicy::Safe
     }
 
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
     async fn run(&self, params: InspectParams, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         let active = resolve_active(&self.scope, &self.static_packages, &self.registry)
             .map_err(|error| failed(self.id(), error))?;
@@ -102,7 +106,12 @@ impl TypedTool for InspectTool {
                     "source": {"lifetime": "static", "manifest": manifest},
                     "agents": entry.package.agents.keys().collect::<Vec<_>>(),
                     "workflows": entry.package.workflows.keys().collect::<Vec<_>>(),
-                    "skills": entry.package.skills.iter().map(|skill| &skill.name).collect::<Vec<_>>()
+                    "skills": entry.package.skills.iter().map(|skill| &skill.name).collect::<Vec<_>>(),
+                    "tools": entry.package.tools.keys().collect::<Vec<_>>(),
+                    "runtime": entry.package.runtime.as_ref().map(|runtime| match runtime {
+                        crate::PluginRuntime::Wasi { .. } => "wasi",
+                        crate::PluginRuntime::Process { .. } => "process",
+                    })
                 })
             })
             .collect::<Vec<_>>();
@@ -114,7 +123,9 @@ impl TypedTool for InspectTool {
                 "source": {"lifetime": "process"},
                 "agents": status.agents,
                 "workflows": status.workflows,
-                "skills": status.skills
+                "skills": status.skills,
+                "tools": status.tools,
+                "runtime": status.runtime
             }));
         }
         if let Some(id) = params.id {

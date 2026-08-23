@@ -101,6 +101,56 @@ Independent runtime work has three bounded controls:
 Each field accepts `1..=64`; omission uses the values above. Set a field to `1`
 to restore serial behavior for that layer.
 
+## Plugin packages
+
+Plugins are package directories, not `zuno.json` fields. Install them globally
+or below the selected project's `.zuno/extensions` directory:
+
+```sh
+zuno plugin add /path/to/package --project
+zuno plugin list
+zuno plugin update /path/to/package --project
+zuno plugin remove package-id --project
+```
+
+Custom agents and workflows use native tool permissions for file, network, and
+environment access. Runtime tools use an explicitly granted WASI component or a
+contained `host.full` process. See [plugins, custom agents, and
+workflows](../plugins.md).
+
+## Strict HITL authorization
+
+Strict authorization is off by default. Enable it when every side-effecting tool
+invocation must receive a fresh decision from an attached user:
+
+```json
+{
+  "authorization": {
+    "strict": true
+  }
+}
+```
+
+Strict mode is an additional gate above ordinary `permission` rules:
+
+- An explicit `deny` remains terminal.
+- `allow`, a plugin allow, an earlier "Allow always", and TUI `--auto` cannot
+  authorize a side effect.
+- The prompt offers only "Allow once" and "Reject"; approval is never remembered
+  for a later call.
+- A headless run fails closed because it has no user to ask.
+
+Native file reads, `glob`, `grep`, skill/session/job/goal inspection, read-only
+LSP operations, MCP resource reads, `webfetch`, and `web_search` do not receive
+the extra strict prompt. `bg list/output/wait` are read-only while `bg cancel`
+requires approval. Shell, file writes, durable state changes, delegation,
+product agents, extension lifecycle mutations, and unknown harness or MCP tools
+are side-effecting by default.
+
+`bash` always requires strict approval, even for a command such as `rg`, because
+the shell is not an operating-system sandbox. Use the native `grep` or `glob`
+tool when the intended operation is read-only.
+
 ## Memory learning
 
 Resident memory is enabled by default, but model and reflection writes enter an

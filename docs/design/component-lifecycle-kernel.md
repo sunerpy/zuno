@@ -143,9 +143,10 @@ unload.
 
 First-party component crates may not call process spawning, `tokio::spawn`, or
 global registration APIs outside an ownership adapter unless the code documents
-an explicit process-lifetime exemption. Third-party executable plugins will not
-run as Rust dynamic libraries in the main process. They must use an isolated
-process protocol or a capability-restricted WASI host.
+an explicit process-lifetime exemption. Third-party executable plugins do not
+run as Rust dynamic libraries. They use a contained process protocol or the
+capability-restricted WASI Component Model host documented in
+[plugins.md](../plugins.md).
 
 ## Product migration
 
@@ -190,21 +191,24 @@ privately create resources whose lifetime differs from its runtime.
 
 ### Extensions
 
-Declarative agent/workflow/skill packages remain non-executable. Their lifecycle
-is coupled to host composition:
+Agent/workflow/skill contributions remain declarative catalog data. A static
+package may additionally declare executable tools backed by one WASI component
+or contained process. Their lifecycle is coupled to host composition:
 
 1. registry creates a candidate state without marking it running;
 2. the host resolves and prepares the candidate composition;
-3. the old host shuts down;
-4. the candidate host commits;
-5. only then does the registry publish `Running` and advance the scope-local
+3. executable hosts initialize as deferred profile effects;
+4. the old host shuts down;
+5. the candidate host commits and publishes plugin routing;
+6. only then does the registry publish `Running` and advance the scope-local
    generation.
 
 Failure leaves the previous registry state and composition together. Generation
 is scoped by workspace rather than global to the process.
 
-Executable extension support is deferred until the lifecycle kernel and an
-isolated plugin host both pass the acceptance tests below.
+Process-local `extension_define` packages cannot declare runtime code. Executable
+packages must be installed statically so artifact provenance and package-relative
+paths are fixed before a host starts.
 
 ## Implemented result
 
@@ -232,12 +236,21 @@ The native foundation and critical product boundaries are now in place:
 - Dynamic extensions separate committed and desired state, use scope-local
   revisions and active-consumer leases, and commit only after a reserved candidate
   host starts. TUI and server entry paths both use that transaction.
+- Static executable packages register deferred runtime effects. WASI components
+  receive only explicit workspace/network/environment grants plus fuel, memory,
+  and wall-time budgets. Process plugins must declare `host.full`, speak bounded
+  JSON-RPC over stdio, and are stopped and reaped with the profile. Process-tree
+  ownership is a lifecycle guarantee, not a sandbox: hostile process plugins
+  require an external OS/container trust boundary.
+- Runtime tools use the native permission, strict-HITL, replay, concurrency, and
+  UI-intent pipeline. Routing is withdrawn before reverse-order shutdown; a lost
+  response or cleanup failure becomes `Uncertain`.
 - Runtime/component state and cleanup diagnostics are projected through
   frontend-neutral snapshot values.
 
-This does not introduce executable third-party plugins. Declarative extension
-packages remain data, and a future executable host must be process- or WASI-
-isolated and satisfy the same disposal tests before registration.
+This does not introduce a Rust dylib ABI or arbitrary in-process native code.
+Trusted compiled Rust components remain build-time composition; runtime-loaded
+code uses WASI or a contained process.
 
 ## TDD and acceptance matrix
 
@@ -279,6 +292,14 @@ Tests are added before the behavior they require.
 - successful commit updates catalog and lifecycle state together;
 - restart still drops process-local definitions;
 - static and dynamic packages use the same validated catalog contribution path.
+- process-local definitions reject executable runtimes;
+- WASI initialization, invocation, guest error, malformed metadata, timeout,
+  cancellation, resource limits, and shutdown are bounded;
+- process plugins negotiate the protocol, bound frames and stderr, redact known
+  secrets, stop the process tree, and mark lost replies uncertain;
+- plugin routing is unavailable before all hosts initialize and is withdrawn
+  before reverse cleanup;
+- add/update/remove package installation is transactional and rejects symlinks.
 
 ### Full gates
 

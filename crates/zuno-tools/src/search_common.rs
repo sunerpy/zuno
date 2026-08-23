@@ -9,7 +9,7 @@ use serde_json::json;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use zuno_error::ToolError;
-use zuno_search::{Backend, Cancellation, SearchError};
+use zuno_search::{Cancellation, Ripgrep, SearchError};
 use zuno_tool::{InterruptHandle, PermissionAsk, ToolContext};
 
 /// The result cap both tools apply.
@@ -196,32 +196,43 @@ pub fn map_search_error(tool: &str, error: SearchError) -> ToolError {
     }
 }
 
-/// The backend both tools run their requests through.
+/// The official ripgrep adapter both tools run their requests through.
 ///
-/// Held by the tool rather than read from the environment at call time so a test can
-/// pin it, and so the choice is made once at registry-assembly time.
+/// Held by the tool so discovery and version validation happen once at
+/// registry-assembly time rather than once per invocation.
 #[derive(Debug, Clone)]
 pub struct SearchTooling {
     /// Where searches are rooted.
     pub scope: SearchScope,
-    /// Which engine answers them.
-    pub backend: Backend,
+    /// Which `rg` executable answers them.
+    pub ripgrep: Ripgrep,
 }
 
 impl SearchTooling {
-    /// Tooling rooted at `directory`, with the backend chosen from the environment.
+    /// Tooling rooted at `directory`, deferring PATH failure until invocation.
+    ///
+    /// Production assembly uses [`Self::discover`] so an unavailable dependency is
+    /// reported before the tools are exposed.
     #[must_use]
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             scope: SearchScope::new(directory),
-            backend: Backend::from_env(),
+            ripgrep: Ripgrep::new("rg"),
         }
     }
 
-    /// Tooling with an explicit scope and backend.
+    /// Resolve and version-check the official `rg` executable for one scope.
+    pub fn discover(scope: SearchScope) -> Result<Self, SearchError> {
+        Ok(Self {
+            scope,
+            ripgrep: Ripgrep::discover()?,
+        })
+    }
+
+    /// Tooling with an explicit scope and executable.
     #[must_use]
-    pub fn with_backend(scope: SearchScope, backend: Backend) -> Self {
-        Self { scope, backend }
+    pub fn with_ripgrep(scope: SearchScope, ripgrep: Ripgrep) -> Self {
+        Self { scope, ripgrep }
     }
 }
 

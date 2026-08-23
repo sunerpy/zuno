@@ -165,6 +165,20 @@
       },
       "type": "object"
     },
+    "AuthorizationConfig": {
+      "additionalProperties": false,
+      "description": "Cross-cutting authorization behavior.",
+      "properties": {
+        "strict": {
+          "description": "Require a fresh human approval for every side-effecting tool invocation.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "Autoupdate": {
       "anyOf": [
         {
@@ -2272,6 +2286,17 @@
         }
       ],
       "description": "Attachment processing."
+    },
+    "authorization": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AuthorizationConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Cross-cutting authorization behavior."
     },
     "autoupdate": {
       "anyOf": [

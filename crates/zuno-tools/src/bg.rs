@@ -10,7 +10,7 @@ use zuno_error::ToolError;
 use zuno_pty::{
     BackgroundExecutionId, BackgroundExecutionInfo, BackgroundExecutionService, ReplayCursor,
 };
-use zuno_tool::{ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
+use zuno_tool::{ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool};
 
 pub const WIRE_ID: &str = "bg";
 const DEFAULT_WAIT_MS: u64 = 30_000;
@@ -83,6 +83,13 @@ impl TypedTool for BackgroundTool {
 
     fn replay_policy(&self) -> ToolReplayPolicy {
         ToolReplayPolicy::Never
+    }
+
+    fn effect(&self, args: &Value) -> ToolEffect {
+        match args.get("action").and_then(Value::as_str) {
+            Some("list" | "output" | "wait") => ToolEffect::ReadOnly,
+            Some("cancel") | None | Some(_) => ToolEffect::SideEffecting,
+        }
     }
 
     async fn run(

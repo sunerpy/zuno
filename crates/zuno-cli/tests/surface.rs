@@ -69,6 +69,7 @@ fn surface_registered_commands_match_their_dispositions() {
 
     assert!(registered.contains(&"completion"));
     assert!(registered.contains(&"providers"));
+    assert!(registered.contains(&"plugin"));
 }
 
 #[test]
@@ -220,6 +221,11 @@ const IMPLEMENTED_PROBES: &[Probe] = &[
         evidence: "the model catalog cannot be refreshed",
     },
     Probe {
+        command: "plugin",
+        argv: &["plugin", "list"],
+        evidence: "No plugins active",
+    },
+    Probe {
         command: "providers",
         argv: &["providers", "list"],
         evidence: "0 credentials",
@@ -335,12 +341,13 @@ fn probe_binary(argv: &[&str], root: &std::path::Path) -> std::process::Output {
 /// the user reads. Nothing in the assertion can be satisfied by parsing:
 /// [`Probe::evidence`] is a fragment only that command's handler emits, so the
 /// arm must have called the handler for the probe to pass, and the routing table
-/// is exercised in full rather than sampled — all twelve arms of the `match` are
+/// is exercised in full rather than sampled — every implemented arm of the `match` is
 /// covered, because [`surface_every_implemented_command_actually_has_a_handler`]
 /// makes [`IMPLEMENTED_PROBES`] a bijection with the implemented dispositions.
 /// A guard that probed only `agent` would fall to the same mutation one arm over.
 ///
-/// Cost, stated so it is not "optimised" away later: twelve subprocesses, each
+/// Cost, stated so it is not "optimised" away later: one subprocess per implemented
+/// command, each
 /// chosen to fail or finish immediately rather than to do the command's real
 /// work. Reaching the handler is the whole claim; finishing its job is other
 /// tests' business.

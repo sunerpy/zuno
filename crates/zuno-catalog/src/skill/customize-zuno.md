@@ -126,6 +126,9 @@ Every field is optional.
     "edit": "deny",
     "bash": { "git *": "allow", "*": "ask" }
   },
+  "authorization": {
+    "strict": false
+  },
 
   "formatter": false,
   "lsp": false,
@@ -160,6 +163,9 @@ Shape notes worth being explicit about:
 - `command` is an object keyed by command name, not an array.
 - `mcp[name].command` is an array of strings, never a single string. `type` is required.
 - `permission` is either a string action or an object keyed by tool name.
+- `authorization.strict` defaults to `false`; when true, side-effecting calls
+  require a fresh human approval that `allow`, plugins, `--auto`, and standing
+  grants cannot bypass.
 - `web_search.provider` is `"exa"` or `"parallel"`; limits are positive integers.
 
 ## Provider initialization
@@ -208,13 +214,23 @@ Example:
     "release-reviewer": {
       "description": "Review release safety",
       "mode": "subagent",
-      "prompt": "Inspect release integrity, rollback, and authorization."
+      "prompt": "Inspect files, environment facts, current external evidence, rollback, and authorization. Do not delegate.",
+      "permission": {
+        "*": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "lsp": "allow",
+        "webfetch": "allow",
+        "web_search": "allow",
+        "bash": "ask"
+      }
     }
   },
   "workflows": {
     "release-review": {
       "description": "Run the release review workflow",
-      "prompt": "Review this release candidate. $ARGUMENTS"
+      "prompt": "Call task once with subagent_type=\"release-reviewer\", background=false, and this prompt: Review this release candidate. $ARGUMENTS"
     }
   },
   "skills": [
@@ -228,12 +244,39 @@ Example:
 ```
 
 The static directory name must equal `id`. Two active extension packages may
-not claim the same agent, workflow, or skill name. These packages are
-declarative: they do not evaluate JavaScript, load a foreign plugin ABI, or load
-Rust dynamic libraries. An agent contribution's map key is its fixed identity;
-it cannot carry a second `name` or set `disable: true`. A custom `AgentDriver`,
-executable tool, provider, or other typed service remains a compiled Rust
-`Component` in a `HarnessProfile`.
+not claim the same agent, workflow, skill, or tool name. An agent contribution's
+map key is its fixed identity; it cannot carry a second `name` or set
+`disable: true`.
+
+Agent/workflow capabilities use ordinary Zuno tools and permissions. A
+`subagent` or `all` contribution becomes a real `task` target. Repository files
+come from `read`/`glob`/`grep`/`lsp`/`edit`, network research from
+`webfetch`/`web_search`, and environment or normal process access from `bash`.
+Do not invent a second capability field for an agent. `authorization.strict`
+still asks freshly for side effects even when the agent says `allow`.
+
+Static packages may additionally declare executable `tools` backed by one
+runtime:
+
+- `kind: "wasi"`: a Component Model artifact with explicit
+  `workspace.read`, `workspace.write`, `network`, and exact `environment`
+  names, plus fuel, memory, and timeout bounds.
+- `kind: "process"`: a contained executable speaking Zuno JSON-RPC over
+  stdio. It must declare exactly `capabilities: ["host.full"]`.
+
+Use `zuno plugin add|update|remove|list` to manage persistent packages.
+Process-local `extension_define` packages cannot declare executable code.
+Runtime tools default to `effect: "sideEffecting"`, `replay: "never"`, and
+`concurrency: "exclusive"` and pass through normal HITL. A `host.full` process
+tool, or a WASI tool granted `network`/`workspace.write`, cannot claim
+`readOnly` or safe replay because the host cannot enforce that promise. Runtime
+without a tool consumer is invalid. Zuno does not evaluate JavaScript, load a
+foreign plugin ABI, or load Rust dynamic libraries. Trusted providers, drivers,
+approvals, and arbitrary typed services remain compiled Rust `Component`s in a
+`HarnessProfile`.
+
+Read `docs/plugins.md` and reuse the packages under `examples/plugins/` before
+authoring a new manifest.
 
 ## Skills
 
@@ -445,6 +488,18 @@ or globs like `~/projects/**`).
 
 Per-agent `permission:` overrides top-level `permission:`. Plan Mode lives on
 the `plan` agent's permission ruleset (`edit: deny *`).
+
+Strict HITL is a separate top-level policy:
+
+```json
+"authorization": { "strict": true }
+```
+
+It adds a one-call-only prompt to side-effecting tools. Reads, native
+`glob`/`grep`, LSP inspection, MCP resource reads, `webfetch`, and `web_search`
+remain subject to their normal permission rules without the extra prompt.
+Unknown harness and MCP tools default to side-effecting. `bash` is always treated
+as side-effecting because command analysis is not an OS sandbox.
 
 ## Escape hatches
 

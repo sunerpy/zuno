@@ -30,6 +30,37 @@ fn agent(name: &str) -> Agent {
     }
 }
 
+#[test]
+fn configured_subagents_reach_task_with_their_model_choice() {
+    let mut explorer = agent("explorer");
+    explorer.mode = AgentMode::Subagent;
+    let mut looker = agent("looker");
+    looker.mode = AgentMode::Subagent;
+    let mut custom = agent("release-reviewer");
+    custom.mode = AgentMode::Subagent;
+    custom.source = AgentSource::Config;
+    custom.model = Some("provider/reviewer".to_owned());
+    custom.variant = Some("high".to_owned());
+    let mut primary = agent("release-primary");
+    primary.mode = AgentMode::Primary;
+    primary.source = AgentSource::Config;
+
+    let resolved = delegation_agents(&[explorer, looker, custom, primary], false)
+        .expect("the resolved catalog is a valid task roster");
+
+    assert_eq!(
+        resolved.targets.as_slice(),
+        &["explorer".to_owned(), "release-reviewer".to_owned()]
+    );
+    assert_eq!(
+        resolved.models,
+        vec![(
+            "release-reviewer".to_owned(),
+            ModelChoice::new("provider/reviewer").with_variant("high")
+        )]
+    );
+}
+
 fn traced_resolver(prompt: &str) -> Resolver {
     let mut assembly = PromptAssembly::new();
     assembly
@@ -58,6 +89,9 @@ fn test_delegation() -> tool_runtime::Delegation {
     tool_runtime::Delegation {
         host: Arc::new(zuno_tools::task::RecordingHost::new()),
         facts: Arc::new(zuno_tools::task::NoProviders),
+        targets: zuno_tools::task::DelegationTargets::new(zuno_tools::task::valid_targets(false))
+            .expect("native delegation targets are valid"),
+        agent_models: Vec::new(),
         session_model: zuno_agent::model_policy::ModelChoice::new("provider/model"),
         limits: zuno_tools::task::DelegationLimits::default(),
         vision_available: false,
@@ -3293,6 +3327,7 @@ async fn run_compatible_turn(
         Vec::new(),
         Vec::new(),
         Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
     );
     let (sender, receiver) = zuno_engine::r#loop::event_channel();

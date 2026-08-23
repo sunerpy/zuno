@@ -28,7 +28,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use zuno_error::ToolError;
-use zuno_tool::{ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{ToolContext, ToolEffect, ToolOutput, TypedTool};
 
 /// The id the model calls, and the key the registry stores.
 ///
@@ -87,6 +87,10 @@ impl TypedTool for InvalidTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     async fn run(&self, params: InvalidParams, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {

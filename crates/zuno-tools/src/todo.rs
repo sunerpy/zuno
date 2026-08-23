@@ -551,6 +551,7 @@ impl TypedTool for TodoWriteTool {
                     patterns: vec!["*".to_owned()],
                     metadata: Map::new(),
                     always: vec!["*".to_owned()],
+                    ..PermissionAsk::default()
                 },
             )
             .await?;

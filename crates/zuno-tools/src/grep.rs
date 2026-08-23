@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use zuno_error::ToolError;
 use zuno_search::GrepRequest;
 use zuno_tool::{
-    PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool,
+    PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy,
+    TypedTool,
 };
 
 /// The description the model reads, verbatim from `tool/grep.txt`.
@@ -81,6 +82,10 @@ impl TypedTool for GrepTool {
         ToolConcurrencyPolicy::ParallelSafe
     }
 
+    fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
     async fn run(&self, params: GrepParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         // `if (!params.pattern) throw` (`grep.ts:35-37`). A required `String` field
         // still admits `""`, so the check is explicit here too.
@@ -124,7 +129,7 @@ impl TypedTool for GrepTool {
         let cancel = InterruptCancellation::from_context(&ctx);
         let results = self
             .tooling
-            .backend
+            .ripgrep
             .grep(&request, &cancel)
             .map_err(|error| map_search_error(self.id(), error))?;
 

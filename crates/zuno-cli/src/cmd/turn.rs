@@ -27,7 +27,7 @@
 //! does with it: `run` prints, the TUI folds the events into its component tree.
 //! That is the whole reason one driver can serve both.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,7 +48,7 @@ use zuno_agent::reflection::{
 use zuno_auth::{AuthStore, Credential, LoginMethodRegistry};
 use zuno_config::schema::provider::ProviderTransport;
 use zuno_engine::compaction::{CompactionState, TokenWindow};
-use zuno_engine::dispatch::ToolRegistryDispatcher;
+use zuno_engine::dispatch::{AuthorizationPolicy, ToolRegistryDispatcher};
 use zuno_engine::driver::AgentDriver;
 use zuno_engine::r#loop::{
     AgentModelResolver, ResolvedAgent, ResolvedModel as EngineModel, RunTurnRequest,
@@ -536,14 +536,20 @@ impl TurnPlan {
             .await
             .with_overlay(extensions.skills().iter().cloned()),
         );
-        let extension_tools = zuno_extension::lifecycle_tools(
+        let mut runtime_surface =
+            zuno_extension::runtime_surface(&extensions, &directory).map_err(to_string)?;
+        let mut extension_tools = zuno_extension::lifecycle_tools(
             extension_scope.clone(),
             static_extensions.clone(),
             Arc::clone(environment.extensions()),
         );
+        extension_tools.extend(runtime_surface.tools().iter().cloned());
         let extension_contributions =
             zuno_harness::ToolContributions::new(extension_tools).map_err(to_string)?;
-        let profile = zuno_harness::default_profile_with_tools(extension_contributions);
+        let mut profile = zuno_harness::default_profile_with_tools(extension_contributions);
+        if let Some(bundle) = runtime_surface.take_bundle() {
+            profile = profile.with_bundle(bundle);
+        }
         let instructions =
             zuno_config::Instructions::discover(&zuno_config::InstructionOptions::from_config(
                 directory.as_path(),
@@ -1774,6 +1780,7 @@ impl TurnHost {
             let background_executions = environment
                 .background_executions(&plan.directory)
                 .map_err(to_string)?;
+            let delegation_agents = delegation_agents(&plan.agents, plan.vision_available)?;
 
             let runtime_tools = super::tool_runtime::assemble(
                 &plan.directory,
@@ -1798,6 +1805,8 @@ impl TurnHost {
                         host: Arc::new(child_host.clone()),
                         facts: Arc::clone(&plan.delegation_facts)
                             as Arc<dyn zuno_tools::task::ProviderFacts>,
+                        targets: delegation_agents.targets,
+                        agent_models: delegation_agents.models,
                         session_model: zuno_agent::model_policy::ModelChoice::new(format!(
                             "{}/{}",
                             plan.provider_id, plan.model_id
@@ -1828,6 +1837,7 @@ impl TurnHost {
                 runtime_tools.tools,
                 runtime_tools.rules,
                 approval,
+                AuthorizationPolicy::from_strict(plan.config.strict_authorization()),
                 McpToolStatus::Ready,
             );
             let tool_concurrency =
@@ -3389,6 +3399,53 @@ fn select_model<'a>(
         ));
     }
     Err(message)
+}
+
+struct DelegationAgents {
+    targets: zuno_tools::task::DelegationTargets,
+    models: Vec<(String, ModelChoice)>,
+}
+
+/// Resolve the exact child-agent roster from the same catalog the child host uses.
+///
+/// Native agents keep `zuno-agent`'s role and capability gates. Configured,
+/// Markdown, and extension agents become targets when their public mode includes
+/// subagent use. This closes the gap where a custom agent could be selected directly
+/// but `task` rejected its name.
+fn delegation_agents(
+    agents: &[zuno_catalog::agent::Agent],
+    vision_available: bool,
+) -> Result<DelegationAgents, String> {
+    let native_targets = zuno_tools::task::valid_targets(vision_available);
+    let names = agents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.mode,
+                zuno_catalog::agent::AgentMode::Subagent | zuno_catalog::agent::AgentMode::All
+            )
+        })
+        .filter(|agent| {
+            !agent.source.is_native()
+                || native_targets
+                    .iter()
+                    .any(|candidate| candidate == &agent.name)
+        })
+        .map(|agent| agent.name.clone())
+        .collect::<Vec<_>>();
+    let target_names = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let models = agents
+        .iter()
+        .filter(|agent| target_names.contains(agent.name.as_str()))
+        .filter_map(|agent| {
+            let model = agent.model.as_ref()?;
+            let mut choice = ModelChoice::new(model.clone());
+            choice.variant = agent.variant.clone();
+            Some((agent.name.clone(), choice))
+        })
+        .collect();
+    let targets = zuno_tools::task::DelegationTargets::new(names).map_err(to_string)?;
+    Ok(DelegationAgents { targets, models })
 }
 
 /// Catalog facts for every reachable model, for [`zuno_tools::task::ProviderFacts`].

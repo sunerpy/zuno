@@ -173,8 +173,6 @@ signal-hook = "=0.4.1"
 # -- filesystem, search, watching -------------------------------------------
 dirs = "6.0.0"
 globset = "0.4.20"
-grep-regex = "0.1.14"
-grep-searcher = "0.1.17"
 ignore = "0.4.33"
 notify = "8.2.0"
 tree-sitter = "0.26.11"
@@ -197,6 +195,15 @@ tree-sitter-typescript = "=0.23.2"
 tree-sitter-yaml = "=0.7.2"
 walkdir = "2.5.0"
 which = "8.0.5"
+wasmtime = { version = "48.0.0", default-features = false, features = [
+  "anyhow",
+  "component-model",
+  "cranelift",
+  "runtime",
+  "std",
+  "wat",
+] }
+wasmtime-wasi = { version = "48.0.0", default-features = false, features = ["p2"] }
 
 # Already in the lockfile as `insta`'s own diff engine, so naming it directly adds
 # no crate and no new download. It gives the tool layer a maintained unified-diff
@@ -226,14 +233,10 @@ aws-lc-rs = { version = "1.17.3", default-features = false, features = [
   "alloc",
 ] }
 base64 = "0.23.1"
-# Already in the lock as a transitive dependency of `grep-regex` at this exact
-# version, so naming it here adds a manifest line and **zero** packages. It is a
-# direct dependency because `zuno-memory`'s prompt-injection scanner runs on every
-# memory write and needs a matcher with a *guaranteed* linear-time bound: this
-# crate compiles to a finite automaton and cannot backtrack, so an adversarial
-# near-miss entry cannot turn the scan into a DoS. A hand-rolled matcher would
-# trade that proof for our own, and the reference's 36 patterns would stop being
-# checkable line-by-line against it.
+# `zuno-memory`'s prompt-injection scanner runs on every memory write and needs a
+# matcher with a guaranteed linear-time bound. The crate compiles patterns to a
+# finite automaton and cannot backtrack, so adversarial near-misses cannot turn the
+# scan into a denial of service.
 regex = "1.13.1"
 hex = "0.4.3"
 sha2 = "0.11.0"

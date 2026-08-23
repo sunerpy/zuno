@@ -1,13 +1,13 @@
-//! The permission prompt: `once`, `always`, or `reject`.
+//! The permission prompt: `once`, optional `always`, or `reject`.
 //!
 //! # The three replies are a contract, not a UI choice
 //!
 //! [`zuno_permission::ReplyKind`] is `Reject | Once | Always`, and the engine's
 //! pending-approval lifecycle accepts exactly those. So this view does not invent a
 //! vocabulary: it produces a [`PermissionDecision`] carrying that enum, and a
-//! consumer hands it to [`zuno_permission::PermissionEngine`] unchanged. The labels
-//! are the oracle's — "Allow once", "Allow always", "Reject"
-//! (`packages/tui/src/routes/session/permission.tsx:432`).
+//! consumer hands it to [`zuno_permission::PermissionEngine`] unchanged. Strict
+//! human-only asks carry no `always` patterns and therefore offer only "Allow once"
+//! and "Reject".
 //!
 //! # Two escalation stages, both for the same reason
 //!
@@ -95,7 +95,7 @@ struct Option_ {
 }
 
 /// The oracle's option order and labels (`permission.tsx:432`).
-const OPTIONS: [Option_; 3] = [
+const STANDARD_OPTIONS: [Option_; 3] = [
     Option_ {
         reply: ReplyKind::Once,
         label: "Allow once",
@@ -103,6 +103,18 @@ const OPTIONS: [Option_; 3] = [
     Option_ {
         reply: ReplyKind::Always,
         label: "Allow always",
+    },
+    Option_ {
+        reply: ReplyKind::Reject,
+        label: "Reject",
+    },
+];
+
+/// Strict/manual asks deliberately omit the standing-grant choice.
+const ONCE_ONLY_OPTIONS: [Option_; 2] = [
+    Option_ {
+        reply: ReplyKind::Once,
+        label: "Allow once",
     },
     Option_ {
         reply: ReplyKind::Reject,
@@ -421,7 +433,7 @@ impl PermissionPrompt {
     /// The currently highlighted reply.
     #[must_use]
     pub fn highlighted(&self) -> ReplyKind {
-        OPTIONS[self.selected].reply
+        self.options()[self.selected].reply
     }
 
     /// Whether the body is expanded.
@@ -434,6 +446,14 @@ impl PermissionPrompt {
     #[must_use]
     pub const fn request(&self) -> &PermissionRequest {
         &self.request
+    }
+
+    fn options(&self) -> &'static [Option_] {
+        if self.request.always.is_empty() {
+            &ONCE_ONLY_OPTIONS
+        } else {
+            &STANDARD_OPTIONS
+        }
     }
 
     fn decide(&self, reply: ReplyKind, message: Option<String>) -> DialogStep {
@@ -464,7 +484,7 @@ impl PermissionPrompt {
         }
         lines.push(padded("", width, self.context.surface()));
         let mut spans = Vec::new();
-        for (index, option) in OPTIONS.iter().enumerate() {
+        for (index, option) in self.options().iter().enumerate() {
             let style = if index == self.selected {
                 self.context.selected()
             } else {
@@ -615,11 +635,12 @@ impl Dialog for PermissionPrompt {
         match self.stage {
             Stage::Choose => match action.name {
                 "dialog.select.prev" => {
-                    self.selected = (self.selected + OPTIONS.len() - 1) % OPTIONS.len();
+                    let len = self.options().len();
+                    self.selected = (self.selected + len - 1) % len;
                     DialogStep::Redraw
                 }
                 "dialog.select.next" => {
-                    self.selected = (self.selected + 1) % OPTIONS.len();
+                    self.selected = (self.selected + 1) % self.options().len();
                     DialogStep::Redraw
                 }
                 "dialog.select.home" => {
@@ -627,7 +648,7 @@ impl Dialog for PermissionPrompt {
                     DialogStep::Redraw
                 }
                 "dialog.select.end" => {
-                    self.selected = OPTIONS.len() - 1;
+                    self.selected = self.options().len() - 1;
                     DialogStep::Redraw
                 }
                 "permission.prompt.fullscreen" => {
@@ -635,7 +656,7 @@ impl Dialog for PermissionPrompt {
                     DialogStep::Redraw
                 }
                 "dialog.select.submit" | "dialog.prompt.submit" => {
-                    match OPTIONS[self.selected].reply {
+                    match self.options()[self.selected].reply {
                         ReplyKind::Always => {
                             self.stage = Stage::ConfirmAlways;
                             self.confirm = true;

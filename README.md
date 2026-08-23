@@ -101,11 +101,18 @@ SQLite 中的 deadline 恢复，人工输入优先。工具失败作为 tool res
 description: Review a change for security and authorization defects
 mode: subagent
 permission:
-  edit: deny
-  bash: deny
+  "*": deny
+  read: allow
+  glob: allow
+  grep: allow
+  lsp: allow
+  webfetch: allow
+  web_search: allow
+  bash: ask
 ---
 
-Inspect trust boundaries, permission checks, durable state, and failure behavior.
+Inspect repository files, relevant environment facts, current external evidence,
+trust boundaries, permission checks, durable state, and failure behavior.
 Return findings with exact file locations.
 ```
 
@@ -118,7 +125,27 @@ Workflow 和 Skill。`extension_define` 只在当前进程内记录不可变定�
 需要跨重启保留时，把同一清单写到
 `.zuno/extensions/<id>/extension.json`（全局路径为
 `~/.config/zuno/extensions/<id>/extension.json`）并重启。两种加载方式共用验证与冲突检查；
-不会执行 JavaScript/Cordis ABI，也不会加载 Rust 动态库。
+扩展中 `mode: subagent | all` 的 Agent 会进入 `task` 的真实目标列表，并在子会话中使用自身
+模型、Prompt 与原生工具权限。文件由 `read/glob/grep/lsp/edit` 提供，网络由
+`webfetch/web_search` 提供，环境与普通进程能力由受权限控制的 `bash` 提供；Strict 模式仍会
+对所有副作用调用逐次 HITL。
+
+静态包还可以注册可执行工具：首选进程内、按 workspace/network/env 最小授权并带 fuel、内存和
+超时限制的 WASI Component；确实需要完整宿主 API 时使用声明 `host.full` 的受控子进程。
+两者都作为 Profile effect 初始化，卸载时先撤销路由再逆序异步清理；无法确认停止则标记
+`Uncertain`，不会自动重放。Zuno 不执行 JavaScript/Cordis ABI，也不加载 Rust 动态库。
+`host.full`、WASI `network` 或 `workspace.write` 工具不能声明只读/安全重放，因此 Strict
+模式不会被插件清单中的虚假只读标记绕过。
+
+```sh
+zuno plugin add examples/plugins/review-kit --project
+zuno plugin list
+zuno plugin update examples/plugins/review-kit --project
+zuno plugin remove review-kit --project
+```
+
+完整清单、能力表、WIT/JSON-RPC 协议以及自定义 Agent、Workflow、WASI 和进程示例见
+[插件与扩展指南](docs/plugins.md)。
 
 原生 workflow 不需要修改默认循环。实现 `AgentDriver`，选择模型可见的 `ToolManifest`，按需
 加入原生工具，再把它们组成一个事务化 Profile：
@@ -148,6 +175,7 @@ Profile 中还可以挂载 provider、远程执行器、审批、评测或 bench
 | [docs/reference/configuration.md](docs/reference/configuration.md) | `zuno.json` Schema、配置层与独立 `tui.json` |
 | [docs/reference/providers.md](docs/reference/providers.md) | Provider、凭证、`myopenai` 与原生 Rust 请求链 |
 | [docs/harness-runtime.md](docs/harness-runtime.md) | 原生组件、Profile 事务、持久 inbox 与自定义 Harness |
+| [docs/plugins.md](docs/plugins.md) | 插件安装、Agent/Workflow、WASI/进程能力与协议示例 |
 | [docs/design/harness-comparison.md](docs/design/harness-comparison.md) | DSH、Codex、OMO、pi-agent、OpenCode 与 Claw Code 的借鉴决策 |
 | [docs/design/client-interfaces.md](docs/design/client-interfaces.md) | TUI、ACP、HTTP 与未来 GUI 共用的事件和投影接口 |
 | [docs/design/memory-learning.md](docs/design/memory-learning.md) | 可审计记忆候选、反思提取、审核、晋升与撤销 |

@@ -165,6 +165,28 @@ fn memory_false_dominates_every_enabled_default() {
 }
 
 #[test]
+fn strict_authorization_defaults_off_and_can_be_enabled() {
+    assert!(!Config::default().strict_authorization());
+    assert!(
+        parse(r#"{"authorization":{"strict":true}}"#)
+            .expect("strict authorization parses")
+            .strict_authorization()
+    );
+    assert!(
+        !parse(r#"{"authorization":{"strict":false}}"#)
+            .expect("strict authorization can be disabled explicitly")
+            .strict_authorization()
+    );
+}
+
+#[test]
+fn authorization_rejects_unknown_nested_keys() {
+    let error = parse(r#"{"authorization":{"strict":true,"remember":true}}"#)
+        .expect_err("authorization must not silently ignore unknown policy");
+    assert_eq!(issue_path(&error), "authorization.remember");
+}
+
+#[test]
 fn memory_options_resolve_caps_cadence_and_component_flags() {
     let config = parse(
         r#"{"memory":{"resident":false,"tool":false,"reflection":false,"global_char_limit":1200,"project_char_limit":2400,"nudge_interval":0}}"#,

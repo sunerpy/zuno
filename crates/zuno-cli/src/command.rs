@@ -6,6 +6,7 @@
 //! disposition policy; todos 80-85 extend the same request path for maintenance.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use zuno_observability::LogLevel;
@@ -467,6 +468,54 @@ pub enum McpAuthCommand {
     List,
 }
 
+#[derive(Debug, Clone, Args)]
+#[command(subcommand_required = true)]
+pub struct PluginArgs {
+    #[command(subcommand)]
+    pub command: Option<PluginCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PluginCommand {
+    /// List packages active for one directory.
+    #[command(alias = "ls")]
+    List {
+        /// Directory whose project configuration chain should be inspected.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Install a new local package.
+    Add(PluginInstallArgs),
+    /// Transactionally replace an installed local package.
+    Update(PluginInstallArgs),
+    /// Remove an installed package.
+    Remove(PluginRemoveArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PluginInstallArgs {
+    /// Package directory or its extension.json manifest.
+    pub source: PathBuf,
+    /// Install below the selected project's `.zuno` directory instead of globally.
+    #[arg(long)]
+    pub project: bool,
+    /// Directory used to select the project target.
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PluginRemoveArgs {
+    /// Stable package id.
+    pub id: String,
+    /// Remove from the selected project's `.zuno` directory instead of globally.
+    #[arg(long)]
+    pub project: bool,
+    /// Directory used to select the project target.
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum DbFormat {
     Json,
@@ -618,6 +667,8 @@ pub enum Command {
     Providers(ProvidersArgs),
     /// Manage Model Context Protocol servers.
     Mcp(McpArgs),
+    /// Install and inspect Zuno extension plugins.
+    Plugin(PluginArgs),
     /// Database tools.
     Db(DbArgs),
     /// Diagnostics and introspection.
@@ -658,6 +709,7 @@ impl Command {
             Self::Models(args) => dispatch(DispatchArguments::Models(args), environment),
             Self::Providers(args) => dispatch(DispatchArguments::Providers(args), environment),
             Self::Mcp(args) => dispatch(DispatchArguments::Mcp(args), environment),
+            Self::Plugin(args) => dispatch(DispatchArguments::Plugin(args), environment),
             Self::Db(args) => dispatch(DispatchArguments::Db(args), environment),
             Self::Debug(args) => dispatch(DispatchArguments::Debug(args), environment),
             Self::Completion(args) => dispatch(DispatchArguments::Completion(args), environment),
@@ -713,6 +765,8 @@ pub enum ImplementedCommand {
     Providers,
     /// `mcp`.
     Mcp,
+    /// `plugin`.
+    Plugin,
     /// `db`.
     Db,
     /// `debug`.
@@ -738,6 +792,7 @@ impl ImplementedCommand {
             Self::Models => "models",
             Self::Providers => "providers",
             Self::Mcp => "mcp",
+            Self::Plugin => "plugin",
             Self::Db => "db",
             Self::Debug => "debug",
             Self::Completion => "completion",
@@ -757,6 +812,7 @@ pub enum DispatchArguments {
     Models(ModelsArgs),
     Providers(ProvidersArgs),
     Mcp(McpArgs),
+    Plugin(PluginArgs),
     Db(DbArgs),
     Debug(DebugArgs),
     Completion(CompletionArgs),
@@ -776,6 +832,7 @@ impl DispatchArguments {
             Self::Models(_) => ImplementedCommand::Models,
             Self::Providers(_) => ImplementedCommand::Providers,
             Self::Mcp(_) => ImplementedCommand::Mcp,
+            Self::Plugin(_) => ImplementedCommand::Plugin,
             Self::Db(_) => ImplementedCommand::Db,
             Self::Debug(_) => ImplementedCommand::Debug,
             Self::Completion(_) => ImplementedCommand::Completion,
@@ -808,6 +865,7 @@ impl DispatchArguments {
             | Self::Models(_)
             | Self::Providers(_)
             | Self::Mcp(_)
+            | Self::Plugin(_)
             | Self::Db(_)
             | Self::Debug(_)
             | Self::Completion(_)
@@ -842,6 +900,7 @@ impl DispatchArguments {
             | Self::Models(_)
             | Self::Providers(_)
             | Self::Mcp(_)
+            | Self::Plugin(_)
             | Self::Db(_)
             | Self::Debug(_)
             | Self::Completion(_)
@@ -950,6 +1009,7 @@ mod tests {
             &["providers", "list"],
             &["auth", "list"],
             &["mcp", "list"],
+            &["plugin", "list"],
             &["db"],
             &["debug", "paths"],
             &["tui"],

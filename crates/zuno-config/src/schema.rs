@@ -74,6 +74,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "lsp",
     "instructions",
     "permission",
+    "authorization",
     "tools",
     "attachment",
     "enterprise",
@@ -177,6 +178,9 @@ pub struct Config {
     /// Global permissions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<PermissionConfig>,
+    /// Cross-cutting authorization behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<AuthorizationConfig>,
     /// Tool switches, keyed by tool name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<OrderedMap<bool>>,
@@ -225,6 +229,15 @@ impl Config {
             ResolvedConcurrencyConfig::default,
             ConcurrencyConfig::resolved,
         )
+    }
+
+    /// Whether side-effecting tool calls require a fresh attached-user decision.
+    #[must_use]
+    pub fn strict_authorization(&self) -> bool {
+        self.authorization
+            .as_ref()
+            .and_then(|authorization| authorization.strict)
+            .unwrap_or(false)
     }
 }
 
@@ -447,6 +460,15 @@ pub struct CompactionConfig {
     /// Token buffer left free so compaction itself cannot overflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u32>,
+}
+
+/// Cross-cutting authorization behavior.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationConfig {
+    /// Require a fresh human approval for every side-effecting tool invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Small positive concurrency bound accepted at every runtime boundary.

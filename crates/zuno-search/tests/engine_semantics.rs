@@ -1,18 +1,15 @@
 //! The ignore, hidden-file and override semantics, pinned against observations of
 //! the real binary.
 //!
-//! Every expectation in this file was first recorded by running the real
-//! `opencode debug rg` (1.18.12) over the same tree; the transcripts are in
-//! `.omo/evidence/task-41-opencode-rust.txt`. They are asserted here as unit
-//! expectations so a regression is caught without spawning a process, and the
-//! differential test in `zuno-tools` re-checks them against the binary itself.
+//! Every expectation is exercised against the official binary that Zuno ships
+//! beside or resolves from `PATH`; there is intentionally no second walker whose
+//! semantics can drift.
 
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 use zuno_search::{
-    AlreadyCancelled, Backend, EmbeddedEngine, GlobRequest, GrepRequest, NeverCancelled,
-    SearchError,
+    AlreadyCancelled, GlobRequest, GrepRequest, NeverCancelled, Ripgrep, SearchError,
 };
 
 /// The tree every case runs against.
@@ -53,8 +50,12 @@ fn write(root: &Path, relative: &str, contents: &str) {
     fs::write(root.join(relative), contents).expect("a fixture file");
 }
 
+fn engine() -> Ripgrep {
+    Ripgrep::discover().expect("the test environment provides supported rg")
+}
+
 fn paths(root: &Path, pattern: &str) -> Vec<String> {
-    EmbeddedEngine
+    engine()
         .glob(&GlobRequest::new(root, pattern, 10_000), &NeverCancelled)
         .expect("the glob succeeds")
         .items
@@ -64,7 +65,7 @@ fn paths(root: &Path, pattern: &str) -> Vec<String> {
 }
 
 fn matched(root: &Path, pattern: &str, include: Option<&str>) -> Vec<String> {
-    EmbeddedEngine
+    engine()
         .grep(
             &GrepRequest::new(root, pattern, 10_000).with_include(include.map(str::to_owned)),
             &NeverCancelled,
@@ -207,7 +208,7 @@ fn grep_never_reads_the_git_directory() {
 #[test]
 fn a_pattern_with_no_matches_is_an_empty_result_and_not_an_error() {
     let dir = fixture();
-    let results = EmbeddedEngine
+    let results = engine()
         .grep(
             &GrepRequest::new(dir.path(), "zzzznomatchzzzz", 10_000),
             &NeverCancelled,
@@ -221,7 +222,7 @@ fn a_pattern_with_no_matches_is_an_empty_result_and_not_an_error() {
 #[test]
 fn a_glob_with_no_matches_is_an_empty_result_and_not_an_error() {
     let dir = fixture();
-    let results = EmbeddedEngine
+    let results = engine()
         .glob(
             &GlobRequest::new(dir.path(), "**/*.nothing", 10_000),
             &NeverCancelled,
@@ -234,7 +235,7 @@ fn a_glob_with_no_matches_is_an_empty_result_and_not_an_error() {
 #[test]
 fn a_match_carries_the_line_terminator_the_offset_and_the_submatch_spans() {
     let dir = fixture();
-    let results = EmbeddedEngine
+    let results = engine()
         .grep(
             &GrepRequest::new(dir.path(), "needle", 10_000),
             &NeverCancelled,
@@ -272,7 +273,7 @@ fn every_occurrence_on_a_line_becomes_a_submatch_of_one_record() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     write(dir.path(), "a.txt", "needle needle needle\n");
 
-    let results = EmbeddedEngine
+    let results = engine()
         .grep(
             &GrepRequest::new(dir.path(), "needle", 10_000),
             &NeverCancelled,
@@ -288,7 +289,7 @@ fn every_occurrence_on_a_line_becomes_a_submatch_of_one_record() {
 fn the_limit_truncates_and_says_so() {
     let dir = fixture();
 
-    let globbed = EmbeddedEngine
+    let globbed = engine()
         .glob(&GlobRequest::new(dir.path(), "**/*", 3), &NeverCancelled)
         .expect("the glob succeeds");
     assert_eq!(globbed.items.len(), 3);
@@ -303,7 +304,7 @@ fn the_limit_truncates_and_says_so() {
         "truncation takes the first of a stable order, so it is reproducible"
     );
 
-    let grepped = EmbeddedEngine
+    let grepped = engine()
         .grep(&GrepRequest::new(dir.path(), "needle", 2), &NeverCancelled)
         .expect("the grep succeeds");
     assert_eq!(grepped.items.len(), 2);
@@ -313,7 +314,7 @@ fn the_limit_truncates_and_says_so() {
 #[test]
 fn a_limit_that_exactly_fits_is_not_reported_as_truncated() {
     let dir = fixture();
-    let globbed = EmbeddedEngine
+    let globbed = engine()
         .glob(&GlobRequest::new(dir.path(), "src/**", 2), &NeverCancelled)
         .expect("the glob succeeds");
 
@@ -327,7 +328,7 @@ fn a_limit_that_exactly_fits_is_not_reported_as_truncated() {
 #[test]
 fn an_invalid_regex_is_a_typed_model_correctable_failure() {
     let dir = fixture();
-    let error = EmbeddedEngine
+    let error = engine()
         .grep(
             &GrepRequest::new(dir.path(), "(unclosed", 10),
             &NeverCancelled,
@@ -341,7 +342,7 @@ fn an_invalid_regex_is_a_typed_model_correctable_failure() {
 #[test]
 fn an_invalid_glob_is_a_typed_model_correctable_failure() {
     let dir = fixture();
-    let error = EmbeddedEngine
+    let error = engine()
         .glob(
             &GlobRequest::new(dir.path(), "[unclosed", 10),
             &NeverCancelled,
@@ -356,7 +357,7 @@ fn an_invalid_glob_is_a_typed_model_correctable_failure() {
 fn a_missing_root_and_a_file_root_are_distinguished() {
     let dir = fixture();
 
-    let missing = EmbeddedEngine
+    let missing = engine()
         .glob(
             &GlobRequest::new(dir.path().join("nowhere"), "**/*", 10),
             &NeverCancelled,
@@ -365,7 +366,7 @@ fn a_missing_root_and_a_file_root_are_distinguished() {
     assert!(matches!(missing, SearchError::RootMissing { .. }));
     assert!(!missing.is_model_correctable());
 
-    let file = EmbeddedEngine
+    let file = engine()
         .glob(
             &GlobRequest::new(dir.path().join("README.md"), "**/*", 10),
             &NeverCancelled,
@@ -375,18 +376,18 @@ fn a_missing_root_and_a_file_root_are_distinguished() {
 }
 
 #[test]
-fn a_fired_interrupt_stops_the_walk_rather_than_returning_a_short_list() {
+fn a_fired_interrupt_stops_the_process_rather_than_returning_a_short_list() {
     let dir = fixture();
 
-    let globbed = EmbeddedEngine
+    let globbed = engine()
         .glob(
             &GlobRequest::new(dir.path(), "**/*", 10_000),
             &AlreadyCancelled,
         )
-        .expect_err("a cancelled walk does not return partial results");
+        .expect_err("a cancelled process does not return partial results");
     assert!(matches!(globbed, SearchError::Cancelled));
 
-    let grepped = EmbeddedEngine
+    let grepped = engine()
         .grep(
             &GrepRequest::new(dir.path(), "needle", 10_000),
             &AlreadyCancelled,
@@ -401,7 +402,7 @@ fn a_binary_file_does_not_contribute_matches() {
     fs::write(dir.path().join("blob.bin"), b"needle\x00needle\n").expect("a binary fixture");
     write(dir.path(), "plain.txt", "needle\n");
 
-    let results = EmbeddedEngine
+    let results = engine()
         .grep(
             &GrepRequest::new(dir.path(), "needle", 10_000),
             &NeverCancelled,
@@ -438,10 +439,8 @@ fn a_nested_gitignore_is_honoured() {
 
 #[test]
 fn a_gitignore_outside_a_repository_is_not_applied() {
-    // `ignore`'s `require_git` default is true, and so is ripgrep's. Verified against
-    // rg 15.1.0: with no `.git` anywhere, `rg --json --hidden -- needle .` over a
-    // tree whose `.gitignore` names `secret.ts` returns `secret.ts` anyway. A port
-    // that applied the file unconditionally would hide a result the oracle shows.
+    // Ripgrep applies repository ignore files only when it discovers repository
+    // context. With no `.git` anywhere, both files remain visible.
     let dir = tempfile::tempdir().expect("a temporary directory");
     write(dir.path(), ".gitignore", "secret.ts\n");
     write(dir.path(), "secret.ts", "needle\n");
@@ -459,52 +458,10 @@ fn a_long_line_is_capped_and_marked() {
     let line = format!("needle{}\n", "x".repeat(3_000));
     write(dir.path(), "long.txt", &line);
 
-    let results = EmbeddedEngine
+    let results = engine()
         .grep(&GrepRequest::new(dir.path(), "needle", 10), &NeverCancelled)
         .expect("the grep succeeds");
 
     assert_eq!(results.items[0].text.len(), 2_003);
     assert!(results.items[0].text.ends_with("..."));
-}
-
-#[test]
-fn both_backends_agree_when_a_system_ripgrep_is_available() {
-    let dir = fixture();
-    let Some(program) = zuno_search::locate_ripgrep() else {
-        eprintln!("no system rg on PATH; the cross-backend comparison is skipped");
-        return;
-    };
-
-    let embedded = Backend::embedded();
-    let external = Backend::ripgrep(&program);
-
-    for pattern in ["**/*", "**/*.ts", "src/**"] {
-        let request = GlobRequest::new(dir.path(), pattern, 10_000);
-        assert_eq!(
-            embedded
-                .glob(&request, &NeverCancelled)
-                .expect("embedded")
-                .items,
-            external
-                .glob(&request, &NeverCancelled)
-                .expect("ripgrep")
-                .items,
-            "the two backends disagree on glob {pattern}"
-        );
-    }
-
-    for include in [None, Some("*.ts".to_owned())] {
-        let request = GrepRequest::new(dir.path(), "needle", 10_000).with_include(include.clone());
-        assert_eq!(
-            embedded
-                .grep(&request, &NeverCancelled)
-                .expect("embedded")
-                .items,
-            external
-                .grep(&request, &NeverCancelled)
-                .expect("ripgrep")
-                .items,
-            "the two backends disagree on grep with include {include:?}"
-        );
-    }
 }

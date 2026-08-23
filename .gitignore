@@ -1,5 +1,6 @@
 .omo
 /target
+/examples/plugins/wasi-word-count/plugin.wasm
 
 # Release archives and the unpacked artifact `make smoke-artifact` exercises.
 # Build outputs, never source.

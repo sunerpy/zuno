@@ -3,6 +3,7 @@ use std::path::Path;
 
 use serde_json::json;
 use tempfile::tempdir;
+use zuno_config::schema::permission::{PermissionAction, PermissionRule};
 use zuno_extension::{
     API_VERSION, ExtensionRegistry, Package, Scope, StaticPackage, discover_static, resolve_active,
 };
@@ -107,4 +108,54 @@ fn duplicate_contribution_names_fail_instead_of_silently_shadowing() {
 
     assert!(error.to_string().contains("agent"));
     assert!(error.to_string().contains("same"));
+}
+
+#[test]
+fn extension_agents_keep_native_file_network_and_environment_tool_permissions() {
+    let package: Package = serde_json::from_value(json!({
+        "apiVersion": API_VERSION,
+        "id": "capable-agent",
+        "description": "custom agent capability fixture",
+        "agents": {
+            "network-reviewer": {
+                "mode": "subagent",
+                "prompt": "Inspect files, network evidence, and environment facts.",
+                "permission": {
+                    "read": "allow",
+                    "web_search": "allow",
+                    "bash": "ask"
+                }
+            }
+        }
+    }))
+    .expect("valid extension agent");
+    let package = StaticPackage::new(
+        package,
+        Path::new("/repo/.zuno/extensions/capable-agent/extension.json"),
+    )
+    .expect("matching package provenance");
+    let resolved = resolve_active(
+        &Scope::new(Path::new("/repo")),
+        &[package],
+        &ExtensionRegistry::new(),
+    )
+    .expect("package resolves");
+    let permission = resolved
+        .agents()
+        .get("network-reviewer")
+        .and_then(|agent| agent.permission.as_ref())
+        .expect("agent permission survives extension resolution")
+        .normalized();
+
+    for (tool, expected) in [
+        ("read", PermissionAction::Allow),
+        ("web_search", PermissionAction::Allow),
+        ("bash", PermissionAction::Ask),
+    ] {
+        assert_eq!(
+            permission.get(tool),
+            Some(&PermissionRule::Action(expected)),
+            "{tool} capability changed"
+        );
+    }
 }

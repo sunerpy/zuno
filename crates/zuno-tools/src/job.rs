@@ -8,7 +8,9 @@ use std::sync::Arc;
 use zuno_db::Pool;
 use zuno_db::job::{AgentJob, AgentJobStore, JobStatus, ReportDelivery};
 use zuno_error::{DbError, ToolError};
-use zuno_tool::{ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool};
+use zuno_tool::{
+    ToolConcurrencyPolicy, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool,
+};
 
 /// The tool identifier exposed to models.
 pub const WIRE_ID: &str = "job";
@@ -59,6 +61,10 @@ impl TypedTool for JobTool {
 
     fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
         ToolConcurrencyPolicy::ParallelSafe
+    }
+
+    fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     async fn run(&self, params: JobParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {

@@ -119,6 +119,33 @@ pub enum ToolUiIntent {
     Subagent,
 }
 
+/// The externally observable effect one invocation may have.
+///
+/// `SideEffecting` is deliberately the default: an extension or MCP tool that does
+/// not make an explicit safety claim must be treated as capable of mutation.
+/// `Delegating` is reserved for orchestration tools whose child calls pass through
+/// the same permission context and carry their own effect classification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ToolEffect {
+    /// Reads or inspections that do not mutate authoritative state.
+    ReadOnly,
+    /// The tool's effect is asking the attached user, so another approval would be circular.
+    UserMediated,
+    /// The tool only dispatches child tools, which are authorized independently.
+    Delegating,
+    /// Filesystem, process, durable-state, remote, or otherwise uncertain mutation.
+    #[default]
+    SideEffecting,
+}
+
+impl ToolEffect {
+    /// Whether strict authorization must obtain a fresh human decision.
+    #[must_use]
+    pub const fn requires_manual_approval(self) -> bool {
+        matches!(self, Self::SideEffecting)
+    }
+}
+
 /// Whether an identical tool call may be issued again after a transient failure.
 ///
 /// `Never` is the default because a lost response does not prove a mutation failed:
@@ -178,6 +205,14 @@ pub trait Tool: Send + Sync {
     /// Stable client presentation intent.
     fn ui_intent(&self) -> ToolUiIntent {
         ToolUiIntent::Generic
+    }
+
+    /// The effect of this invocation after argument validation.
+    ///
+    /// The raw value is supplied so a mixed tool such as `bg` can classify
+    /// inspection and cancellation actions differently.
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::SideEffecting
     }
 
     /// The parameter schema **before** central augmentation.
@@ -335,6 +370,11 @@ pub trait TypedTool: Send + Sync + 'static {
         ToolUiIntent::Generic
     }
 
+    /// The effect of this invocation after argument validation.
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::SideEffecting
+    }
+
     /// Runs the tool against decoded arguments.
     async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError>;
 }
@@ -368,6 +408,10 @@ impl<T: TypedTool> Tool for Typed<T> {
 
     fn ui_intent(&self) -> ToolUiIntent {
         self.0.ui_intent()
+    }
+
+    fn effect(&self, args: &Value) -> ToolEffect {
+        self.0.effect(args)
     }
 
     fn raw_parameters_schema(&self) -> Value {
@@ -441,6 +485,10 @@ mod tests {
             ToolReplayPolicy::Safe
         }
 
+        fn effect(&self, _args: &Value) -> ToolEffect {
+            ToolEffect::ReadOnly
+        }
+
         async fn run(
             &self,
             params: EchoParams,
@@ -506,6 +554,23 @@ mod tests {
         assert_eq!(
             definition.parameters["required"],
             json!(["text", INTENT_KEY])
+        );
+    }
+
+    #[test]
+    fn effects_fail_closed_and_typed_tools_delegate_their_declaration() {
+        let proxy = Proxied {
+            remote_schema: json!({"type": "object"}),
+        };
+        assert_eq!(
+            proxy.effect(&json!({})),
+            ToolEffect::SideEffecting,
+            "unclassified dynamic tools must require strict approval"
+        );
+        assert_eq!(
+            erase(Echo).effect(&json!({"text": "hello"})),
+            ToolEffect::ReadOnly,
+            "the erased adapter dropped the typed tool's effect"
         );
     }
 

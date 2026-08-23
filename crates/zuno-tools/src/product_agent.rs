@@ -172,6 +172,7 @@ impl TypedTool for ProductAgentTool {
                 patterns: vec![format!("product:{}", self.instance)],
                 metadata,
                 always: vec![format!("product:{}", self.instance)],
+                ..PermissionAsk::default()
             },
         )
         .await?;

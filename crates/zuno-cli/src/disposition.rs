@@ -110,8 +110,8 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
     CommandDisposition {
         upstream_symbol: "PluginCommand",
         command: "plugin",
-        disposition: Disposition::NotRegistered,
-        reason: "the resident host loads configured plugins, but Zuno does not own an npm installer; declare plugins in zuno.json so compatibility is checked before import",
+        disposition: Disposition::Implemented,
+        reason: "lists, installs, updates, and removes native Zuno plugin packages through the local extension host",
     },
     CommandDisposition {
         upstream_symbol: "PrCommand",

@@ -15,15 +15,20 @@ schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
 zuno-catalog = { workspace = true }
 zuno-config = { workspace = true }
 zuno-error = { workspace = true }
 zuno-paths = { workspace = true }
+zuno-process = { workspace = true }
+zuno-runtime = { workspace = true }
 zuno-tool = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true }
 
 [lints]
 workspace = true

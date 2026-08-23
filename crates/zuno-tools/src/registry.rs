@@ -555,8 +555,11 @@ impl RegistryCore {
             .ok_or_else(|| zuno_error::ToolError::NotFound {
                 tool: resolved.to_owned(),
             })?;
-        ctx.ask(resolved, PermissionAsk::new(permission_key(resolved), "*"))
-            .await?;
+        let mut ask = PermissionAsk::new(permission_key(resolved), "*")
+            .with_tool_effect(tool.effect(&arguments));
+        ask.metadata
+            .insert("arguments".to_owned(), arguments.clone());
+        ctx.ask(resolved, ask).await?;
         tool.invoke(arguments, ctx).await
     }
 }

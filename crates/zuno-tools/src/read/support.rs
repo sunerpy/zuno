@@ -223,6 +223,7 @@ impl FileToolRuntime {
                     patterns: vec![pattern.clone()],
                     metadata,
                     always: vec![pattern.clone()],
+                    ..PermissionAsk::default()
                 },
             )
             .await?;
@@ -240,6 +241,7 @@ impl FileToolRuntime {
                 patterns: vec![target.resource.clone()],
                 metadata,
                 always: vec!["*".to_owned()],
+                ..PermissionAsk::default()
             },
         )
         .await

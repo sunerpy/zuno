@@ -344,6 +344,124 @@ fn mcp_add_list_auth_and_logout_persist_headless_state() {
 }
 
 #[test]
+fn plugin_add_update_list_and_remove_use_project_extension_storage() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let source = root.path().join("plugin-source");
+    std::fs::create_dir(&source).expect("plugin source");
+    let manifest = source.join("extension.json");
+    std::fs::write(
+        &manifest,
+        r#"{
+  "apiVersion": "zuno.extension/v1",
+  "id": "cli-plugin",
+  "description": "first plugin revision",
+  "agents": {
+    "network-reviewer": {
+      "description": "Reviews files and network evidence.",
+      "mode": "subagent",
+      "prompt": "Use native tools to review the request.",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "web_search": "allow",
+        "bash": "ask"
+      }
+    }
+  },
+  "workflows": {
+    "network-review": {
+      "description": "Delegate a network-aware review.",
+      "prompt": "Use task with subagent_type=network-reviewer for: $ARGUMENTS"
+    }
+  }
+}"#,
+    )
+    .expect("first plugin manifest");
+    let source_text = source.to_str().expect("UTF-8 source");
+    let root_text = root.path().to_str().expect("UTF-8 root");
+
+    let added = run(
+        root.path(),
+        &[
+            "plugin",
+            "add",
+            source_text,
+            "--project",
+            "--dir",
+            root_text,
+        ],
+    );
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(
+        root.path()
+            .join(".zuno/extensions/cli-plugin/extension.json")
+            .is_file()
+    );
+
+    let listed = run(root.path(), &["plugin", "list", "--dir", root_text]);
+    assert!(listed.status.success());
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("cli-plugin (declarative)"), "{stdout}");
+    assert!(stdout.contains("agents: network-reviewer"), "{stdout}");
+    assert!(stdout.contains("workflows: network-review"), "{stdout}");
+
+    let updated_manifest = std::fs::read_to_string(&manifest)
+        .expect("read manifest")
+        .replace("first plugin revision", "second plugin revision");
+    std::fs::write(&manifest, updated_manifest).expect("second plugin manifest");
+    let updated = run(
+        root.path(),
+        &[
+            "plugin",
+            "update",
+            source_text,
+            "--project",
+            "--dir",
+            root_text,
+        ],
+    );
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    let listed = run(root.path(), &["plugin", "list", "--dir", root_text]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("second plugin revision"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    let removed = run(
+        root.path(),
+        &[
+            "plugin",
+            "remove",
+            "cli-plugin",
+            "--project",
+            "--dir",
+            root_text,
+        ],
+    );
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let listed = run(root.path(), &["plugin", "list", "--dir", root_text]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("No plugins active"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+}
+
+#[test]
 fn debug_config_emits_only_resolved_json() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut command = zuno();

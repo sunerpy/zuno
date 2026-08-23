@@ -58,7 +58,7 @@ type Grant = (String, Vec<String>);
 
 struct Pending {
     answer: oneshot::Sender<ReplyKind>,
-    grant: Grant,
+    grant: Option<Grant>,
 }
 
 #[derive(Default)]
@@ -105,8 +105,10 @@ impl PermissionBroker {
             let Some(pending) = parked.pending.remove(request_id) else {
                 return;
             };
-            if reply == ReplyKind::Always {
-                parked.standing.push(pending.grant);
+            if reply == ReplyKind::Always
+                && let Some(grant) = pending.grant
+            {
+                parked.standing.push(grant);
             }
             pending.answer
         };
@@ -121,15 +123,16 @@ impl PermissionAsker for PermissionBroker {
         let (sender, receiver) = oneshot::channel();
         {
             let grant: Grant = (ask.permission.clone(), ask.patterns.clone());
+            let reusable = !ask.manual && !ask.always.is_empty();
             let mut parked = locked(&self.parked);
-            if parked.standing.contains(&grant) {
+            if reusable && parked.standing.contains(&grant) {
                 return Ok(());
             }
             parked.pending.insert(
                 request_id.clone(),
                 Pending {
                     answer: sender,
-                    grant,
+                    grant: reusable.then_some(grant),
                 },
             );
             parked.waiting.push_back(ask.into_request(
@@ -162,8 +165,14 @@ pub(crate) struct AutoApproval;
 
 #[async_trait]
 impl PermissionAsker for AutoApproval {
-    async fn ask(&self, _tool: &str, _ask: PermissionAsk) -> Result<(), ToolError> {
-        Ok(())
+    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+        if ask.manual {
+            Err(ToolError::Denied {
+                tool: tool.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 

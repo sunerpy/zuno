@@ -78,6 +78,26 @@ fn views_permission_prompt_resolves_to_always_after_confirming() {
 }
 
 #[test]
+fn views_permission_manual_prompt_omits_always() {
+    let mut request = request("bash");
+    request.always.clear();
+    let input = json!({"command": "git push"});
+    let joined = render(
+        PermissionPrompt::new(ViewContext::defaults(), request.clone(), &input),
+        80,
+        14,
+    )
+    .join("\n");
+    assert!(joined.contains("Allow once"));
+    assert!(joined.contains("Reject"));
+    assert!(!joined.contains("Allow always"));
+
+    let mut prompt = PermissionPrompt::new(ViewContext::defaults(), request, &input);
+    prompt.handle_action(action("dialog.select.next"), &key(KeyCode::Down));
+    assert_eq!(prompt.highlighted(), ReplyKind::Reject);
+}
+
+#[test]
 fn views_permission_prompt_resolves_to_reject() {
     let mut prompt = prompt("webfetch", json!({"url": "https://example.com"}));
     prompt.handle_action(action("dialog.select.end"), &key(KeyCode::End));

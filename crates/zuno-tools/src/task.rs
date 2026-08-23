@@ -396,6 +396,64 @@ pub fn valid_targets(vision_available: bool) -> Vec<String> {
         .collect()
 }
 
+/// A validated, composition-owned set of agents the `task` tool may target.
+///
+/// The default constructor still derives Zuno's native roster from
+/// [`valid_targets`]. A composition that also resolves configured or extension
+/// agents replaces that roster with this exact set, so the tool never advertises
+/// an agent the child-turn host cannot start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationTargets {
+    names: Vec<String>,
+}
+
+impl DelegationTargets {
+    /// Validate one exact target roster while preserving declaration order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty identifier, a duplicate, or the primary
+    /// coordinator. Agent-name syntax is validated by the catalog before this
+    /// same-process boundary.
+    pub fn new(names: impl IntoIterator<Item = String>) -> Result<Self, DelegationTargetError> {
+        let mut resolved = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for name in names {
+            if name.trim().is_empty() {
+                return Err(DelegationTargetError::Empty);
+            }
+            if name == COORDINATOR {
+                return Err(DelegationTargetError::Coordinator);
+            }
+            if !seen.insert(name.clone()) {
+                return Err(DelegationTargetError::Duplicate(name));
+            }
+            resolved.push(name);
+        }
+        Ok(Self { names: resolved })
+    }
+
+    /// Target names in stable catalog order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.names
+    }
+}
+
+/// Invalid composition input for [`DelegationTargets`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DelegationTargetError {
+    /// Agent identities are never blank.
+    #[error("a delegation target cannot be empty")]
+    Empty,
+    /// The user-facing coordinator cannot recursively target itself.
+    #[error("`{COORDINATOR}` is the primary coordinator and cannot be a delegation target")]
+    Coordinator,
+    /// One identity must map to one child-agent definition.
+    #[error("delegation target `{0}` is registered more than once")]
+    Duplicate(String),
+}
+
 /// What the precedence ladder decided, plus everything the caller must be told.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DelegationPlan {
@@ -422,6 +480,7 @@ pub struct TaskTool {
     agent_overrides: BTreeMap<String, ModelChoice>,
     limits: DelegationLimits,
     vision_available: bool,
+    targets: Option<DelegationTargets>,
 }
 
 impl TaskTool {
@@ -436,6 +495,7 @@ impl TaskTool {
             agent_overrides: BTreeMap::new(),
             limits: DelegationLimits::default(),
             vision_available: false,
+            targets: None,
         }
     }
 
@@ -472,6 +532,20 @@ impl TaskTool {
     pub const fn with_vision_available(mut self, available: bool) -> Self {
         self.vision_available = available;
         self
+    }
+
+    /// Replace the native target roster with the composition's exact resolved set.
+    #[must_use]
+    pub fn with_targets(mut self, targets: DelegationTargets) -> Self {
+        self.targets = Some(targets);
+        self
+    }
+
+    fn targets(&self) -> Vec<String> {
+        self.targets.as_ref().map_or_else(
+            || valid_targets(self.vision_available),
+            |targets| targets.as_slice().to_vec(),
+        )
     }
 
     /// Resolve the child's model and effort.
@@ -622,7 +696,7 @@ impl TaskTool {
     }
 
     fn target(&self, params: &TaskParams) -> Result<(String, Option<String>), ToolError> {
-        let targets = valid_targets(self.vision_available);
+        let targets = self.targets();
         let rendered = targets.join(", ");
         match (params.subagent_type.as_deref(), params.category.as_deref()) {
             (None, None) => Err(reject(TaskRejection::NoTarget {
@@ -705,7 +779,7 @@ impl TypedTool for TaskTool {
         let (agent, category) = self.target(&params)?;
         self.guard_depth(&ctx).await?;
 
-        let targets = valid_targets(self.vision_available);
+        let targets = self.targets();
         let mut metadata = Map::new();
         if let Some(description) = &params.description {
             metadata.insert("description".to_owned(), Value::String(description.clone()));
@@ -722,6 +796,7 @@ impl TypedTool for TaskTool {
                 patterns: vec![agent.clone()],
                 metadata,
                 always: vec!["*".to_owned()],
+                ..PermissionAsk::default()
             },
         )
         .await?;

@@ -41,6 +41,26 @@ frontend-neutral lifecycle snapshots. It deliberately does not embed Cordis or
 load executable JavaScript/Rust plugins in-process. The upstream delta remained
 empty, so the baseline is unchanged.
 
+## 2026-08-23 no-delta review
+
+`dsh_delta.py` again found no commit after `dsh-v0.1.1-rc.2`, so the recorded
+baseline remains `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`.
+
+Runtime-loadable plugin behavior was classified `adapt`. Zuno keeps trusted
+compiled Rust `Component`s for first-party typed services, adds a Wasmtime
+Component Model host for statically installed tools with explicit
+workspace/network/environment grants and resource budgets, and provides a
+contained `host.full` process protocol for APIs outside WASI. Both runtimes are
+profile effects with initialize/invoke/shutdown negotiation, reverse cleanup,
+transactional publication, cancellation, and `Uncertain` non-replay. Rust dylibs
+and the JavaScript/Cordis ABI remain rejected.
+
+Custom agent/workflow behavior was also classified `adapt`: extension agents use
+the same native model, permission, file, network, environment, child-session, and
+strict-HITL paths as built-ins, and `subagent`/`all` agents enter the exact `task`
+target roster. Workflows invoke that public delegation path rather than acquiring
+a private loop.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

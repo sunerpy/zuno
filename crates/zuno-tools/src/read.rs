@@ -15,7 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 use zuno_error::ToolError;
 use zuno_tool::{
-    Attachment, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool,
+    Attachment, ToolConcurrencyPolicy, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy,
+    TypedTool,
 };
 
 const DEFAULT_READ_LIMIT: usize = 2_000;
@@ -241,6 +242,10 @@ impl TypedTool for ReadTool {
 
     fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
         ToolConcurrencyPolicy::ParallelSafe
+    }
+
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
     }
 
     async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {

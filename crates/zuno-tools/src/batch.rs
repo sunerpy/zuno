@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use tokio::task::JoinSet;
 use zuno_error::ToolError;
 use zuno_error::source::describe;
-use zuno_tool::{OutputLimits, ToolContext, ToolOutput, ToolOutputStore, TypedTool};
+use zuno_tool::{OutputLimits, ToolContext, ToolEffect, ToolOutput, ToolOutputStore, TypedTool};
 
 /// Maximum declared and expanded sub-calls in one composition.
 pub const MAX_SUBCALLS: usize = 10;
@@ -76,6 +76,10 @@ impl TypedTool for ExecuteTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::Delegating
     }
 
     async fn run(&self, params: ExecuteParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {

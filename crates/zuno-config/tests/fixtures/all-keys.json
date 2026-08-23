@@ -221,6 +221,9 @@
     "skill": "allow",
     "todoread": "allow"
   },
+  "authorization": {
+    "strict": true
+  },
   "tools": {
     "bash": true,
     "webfetch": false

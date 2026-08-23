@@ -36,10 +36,11 @@ provided/required service types, and scrubbed diagnostics without coupling a
 client to the runtime implementation. The TUI projects this inventory today; the
 same value is available to future server, ACP, and GUI surfaces.
 
-## Declarative extension packages
+## Extension packages and executable plugin hosts
 
-Zuno also exposes one validated declarative package protocol for agents, slash-command workflows,
-and skills. It adapts DSH's lifecycle outcome without loading the Cordis/JavaScript ABI:
+Zuno exposes one validated package protocol for agents, slash-command workflows,
+skills, and runtime tools. It adapts DSH's lifecycle outcome without loading the
+Cordis/JavaScript ABI or a Rust dynamic library:
 
 - `extension_define` records an immutable package in the current process and worktree scope.
 - `extension_run` validates the desired package set and stages a pending revision.
@@ -70,12 +71,53 @@ process starts with an empty registry. Static packages live at
 `~/.config/zuno/extensions/<id>/extension.json`, are loaded at composition startup, and require the
 directory name to match the package id. Dynamic and static packages use the same
 `zuno.extension/v1` schema and contribution merger. Duplicate package ids or duplicate
-agent/workflow/skill names across active extension packages fail instead of silently choosing a
-winner. An agent contribution cannot rename its map identity or mark itself disabled.
+agent/workflow/skill/tool names across active extension packages fail instead of
+silently choosing a winner. An agent contribution cannot rename its map identity
+or mark itself disabled.
 
-Declarative packages do not evaluate JavaScript, load a foreign plugin ABI, or load Rust dynamic
-libraries. Executable tools, providers, drivers, approvals, and other typed services remain compiled
-Rust `Component` implementations mounted through a `HarnessProfile`.
+Static packages may declare one executable runtime:
+
+- `kind: "wasi"` loads a Component Model artifact through Wasmtime. Workspace
+  read/write, sockets, and exact environment names are explicit grants. Fuel,
+  linear memory, instance resources, wall time, cancellation, and shutdown are
+  bounded.
+- `kind: "process"` starts a contained executable speaking Zuno's bounded
+  line-delimited JSON-RPC protocol. It must declare `host.full`, because an OS
+  process cannot enforce narrower host authority.
+
+Here “contained” means that the lifecycle host owns and attempts to reap the
+child process tree; it is not an OS security boundary. A `host.full` package is
+fully trusted and must itself be sandboxed at the deployment boundary when its
+code is not trusted.
+
+All package hosts initialize before their tool routing is published. Unload
+withdraws routing and stops hosts in reverse order. Timeout, protocol loss, or a
+cleanup result that cannot prove quiescence becomes `Uncertain` and is never
+replayed. Process-local definitions reject executable runtimes; install
+persistent packages with `zuno plugin add|update|remove|list`.
+
+Extension tools use the native effect, strict-authorization, replay,
+concurrency, and UI-intent pipeline. Version 1 keeps runtime calls exclusive,
+defaults effect to side-effecting and replay to never, and permits safe replay
+only when a WASI capability envelope itself excludes network and workspace
+writes. Process tools are always side-effecting and non-replayable because
+`host.full` cannot enforce a read-only claim. A runtime with no tool consumer is
+rejected.
+
+Configured and extension agents are not prompt-only aliases. Agents whose mode
+is `subagent` or `all` join the exact `task` target roster and retain their
+configured model, variant, prompt, and permissions in the child turn. File,
+network, and environment access comes through the same native tools and
+permission rules as built-in agents: `read`/`glob`/`grep`/`lsp`, `edit`,
+`webfetch`/`web_search`, and `bash`. `bash` inherits the Zuno process
+environment and host visibility and therefore remains a side-effecting,
+approval-governed capability. A workflow that requires one custom agent
+explicitly calls `task` with that `subagent_type`.
+
+Providers, drivers, approvals, and arbitrary typed services remain trusted
+compiled Rust `Component` implementations mounted through a `HarnessProfile`.
+See [plugins, custom agents, and workflows](plugins.md) for manifests,
+capability tables, protocols, and runnable examples.
 
 ## Native agents
 
@@ -204,6 +246,32 @@ Recovery is selected from typed errors, never rendered messages:
 - Authentication failures, user interruption, and a closed event consumer pause the goal for human action.
 - Invalid provider protocol, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal.
 
+### Tool effects and strict authorization
+
+Authorization, replay, and concurrency are independent declarations. Every tool
+classifies each invocation as `ReadOnly`, `UserMediated`, `Delegating`, or
+`SideEffecting`; the default is `SideEffecting`, so an unknown harness or MCP
+tool fails closed. Mixed tools may classify from validated arguments: `bg`
+inspection is read-only and `bg cancel` is side-effecting. `execute` is
+delegating, and each child call passes through the same permission context with
+its own effect.
+
+```json
+{
+  "authorization": {
+    "strict": true
+  }
+}
+```
+
+Strict mode is off by default. When enabled, an explicit deny is evaluated first,
+then every side-effecting invocation requires a fresh attached-user approval even
+when a normal rule or plugin says allow. The ask cannot be satisfied by a standing
+grant or automatic approval and offers no "always" choice. TUI `--auto` yields to
+the human broker; headless surfaces deny the call. Approval covers the same
+tool's internal resource checks for that invocation only, while a later explicit
+resource deny still wins.
+
 Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, session search, job status, LSP inspection, goal status, and web search/fetch.
 
 The loop never mechanically replays a call. It persists the failed tool result and gives it to the model in the next step, including timeouts that might have completed an external side effect before their response was lost. A later recovery turn receives a hidden, SQL-derived notice naming the retry attempt. A `Safe` failure may be attempted again after backoff; a `Never` failure requires authoritative inspection of the worktree or external state before the model decides whether another mutation is appropriate.
@@ -234,6 +302,21 @@ behavior.
 ```
 
 Every value is validated in `1..=64`.
+
+## Native search and shell isolation
+
+`glob` and `grep` use the official `rg` executable as their only search engine.
+Zuno contributes a thin adapter for typed arguments, cancellation, bounded JSON
+decoding, stable ordering, and result shaping; it does not maintain a second
+ripgrep-compatible walker. `rg` major version 14 or newer must be available on
+`PATH` (or packaged beside Zuno by a distributor). Missing or unsupported
+ripgrep is a startup error for the tool runtime, never a silent fallback.
+
+The `bash` tool is not an OS sandbox. Its tree-sitter command analysis,
+deterministic destructive-command gate, permission checks, process-tree
+containment, working directory, and time limits reduce accidental execution
+risk, but the child still inherits the Zuno process's filesystem, network, and
+credentials. Strict authorization adds HITL; it does not add confinement.
 
 ## Background command execution
 

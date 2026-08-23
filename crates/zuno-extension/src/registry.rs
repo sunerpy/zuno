@@ -44,6 +44,8 @@ pub struct PackageStatus {
     pub agents: Vec<String>,
     pub workflows: Vec<String>,
     pub skills: Vec<String>,
+    pub tools: Vec<String>,
+    pub runtime: Option<String>,
 }
 
 /// Token identifying one prepared composition mutation.
@@ -338,6 +340,9 @@ impl ExtensionRegistry {
 
     pub fn define(&self, scope: &Scope, package: Package) -> Result<(), RegistryError> {
         package.validate().map_err(RegistryError::Manifest)?;
+        if package.runtime.is_some() {
+            return Err(RegistryError::DynamicExecutable(package.id));
+        }
         let mut scopes = self.write();
         let scoped = scopes.entry(scope.clone()).or_default();
         reject_uncertain(scoped)?;
@@ -681,6 +686,11 @@ fn status(package: &Package, state: DynamicState) -> PackageStatus {
             .iter()
             .map(|skill| skill.name.clone())
             .collect(),
+        tools: package.tools.keys().map(str::to_owned).collect(),
+        runtime: package.runtime.as_ref().map(|runtime| match runtime {
+            crate::PluginRuntime::Wasi { .. } => "wasi".to_owned(),
+            crate::PluginRuntime::Process { .. } => "process".to_owned(),
+        }),
     }
 }
 
@@ -692,6 +702,10 @@ pub enum RegistryError {
     AlreadyDefined(String),
     #[error("extension package `{0}` is not defined in this process")]
     NotFound(String),
+    #[error(
+        "process-local extension package `{0}` cannot declare executable runtime code; install it as a static package"
+    )]
+    DynamicExecutable(String),
     #[error("extension package activation failed")]
     Activation(#[source] Box<crate::resolve::ResolveError>),
     #[error(

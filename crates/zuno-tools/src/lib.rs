@@ -2,10 +2,9 @@
 //!
 //! # Search
 //!
-//! [`glob`] matches paths and [`grep`] searches contents, both over
-//! [`zuno_search`]'s embedded engine. Nothing here downloads a ripgrep binary, which
-//! the oracle does on first search; a system `rg` is reachable only through
-//! [`zuno_search::Backend::from_env`] and is never selected implicitly.
+//! [`glob`] matches paths and [`grep`] searches contents through the official
+//! `rg` executable. Zuno does not maintain a second ripgrep-compatible walker or
+//! download an executable during a tool call.
 //!
 //! # The web tools
 //!

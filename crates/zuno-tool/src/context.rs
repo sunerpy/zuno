@@ -32,6 +32,8 @@ use std::sync::Arc;
 use zuno_error::ToolError;
 use zuno_permission::{PermissionRequest, ToolCall};
 
+use crate::ToolEffect;
+
 /// The cancellation signal a running tool observes.
 ///
 /// See the module docs for why this is a trait rather than `zuno-engine`'s concrete
@@ -90,6 +92,14 @@ pub struct PermissionAsk {
     pub metadata: Map<String, Value>,
     /// Patterns an "always" reply should install a standing grant for.
     pub always: Vec<String>,
+    /// Effect of the tool invocation this ask protects, when known.
+    ///
+    /// Tool-internal resource checks leave this unset. Dispatch and composed-call
+    /// boundaries set it so strict authorization can distinguish reads from
+    /// mutations without guessing from the permission name.
+    pub tool_effect: Option<ToolEffect>,
+    /// Require a fresh attached-user decision and forbid standing or automatic approval.
+    pub manual: bool,
 }
 
 impl PermissionAsk {
@@ -101,7 +111,24 @@ impl PermissionAsk {
             patterns: vec![pattern.into()],
             metadata: Map::new(),
             always: Vec::new(),
+            tool_effect: None,
+            manual: false,
         }
+    }
+
+    /// Attach the classified effect of the invocation this ask protects.
+    #[must_use]
+    pub fn with_tool_effect(mut self, effect: ToolEffect) -> Self {
+        self.tool_effect = Some(effect);
+        self
+    }
+
+    /// Convert this ask into a fresh human-only decision.
+    #[must_use]
+    pub fn require_manual(mut self) -> Self {
+        self.manual = true;
+        self.always.clear();
+        self
     }
 
     /// Completes the ask into the request the permission engine evaluates.

@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Mutex, PoisonError};
 use zuno_error::ToolError;
-use zuno_tool::{ToolContext, ToolOutput, TypedTool};
+use zuno_tool::{ToolContext, ToolEffect, ToolOutput, TypedTool};
 
 /// The id the model calls. Registry key and wire id agree (`registry.ts:218`).
 pub const WIRE_ID: &str = "question";
@@ -349,6 +349,10 @@ impl TypedTool for QuestionTool {
 
     fn description(&self) -> &str {
         DESCRIPTION
+    }
+
+    fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
+        ToolEffect::UserMediated
     }
 
     async fn run(&self, params: QuestionParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {

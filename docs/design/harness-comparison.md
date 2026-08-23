@@ -1,6 +1,6 @@
 # Harness design comparison
 
-Status: 2026-08-22.
+Status: 2026-08-23.
 
 This document records which ideas Zuno adopts from other agent harnesses. The source projects are references, not runtime compatibility targets.
 
@@ -55,9 +55,14 @@ Zuno adapts:
 - Cordis plugins become Rust components and typed services;
 - `cordis.yml` composition becomes `HarnessProfile` plus Zuno config;
 - Cordis' define/run/stop/undefine lifecycle becomes validated
-  `zuno.extension/v1` agent/workflow/skill packages with committed versus desired
-  revisions, active-consumer leases, exclusive transition reservations,
-  process-local and static lifetimes, and no JavaScript ABI;
+  `zuno.extension/v1` packages with committed versus desired revisions,
+  active-consumer leases, exclusive transition reservations, process-local and
+  static lifetimes, and no JavaScript ABI;
+- DSH's runtime plugin ergonomics become static WASI Component Model packages
+  with explicit workspace/network/environment grants, or contained
+  `host.full` processes when a guest needs unrestricted host APIs. Rust dynamic
+  libraries remain rejected because unload safety and ABI compatibility cannot
+  be proven;
 - worker-thread orchestration becomes Tokio tasks with durable SQLite coordination.
 - product-owned Codex and Claude Code subagents become native Rust protocol
   providers, static Zuno tools, and durable `ProductAgent` jobs rather than a
@@ -97,7 +102,9 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | --- | --- | --- |
 | Everything is a plugin | adopt | Side-effect-free `Component::prepare`, typed services, deferred `EffectScope`, lifecycle diagnostics, `ProfileBundle`, transactional `HarnessProfile` |
 | Agent-authored temporary extensions | adapt | Process-local immutable package registry plus `extension_define/run/stop/undefine/inspect`; committed/desired revisions publish only after old host leases are quiescent and the candidate starts |
-| Restart-persistent extension bundles | adapt | Static `.zuno/extensions/<id>/extension.json` packages using the same schema and merger |
+| Restart-persistent extension bundles | adapt | Static `.zuno/extensions/<id>/extension.json` packages using the same schema and merger; `zuno plugin add/update/remove/list` owns transactional filesystem installation |
+| Runtime-loadable executable plugins | adapt | WASI Component Model tools with explicit grants and budgets, plus a contained `host.full` process fallback; both are deferred effects with reverse shutdown and `Uncertain` outcomes, while Rust dylibs and the JavaScript/Cordis ABI remain rejected |
+| Custom agent/workflow capabilities | adapt | Extension agents enter the native `task` roster and use native file, network, environment, permission, strict-HITL, model, and child-session paths; workflows delegate through the normal `task` tool |
 | Capability roles | adopt | interface/provider/consumer ownership in separate crates or modules |
 | Model-visible means logged | adopt | durable inbox, tool results, retry notices, `session.prompt.assembled` |
 | Stable client projections | adopt | cursor replay plus snapshots shared by TUI/server/ACP/future GUI |

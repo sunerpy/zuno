@@ -24,14 +24,22 @@ use std::process::Command;
 /// be "fixed" by loosening the check until it stopped catching the real thing.
 const OPENSSL_CRATES: &[&str] = &["openssl", "openssl-sys", "openssl-src", "native-tls"];
 
-/// The WebAssembly runtime, matched as crate *families*.
+/// The WebAssembly runtime intentionally shipped for constrained WASI plugins,
+/// matched as crate *families*.
 ///
-/// Unlike the OpenSSL list these are prefixes: Wasmtime resolves to dozens of
+/// Unlike the OpenSSL list these are prefixes: Wasmtime resolves to many
 /// packages (`wasmtime-cranelift`, `cranelift-codegen`, `wasmparser`,
-/// `wasmtime-environ`, …) and naming each one would go stale on the next release.
-/// A family match is safe here and unsafe for OpenSSL, where a legitimate
-/// `openssl-probe` sits right next to the banned `openssl-sys`.
+/// `wasmtime-environ`, …). The release gate checks the two public host crates
+/// exactly and uses this family matcher only to guard the graph inspection helper.
 const WASM_RUNTIME_FAMILIES: &[&str] = &["wasmtime", "cranelift", "wasmparser", "wasm-encoder"];
+
+/// Native dynamic-library loaders are not a supported plugin ABI.
+///
+/// Runtime-loadable Rust code uses the WASI Component Model or a contained process;
+/// loading an arbitrary `.so`/`.dylib`/`.dll` would make unload safety and Rust ABI
+/// compatibility unverifiable.
+const DYNAMIC_PLUGIN_LOADER_CRATES: &[&str] =
+    &["abi_stable", "dlopen", "dlopen2", "libffi", "libloading"];
 
 /// Packages whose presence proves TLS is still *there*, in rustls form.
 ///
@@ -237,21 +245,23 @@ fn explain(offenders: &[&String]) -> String {
 }
 
 #[test]
-fn the_shipped_binary_pulls_in_no_wasm_runtime() {
+fn the_shipped_binary_contains_the_wasi_component_host() {
     let graph = default_graph(&["-p", "zuno-cli"]);
     assert!(
         graph.len() >= MINIMUM_GRAPH_PACKAGES,
         "the graph for zuno-cli has only {} packages; this assertion would pass vacuously",
         graph.len()
     );
-    let offenders = family_matches(&graph, WASM_RUNTIME_FAMILIES);
+    for required in ["wasmtime", "wasmtime-wasi"] {
+        assert!(
+            contains_package(&graph, required),
+            "the shipped binary has no `{required}`; runtime-loadable WASI component \
+             plugins would be advertised without an executable host"
+        );
+    }
     assert!(
-        offenders.is_empty(),
-        "the shipped binary's graph contains a WebAssembly runtime: {offenders:?}\n\
-         native harness profiles must not pull a JIT into published artifacts; \
-         that would change the security and size profile entirely.\n\
-         How each one got in:\n{}",
-        explain(&offenders)
+        !family_matches(&graph, WASM_RUNTIME_FAMILIES).is_empty(),
+        "the WASI host crates are present but the family matcher saw no runtime packages"
     );
 }
 
@@ -266,29 +276,41 @@ fn the_shipped_binary_has_no_legacy_plugin_runtime() {
     for legacy in ["zuno-plugin", "zuno-plugin-sdk"] {
         assert!(
             !contains_package(&graph, legacy),
-            "the shipped binary still depends on `{legacy}`; Zuno-native profiles and \
-             components are the only supported extension runtime\n{}",
+            "the shipped binary still depends on legacy crate `{legacy}`; the current \
+             plugin host lives in `zuno-extension` and exposes no old Rust plugin ABI\n{}",
             inverted_path(legacy)
         );
     }
 }
 
 #[test]
-fn the_default_workspace_graph_pulls_in_no_wasm_runtime() {
+fn the_shipped_binary_has_no_native_dynamic_plugin_loader() {
+    let graph = default_graph(&["-p", "zuno-cli"]);
+    let offenders = exact_matches(&graph, DYNAMIC_PLUGIN_LOADER_CRATES);
+    assert!(
+        offenders.is_empty(),
+        "the shipped binary contains a native dynamic-library plugin loader: \
+         {offenders:?}\nRuntime-loadable plugins must use WASI components or a \
+         contained process.\nHow each one got in:\n{}",
+        explain(&offenders)
+    );
+}
+
+#[test]
+fn the_default_workspace_graph_contains_the_wasi_component_host() {
     let graph = default_graph(&["--workspace"]);
     assert!(
         graph.len() >= MINIMUM_GRAPH_PACKAGES,
         "the workspace graph has only {} packages; this assertion would pass vacuously",
         graph.len()
     );
-    let offenders = family_matches(&graph, WASM_RUNTIME_FAMILIES);
-    assert!(
-        offenders.is_empty(),
-        "the default workspace graph contains a WebAssembly runtime: \
-         {offenders:?}\n\
-         How each one got in:\n{}",
-        explain(&offenders)
-    );
+    for required in ["wasmtime", "wasmtime-wasi"] {
+        assert!(
+            contains_package(&graph, required),
+            "the workspace graph has no `{required}`; the release graph is not \
+             exercising the plugin runtime"
+        );
+    }
 }
 
 // ─── The unsafe gate ────────────────────────────────────────────────────────

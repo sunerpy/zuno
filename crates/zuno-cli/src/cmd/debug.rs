@@ -6,7 +6,7 @@ use zuno_catalog::lsp_config::ResolvedLsp;
 use zuno_catalog::skill::discovery::SkillOptions;
 use zuno_config::schema::Config;
 use zuno_lsp::{Manager, RestartPolicy, ServerRegistry};
-use zuno_search::{Backend, GlobRequest, GrepRequest, NeverCancelled};
+use zuno_search::{GlobRequest, GrepRequest, NeverCancelled, Ripgrep};
 use zuno_snapshot::{Location, Store};
 
 use crate::command::{
@@ -202,7 +202,7 @@ fn skill(context: &Context) -> Result<(), String> {
 }
 
 fn rg(command: &DebugRgCommand, context: &Context) -> Result<(), String> {
-    let backend = Backend::from_env();
+    let ripgrep = Ripgrep::discover().map_err(to_string)?;
     match command {
         DebugRgCommand::Files {
             query: _,
@@ -214,7 +214,7 @@ fn rg(command: &DebugRgCommand, context: &Context) -> Result<(), String> {
                 glob.as_deref().unwrap_or("**/*"),
                 limit.unwrap_or(10_000),
             );
-            let result = backend.glob(&request, &NeverCancelled).map_err(to_string)?;
+            let result = ripgrep.glob(&request, &NeverCancelled).map_err(to_string)?;
             for entry in result.items {
                 println!("{}", entry.path);
             }
@@ -230,7 +230,7 @@ fn rg(command: &DebugRgCommand, context: &Context) -> Result<(), String> {
             if let Some(include) = combined_glob(glob) {
                 request = request.with_include(Some(include));
             }
-            let result = backend.grep(&request, &NeverCancelled).map_err(to_string)?;
+            let result = ripgrep.grep(&request, &NeverCancelled).map_err(to_string)?;
             print_json(&result.items)
         }
     }

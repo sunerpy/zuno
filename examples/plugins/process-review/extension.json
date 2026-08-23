@@ -1,0 +1,36 @@
+{
+  "apiVersion": "zuno.extension/v1",
+  "id": "process-review",
+  "description": "Example contained process plugin with one executable review tool.",
+  "runtime": {
+    "kind": "process",
+    "command": "python3",
+    "args": [
+      "plugin.py"
+    ],
+    "capabilities": [
+      "host.full"
+    ],
+    "timeoutMs": 30000
+  },
+  "tools": {
+    "review_outline": {
+      "description": "Create a compact review checklist for a named subject.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string",
+            "description": "The change or system to review."
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "additionalProperties": false
+      },
+      "effect": "sideEffecting",
+      "replay": "never"
+    }
+  }
+}

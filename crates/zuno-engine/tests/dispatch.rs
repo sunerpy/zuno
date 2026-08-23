@@ -12,7 +12,7 @@ use zuno_engine::r#loop::{DispatchRequest, ToolCall, ToolDispatcher};
 use zuno_error::ToolError;
 use zuno_llm::cache::McpToolStatus;
 use zuno_permission::{PermissionAction, Rule};
-use zuno_tool::{PermissionAsk, PermissionAsker, Tool, ToolContext, ToolOutput};
+use zuno_tool::{PermissionAsk, PermissionAsker, Tool, ToolContext, ToolEffect, ToolOutput};
 
 #[derive(Default)]
 struct RecordingApprover {
@@ -66,6 +66,7 @@ struct RecordingTool {
     id: &'static str,
     calls: Arc<AtomicUsize>,
     events: Option<Arc<Mutex<Vec<String>>>>,
+    effect: ToolEffect,
 }
 
 impl RecordingTool {
@@ -74,6 +75,16 @@ impl RecordingTool {
             id,
             calls,
             events: None,
+            effect: ToolEffect::SideEffecting,
+        }
+    }
+
+    fn read_only(id: &'static str, calls: Arc<AtomicUsize>) -> Self {
+        Self {
+            id,
+            calls,
+            events: None,
+            effect: ToolEffect::ReadOnly,
         }
     }
 
@@ -86,6 +97,7 @@ impl RecordingTool {
             id,
             calls,
             events: Some(events),
+            effect: ToolEffect::SideEffecting,
         }
     }
 }
@@ -111,6 +123,10 @@ impl Tool for RecordingTool {
         })
     }
 
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        self.effect
+    }
+
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some(events) = &self.events {
@@ -120,6 +136,37 @@ impl Tool for RecordingTool {
                 .push("execute".to_owned());
         }
         Ok(ToolOutput::text(self.id, args["command"].to_string()))
+    }
+}
+
+struct InternallyGatedTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for InternallyGatedTool {
+    fn id(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        "Exercise one tool-owned permission check after dispatch authorization."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, _args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        ctx.ask("bash", PermissionAsk::new("bash", "nested command"))
+            .await?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("bash", "done"))
     }
 }
 
@@ -246,7 +293,13 @@ fn dispatcher(
     rules: Vec<Rule>,
     approver: Arc<dyn PermissionAsker>,
 ) -> ToolRegistryDispatcher {
-    ToolRegistryDispatcher::new(tools, rules, approver, McpToolStatus::Ready)
+    ToolRegistryDispatcher::new(
+        tools,
+        rules,
+        approver,
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    )
 }
 
 #[derive(Default)]
@@ -305,6 +358,162 @@ impl ToolHooks for AllowingHooks {
 }
 
 #[tokio::test]
+async fn strict_authorization_forces_fresh_manual_approval_despite_allows() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![allow_all_rule()],
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Strict,
+        McpToolStatus::Ready,
+    )
+    .with_hooks(Arc::new(AllowingHooks));
+
+    for index in 0..2 {
+        let result = dispatcher
+            .dispatch(request(
+                &dispatcher,
+                &format!("call-strict-{index}"),
+                "bash",
+                json!({"command": "git status", "intent": "inspect"}),
+            ))
+            .await;
+        assert!(!result.is_error, "{}", result.output.output);
+    }
+
+    let asks = approver.asks();
+    assert_eq!(asks.len(), 2, "strict approval was remembered across calls");
+    assert!(asks.iter().all(|ask| ask.manual));
+    assert!(asks.iter().all(|ask| ask.always.is_empty()));
+    assert!(
+        asks.iter()
+            .all(|ask| ask.tool_effect == Some(ToolEffect::SideEffecting))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn strict_authorization_does_not_add_prompts_to_read_only_tools() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RecordingTool::read_only(
+            "grep",
+            Arc::clone(&calls),
+        ))],
+        vec![allow_all_rule()],
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Strict,
+        McpToolStatus::Ready,
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-strict-read",
+            "grep",
+            json!({"command": "needle", "intent": "inspect"}),
+        ))
+        .await;
+
+    assert!(!result.is_error, "{}", result.output.output);
+    assert!(approver.asks().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn strict_authorization_keeps_explicit_denies_terminal() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![allow_all_rule(), deny_rule("bash", "rm -rf /")],
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Strict,
+        McpToolStatus::Ready,
+    )
+    .with_hooks(Arc::new(AllowingHooks));
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-strict-deny",
+            "bash",
+            json!({"command": "rm -rf /", "intent": "must remain denied"}),
+        ))
+        .await;
+
+    assert!(result.is_error);
+    assert!(approver.asks().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn strict_dispatch_approval_covers_the_same_tools_internal_gate_once() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(InternallyGatedTool {
+            calls: Arc::clone(&calls),
+        })],
+        Vec::new(),
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Strict,
+        McpToolStatus::Ready,
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-strict-internal",
+            "bash",
+            json!({"command": "printf ok", "intent": "run one command"}),
+        ))
+        .await;
+
+    assert!(!result.is_error, "{}", result.output.output);
+    assert_eq!(approver.asks().len(), 1, "the tool was prompted twice");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn strict_dispatch_approval_does_not_hide_a_later_explicit_resource_deny() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(InternallyGatedTool {
+            calls: Arc::clone(&calls),
+        })],
+        vec![deny_rule("bash", "nested command")],
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Strict,
+        McpToolStatus::Ready,
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-strict-internal-deny",
+            "bash",
+            json!({"command": "printf ok", "intent": "run one command"}),
+        ))
+        .await;
+
+    assert!(result.is_error);
+    assert_eq!(
+        approver.asks().len(),
+        1,
+        "the top-level manual ask was lost"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "an explicit nested resource deny was bypassed"
+    );
+}
+
+#[tokio::test]
 async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
@@ -312,6 +521,7 @@ async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         vec![allow_all_rule(), deny_rule("bash", "rm -rf /")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
     )
     .with_hooks(Arc::new(AllowingHooks));
@@ -363,6 +573,7 @@ async fn production_dispatch_rewrites_arguments_before_permission_and_execution(
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         vec![deny_rule("bash", "original")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
     )
     .with_hooks(Arc::new(MutatingHooks));
@@ -390,6 +601,7 @@ async fn a_plugin_allow_resolves_an_ask_without_prompting() {
         vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
         Vec::new(),
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
     )
     .with_hooks(Arc::new(AllowingHooks));

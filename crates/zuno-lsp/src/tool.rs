@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zuno_error::ToolError;
 use zuno_tool::{
-    PermissionAsk, Tool, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy,
-    TypedTool, erase,
+    PermissionAsk, Tool, ToolConcurrencyPolicy, ToolContext, ToolEffect, ToolOutput,
+    ToolReplayPolicy, TypedTool, erase,
 };
 
 const DESCRIPTION: &str = "Interact with language servers for definitions, references, hover information, symbols, implementations, and call hierarchies.";
@@ -134,6 +134,10 @@ impl TypedTool for LspTool {
         ToolConcurrencyPolicy::ParallelSafe
     }
 
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
     async fn run(&self, params: LspParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         if params.line == 0 || params.character == 0 {
             return Err(ToolError::InvalidArgs {
@@ -171,6 +175,7 @@ impl TypedTool for LspTool {
                 patterns: vec!["*".to_owned()],
                 metadata,
                 always: vec!["*".to_owned()],
+                ..PermissionAsk::default()
             },
         )
         .await?;

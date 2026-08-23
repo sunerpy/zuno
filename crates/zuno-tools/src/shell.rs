@@ -356,6 +356,7 @@ impl ShellTool {
                     patterns: patterns.clone(),
                     metadata,
                     always: patterns,
+                    ..PermissionAsk::default()
                 },
             )
             .await?;
@@ -384,6 +385,7 @@ impl ShellTool {
                     .iter()
                     .map(|resource| resource.always.clone())
                     .collect(),
+                ..PermissionAsk::default()
             },
         )
         .await

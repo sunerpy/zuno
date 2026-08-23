@@ -419,6 +419,49 @@ fn valid_targets_are_the_rosters_and_exclude_the_coordinator() {
 }
 
 #[tokio::test]
+async fn a_composition_can_replace_the_native_roster_with_custom_agents() {
+    let host = Arc::new(RecordingHost::new());
+    let targets = DelegationTargets::new(vec!["release-reviewer".to_owned()])
+        .expect("custom target is valid");
+    tool(Arc::clone(&host))
+        .with_targets(targets)
+        .run(
+            TaskParams {
+                subagent_type: Some("release-reviewer".to_owned()),
+                ..params("review the release")
+            },
+            allowed(),
+        )
+        .await
+        .expect("the resolved custom target is reachable");
+
+    assert_eq!(host.dispatched()[0].agent, "release-reviewer");
+    let error = tool(Arc::new(RecordingHost::new()))
+        .with_targets(
+            DelegationTargets::new(vec!["release-reviewer".to_owned()])
+                .expect("custom target is valid"),
+        )
+        .run(to_explorer(), allowed())
+        .await
+        .expect_err("an omitted native target must not remain reachable");
+    assert!(message(&error).contains("Unknown agent `explorer`"));
+}
+
+#[test]
+fn composition_targets_reject_duplicates_and_the_coordinator() {
+    assert_eq!(
+        DelegationTargets::new(vec!["reviewer".to_owned(), "reviewer".to_owned()])
+            .expect_err("duplicates are ambiguous"),
+        DelegationTargetError::Duplicate("reviewer".to_owned())
+    );
+    assert_eq!(
+        DelegationTargets::new(vec![COORDINATOR.to_owned()])
+            .expect_err("the coordinator cannot recurse"),
+        DelegationTargetError::Coordinator
+    );
+}
+
+#[tokio::test]
 async fn a_vision_gated_target_is_unreachable_until_the_catalog_offers_one() {
     let looker = valid_targets(true)
         .into_iter()

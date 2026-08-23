@@ -61,6 +61,30 @@ fn harness_guide_documents_the_native_extension_contract() {
 }
 
 #[test]
+fn plugin_guide_documents_capabilities_protocols_and_examples() {
+    contains_all(
+        "docs/plugins.md",
+        &[
+            "zuno plugin add",
+            "zuno plugin update",
+            "workspace.read",
+            "workspace.write",
+            "`network`",
+            "`environment` names",
+            "`host.full`",
+            "authorization.strict",
+            "subagent_type",
+            "memoryMiB",
+            "zuno.plugin/1",
+            "wit/zuno-plugin/plugin.wit",
+            "examples/plugins/review-kit",
+            "examples/plugins/wasi-word-count",
+            "examples/plugins/process-review",
+        ],
+    );
+}
+
+#[test]
 fn architecture_documents_pin_the_native_harness_decisions() {
     contains_all(
         "AGENTS.md",
@@ -146,6 +170,7 @@ fn readmes_document_extension_examples_and_do_not_advertise_compatibility() {
             "session.prompt.assembled",
             "design/harness-comparison.md",
             "design/client-interfaces.md",
+            "plugins.md",
         ] {
             assert!(
                 text.contains(required),

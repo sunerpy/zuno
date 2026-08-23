@@ -2,7 +2,7 @@
 //!
 //! Every variant names the thing that went wrong precisely enough that the caller
 //! can decide whether the *model* can fix it (a bad regex, a path that is a file)
-//! or whether it cannot (a missing root, a cancelled walk). `zuno-tools` maps these
+//! or whether it cannot (a missing root, a cancelled process). `zuno-tools` maps these
 //! onto [`zuno_error::ToolError`] on that basis, which is why there is no
 //! `Other(String)` here to launder an unclassified failure through.
 
@@ -49,7 +49,7 @@ pub enum SearchError {
         message: String,
     },
 
-    /// The interrupt fired while walking or searching.
+    /// The interrupt fired while `rg` was running.
     ///
     /// Raised rather than returning the partial results collected so far: a
     /// truncated result set that does not say it is truncated would be read by the
@@ -57,17 +57,11 @@ pub enum SearchError {
     #[error("search was cancelled")]
     Cancelled,
 
-    /// Reading a file's contents failed in a way the walk could not skip past.
-    #[error("reading {path} failed")]
-    Read {
-        /// The file being read.
-        path: PathBuf,
-        /// The underlying I/O failure.
-        #[source]
-        source: std::io::Error,
-    },
+    /// No supported official `rg` executable is available.
+    #[error("{message}")]
+    Unavailable { message: String },
 
-    /// A system `rg` binary was selected but could not be started.
+    /// The official `rg` binary could not be started.
     #[error("spawning the ripgrep binary {program} failed")]
     Spawn {
         /// The binary that could not be started.
@@ -77,8 +71,8 @@ pub enum SearchError {
         source: std::io::Error,
     },
 
-    /// A system `rg` binary ran and failed for a reason other than a bad pattern.
-    #[error("the ripgrep backend failed: {message}")]
+    /// The official `rg` binary ran and failed for a reason other than a bad pattern.
+    #[error("ripgrep failed: {message}")]
     Ripgrep {
         /// `rg`'s own diagnostics, trimmed.
         message: String,

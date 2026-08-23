@@ -1,6 +1,9 @@
 {
   "model": "myopenai/primary-model",
   "small_model": "myopenai/fast-model",
+  "authorization": {
+    "strict": false
+  },
   "concurrency": {
     "tool_calls": 8,
     "mcp_connections": 8,

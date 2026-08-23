@@ -14,7 +14,8 @@ use serde_json::json;
 use zuno_error::ToolError;
 use zuno_search::GlobRequest;
 use zuno_tool::{
-    PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, TypedTool,
+    PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy,
+    TypedTool,
 };
 
 /// The description the model reads, verbatim from `tool/glob.txt`.
@@ -68,6 +69,10 @@ impl TypedTool for GlobTool {
         ToolConcurrencyPolicy::ParallelSafe
     }
 
+    fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
     async fn run(&self, params: GlobParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         // Asked before anything is resolved or stat'd, which is the oracle's order
         // (`glob.ts:28-36`): the gate sees the call as the model wrote it.
@@ -101,7 +106,7 @@ impl TypedTool for GlobTool {
         let cancel = InterruptCancellation::from_context(&ctx);
         let results = self
             .tooling
-            .backend
+            .ripgrep
             .glob(&request, &cancel)
             .map_err(|error| map_search_error(self.id(), error))?;
 
@@ -275,12 +280,12 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("packages/app")).expect("a subdirectory");
         std::fs::write(dir.path().join("packages/app/a.ts"), "x").expect("a fixture file");
 
-        let tooling = SearchTooling::with_backend(
+        let tooling = SearchTooling::with_ripgrep(
             crate::search_common::SearchScope::with_worktree(
                 dir.path().join("packages/app"),
                 dir.path(),
             ),
-            zuno_search::Backend::embedded(),
+            zuno_search::Ripgrep::new("rg"),
         );
 
         let output = erase(GlobTool::new(tooling))

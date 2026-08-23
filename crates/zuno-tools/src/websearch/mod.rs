@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use zuno_error::{BoxSource, ToolError};
 use zuno_tool::{
-    InterruptHandle, PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput,
+    InterruptHandle, PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolEffect, ToolOutput,
     ToolReplayPolicy, TypedTool,
 };
 
@@ -277,6 +277,10 @@ impl TypedTool for WebSearchTool {
         ToolConcurrencyPolicy::ParallelSafe
     }
 
+    fn effect(&self, _args: &serde_json::Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+
     async fn run(
         &self,
         params: WebSearchParams,
@@ -296,6 +300,7 @@ impl TypedTool for WebSearchTool {
                 .expect("object")
                 .clone(),
                 always: vec!["*".to_owned()],
+                ..PermissionAsk::default()
             },
         )
         .await?;

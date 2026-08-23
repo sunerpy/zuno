@@ -9,6 +9,7 @@ This directory is organized so it can be projected into a documentation site wit
 - [Provider authentication](design/provider-authentication.md): credential precedence, login-method registration, OpenAI API keys, and ChatGPT OAuth.
 - [Codex and Claude Code product agents](design/product-agents.md): native product protocols, permissions, background jobs, cancellation, and credential ownership.
 - [Harness runtime](harness-runtime.md): components, profiles, durable delivery, goals, and recovery.
+- [Plugins, custom agents, and workflows](plugins.md): package installation, WASI/process runtimes, capabilities, protocols, and examples.
 - [Client interfaces](design/client-interfaces.md): TUI, HTTP, ACP, and future GUI ownership.
 - [Memory learning](design/memory-learning.md): durable candidates, reflection, review, promotion, and undo.
 

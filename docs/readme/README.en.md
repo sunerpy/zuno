@@ -101,11 +101,18 @@ model, mode, permissions, and steps, and the body becomes a traced prompt sectio
 description: Review a change for security and authorization defects
 mode: subagent
 permission:
-  edit: deny
-  bash: deny
+  "*": deny
+  read: allow
+  glob: allow
+  grep: allow
+  lsp: allow
+  webfetch: allow
+  web_search: allow
+  bash: ask
 ---
 
-Inspect trust boundaries, permission checks, durable state, and failure behavior.
+Inspect repository files, relevant environment facts, current external evidence,
+trust boundaries, permission checks, durable state, and failure behavior.
 Return findings with exact file locations.
 ```
 
@@ -118,7 +125,33 @@ exiting Zuno loses process-local definitions.
 For restart-persistent loading, write the same manifest to
 `.zuno/extensions/<id>/extension.json` (or
 `~/.config/zuno/extensions/<id>/extension.json`) and restart. Both lifetimes use one validator and
-collision checker. They do not evaluate JavaScript/Cordis plugins or load Rust dynamic libraries.
+collision checker. Extension agents with mode `subagent` or `all` join the real
+`task` target roster and retain their model, prompt, and native tool permissions
+inside the child session. File access comes from `read`/`glob`/`grep`/`lsp`/`edit`,
+network access from `webfetch`/`web_search`, and environment or ordinary process
+access from permission-governed `bash`. Strict authorization still applies fresh
+HITL to every side effect.
+
+Static packages may also register executable tools. Prefer an in-process WASI
+component with explicit workspace, network, and environment grants plus fuel,
+memory, and wall-time bounds. Use a contained `host.full` process only when the
+plugin needs unrestricted host APIs. Both are profile effects: unload withdraws
+routing before reverse asynchronous cleanup, and an unprovable stop becomes
+`Uncertain` without replay. Zuno neither evaluates the JavaScript/Cordis ABI nor
+loads Rust dynamic libraries.
+`host.full`, WASI `network`, and WASI `workspace.write` tools cannot claim
+read-only or safe-replay policy, so a manifest cannot use those grants to bypass
+strict authorization.
+
+```sh
+zuno plugin add examples/plugins/review-kit --project
+zuno plugin list
+zuno plugin update examples/plugins/review-kit --project
+zuno plugin remove review-kit --project
+```
+
+See [the plugin guide](../plugins.md) for manifests, capability tables,
+WIT/JSON-RPC protocols, and custom agent, workflow, WASI, and process examples.
 
 A native workflow does not modify the default loop. Implement `AgentDriver`, select a
 model-visible `ToolManifest`, contribute any native tools, and activate the result as one
@@ -148,6 +181,7 @@ durable events, the inbox, and projections. See the
 | Page                                                  | Purpose                                                                  |
 | ----------------------------------------------------- | ------------------------------------------------------------------------ |
 | [Harness Runtime](../harness-runtime.md)              | Native components, profile transactions, durable input, custom harnesses |
+| [Plugins](../plugins.md)                              | Installation, agents/workflows, WASI/process grants, and protocols       |
 | [Harness comparison](../design/harness-comparison.md) | Decisions from DSH, Codex, OMO, pi-agent, OpenCode, and Claw Code        |
 | [Client interfaces](../design/client-interfaces.md)   | Shared events and projections for TUI, ACP, HTTP, and a future GUI       |
 | [Memory learning](../design/memory-learning.md)       | Auditable candidates, reflection, review, promotion, and undo            |

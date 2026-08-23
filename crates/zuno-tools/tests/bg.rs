@@ -1,11 +1,12 @@
 #![cfg(unix)]
 
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 use zuno_pty::{BackgroundExecutionInput, BackgroundExecutionService};
-use zuno_tool::{AllowAll, NeverInterrupted, ToolContext, ToolReplayPolicy, TypedTool};
+use zuno_tool::{AllowAll, NeverInterrupted, ToolContext, ToolEffect, ToolReplayPolicy, TypedTool};
 use zuno_tools::{BackgroundAction, BackgroundParams, BackgroundTool};
 
 fn context(session_id: &str) -> ToolContext {
@@ -152,5 +153,24 @@ fn mixed_read_and_cancel_surface_is_never_replayable() {
     assert_eq!(
         BackgroundTool::new(service).replay_policy(),
         ToolReplayPolicy::Never
+    );
+}
+
+#[test]
+fn strict_effect_is_dynamic_for_background_actions() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service =
+        Arc::new(BackgroundExecutionService::open(directory.path()).expect("background service"));
+    let tool = BackgroundTool::new(service);
+    for action in ["list", "output", "wait"] {
+        assert_eq!(
+            tool.effect(&json!({"action": action})),
+            ToolEffect::ReadOnly,
+            "{action}"
+        );
+    }
+    assert_eq!(
+        tool.effect(&json!({"action": "cancel"})),
+        ToolEffect::SideEffecting
     );
 }

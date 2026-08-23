@@ -420,7 +420,7 @@ fn execute_once(
     let broker = Arc::new(PermissionBroker::new(terminal_sender.clone()));
     let question_broker = Arc::new(QuestionBroker::new(terminal_sender.clone()));
     let question: Arc<dyn QuestionAsker> = Arc::clone(&question_broker) as Arc<dyn QuestionAsker>;
-    let approval: Arc<dyn PermissionAsker> = if args.auto {
+    let approval: Arc<dyn PermissionAsker> = if args.auto && !plan.config().strict_authorization() {
         Arc::new(AutoApproval)
     } else {
         Arc::clone(&broker) as Arc<dyn PermissionAsker>

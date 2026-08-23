@@ -29,6 +29,12 @@ fn bridge(broker: &Arc<PermissionBroker>) -> PermissionBridge {
     PermissionBridge::new(context, Arc::clone(broker), host)
 }
 
+fn reusable_ask(permission: &str, pattern: &str) -> PermissionAsk {
+    let mut ask = PermissionAsk::new(permission, pattern);
+    ask.always = vec![pattern.to_owned()];
+    ask
+}
+
 fn resize() -> AppEvent {
     AppEvent::Terminal(TerminalEvent::Resize {
         width: 80,
@@ -138,7 +144,7 @@ async fn answer_through_production_keys(
     let (broker, mut wake) = broker();
     let asking = {
         let broker = Arc::clone(&broker);
-        tokio::spawn(async move { broker.ask("bash", PermissionAsk::new("bash", "ls")).await })
+        tokio::spawn(async move { broker.ask("bash", reusable_ask("bash", "ls")).await })
     };
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), wake.recv()).await,
@@ -316,6 +322,7 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
         vec![Arc::new(DispatchBash)],
         Vec::new(),
         Arc::clone(&broker) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
     ));
     let available_tools = dispatcher.available_tools().definitions.into();
@@ -388,6 +395,7 @@ async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscr
         vec![Arc::new(DispatchEdit)],
         Vec::new(),
         Arc::clone(&broker) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
     ));
     let available_tools = dispatcher.available_tools().definitions.into();
@@ -496,7 +504,7 @@ async fn production_keys_answer_every_permission_choice() {
     assert!(
         tokio::time::timeout(
             Duration::from_millis(250),
-            always_broker.ask("bash", PermissionAsk::new("bash", "ls")),
+            always_broker.ask("bash", reusable_ask("bash", "ls")),
         )
         .await
         .expect("the always grant must answer a matching ask immediately")
@@ -556,7 +564,7 @@ async fn always_answers_the_next_matching_ask_without_prompting() {
     let mut bridge = bridge(&broker);
     let first = {
         let broker = Arc::clone(&broker);
-        tokio::spawn(async move { broker.ask("bash", PermissionAsk::new("bash", "ls")).await })
+        tokio::spawn(async move { broker.ask("bash", reusable_ask("bash", "ls")).await })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
     bridge.handle_event(&resize());
@@ -578,7 +586,7 @@ async fn always_answers_the_next_matching_ask_without_prompting() {
 
     let repeated = tokio::time::timeout(
         Duration::from_secs(5),
-        broker.ask("bash", PermissionAsk::new("bash", "ls")),
+        broker.ask("bash", reusable_ask("bash", "ls")),
     )
     .await
     .expect("a standing grant must answer without a prompt");
@@ -598,6 +606,39 @@ async fn auto_approval_never_parks_anything() {
             .await
             .is_ok()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_approval_bypasses_neither_auto_mode_nor_standing_grants() {
+    let denied = AutoApproval
+        .ask(
+            "bash",
+            PermissionAsk::new("bash", "git push").require_manual(),
+        )
+        .await;
+    assert!(matches!(denied, Err(ToolError::Denied { .. })));
+
+    let (broker, _wake) = broker();
+    locked(&broker.parked)
+        .standing
+        .push((String::from("bash"), vec![String::from("git push")]));
+    let waiting = {
+        let broker = Arc::clone(&broker);
+        tokio::spawn(async move {
+            broker
+                .ask(
+                    "bash",
+                    PermissionAsk::new("bash", "git push").require_manual(),
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        broker.next_request().is_some(),
+        "a strict manual ask was incorrectly satisfied by a standing grant"
+    );
+    waiting.abort();
 }
 
 #[tokio::test]
@@ -708,6 +749,7 @@ async fn cmd_tui_permission_prompt_replaces_the_working_spinner() {
                         patterns: vec![String::from("rm -rf /")],
                         metadata: serde_json::Map::new(),
                         always: vec![String::from("*")],
+                        ..PermissionAsk::default()
                     },
                 )
                 .await
