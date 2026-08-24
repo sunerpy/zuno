@@ -24,6 +24,7 @@ This directory is organized so it can be projected into a documentation site wit
 ## Design
 
 - [Harness comparison](design/harness-comparison.md)
+- [Build-agent prompt and request comparison](design/agent-prompt-request-comparison.md)
 - [Provider authentication](design/provider-authentication.md)
 - [Product agents](design/product-agents.md)
 - [Memory learning](design/memory-learning.md)
