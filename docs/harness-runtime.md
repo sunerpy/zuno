@@ -499,8 +499,23 @@ Codex comparison and the split ownership decision are recorded in
 `BackgroundExecutionService` before spawning it. Explicit background mode and a
 foreground attention timeout therefore retain one execution identity and one
 process tree; neither path adopts a detached task or starts a second command.
-The service keeps a bounded 2 MiB live tail, persists complete output separately,
-and records status under `.zuno/background`.
+An ordinary foreground command is ephemeral: while it runs, its complete output
+is spooled so the normal output policy can inspect it, but its state is hidden
+from `/ps` and both the in-memory row and spool file are removed as soon as the
+caller consumes the terminal result. A command is made durable only when
+`background: true` was requested or the foreground attention deadline promotes
+the still-running process.
+
+Durable commands keep a bounded 2 MiB live tail, persist complete output
+separately, and record status under `.zuno/background`. The service retains at
+most 32 terminal commands per workspace and removes the oldest row together with
+its `.status.json` and `.output` files. Running commands are never evicted.
+Consequently ordinary `bash` calls no longer accumulate files, while `/ps`,
+`bg`, and restart reconciliation keep the state they actually require. Other
+tools such as `read`, `grep`, `glob`, and web search never use this directory.
+Because the product is still pre-release, terminal rows written by the old
+always-durable format are discarded on first open; an old running row is
+conservatively rewritten as `uncertain` and is never replayed.
 
 The `bg` tool supports `list`, `output`, `wait`, and `cancel` for executions owned
 by the current session. The complete tool has `ToolReplayPolicy::Never` because

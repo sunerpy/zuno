@@ -4,7 +4,7 @@ use crate::views::testkit::{action, press};
 use crossterm::event::KeyCode;
 use std::collections::BTreeMap;
 use std::time::Duration;
-use zuno_pty::BackgroundExecutionInput;
+use zuno_pty::{BackgroundExecutionInput, BackgroundExecutionRetention};
 
 fn running() -> (
     tempfile::TempDir,
@@ -26,6 +26,7 @@ fn running() -> (
             title: "preview server".to_owned(),
             command: "printf ready; sleep 30".to_owned(),
             hard_ceiling: Duration::from_secs(60),
+            retention: BackgroundExecutionRetention::Durable,
         })
         .expect("background command starts");
     (directory, service, info)

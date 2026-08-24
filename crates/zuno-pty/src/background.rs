@@ -1,10 +1,15 @@
-//! Process-owned background command execution with bounded live output.
+//! Process-owned command execution with bounded live output and durable background retention.
 //!
 //! A command enters this service before it is spawned. Foreground callers may
 //! wait for it, detach after an attention deadline, or cancel it, but they never
 //! transfer an already-running [`tokio::task::JoinHandle`] between owners. That
 //! single-owner shape is what makes cancellation and at-most-once execution hold
 //! across explicit background mode and foreground timeout promotion.
+//!
+//! Foreground commands are ephemeral and disappear after their caller consumes
+//! the terminal output. Explicit or timeout-promoted background commands persist
+//! status/output for restart reconciliation, with terminal history bounded by
+//! [`MAX_RETAINED_TERMINAL_EXECUTIONS`].
 
 use crate::{BUFFER_LIMIT, ReplayCursor, ScrollbackBuffer};
 use serde::{Deserialize, Serialize};
@@ -13,6 +18,7 @@ use std::ffi::OsString;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
@@ -20,10 +26,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
-const STATE_FORMAT: u32 = 1;
+const LEGACY_STATE_FORMAT: u32 = 1;
+const STATE_FORMAT: u32 = 2;
 const OUTPUT_SUFFIX: &str = ".output";
 const STATUS_SUFFIX: &str = ".status.json";
 const OUTPUT_CHUNK: usize = 8 * 1024;
+
+/// Completed background executions retained per workspace.
+///
+/// Running commands are never evicted. The terminal cap bounds the durable
+/// store at two files per retained execution while preserving a useful recent
+/// history for `/ps` and `bg`.
+pub const MAX_RETAINED_TERMINAL_EXECUTIONS: usize = 32;
 
 /// Lifecycle events shared by TUI, server, and future clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +147,24 @@ pub struct BackgroundExecutionProjection {
     pub executions: Vec<BackgroundExecutionInfo>,
 }
 
+/// Whether one execution is an implementation detail of a foreground call or a
+/// user-visible background job that must survive session/TUI rebinding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundExecutionRetention {
+    /// Keep process ownership in memory and remove its output after the caller
+    /// consumes the terminal result.
+    Ephemeral,
+    /// Persist status and output so `/ps`, `bg`, and restart reconciliation can
+    /// continue observing the command.
+    Durable,
+}
+
+impl BackgroundExecutionRetention {
+    const fn is_durable(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+}
+
 /// Command launch input. Environment values are never persisted.
 #[derive(Debug)]
 pub struct BackgroundExecutionInput {
@@ -144,6 +176,7 @@ pub struct BackgroundExecutionInput {
     pub title: String,
     pub command: String,
     pub hard_ceiling: Duration,
+    pub retention: BackgroundExecutionRetention,
 }
 
 /// Bounded output replay for a running or retained command.
@@ -171,6 +204,10 @@ pub enum BackgroundExecutionError {
     InvalidId(String),
     #[error("background execution `{0}` does not exist")]
     NotFound(BackgroundExecutionId),
+    #[error("foreground execution `{0}` is still running")]
+    ForegroundStillRunning(BackgroundExecutionId),
+    #[error("background execution `{0}` is durable and cannot be consumed as foreground output")]
+    DurableForeground(BackgroundExecutionId),
     #[error("could not create background execution state at `{path}`")]
     State {
         path: PathBuf,
@@ -202,6 +239,8 @@ struct ExecutionState {
     info: watch::Sender<BackgroundExecutionInfo>,
     output: Mutex<ScrollbackBuffer>,
     cancel: watch::Sender<bool>,
+    durable: AtomicBool,
+    transition: Mutex<()>,
 }
 
 impl ExecutionState {
@@ -211,6 +250,16 @@ impl ExecutionState {
 
     fn output(&self) -> MutexGuard<'_, ScrollbackBuffer> {
         self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn is_durable(&self) -> bool {
+        self.durable.load(Ordering::Acquire)
+    }
+
+    fn transition(&self) -> MutexGuard<'_, ()> {
+        self.transition
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -271,13 +320,14 @@ impl BackgroundExecutionService {
                         source,
                     }
                 })?;
-            if persisted.format != STATE_FORMAT {
+            if !matches!(persisted.format, LEGACY_STATE_FORMAT | STATE_FORMAT) {
                 return Err(BackgroundExecutionError::State {
                     path: status_file,
                     source: std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "unsupported background state format {}; expected {STATE_FORMAT}",
+                            "unsupported background state format {}; expected \
+                             {LEGACY_STATE_FORMAT} or {STATE_FORMAT}",
                             persisted.format
                         ),
                     ),
@@ -289,6 +339,10 @@ impl BackgroundExecutionService {
             persisted.info.id = id.clone();
             persisted.info.output_file = output_file.clone();
             persisted.info.status_file = canonical_status_file;
+            if persisted.format == LEGACY_STATE_FORMAT && persisted.info.status.is_terminal() {
+                remove_execution_files(&persisted.info)?;
+                continue;
+            }
             if persisted.info.status == BackgroundExecutionStatus::Running {
                 let now = now_millis();
                 persisted.info.status = BackgroundExecutionStatus::Uncertain;
@@ -320,9 +374,12 @@ impl BackgroundExecutionService {
                         &tail,
                     )),
                     cancel,
+                    durable: AtomicBool::new(true),
+                    transition: Mutex::new(()),
                 }),
             );
         }
+        service.prune_retained();
         Ok(service)
     }
 
@@ -362,12 +419,13 @@ impl BackgroundExecutionService {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command
-            .spawn()
-            .map_err(|source| BackgroundExecutionError::Spawn {
+        let mut child = command.spawn().map_err(|source| {
+            let _removed = remove_if_exists(&output_file);
+            BackgroundExecutionError::Spawn {
                 command: input.command.clone(),
                 source,
-            })?;
+            }
+        })?;
         let pid = child.id();
         let now = now_millis();
         let info = BackgroundExecutionInfo {
@@ -387,10 +445,12 @@ impl BackgroundExecutionService {
             output_file,
             status_file,
         };
-        if let Err(error) = persist_info(&info) {
+        let durable = input.retention.is_durable();
+        if durable && let Err(error) = persist_info(&info) {
             if let Some(pid) = pid {
                 let _terminated = zuno_process::request_contained_process_shutdown(pid);
             }
+            let _removed = remove_execution_files(&info);
             let _reaper = tokio::spawn(async move {
                 let _status = child.wait().await;
             });
@@ -403,30 +463,37 @@ impl BackgroundExecutionService {
             info: info_sender,
             output: Mutex::new(ScrollbackBuffer::new()),
             cancel: cancel_sender,
+            durable: AtomicBool::new(durable),
+            transition: Mutex::new(()),
         });
         self.executions().insert(id, Arc::clone(&state));
-        let _delivered = self
-            .inner
-            .events
-            .send(BackgroundExecutionEvent::Created(info.clone()));
+        if durable {
+            let _delivered = self
+                .inner
+                .events
+                .send(BackgroundExecutionEvent::Created(info.clone()));
+        }
 
-        let events = self.inner.events.clone();
         tokio::spawn(run_execution(
             child,
             state,
             cancel_receiver,
             input.hard_ceiling,
-            events,
+            self.clone(),
         ));
+        if durable {
+            self.prune_retained();
+        }
         Ok(info)
     }
 
-    /// Every command in creation order.
+    /// Every durable command in creation order.
     #[must_use]
     pub fn list(&self) -> Vec<BackgroundExecutionInfo> {
         let mut values = self
             .executions()
             .values()
+            .filter(|state| state.is_durable())
             .map(|state| state.info())
             .collect::<Vec<_>>();
         values.sort_by(|left, right| {
@@ -462,6 +529,40 @@ impl BackgroundExecutionService {
         self.state(id).map(|state| state.info())
     }
 
+    /// Makes a live foreground execution durable after its attention deadline.
+    ///
+    /// The status snapshot is written before the execution becomes observable,
+    /// so a failed promotion cannot invite the caller to rerun a command whose
+    /// durable ownership is ambiguous.
+    pub fn promote(
+        &self,
+        id: &BackgroundExecutionId,
+    ) -> Result<BackgroundExecutionInfo, BackgroundExecutionError> {
+        let state = self.state(id)?;
+        let info = {
+            let _transition = state.transition();
+            if state.is_durable() {
+                return Ok(state.info());
+            }
+            let info = state.info();
+            persist_info(&info)?;
+            state.durable.store(true, Ordering::Release);
+            let _created = self
+                .inner
+                .events
+                .send(BackgroundExecutionEvent::Created(info.clone()));
+            if info.status.is_terminal() {
+                let _settled = self
+                    .inner
+                    .events
+                    .send(BackgroundExecutionEvent::Settled(info.clone()));
+            }
+            info
+        };
+        self.prune_retained();
+        Ok(info)
+    }
+
     /// Replays bounded output from an absolute cursor.
     pub fn output(
         &self,
@@ -488,6 +589,34 @@ impl BackgroundExecutionService {
     ) -> Result<Vec<u8>, BackgroundExecutionError> {
         let info = self.get(id)?;
         std::fs::read(&info.output_file).map_err(|source| state_error(&info.output_file, source))
+    }
+
+    /// Consumes one terminal foreground execution and removes every transient
+    /// artifact it created.
+    pub fn finish_foreground(
+        &self,
+        id: &BackgroundExecutionId,
+    ) -> Result<Vec<u8>, BackgroundExecutionError> {
+        let state = self.state(id)?;
+        let _transition = state.transition();
+        if state.is_durable() {
+            return Err(BackgroundExecutionError::DurableForeground(id.clone()));
+        }
+        let info = state.info();
+        if !info.status.is_terminal() {
+            return Err(BackgroundExecutionError::ForegroundStillRunning(id.clone()));
+        }
+        let output = std::fs::read(&info.output_file)
+            .map_err(|source| state_error(&info.output_file, source))?;
+        remove_execution_files(&info)?;
+        let mut executions = self.executions();
+        if executions
+            .get(id)
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &state))
+        {
+            executions.remove(id);
+        }
+        Ok(output)
     }
 
     /// Waits until the command settles, or returns a non-terminal progress
@@ -537,7 +666,7 @@ impl BackgroundExecutionService {
         Ok(!state.cancel.send_replace(true))
     }
 
-    /// Directory containing durable status and complete output files.
+    /// Directory containing durable status/output and active foreground output.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.inner.root
@@ -567,6 +696,47 @@ impl BackgroundExecutionService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn prune_retained(&self) {
+        let mut terminal = self
+            .executions()
+            .iter()
+            .filter_map(|(id, state)| {
+                let info = state.info();
+                (state.is_durable() && info.status.is_terminal())
+                    .then(|| (id.clone(), Arc::clone(state), info))
+            })
+            .collect::<Vec<_>>();
+        if terminal.len() <= MAX_RETAINED_TERMINAL_EXECUTIONS {
+            return;
+        }
+        terminal.sort_by(|left, right| {
+            left.2
+                .time_completed
+                .unwrap_or(left.2.time_updated)
+                .cmp(&right.2.time_completed.unwrap_or(right.2.time_updated))
+                .then_with(|| left.2.time_created.cmp(&right.2.time_created))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let remove = terminal.len() - MAX_RETAINED_TERMINAL_EXECUTIONS;
+        for (id, state, info) in terminal.into_iter().take(remove) {
+            if let Err(error) = remove_execution_files(&info) {
+                tracing::warn!(
+                    execution_id = %id,
+                    error = %error,
+                    "could not prune retained background execution"
+                );
+                continue;
+            }
+            let mut executions = self.executions();
+            if executions
+                .get(&id)
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &state))
+            {
+                executions.remove(&id);
+            }
+        }
+    }
 }
 
 async fn run_execution(
@@ -574,7 +744,7 @@ async fn run_execution(
     state: Arc<ExecutionState>,
     mut cancel: watch::Receiver<bool>,
     hard_ceiling: Duration,
-    events: broadcast::Sender<BackgroundExecutionEvent>,
+    service: BackgroundExecutionService,
 ) {
     let output_file = state.info().output_file;
     let (chunks, receiver) = mpsc::channel::<Vec<u8>>(32);
@@ -654,12 +824,25 @@ async fn run_execution(
             break;
         }
     }
-    if let Err(error) = persist_info(&info) {
-        info.status = BackgroundExecutionStatus::Failed;
-        info.error = Some(error.to_string());
+    let durable = {
+        let _transition = state.transition();
+        let durable = state.is_durable();
+        if durable && let Err(error) = persist_info(&info) {
+            info.status = BackgroundExecutionStatus::Failed;
+            info.error = Some(error.to_string());
+        }
+        state.info.send_replace(info.clone());
+        if durable {
+            let _delivered = service
+                .inner
+                .events
+                .send(BackgroundExecutionEvent::Settled(info));
+        }
+        durable
+    };
+    if durable {
+        service.prune_retained();
     }
-    state.info.send_replace(info.clone());
-    let _delivered = events.send(BackgroundExecutionEvent::Settled(info));
 }
 
 async fn pump(
@@ -728,6 +911,20 @@ fn persist_info(info: &BackgroundExecutionInfo) -> Result<(), BackgroundExecutio
     }
     std::fs::rename(&temporary, &info.status_file)
         .map_err(|source| state_error(&info.status_file, source))
+}
+
+fn remove_execution_files(info: &BackgroundExecutionInfo) -> Result<(), BackgroundExecutionError> {
+    remove_if_exists(&info.status_file)?;
+    remove_if_exists(&info.status_file.with_extension("json.tmp"))?;
+    remove_if_exists(&info.output_file)
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), BackgroundExecutionError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(state_error(path, source)),
+    }
 }
 
 fn read_tail(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {

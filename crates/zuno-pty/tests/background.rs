@@ -5,8 +5,9 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 use zuno_pty::{
-    BUFFER_LIMIT, BackgroundExecutionId, BackgroundExecutionInput, BackgroundExecutionService,
-    BackgroundExecutionStatus, ReplayCursor,
+    BUFFER_LIMIT, BackgroundExecutionId, BackgroundExecutionInput, BackgroundExecutionRetention,
+    BackgroundExecutionService, BackgroundExecutionStatus, MAX_RETAINED_TERMINAL_EXECUTIONS,
+    ReplayCursor,
 };
 
 fn input(
@@ -24,6 +25,7 @@ fn input(
         title: command.clone(),
         command,
         hard_ceiling,
+        retention: BackgroundExecutionRetention::Durable,
     }
 }
 
@@ -148,6 +150,47 @@ async fn live_output_is_bounded_while_the_complete_file_is_retained() {
     );
 }
 
+#[tokio::test]
+async fn terminal_retention_removes_the_oldest_state_and_both_files() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+    let mut oldest = None;
+
+    for index in 0..=MAX_RETAINED_TERMINAL_EXECUTIONS {
+        let info = service
+            .start(input(
+                directory.path(),
+                format!("printf task-{index}"),
+                Duration::from_secs(2),
+            ))
+            .expect("command starts");
+        if oldest.is_none() {
+            oldest = Some(info.clone());
+        }
+        service.wait(&info.id, None).await.expect("command settles");
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.list().len() > MAX_RETAINED_TERMINAL_EXECUTIONS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retention pruning");
+
+    let oldest = oldest.expect("oldest command");
+    assert_eq!(service.list().len(), MAX_RETAINED_TERMINAL_EXECUTIONS);
+    assert!(service.get(&oldest.id).is_err());
+    assert!(!oldest.output_file.exists());
+    assert!(!oldest.status_file.exists());
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .expect("background directory")
+            .count(),
+        MAX_RETAINED_TERMINAL_EXECUTIONS * 2
+    );
+}
+
 #[test]
 fn persisted_running_state_reconciles_to_uncertain_without_replay() {
     let directory = tempfile::tempdir().expect("workspace");
@@ -194,12 +237,60 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
             .is_some_and(|value| value.contains("not replayed"))
     );
     assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(&status_file).expect("rewritten status")
+        )
+        .expect("rewritten JSON")["format"],
+        2
+    );
+    assert_eq!(
         service
             .output(&id, ReplayCursor::Full)
             .expect("recovered output")
             .bytes,
         b"partial"
     );
+}
+
+#[test]
+fn legacy_terminal_state_is_removed_instead_of_retained() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let id =
+        BackgroundExecutionId::parse("bg_fedcba9876543210fedcba9876543210").expect("fixture id");
+    let output_file = directory.path().join(format!("{id}.output"));
+    let status_file = directory.path().join(format!("{id}.status.json"));
+    std::fs::write(&output_file, b"obsolete foreground output").expect("fixture output");
+    std::fs::write(
+        &status_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format": 1,
+            "info": {
+                "id": id.as_str(),
+                "sessionId": "ses_legacy",
+                "title": "legacy",
+                "command": "legacy",
+                "cwd": directory.path(),
+                "status": "completed",
+                "pid": null,
+                "exitCode": 0,
+                "timedOut": false,
+                "timeCreated": 1,
+                "timeUpdated": 2,
+                "timeCompleted": 2,
+                "error": null,
+                "outputFile": "/must/not/be/trusted",
+                "statusFile": "/must/not/be/trusted"
+            }
+        }))
+        .expect("fixture JSON"),
+    )
+    .expect("fixture status");
+
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+
+    assert!(service.list().is_empty());
+    assert!(!output_file.exists());
+    assert!(!status_file.exists());
 }
 
 async fn wait_for_file(path: &Path) {

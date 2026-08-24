@@ -16,8 +16,8 @@ use std::time::Duration;
 use tree_sitter::{Node, Parser};
 use zuno_error::ToolError;
 use zuno_pty::{
-    BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionService,
-    BackgroundExecutionStatus,
+    BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionRetention,
+    BackgroundExecutionService, BackgroundExecutionStatus,
 };
 use zuno_tool::{OutputLimits, PermissionAsk, Tool, ToolContext, ToolOutput, ToolOutputStore};
 
@@ -254,9 +254,14 @@ impl ShellTool {
         let env = self.environment(&cwd, &ctx).await?;
         let command = params.command.clone();
         let foreground_timeout_ms = normalize_foreground_timeout(params.timeout);
+        let retention = if params.background {
+            BackgroundExecutionRetention::Durable
+        } else {
+            BackgroundExecutionRetention::Ephemeral
+        };
         let execution = self
             .background_executions
-            .start(self.execution_input(&command, &cwd, env, &ctx))
+            .start(self.execution_input(&command, &cwd, env, &ctx, retention))
             .map_err(failed)?;
 
         if params.background {
@@ -272,20 +277,36 @@ impl ShellTool {
             () = ctx.interrupt.notified() => {
                 let _cancelled = self.background_executions.cancel(&execution.id);
                 let _settled = self.background_executions.wait(&execution.id, None).await;
+                if let Err(error) = self.background_executions.finish_foreground(&execution.id) {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        error = %error,
+                        "could not remove interrupted foreground execution"
+                    );
+                }
                 return Err(interrupted());
             }
         };
         if waited.timed_out {
+            let promoted = self
+                .background_executions
+                .promote(&execution.id)
+                .map_err(failed)?;
             return Ok(timeout_promoted_output(
                 command,
                 foreground_timeout_ms,
-                &waited.info,
+                &promoted,
             ));
         }
+        let full = self
+            .background_executions
+            .finish_foreground(&execution.id)
+            .map_err(failed)?;
         self.completed_output(
             &command,
             foreground_timeout_ms,
             waited.info,
+            full,
             &ctx.session_id,
             accept_large_output,
         )
@@ -419,6 +440,7 @@ impl ShellTool {
         cwd: &Path,
         env: BTreeMap<String, String>,
         ctx: &ToolContext,
+        retention: BackgroundExecutionRetention,
     ) -> BackgroundExecutionInput {
         let arguments = match self.shell.kind {
             ShellKind::PowerShell => vec![
@@ -443,6 +465,7 @@ impl ShellTool {
             title: command.to_owned(),
             command: command.to_owned(),
             hard_ceiling: self.hard_ceiling,
+            retention,
         }
     }
 
@@ -451,6 +474,7 @@ impl ShellTool {
         command: &str,
         foreground_timeout_ms: u64,
         execution: BackgroundExecutionInfo,
+        bytes: Vec<u8>,
         session_id: &str,
         accept_large_output: bool,
     ) -> Result<ToolOutput, ToolError> {
@@ -482,10 +506,6 @@ impl ShellTool {
             }
         }
 
-        let bytes = self
-            .background_executions
-            .complete_output(&execution.id)
-            .map_err(failed)?;
         let mut full = String::from_utf8_lossy(&bytes).into_owned();
         if full.is_empty() {
             full = "(no output)".to_owned();

@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
-use zuno_pty::{BackgroundExecutionInput, BackgroundExecutionService};
+use zuno_pty::{
+    BackgroundExecutionInput, BackgroundExecutionRetention, BackgroundExecutionService,
+};
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext, ToolEffect, ToolReplayPolicy, TypedTool};
 use zuno_tools::{BackgroundAction, BackgroundParams, BackgroundTool};
 
@@ -30,6 +32,7 @@ fn input(directory: &std::path::Path, session_id: &str, command: &str) -> Backgr
         title: command.to_owned(),
         command: command.to_owned(),
         hard_ceiling: Duration::from_secs(5),
+        retention: BackgroundExecutionRetention::Durable,
     }
 }
 

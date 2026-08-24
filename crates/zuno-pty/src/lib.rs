@@ -15,6 +15,7 @@
 //! |---|---|---|
 //! | one session's retained output | [`buffer::BUFFER_LIMIT`] (2 MiB) | [`buffer::ScrollbackBuffer`] |
 //! | exited sessions kept observable | [`retention::EXITED_LIMIT`] (25) | [`retention::ExitRetention`] |
+//! | completed background commands kept observable | [`background::MAX_RETAINED_TERMINAL_EXECUTIONS`] (32) | [`BackgroundExecutionService`] |
 //! | queued output per attachment | [`session::DEFAULT_SUBSCRIBER_CAPACITY`] chunks | [`session::PtyOutput::Lagged`] |
 //! | outstanding connect tickets | [`ticket::TICKET_CAPACITY`] | [`ticket::TicketStore`] |
 //!
@@ -47,8 +48,8 @@ use tokio::sync::broadcast;
 pub use crate::background::{
     BackgroundExecutionError, BackgroundExecutionEvent, BackgroundExecutionId,
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionOutput,
-    BackgroundExecutionProjection, BackgroundExecutionService, BackgroundExecutionStatus,
-    BackgroundWaitOutcome,
+    BackgroundExecutionProjection, BackgroundExecutionRetention, BackgroundExecutionService,
+    BackgroundExecutionStatus, BackgroundWaitOutcome, MAX_RETAINED_TERMINAL_EXECUTIONS,
 };
 pub use crate::buffer::{BUFFER_LIMIT, Replay, ReplayCursor, ScrollbackBuffer};
 pub use crate::retention::EXITED_LIMIT;

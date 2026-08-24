@@ -134,6 +134,34 @@ async fn timeout_policy_hard_ceiling_still_terminates_the_process_group() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn completed_foreground_commands_leave_no_background_records_or_files() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let background_dir = tempfile::tempdir().expect("background dir");
+    let service = Arc::new(
+        BackgroundExecutionService::open(background_dir.path()).expect("background service"),
+    );
+    let tool = ShellTool::new(workspace.path())
+        .expect("shell tool")
+        .with_background_executions(service.clone());
+
+    let output = tool
+        .run(params("printf foreground", Some(1_000)), context())
+        .await
+        .expect("foreground command");
+
+    assert_eq!(output.output, "foreground");
+    assert!(service.list().is_empty());
+    assert_eq!(
+        std::fs::read_dir(background_dir.path())
+            .expect("background directory")
+            .count(),
+        0,
+        "a completed foreground command must not leave durable execution artifacts"
+    );
+}
+
+#[cfg(unix)]
 async fn wait_for_task(
     service: &BackgroundExecutionService,
     task_id: &BackgroundExecutionId,
