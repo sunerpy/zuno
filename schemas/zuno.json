@@ -15,7 +15,7 @@
     },
     "AgentConfig": {
       "additionalProperties": true,
-      "description": "One entry of the `agent` map, or one Markdown agent definition's frontmatter.\n\nDeserialization performs the oracle's sweep: any key this struct does not name\nis copied into [`options`](Self::options) *and* kept verbatim in\n[`extra`](Self::extra).",
+      "description": "One entry of the `agents` map, or one Markdown agent definition's frontmatter.\n\nDeserialization performs the oracle's sweep: any key this struct does not name\nis copied into [`options`](Self::options) *and* kept verbatim in\n[`extra`](Self::extra).",
       "properties": {
         "color": {
           "anyOf": [
@@ -27,6 +27,16 @@
             }
           ],
           "description": "Display colour."
+        },
+        "delegates": {
+          "description": "Exact child-agent allowlist for direct delegation and workflows.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "description": {
           "description": "When to use the agent.",
@@ -93,6 +103,17 @@
             "null"
           ]
         },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentReasoning"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provider-neutral reasoning level, applied only with the configured model."
+        },
         "steps": {
           "description": "Maximum agentic iterations before a text-only response is forced.",
           "format": "uint32",
@@ -107,6 +128,16 @@
           "format": "double",
           "type": [
             "number",
+            "null"
+          ]
+        },
+        "tools": {
+          "description": "Exact model-visible tool allowlist for this agent.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },
@@ -148,6 +179,78 @@
         }
       ]
     },
+    "AgentReasoning": {
+      "description": "Provider-neutral reasoning level selected for this agent.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Disable model reasoning when supported.",
+          "type": "string"
+        },
+        {
+          "const": "low",
+          "description": "Use a small reasoning budget.",
+          "type": "string"
+        },
+        {
+          "const": "medium",
+          "description": "Use the normal reasoning budget.",
+          "type": "string"
+        },
+        {
+          "const": "high",
+          "description": "Use a large reasoning budget.",
+          "type": "string"
+        },
+        {
+          "const": "xhigh",
+          "description": "Use the strongest broadly available effort.",
+          "type": "string"
+        },
+        {
+          "const": "max",
+          "description": "Use the strongest effort exposed by the model.",
+          "type": "string"
+        }
+      ]
+    },
+    "AgentWorkflowConfig": {
+      "additionalProperties": false,
+      "description": "A named, configuration-owned workflow template.",
+      "properties": {
+        "maxAgents": {
+          "description": "Maximum nodes admitted into one run. Defaults to twelve.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maxParallel": {
+          "description": "Maximum simultaneously running nodes. Defaults to four.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "nodes": {
+          "description": "The immutable DAG instantiated by the model-facing workflow tool.",
+          "items": {
+            "$ref": "#/$defs/WorkflowNodeConfig"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "type": "object"
+    },
     "AttachmentConfig": {
       "description": "Attachment processing (`config/attachment.ts:22-24`).",
       "properties": {
@@ -161,20 +264,6 @@
             }
           ],
           "description": "Image attachment limits."
-        }
-      },
-      "type": "object"
-    },
-    "AuthorizationConfig": {
-      "additionalProperties": false,
-      "description": "Cross-cutting authorization behavior.",
-      "properties": {
-        "strict": {
-          "description": "Require a fresh human approval for every side-effecting tool invocation.",
-          "type": [
-            "boolean",
-            "null"
-          ]
         }
       },
       "type": "object"
@@ -1503,6 +1592,12 @@
       },
       "type": "object"
     },
+    "OrderedMap_of_AgentWorkflowConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/AgentWorkflowConfig"
+      },
+      "type": "object"
+    },
     "OrderedMap_of_CommandConfig": {
       "additionalProperties": {
         "$ref": "#/$defs/CommandConfig"
@@ -1596,17 +1691,41 @@
       ]
     },
     "PermissionConfig": {
-      "anyOf": [
+      "additionalProperties": false,
+      "description": "The canonical permission configuration used by Zuno.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/PermissionMode",
+          "default": "standard",
+          "description": "How unresolved and side-effecting calls are admitted."
+        },
+        "rules": {
+          "$ref": "#/$defs/PermissionObject",
+          "default": {},
+          "description": "Ordered per-tool rules. Explicit denies remain terminal in every mode."
+        }
+      },
+      "type": "object"
+    },
+    "PermissionMode": {
+      "description": "Cross-cutting human-in-the-loop behavior for tool calls.",
+      "oneOf": [
         {
-          "$ref": "#/$defs/PermissionAction",
-          "description": "A bare action applied to every tool."
+          "const": "standard",
+          "description": "Apply configured rules and the normal risk gates.",
+          "type": "string"
         },
         {
-          "$ref": "#/$defs/PermissionObject",
-          "description": "Per-tool rules, in the author's key order."
+          "const": "strict",
+          "description": "Require a fresh decision for every side-effecting call.",
+          "type": "string"
+        },
+        {
+          "const": "allow_all",
+          "description": "Skip HITL prompts while preserving explicit denies and sandbox validation.",
+          "type": "string"
         }
-      ],
-      "description": "The `permission` key: one action for everything, or per-tool rules."
+      ]
     },
     "PermissionObject": {
       "$ref": "#/$defs/OrderedMap_of_PermissionRule",
@@ -2327,6 +2446,46 @@
       },
       "type": "object"
     },
+    "WorkflowNodeConfig": {
+      "additionalProperties": false,
+      "description": "One node in a configured workflow DAG.",
+      "properties": {
+        "agent": {
+          "description": "Configured or built-in agent to run.",
+          "type": "string"
+        },
+        "dependsOn": {
+          "description": "Node ids that must complete successfully first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "description": "Human-readable purpose shown in runtime projections.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable node id within the template.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Optional node-specific instruction appended to the run prompt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "agent"
+      ],
+      "type": "object"
+    },
     "false": {
       "const": false
     }
@@ -2342,7 +2501,7 @@
         "null"
       ]
     },
-    "agent": {
+    "agents": {
       "anyOf": [
         {
           "$ref": "#/$defs/OrderedMap_of_AgentConfig"
@@ -2363,17 +2522,6 @@
         }
       ],
       "description": "Attachment processing."
-    },
-    "authorization": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/AuthorizationConfig"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Cross-cutting authorization behavior."
     },
     "autoupdate": {
       "anyOf": [
@@ -2560,7 +2708,7 @@
           "type": "null"
         }
       ],
-      "description": "Global permissions."
+      "description": "Global permissions and cross-cutting HITL mode."
     },
     "productAgent": {
       "anyOf": [
@@ -2708,6 +2856,17 @@
         }
       ],
       "description": "Web-search provider and runtime-owned batch limits."
+    },
+    "workflows": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_AgentWorkflowConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Named, immutable multi-agent workflow templates."
     }
   },
   "title": "Zuno configuration",

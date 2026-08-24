@@ -15,7 +15,7 @@
 //!   [`Capabilities::sampling_params`] being `false`, which the catalog supplies
 //!   per model. The reference implementation instead maintained a growing
 //!   `is_reasoning_model()` prefix list
-//!   (`.omo/refs/claw-code/rust/crates/api/src/providers/openai_compat.rs:1191-1204`)
+//!   (`claw-code`)
 //!   that had to be edited for every new reasoning model.
 //! - **The one genuine model-id rule lives in [`MODEL_PROTOCOL_RULES`]**, a single
 //!   named table with its citation, extensible from config so a user meeting a new
@@ -70,7 +70,7 @@ pub struct ModelRule {
 ///
 /// `deepseek-v4` Pro and Flash require prior assistant reasoning replayed as
 /// `reasoning_content` and a `thinking: {"type":"enabled"}` opt-in
-/// (`.omo/refs/claw-code/rust/crates/api/src/providers/openai_compat.rs:970-981`,
+/// (`claw-code`,
 /// `:1226-1227`, `:1287-1300`).
 ///
 /// Nothing else in this crate matches a model id. If a row is added here, that is

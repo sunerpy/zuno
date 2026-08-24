@@ -298,7 +298,7 @@ async fn dropping_the_only_session_observer_rejects_a_question() {
             .await
             .expect("dropping the only observer must release the question asker")
             .expect("question asker task does not panic"),
-        QuestionDecision::Rejected
+        QuestionDecision::Cancelled
     );
     assert!(
         requests.questions(None).is_empty(),

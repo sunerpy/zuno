@@ -5,7 +5,7 @@
 //! their untrusted body before checking request ownership to match the upstream API;
 //! when validation fails, they claim only a matching `(session_id, request_id)` for
 //! fail-closed cleanup. A claimed request owns its answer sender, and dropping the
-//! claim sends the rejecting decision. Consequently a malformed or disconnected
+//! claim sends a failed terminal decision. Consequently a malformed or disconnected
 //! reply can never authorize a tool by accident or consume another session's request.
 
 use std::collections::HashMap;
@@ -73,7 +73,9 @@ pub struct QuestionToolCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuestionDecision {
     Answered(QuestionAnswers),
-    Rejected,
+    Cancelled,
+    Expired,
+    Failed,
 }
 
 struct PendingPermission {
@@ -179,9 +181,9 @@ impl RequestBroker {
                 "failed to publish HTTP question request `{}`: {error}",
                 request.id
             );
-            self.reject_question(&request.session_id, &request.id);
+            self.finish_question(&request.session_id, &request.id, QuestionDecision::Failed);
         }
-        receiver.await.unwrap_or(QuestionDecision::Rejected)
+        receiver.await.unwrap_or(QuestionDecision::Failed)
     }
 
     #[must_use]
@@ -296,8 +298,22 @@ impl RequestBroker {
                     "answers": answers,
                 }),
             ),
-            QuestionDecision::Rejected => (
-                "question.v2.rejected",
+            QuestionDecision::Cancelled => (
+                "question.v2.cancelled",
+                json!({
+                    "sessionID": session_id,
+                    "requestID": request_id,
+                }),
+            ),
+            QuestionDecision::Expired => (
+                "question.v2.expired",
+                json!({
+                    "sessionID": session_id,
+                    "requestID": request_id,
+                }),
+            ),
+            QuestionDecision::Failed => (
+                "question.v2.failed",
                 json!({
                     "sessionID": session_id,
                     "requestID": request_id,
@@ -311,8 +327,8 @@ impl RequestBroker {
         reject_permission(&self.pending, session_id, request_id);
     }
 
-    fn reject_question(&self, session_id: &str, request_id: &str) {
-        reject_question(&self.pending, session_id, request_id);
+    fn finish_question(&self, session_id: &str, request_id: &str, decision: QuestionDecision) {
+        finish_question(&self.pending, session_id, request_id, decision);
     }
 
     fn spawn_permission_watchdog(&self, request: &PermissionRequest) {
@@ -336,7 +352,12 @@ impl RequestBroker {
         let _watchdog = tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
             if let Some(pending) = pending.upgrade() {
-                reject_question(&pending, &session_id, &request_id);
+                finish_question(
+                    &pending,
+                    &session_id,
+                    &request_id,
+                    QuestionDecision::Expired,
+                );
             }
         });
     }
@@ -398,7 +419,7 @@ impl Drop for SessionRequestObserver {
             let _delivered = permission.answer.send(ReplyKind::Reject);
         }
         for question in questions {
-            let _delivered = question.answer.send(QuestionDecision::Rejected);
+            let _delivered = question.answer.send(QuestionDecision::Cancelled);
         }
     }
 }
@@ -420,7 +441,12 @@ fn reject_permission(pending: &Mutex<Pending>, session_id: &str, request_id: &st
     let _delivered = request.answer.send(ReplyKind::Reject);
 }
 
-fn reject_question(pending: &Mutex<Pending>, session_id: &str, request_id: &str) {
+fn finish_question(
+    pending: &Mutex<Pending>,
+    session_id: &str,
+    request_id: &str,
+    decision: QuestionDecision,
+) {
     let request = {
         let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(request) = pending.questions.get(request_id) else {
@@ -434,7 +460,7 @@ fn reject_question(pending: &Mutex<Pending>, session_id: &str, request_id: &str)
             .remove(request_id)
             .expect("the request was checked while holding the same lock")
     };
-    let _delivered = request.answer.send(QuestionDecision::Rejected);
+    let _delivered = request.answer.send(decision);
 }
 
 fn take_session_requests(
@@ -508,7 +534,7 @@ impl QuestionResolution {
 impl Drop for QuestionResolution {
     fn drop(&mut self) {
         if let Some(answer) = self.answer.take() {
-            let _delivered = answer.send(QuestionDecision::Rejected);
+            let _delivered = answer.send(QuestionDecision::Failed);
         }
     }
 }

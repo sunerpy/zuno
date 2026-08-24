@@ -37,7 +37,7 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 ///
 /// The local tool-output gate is 51,200 bytes
 /// (`crates/zuno-tool/src/output.rs:29-32`), while the reference implementation's
-/// limit is 524,288 characters (`.omo/plans/memory-perf-optimization.md` §3.2).
+/// limit is 524,288 characters (the perf plan §3.2).
 /// A real event may contain a long code block or an escaped large tool argument,
 /// so 8 MiB leaves more than 16x the larger reference allowance without making a
 /// missing SSE delimiter an unbounded allocation.

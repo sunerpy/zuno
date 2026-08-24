@@ -67,7 +67,7 @@ use zuno_permission::Rule;
 /// other way — see the note in this crate's `Cargo.toml`. The cross-crate
 /// assertion that these ids still match the registry belongs in `zuno-tools`, where
 /// todo 65's `task` tool already sees both crates.
-pub const GOVERNED_TOOL_IDS: [&str; 14] = [
+pub const GOVERNED_TOOL_IDS: [&str; 17] = [
     "bash",
     "read",
     "glob",
@@ -75,7 +75,10 @@ pub const GOVERNED_TOOL_IDS: [&str; 14] = [
     "edit",
     "task",
     "webfetch",
-    "todowrite",
+    "plan_get",
+    "plan_update",
+    "todo_get",
+    "todo_update",
     "web_search",
     "skill",
     "execute",
@@ -122,11 +125,11 @@ pub enum Write {
 ///
 /// This exists as a field because of a specific defect worth naming. Slim's
 /// `fixer` is deliberately amnesiac — "NO external research", "No multi-step
-/// research/planning" (`.omo/refs/omo-slim/src/agents/fixer.ts:15-17`) — so any
+/// research/planning" (`omo-slim`) — so any
 /// *explore → decide → implement → verify* task has to bounce back through the
 /// orchestrator between every phase, and the orchestrator's context absorbs all of
 /// it. [`WORKER`] is [`Self::Allowed`] instead; that is deviation (1) of the three
-/// recorded in `.omo/drafts/opencode-rust.md`. It keeps the property that actually
+/// recorded in the design notes. It keeps the property that actually
 /// bounds a worker — [`Delegation::NoChildren`] — and drops the one that only
 /// bounded its usefulness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +147,7 @@ pub enum Gate {
     Always,
     /// Present exactly when some resolved model accepts image input.
     ///
-    /// Deviation (2) in `.omo/drafts/opencode-rust.md`: slim disables its
+    /// Deviation (2) in the design notes: slim disables its
     /// multimodal agent by default (`src/config/constants.ts:91`). An opt-in
     /// context-hygiene feature is one nobody opts into, and the cost of the agent
     /// existing is a paragraph in a prompt. So the gate is a capability question,
@@ -230,7 +233,7 @@ pub enum OutputContract {
 
 /// A deny-by-default permission set.
 ///
-/// Ported from `.omo/refs/omo-slim/src/agents/permissions.ts:13-30`, including its
+/// Ported from `omo-slim`, including its
 /// apparent redundancy: a `'*'` catch-all deny **and** explicit denies **and**
 /// explicit allows. The redundancy is the point — an explicit deny survives a
 /// future change to how the catch-all is interpreted, and it makes the boundary
@@ -409,7 +412,8 @@ const READ_ONLY_DENIED: &[&str] = &[
     "edit",
     "task",
     "question",
-    "todowrite",
+    "plan_update",
+    "todo_update",
     "execute",
     "plan_exit",
     "webfetch",
@@ -418,7 +422,7 @@ const READ_ONLY_DENIED: &[&str] = &[
 ];
 
 /// The inspection tools every read-only agent may call.
-const READ_ONLY_ALLOWED: &[&str] = &["read", "glob", "grep", "lsp"];
+const READ_ONLY_ALLOWED: &[&str] = &["read", "glob", "grep", "lsp", "plan_get", "todo_get"];
 
 /// The primary, write-capable agent - the only one that may delegate.
 pub const BUILD: Agent = Agent {
@@ -449,7 +453,10 @@ pub const BUILD: Agent = Agent {
             "task",
             "webfetch",
             "web_search",
-            "todowrite",
+            "plan_get",
+            "plan_update",
+            "todo_get",
+            "todo_update",
             "skill",
             "execute",
             "question",
@@ -489,7 +496,10 @@ pub const DEEP: Agent = Agent {
             "bash",
             "webfetch",
             "web_search",
-            "todowrite",
+            "plan_get",
+            "plan_update",
+            "todo_get",
+            "todo_update",
             "skill",
             "execute",
         ],
@@ -550,12 +560,22 @@ pub const LIBRARIAN: Agent = Agent {
             "edit",
             "task",
             "question",
-            "todowrite",
+            "plan_update",
+            "todo_update",
             "execute",
             "plan_exit",
             "skill",
         ],
-        allowed: &["read", "glob", "grep", "lsp", "webfetch", "web_search"],
+        allowed: &[
+            "read",
+            "glob",
+            "grep",
+            "lsp",
+            "webfetch",
+            "web_search",
+            "plan_get",
+            "todo_get",
+        ],
         extension_tools: ExtensionTools::Excluded,
     },
     delegation: Delegation::NoChildren,
@@ -631,7 +651,10 @@ pub const WORKER: Agent = Agent {
             "bash",
             "webfetch",
             "web_search",
-            "todowrite",
+            "plan_get",
+            "plan_update",
+            "todo_get",
+            "todo_update",
             "skill",
             "execute",
         ],

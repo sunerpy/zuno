@@ -650,6 +650,7 @@ async fn collect_text(
         model_id: agent.model.model_id.clone(),
         surface: agent.model.surface,
         messages,
+        developer_context: Vec::new(),
         tools: Vec::new(),
         parameters: serde_json::Map::new(),
         headers: std::collections::BTreeMap::new(),

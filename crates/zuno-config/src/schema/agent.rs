@@ -29,6 +29,38 @@ pub enum AgentMode {
     All,
 }
 
+/// Provider-neutral reasoning level selected for this agent.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentReasoning {
+    /// Disable model reasoning when supported.
+    Off,
+    /// Use a small reasoning budget.
+    Low,
+    /// Use the normal reasoning budget.
+    Medium,
+    /// Use a large reasoning budget.
+    High,
+    /// Use the strongest broadly available effort.
+    Xhigh,
+    /// Use the strongest effort exposed by the model.
+    Max,
+}
+
+impl AgentReasoning {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 /// A named theme colour (`config/agent.ts:9`).
 #[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -115,9 +147,9 @@ fn is_hex_color(value: &str) -> bool {
 pub const SWEEP_EXEMPT_KEYS: &[&str] = &["name"];
 
 /// Field names that are not part of Zuno's agent schema.
-pub const UNSUPPORTED_AGENT_KEYS: &[&str] = &["tools", "maxSteps"];
+pub const UNSUPPORTED_AGENT_KEYS: &[&str] = &["maxSteps"];
 
-/// One entry of the `agent` map, or one Markdown agent definition's frontmatter.
+/// One entry of the `agents` map, or one Markdown agent definition's frontmatter.
 ///
 /// Deserialization performs the oracle's sweep: any key this struct does not name
 /// is copied into [`options`](Self::options) *and* kept verbatim in
@@ -130,6 +162,9 @@ pub struct AgentConfig {
     /// Default model variant, applied only with the agent's configured model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    /// Provider-neutral reasoning level, applied only with the configured model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<AgentReasoning>,
     /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -160,6 +195,12 @@ pub struct AgentConfig {
     /// Maximum agentic iterations before a text-only response is forced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steps: Option<NonZeroU32>,
+    /// Exact model-visible tool allowlist for this agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// Exact child-agent allowlist for direct delegation and workflows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegates: Option<Vec<String>>,
     /// Per-tool permissions for this agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<PermissionConfig>,
@@ -170,13 +211,31 @@ pub struct AgentConfig {
     pub extra: JsonMap,
 }
 
+fn validate_name_list(field: &str, values: Option<&[String]>) -> Result<(), String> {
+    let Some(values) = values else {
+        return Ok(());
+    };
+    if values.is_empty() {
+        return Err(format!("agent `{field}` must not be empty when present"));
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for value in values {
+        if value.trim().is_empty() {
+            return Err(format!("agent `{field}` entries must not be empty"));
+        }
+        if !unique.insert(value.as_str()) {
+            return Err(format!("agent `{field}` contains duplicate `{value}`"));
+        }
+    }
+    Ok(())
+}
+
 impl<'de> Deserialize<'de> for AgentConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = AgentWire::deserialize(deserializer)?;
         for key in UNSUPPORTED_AGENT_KEYS {
             if wire.extra.contains_key(*key) {
                 let replacement = match *key {
-                    "tools" => "permission",
                     "maxSteps" => "steps",
                     _ => unreachable!("unsupported agent keys have a native replacement"),
                 };
@@ -185,11 +244,18 @@ impl<'de> Deserialize<'de> for AgentConfig {
                 )));
             }
         }
-        if wire.variant.is_some() && wire.model.is_none() {
+        if (wire.variant.is_some() || wire.reasoning.is_some()) && wire.model.is_none() {
             return Err(de::Error::custom(
-                "agent `variant` requires an explicit `model`",
+                "agent `variant` and `reasoning` require an explicit `model`",
             ));
         }
+        if wire.variant.is_some() && wire.reasoning.is_some() {
+            return Err(de::Error::custom(
+                "agent `variant` and `reasoning` are mutually exclusive",
+            ));
+        }
+        validate_name_list("tools", wire.tools.as_deref()).map_err(de::Error::custom)?;
+        validate_name_list("delegates", wire.delegates.as_deref()).map_err(de::Error::custom)?;
         Ok(wire.sweep())
     }
 }
@@ -198,6 +264,7 @@ impl<'de> Deserialize<'de> for AgentConfig {
 struct AgentWire {
     model: Option<String>,
     variant: Option<String>,
+    reasoning: Option<AgentReasoning>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     prompt: Option<String>,
@@ -208,6 +275,8 @@ struct AgentWire {
     options: Option<JsonMap>,
     color: Option<AgentColor>,
     steps: Option<NonZeroU32>,
+    tools: Option<Vec<String>>,
+    delegates: Option<Vec<String>>,
     permission: Option<PermissionConfig>,
     #[serde(flatten)]
     extra: JsonMap,
@@ -228,6 +297,7 @@ impl AgentWire {
         AgentConfig {
             model: self.model,
             variant: self.variant,
+            reasoning: self.reasoning,
             temperature: self.temperature,
             top_p: self.top_p,
             prompt: self.prompt,
@@ -238,6 +308,8 @@ impl AgentWire {
             options,
             color: self.color,
             steps: self.steps,
+            tools: self.tools,
+            delegates: self.delegates,
             permission: self.permission,
             extra: self.extra,
         }

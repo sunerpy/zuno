@@ -441,6 +441,13 @@ fn converse_body(
             "content": converse_content(&message.content)?,
         }));
     }
+    system.extend(
+        request
+            .developer_context
+            .iter()
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| json!({"text": content})),
+    );
     let mut body = Map::from_iter([
         (
             "modelId".to_owned(),
@@ -518,20 +525,26 @@ fn native_body(
     match request.surface {
         ApiSurface::Messages | ApiSurface::Default => anthropic_native_body(request, generation),
         ApiSurface::Chat => {
+            let mut messages = openai_messages(&request.messages)?;
+            append_openai_developer_context(&mut messages, &request.developer_context, "developer");
             let mut body = json!({
                 "model": request.model_id,
                 "stream": true,
-                "messages": openai_messages(&request.messages)?,
+                "messages": messages,
             });
             insert_openai_generation(&mut body, "max_tokens", generation);
             Ok(body)
         }
         ApiSurface::Responses => {
+            let (instructions, input) = openai_responses_input(request)?;
             let mut body = json!({
                 "model": request.model_id,
                 "stream": true,
-                "input": openai_messages(&request.messages)?,
+                "input": input,
             });
+            if let Some(instructions) = instructions {
+                body["instructions"] = Value::String(instructions);
+            }
             insert_openai_generation(&mut body, "max_output_tokens", generation);
             Ok(body)
         }
@@ -564,7 +577,7 @@ fn anthropic_native_body(
         if message.role == Role::System {
             for block in &message.content {
                 if let RequestContentBlock::Text { text } = block {
-                    system.push(text.clone());
+                    system.push(json!({"type": "text", "text": text}));
                 } else {
                     return Err(ProviderError::fatal(
                         RequestShapeError::UnsupportedSystemBlock,
@@ -578,6 +591,13 @@ fn anthropic_native_body(
             }));
         }
     }
+    system.extend(
+        request
+            .developer_context
+            .iter()
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| json!({"type": "text", "text": content})),
+    );
     let mut body = Map::from_iter([
         (
             "anthropic_version".to_owned(),
@@ -599,7 +619,7 @@ fn anthropic_native_body(
     insert_f64(&mut body, "temperature", generation.temperature);
     insert_f64(&mut body, "top_p", generation.top_p);
     if !system.is_empty() {
-        body.insert("system".to_owned(), Value::String(system.join("\n")));
+        body.insert("system".to_owned(), Value::Array(system));
     }
     Ok(Value::Object(body))
 }
@@ -642,31 +662,66 @@ fn anthropic_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provi
 }
 
 fn openai_messages(messages: &[Message]) -> Result<Vec<Value>, ProviderError> {
-    messages
-        .iter()
-        .map(|message| {
-            let mut text = String::new();
-            for block in &message.content {
-                match block {
-                    RequestContentBlock::Text { text: value } => text.push_str(value),
-                    _ => {
-                        return Err(ProviderError::fatal(
-                            RequestShapeError::OpenAiBlockUnsupported,
-                        ));
-                    }
-                }
+    messages.iter().map(openai_message).collect()
+}
+
+fn openai_message(message: &Message) -> Result<Value, ProviderError> {
+    let mut text = String::new();
+    for block in &message.content {
+        match block {
+            RequestContentBlock::Text { text: value } => text.push_str(value),
+            _ => {
+                return Err(ProviderError::fatal(
+                    RequestShapeError::OpenAiBlockUnsupported,
+                ));
             }
-            Ok(json!({
-                "role": match message.role {
-                    Role::System => "system",
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::Tool => "tool",
-                },
-                "content": text,
-            }))
-        })
-        .collect()
+        }
+    }
+    Ok(json!({
+        "role": match message.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        },
+        "content": text,
+    }))
+}
+
+fn append_openai_developer_context(
+    messages: &mut Vec<Value>,
+    developer_context: &[String],
+    role: &str,
+) {
+    messages.extend(
+        developer_context
+            .iter()
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| json!({"role": role, "content": content})),
+    );
+}
+
+fn openai_responses_input(
+    request: &CompletionRequest,
+) -> Result<(Option<String>, Vec<Value>), ProviderError> {
+    let mut instructions = None;
+    let mut input = Vec::new();
+    for message in &request.messages {
+        let mut value = openai_message(message)?;
+        if message.role == Role::System && instructions.is_none() {
+            instructions = value
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            continue;
+        }
+        if message.role == Role::System {
+            value["role"] = Value::String("developer".to_owned());
+        }
+        input.push(value);
+    }
+    append_openai_developer_context(&mut input, &request.developer_context, "developer");
+    Ok((instructions.filter(|value| !value.is_empty()), input))
 }
 
 fn map_decode_error(error: BedrockDecodeError) -> ProviderError {
@@ -743,6 +798,58 @@ mod tests {
             }),
             "a provider configured with no generation controls must still send the \
              pre-`inferenceConfig` shape byte for byte"
+        );
+    }
+
+    #[test]
+    fn developer_context_uses_native_system_or_developer_items() {
+        let base = CompletionRequest::new(
+            "model-under-test",
+            vec![
+                Message::new(Role::System, "stable kernel"),
+                Message::new(Role::User, "exact user text"),
+            ],
+        )
+        .with_developer_context(vec!["active goal".to_owned(), "memory".to_owned()]);
+
+        let converse = converse_body(&base, &BedrockGeneration::default()).expect("Converse body");
+        assert_eq!(
+            converse["system"],
+            json!([
+                {"text": "stable kernel"},
+                {"text": "active goal"},
+                {"text": "memory"},
+            ])
+        );
+
+        let messages = native_body(
+            &base.clone().on_surface(ApiSurface::Messages),
+            &BedrockGeneration::default(),
+        )
+        .expect("Anthropic body");
+        assert_eq!(
+            messages["system"],
+            json!([
+                {"type": "text", "text": "stable kernel"},
+                {"type": "text", "text": "active goal"},
+                {"type": "text", "text": "memory"},
+            ])
+        );
+
+        let responses = native_body(
+            &base.on_surface(ApiSurface::Responses),
+            &BedrockGeneration::default(),
+        )
+        .expect("Mantle Responses body");
+        assert_eq!(responses["instructions"], "stable kernel");
+        assert_eq!(responses["input"][0]["role"], "user");
+        assert_eq!(
+            responses["input"][1],
+            json!({"role": "developer", "content": "active goal"})
+        );
+        assert_eq!(
+            responses["input"][2],
+            json!({"role": "developer", "content": "memory"})
         );
     }
 

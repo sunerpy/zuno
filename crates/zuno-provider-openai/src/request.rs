@@ -64,6 +64,9 @@ pub fn build_request_body(
     request: &CompletionRequest,
     config: &OpenAiConfig,
 ) -> Result<Value, ProviderError> {
+    request
+        .validate_tool_arguments()
+        .map_err(ProviderError::fatal)?;
     match resolve_surface(request.surface) {
         ApiSurface::Chat => build_chat_body(request, config),
         ApiSurface::Responses => build_responses_body(request, config),
@@ -79,16 +82,19 @@ fn build_chat_body(
 ) -> Result<Value, ProviderError> {
     let mut root = Map::new();
     root.insert("model".to_owned(), json!(request.model_id));
-    root.insert(
-        "messages".to_owned(),
-        Value::Array(
-            request
-                .messages
-                .iter()
-                .flat_map(chat_message)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
+    let mut messages = request
+        .messages
+        .iter()
+        .flat_map(chat_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    messages.extend(
+        request
+            .developer_context
+            .iter()
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| json!({"role": "developer", "content": content})),
     );
+    root.insert("messages".to_owned(), Value::Array(messages));
     insert_tools(&mut root, config);
     root.insert("stream".to_owned(), Value::Bool(true));
     root.insert(
@@ -107,12 +113,27 @@ fn build_responses_body(
     config: &OpenAiConfig,
 ) -> Result<Value, ProviderError> {
     let mut input = Vec::new();
+    let mut instructions = None;
     for message in &request.messages {
-        input.extend(responses_message(message)?);
+        if message.role == Role::System && instructions.is_none() {
+            instructions = Some(joined_text(message));
+        } else {
+            input.extend(responses_message(message)?);
+        }
     }
+    input.extend(
+        request
+            .developer_context
+            .iter()
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| json!({"role": "developer", "content": content})),
+    );
 
     let mut root = Map::new();
     root.insert("model".to_owned(), json!(request.model_id));
+    if let Some(instructions) = instructions.filter(|instructions| !instructions.is_empty()) {
+        root.insert("instructions".to_owned(), Value::String(instructions));
+    }
     root.insert("input".to_owned(), Value::Array(input));
     insert_tools(&mut root, config);
     if let Some(store) = config.store() {
@@ -280,7 +301,7 @@ fn chat_assistant(message: &Message) -> Result<Value, ProviderError> {
 fn responses_message(message: &Message) -> Result<Vec<Value>, ProviderError> {
     match message.role {
         Role::System => Ok(vec![json!({
-            "role": "system",
+            "role": "developer",
             "content": joined_text(message),
         })]),
         Role::User => Ok(vec![json!({
@@ -453,6 +474,36 @@ mod tests {
     use super::*;
     use zuno_llm::event::RequestContentBlock;
 
+    #[test]
+    fn responses_uses_native_instructions_and_developer_context() {
+        let request = CompletionRequest::new(
+            "gpt-5.6-sol",
+            vec![
+                Message::new(Role::System, "KERNEL AND AGENT ROLE"),
+                Message::new(Role::System, "GLOBAL RULES"),
+                Message::new(Role::System, "PROJECT RULES"),
+                Message::new(Role::System, "SELECTED SKILL"),
+                Message::new(Role::User, "keep this exact"),
+            ],
+        )
+        .with_developer_context(vec!["ACTIVE GOAL".to_owned(), "MEMORY".to_owned()]);
+
+        let body = build_request_body(&request, &OpenAiConfig::default()).expect("body");
+
+        assert_eq!(body["instructions"], "KERNEL AND AGENT ROLE");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["content"], "GLOBAL RULES");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][1]["content"], "PROJECT RULES");
+        assert_eq!(body["input"][2]["role"], "developer");
+        assert_eq!(body["input"][2]["content"], "SELECTED SKILL");
+        assert_eq!(body["input"][3]["role"], "user");
+        assert_eq!(body["input"][3]["content"][0]["text"], "keep this exact");
+        assert_eq!(body["input"][4]["role"], "developer");
+        assert_eq!(body["input"][4]["content"], "ACTIVE GOAL");
+        assert_eq!(body["input"][5]["role"], "developer");
+        assert_eq!(body["input"][5]["content"], "MEMORY");
+    }
     #[test]
     fn every_known_reasoning_model_strips_all_sampling_parameters() {
         let reasoning_models = [

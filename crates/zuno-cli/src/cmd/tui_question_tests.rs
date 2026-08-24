@@ -2,7 +2,7 @@ use super::*;
 
 use crate::cmd::tui_permission::{PermissionBridge, PermissionBroker};
 use std::time::Duration;
-use zuno_tools::question::{QuestionOption, QuestionPrompt as ToolQuestionPrompt};
+use zuno_tools::question::{QuestionOption, QuestionOutcome, QuestionPrompt as ToolQuestionPrompt};
 use zuno_tui::app::{AppEvent, Component, render_offscreen};
 use zuno_tui::keybind::{ActionComponent, Definition};
 use zuno_tui::views::dialog::ObservedBase;
@@ -175,7 +175,10 @@ async fn question_round_trip_returns_multi_question_answers_in_order() {
         .expect("the question was answered");
     assert_eq!(
         answers,
-        vec![vec![String::from("First")], vec![String::from("Second")],]
+        QuestionOutcome::Answered(vec![
+            vec![String::from("First")],
+            vec![String::from("Second")],
+        ])
     );
 }
 
@@ -203,11 +206,9 @@ async fn question_escape_cancels_the_tool_and_never_hangs() {
         .await
         .expect("cancelling must not leave the turn parked forever")
         .expect("the asking task");
-    assert!(
-        matches!(
-            outcome,
-            Err(ToolError::Denied { ref tool }) if tool == "question"
-        ),
-        "escape returned a fabricated answer instead of cancelling: {outcome:?}"
+    assert_eq!(
+        outcome.expect("the cancellation is an authoritative outcome"),
+        QuestionOutcome::Cancelled,
+        "escape returned a fabricated answer instead of cancelling"
     );
 }

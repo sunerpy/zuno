@@ -6,7 +6,7 @@ use zuno_llm::event::{
 };
 use zuno_llm::registry::{ApiSurface, CompletionRequest};
 use zuno_provider_openai::{OpenAiConfig, OpenAiDecoder, Sampling, build_request_body};
-use zuno_testkit::{CassettePlayer, HttpInteraction, RequestSnapshot};
+use zuno_testkit::{CassettePlayer, HttpInteraction, RequestSnapshot, canonical_snapshot};
 
 const CHAT_MODEL: &str = "gpt-4o-mini";
 const RESPONSES_MODEL: &str = "gpt-5.5";
@@ -42,6 +42,40 @@ fn snapshot(url: &str, body: Value) -> RequestSnapshot {
         headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
         body: serde_json::to_string(&body).expect("request JSON"),
     }
+}
+
+fn next_adapted_responses<'a>(
+    player: &'a mut CassettePlayer,
+    incoming: &RequestSnapshot,
+) -> &'a HttpInteraction {
+    {
+        let recorded = player.peek().expect("recorded Responses interaction");
+        let mut expected = recorded.request.clone();
+        let mut body: Value = serde_json::from_str(&expected.body).expect("recorded request JSON");
+        let inputs = body["input"]
+            .as_array_mut()
+            .expect("recorded Responses input array");
+        let system = inputs
+            .first()
+            .cloned()
+            .expect("recorded Responses system input");
+        assert_eq!(system["role"], "system");
+        let instructions = system["content"]
+            .as_str()
+            .expect("recorded Responses system text")
+            .to_owned();
+        inputs.remove(0);
+        body["instructions"] = Value::String(instructions);
+        expected.body = serde_json::to_string(&body).expect("adapted request JSON");
+        assert_eq!(
+            canonical_snapshot(&expected),
+            canonical_snapshot(incoming),
+            "Zuno may adapt the oracle request only by lifting its leading system item into Responses instructions"
+        );
+    }
+    player
+        .next_unchecked()
+        .expect("consume adapted Responses interaction")
 }
 
 fn chat_config(max_tokens: u64) -> OpenAiConfig {
@@ -299,9 +333,10 @@ fn recorded_responses_text_uses_default_surface_and_exact_events() {
     );
     let config = OpenAiConfig::default().with_max_tokens(80);
     let body = build_request_body(&request, &config).expect("request");
-    let interaction = player
-        .next_http(&snapshot("https://api.openai.com/v1/responses", body))
-        .expect("request parity");
+    let interaction = next_adapted_responses(
+        &mut player,
+        &snapshot("https://api.openai.com/v1/responses", body),
+    );
     let (events, _) = decode(interaction, RESPONSES_MODEL, ApiSurface::Default);
     assert!(matches!(
         &events[0],
@@ -351,9 +386,10 @@ fn recorded_responses_tool_call_matches_request_and_exact_events() {
         .with_tools(vec![weather_tool_responses()])
         .with_tool_choice(json!({ "type": "function", "name": "get_weather" }));
     let body = build_request_body(&request, &config).expect("request");
-    let interaction = player
-        .next_http(&snapshot("https://api.openai.com/v1/responses", body))
-        .expect("request parity");
+    let interaction = next_adapted_responses(
+        &mut player,
+        &snapshot("https://api.openai.com/v1/responses", body),
+    );
     let (events, blocks) = decode(interaction, RESPONSES_MODEL, ApiSurface::Responses);
     assert_eq!(
         events,
@@ -435,9 +471,10 @@ fn recorded_encrypted_reasoning_survives_store_false_continuation() {
         ],
     );
     let first_body = build_request_body(&first_request, &reasoning_config).expect("first request");
-    let first = player
-        .next_http(&snapshot("https://api.openai.com/v1/responses", first_body))
-        .expect("first request parity");
+    let first = next_adapted_responses(
+        &mut player,
+        &snapshot("https://api.openai.com/v1/responses", first_body),
+    );
     let (first_events, first_blocks) = decode(first, RESPONSES_MODEL, ApiSurface::Responses);
     let encrypted = match &first_blocks[0] {
         RequestContentBlock::ProviderEncryptedReasoning {

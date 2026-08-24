@@ -35,7 +35,7 @@
 //! [`render`] is a pure function of `(source, width, palette)`. It reads no global, it
 //! holds no cache, and it mutates nothing that outlives the call — [`Builder`] is
 //! constructed per call and dropped with it. That is a requirement rather than a
-//! preference: `.omo/plans/memory-perf-optimization.md` §3.3 R2-R5 add a
+//! preference: the perf plan §3.3 R2-R5 add a
 //! prepared-frame cache and a 2048-entry per-message line cache *above* this
 //! function, and a memoised function that consults hidden state cannot be memoised
 //! correctly. Nothing here needs `&mut self` on a value the caller keeps.

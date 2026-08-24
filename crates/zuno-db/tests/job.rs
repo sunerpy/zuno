@@ -73,7 +73,7 @@ fn report(id: &str) -> NewSessionInput {
             "childSessionID": CHILD,
             "text": "child result"
         }),
-        InputDelivery::NextStep,
+        InputDelivery::Queue,
         20,
     )
 }
@@ -136,19 +136,47 @@ fn product_agent_jobs_have_no_fake_child_session_and_can_be_uncertain() {
 }
 
 #[test]
+fn workflow_jobs_are_first_class_durable_subjects() {
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    let created = store
+        .create(NewAgentJob::new(
+            "job_workflow",
+            PARENT,
+            JobSubject::workflow("run_release", "release-hardening"),
+            ReportDelivery::Quiet,
+            10,
+        ))
+        .expect("create workflow job");
+    assert_eq!(
+        created.subject.as_json(),
+        json!({"kind":"workflow","runID":"run_release","workflow":"release-hardening"})
+    );
+    assert_eq!(
+        store
+            .running_workflows_for(PARENT)
+            .expect("running workflows")
+            .into_iter()
+            .map(|job| job.id)
+            .collect::<Vec<_>>(),
+        ["job_workflow"]
+    );
+}
+
+#[test]
 fn durable_product_subjects_reject_blank_identifiers() {
     let pool = initialized(&DbLocation::Memory);
     let connection = pool.get().expect("database connection");
     let error = connection
         .execute(
-            "INSERT INTO agent_job (
-               id, parent_session_id, subject_kind, child_session_id, product_run_id,
-               product_kind, product_instance, product_tool, status, report_delivery,
+            r#"INSERT INTO agent_job (
+               id, parent_session_id, subject_kind, subject_payload, status, report_delivery,
                created_seq, time_created, time_updated
              ) VALUES (
-               'job_blank_product', ?1, 'product-agent', NULL, '   ',
-               'codex', 'reviewer', 'subagent_codex', 'running', 'quiet', 0, 1, 1
-             )",
+               'job_blank_product', ?1, 'product-agent',
+               '{"kind":"productAgent","runID":"   ","product":"codex","instance":"reviewer","tool":"subagent_codex"}',
+               'running', 'quiet', 0, 1, 1
+             )"#,
             [PARENT],
         )
         .expect_err("blank durable product identifiers must fail");

@@ -219,7 +219,7 @@ impl PromptDelivery {
     fn into_inbox(self) -> InputDelivery {
         match self {
             Self::Steer => InputDelivery::Steer,
-            Self::NextStep => InputDelivery::NextStep,
+            Self::NextStep => InputDelivery::Queue,
         }
     }
 }
@@ -828,9 +828,11 @@ fn spawn_prompt_driver(
             let Some(promoted) = promoted else {
                 return;
             };
+            let promoted_id = promoted.id.clone();
             let request = match prompt_execution(&state, promoted) {
                 Ok(request) => request,
                 Err(error) => {
+                    let _settled = inbox.mark_failed(&session_id, &promoted_id, error.clone());
                     publish_prompt_error(&state, &session_id, &error).await;
                     if !continue_prompt_driver(&inbox, &services, &session_id, &mut guard) {
                         return;
@@ -841,6 +843,7 @@ fn spawn_prompt_driver(
             let current_guard = guard
                 .take()
                 .expect("prompt driver owns a guard before each execution");
+            let input_id = request.message_id.clone();
             let outcome = run_prompt_execution(
                 &state,
                 &services,
@@ -850,6 +853,7 @@ fn spawn_prompt_driver(
             )
             .await;
             if let Err(error) = outcome {
+                let _settled = inbox.mark_failed(&session_id, &input_id, error.clone());
                 eprintln!("session prompt execution failed: {error}");
                 publish_prompt_error(&state, &session_id, &error).await;
             }

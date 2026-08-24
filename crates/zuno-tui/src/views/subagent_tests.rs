@@ -76,8 +76,38 @@ fn durable_job(status: &str, result: Option<&str>) -> zuno_types::JobProjection 
         report_delivery: "quiet".to_owned(),
         result: result.map(str::to_owned),
         error: None,
+        span: zuno_types::ExecutionSpan::from_aggregate(
+            1_000,
+            (status != "running").then_some(3_500),
+            2_500,
+            0,
+            false,
+        ),
         time_created: 1_000,
         time_completed: (status != "running").then_some(3_500),
+    }
+}
+
+fn durable_workflow(status: &str) -> zuno_types::JobProjection {
+    zuno_types::JobProjection {
+        id: "job_workflow".to_owned(),
+        subject: zuno_types::JobSubjectProjection::Workflow {
+            run_id: "run_release".to_owned(),
+            workflow: "release-hardening".to_owned(),
+        },
+        status: status.to_owned(),
+        report_delivery: "nextStep".to_owned(),
+        result: None,
+        error: (status == "uncertain").then(|| "runner disconnected".to_owned()),
+        span: zuno_types::ExecutionSpan::from_aggregate(
+            2_000,
+            (status != "running").then_some(4_000),
+            2_000,
+            0,
+            false,
+        ),
+        time_created: 2_000,
+        time_completed: (status != "running").then_some(4_000),
     }
 }
 
@@ -135,6 +165,23 @@ fn durable_job_output_refines_status_result_timing_and_subject() {
         assert_eq!(rows[0].time_completed, Some(3500));
         assert_eq!(rows[0].product, "codex");
     }
+}
+
+#[test]
+fn workflow_jobs_are_visible_without_forging_child_sessions() {
+    let rows = delegations_with_jobs(&[], &[durable_workflow("uncertain")]);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let workflow = &rows[0];
+    assert_eq!(workflow.tool, "workflow");
+    assert_eq!(workflow.product, "zuno");
+    assert_eq!(workflow.target.as_deref(), Some("release-hardening"));
+    assert_eq!(workflow.run_id.as_deref(), Some("run_release"));
+    assert!(
+        workflow.session_id.is_none(),
+        "workflow is not a child session"
+    );
+    assert_eq!(workflow.state, "uncertain");
+    assert_eq!(workflow.diagnostic.as_deref(), Some("runner disconnected"));
 }
 
 #[test]

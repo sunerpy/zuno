@@ -7,7 +7,7 @@
 //! Every expected value here was observed on the real `opencode` binary
 //! (`GET /command`, version 1.18.12, source tree pinned `aefaf140c1` = v1.18.13)
 //! or produced by a verbatim transcription of its expansion code. Nothing is
-//! inferred. Transcripts: `.omo/evidence/task-15-opencode-rust.txt`.
+//! inferred. Transcripts: the task-15 verification transcript.
 
 use super::*;
 

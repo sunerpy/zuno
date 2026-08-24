@@ -32,7 +32,7 @@
 //! running and reports "Background task updated" — the caller believes it amended the
 //! running work, and whether the child ever observes the amendment depends on where
 //! in its turn it was. `oh-my-opencode-slim` recognises the hazard and answers it with
-//! prompt prose (`.omo/refs/omo-slim/src/agents/orchestrator.ts:226-231`: "A task in
+//! prompt prose (`omo-slim`: "A task in
 //! the Active / Unreconciled section is still running and cannot receive another
 //! `task` call, even with its `task_id`"), which is an instruction a model may
 //! disregard. Here it is a refusal, and the refusal names the job, because the caller
@@ -79,7 +79,7 @@ pub const FALLBACK_ALIAS_PREFIX: &str = "job";
 /// How many leading characters of an agent name become its alias prefix.
 ///
 /// slim keeps a hand-written `AGENT_PREFIX` table
-/// (`.omo/refs/omo-slim/src/utils/background-job-board.ts:119-127`) whose every entry
+/// (`omo-slim`) whose every entry
 /// is the agent's own first three characters, so the table encodes nothing the name
 /// does not already say. Taking the prefix from the name keeps a roster change from
 /// needing an edit here — and a test asserts the roster's prefixes stay distinct,

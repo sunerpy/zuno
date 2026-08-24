@@ -144,48 +144,57 @@ environment access. Runtime tools use an explicitly granted WASI component or a
 contained `host.full` process. See [plugins, custom agents, and
 workflows](../plugins.md).
 
-## Ordinary permission prompts
+## Permission modes and rules
 
-To run ordinary tool calls without confirmation, allow every permission and
-leave strict authorization disabled (the default):
+Zuno accepts one permission shape only: `permission.mode` selects the HITL
+policy and `permission.rules` carries ordered per-tool rules. Legacy string,
+direct-rule, and `authorization.strict` forms are rejected.
 
-```json
-{
-  "permission": "allow"
-}
-```
-
-For a narrower shell-oriented configuration, allow both the shell and its
-external-path escalation:
+To run tool calls without Zuno HITL prompts, use `allow_all`:
 
 ```json
 {
   "permission": {
-    "bash": "allow",
-    "external_directory": "allow"
+    "mode": "allow_all",
+    "rules": {}
   }
 }
 ```
 
-An explicit `deny` still wins. These settings suppress normal `ask` rules; they
-do not let a standing grant approve a shell operation marked human-only by the
-destructive-command risk gate. Use `zuno debug config` to inspect the merged
-configuration that a session will actually use.
-
-## Strict HITL authorization
-
-Strict authorization is off by default. Enable it when every side-effecting tool
-invocation must receive a fresh decision from an attached user:
+For a narrower shell-oriented configuration, keep standard mode and allow both
+the shell and its external-path escalation:
 
 ```json
 {
-  "authorization": {
-    "strict": true
+  "permission": {
+    "mode": "standard",
+    "rules": {
+      "bash": "allow",
+      "external_directory": "allow"
+    }
   }
 }
 ```
 
-Strict mode is an additional gate above ordinary `permission` rules:
+An explicit `deny` still wins in every mode. `allow_all` bypasses HITL only; it
+does not bypass sandboxing, argument validation, explicit denies, or the shell's
+destructive-command safety gate. Use `zuno debug permissions` and
+`zuno debug config` to inspect the effective policy.
+
+## Strict HITL authorization
+
+Strict mode requires a fresh decision for every side-effecting invocation:
+
+```json
+{
+  "permission": {
+    "mode": "strict",
+    "rules": {}
+  }
+}
+```
+
+Strict mode evaluates explicit rules before its fresh-approval gate:
 
 - An explicit `deny` remains terminal.
 - `allow`, a plugin allow, an earlier "Allow always", and TUI `--auto` cannot

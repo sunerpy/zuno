@@ -19,7 +19,7 @@
 //! A registry keyed only by name cannot express any of them, and todos 30, 94, 95
 //! and 96 would each have to invent a private side channel. So the factory
 //! signature takes a [`Spec`], and the reference implementation's parameterized
-//! factory (`.omo/refs/jcode/src/cli/startup.rs:160-175`, where OpenRouter serves
+//! factory (`jcode`, where OpenRouter serves
 //! four identities through one concrete type) is generalized to every provider
 //! rather than special-cased for one.
 //!

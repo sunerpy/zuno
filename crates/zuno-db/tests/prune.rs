@@ -153,14 +153,6 @@ fn seed(connection: &Connection) {
             .expect("insert part");
         connection
             .execute(
-                "INSERT INTO todo
-                   (session_id, content, status, priority, position, time_created, time_updated)
-                 VALUES (?1, 'retain this', 'pending', 'high', 0, 1, 1)",
-                [session_id],
-            )
-            .expect("insert todo");
-        connection
-            .execute(
                 "INSERT INTO session_message
                    (id, session_id, type, seq, time_created, time_updated, data)
                  VALUES (?1, ?2, 'user', ?3, 1, 1, '{}')",
@@ -170,11 +162,64 @@ fn seed(connection: &Connection) {
         connection
             .execute(
                 "INSERT INTO session_input
-                   (id, session_id, prompt, delivery, admitted_seq, time_created)
-                 VALUES (?1, ?2, '{}', 'inbox', ?3, 1)",
+                   (id, session_id, prompt, delivery, state, revision, admitted_seq,
+                    promoted_seq, error, time_created, time_updated)
+                 VALUES (?1, ?2, '{}', 'queue', 'queued', 1, ?3, NULL, NULL, 1, 1)",
                 rusqlite::params![format!("sinp_{session_id}"), session_id, seq],
             )
             .expect("insert session_input");
+        let subject_payload = format!(
+            r#"{{"kind":"productAgent","runID":"run_{session_id}","product":"codex","instance":"codex","tool":"subagent_codex"}}"#
+        );
+        connection
+            .execute(
+                "INSERT INTO agent_job
+                   (id, parent_session_id, subject_kind, subject_payload, status,
+                    report_delivery, report_input_id, created_seq, time_created, time_updated)
+                 VALUES (?1, ?2, 'product-agent', ?3, 'completed', 'quiet', ?4, ?5, 1, 1)",
+                rusqlite::params![
+                    format!("job_{session_id}"),
+                    session_id,
+                    subject_payload,
+                    format!("sinp_{session_id}"),
+                    seq,
+                ],
+            )
+            .expect("insert agent job");
+        connection
+            .execute(
+                "INSERT INTO work_plan
+                   (session_id, id, revision, title, steps, time_created, time_updated)
+                 VALUES (?1, ?2, 1, 'ship', '[]', 1, 1)",
+                rusqlite::params![session_id, format!("plan_{session_id}")],
+            )
+            .expect("insert work plan");
+        connection
+            .execute(
+                "INSERT INTO work_item
+                   (id, session_id, subject, description, status, priority, dependencies,
+                    revision, time_created, time_updated)
+                 VALUES (?1, ?2, 'verify', 'verify the result', 'pending', 'high', '[]', 1, 1, 1)",
+                rusqlite::params![format!("item_{session_id}"), session_id],
+            )
+            .expect("insert work item");
+        connection
+            .execute(
+                "INSERT INTO memory_reflection_delivery
+                   (session_id, source_message_id, ordinal, recovered, negative_learning, time_created)
+                 VALUES (?1, ?2, 1, 0, 0, 1)",
+                rusqlite::params![session_id, message_id],
+            )
+            .expect("insert reflection delivery");
+        connection
+            .execute(
+                "INSERT INTO memory_reflection_job
+                   (id, session_id, source_message_id, trigger, status, owner_id,
+                    lease_expires, time_created, time_updated, time_completed)
+                 VALUES (?1, ?2, ?3, 'periodic', 'completed', 'test', 1, 1, 1, 1)",
+                rusqlite::params![format!("reflection_{session_id}"), session_id, message_id],
+            )
+            .expect("insert reflection job");
         connection
             .execute(
                 "INSERT INTO session_context_epoch (session_id, baseline, snapshot, baseline_seq)
@@ -315,7 +360,7 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     assert_eq!(all_table_counts(&connection), before);
     assert!(remote.calls.borrow().is_empty(), "preview never unshares");
     assert_eq!(outcome.preview.tables.len(), PRUNE_TABLES.len());
-    assert_eq!(outcome.preview.total_rows, 36);
+    assert_eq!(outcome.preview.total_rows, 48);
     assert!(outcome.preview.total_bytes > 0);
     assert_eq!(outcome.preview.cost, 7.5);
     assert_eq!(outcome.preview.tokens.input, 6);
@@ -378,23 +423,26 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
     assert_eq!(remote.calls.borrow().as_slice(), ["ses_root"]);
     assert_eq!(count(&connection, "session"), 1, "bystander survives");
 
-    for table in [
-        "session_context_epoch",
-        "session_input",
-        "session_message",
-        "todo",
-        "part",
-        "message",
-        "session_share",
-        "session",
+    for (table, column) in [
+        ("memory_reflection_job", "session_id"),
+        ("memory_reflection_delivery", "session_id"),
+        ("agent_job", "parent_session_id"),
+        ("work_item", "session_id"),
+        ("work_plan", "session_id"),
+        ("session_context_epoch", "session_id"),
+        ("session_input", "session_id"),
+        ("session_message", "session_id"),
+        ("part", "session_id"),
+        ("message", "session_id"),
+        ("session_share", "session_id"),
+        ("session", "id"),
     ] {
         let remaining: i64 = connection
             .query_row(
                 &format!(
-                    "SELECT count(*) FROM {table} WHERE session_id IN
+                    "SELECT count(*) FROM {table} WHERE {column} IN
                      ('ses_root', 'ses_child', 'ses_grandchild')"
-                )
-                .replace("session WHERE session_id", "session WHERE id"),
+                ),
                 [],
                 |row| row.get(0),
             )
@@ -545,14 +593,22 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
 
 #[test]
 fn prune_delete_order_and_true_related_table_count_are_pinned() {
-    assert_eq!(PRUNE_TABLES.len(), 10, "the plan's 12-table count is stale");
+    assert_eq!(
+        PRUNE_TABLES.len(),
+        14,
+        "every session-owned schema table must be explicit"
+    );
     assert_eq!(
         DELETE_ORDER,
         [
+            "memory_reflection_job",
+            "memory_reflection_delivery",
+            "agent_job",
+            "work_item",
+            "work_plan",
             "session_context_epoch",
             "session_input",
             "session_message",
-            "todo",
             "part",
             "message",
             "session_share",

@@ -48,7 +48,7 @@
 //!
 //! # Ported from
 //!
-//! `.omo/refs/hermes-agent/tools/memory_tool.py` and its
+//! `hermes-agent` and its
 //! `tools/threat_patterns.py`, with three deliberate divergences, each recorded at
 //! its own site:
 //!

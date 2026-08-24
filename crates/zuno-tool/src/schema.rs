@@ -2,7 +2,7 @@
 //!
 //! # Why derivation, not authorship
 //!
-//! The reference Rust agent in `.omo/refs/claw-code/rust/crates/tools/src/lib.rs`
+//! The reference Rust agent in `claw-code`
 //! hand-writes its tool schemas with `serde_json::json!` — 250 `json!` literals in
 //! one file, 61 of them `"type": "object"` — and deserializes the same arguments
 //! into *separate* serde structs declared elsewhere in the file (see
@@ -18,7 +18,7 @@
 //!
 //! # Why augmentation is central
 //!
-//! Two properties are cross-cutting: every tool wants to report *why* it is being
+//! Two properties are cross-cutting: every tool may report *why* it is being
 //! called, and every tool can produce a result too large to hand back. Wiring
 //! those into each tool by hand would mean editing every schema, and would miss
 //! MCP proxied tools entirely — their schema arrives from a remote server as plain
@@ -26,7 +26,7 @@
 //! point where a tool becomes a provider-facing definition
 //! ([`crate::Tool::definition`]), and applies to derived and proxied schemas
 //! alike. Pattern taken from
-//! `.omo/refs/jcode/crates/jcode-tool-core/src/lib.rs:49-101`.
+//! `jcode`.
 //!
 //! # The cost discipline
 //!
@@ -54,7 +54,7 @@ pub const ACCEPT_LARGE_OUTPUT_KEY: &str = "accept_large_output";
 
 /// The `intent` description. Terse on purpose: see the module docs.
 pub const INTENT_DESCRIPTION: &str =
-    "Required short label shown in the UI: why this call is being made.";
+    "Optional short label shown in the UI: why this call is being made.";
 
 /// The `accept_large_output` description. Terse on purpose: see the module docs.
 pub const ACCEPT_LARGE_OUTPUT_DESCRIPTION: &str =
@@ -132,9 +132,9 @@ pub fn params_schema<T: JsonSchema>() -> Value {
 ///
 /// Idempotent, and non-destructive: a schema that already declares `intent` or
 /// `accept_large_output` keeps its own definition, so a tool with a stricter
-/// `intent` (an enum of labels, say) is not overwritten. Only `intent` joins
-/// `required`; requiring the escape hatch would make the model answer a token
-/// budget question on every call.
+/// `intent` (an enum of labels, say) is not overwritten. Both injected fields are
+/// optional metadata; the tool params type remains the sole source of required
+/// arguments.
 ///
 /// Non-object schemas pass through untouched. That includes MCP proxied schemas
 /// that are shaped unusually — the alternative, rewriting a remote server's
@@ -158,22 +158,6 @@ pub fn augment(mut schema: Value) -> Value {
     properties
         .entry(ACCEPT_LARGE_OUTPUT_KEY)
         .or_insert_with(accept_large_output_property);
-
-    match object.get_mut("required") {
-        Some(Value::Array(required)) => {
-            if !required.iter().any(|v| v.as_str() == Some(INTENT_KEY)) {
-                required.push(Value::String(INTENT_KEY.to_owned()));
-            }
-        }
-        // A `required` that is present but not an array is malformed for any
-        // draft; replacing it is the only reading that leaves a valid schema.
-        Some(_) | None => {
-            object.insert(
-                "required".to_owned(),
-                Value::Array(vec![Value::String(INTENT_KEY.to_owned())]),
-            );
-        }
-    }
 
     schema
 }
@@ -245,7 +229,7 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert!(
             schema["properties"][INTENT_KEY].is_object(),
-            "a no-argument tool still has to report an intent"
+            "a no-argument tool can still report optional intent metadata"
         );
     }
 
@@ -255,13 +239,10 @@ mod tests {
         let twice = augment(once.clone());
 
         assert_eq!(once, twice);
-        let required = twice["required"].as_array().expect("required array");
         assert_eq!(
-            required
-                .iter()
-                .filter(|v| v.as_str() == Some(INTENT_KEY))
-                .count(),
-            1
+            twice["required"],
+            serde_json::json!(["command"]),
+            "augmentation must not add optional metadata to required"
         );
     }
 
@@ -288,12 +269,12 @@ mod tests {
     }
 
     #[test]
-    fn augment_replaces_a_malformed_required() {
+    fn augment_does_not_guess_at_a_malformed_required_keyword() {
         let broken = serde_json::json!({ "type": "object", "required": "command" });
 
         let out = augment(broken);
 
-        assert_eq!(out["required"], serde_json::json!([INTENT_KEY]));
+        assert_eq!(out["required"], serde_json::json!("command"));
     }
 
     #[test]

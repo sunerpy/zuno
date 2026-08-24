@@ -331,5 +331,5 @@ assertions alone are not acceptance.
 5. Critical product resource adapters and lifecycle projection.
 6. Architecture documentation, DSH adoption ledger, full gates.
 
-Delivery uses logical commits. Existing user-owned `.omo/notepads` changes remain
+Delivery uses logical commits. Existing user-owned engineering-note changes remain
 outside every commit.

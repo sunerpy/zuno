@@ -47,6 +47,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, TurnEvent};
 use zuno_llm::event::StreamEvent;
+pub use zuno_types::TokenUsage;
+use zuno_types::UsageSnapshot;
 
 #[cfg(test)]
 #[path = "message_tests.rs"]
@@ -163,8 +165,10 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         // A patch is a write, so it shares the write arrow rather than inventing a glyph:
         // the two differ in how the change is expressed, not in what happens to the file.
         "apply_patch" => ("→", "Preparing patch..."),
-        // A ballot box for the plan, which is what a todo list is here.
-        "todowrite" => ("☑", "Updating plan..."),
+        "plan_get" => ("≣", "Reading plan..."),
+        "plan_update" => ("≣", "Updating plan..."),
+        "todo_get" => ("☑", "Reading work items..."),
+        "todo_update" => ("☑", "Updating work items..."),
         // The only tool that is about to block on the user, so it gets the one glyph that
         // reads as a question.
         "question" => ("?", "Asking..."),
@@ -182,7 +186,7 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         "memory_propose" => ("≡", "Proposing memory..."),
         // One glyph for all three goal tools: they read, set and amend one object, and
         // three glyphs would imply three subjects.
-        "get_goal" | "create_goal" | "update_goal" => ("◎", "Reading the goal..."),
+        "goal_get" | "goal_propose" | "goal_update" => ("◎", "Reading the goal..."),
         _ => ("⚙", "Preparing..."),
     }
 }
@@ -647,6 +651,8 @@ pub struct Transcript {
     tokens: TokenUsage,
     /// Whether cumulative usage is known, unavailable, or not reported yet.
     usage_state: UsageState,
+    /// Durable count of turns that ended in failure rather than completion or cancellation.
+    failed_turns: u64,
     /// The whole prompt the most recent request sent.
     ///
     /// Separate from [`Self::tokens`], and replaced rather than accumulated, because the
@@ -654,7 +660,9 @@ pub struct Transcript {
     /// so far, and this is what is currently in the window. Deriving the second from the
     /// first is the defect [`Transcript::context_used`] documents — a cumulative figure
     /// passes any window on the second turn.
-    last_prompt_tokens: u64,
+    last_prompt_tokens: Option<u64>,
+    /// Local estimate for the newest provider request until confirmed usage arrives.
+    estimated_pending_prompt_tokens: Option<u64>,
     /// The model's context ceiling, when the catalog states one.
     context_limit: u64,
     /// How many animation-clock frames have elapsed.
@@ -671,6 +679,9 @@ pub struct Transcript {
     /// slow. The dialog stack is the only thing that knows the difference, so it is what
     /// sets this.
     awaiting_user: Option<AwaitingUser>,
+    /// Skills loaded by the host before a provider request, including restored prompt
+    /// blocks from an earlier process.
+    loaded_skills: BTreeSet<LoadedSkillIdentity>,
     /// How many leading messages were read back from the database rather than lived through.
     ///
     /// A count rather than a flag per message, because [`Self::replay`] refuses a
@@ -690,6 +701,12 @@ impl Transcript {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Restore selected Skill identities from durable prompt receipts before the first
+    /// frame. Tool-loaded identities are still derived from replayed tool calls.
+    pub fn restore_loaded_skills(&mut self, skills: impl IntoIterator<Item = LoadedSkillIdentity>) {
+        self.loaded_skills.extend(skills);
     }
 
     /// Record why a mounted prompt is asking the user to decide.
@@ -764,23 +781,27 @@ impl Transcript {
     }
 
     /// Restore durable usage before replaying an existing session.
-    pub fn restore_usage(
-        &mut self,
-        tokens: TokenUsage,
-        last_prompt_tokens: Option<u64>,
-        context_limit: Option<u64>,
-        known: bool,
-    ) {
-        self.tokens = tokens;
-        self.last_prompt_tokens = last_prompt_tokens.unwrap_or_default();
-        if let Some(context_limit) = context_limit {
+    pub fn restore_usage(&mut self, snapshot: UsageSnapshot) {
+        self.tokens = snapshot.confirmed;
+        self.last_prompt_tokens = snapshot.last_prompt_tokens;
+        self.estimated_pending_prompt_tokens = snapshot.estimated_pending_prompt_tokens;
+        self.failed_turns = snapshot.failed_turns;
+        if let Some(context_limit) = snapshot.context_limit {
             self.context_limit = context_limit;
         }
-        self.usage_state = if known {
+        self.usage_state = if snapshot.confirmed_known {
             UsageState::Known
-        } else {
+        } else if snapshot.last_confirmed_at.is_some() || !snapshot.confirmed.is_empty() {
             UsageState::Unavailable
+        } else {
+            UsageState::NotReported
         };
+    }
+
+    /// Turns that ended in an error. User cancellations are tracked separately.
+    #[must_use]
+    pub const fn failed_turns(&self) -> u64 {
+        self.failed_turns
     }
 
     /// State the model's context ceiling, so a percentage can be computed.
@@ -799,7 +820,7 @@ impl Transcript {
     /// Replaced on every usage report rather than accumulated, which is the distinction
     /// [`Self::context_used`] needs and [`Self::tokens`] cannot provide.
     #[must_use]
-    pub const fn last_prompt_tokens(&self) -> u64 {
+    pub const fn last_prompt_tokens(&self) -> Option<u64> {
         self.last_prompt_tokens
     }
 
@@ -819,9 +840,17 @@ impl Transcript {
         if self.context_limit == 0 {
             return None;
         }
+        let (prompt_tokens, estimated) = match self.estimated_pending_prompt_tokens {
+            Some(prompt_tokens) => (prompt_tokens, true),
+            None => match self.last_prompt_tokens {
+                Some(prompt_tokens) => (prompt_tokens, false),
+                None => return None,
+            },
+        };
         Some(ContextWindowUsage {
-            prompt_tokens: self.last_prompt_tokens,
+            prompt_tokens,
             limit: self.context_limit,
+            estimated,
         })
     }
 
@@ -926,8 +955,21 @@ impl Transcript {
     /// into a redraw request.
     pub fn observe(&mut self, event: &TurnEvent) -> bool {
         match event {
+            TurnEvent::SkillLoaded { name, source } => {
+                self.loaded_skills.insert(LoadedSkillIdentity {
+                    name: name.clone(),
+                    source: Some(source.clone()),
+                })
+            }
             TurnEvent::TurnStarted { .. } => {
                 self.mark_running();
+                true
+            }
+            TurnEvent::ProviderRequestStarted {
+                estimated_prompt_tokens,
+                ..
+            } => {
+                self.estimated_pending_prompt_tokens = Some(*estimated_prompt_tokens);
                 true
             }
             TurnEvent::AssistantMessageCreated { message_id, .. } => {
@@ -1027,6 +1069,7 @@ impl Transcript {
             }
             TurnEvent::TurnFailed { message, .. } => {
                 self.running = false;
+                self.failed_turns = self.failed_turns.saturating_add(1);
                 self.streaming = None;
                 self.close_reasoning();
                 for transcript_message in &mut self.messages {
@@ -1140,11 +1183,13 @@ impl Transcript {
                 accounting,
             } => {
                 self.usage_state = UsageState::Known;
+                self.estimated_pending_prompt_tokens = None;
                 let input = input_tokens.unwrap_or_default();
                 let cache_read = cache_read_input_tokens.unwrap_or_default();
                 let cache_write = cache_write_input_tokens.unwrap_or_default();
                 // Replaced, not added: this is the window's current occupancy.
-                self.last_prompt_tokens = accounting.prompt_total(input, cache_read, cache_write);
+                self.last_prompt_tokens =
+                    Some(accounting.prompt_total(input, cache_read, cache_write));
                 self.tokens.add(
                     accounting.uncached_input(input, cache_read, cache_write),
                     output_tokens.unwrap_or_default(),
@@ -1465,41 +1510,45 @@ impl TranscriptView {
             .unwrap_or(self.thinking)
     }
 
-    /// Skill identities whose `skill` tool call completed successfully.
+    /// Skill identities loaded either by the host before the first request or by a
+    /// successful `skill load` tool call.
     #[must_use]
     pub fn loaded_skills(&self) -> BTreeSet<LoadedSkillIdentity> {
-        self.transcript
-            .messages
-            .iter()
-            .flat_map(|message| &message.parts)
-            .filter_map(|part| {
-                let MessagePart::Tool {
-                    name,
-                    arguments,
-                    status: ToolStatus::Completed,
-                    ..
-                } = part
-                else {
-                    return None;
-                };
-                if name != "skill" {
-                    return None;
-                }
-                let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
-                if value.get("action").and_then(serde_json::Value::as_str) != Some("load") {
-                    return None;
-                }
-                let name = value
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)?
-                    .to_owned();
-                let source = value
-                    .get("source")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-                Some(LoadedSkillIdentity { name, source })
-            })
-            .collect()
+        let mut loaded = self.transcript.loaded_skills.clone();
+        loaded.extend(
+            self.transcript
+                .messages
+                .iter()
+                .flat_map(|message| &message.parts)
+                .filter_map(|part| {
+                    let MessagePart::Tool {
+                        name,
+                        arguments,
+                        status: ToolStatus::Completed,
+                        ..
+                    } = part
+                    else {
+                        return None;
+                    };
+                    if name != "skill" {
+                        return None;
+                    }
+                    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+                    if value.get("action").and_then(serde_json::Value::as_str) != Some("load") {
+                        return None;
+                    }
+                    let name = value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)?
+                        .to_owned();
+                    let source = value
+                        .get("source")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    Some(LoadedSkillIdentity { name, source })
+                }),
+        );
+        loaded
     }
 
     /// Begin a transcript selection at a screen coordinate.
@@ -2368,7 +2417,7 @@ impl TranscriptView {
                 let row = match (crate::views::tool::summary(name, arguments), title, status) {
                     (Some(summary), _, _) => {
                         // Measured against what the head actually spent, not against a
-                        // constant: the name's width runs from `read` to `update_goal`, and
+                        // constant: the name's width runs from `read` to `goal_update`, and
                         // the summary has to be fitted to what is left after it. One more
                         // column is charged for the space that joins them.
                         let room = usize::from(body_width)
@@ -2527,16 +2576,13 @@ impl TranscriptView {
             self.push_overflow(frame, total, budget, capped, out);
             return;
         }
-        // A failed call's output *is* the failure, so it is painted as one. In `muted` it
-        // read as ordinary output two shades quieter than the red row above it, which is
-        // backwards: §7.5 asks for the error to hang below the tool row, and hanging it
-        // there in the colour of success-adjacent noise is only half of that.
+        // The status remains on the header. Result prose itself stays readable instead of
+        // tinting an entire multi-line block red or low-contrast grey; only blocked guidance
+        // keeps warning colour because it asks the user to act.
         let body = match status {
-            ToolStatus::Error => self.context.error(),
+            ToolStatus::Error | ToolStatus::Completed => self.context.tool_output(),
             ToolStatus::Blocked => self.context.warning(),
-            ToolStatus::Pending | ToolStatus::Running | ToolStatus::Completed => {
-                self.context.muted()
-            }
+            ToolStatus::Pending | ToolStatus::Running => self.context.secondary(),
         };
         let rows = wrap(result, body_width);
         let total = rows.len();
@@ -2618,7 +2664,7 @@ impl TranscriptView {
 /// wrapped with no row cap at all, so a single entry can be arbitrarily tall. §6.2's
 /// reference point is a 2,048-entry FIFO; an entry bound here would have permitted an
 /// unbounded number of bytes, which is the failure class
-/// `.omo/plans/memory-perf-optimization.md` exists to remove rather than relocate.
+/// the perf plan exists to remove rather than relocate.
 ///
 /// **What it costs at the bound.** A prepared 931-message frame was measured at
 /// 5,156,568 bytes over 13,023 rows — 396 bytes per row including each `Line`, its
@@ -3101,28 +3147,6 @@ pub struct StatusView {
     effort: Option<zuno_llm::effort::ReasoningEffort>,
 }
 
-/// Token counts for the session, accumulated across every step of every turn.
-///
-/// Cumulative rather than per-step because the number a user is watching for is what
-/// the session has cost so far; a per-step count resets to a small number at every
-/// step boundary and reads as if usage went down.
-/// The four buckets are **disjoint**, which is what makes [`Self::total`] a sum. Getting
-/// there takes work at the fold, because providers disagree about whether their prompt
-/// figure already contains their cache figure: `zuno_llm::event::PromptAccounting` states
-/// which, and [`Transcript::observe`] normalises with it before adding. Adding the raw
-/// numbers is what made the sidebar's total count OpenAI's cache reads twice.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TokenUsage {
-    /// Prompt tokens that were neither read from nor written to the cache.
-    pub input: u64,
-    /// Completion tokens received.
-    pub output: u64,
-    /// Prompt tokens served from the provider's cache.
-    pub cache_read: u64,
-    /// Prompt tokens written into the provider's cache.
-    pub cache_write: u64,
-}
-
 /// Occupancy of the model window for the most recent provider request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextWindowUsage {
@@ -3130,6 +3154,8 @@ pub struct ContextWindowUsage {
     pub prompt_tokens: u64,
     /// Model-declared maximum prompt window.
     pub limit: u64,
+    /// True until provider usage confirms this locally estimated request.
+    pub estimated: bool,
 }
 
 impl ContextWindowUsage {
@@ -3153,40 +3179,6 @@ pub enum UsageState {
     Known,
     /// Historical snapshots lack enough accounting information to be reliable.
     Unavailable,
-}
-
-impl TokenUsage {
-    /// Whether anything has been counted yet.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
-    }
-
-    /// Every token the session has been billed for, cache included and counted once.
-    ///
-    /// A plain sum only because the four buckets are disjoint — see the type's own note.
-    /// Saturating rather than wrapping: a long session's total is large, and a figure
-    /// that wrapped to a small number would read as usage going down.
-    #[must_use]
-    pub const fn total(&self) -> u64 {
-        self.input
-            .saturating_add(self.output)
-            .saturating_add(self.cache_read)
-            .saturating_add(self.cache_write)
-    }
-
-    /// Add one step's report.
-    ///
-    /// A provider that reports the same step twice — a retry replaying its usage
-    /// event — would double-count, so the accumulator is fed from
-    /// [`StreamEvent::TokenUsage`] only, which the engine emits once per completed
-    /// step (`zuno-engine/src/loop.rs:530`).
-    pub const fn add(&mut self, input: u64, output: u64, cache_read: u64, cache_write: u64) {
-        self.input += input;
-        self.output += output;
-        self.cache_read += cache_read;
-        self.cache_write += cache_write;
-    }
 }
 
 /// Group `value` in thousands so a six-figure token count stays readable.

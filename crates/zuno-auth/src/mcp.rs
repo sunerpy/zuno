@@ -37,7 +37,7 @@
 //! `Cargo.toml`, and task 24 must not edit it, so two concurrent updates here can
 //! lose one another. [`McpAuthStore::mutate`] is the single choke point through
 //! which every write passes, so the lock has exactly one place to go. Recorded in
-//! `.omo/notepads/opencode-rust/issues.md` for task 46, which owns the MCP OAuth
+//! the project's engineering notes for task 46, which owns the MCP OAuth
 //! flow.
 
 use std::collections::BTreeMap;

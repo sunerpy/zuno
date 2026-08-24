@@ -7,14 +7,7 @@ use zuno_config::schema::permission::{
 /// Flatten permission configuration without changing either object order.
 #[must_use]
 pub fn rules_from_config(config: &PermissionConfig) -> Vec<Rule> {
-    match config {
-        PermissionConfig::Action(action) => vec![Rule {
-            permission: "*".to_owned(),
-            pattern: "*".to_owned(),
-            action: *action,
-        }],
-        PermissionConfig::Object(object) => rules_from_object(object),
-    }
+    rules_from_object(&config.rules)
 }
 
 fn rules_from_object(object: &PermissionObject) -> Vec<Rule> {

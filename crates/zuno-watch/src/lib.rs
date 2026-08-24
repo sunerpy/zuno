@@ -570,7 +570,7 @@ impl Drop for Watcher {
 /// thing: `HEAD` changing, i.e. a branch switch. Because that list is a snapshot,
 /// an entry created in `.git` *after* subscribing slips through the oracle's
 /// filter; this states the intent directly instead, which is a strict narrowing.
-/// Recorded in `.omo/notepads/opencode-rust/issues.md`.
+/// Recorded in the project's engineering notes.
 #[must_use]
 pub fn is_vcs_reportable(vcs_dir: &Path, path: &Path) -> bool {
     path == vcs_dir.join("HEAD")

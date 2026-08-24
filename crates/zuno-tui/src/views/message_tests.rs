@@ -584,28 +584,22 @@ fn views_user_messages_render_commonmark_tables_instead_of_literal_pipes() {
 }
 
 #[test]
-fn views_thinking_style_is_a_muted_composite_not_a_warning_composite() {
+fn views_thinking_style_uses_a_readable_secondary_accent_without_dim() {
     let context = ViewContext::defaults();
     let palette = context.palette();
-    let thinking = context.thinking().fg.expect("a foreground");
-    let expected = ratatui::style::Color::from(crate::theme::tint(
-        palette.background,
-        palette.text_muted,
-        palette.thinking_opacity,
-    ));
-    let warning = ratatui::style::Color::from(crate::theme::tint(
-        palette.background,
-        palette.warning,
-        palette.thinking_opacity,
-    ));
+    let style = context.thinking();
+    let thinking = style.fg.expect("a foreground");
     assert_eq!(
-        thinking, expected,
-        "reasoning does not use the theme's muted hierarchy"
+        thinking,
+        ratatui::style::Color::from(palette.secondary),
+        "reasoning does not use the semantic secondary accent"
     );
     assert_ne!(
-        thinking, warning,
-        "reasoning still occupies the same colour family as a warning"
+        thinking,
+        ratatui::style::Color::from(palette.text_muted),
+        "reasoning fell back to the low-contrast muted colour"
     );
+    assert!(!style.add_modifier.contains(Modifier::DIM));
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,17 +1160,20 @@ fn views_transcript_folds_provider_token_usage_for_the_ambient_panel() {
 #[test]
 fn views_transcript_restores_durable_usage_and_marks_unknown_history() {
     let mut transcript = crate::views::message::Transcript::new();
-    transcript.restore_usage(
-        crate::views::message::TokenUsage {
+    transcript.restore_usage(zuno_types::UsageSnapshot {
+        confirmed: crate::views::message::TokenUsage {
             input: 900,
             output: 100,
+            reasoning: 0,
             cache_read: 200,
             cache_write: 0,
+            unclassified: 0,
         },
-        Some(1_100),
-        Some(10_000),
-        true,
-    );
+        last_prompt_tokens: Some(1_100),
+        context_limit: Some(10_000),
+        confirmed_known: true,
+        ..zuno_types::UsageSnapshot::default()
+    });
     assert_eq!(
         transcript.usage_state(),
         crate::views::message::UsageState::Known
@@ -1187,15 +1184,14 @@ fn views_transcript_restores_durable_usage_and_marks_unknown_history() {
         Some(crate::views::message::ContextWindowUsage {
             prompt_tokens: 1_100,
             limit: 10_000,
+            estimated: false,
         })
     );
 
-    transcript.restore_usage(
-        crate::views::message::TokenUsage::default(),
-        None,
-        None,
-        false,
-    );
+    transcript.restore_usage(zuno_types::UsageSnapshot {
+        last_confirmed_at: Some(1),
+        ..zuno_types::UsageSnapshot::default()
+    });
     assert_eq!(
         transcript.usage_state(),
         crate::views::message::UsageState::Unavailable
@@ -1242,10 +1238,62 @@ fn views_transcript_counts_a_cached_token_once_whichever_convention_the_provider
     assert_eq!(openai.transcript().tokens().total(), 1_540);
     assert_eq!(
         openai.transcript().last_prompt_tokens(),
-        1_200,
+        Some(1_200),
         "the whole prompt, cache included, is what occupies the window"
     );
-    assert_eq!(anthropic.transcript().last_prompt_tokens(), 1_200);
+    assert_eq!(anthropic.transcript().last_prompt_tokens(), Some(1_200));
+}
+
+#[test]
+fn views_failed_provider_request_keeps_confirmed_usage_and_exposes_local_estimate() {
+    let mut transcript = Transcript::new();
+    transcript.restore_usage(zuno_types::UsageSnapshot {
+        confirmed: TokenUsage {
+            input: 3_000,
+            output: 500,
+            reasoning: 0,
+            cache_read: 700,
+            cache_write: 0,
+            unclassified: 0,
+        },
+        last_prompt_tokens: Some(4_200),
+        context_limit: Some(10_000),
+        confirmed_known: true,
+        ..zuno_types::UsageSnapshot::default()
+    });
+    let confirmed = transcript.tokens();
+
+    transcript.observe(&TurnEvent::ProviderRequestStarted {
+        step: 1,
+        message_count: 7,
+        estimated_prompt_tokens: 8_500,
+    });
+    assert_eq!(
+        transcript.context_window(),
+        Some(ContextWindowUsage {
+            prompt_tokens: 8_500,
+            limit: 10_000,
+            estimated: true,
+        })
+    );
+    transcript.observe(&TurnEvent::TurnFailed {
+        assistant_message_id: None,
+        steps: 1,
+        message: "provider rejected malformed tool input".to_owned(),
+    });
+
+    assert_eq!(transcript.tokens(), confirmed);
+    assert_eq!(transcript.failed_turns(), 1);
+    assert_eq!(transcript.last_prompt_tokens(), Some(4_200));
+    assert_eq!(
+        transcript.context_window(),
+        Some(ContextWindowUsage {
+            prompt_tokens: 8_500,
+            limit: 10_000,
+            estimated: true,
+        }),
+        "a rejected request keeps its local estimate without overwriting confirmed usage"
+    );
 }
 
 #[test]
@@ -2128,8 +2176,8 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
         ("bash", r#"{"command":"cargo build"}"#),
         ("web_search", r#"{"queries":["ratatui spans"]}"#),
         (
-            "todowrite",
-            r#"{"todos":[{"content":"ship it","status":"pending","priority":"high"}]}"#,
+            "todo_update",
+            r#"{"changes":[{"action":"add","id":"todo_ship","subject":"ship it","description":"ship it","status":"pending","priority":"high"}]}"#,
         ),
         (
             "memory_propose",
@@ -2165,7 +2213,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
         "grep \"fn main\"",
         "bash cargo build",
         "web_search ratatui spans",
-        "todowrite 1 items · ship it",
+        "todo_update 1 changes · ship it",
         "memory_propose add project: run cargo fmt",
     ] {
         assert!(
@@ -2401,9 +2449,9 @@ fn views_a_diff_bearing_result_uses_the_diff_palette_not_the_muted_output_style(
 }
 
 #[test]
-fn views_a_failed_tool_paints_its_output_as_an_error_below_the_call_row() {
-    // §7.5: the error hangs below the tool row rather than replacing it — the call is still
-    // worth naming — and it is painted as a failure rather than as quiet output.
+fn views_a_failed_tool_marks_the_call_as_error_but_keeps_its_output_readable() {
+    // The error hangs below the tool row rather than replacing it. The status row carries the
+    // red error semantic; prose remains primary text so a multi-line diagnostic stays readable.
     let mut view = view();
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
@@ -2433,15 +2481,20 @@ fn views_a_failed_tool_paints_its_output_as_an_error_below_the_call_row() {
     );
     let context = ViewContext::defaults();
     let error = ratatui::style::Color::from(context.palette().error);
-    let painted = view.lines(60).into_iter().any(|line| {
-        line.spans
-            .iter()
-            .any(|span| span.style.fg == Some(error) && span.content.contains("exit status 1"))
-    });
+    let primary = ratatui::style::Color::from(context.palette().text);
+    let lines = view.lines(60);
     assert!(
-        painted,
-        "a failed call's output is painted as ordinary muted output, so it reads as noise \
-         rather than as the failure it is"
+        lines.iter().any(|line| line.spans.iter().any(|span| {
+            span.style.fg == Some(error)
+                && (span.content.contains('✗') || span.content.contains("bash"))
+        })),
+        "the failed call row did not carry the semantic error colour"
+    );
+    assert!(
+        lines.iter().any(|line| line.spans.iter().any(|span| {
+            span.style.fg == Some(primary) && span.content.contains("exit status 1")
+        })),
+        "the diagnostic body was not kept in readable primary text"
     );
 }
 

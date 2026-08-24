@@ -1,7 +1,7 @@
 //! Prompt-injection and exfiltration screening for content bound for the system
 //! prompt.
 //!
-//! Port of `.omo/refs/hermes-agent/tools/threat_patterns.py`, carrying all **36**
+//! Port of `hermes-agent`, carrying all **36**
 //! patterns of its broadest ruleset plus one Zuno-native credential-literal
 //! rule. Memory writes use the broadest set — `scope="strict"`, which is `all` +
 //! `context` + `strict` (`:216-218`) — for the reason stated at

@@ -24,6 +24,7 @@ pub mod permission;
 pub mod product_agent;
 pub mod provider;
 pub mod reference;
+pub mod workflow;
 
 #[cfg(test)]
 mod tests;
@@ -33,10 +34,11 @@ use crate::schema::formatter::FormatterConfig;
 use crate::schema::lsp::LspConfig;
 use crate::schema::mcp::McpServerConfig;
 use crate::schema::ordered::OrderedMap;
-use crate::schema::permission::PermissionConfig;
+use crate::schema::permission::{PermissionConfig, PermissionMode};
 use crate::schema::product_agent::ProductAgentConfig;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
+use crate::schema::workflow::AgentWorkflowConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -66,7 +68,8 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "default_agent",
     "subagent_depth",
     "username",
-    "agent",
+    "agents",
+    "workflows",
     "provider",
     "productAgent",
     "mcp",
@@ -74,7 +77,6 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "lsp",
     "instructions",
     "permission",
-    "authorization",
     "tools",
     "attachment",
     "enterprise",
@@ -155,8 +157,11 @@ pub struct Config {
     /// and `compaction` explicitly and then adds `Record(String, AgentConfig)`
     /// (`config/config.ts:96-110`), so every value has the same type and the named
     /// keys carry no extra meaning at parse time.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "agents", skip_serializing_if = "Option::is_none")]
     pub agent: Option<OrderedMap<AgentConfig>>,
+    /// Named, immutable multi-agent workflow templates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflows: Option<OrderedMap<AgentWorkflowConfig>>,
     /// Custom providers and model overrides.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<OrderedMap<ProviderConfig>>,
@@ -175,12 +180,9 @@ pub struct Config {
     /// Additional instruction files or glob patterns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Vec<String>>,
-    /// Global permissions.
+    /// Global permissions and cross-cutting HITL mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<PermissionConfig>,
-    /// Cross-cutting authorization behavior.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub authorization: Option<AuthorizationConfig>,
     /// Tool switches, keyed by tool name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<OrderedMap<bool>>,
@@ -231,13 +233,18 @@ impl Config {
         )
     }
 
+    /// Resolve the canonical permission mode.
+    #[must_use]
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.permission
+            .as_ref()
+            .map_or(PermissionMode::Standard, |permission| permission.mode)
+    }
+
     /// Whether side-effecting tool calls require a fresh attached-user decision.
     #[must_use]
     pub fn strict_authorization(&self) -> bool {
-        self.authorization
-            .as_ref()
-            .and_then(|authorization| authorization.strict)
-            .unwrap_or(false)
+        self.permission_mode() == PermissionMode::Strict
     }
 }
 
@@ -510,15 +517,6 @@ impl<'de> Deserialize<'de> for CompactionThresholdPercent {
         let value = u8::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
     }
-}
-
-/// Cross-cutting authorization behavior.
-#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthorizationConfig {
-    /// Require a fresh human approval for every side-effecting tool invocation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strict: Option<bool>,
 }
 
 /// Small positive concurrency bound accepted at every runtime boundary.

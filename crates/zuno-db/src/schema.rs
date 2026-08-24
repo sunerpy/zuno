@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 23;
+pub const TABLE_COUNT: usize = 24;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -134,10 +134,14 @@ CREATE TABLE `session_input` (
   `id` text PRIMARY KEY,
   `session_id` text NOT NULL,
   `prompt` text NOT NULL,
-  `delivery` text NOT NULL,
+  `delivery` text NOT NULL CHECK (`delivery` IN ('queue', 'steer')),
+  `state` text NOT NULL CHECK (`state` IN ('queued', 'steering', 'promoted', 'consumed', 'cancelled', 'failed')),
+  `revision` integer NOT NULL CHECK (`revision` > 0),
   `admitted_seq` integer NOT NULL,
   `promoted_seq` integer,
+  `error` text,
   `time_created` integer NOT NULL,
+  `time_updated` integer NOT NULL,
   CONSTRAINT `fk_session_input_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
 );
 CREATE TABLE `session_message` (
@@ -176,6 +180,10 @@ CREATE TABLE `session` (
   `tokens_context_limit` integer,
   `tokens_accounting` text,
   `tokens_known` integer DEFAULT 0 NOT NULL,
+  `tokens_estimated_pending_prompt` integer,
+  `tokens_last_confirmed_at` integer,
+  `failed_turns` integer DEFAULT 0 NOT NULL,
+  `last_failed_at` integer,
   `revert` text,
   `permission` text,
   `agent` text,
@@ -190,11 +198,7 @@ CREATE TABLE `agent_job` (
   `id` text PRIMARY KEY,
   `parent_session_id` text NOT NULL,
   `subject_kind` text NOT NULL,
-  `child_session_id` text,
-  `product_run_id` text,
-  `product_kind` text,
-  `product_instance` text,
-  `product_tool` text,
+  `subject_payload` text NOT NULL,
   `status` text NOT NULL,
   `report_delivery` text NOT NULL,
   `result` text,
@@ -206,30 +210,59 @@ CREATE TABLE `agent_job` (
   `time_updated` integer NOT NULL,
   `time_completed` integer,
   CONSTRAINT `agent_job_subject` CHECK (
-    (`subject_kind` = 'child-session' AND `child_session_id` IS NOT NULL AND
-     `product_run_id` IS NULL AND `product_kind` IS NULL AND
-     `product_instance` IS NULL AND `product_tool` IS NULL) OR
-    (`subject_kind` = 'product-agent' AND `child_session_id` IS NULL AND
-     length(trim(`product_run_id`)) > 0 AND length(trim(`product_kind`)) > 0 AND
-     length(trim(`product_instance`)) > 0 AND length(trim(`product_tool`)) > 0)
+    json_valid(`subject_payload`) AND (
+      (`subject_kind` = 'child-session' AND
+       json_extract(`subject_payload`, '$.kind') = 'childSession' AND
+       coalesce(length(trim(json_extract(`subject_payload`, '$.sessionID'))), 0) > 0 AND
+       `parent_session_id` <> json_extract(`subject_payload`, '$.sessionID')) OR
+      (`subject_kind` = 'product-agent' AND
+       json_extract(`subject_payload`, '$.kind') = 'productAgent' AND
+       coalesce(length(trim(json_extract(`subject_payload`, '$.runID'))), 0) > 0 AND
+       coalesce(length(trim(json_extract(`subject_payload`, '$.product'))), 0) > 0 AND
+       coalesce(length(trim(json_extract(`subject_payload`, '$.instance'))), 0) > 0 AND
+       coalesce(length(trim(json_extract(`subject_payload`, '$.tool'))), 0) > 0) OR
+      (`subject_kind` = 'workflow' AND
+       json_extract(`subject_payload`, '$.kind') = 'workflow' AND
+       coalesce(length(trim(json_extract(`subject_payload`, '$.runID'))), 0) > 0 AND
+       coalesce(length(trim(json_extract(`subject_payload`, '$.workflow'))), 0) > 0)
+    )
   ),
-  CONSTRAINT `agent_job_distinct_sessions` CHECK (`child_session_id` IS NULL OR `parent_session_id` <> `child_session_id`),
   CONSTRAINT `agent_job_status` CHECK (`status` IN ('running','completed','failed','cancelled','uncertain')),
   CONSTRAINT `agent_job_report_delivery` CHECK (`report_delivery` IN ('next-step','quiet')),
   CONSTRAINT `fk_agent_job_parent_session_id_session_id_fk` FOREIGN KEY (`parent_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
-  CONSTRAINT `fk_agent_job_child_session_id_session_id_fk` FOREIGN KEY (`child_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_agent_job_report_input_id_session_input_id_fk` FOREIGN KEY (`report_input_id`) REFERENCES `session_input`(`id`) ON DELETE SET NULL
 );
-CREATE TABLE `todo` (
-  `session_id` text NOT NULL,
-  `content` text NOT NULL,
-  `status` text NOT NULL,
-  `priority` text NOT NULL,
-  `position` integer NOT NULL,
+CREATE TABLE `work_plan` (
+  `session_id` text PRIMARY KEY,
+  `id` text NOT NULL UNIQUE,
+  `goal_id` text,
+  `revision` integer NOT NULL CHECK (`revision` >= 1),
+  `title` text NOT NULL,
+  `steps` text NOT NULL,
   `time_created` integer NOT NULL,
   `time_updated` integer NOT NULL,
-  CONSTRAINT `todo_pk` PRIMARY KEY(`session_id`, `position`),
-  CONSTRAINT `fk_todo_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
+  CONSTRAINT `fk_work_plan_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
+);
+CREATE TABLE `work_item` (
+  `id` text PRIMARY KEY,
+  `session_id` text NOT NULL,
+  `goal_id` text,
+  `plan_step_id` text,
+  `parent_id` text,
+  `subject` text NOT NULL,
+  `description` text NOT NULL,
+  `active_form` text,
+  `status` text NOT NULL CHECK (`status` IN ('pending','in_progress','completed','cancelled','blocked')),
+  `priority` text NOT NULL CHECK (`priority` IN ('high','medium','low')),
+  `dependencies` text NOT NULL,
+  `owner` text,
+  `revision` integer NOT NULL CHECK (`revision` >= 1),
+  `tokens_used` integer NOT NULL DEFAULT 0,
+  `usage_known` integer NOT NULL DEFAULT 0,
+  `time_used_ms` integer NOT NULL DEFAULT 0,
+  `time_created` integer NOT NULL,
+  `time_updated` integer NOT NULL,
+  CONSTRAINT `fk_work_item_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
 );
 CREATE TABLE `memory_reflection_delivery` (
   `session_id` text NOT NULL,
@@ -304,20 +337,30 @@ CREATE UNIQUE INDEX `permission_project_action_resource_idx` ON `permission` (`p
 CREATE INDEX `message_session_time_created_id_idx` ON `message` (`session_id`,`time_created`,`id`);
 CREATE INDEX `part_message_id_id_idx` ON `part` (`message_id`,`id`);
 CREATE INDEX `part_session_idx` ON `part` (`session_id`);
-CREATE INDEX `session_input_session_pending_delivery_seq_idx` ON `session_input` (`session_id`,`promoted_seq`,`delivery`,`admitted_seq`);
+CREATE INDEX `session_input_session_pending_delivery_seq_idx` ON `session_input` (`session_id`,`state`,`delivery`,`admitted_seq`);
 CREATE UNIQUE INDEX `session_input_session_admitted_seq_idx` ON `session_input` (`session_id`,`admitted_seq`);
 CREATE UNIQUE INDEX `session_input_session_promoted_seq_idx` ON `session_input` (`session_id`,`promoted_seq`);
 CREATE UNIQUE INDEX `session_message_session_seq_idx` ON `session_message` (`session_id`,`seq`);
 CREATE INDEX `session_message_session_type_seq_idx` ON `session_message` (`session_id`,`type`,`seq`);
 CREATE INDEX `session_message_session_time_created_id_idx` ON `session_message` (`session_id`,`time_created`,`id`);
 CREATE INDEX `session_message_time_created_idx` ON `session_message` (`time_created`);
-CREATE UNIQUE INDEX `agent_job_child_running_idx` ON `agent_job` (`child_session_id`) WHERE `status` = 'running';
-CREATE UNIQUE INDEX `agent_job_product_run_idx` ON `agent_job` (`product_run_id`) WHERE `product_run_id` IS NOT NULL;
+CREATE UNIQUE INDEX `agent_job_child_running_idx`
+  ON `agent_job` (json_extract(`subject_payload`, '$.sessionID'))
+  WHERE `subject_kind` = 'child-session' AND `status` = 'running';
+CREATE UNIQUE INDEX `agent_job_product_run_idx`
+  ON `agent_job` (json_extract(`subject_payload`, '$.runID'))
+  WHERE `subject_kind` = 'product-agent';
+CREATE UNIQUE INDEX `agent_job_workflow_run_idx`
+  ON `agent_job` (json_extract(`subject_payload`, '$.runID'))
+  WHERE `subject_kind` = 'workflow';
 CREATE INDEX `agent_job_parent_status_created_idx` ON `agent_job` (`parent_session_id`,`status`,`time_created`);
 CREATE INDEX `session_project_idx` ON `session` (`project_id`);
 CREATE INDEX `session_workspace_idx` ON `session` (`workspace_id`);
 CREATE INDEX `session_parent_idx` ON `session` (`parent_id`);
-CREATE INDEX `todo_session_idx` ON `todo` (`session_id`);
+CREATE INDEX `work_plan_goal_idx` ON `work_plan` (`goal_id`);
+CREATE INDEX `work_item_session_status_created_idx` ON `work_item` (`session_id`,`status`,`time_created`);
+CREATE INDEX `work_item_goal_idx` ON `work_item` (`goal_id`);
+CREATE INDEX `work_item_plan_step_idx` ON `work_item` (`plan_step_id`);
 CREATE INDEX `memory_reflection_job_session_status_time_idx` ON `memory_reflection_job` (`session_id`,`status`,`time_created`);
 CREATE INDEX `memory_candidate_path_status_time_idx` ON `memory_candidate` (`target_path`,`status`,`time_created`);
 CREATE INDEX `memory_candidate_session_time_idx` ON `memory_candidate` (`source_session_id`,`time_created`);

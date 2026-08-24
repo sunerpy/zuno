@@ -11,12 +11,20 @@ use crate::session::Tokens;
 
 const SSE_AGGREGATE_PREFIX: &str = "sse:";
 
-/// The ten schema tables whose rows can be attributed to a selected session set.
-pub const PRUNE_TABLES: [&str; 10] = [
+/// The fourteen schema tables whose rows belong to a selected session set.
+///
+/// `memory_candidate` is deliberately absent: its source-session foreign key uses
+/// `ON DELETE SET NULL` so reviewed or applied long-term memory survives transcript
+/// retention while losing only the deleted provenance pointer.
+pub const PRUNE_TABLES: [&str; 14] = [
+    "memory_reflection_job",
+    "memory_reflection_delivery",
+    "agent_job",
+    "work_item",
+    "work_plan",
     "session_context_epoch",
     "session_input",
     "session_message",
-    "todo",
     "part",
     "message",
     "session_share",
@@ -28,8 +36,10 @@ pub const PRUNE_TABLES: [&str; 10] = [
 /// Local rows are removed in this order before the final global `part` orphan sweep.
 ///
 /// Explicitly naming every table avoids making destructive correctness depend on
-/// which foreign-key cascades happen to exist in one schema revision.
-pub const DELETE_ORDER: [&str; 10] = PRUNE_TABLES;
+/// which foreign-key cascades happen to exist in one schema revision. Dependants
+/// precede their owners (`memory_reflection_job` before its delivery row and
+/// `agent_job` before its optional report input).
+pub const DELETE_ORDER: [&str; 14] = PRUNE_TABLES;
 
 /// A reversible change to `session.time_archived`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +353,10 @@ pub fn preview(
                 "session_id IN (SELECT value FROM json_each(?1))",
                 selected_json.as_str(),
             ),
+            Relation::ParentSessionId => (
+                "parent_session_id IN (SELECT value FROM json_each(?1))",
+                selected_json.as_str(),
+            ),
             Relation::SessionPrimaryKey => (
                 "id IN (SELECT value FROM json_each(?1))",
                 selected_json.as_str(),
@@ -446,6 +460,10 @@ pub fn delete_in_transaction(
         let (predicate, binding) = match spec.relation {
             Relation::SessionId | Relation::PartWithOrphanSweep => (
                 "session_id IN (SELECT value FROM json_each(?1))",
+                selected_json.as_str(),
+            ),
+            Relation::ParentSessionId => (
+                "parent_session_id IN (SELECT value FROM json_each(?1))",
                 selected_json.as_str(),
             ),
             Relation::SessionPrimaryKey => (
@@ -604,6 +622,7 @@ fn count_from_i64(value: i64) -> Result<u64, PruneError> {
 #[derive(Clone, Copy)]
 enum Relation {
     SessionId,
+    ParentSessionId,
     SessionPrimaryKey,
     PartWithOrphanSweep,
     Aggregate,
@@ -616,7 +635,94 @@ struct TableSpec {
     columns: &'static [&'static str],
 }
 
-const TABLE_SPECS: [TableSpec; 10] = [
+const TABLE_SPECS: [TableSpec; 14] = [
+    TableSpec {
+        name: "memory_reflection_job",
+        relation: Relation::SessionId,
+        columns: &[
+            "id",
+            "session_id",
+            "source_message_id",
+            "trigger",
+            "status",
+            "owner_id",
+            "lease_expires",
+            "error",
+            "time_created",
+            "time_updated",
+            "time_completed",
+        ],
+    },
+    TableSpec {
+        name: "memory_reflection_delivery",
+        relation: Relation::SessionId,
+        columns: &[
+            "session_id",
+            "source_message_id",
+            "ordinal",
+            "recovered",
+            "negative_learning",
+            "time_created",
+        ],
+    },
+    TableSpec {
+        name: "agent_job",
+        relation: Relation::ParentSessionId,
+        columns: &[
+            "id",
+            "parent_session_id",
+            "subject_kind",
+            "subject_payload",
+            "status",
+            "report_delivery",
+            "result",
+            "error",
+            "report_input_id",
+            "created_seq",
+            "settled_seq",
+            "time_created",
+            "time_updated",
+            "time_completed",
+        ],
+    },
+    TableSpec {
+        name: "work_item",
+        relation: Relation::SessionId,
+        columns: &[
+            "id",
+            "session_id",
+            "goal_id",
+            "plan_step_id",
+            "parent_id",
+            "subject",
+            "description",
+            "active_form",
+            "status",
+            "priority",
+            "dependencies",
+            "owner",
+            "revision",
+            "tokens_used",
+            "usage_known",
+            "time_used_ms",
+            "time_created",
+            "time_updated",
+        ],
+    },
+    TableSpec {
+        name: "work_plan",
+        relation: Relation::SessionId,
+        columns: &[
+            "session_id",
+            "id",
+            "goal_id",
+            "revision",
+            "title",
+            "steps",
+            "time_created",
+            "time_updated",
+        ],
+    },
     TableSpec {
         name: "session_context_epoch",
         relation: Relation::SessionId,
@@ -630,9 +736,13 @@ const TABLE_SPECS: [TableSpec; 10] = [
             "session_id",
             "prompt",
             "delivery",
+            "state",
+            "revision",
             "admitted_seq",
             "promoted_seq",
+            "error",
             "time_created",
+            "time_updated",
         ],
     },
     TableSpec {
@@ -646,19 +756,6 @@ const TABLE_SPECS: [TableSpec; 10] = [
             "time_created",
             "time_updated",
             "data",
-        ],
-    },
-    TableSpec {
-        name: "todo",
-        relation: Relation::SessionId,
-        columns: &[
-            "session_id",
-            "content",
-            "status",
-            "priority",
-            "position",
-            "time_created",
-            "time_updated",
         ],
     },
     TableSpec {
@@ -715,6 +812,14 @@ const TABLE_SPECS: [TableSpec; 10] = [
             "tokens_reasoning",
             "tokens_cache_read",
             "tokens_cache_write",
+            "tokens_last_prompt",
+            "tokens_context_limit",
+            "tokens_accounting",
+            "tokens_known",
+            "tokens_estimated_pending_prompt",
+            "tokens_last_confirmed_at",
+            "failed_turns",
+            "last_failed_at",
             "revert",
             "permission",
             "agent",

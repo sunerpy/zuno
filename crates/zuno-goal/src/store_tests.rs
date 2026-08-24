@@ -30,9 +30,11 @@ impl Fixture {
     fn on_disk() -> Self {
         let spill = tempfile::tempdir().expect("create spill directory");
         let database = tempfile::tempdir().expect("create database directory");
-        let store =
-            GoalStore::open_at(&database.path().join(GOAL_DB_FILE), spill.path().to_owned())
-                .expect("open goal store on disk");
+        let store = GoalStore::open_at(
+            &database.path().join("goal-test.db"),
+            spill.path().to_owned(),
+        )
+        .expect("open goal store on disk");
         Self {
             store,
             spill,
@@ -45,7 +47,7 @@ impl Fixture {
             .as_ref()
             .expect("an on-disk fixture has a database directory")
             .path()
-            .join(GOAL_DB_FILE)
+            .join("goal-test.db")
     }
 
     /// Close every connection and open the same file again.
@@ -59,7 +61,7 @@ impl Fixture {
             .as_ref()
             .expect("an on-disk fixture has a database directory")
             .path()
-            .join(GOAL_DB_FILE);
+            .join("goal-test.db");
         drop(store);
         let store =
             GoalStore::open_at(&path, spill.path().to_owned()).expect("reopen goal store on disk");
@@ -149,7 +151,10 @@ fn seed(fixture: &Fixture, status: GoalStatus, budget: Budget) {
                 .update_status_as_model(SESSION, model)
                 .expect("seed the model status");
         }
-        GoalStatus::Paused | GoalStatus::UsageLimited | GoalStatus::BudgetLimited => {
+        GoalStatus::Paused
+        | GoalStatus::UsageLimited
+        | GoalStatus::BudgetLimited
+        | GoalStatus::Cancelled => {
             let system = SystemStatus::from_status(status).expect("a system-owned status");
             fixture
                 .store
@@ -160,7 +165,7 @@ fn seed(fixture: &Fixture, status: GoalStatus, budget: Budget) {
     if budget.is_exceeded() {
         fixture
             .store
-            .record_usage(SESSION, OVERSPEND, 1)
+            .record_usage(SESSION, OVERSPEND, 1, true)
             .expect("push the counters over budget");
     }
     assert_eq!(
@@ -172,10 +177,13 @@ fn seed(fixture: &Fixture, status: GoalStatus, budget: Budget) {
 
 /// What the two SQL guards say a transition resolves to.
 fn expected_status(from: GoalStatus, to: GoalStatus, over_budget: bool) -> GoalStatus {
-    let terminal_status_is_kept =
+    let cancelled_is_kept = from == GoalStatus::Cancelled;
+    let budget_terminal_status_is_kept =
         from == GoalStatus::BudgetLimited && matches!(to, GoalStatus::Blocked | GoalStatus::Paused);
     let reactivation_is_still_over_budget = to == GoalStatus::Active && over_budget;
-    if terminal_status_is_kept || reactivation_is_still_over_budget {
+    if cancelled_is_kept {
+        GoalStatus::Cancelled
+    } else if budget_terminal_status_is_kept || reactivation_is_still_over_budget {
         GoalStatus::BudgetLimited
     } else {
         to
@@ -259,8 +267,8 @@ fn every_transition_from_both_scopes_obeys_the_ownership_split() {
     let refused = rows.iter().filter(|row| row.contains("REFUSED")).count();
     assert_eq!(
         refused,
-        GoalStatus::ALL.len() * 4 + GoalStatus::ALL.len() * 2,
-        "each start state refuses four system-owned statuses to the model \
+        GoalStatus::ALL.len() * 5 + GoalStatus::ALL.len() * 2,
+        "each start state refuses five system-owned statuses to the model \
          and two model-owned statuses to the system"
     );
 }
@@ -273,6 +281,7 @@ fn the_same_matrix_over_a_spent_budget_never_lets_either_scope_clear_the_limit()
         GoalStatus::UsageLimited,
         GoalStatus::BudgetLimited,
         GoalStatus::Complete,
+        GoalStatus::Cancelled,
     ];
     let rows = matrix(Budget::Exceeded, &seeds);
     assert_eq!(rows.len(), seeds.len() * GoalStatus::ALL.len() * 2);
@@ -282,7 +291,7 @@ fn the_same_matrix_over_a_spent_budget_never_lets_either_scope_clear_the_limit()
     for row in &rows {
         if row.contains("-> Active") && !row.contains("REFUSED") {
             assert!(
-                row.contains("stored BudgetLimited"),
+                row.contains("stored BudgetLimited") || row.contains("stored Cancelled"),
                 "an over-budget goal was reactivated: {row}"
             );
         }
@@ -360,7 +369,7 @@ fn exceeding_the_token_budget_flips_the_status_inside_the_recording_statement() 
 
     let under = fixture
         .store
-        .record_usage(SESSION, BUDGET - 1, 5)
+        .record_usage(SESSION, BUDGET - 1, 5, true)
         .expect("record usage")
         .expect("the session has a goal");
     assert_eq!(under.status, GoalStatus::Active);
@@ -369,7 +378,7 @@ fn exceeding_the_token_budget_flips_the_status_inside_the_recording_statement() 
 
     let over = fixture
         .store
-        .record_usage(SESSION, 1, 5)
+        .record_usage(SESSION, 1, 5, true)
         .expect("record usage")
         .expect("the session has a goal");
     assert_eq!(
@@ -420,21 +429,21 @@ fn create_goal_over_an_active_goal_is_refused_and_changes_nothing() {
     assert_eq!(
         error.to_string(),
         "session ses_goal_matrix already has a goal with status `active`; \
-         create_goal may replace a goal only once it is `complete`"
+         create_goal may replace a goal only once it is `complete` or `cancelled`"
     );
     assert!(error.is_model_refusal());
     assert_eq!(fixture.goal(SESSION), original);
 }
 
 #[test]
-fn create_goal_is_refused_over_every_status_except_complete() {
+fn create_goal_is_refused_over_every_status_except_complete_or_cancelled() {
     for status in GoalStatus::ALL {
         let fixture = Fixture::in_memory();
         seed(&fixture, status, Budget::Unset);
         let before = fixture.goal(SESSION);
         let outcome = fixture.store.create_goal(SESSION, "a new objective", None);
-        if status == GoalStatus::Complete {
-            let replaced = outcome.expect("a complete goal may be replaced");
+        if matches!(status, GoalStatus::Complete | GoalStatus::Cancelled) {
+            let replaced = outcome.expect("a terminal goal may be replaced");
             assert_eq!(replaced.objective, "a new objective");
             assert_eq!(replaced.status, GoalStatus::Active);
             assert_ne!(replaced.goal_id, before.goal_id);
@@ -459,7 +468,7 @@ fn replacing_a_complete_goal_resets_both_counters_and_mints_a_new_goal_id() {
         .expect("create the goal");
     fixture
         .store
-        .record_usage(SESSION, 400, 90)
+        .record_usage(SESSION, 400, 90, true)
         .expect("record usage");
     fixture
         .store
@@ -487,7 +496,7 @@ fn a_goal_survives_a_process_restart_with_its_counters_intact() {
         .expect("create the goal");
     fixture
         .store
-        .record_usage(SESSION, 250, 61)
+        .record_usage(SESSION, 250, 61, true)
         .expect("record usage");
     fixture
         .store
@@ -573,7 +582,7 @@ fn lowering_the_budget_below_what_is_spent_stops_the_goal_in_the_same_statement(
         .expect("create the goal");
     let spent = fixture
         .store
-        .record_usage(SESSION, 500, 30)
+        .record_usage(SESSION, 500, 30, true)
         .expect("record usage")
         .expect("the session has a goal");
     assert_eq!(spent.status, GoalStatus::Active);
@@ -619,7 +628,7 @@ fn an_active_goal_is_never_observed_over_its_budget() {
 
     let by_usage = fixture
         .store
-        .record_usage(SESSION, OVERSPEND, 1)
+        .record_usage(SESSION, OVERSPEND, 1, true)
         .expect("record usage")
         .expect("the session has a goal");
     assert!(!(by_usage.status.is_active() && by_usage.is_over_budget()));
@@ -630,7 +639,7 @@ fn an_active_goal_is_never_observed_over_its_budget() {
         .expect("replace the goal");
     fixture
         .store
-        .record_usage(SESSION, OVERSPEND, 1)
+        .record_usage(SESSION, OVERSPEND, 1, true)
         .expect("record usage");
     let by_budget = fixture
         .store
@@ -661,7 +670,7 @@ fn usage_accumulates_for_a_finished_goal_without_reviving_the_budget_flip() {
 
     let accounted = fixture
         .store
-        .record_usage(SESSION, OVERSPEND, 30)
+        .record_usage(SESSION, OVERSPEND, 30, true)
         .expect("record the completing turn's cost")
         .expect("the session has a goal");
     assert_eq!(accounted.tokens_used, OVERSPEND);
@@ -683,16 +692,58 @@ fn negative_deltas_are_clamped_rather_than_persisted() {
         .expect("create the goal");
     fixture
         .store
-        .record_usage(SESSION, 100, 10)
+        .record_usage(SESSION, 100, 10, true)
         .expect("record usage");
 
     let clamped = fixture
         .store
-        .record_usage(SESSION, -50, -5)
+        .record_usage(SESSION, -50, -5, true)
         .expect("record usage")
         .expect("the session has a goal");
     assert_eq!(clamped.tokens_used, 100);
     assert_eq!(clamped.time_used_seconds, 10);
+}
+
+#[test]
+fn unknown_accounting_is_sticky_and_history_keeps_the_confirmed_lower_bound() {
+    let fixture = Fixture::in_memory();
+    fixture
+        .store
+        .create_goal(SESSION, "track trustworthy usage", Some(1_000))
+        .expect("create the goal");
+
+    let unknown = fixture
+        .store
+        .record_usage(SESSION, 100, 10, false)
+        .expect("record unknown usage")
+        .expect("the session has a goal");
+    assert_eq!(unknown.tokens_used, 100);
+    assert!(!unknown.usage_known);
+
+    let later = fixture
+        .store
+        .record_usage(SESSION, 50, 5, true)
+        .expect("record later confirmed usage")
+        .expect("the session has a goal");
+    assert_eq!(later.tokens_used, 150);
+    assert_eq!(later.time_used_seconds, 15);
+    assert!(
+        !later.usage_known,
+        "a later confirmed checkpoint must not erase an earlier accounting gap"
+    );
+
+    let history = fixture.store.history(SESSION).expect("read history");
+    assert_eq!(
+        history
+            .iter()
+            .map(|entry| entry.goal.usage_known)
+            .collect::<Vec<_>>(),
+        [true, false, false]
+    );
+    assert_eq!(
+        history.last().map(|entry| entry.goal.tokens_used),
+        Some(150)
+    );
 }
 
 #[test]
@@ -704,7 +755,7 @@ fn rewriting_the_objective_keeps_the_goal_instance_and_its_counters() {
         .expect("create the goal");
     fixture
         .store
-        .record_usage(SESSION, 120, 12)
+        .record_usage(SESSION, 120, 12, true)
         .expect("record usage");
 
     let updated = fixture
@@ -793,7 +844,7 @@ fn a_session_with_no_goal_reads_none_and_every_write_reports_none() {
     assert_eq!(
         fixture
             .store
-            .record_usage("ses_absent", 10, 1)
+            .record_usage("ses_absent", 10, 1, true)
             .expect("write"),
         None
     );
@@ -819,7 +870,7 @@ fn two_sessions_keep_independent_goals() {
         .expect("create b");
     fixture
         .store
-        .record_usage("ses_a", 10, 1)
+        .record_usage("ses_a", 10, 1, true)
         .expect("spend a's budget");
 
     assert_eq!(fixture.status("ses_a"), GoalStatus::BudgetLimited);
@@ -842,7 +893,7 @@ fn the_replacement_guard_is_in_the_statement_and_not_around_it() {
         .expect("create the goal");
     let sql = format!("{UPSERT_BODY}\n{UPSERT_IF_COMPLETE}");
     assert!(
-        sql.contains("WHERE goal.status = 'complete'"),
+        sql.contains("WHERE goal.status IN ('complete', 'cancelled')"),
         "the guard must be part of the upsert: {sql}"
     );
 
@@ -855,6 +906,7 @@ fn the_replacement_guard_is_in_the_statement_and_not_around_it() {
             SESSION,
             "goal-2",
             "the second objective",
+            "[]",
             None::<i64>,
             1_i64
         ])
@@ -877,6 +929,7 @@ fn the_replacement_guard_is_in_the_statement_and_not_around_it() {
             SESSION,
             "goal-2",
             "the second objective",
+            "[]",
             None::<i64>,
             2_i64
         ])
@@ -907,7 +960,7 @@ fn the_budget_flip_is_in_the_recording_statement_and_not_around_it() {
     let connection = fixture.store.pool().get().expect("check out a connection");
     let flipped: String = connection
         .query_row(
-            "UPDATE goal SET tokens_used = tokens_used + ?1, \
+            "UPDATE goal SET revision = revision + 1, tokens_used = tokens_used + ?1, \
              status = CASE WHEN status = 'active' AND token_budget IS NOT NULL \
              AND tokens_used + ?1 >= token_budget THEN 'budget_limited' ELSE status END \
              WHERE session_id = ?2 RETURNING status",
@@ -991,8 +1044,8 @@ fn the_table_declares_the_check_constraint_and_deliberately_no_foreign_key() {
         )
         .expect("count the tables");
     assert_eq!(
-        tables, 5,
-        "the goal database holds its goal and runtime tables"
+        tables, 6,
+        "the shared database fixture holds goal state and its durable history"
     );
 }
 
@@ -1034,20 +1087,154 @@ fn reopening_the_same_file_does_not_disturb_the_stored_goal() {
 }
 
 #[test]
-fn the_default_locations_sit_beside_the_session_database_without_being_in_it() {
-    let database = default_db_path();
-    let spill = default_spill_dir();
-    assert_eq!(database.parent(), Some(zuno_paths::data()));
-    assert_eq!(spill.parent(), Some(zuno_paths::data()));
+fn goal_history_keeps_every_revision_across_cancel_and_replacement() {
+    let fixture = Fixture::in_memory();
+    let first = fixture
+        .store
+        .create_goal(SESSION, "first objective", None)
+        .expect("create first goal");
+    fixture
+        .store
+        .update_objective(SESSION, "revised objective")
+        .expect("revise objective")
+        .expect("goal exists");
+    fixture
+        .store
+        .set_status_as_system(SESSION, SystemStatus::Cancelled)
+        .expect("cancel goal")
+        .expect("goal exists");
+    let second = fixture
+        .store
+        .create_goal(SESSION, "replacement objective", None)
+        .expect("replace cancelled goal");
+
+    let history = fixture.store.history(SESSION).expect("read goal history");
+    assert_eq!(history.len(), 4);
     assert_eq!(
-        database.file_name().expect("a file name"),
-        GOAL_DB_FILE,
-        "the goal database is its own file"
+        history
+            .iter()
+            .map(|entry| entry.revision)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 1]
     );
-    let session_database = zuno_paths::db_path();
-    assert_ne!(
-        session_database.as_path(),
-        Some(database.as_path()),
-        "the goal must not be stored in the session database"
+    assert_eq!(history[0].goal.goal_id, first.goal_id);
+    assert_eq!(history[2].goal.status, GoalStatus::Cancelled);
+    assert_eq!(history[3].goal.goal_id, second.goal_id);
+    assert!(
+        history
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
     );
+}
+
+#[test]
+fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    let mut connection = pool.open_connection().expect("open shared connection");
+    zuno_db::migration::apply(&mut connection).expect("apply shared schema");
+    connection
+        .execute(
+            "INSERT INTO project \
+             (id,worktree,vcs,name,icon_url,icon_url_override,icon_color,time_created,\
+              time_updated,time_initialized,sandboxes,commands) \
+             VALUES ('prj','/tmp',NULL,NULL,NULL,NULL,NULL,1,1,NULL,'[]',NULL)",
+            [],
+        )
+        .expect("insert project");
+    connection
+        .execute(
+            "INSERT INTO session \
+             (id,project_id,slug,directory,title,version,time_created,time_updated) \
+             VALUES (?1,'prj','goal','/tmp','goal','test',1,1)",
+            params![SESSION],
+        )
+        .expect("insert session");
+    drop(connection);
+
+    let store = GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+        .expect("attach goal store");
+    let goal = store
+        .create_goal(SESSION, "ship safely", None)
+        .expect("create goal");
+    let steps = serde_json::json!([
+        {"id":"scan","title":"Scan","status":"pending"},
+        {"id":"ship","title":"Ship","status":"completed"}
+    ]);
+    let connection = pool.get().expect("check out connection");
+    connection
+        .execute(
+            "INSERT INTO work_plan \
+             (session_id,id,goal_id,revision,title,steps,time_created,time_updated) \
+             VALUES (?1,'plan',?2,1,'release',?3,1,1)",
+            params![SESSION, goal.goal_id, steps.to_string()],
+        )
+        .expect("insert plan");
+    connection
+        .execute(
+            "INSERT INTO work_item \
+             (id,session_id,goal_id,plan_step_id,parent_id,subject,description,active_form,\
+              status,priority,dependencies,owner,revision,tokens_used,time_used_ms,\
+              time_created,time_updated) \
+             VALUES ('todo',?1,?2,'scan',NULL,'scan','scan repository',NULL,\
+                     'in_progress','high','[]','researcher',1,0,0,1,1)",
+            params![SESSION, goal.goal_id],
+        )
+        .expect("insert work item");
+    drop(connection);
+
+    let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
+    jobs.create(zuno_db::job::NewAgentJob::new(
+        "job",
+        SESSION,
+        zuno_db::job::JobSubject::product_agent("run", "codex", "release-review", "subagent_codex"),
+        zuno_db::job::ReportDelivery::Quiet,
+        1,
+    ))
+    .expect("insert running job");
+
+    let blocked = store
+        .complete_checked(SESSION, goal.revision)
+        .expect_err("unfinished durable work must block completion");
+    assert!(matches!(
+        blocked,
+        GoalError::CompletionBlocked {
+            plan_steps: 1,
+            work_items: 1,
+            jobs: 1
+        }
+    ));
+    assert_eq!(store.goal(SESSION).expect("read goal"), Some(goal.clone()));
+
+    let completed_steps = serde_json::json!([
+        {"id":"scan","title":"Scan","status":"completed"},
+        {"id":"ship","title":"Ship","status":"completed"}
+    ]);
+    let connection = pool.get().expect("check out connection");
+    connection
+        .execute(
+            "UPDATE work_plan SET steps=?1 WHERE session_id=?2",
+            params![completed_steps.to_string(), SESSION],
+        )
+        .expect("complete plan");
+    connection
+        .execute(
+            "UPDATE work_item SET status='completed' WHERE session_id=?1",
+            params![SESSION],
+        )
+        .expect("complete work item");
+    drop(connection);
+    jobs.settle(
+        "job",
+        zuno_db::job::JobSettlement::completed(serde_json::json!({"ok":true}), 2, None),
+    )
+    .expect("complete job");
+
+    let completed = store
+        .complete_checked(SESSION, goal.revision)
+        .expect("complete goal")
+        .expect("goal exists");
+    assert_eq!(completed.status, GoalStatus::Complete);
 }

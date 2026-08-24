@@ -13,7 +13,7 @@ pub(crate) fn provider_config(base_url: &str) -> String {
     serde_json::json!({
         "formatter": false,
         "lsp": false,
-        "permission": { "*": "allow" },
+        "permission": { "mode": "allow_all", "rules": {} },
         "provider": {
             "test": {
                 "name": "Test",

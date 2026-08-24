@@ -210,6 +210,35 @@ impl Pool {
         self.transaction_with_behavior(TransactionBehavior::Immediate, work)
     }
 
+    /// Run `work` inside an `IMMEDIATE` transaction while preserving a
+    /// domain-specific error type.
+    ///
+    /// Unlike wrapping a domain error in `Ok(Err(...))`, returning that error
+    /// directly from `work` guarantees that SQLite rolls the transaction back.
+    ///
+    /// # Errors
+    ///
+    /// The domain error returned by `work`, or a converted [`DbError`] when the
+    /// transaction cannot be started or committed.
+    pub fn try_transaction<T, E, F>(&self, work: F) -> Result<T, E>
+    where
+        E: From<DbError>,
+        F: FnOnce(&Transaction<'_>) -> Result<T, E>,
+    {
+        let _writer = self.lock_writer();
+        let mut connection = self.get().map_err(E::from)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(open::map_error)
+            .map_err(E::from)?;
+        let value = work(&transaction)?;
+        transaction
+            .commit()
+            .map_err(open::map_error)
+            .map_err(E::from)?;
+        Ok(value)
+    }
+
     /// Run `work` inside a transaction with an explicit locking behaviour.
     ///
     /// # Errors

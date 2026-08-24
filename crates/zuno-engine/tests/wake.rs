@@ -52,7 +52,7 @@ fn admit(inbox: &SessionInbox, id: &str) {
             id,
             SESSION,
             json!({"kind": "subagentReport", "text": id}),
-            InputDelivery::NextStep,
+            InputDelivery::Queue,
             10,
         ))
         .expect("admit input");

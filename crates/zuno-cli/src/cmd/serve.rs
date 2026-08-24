@@ -15,7 +15,7 @@ use zuno_server::{
     SessionMutationFuture, SessionPromptExecution, events_router,
 };
 use zuno_tool::{PermissionAsk, PermissionAsker};
-use zuno_tools::question::{Answer, QuestionAsker};
+use zuno_tools::question::{QuestionAsker, QuestionOutcome};
 
 use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
 use crate::command::ServeArgs;
@@ -226,7 +226,7 @@ impl QuestionAsker for ServerQuestionAsker {
         session_id: &str,
         questions: &[zuno_tools::question::QuestionRequest],
         call: Option<(&str, &str)>,
-    ) -> Result<Vec<Answer>, ToolError> {
+    ) -> Result<QuestionOutcome, ToolError> {
         let questions = questions
             .iter()
             .map(serde_json::to_value)
@@ -245,12 +245,12 @@ impl QuestionAsker for ServerQuestionAsker {
             questions,
             tool,
         };
-        match self.requests.ask_question(request).await {
-            QuestionDecision::Answered(answers) => Ok(answers),
-            QuestionDecision::Rejected => Err(ToolError::Denied {
-                tool: "question".to_owned(),
-            }),
-        }
+        Ok(match self.requests.ask_question(request).await {
+            QuestionDecision::Answered(answers) => QuestionOutcome::Answered(answers),
+            QuestionDecision::Cancelled => QuestionOutcome::Cancelled,
+            QuestionDecision::Expired => QuestionOutcome::Expired,
+            QuestionDecision::Failed => QuestionOutcome::Failed,
+        })
     }
 }
 

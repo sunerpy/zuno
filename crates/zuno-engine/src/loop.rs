@@ -127,6 +127,12 @@ pub enum TurnEvent {
         session_id: String,
         title: String,
     },
+    /// A skill explicitly named by the user was loaded by the host before the
+    /// first provider request, without fabricating an assistant tool call.
+    SkillLoaded {
+        name: String,
+        source: String,
+    },
     TurnStarted {
         session_id: String,
     },
@@ -154,6 +160,8 @@ pub enum TurnEvent {
     ProviderRequestStarted {
         step: u32,
         message_count: usize,
+        /// Deterministic local estimate retained when a provider rejects the request.
+        estimated_prompt_tokens: u64,
     },
     Provider {
         step: u32,
@@ -322,6 +330,10 @@ pub enum TurnError {
     ToolUseEndWithoutStart { step: u32, call_id: String },
     #[error("provider emitted a signature for unknown tool call `{call_id}` in step {step}")]
     ToolSignatureWithoutStart { step: u32, call_id: String },
+    #[error(
+        "provider emitted malformed tool arguments {count} consecutive times; last tool was `{tool}`"
+    )]
+    InvalidToolCalls { count: u8, tool: String },
     #[error("the turn event consumer closed")]
     EventConsumerClosed,
     #[error("plugin hook failed: {0}")]
@@ -389,6 +401,7 @@ impl TurnError {
             Self::ToolInputWithoutStart { .. } => "tool_input_without_start",
             Self::ToolUseEndWithoutStart { .. } => "tool_end_without_start",
             Self::ToolSignatureWithoutStart { .. } => "tool_signature_without_start",
+            Self::InvalidToolCalls { .. } => "invalid_tool_calls",
             Self::EventConsumerClosed => "event_consumer_closed",
             Self::Hook(_) => "hook",
             Self::Database(_) => "database",
@@ -447,6 +460,7 @@ impl TurnError {
                 | DbError::SchemaMismatch { .. }
                 | DbError::Query { .. }
                 | DbError::NotFound { .. }
+                | DbError::Conflict { .. }
                 | DbError::Decode { .. },
             ) => TurnRecovery::Fail,
             Self::Provider(ProviderError::ContextLimit { .. }) => TurnRecovery::Compact,
@@ -470,6 +484,7 @@ impl TurnError {
             | Self::ToolInputWithoutStart { .. }
             | Self::ToolUseEndWithoutStart { .. }
             | Self::ToolSignatureWithoutStart { .. }
+            | Self::InvalidToolCalls { .. }
             | Self::Hook(_)
             | Self::Cache(_) => TurnRecovery::Fail,
             Self::ProviderRetryDeadlineExceeded { .. } => TurnRecovery::Retry {
@@ -1050,17 +1065,7 @@ impl StepAccumulator {
                     call_id: call_id.to_owned(),
                 })?;
         let raw = tool.raw_input.trim();
-        let (input, input_error) = if raw.is_empty() {
-            (json!({}), None)
-        } else {
-            match serde_json::from_str(raw) {
-                Ok(value) => (value, None),
-                Err(error) => (
-                    Value::String(tool.raw_input.clone()),
-                    Some(error.to_string()),
-                ),
-            }
-        };
+        let (input, input_error) = parse_tool_input(raw);
         self.calls.insert(
             tool.ordinal,
             ToolCall {
@@ -1079,17 +1084,7 @@ impl StepAccumulator {
         let mut calls = self.calls.clone();
         for tool in self.active_tools.values() {
             let raw = tool.raw_input.trim();
-            let (input, input_error) = if raw.is_empty() {
-                (json!({}), None)
-            } else {
-                match serde_json::from_str(raw) {
-                    Ok(value) => (value, None),
-                    Err(error) => (
-                        Value::String(tool.raw_input.clone()),
-                        Some(error.to_string()),
-                    ),
-                }
-            };
+            let (input, input_error) = parse_tool_input(raw);
             calls.insert(
                 tool.ordinal,
                 ToolCall {
@@ -1144,6 +1139,20 @@ impl StepAccumulator {
     }
 }
 
+fn parse_tool_input(raw: &str) -> (Value, Option<String>) {
+    if raw.is_empty() {
+        return (json!({}), None);
+    }
+    match serde_json::from_str(raw) {
+        Ok(Value::Object(input)) => (Value::Object(input), None),
+        Ok(_) => (
+            json!({}),
+            Some("tool arguments must be a JSON object".to_owned()),
+        ),
+        Err(error) => (json!({}), Some(error.to_string())),
+    }
+}
+
 /// Run one complete user turn. Every continuation after a tool result re-enters
 /// this same loop and emits through the same bounded channel.
 pub async fn run_turn(
@@ -1176,7 +1185,9 @@ async fn run_turn_in_span(
     let mut last_assistant_id = None;
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
     let mut prompt_traces = PromptTraceSet::default();
+    let mut last_prompt_receipt_id = None::<String>;
     let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
+    let mut consecutive_invalid_tool_calls = 0_u8;
 
     loop {
         if context.interrupt.is_set() {
@@ -1257,21 +1268,22 @@ async fn run_turn_in_span(
         let mut assistant = assistant_message(
             &request, &session, &requested, &agent, &model, step, &history,
         )?;
-        let mut system = vec![agent.system_prompt.clone()];
+        let mut system = agent.prompt_assembly.system_messages();
         context
             .hooks
             .transform_system(&request.session_id, &model, &mut system)
             .await
             .map_err(TurnError::Hook)?;
-        let system_prompt = system.join("\n");
+        let system_prompt = system.join("\n\n");
         if prompt_traces.insert(&system_prompt) {
-            let event = NewSessionEvent::new(
-                "session.prompt.assembled",
+            let mut properties =
                 agent
                     .prompt_assembly
-                    .event_properties(&agent.name, step, &system_prompt),
-            )?;
-            append_with_connection(context.connection, &request.session_id, event)?;
+                    .event_properties(&agent.name, step, &system_prompt);
+            properties.insert("turnId".to_owned(), Value::String(request.turn_id.clone()));
+            let event = NewSessionEvent::new("session.prompt.assembled", properties)?;
+            let receipt = append_with_connection(context.connection, &request.session_id, event)?;
+            last_prompt_receipt_id = Some(receipt.id);
         }
         let stable_history = if context.hooks.enabled() {
             let mut transformed = hook_messages(&history);
@@ -1280,13 +1292,17 @@ async fn run_turn_in_span(
                 .transform_messages(&request.session_id, &mut transformed)
                 .await
                 .map_err(TurnError::Hook)?;
-            let mut messages = vec![Message::new(Role::System, system_prompt.clone())];
+            let mut messages = system
+                .iter()
+                .filter(|message| !message.is_empty())
+                .map(|message| Message::new(Role::System, message.clone()))
+                .collect::<Vec<_>>();
             for message in transformed {
                 append_transformed_message_owned(&mut messages, message);
             }
             messages
         } else {
-            project_history_owned(&system_prompt, history)
+            project_history_owned_with_system_messages(&system, history)
         };
         let assistant_id = assistant.id.clone();
         MessageStore::new(context.connection).put_message(&assistant)?;
@@ -1318,18 +1334,17 @@ async fn run_turn_in_span(
             &definitions,
             available.mcp_status,
         )?;
+        let message_count = prepared
+            .messages()
+            .len()
+            .saturating_add(prepared.developer_context().len());
+        let estimated_prompt_tokens = estimate_prepared_prompt_tokens(&prepared);
         let locked_tools: Arc<[ToolDefinition]> = Arc::from(prepared.tools().to_vec());
         events
             .send(TurnEvent::ToolSnapshotLocked {
                 step,
                 tool_ids: locked_tools.iter().map(|tool| tool.id.clone()).collect(),
                 rebuilt_for_late_mcp: prepared.rebuilt_tools(),
-            })
-            .await?;
-        events
-            .send(TurnEvent::ProviderRequestStarted {
-                step,
-                message_count: prepared.messages().len(),
             })
             .await?;
 
@@ -1352,6 +1367,35 @@ async fn run_turn_in_span(
             )
             .await
             .map_err(TurnError::Hook)?;
+        completion
+            .validate_tool_arguments()
+            .map_err(ProviderError::fatal)?;
+        let request_id = format!("req_{}", Uuid::now_v7().simple());
+        session::record_provider_request_started(
+            context.connection,
+            &request.session_id,
+            estimated_prompt_tokens,
+            request.context_limit,
+        )?;
+        append_provider_request_started(
+            context.connection,
+            &request,
+            ProviderRequestStart {
+                step,
+                request_id: &request_id,
+                prompt_receipt_id: last_prompt_receipt_id.as_deref(),
+                message_count,
+                estimated_prompt_tokens,
+                assistant_message_id: &assistant_id,
+            },
+        )?;
+        events
+            .send(TurnEvent::ProviderRequestStarted {
+                step,
+                message_count,
+                estimated_prompt_tokens,
+            })
+            .await?;
         let accumulator = Arc::new(Mutex::new(StepAccumulator::new(
             model.catalog_provider_id.clone(),
             model.catalog_model_id.clone(),
@@ -1512,6 +1556,15 @@ async fn run_turn_in_span(
         let provider_exit = match provider_result {
             Ok(exit) => exit,
             Err(error) => {
+                append_provider_request_terminal(
+                    context.connection,
+                    &request,
+                    step,
+                    &request_id,
+                    "failed",
+                    &assistant_id,
+                    Some(&error),
+                )?;
                 checkpoint_assistant(
                     context.connection,
                     &request,
@@ -1544,6 +1597,15 @@ async fn run_turn_in_span(
                 .await;
             if let Err(message) = hook_result {
                 let error = TurnError::Hook(message);
+                append_provider_request_terminal(
+                    context.connection,
+                    &request,
+                    step,
+                    &request_id,
+                    "failed",
+                    &assistant_id,
+                    Some(&error),
+                )?;
                 checkpoint_assistant(
                     context.connection,
                     &request,
@@ -1565,6 +1627,15 @@ async fn run_turn_in_span(
         }
 
         if provider_exit == ProviderStreamExit::Interrupted {
+            append_provider_request_terminal(
+                context.connection,
+                &request,
+                step,
+                &request_id,
+                "cancelled",
+                &assistant_id,
+                None,
+            )?;
             checkpoint_assistant(
                 context.connection,
                 &request,
@@ -1594,6 +1665,15 @@ async fn run_turn_in_span(
         }
 
         if provider_exit == ProviderStreamExit::Steered && !accumulator.saw_message_end {
+            append_provider_request_terminal(
+                context.connection,
+                &request,
+                step,
+                &request_id,
+                "steered",
+                &assistant_id,
+                None,
+            )?;
             checkpoint_assistant(
                 context.connection,
                 &request,
@@ -1622,6 +1702,15 @@ async fn run_turn_in_span(
 
         if !accumulator.saw_message_end {
             let error = TurnError::StreamEndedWithoutMessageEnd { step };
+            append_provider_request_terminal(
+                context.connection,
+                &request,
+                step,
+                &request_id,
+                "failed",
+                &assistant_id,
+                Some(&error),
+            )?;
             checkpoint_assistant(
                 context.connection,
                 &request,
@@ -1646,6 +1735,15 @@ async fn run_turn_in_span(
                 provider_id: model.catalog_provider_id,
                 step,
             };
+            append_provider_request_terminal(
+                context.connection,
+                &request,
+                step,
+                &request_id,
+                "failed",
+                &assistant_id,
+                Some(&error),
+            )?;
             checkpoint_assistant(
                 context.connection,
                 &request,
@@ -1673,6 +1771,15 @@ async fn run_turn_in_span(
             &locked_tools,
             AssistantCheckpointDisposition::Completed,
         )?;
+        append_provider_request_terminal(
+            context.connection,
+            &request,
+            step,
+            &request_id,
+            "completed",
+            &assistant_id,
+            None,
+        )?;
         events
             .send(TurnEvent::AssistantCheckpointed {
                 step,
@@ -1682,6 +1789,27 @@ async fn run_turn_in_span(
             .await?;
 
         let calls = accumulator.calls.values().cloned().collect::<Vec<_>>();
+        let invalid_calls = calls
+            .iter()
+            .filter(|call| call.input_error.is_some())
+            .count();
+        if invalid_calls == 0 {
+            consecutive_invalid_tool_calls = 0;
+        } else {
+            consecutive_invalid_tool_calls = consecutive_invalid_tool_calls
+                .saturating_add(u8::try_from(invalid_calls).unwrap_or(u8::MAX));
+            if consecutive_invalid_tool_calls >= 3 {
+                let tool = calls
+                    .iter()
+                    .rev()
+                    .find(|call| call.input_error.is_some())
+                    .map_or_else(|| "unknown".to_owned(), |call| call.name.clone());
+                return Err(TurnError::InvalidToolCalls {
+                    count: consecutive_invalid_tool_calls,
+                    tool,
+                });
+            }
+        }
         let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
         if !injected.skip_remaining_tools {
             let mut next_call = 0;
@@ -1976,7 +2104,27 @@ fn inject_live_inputs(
         {
             continue;
         }
-        persist_live_input(context.connection, request, requested, &message)?;
+        if let Err(error) = persist_live_input(context.connection, request, requested, &message) {
+            if let Some(input_id) = message.input_id.as_deref() {
+                let _settled =
+                    live.inbox
+                        .mark_failed(&request.session_id, input_id, error.to_string());
+            }
+            return Err(error);
+        }
+        if let Some(input_id) = message.input_id.as_deref()
+            && live
+                .inbox
+                .mark_consumed(&request.session_id, input_id)?
+                .is_none()
+        {
+            return Err(DbError::Conflict {
+                table: "session_input".to_owned(),
+                id: input_id.to_owned(),
+                detail: "promoted live input was not available for consumed settlement".to_owned(),
+            }
+            .into());
+        }
         injected.count = injected.count.saturating_add(1);
         injected.skip_remaining_tools |= message.urgent;
     }
@@ -2252,6 +2400,28 @@ pub fn project_history_owned(system_prompt: &str, history: Vec<MessageWithParts>
         .into_iter()
         .map(|projected| projected.message)
         .collect()
+}
+
+/// Consume retained history while preserving separate provider system roles.
+///
+/// OpenAI Responses maps the first system message to native `instructions` and
+/// subsequent system messages to developer input items. Other providers consume
+/// the same provider-neutral ordering through their native role mapping.
+#[must_use]
+pub fn project_history_owned_with_system_messages(
+    system_messages: &[String],
+    history: Vec<MessageWithParts>,
+) -> Vec<Message> {
+    let projected_history = project_history_owned("", history).into_iter().skip(1);
+    let mut messages = Vec::with_capacity(system_messages.len() + projected_history.size_hint().0);
+    messages.extend(
+        system_messages
+            .iter()
+            .filter(|message| !message.is_empty())
+            .map(|message| Message::new(Role::System, message.clone())),
+    );
+    messages.extend(projected_history);
+    messages
 }
 
 /// Consume retained history while preserving each provider message's stored id.
@@ -2633,7 +2803,19 @@ fn append_tool_pair_owned(
     let Some(Value::Object(mut state)) = data.remove("state") else {
         return;
     };
-    let input = state.remove("input").unwrap_or_else(|| json!({}));
+    let input = match state.remove("input") {
+        Some(Value::Object(input)) => Value::Object(input),
+        Some(_) => {
+            state.insert("status".to_owned(), Value::String("error".to_owned()));
+            state.entry("error".to_owned()).or_insert_with(|| {
+                Value::String(
+                    "[Stored tool arguments were invalid and were not replayed]".to_owned(),
+                )
+            });
+            json!({})
+        }
+        None => json!({}),
+    };
     let thought_signature = match data.remove("metadata") {
         Some(Value::Object(mut metadata)) => take_string(&mut metadata, "thoughtSignature"),
         Some(_) | None => None,
@@ -2797,13 +2979,7 @@ fn assistant_message(
         "mode": agent.name,
         "agent": agent.name,
         "path": { "cwd": session.directory, "root": session.directory },
-        "cost": 0.0,
-        "tokens": {
-            "input": 0,
-            "output": 0,
-            "reasoning": 0,
-            "cache": { "read": 0, "write": 0 }
-        }
+        "cost": 0.0
     }))
     .map_err(TurnError::from)
 }
@@ -2817,15 +2993,120 @@ fn assistant_message(
 /// field, and the two that already accept native reasoning read it from
 /// *provider-scoped* options — a per-session choice cannot live there without
 /// rewriting the model spec on every keypress.
+#[derive(Debug, Clone, Copy)]
+struct ProviderRequestStart<'a> {
+    step: u32,
+    request_id: &'a str,
+    prompt_receipt_id: Option<&'a str>,
+    message_count: usize,
+    estimated_prompt_tokens: u64,
+    assistant_message_id: &'a str,
+}
+
+fn append_provider_request_started(
+    connection: &mut Connection,
+    request: &RunTurnRequest,
+    start: ProviderRequestStart<'_>,
+) -> Result<(), TurnError> {
+    let mut properties = Map::from_iter([
+        (
+            "requestID".to_owned(),
+            Value::String(start.request_id.to_owned()),
+        ),
+        ("turnID".to_owned(), Value::String(request.turn_id.clone())),
+        ("step".to_owned(), Value::from(start.step)),
+        ("status".to_owned(), Value::String("started".to_owned())),
+        ("messageCount".to_owned(), Value::from(start.message_count)),
+        (
+            "estimatedPromptTokens".to_owned(),
+            Value::from(start.estimated_prompt_tokens),
+        ),
+        (
+            "assistantMessageID".to_owned(),
+            Value::String(start.assistant_message_id.to_owned()),
+        ),
+    ]);
+    if let Some(prompt_receipt_id) = start.prompt_receipt_id {
+        properties.insert(
+            "promptReceiptID".to_owned(),
+            Value::String(prompt_receipt_id.to_owned()),
+        );
+    }
+    append_with_connection(
+        connection,
+        &request.session_id,
+        NewSessionEvent::new("session.provider.request", properties)?,
+    )?;
+    Ok(())
+}
+
+fn append_provider_request_terminal(
+    connection: &mut Connection,
+    request: &RunTurnRequest,
+    step: u32,
+    request_id: &str,
+    status: &str,
+    assistant_message_id: &str,
+    error: Option<&TurnError>,
+) -> Result<(), TurnError> {
+    let mut properties = Map::from_iter([
+        ("requestID".to_owned(), Value::String(request_id.to_owned())),
+        ("turnID".to_owned(), Value::String(request.turn_id.clone())),
+        ("step".to_owned(), Value::from(step)),
+        ("status".to_owned(), Value::String(status.to_owned())),
+        (
+            "assistantMessageID".to_owned(),
+            Value::String(assistant_message_id.to_owned()),
+        ),
+    ]);
+    if let Some(error) = error {
+        properties.insert(
+            "errorKind".to_owned(),
+            Value::String(error.kind().to_owned()),
+        );
+        properties.insert("message".to_owned(), Value::String(error.durable_message()));
+    }
+    append_with_connection(
+        connection,
+        &request.session_id,
+        NewSessionEvent::new("session.provider.request", properties)?,
+    )?;
+    Ok(())
+}
+
+fn estimate_prepared_prompt_tokens(prepared: &PreparedTurn<ToolDefinition>) -> u64 {
+    let message_bytes = serde_json::to_vec(prepared.messages()).map_or(0, |value| value.len());
+    let developer_bytes = prepared
+        .developer_context()
+        .iter()
+        .fold(0_usize, |bytes, context| {
+            bytes.saturating_add(context.len())
+        });
+    let tool_bytes = prepared.tools().iter().fold(0_usize, |bytes, tool| {
+        bytes
+            .saturating_add(tool.id.len())
+            .saturating_add(tool.description.len())
+            .saturating_add(tool.parameters.to_string().len())
+    });
+    let bytes = prepared
+        .system_static()
+        .len()
+        .saturating_add(message_bytes)
+        .saturating_add(developer_bytes)
+        .saturating_add(tool_bytes);
+    u64::try_from(bytes).unwrap_or(u64::MAX).div_ceil(4)
+}
+
 fn completion_request(
     model: &ResolvedModel,
     prepared: PreparedTurn<ToolDefinition>,
 ) -> zuno_llm::registry::CompletionRequest {
-    let (messages, tools) = prepared.into_request_parts();
+    let (messages, developer_context, tools) = prepared.into_request_parts();
     zuno_llm::registry::CompletionRequest {
         model_id: model.model_id.clone(),
         surface: model.surface,
         messages,
+        developer_context,
         tools: tools
             .iter()
             .map(|tool| zuno_llm::registry::ToolSchema {
@@ -3010,35 +3291,22 @@ fn checkpoint_assistant(
 }
 
 fn update_usage(data: &mut Map<String, Value>, accumulator: &StepAccumulator) {
-    let Some(tokens) = data.get_mut("tokens").and_then(Value::as_object_mut) else {
+    let Some(accounting) = accumulator.prompt_accounting else {
         return;
     };
-    tokens.insert(
-        "input".to_owned(),
-        Value::from(accumulator.input_tokens.unwrap_or(0)),
+    data.insert(
+        "tokens".to_owned(),
+        json!({
+            "input": accumulator.input_tokens.unwrap_or(0),
+            "output": accumulator.output_tokens.unwrap_or(0),
+            "reasoning": 0,
+            "cache": {
+                "read": accumulator.cache_read_input_tokens.unwrap_or(0),
+                "write": accumulator.cache_write_input_tokens.unwrap_or(0)
+            },
+            "accounting": accounting.as_str()
+        }),
     );
-    tokens.insert(
-        "output".to_owned(),
-        Value::from(accumulator.output_tokens.unwrap_or(0)),
-    );
-    if let Some(cache) = tokens.get_mut("cache").and_then(Value::as_object_mut) {
-        cache.insert(
-            "read".to_owned(),
-            Value::from(accumulator.cache_read_input_tokens.unwrap_or(0)),
-        );
-        cache.insert(
-            "write".to_owned(),
-            Value::from(accumulator.cache_write_input_tokens.unwrap_or(0)),
-        );
-    }
-    if let Some(accounting) = accumulator.prompt_accounting {
-        tokens.insert(
-            "accounting".to_owned(),
-            Value::String(accounting.as_str().to_owned()),
-        );
-    } else {
-        tokens.remove("accounting");
-    }
 }
 
 /// Persist one provider reasoning capsule under the key [`append_reasoning_owned`]
@@ -3096,7 +3364,7 @@ fn checkpoint_tool_part(
     ui_intent: ToolUiIntent,
     failure: Option<&str>,
 ) -> Result<PartRecord, TurnError> {
-    let state = if let Some(error) = failure {
+    let mut state = if let Some(error) = failure {
         json!({
             "status": "error",
             "input": call.input,
@@ -3112,6 +3380,9 @@ fn checkpoint_tool_part(
             "raw": call.raw_input
         })
     };
+    if let Some(error) = &call.input_error {
+        state["inputError"] = Value::String(error.clone());
+    }
     let mut payload = json!({
         "id": tool_part_id(&request.turn_id, step, call_index),
         "sessionID": request.session_id,

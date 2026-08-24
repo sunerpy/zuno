@@ -165,30 +165,105 @@ fn session_screen_submitting_moves_the_prompt_into_the_transcript() {
 }
 
 #[test]
-fn session_screen_a_submission_during_work_is_forwarded_as_a_steer_candidate() {
+fn session_screen_a_submission_during_work_is_queued_for_the_next_turn() {
     let (sender, _shutdown) = terminal_event_channel();
     let (prompts, mut submitted) = mpsc::channel(2);
-    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_prompt_sink(prompts);
+    let (mutations, _mutation_source) = mpsc::channel(2);
+    let projection = crate::views::picker::QueuedInputProjection::default();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_queued_inputs(projection.clone(), mutations);
     screen.status.mark_running();
 
     screen.submit_prompt("change direction");
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Text(String::from("change direction"))),
+        Ok(PromptSubmission::Queue(Box::new(PromptSubmission::Text(
+            String::from("change direction")
+        )))),
         "the active turn caused the follow-up to be refused instead of admitted"
     );
+    assert!(
+        ActionComponent::drain_toasts(&mut screen).is_empty(),
+        "the screen claimed queue admission before SQLite committed"
+    );
+    projection.publish(
+        vec![crate::views::picker::QueuedInputEntry {
+            id: String::from("msg_queued"),
+            text: String::from("change direction"),
+            delivery: crate::views::picker::QueuedInputDelivery::Queue,
+            revision: 1,
+            editable: true,
+        }],
+        Some(crate::views::picker::QueuedInputNotice {
+            input_id: String::from("msg_queued"),
+            kind: crate::views::picker::QueuedInputNoticeKind::Admitted(
+                crate::views::picker::QueuedInputDelivery::Queue,
+            ),
+        }),
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
     let notices = ActionComponent::drain_toasts(&mut screen);
     assert!(
         notices
             .iter()
-            .any(|toast| toast.text().contains("next safe point")),
-        "the user was not told whether the accepted input would steer or queue: {notices:?}"
+            .any(|toast| toast.text().contains("next turn")),
+        "the committed queue input was not acknowledged: {notices:?}"
     );
     let rendered = rows(&render_offscreen(&mut screen, 72, 10).expect("infallible")).join("\n");
     assert!(
         !rendered.contains("not sent: a turn is already running"),
         "the old channel-capacity refusal remained visible:\n{rendered}"
+    );
+}
+
+#[test]
+fn session_screen_ctrl_enter_marks_a_busy_submission_as_an_explicit_steer() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(2);
+    let (mutations, _mutation_source) = mpsc::channel(2);
+    let projection = crate::views::picker::QueuedInputProjection::default();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_queued_inputs(projection.clone(), mutations);
+    screen.status.mark_running();
+    screen.editor.set_text("change direction now");
+
+    screen.handle_action(action("input_force_submit"), &press_none());
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Steer(Box::new(PromptSubmission::Text(
+            String::from("change direction now")
+        ))))
+    );
+    assert!(
+        ActionComponent::drain_toasts(&mut screen).is_empty(),
+        "the screen claimed steer admission before SQLite committed"
+    );
+    projection.publish(
+        vec![crate::views::picker::QueuedInputEntry {
+            id: String::from("msg_steer"),
+            text: String::from("change direction now"),
+            delivery: crate::views::picker::QueuedInputDelivery::Steer,
+            revision: 1,
+            editable: true,
+        }],
+        Some(crate::views::picker::QueuedInputNotice {
+            input_id: String::from("msg_steer"),
+            kind: crate::views::picker::QueuedInputNoticeKind::Admitted(
+                crate::views::picker::QueuedInputDelivery::Steer,
+            ),
+        }),
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    let notices = ActionComponent::drain_toasts(&mut screen);
+    assert!(
+        notices
+            .iter()
+            .any(|toast| toast.text().contains("next safe point")),
+        "the committed steer was not acknowledged: {notices:?}"
     );
 }
 
@@ -391,6 +466,166 @@ fn session_screen_catalog_slash_stays_typed_for_the_host() {
         })
     );
     assert_eq!(screen.submissions(), ["/review src/lib.rs carefully"]);
+}
+
+#[test]
+fn session_screen_direct_skill_stays_typed_with_its_source() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_slash_commands([CatalogCommand::skill(
+            "github-project-scaffold",
+            Some("Prepare a public repository".to_owned()),
+            "/skills/github-project-scaffold/SKILL.md",
+        )]);
+    screen
+        .editor
+        .set_text("/github-project-scaffold audit this repository");
+
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Skill {
+            name: "github-project-scaffold".to_owned(),
+            source: "/skills/github-project-scaffold/SKILL.md".to_owned(),
+            arguments: "audit this repository".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn session_screen_plan_command_requires_confirmation_before_switching_agents() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_catalog(catalog());
+    screen.editor.set_text("/plan");
+
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert!(
+        chosen.try_recv().is_err(),
+        "Plan mode changed before the user confirmed it"
+    );
+    let dialogs = screen.drain_dialogs();
+    assert_eq!(dialogs.len(), 1);
+    assert_eq!(dialogs[0].id(), PLAN_START_CONFIRM_DIALOG_ID);
+
+    screen.apply_dialog_outcome(
+        PLAN_START_CONFIRM_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: PLAN_START_CONFIRM_DIALOG_ID,
+            value: crate::views::basics::CONFIRM_VALUE.to_owned(),
+        },
+    );
+
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Agent(String::from("plan")))
+    );
+    assert_eq!(screen.catalog.agent.as_deref(), Some("plan"));
+}
+
+#[test]
+fn session_screen_start_plan_switches_immediately_without_model_text() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_catalog(catalog());
+    screen.editor.set_text("/start-plan");
+
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Agent(String::from("plan")))
+    );
+    assert_eq!(screen.catalog.agent.as_deref(), Some("plan"));
+    assert!(
+        screen.drain_dialogs().is_empty(),
+        "the explicit start command unexpectedly asked twice"
+    );
+}
+
+#[test]
+fn session_screen_start_work_requires_a_durable_plan() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(1);
+    let mut offered = catalog();
+    offered.agent = Some(String::from("plan"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_catalog(offered);
+    screen.editor.set_text("/start-work");
+
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert!(chosen.try_recv().is_err());
+    assert!(screen.drain_dialogs().is_empty());
+    assert!(
+        ActionComponent::drain_toasts(&mut screen)
+            .iter()
+            .any(|toast| toast.text().contains("no durable plan is ready")),
+        "the missing durable plan was not explained"
+    );
+}
+
+#[test]
+fn session_screen_start_work_confirms_the_durable_plan_before_build_mode() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(1);
+    let mut offered = catalog();
+    offered.agent = Some(String::from("plan"));
+    let work = crate::views::ambient::WorkState::new(zuno_types::WorkStateProjection {
+        plan: Some(zuno_types::PlanProjection {
+            id: String::from("plan_release"),
+            goal_id: None,
+            revision: 3,
+            title: String::from("Release hardening"),
+            steps: vec![zuno_types::PlanStepProjection {
+                id: String::from("step_scan"),
+                title: String::from("Inspect the repository"),
+                status: String::from("pending"),
+            }],
+            span: zuno_types::ExecutionSpan::default(),
+            time_created: 1,
+            time_updated: 2,
+        }),
+        ..zuno_types::WorkStateProjection::default()
+    });
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_selection_sink(selections)
+        .with_catalog(offered)
+        .with_work_state(work);
+    screen.editor.set_text("/start-work");
+
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert!(
+        chosen.try_recv().is_err(),
+        "Work mode changed before the durable plan was confirmed"
+    );
+    let dialogs = screen.drain_dialogs();
+    assert_eq!(dialogs.len(), 1);
+    assert_eq!(dialogs[0].id(), WORK_START_CONFIRM_DIALOG_ID);
+
+    screen.apply_dialog_outcome(
+        WORK_START_CONFIRM_DIALOG_ID,
+        &crate::views::dialog::DialogOutcome::Selected {
+            dialog: WORK_START_CONFIRM_DIALOG_ID,
+            value: crate::views::basics::CONFIRM_VALUE.to_owned(),
+        },
+    );
+
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Agent(String::from("build")))
+    );
+    assert_eq!(screen.catalog.agent.as_deref(), Some("build"));
 }
 
 #[test]
@@ -1398,6 +1633,10 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
     );
     screen.handle_action(action("app_exit"), &press_none());
     assert_eq!(cancelled.try_recv(), Ok(()));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
+        assistant_message_id: None,
+        steps: 0,
+    }));
 
     screen.submit_prompt("second");
     assert_eq!(
@@ -4475,6 +4714,43 @@ fn session_a_transcript_drag_auto_copies_and_right_click_repeats_the_pane_bounde
 }
 
 #[test]
+fn session_sidebar_marks_a_host_preloaded_skill_without_a_fake_tool_call() {
+    let (mut screen, _shutdown) = screen();
+    screen.sidebar_mut().ambient_mut().skills = vec![crate::views::ambient::SkillSummary {
+        name: String::from("codegraph"),
+        source: String::from("/skills/codegraph/SKILL.md"),
+        description: String::from("navigate the indexed repository"),
+        loaded: false,
+    }];
+    screen.sidebar_mut().toggle_skills();
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("use codegraph"));
+
+    screen.handle_event(&AppEvent::Engine(TurnEvent::SkillLoaded {
+        name: String::from("codegraph"),
+        source: String::from("/skills/codegraph/SKILL.md"),
+    }));
+
+    let rendered = rows(&render_offscreen(&mut screen, 120, 32).expect("infallible")).join("\n");
+    assert!(
+        rendered.contains("1/1 loaded") && rendered.contains("✓ codegraph · loaded"),
+        "a host preload was not projected as loaded:\n{rendered}"
+    );
+    assert!(
+        !screen
+            .transcript_mut()
+            .transcript_mut()
+            .messages()
+            .iter()
+            .flat_map(|message| &message.parts)
+            .any(|part| matches!(part, crate::views::message::MessagePart::Tool { .. })),
+        "host preloading fabricated an assistant tool call"
+    );
+}
+
+#[test]
 fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skills() {
     let (mut screen, _shutdown) = screen();
     screen.sidebar_mut().ambient_mut().skills = vec![crate::views::ambient::SkillSummary {
@@ -5230,7 +5506,6 @@ const PRESSABLE_BUT_DEAD: &[&str] = &[
     "session_delete",
     "session_export",
     "session_pin_toggle",
-    "session_queued_prompts",
     "session_quick_switch_1",
     "session_quick_switch_2",
     "session_quick_switch_3",
@@ -5313,11 +5588,11 @@ fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_nam
     );
     // The census is a number as well as a set, so shrinking it is a visible event in a diff
     // and growing it silently is impossible. `agent_cycle` and `agent_cycle_reverse` were the
-    // two an earlier change took off the list; `session_child_first` is the one this change
-    // did, by giving `ctrl+x down` the delegated-task view to open.
+    // two an earlier change took off the list; `session_child_first` gained the delegated-task
+    // view, and `session_queued_prompts` gained the durable queue picker.
     assert_eq!(
         PRESSABLE_BUT_DEAD.len(),
-        46,
+        45,
         "the pressable-but-dead census changed size; that is a real event either way and the \
          count is pinned so it cannot pass unremarked"
     );

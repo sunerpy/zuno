@@ -73,7 +73,7 @@ pub enum OracleFlavour {
 /// manager. What is pinned is the release, not the route to it.
 ///
 /// Moving this constant means recapturing every artifact measured against it. See
-/// `.omo/evidence/task-130-opencode-rust.txt` for what 1.18.15 was measured to
+/// the task-130 verification transcript for what 1.18.15 was measured to
 /// produce.
 pub const PINNED_RELEASE: &str = "1.18.18";
 

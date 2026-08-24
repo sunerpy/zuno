@@ -88,6 +88,35 @@ fn token_budget_capability_uses_the_resolver_budget_shape() {
 }
 
 #[test]
+fn gemini_keeps_static_and_volatile_context_as_separate_system_parts() {
+    let provider = GoogleGenerativeAi::new("test-api-key", GeminiOptions::default())
+        .expect("provider configuration");
+    let request = CompletionRequest::new(
+        "gemini-2.5-flash",
+        vec![
+            text(Role::System, "stable kernel"),
+            text(Role::User, "exact user text"),
+        ],
+    )
+    .with_developer_context(vec!["active goal".to_owned(), "memory".to_owned()]);
+
+    let prepared = provider.prepare(&request).expect("Gemini request");
+    assert_eq!(
+        prepared.body["systemInstruction"]["parts"],
+        json!([
+            {"text": "stable kernel"},
+            {"text": "active goal"},
+            {"text": "memory"},
+        ])
+    );
+    assert_eq!(prepared.body["contents"][0]["role"], "user");
+    assert_eq!(
+        prepared.body["contents"][0]["parts"][0]["text"],
+        "exact user text"
+    );
+}
+
+#[test]
 fn gemini_request_and_stream_replay_the_real_tool_call_cassette() {
     if !recordings_available("gemini_request_and_stream_replay_the_real_tool_call_cassette") {
         return;
@@ -342,7 +371,8 @@ fn vertex_anthropic_uses_anthropic_shape_and_replays_real_anthropic_wire_events(
     let request = CompletionRequest::new(
         "claude-model-under-test",
         vec![text(Role::User, "What is the weather in Paris?")],
-    );
+    )
+    .with_developer_context(vec!["active goal".to_owned(), "memory".to_owned()]);
     let prepared = provider.prepare(&request).expect("Anthropic request");
 
     assert_eq!(prepared.body["anthropic_version"], "vertex-2023-10-16");
@@ -350,6 +380,14 @@ fn vertex_anthropic_uses_anthropic_shape_and_replays_real_anthropic_wire_events(
     assert!(prepared.body.get("contents").is_none());
     assert!(prepared.body.get("model").is_none());
     assert_eq!(prepared.body["messages"][0]["role"], "user");
+    assert_eq!(
+        prepared.body["system"],
+        json!([
+            {"type": "text", "text": "Use the weather tool."},
+            {"type": "text", "text": "active goal"},
+            {"type": "text", "text": "memory"},
+        ])
+    );
     assert!(prepared.url.contains(":streamRawPredict"));
 
     let mut cassette = CassettePlayer::from_oracle("anthropic-messages/streams-tool-call")

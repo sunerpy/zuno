@@ -1,14 +1,8 @@
-//! Permission configuration.
+//! Canonical permission configuration.
 //!
-//! Oracle: `packages/core/src/v1/config/permission.ts:5-50`.
-//!
-//! Two details of that file drive the shape here. First, the comment at `:14-16`:
-//! runtime parsing uses `propertyOrder: "original"` **because permission
-//! precedence depends on the author's key order**, so the object cannot be a
-//! sorted map. Second, `Info` decodes a bare action string into `{ "*": action }`
-//! (`:40-48`); that normalization is offered as [`PermissionConfig::normalized`]
-//! rather than applied during deserialization, so the parsed value still says
-//! which form the author wrote.
+//! Zuno is unreleased, so the public shape has one representation only:
+//! `permission.mode` selects cross-cutting HITL behavior and
+//! `permission.rules` carries ordered per-tool rules.
 
 use crate::schema::ordered::OrderedMap;
 use schemars::JsonSchema;
@@ -26,6 +20,19 @@ pub enum PermissionAction {
     Allow,
     /// Refuse.
     Deny,
+}
+
+/// Cross-cutting human-in-the-loop behavior for tool calls.
+#[derive(JsonSchema, Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// Apply configured rules and the normal risk gates.
+    #[default]
+    Standard,
+    /// Require a fresh decision for every side-effecting call.
+    Strict,
+    /// Skip HITL prompts while preserving explicit denies and sandbox validation.
+    AllowAll,
 }
 
 /// A permission rule: one action for the whole tool, or per-pattern actions
@@ -50,7 +57,10 @@ pub const KNOWN_KEYS: &[&str] = &[
     "bash",
     "task",
     "external_directory",
-    "todowrite",
+    "plan_get",
+    "plan_update",
+    "todo_get",
+    "todo_update",
     "question",
     "webfetch",
     "web_search",
@@ -62,66 +72,26 @@ pub const KNOWN_KEYS: &[&str] = &[
 /// The subset of [`KNOWN_KEYS`] the oracle types as a bare action, with no
 /// per-pattern form (`config/permission.ts:27-30,32`).
 pub const ACTION_ONLY_KEYS: &[&str] = &[
-    "todowrite",
+    "plan_get",
+    "plan_update",
+    "todo_get",
+    "todo_update",
     "question",
     "webfetch",
     "web_search",
     "doom_loop",
 ];
 
-/// The `permission` key: one action for everything, or per-tool rules.
-#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize)]
-#[serde(untagged)]
-pub enum PermissionConfig {
-    /// A bare action applied to every tool.
-    Action(PermissionAction),
-    /// Per-tool rules, in the author's key order.
-    Object(PermissionObject),
-}
-
-impl PermissionConfig {
-    /// The object form, expanding a bare action to `{ "*": action }` exactly as
-    /// `normalizeInput` does at `config/permission.ts:40-41`.
-    #[must_use]
-    pub fn normalized(&self) -> PermissionObject {
-        match self {
-            Self::Action(action) => {
-                let mut rules = OrderedMap::new();
-                rules.insert("*", PermissionRule::Action(*action));
-                PermissionObject(rules)
-            }
-            Self::Object(object) => object.clone(),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for PermissionConfig {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct PermissionConfigVisitor;
-
-        impl<'de> Visitor<'de> for PermissionConfigVisitor {
-            type Value = PermissionConfig;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(r#"one of "ask", "allow", "deny", or an object of permission rules"#)
-            }
-
-            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                match value {
-                    "ask" => Ok(PermissionConfig::Action(PermissionAction::Ask)),
-                    "allow" => Ok(PermissionConfig::Action(PermissionAction::Allow)),
-                    "deny" => Ok(PermissionConfig::Action(PermissionAction::Deny)),
-                    other => Err(de::Error::unknown_variant(other, &["ask", "allow", "deny"])),
-                }
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, access: A) -> Result<Self::Value, A::Error> {
-                PermissionObject::from_map_access(access).map(PermissionConfig::Object)
-            }
-        }
-
-        deserializer.deserialize_any(PermissionConfigVisitor)
-    }
+/// The canonical permission configuration used by Zuno.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionConfig {
+    /// How unresolved and side-effecting calls are admitted.
+    #[serde(default)]
+    pub mode: PermissionMode,
+    /// Ordered per-tool rules. Explicit denies remain terminal in every mode.
+    #[serde(default)]
+    pub rules: PermissionObject,
 }
 
 /// Per-tool permission rules, in the author's key order.
@@ -150,13 +120,7 @@ impl PermissionObject {
     fn from_map_access<'de, A: MapAccess<'de>>(mut access: A) -> Result<Self, A::Error> {
         let mut rules = OrderedMap::new();
         while let Some((key, rule)) = access.next_entry::<String, PermissionRule>()? {
-            if ACTION_ONLY_KEYS.contains(&key.as_str())
-                && matches!(rule, PermissionRule::Patterns(_))
-            {
-                return Err(de::Error::custom(format!(
-                    "permission {key:?} takes a bare action, not per-pattern rules"
-                )));
-            }
+            validate_rule::<A::Error>(&key, &rule)?;
             rules.insert(key, rule);
         }
         Ok(Self(rules))
@@ -181,4 +145,13 @@ impl<'de> Deserialize<'de> for PermissionObject {
 
         deserializer.deserialize_map(PermissionObjectVisitor)
     }
+}
+
+fn validate_rule<E: de::Error>(key: &str, rule: &PermissionRule) -> Result<(), E> {
+    if ACTION_ONLY_KEYS.contains(&key) && matches!(rule, PermissionRule::Patterns(_)) {
+        return Err(de::Error::custom(format!(
+            "permission {key:?} takes a bare action, not per-pattern rules"
+        )));
+    }
+    Ok(())
 }

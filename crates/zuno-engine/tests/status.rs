@@ -232,6 +232,36 @@ fn status_soft_interrupt_injects_at_safe_point_without_cancelling() {
 }
 
 #[test]
+fn status_cancel_soft_interrupt_removes_only_the_named_durable_input() {
+    let registry = SessionRunRegistry::new();
+    let control = registry.control(SESSION_ID);
+    let turn = registry.begin_turn(SESSION_ID).expect("active turn");
+    for (id, content) in [("msg_drop", "drop"), ("msg_keep", "keep")] {
+        control
+            .queue_soft_interrupt(SoftInterruptMessage {
+                input_id: Some(id.to_owned()),
+                content: content.to_owned(),
+                images: Vec::new(),
+                urgent: false,
+                source: SoftInterruptSource::User,
+            })
+            .expect("queue soft interrupt");
+    }
+
+    assert_eq!(control.cancel_soft_interrupt("msg_drop"), Ok(true));
+    assert_eq!(control.cancel_soft_interrupt("msg_drop"), Ok(false));
+    assert!(
+        turn.soft_interrupt_signal().is_set(),
+        "the remaining steer still owes a safe-boundary wake"
+    );
+    let delivery = turn.take_soft_interrupts_at_safe_point();
+    assert_eq!(delivery.messages.len(), 1);
+    assert_eq!(delivery.messages[0].input_id.as_deref(), Some("msg_keep"));
+    assert_eq!(delivery.messages[0].content, "keep");
+    assert!(!turn.soft_interrupt_signal().is_set());
+}
+
+#[test]
 fn status_urgent_soft_interrupt_skips_remaining_tools_in_event_sequence() {
     let registry = SessionRunRegistry::new();
     let control = registry.control(SESSION_ID);

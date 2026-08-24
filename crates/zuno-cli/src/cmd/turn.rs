@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
+use rusqlite::OptionalExtension as _;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument as _;
@@ -129,6 +130,28 @@ impl SessionChoice {
             (None, false) => Self::New,
         }
     }
+}
+
+/// Stored collaboration agent for an explicitly resumed session.
+///
+/// This read-only hint runs before generic turn resolution. Missing, in-memory,
+/// or unreadable databases simply provide no hint; authoritative validation and
+/// schema handling still happen when the turn host opens.
+pub(crate) fn persisted_session_agent(choice: &SessionChoice) -> Option<String> {
+    let SessionChoice::Existing(id) = choice else {
+        return None;
+    };
+    let location = zuno_paths::db_path();
+    let path = location.as_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let pool = zuno_db::pool::Pool::open(&location).ok()?;
+    let connection = pool.get().ok()?;
+    zuno_db::session::find(&connection, id)
+        .ok()
+        .flatten()
+        .and_then(|session| session.agent)
 }
 
 /// Stable process identity for a session whose database row may not exist yet.
@@ -511,6 +534,15 @@ impl TurnPlan {
                     "agent.policy",
                     format!("zuno-agent::builtin:{}", agent.name),
                     policy.prompt_policy(),
+                )
+                .map_err(to_string)?;
+        }
+        if let Some(mode) = collaboration_mode_prompt(&agent.name) {
+            prompt_assembly
+                .push(
+                    "collaboration.mode",
+                    "zuno-runtime:collaboration-mode",
+                    mode,
                 )
                 .map_err(to_string)?;
         }
@@ -985,6 +1017,18 @@ fn resolve_reflection_model(
 /// [`zuno_catalog::agent::builtin`] directly, because the roster is what decides which
 /// internals this build has — reading past it would let the two disagree about the
 /// set while both looked correct.
+fn collaboration_mode_prompt(agent: &str) -> Option<&'static str> {
+    match agent {
+        "plan" => Some(
+            "Collaboration mode: Plan. Inspect and reason in read-only mode. The durable plan and              work items are the authoritative result; prose alone does not change execution state.              Do not modify product files or start implementation. Ask only questions that materially              change the design. When the plan is decision-complete, tell the user to confirm Start              Work or run `/start-work`; never switch modes on the user's behalf.",
+        ),
+        "build" => Some(
+            "Collaboration mode: Work. Implement the requested outcome and treat any durable plan,              goal, todos, jobs, and queued input as authoritative execution state. Keep those records              current while work proceeds. Use `/start-plan` when a new read-only design pass is              required; do not represent a prose checklist as durable plan state.",
+        ),
+        _ => None,
+    }
+}
+
 fn internal_prompt(name: &str) -> Result<String, String> {
     zuno_agent::builtin::internals()
         .into_iter()
@@ -994,6 +1038,13 @@ fn internal_prompt(name: &str) -> Result<String, String> {
             _ => None,
         })
         .ok_or_else(|| format!("internal agent `{name}` declares no prompt"))
+}
+
+/// One selected Skill whose exact source has entered this session's prompt.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SelectedSkillIdentity {
+    pub(crate) name: String,
+    pub(crate) source: String,
 }
 
 /// An open database, an assembled tool set, and the session a turn runs in.
@@ -1014,6 +1065,8 @@ pub(crate) struct TurnHost {
     /// the moment a failure is printed — see [`without_credential`].
     credential: Option<String>,
     resolver: Resolver,
+    skills: Arc<zuno_catalog::skill::Skills>,
+    selected_skills: BTreeSet<SelectedSkillIdentity>,
     dispatcher: ToolRegistryDispatcher,
     tool_concurrency: ToolConcurrencyLimit,
     session_id: String,
@@ -1057,6 +1110,7 @@ pub(crate) struct TurnHost {
     background_executions: Arc<zuno_pty::BackgroundExecutionService>,
     background_reports: super::child_turn::ChildSessionHost,
     product_agents: super::product_agent::NativeProductAgentHost,
+    workflows: super::workflow::NativeWorkflowHost,
     background_reports_recovered: bool,
     last_turn_completed: bool,
     title_sink: Option<Arc<dyn SessionTitleSink>>,
@@ -1470,6 +1524,51 @@ fn job_result_text(value: &Value) -> Option<String> {
         .or_else(|| (!value.is_null()).then(|| value.to_string()))
 }
 
+fn work_item_span(item: &zuno_tools::WorkItem) -> zuno_types::ExecutionSpan {
+    let completed_at = matches!(
+        item.status,
+        zuno_tools::WorkItemStatus::Completed
+            | zuno_tools::WorkItemStatus::Cancelled
+            | zuno_tools::WorkItemStatus::Blocked
+    )
+    .then_some(item.time_updated);
+    zuno_types::ExecutionSpan::from_aggregate(
+        item.time_created,
+        completed_at,
+        u64::try_from(item.time_used_ms).unwrap_or_default(),
+        u64::try_from(item.tokens_used).unwrap_or_default(),
+        item.usage_known,
+    )
+}
+
+fn aggregate_work_item_span<'a>(
+    items: impl IntoIterator<Item = &'a zuno_tools::WorkItem>,
+    started_at: i64,
+    completed_at: Option<i64>,
+) -> zuno_types::ExecutionSpan {
+    let mut elapsed_ms = 0_u64;
+    let mut usage = zuno_types::TokenUsage::default();
+    let mut any = false;
+    let mut all_known = true;
+    for item in items {
+        any = true;
+        let span = work_item_span(item);
+        elapsed_ms = elapsed_ms.saturating_add(span.elapsed_ms);
+        if span.accounting_known {
+            usage.add_usage(span.usage);
+        } else {
+            all_known = false;
+        }
+    }
+    zuno_types::ExecutionSpan {
+        started_at,
+        completed_at,
+        elapsed_ms,
+        usage,
+        accounting_known: any && all_known,
+    }
+}
+
 fn durable_reflection_transcript(
     connection: &rusqlite::Connection,
     session_id: &str,
@@ -1732,7 +1831,10 @@ impl TurnHost {
                 .ok_or_else(|| "profile did not register tool contributions".to_owned())?;
             let todo_store = Arc::clone(&database);
             let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
-            let goal_store = Arc::new(GoalStore::open_default().map_err(to_string)?);
+            let goal_store = Arc::new(
+                GoalStore::from_pool(Arc::clone(&database), zuno_goal::default_spill_dir())
+                    .map_err(to_string)?,
+            );
             let goal_projection = GoalProjection::new(worktree.as_deref(), prepared.identity.id())
                 .ok_or_else(|| {
                     format!(
@@ -1857,6 +1959,11 @@ impl TurnHost {
                 skill_context_window,
                 skill_config.as_ref(),
             )?;
+            let selected_skills = if prepared.identity.is_materialized() {
+                restore_selected_skills(&connection, prepared.identity.id(), &mut plan.resolver)?
+            } else {
+                BTreeSet::new()
+            };
             let child_host =
                 super::child_turn::ChildSessionHost::new(super::child_turn::ChildSessionContext {
                     database: Arc::clone(&database),
@@ -1879,6 +1986,12 @@ impl TurnHost {
                 child_host.wake_handle(),
                 background_jobs.clone(),
             )?;
+            let workflow_host = super::workflow::NativeWorkflowHost::new(
+                Arc::clone(&database),
+                child_host.clone(),
+                child_host.wake_handle(),
+                background_jobs.clone(),
+            );
             let background_executions = environment
                 .background_executions(&plan.directory)
                 .map_err(to_string)?;
@@ -1922,6 +2035,7 @@ impl TurnHost {
                         vision_available: plan.vision_available,
                     },
                     product_agents: Arc::new(product_agents.clone()),
+                    workflows: Arc::new(workflow_host.clone()),
                     job_controller: Arc::new(background_jobs.clone()),
                     memory: memory_tool,
                 },
@@ -1939,7 +2053,7 @@ impl TurnHost {
                 runtime_tools.tools,
                 runtime_tools.rules,
                 approval,
-                AuthorizationPolicy::from_strict(plan.config.strict_authorization()),
+                AuthorizationPolicy::from_mode(plan.config.permission_mode()),
                 McpToolStatus::Ready,
             );
             let tool_concurrency =
@@ -1955,6 +2069,8 @@ impl TurnHost {
                 providers,
                 credential: presented,
                 resolver: plan.resolver,
+                skills: plan.skills,
+                selected_skills,
                 dispatcher,
                 tool_concurrency,
                 session_id: prepared.identity.id().to_owned(),
@@ -1984,6 +2100,7 @@ impl TurnHost {
                 background_executions,
                 background_reports: child_host,
                 product_agents,
+                workflows: workflow_host,
                 background_reports_recovered: false,
                 last_turn_completed: active_goal,
                 title_sink: None,
@@ -2036,6 +2153,11 @@ impl TurnHost {
         &self.session_directory
     }
 
+    /// Skills the host restored or preloaded as prompt blocks for this session.
+    pub(crate) fn selected_skills(&self) -> Vec<SelectedSkillIdentity> {
+        self.selected_skills.iter().cloned().collect()
+    }
+
     /// Stable identity used by the TUI's exit handoff and rebuild paths.
     pub(crate) fn session_identity(&self) -> PreparedSessionIdentity {
         self.session_identity.clone()
@@ -2053,6 +2175,20 @@ impl TurnHost {
     /// Whether this host already has a durable session row.
     pub(crate) fn is_session_materialized(&self) -> bool {
         self.session_identity.is_materialized()
+    }
+
+    fn materialize_session_for_control(&mut self) -> Result<bool, String> {
+        let SessionMaterializer::Pending(input) = &self.session_materializer else {
+            return Ok(false);
+        };
+        let mut input = input.clone();
+        input.time = Some(zuno_db::message::now_millis());
+        let transaction = self.connection.transaction().map_err(to_string)?;
+        zuno_db::session::create(&transaction, &input).map_err(to_string)?;
+        transaction.commit().map_err(to_string)?;
+        self.session_materializer = SessionMaterializer::Existing;
+        self.session_identity.mark_materialized();
+        Ok(true)
     }
 
     /// Durable usage restored with an existing session.
@@ -2085,6 +2221,21 @@ impl TurnHost {
         session_id: &str,
     ) -> Result<Option<zuno_db::session::Session>, zuno_error::DbError> {
         switchable_session(&self.connection, &self.session_directory, session_id)
+    }
+
+    /// Persist the active collaboration agent after a successful host replacement.
+    pub(super) fn persist_active_agent(&self) -> Result<(), String> {
+        if !self.is_session_materialized() {
+            return Ok(());
+        }
+        zuno_db::session::Store::new(&self.database)
+            .switch_agent_at(
+                &self.session_id,
+                &format!("msg_agent_{}", Uuid::new_v4().simple()),
+                &self.agent,
+                zuno_db::message::now_millis(),
+            )
+            .map_err(to_string)
     }
 
     /// Rename a session through the same transactional store used by every other surface.
@@ -2140,34 +2291,248 @@ impl TurnHost {
         .await
     }
 
+    pub(super) fn goal_command(&mut self, arguments: &str) -> Result<String, String> {
+        let mut parts = arguments.trim().splitn(2, char::is_whitespace);
+        let action = parts.next().unwrap_or_default();
+        let value = parts.next().unwrap_or_default().trim();
+        let mut changed = false;
+        let output = match action {
+            "" | "get" | "show" | "status" => {
+                let goal = self.goal_store.goal(&self.session_id).map_err(to_string)?;
+                json!({
+                    "revision": goal.as_ref().map(|goal| goal.revision),
+                    "goal": goal
+                })
+            }
+            "history" => serde_json::to_value(
+                self.goal_store
+                    .history(&self.session_id)
+                    .map_err(to_string)?,
+            )
+            .map_err(to_string)?,
+            "create" => {
+                if value.is_empty() {
+                    return Err("usage: /goal create <objective>".to_owned());
+                }
+                self.materialize_session_for_control()?;
+                let goal = self
+                    .goal_store
+                    .create_goal(&self.session_id, value, None)
+                    .map_err(to_string)?;
+                changed = true;
+                serde_json::to_value(goal).map_err(to_string)?
+            }
+            "edit" => {
+                if value.is_empty() {
+                    return Err("usage: /goal edit <objective>".to_owned());
+                }
+                let expected_revision = self
+                    .goal_store
+                    .goal(&self.session_id)
+                    .map_err(to_string)?
+                    .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
+                    .revision;
+                let goal = self
+                    .goal_store
+                    .update_objective_checked(&self.session_id, value, expected_revision)
+                    .map_err(to_string)?
+                    .ok_or_else(|| {
+                        "no goal exists; run /goal create <objective> first".to_owned()
+                    })?;
+                changed = true;
+                serde_json::to_value(goal).map_err(to_string)?
+            }
+            "pause" | "resume" | "cancel" => {
+                let status = match action {
+                    "pause" => zuno_goal::SystemStatus::Paused,
+                    "resume" => zuno_goal::SystemStatus::Active,
+                    "cancel" => zuno_goal::SystemStatus::Cancelled,
+                    _ => unreachable!("closed goal system action"),
+                };
+                let expected_revision = self
+                    .goal_store
+                    .goal(&self.session_id)
+                    .map_err(to_string)?
+                    .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
+                    .revision;
+                let goal = self
+                    .goal_store
+                    .set_status_as_system_checked(&self.session_id, status, expected_revision)
+                    .map_err(to_string)?
+                    .ok_or_else(|| {
+                        "no goal exists; run /goal create <objective> first".to_owned()
+                    })?;
+                changed = true;
+                serde_json::to_value(goal).map_err(to_string)?
+            }
+            "block" | "complete" => {
+                if action == "block" && value.is_empty() {
+                    return Err("usage: /goal block <reason>".to_owned());
+                }
+                let status = if action == "block" {
+                    zuno_goal::ModelStatus::Blocked
+                } else {
+                    zuno_goal::ModelStatus::Complete
+                };
+                let expected_revision = self
+                    .goal_store
+                    .goal(&self.session_id)
+                    .map_err(to_string)?
+                    .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
+                    .revision;
+                if action == "block" {
+                    self.goal_store
+                        .record_failure_signal(&self.session_id, Some(value))
+                        .map_err(to_string)?;
+                }
+                let goal = self
+                    .goal_store
+                    .update_status_as_model_checked(&self.session_id, status, expected_revision)
+                    .map_err(to_string)?
+                    .ok_or_else(|| {
+                        "no goal exists; run /goal create <objective> first".to_owned()
+                    })?;
+                changed = true;
+                serde_json::to_value(goal).map_err(to_string)?
+            }
+            "help" => {
+                return Ok("/goal [show|history]
+/goal create <objective>
+/goal edit <objective>
+/goal pause|resume|complete|cancel
+/goal block <reason>"
+                    .to_owned());
+            }
+            unknown => {
+                return Err(format!(
+                    "unknown /goal action `{unknown}`; use show, create, edit, pause, resume, block, complete, cancel, or history"
+                ));
+            }
+        };
+        if changed {
+            self.write_goal_projection()?;
+            self.work_changes.changed();
+        }
+        serde_json::to_string_pretty(&output).map_err(to_string)
+    }
+
     pub(super) fn work_state(&self) -> Result<zuno_types::WorkStateProjection, String> {
         let goal = self
             .goal_store
             .goal(&self.session_id)
             .map_err(to_string)?
             .map(|goal| zuno_types::GoalStateProjection {
+                id: goal.goal_id,
+                revision: goal.revision,
                 objective: goal.objective,
+                success_criteria: goal.success_criteria,
                 status: goal.status.as_str().to_owned(),
-                tokens_used: goal.tokens_used,
+                blocked_reason: goal.blocked_reason,
+                span: zuno_types::ExecutionSpan::from_aggregate(
+                    goal.created_at_ms,
+                    goal.status.is_terminal().then_some(goal.updated_at_ms),
+                    u64::try_from(goal.time_used_seconds)
+                        .unwrap_or_default()
+                        .saturating_mul(1_000),
+                    u64::try_from(goal.tokens_used).unwrap_or_default(),
+                    goal.usage_known,
+                ),
                 token_budget: goal.token_budget,
+                time_created: goal.created_at_ms,
+                time_updated: goal.updated_at_ms,
             });
-        let todos = zuno_tools::todo::TodoStore::list(
-            &zuno_tools::todo::SqliteTodoStore::new(Arc::clone(&self.database)),
-            &self.session_id,
-        )
-        .map_err(to_string)?
-        .into_iter()
-        .map(|todo| zuno_types::TodoProjection {
-            content: todo.content,
-            status: todo.status.as_str().to_owned(),
-            priority: todo.priority.as_str().to_owned(),
-        })
-        .collect();
+        let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
+            .snapshot(&self.session_id)
+            .map_err(to_string)?;
+        let plan_span = work.plan.as_ref().map(|plan| {
+            let step_ids = plan
+                .steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let terminal = !plan.steps.is_empty()
+                && plan.steps.iter().all(|step| {
+                    matches!(
+                        step.status,
+                        zuno_tools::WorkItemStatus::Completed
+                            | zuno_tools::WorkItemStatus::Cancelled
+                            | zuno_tools::WorkItemStatus::Blocked
+                    )
+                });
+            aggregate_work_item_span(
+                work.items.iter().filter(|item| {
+                    item.plan_step_id
+                        .as_deref()
+                        .is_some_and(|id| step_ids.contains(id))
+                }),
+                plan.time_created,
+                terminal.then_some(plan.time_updated),
+            )
+        });
+        let plan = work.plan.map(|plan| zuno_types::PlanProjection {
+            id: plan.id,
+            goal_id: plan.goal_id,
+            revision: plan.revision,
+            title: plan.title,
+            steps: plan
+                .steps
+                .into_iter()
+                .map(|step| zuno_types::PlanStepProjection {
+                    id: step.id,
+                    title: step.title,
+                    status: step.status.as_str().to_owned(),
+                })
+                .collect(),
+            span: plan_span.unwrap_or_default(),
+            time_created: plan.time_created,
+            time_updated: plan.time_updated,
+        });
+        let now = zuno_db::message::now_millis();
+        let background_executions =
+            background_execution_projections(&self.background_executions, &self.session_id, now);
         let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&self.database))
             .list_for_parent(&self.session_id)
             .map_err(to_string)?
             .into_iter()
-            .map(|job| {
+            .map(|job| -> Result<zuno_types::JobProjection, String> {
+                let mut span = zuno_types::ExecutionSpan {
+                    started_at: job.time_created,
+                    completed_at: job.time_completed,
+                    elapsed_ms: u64::try_from(
+                        job.time_completed
+                            .unwrap_or(now)
+                            .saturating_sub(job.time_created),
+                    )
+                    .unwrap_or_default(),
+                    usage: zuno_types::TokenUsage::default(),
+                    accounting_known: false,
+                };
+                match &job.subject {
+                    zuno_db::job::JobSubject::ChildSession { session_id } => {
+                        match zuno_db::session::get(&self.connection, session_id) {
+                            Ok(child) => {
+                                let usage = child.usage.snapshot();
+                                span.usage = usage.confirmed;
+                                span.accounting_known = usage.confirmed_known;
+                            }
+                            Err(zuno_error::DbError::NotFound { .. }) => {}
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                    zuno_db::job::JobSubject::Workflow { run_id, .. } => {
+                        if let Some(root) = work
+                            .items
+                            .iter()
+                            .find(|item| item.id == format!("work_{run_id}"))
+                        {
+                            let root_span = work_item_span(root);
+                            span.usage = root_span.usage;
+                            span.accounting_known = root_span.accounting_known;
+                            span.elapsed_ms = root_span.elapsed_ms;
+                        }
+                    }
+                    zuno_db::job::JobSubject::ProductAgent { .. } => {}
+                }
                 let subject = match job.subject {
                     zuno_db::job::JobSubject::ChildSession { session_id } => {
                         zuno_types::JobSubjectProjection::ChildSession { session_id }
@@ -2183,16 +2548,44 @@ impl TurnHost {
                         instance,
                         tool,
                     },
+                    zuno_db::job::JobSubject::Workflow { run_id, workflow } => {
+                        zuno_types::JobSubjectProjection::Workflow { run_id, workflow }
+                    }
                 };
-                zuno_types::JobProjection {
+                Ok(zuno_types::JobProjection {
                     id: job.id,
                     subject,
                     status: job.status.as_str().to_owned(),
                     report_delivery: job.report_delivery.as_str().to_owned(),
                     result: job.result.as_ref().and_then(job_result_text),
                     error: job.error,
+                    span,
                     time_created: job.time_created,
                     time_completed: job.time_completed,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let todos = work
+            .items
+            .into_iter()
+            .map(|item| {
+                let span = work_item_span(&item);
+                zuno_types::TodoProjection {
+                    id: item.id,
+                    goal_id: item.goal_id,
+                    plan_step_id: item.plan_step_id,
+                    parent_id: item.parent_id,
+                    subject: item.subject,
+                    description: item.description,
+                    active_form: item.active_form,
+                    status: item.status.as_str().to_owned(),
+                    priority: item.priority.as_str().to_owned(),
+                    dependencies: item.dependencies,
+                    owner: item.owner,
+                    revision: item.revision,
+                    span,
+                    time_created: item.time_created,
+                    time_updated: item.time_updated,
                 }
             })
             .collect();
@@ -2205,7 +2598,9 @@ impl TurnHost {
         };
         Ok(zuno_types::WorkStateProjection {
             goal,
+            plan,
             todos,
+            background_executions,
             jobs,
             memory_candidates,
             memory_entries,
@@ -2402,6 +2797,28 @@ impl TurnHost {
         self.commands.list()
     }
 
+    /// Unambiguous Skills that may be invoked directly as `/<skill-name>`.
+    ///
+    /// Real commands retain precedence. Same-named Skill sources remain available
+    /// through `/skills` and the typed `skill` tool, but are not exposed as an
+    /// ambiguous slash name that could silently pick the wrong instructions.
+    pub(crate) fn slash_skills(&self) -> Vec<zuno_catalog::skill::Skill> {
+        let command_names = self
+            .commands()
+            .map(|command| command.name.as_str())
+            .collect::<BTreeSet<_>>();
+        self.skills
+            .all()
+            .iter()
+            .filter(|skill| {
+                skill.description.is_some()
+                    && self.skills.named(&skill.name).len() == 1
+                    && !command_names.contains(skill.name.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
     /// A handle that aborts whichever turn this host has live.
     ///
     /// Resolving the live turn by session id rather than capturing a signal is what
@@ -2509,6 +2926,34 @@ impl TurnHost {
         .await
     }
 
+    pub(crate) async fn drive_skill(
+        &mut self,
+        name: &str,
+        source: &str,
+        arguments: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        self.load_selected_skill(name, source, &events).await?;
+        let arguments = arguments.trim();
+        if arguments.is_empty() {
+            return report_skill_selected(name, &events).await;
+        }
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        let prompt = format!("/{name} {arguments}");
+        self.drive_input(
+            &prompt,
+            None,
+            None,
+            UserInputPersistence::AdmitAndPromote,
+            &guard,
+            events,
+        )
+        .await
+    }
+
     pub(crate) async fn drive_command(
         &mut self,
         command: &str,
@@ -2572,6 +3017,7 @@ impl TurnHost {
         if self.background_reports_recovered {
             return Ok(());
         }
+        self.workflows.recover_uncertain(&self.session_id).await?;
         self.product_agents
             .recover_uncertain(&self.session_id)
             .await?;
@@ -2645,6 +3091,44 @@ impl TurnHost {
         .await
     }
 
+    /// Load and optionally drive a direct Skill whose inbox row was already promoted.
+    pub(crate) async fn drive_promoted_skill(
+        &mut self,
+        name: &str,
+        source: &str,
+        arguments: &str,
+        message_id: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        self.load_selected_skill(name, source, &events).await?;
+        let arguments = arguments.trim();
+        if arguments.is_empty() {
+            self.inbox
+                .mark_consumed(&self.session_id, message_id)
+                .map_err(to_string)?
+                .ok_or_else(|| {
+                    format!(
+                        "promoted input `{message_id}` was not available for consumed settlement"
+                    )
+                })?;
+            return report_skill_selected(name, &events).await;
+        }
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        let prompt = format!("/{name} {arguments}");
+        self.drive_input(
+            &prompt,
+            Some(message_id),
+            None,
+            UserInputPersistence::AlreadyPromoted,
+            &guard,
+            events,
+        )
+        .await
+    }
+
     /// Resolve and drive a catalog command whose inbox row was already promoted.
     pub(crate) async fn drive_promoted_command(
         &mut self,
@@ -2685,6 +3169,33 @@ impl TurnHost {
         .await
     }
 
+    async fn load_selected_skill(
+        &mut self,
+        name: &str,
+        source: &str,
+        events: &TurnEventSender,
+    ) -> Result<(), String> {
+        self.require_active_extension_composition()?;
+        if let Some(skill) = preload_selected_skill(
+            &mut self.resolver,
+            &self.skills,
+            &mut self.selected_skills,
+            name,
+            source,
+        )
+        .await?
+        {
+            events
+                .publish(TurnEvent::SkillLoaded {
+                    name: skill.name,
+                    source: skill.source,
+                })
+                .await
+                .map_err(to_string)?;
+        }
+        Ok(())
+    }
+
     async fn drive_input(
         &mut self,
         prompt: &str,
@@ -2695,6 +3206,22 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.require_active_extension_composition()?;
+        let newly_loaded = preload_explicit_skills(
+            &mut self.resolver,
+            &self.skills,
+            &mut self.selected_skills,
+            prompt,
+        )
+        .await?;
+        for skill in newly_loaded {
+            events
+                .publish(TurnEvent::SkillLoaded {
+                    name: skill.name,
+                    source: skill.source,
+                })
+                .await
+                .map_err(to_string)?;
+        }
         let latest = zuno_db::message::MessageStore::new(&self.connection)
             .latest_time_created(&self.session_id)
             .map_err(to_string)?;
@@ -2778,15 +3305,17 @@ impl TurnHost {
                 "message": message.to_json(),
                 "parts": parts.iter().map(zuno_db::message::PartRecord::to_json).collect::<Vec<_>>(),
             }),
-            zuno_db::inbox::InputDelivery::NextStep,
+            zuno_db::inbox::InputDelivery::Queue,
             message.time_created,
         );
+        let durable_input_id = durable_input.id.clone();
         match &self.session_materializer {
             SessionMaterializer::Existing => {
                 let transaction = self.connection.unchecked_transaction().map_err(to_string)?;
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+                consume_promoted_input(&transaction, &self.session_id, &durable_input_id)?;
                 transaction.commit().map_err(to_string)?;
                 Ok(false)
             }
@@ -2798,6 +3327,7 @@ impl TurnHost {
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+                consume_promoted_input(&transaction, &self.session_id, &durable_input_id)?;
                 transaction.commit().map_err(to_string)?;
                 self.session_materializer = SessionMaterializer::Existing;
                 self.session_identity.mark_materialized();
@@ -2819,6 +3349,7 @@ impl TurnHost {
         }
         let transaction = self.connection.unchecked_transaction().map_err(to_string)?;
         persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+        consume_promoted_input(&transaction, &self.session_id, &message.id)?;
         transaction.commit().map_err(to_string)
     }
 
@@ -3256,6 +3787,11 @@ impl TurnHost {
         events: &TurnEventSender,
     ) -> Result<bool, String> {
         let rendered = failure.rendered(self.credential.as_deref());
+        zuno_db::session::record_turn_failure(&self.connection, &self.session_id).map_err(
+            |audit_error| {
+                format!("{rendered}; additionally failed to record the failed turn: {audit_error}")
+            },
+        )?;
         let disposition = self
             .finish_goal_error(usage_before, started, failure.goal_failure())
             .map_err(|goal_error| {
@@ -3281,9 +3817,10 @@ impl TurnHost {
     fn record_goal_usage(&self, before: GoalUsage, started: Instant) -> Result<(), String> {
         let after = goal_usage(&self.connection, &self.session_id)?;
         let token_delta = after.tokens.saturating_sub(before.tokens);
+        let accounting_known = goal_turn_accounting_known(before, after);
         let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.goal_store
-            .record_usage(&self.session_id, token_delta, elapsed)
+            .record_usage(&self.session_id, token_delta, elapsed, accounting_known)
             .map_err(to_string)?;
         Ok(())
     }
@@ -3409,25 +3946,36 @@ fn goal_tool_failure(recoveries: &[ToolFailureRecovery]) -> Option<GoalTerminalF
 #[derive(Debug, Clone, Copy, Default)]
 struct GoalUsage {
     tokens: i64,
+    confirmed_known: bool,
+    estimated_pending_prompt_tokens: Option<u64>,
+    last_confirmed_at: Option<i64>,
+    failed_turns: u64,
 }
 
 fn goal_usage(connection: &rusqlite::Connection, session_id: &str) -> Result<GoalUsage, String> {
-    connection
-        .query_row(
-            "SELECT COALESCE(SUM(\
-               COALESCE(json_extract(data, '$.tokens.input'), 0) + \
-               COALESCE(json_extract(data, '$.tokens.output'), 0) + \
-               COALESCE(json_extract(data, '$.tokens.reasoning'), 0) + \
-               COALESCE(json_extract(data, '$.tokens.cache.read'), 0) + \
-               COALESCE(json_extract(data, '$.tokens.cache.write'), 0)\
-             ), 0) \
-             FROM message \
-             WHERE session_id = ?1 AND json_extract(data, '$.role') = 'assistant'",
-            [session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|tokens| GoalUsage { tokens })
-        .map_err(to_string)
+    let snapshot = zuno_db::session::get(connection, session_id)
+        .map_err(to_string)?
+        .usage
+        .snapshot();
+    Ok(GoalUsage {
+        tokens: i64::try_from(snapshot.confirmed.total()).unwrap_or(i64::MAX),
+        confirmed_known: snapshot.confirmed_known,
+        estimated_pending_prompt_tokens: snapshot.estimated_pending_prompt_tokens,
+        last_confirmed_at: snapshot.last_confirmed_at,
+        failed_turns: snapshot.failed_turns,
+    })
+}
+
+fn goal_turn_accounting_known(before: GoalUsage, after: GoalUsage) -> bool {
+    if after.tokens != before.tokens || after.last_confirmed_at != before.last_confirmed_at {
+        return after.confirmed_known;
+    }
+    if after.failed_turns > before.failed_turns
+        || after.estimated_pending_prompt_tokens != before.estimated_pending_prompt_tokens
+    {
+        return false;
+    }
+    true
 }
 
 fn dynamic_context_from_goal_entry(
@@ -3444,6 +3992,199 @@ fn dynamic_context_from_goal_entry(
         .collect::<Vec<_>>()
         .join("\n");
     DynamicContext::new(text)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedSkillSection {
+    identity: SelectedSkillIdentity,
+    content: String,
+}
+
+fn parse_selected_skill_sections(data: &str) -> Result<Vec<SelectedSkillSection>, String> {
+    let receipt: Value = serde_json::from_str(data).map_err(to_string)?;
+    let sections = receipt
+        .get("sections")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "prompt receipt has no sections array".to_owned())?;
+    sections
+        .iter()
+        .filter(|section| section.get("role").and_then(Value::as_str) == Some("selected_skill"))
+        .map(|section| {
+            let name = section
+                .get("skillName")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "selected Skill prompt block has no skillName".to_owned())?;
+            let source = section
+                .get("source")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "selected Skill prompt block has no source".to_owned())?;
+            let content = section
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "selected Skill prompt block has no content".to_owned())?;
+            Ok(SelectedSkillSection {
+                identity: SelectedSkillIdentity {
+                    name: name.to_owned(),
+                    source: source.to_owned(),
+                },
+                content: content.to_owned(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn background_execution_projections(
+    service: &zuno_pty::BackgroundExecutionService,
+    session_id: &str,
+    now: i64,
+) -> Vec<zuno_types::BackgroundExecutionProjection> {
+    service
+        .list_for_session(session_id)
+        .into_iter()
+        .map(|execution| zuno_types::BackgroundExecutionProjection {
+            id: execution.id.to_string(),
+            title: execution.title,
+            command: execution.command,
+            status: execution.status.as_str().to_owned(),
+            pid: execution.pid,
+            exit_code: execution.exit_code,
+            timed_out: execution.timed_out,
+            error: execution.error,
+            span: zuno_types::ExecutionSpan {
+                started_at: execution.time_created,
+                completed_at: execution.time_completed,
+                elapsed_ms: u64::try_from(
+                    execution
+                        .time_completed
+                        .unwrap_or(now)
+                        .saturating_sub(execution.time_created),
+                )
+                .unwrap_or_default(),
+                usage: zuno_types::TokenUsage::default(),
+                accounting_known: false,
+            },
+            time_created: execution.time_created,
+            time_completed: execution.time_completed,
+        })
+        .collect()
+}
+
+fn restore_selected_skills(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    resolver: &mut Resolver,
+) -> Result<BTreeSet<SelectedSkillIdentity>, String> {
+    let receipt = connection
+        .query_row(
+            "SELECT data FROM event WHERE type = 'session.prompt.assembled.1' \
+             AND aggregate_id = ?1 ORDER BY seq DESC LIMIT 1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let Some(receipt) = receipt else {
+        return Ok(BTreeSet::new());
+    };
+    let mut restored = BTreeSet::new();
+    for selected in parse_selected_skill_sections(&receipt)? {
+        if restored
+            .iter()
+            .any(|identity: &SelectedSkillIdentity| identity.source == selected.identity.source)
+        {
+            continue;
+        }
+        resolver.append_selected_skill(
+            &selected.identity.name,
+            &selected.identity.source,
+            selected.content,
+        )?;
+        restored.insert(selected.identity);
+    }
+    Ok(restored)
+}
+
+async fn preload_selected_skill(
+    resolver: &mut Resolver,
+    skills: &zuno_catalog::skill::Skills,
+    loaded: &mut BTreeSet<SelectedSkillIdentity>,
+    name: &str,
+    source: &str,
+) -> Result<Option<SelectedSkillIdentity>, String> {
+    if loaded.iter().any(|identity| identity.source == source) {
+        return Ok(None);
+    }
+    let document = zuno_tools::load_skill_document(skills, name, Some(source))
+        .await
+        .map_err(to_string)?;
+    resolver.append_selected_skill(&document.name, &document.source, document.content)?;
+    let identity = SelectedSkillIdentity {
+        name: document.name,
+        source: document.source,
+    };
+    loaded.insert(identity.clone());
+    Ok(Some(identity))
+}
+
+async fn preload_explicit_skills(
+    resolver: &mut Resolver,
+    skills: &zuno_catalog::skill::Skills,
+    loaded: &mut BTreeSet<SelectedSkillIdentity>,
+    prompt: &str,
+) -> Result<Vec<SelectedSkillIdentity>, String> {
+    let mut mentioned = skills
+        .all()
+        .iter()
+        .filter_map(|skill| {
+            first_explicit_skill_mention(prompt, &skill.name)
+                .map(|offset| (offset, skill.name.clone()))
+        })
+        .collect::<Vec<_>>();
+    mentioned.sort();
+    let mut seen_names = BTreeSet::new();
+    mentioned.retain(|(_, name)| seen_names.insert(name.clone()));
+
+    let mut selected = Vec::new();
+    for (_, name) in mentioned {
+        let matches = skills.named(&name);
+        let [skill] = matches.as_slice() else {
+            continue;
+        };
+        if let Some(identity) =
+            preload_selected_skill(resolver, skills, loaded, &skill.name, &skill.location).await?
+        {
+            selected.push(identity);
+        }
+    }
+    Ok(selected)
+}
+
+async fn report_skill_selected(name: &str, events: &TurnEventSender) -> Result<(), String> {
+    events
+        .publish(TurnEvent::Provider {
+            step: 0,
+            event: StreamEvent::StatusDetail {
+                detail: format!("Skill `{name}` loaded for this session"),
+            },
+        })
+        .await
+        .map_err(to_string)
+}
+
+fn first_explicit_skill_mention(prompt: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    prompt.match_indices(name).find_map(|(offset, _)| {
+        let before = prompt[..offset].chars().next_back();
+        let after = prompt[offset + name.len()..].chars().next();
+        (!before.is_some_and(skill_identifier_char) && !after.is_some_and(skill_identifier_char))
+            .then_some(offset)
+    })
+}
+
+fn skill_identifier_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '/')
 }
 
 const DEFAULT_SKILL_METADATA_CHAR_BUDGET: usize = 8_000;
@@ -3610,7 +4351,18 @@ fn announce_instructions(
             continue;
         }
         admitted_bytes = projected;
-        resolver.append_prompt_section(format!("instructions.{index}"), entry.source(), block)?;
+        let origin = match entry.origin() {
+            Some(zuno_config::instructions::Origin::Global) => "global",
+            Some(zuno_config::instructions::Origin::Project) => "project",
+            Some(zuno_config::instructions::Origin::Configured) => "configured",
+            Some(zuno_config::instructions::Origin::Nearby) => "nearby",
+            None => "remote",
+        };
+        resolver.append_prompt_section(
+            format!("instructions.{origin}.{index}"),
+            entry.source(),
+            block,
+        )?;
     }
 
     Ok(())
@@ -3864,7 +4616,10 @@ fn delegation_agents(
         .filter_map(|agent| {
             let model = agent.model.as_ref()?;
             let mut choice = ModelChoice::new(model.clone());
-            choice.variant = agent.variant.clone();
+            choice.variant = agent
+                .reasoning
+                .map(|effort| effort.as_str().to_owned())
+                .or_else(|| agent.variant.clone());
             Some((agent.name.clone(), choice))
         })
         .collect();
@@ -4530,8 +5285,9 @@ fn with_agent_options(
 /// # Why configured values are fallbacks and not overrides
 ///
 /// A session-level choice is a live user action — the effort picker — and the
-/// agent's `variant` or `reasoningEffort` is a configured default, so the live choice wins. That is also
-/// the oracle's order: `input.variant ?? (ag.variant && ...)`
+/// agent's `reasoning`, `variant`, or legacy provider option is a configured default,
+/// so the live choice wins. That is also the oracle's order:
+/// `input.variant ?? (ag.variant && ...)`
 /// (`session/prompt.ts:654`).
 ///
 /// # Why the agent's model must match
@@ -4556,7 +5312,12 @@ fn turn_effort(
             let declared = agent.model.as_deref()?;
             let (declared_provider, declared_model) = declared.split_once('/')?;
             (declared_provider == provider_id && declared_model == model_id)
-                .then(|| agent.variant.as_deref()?.parse().ok())
+                .then(|| {
+                    agent
+                        .reasoning
+                        .and_then(|effort| effort.as_str().parse().ok())
+                        .or_else(|| agent.variant.as_deref()?.parse().ok())
+                })
                 .flatten()
         })
         .or_else(|| configured_reasoning_effort(&agent.options))
@@ -4698,6 +5459,31 @@ impl AgentModelResolver for Resolver {
 }
 
 impl Resolver {
+    fn append_selected_skill(
+        &mut self,
+        name: impl Into<String>,
+        source: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<(), String> {
+        let content = content.into();
+        if content.is_empty() {
+            return Ok(());
+        }
+        let source = source.into();
+        if let Some(assembly) = &mut self.prompt_assembly {
+            assembly
+                .push_selected_skill(name, source, content)
+                .map_err(to_string)?;
+            self.system_prompt = assembly.render();
+        } else if self.system_prompt.is_empty() {
+            self.system_prompt = content;
+        } else {
+            self.system_prompt.push_str("\n\n");
+            self.system_prompt.push_str(&content);
+        }
+        Ok(())
+    }
+
     fn append_prompt_section(
         &mut self,
         id: impl Into<String>,
@@ -4920,6 +5706,19 @@ fn persist_user_message(
         .put_message_at(&message, input.now)
         .map_err(to_string)?;
     store.put_part_at(&part, input.now).map_err(to_string)?;
+    Ok(())
+}
+
+fn consume_promoted_input(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+) -> Result<(), String> {
+    zuno_db::inbox::mark_consumed_in(transaction, session_id, input_id)
+        .map_err(to_string)?
+        .ok_or_else(|| {
+            format!("promoted input `{input_id}` was not available for consumed settlement")
+        })?;
     Ok(())
 }
 

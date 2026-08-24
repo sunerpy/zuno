@@ -139,6 +139,8 @@ pub enum DialogOutcome {
     Question(Vec<Vec<String>>),
     /// The session list requested an operation on its highlighted row.
     Session(crate::views::picker::SessionDialogAction),
+    /// The durable input queue requested an edit or cancellation.
+    QueuedInput(crate::views::picker::QueuedInputDialogAction),
     /// The MCP dialog requested an explicit lifecycle target.
     McpToggle(crate::views::picker::McpToggleRequest),
     /// The subagent dialog requested cancellation while remaining open.

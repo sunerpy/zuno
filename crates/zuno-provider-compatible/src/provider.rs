@@ -201,6 +201,8 @@ impl CompatibleProvider {
     pub fn body_for(&self, request: &CompletionRequest) -> Value {
         let quirks = self.quirks_for(&request.model_id, request.surface);
         let mut body = RequestBody::new(request.model_id.clone(), request.messages.clone());
+        body.developer_context
+            .clone_from(&request.developer_context);
         body.tools = function_envelopes(&request.tools);
         body.sampling = self.sampling;
         body.max_tokens = self.max_tokens;

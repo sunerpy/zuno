@@ -57,6 +57,7 @@ tree-sitter = { workspace = true }
 tree-sitter-bash = { workspace = true }
 tree-sitter-powershell = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 which = { workspace = true }
 
 [dev-dependencies]

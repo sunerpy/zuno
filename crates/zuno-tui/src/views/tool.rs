@@ -146,8 +146,8 @@ impl Summary {
 /// the render layer to learn twenty-one strings is a worse trade than a scan. It is the
 /// same technique [`crate::views::views_tests`] already uses for the colour and keybind
 /// disciplines.
-pub const SUMMARISED: [&str; 23] = [
-    // The 19 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
+pub const SUMMARISED: [&str; 26] = [
+    // The 18 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
     "bash",
@@ -160,18 +160,21 @@ pub const SUMMARISED: [&str; 23] = [
     "task",
     "job",
     "webfetch",
-    "todowrite",
     "web_search",
     "skill",
     "apply_patch",
     "execute",
     "lsp",
     "plan_exit",
-    // Built-ins registered outside the slot table: memory and the three goal tools.
+    // Built-ins registered outside the slot table: memory, goal, plan, and todo state.
     "memory_propose",
-    "get_goal",
-    "create_goal",
-    "update_goal",
+    "goal_get",
+    "goal_propose",
+    "goal_update",
+    "plan_get",
+    "plan_update",
+    "todo_get",
+    "todo_update",
 ];
 
 /// What `name` should say about itself, given the arguments the model wrote.
@@ -185,7 +188,7 @@ pub const SUMMARISED: [&str; 23] = [
 /// that is about to be replaced.
 ///
 /// `None` is also the answer for a tool with nothing worth quoting (`plan_exit`,
-/// `get_goal`) and for a tool this table does not know (an MCP or plugin tool, whose
+/// `goal_get`) and for a tool this table does not know (an MCP or plugin tool, whose
 /// argument shapes are not knowable here). All three cases render the same way, which
 /// is the honest rendering: the row states the tool and claims nothing about its input.
 #[must_use]
@@ -279,15 +282,20 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
                 None => action,
             }))
         }
-        // The count plus the first item. A bare count says nothing about the plan, and the
-        // whole list is not a summary — it is the thing being summarised.
-        "todowrite" => {
-            let todos = value.get("todos").and_then(Value::as_array)?;
-            let first = todos
+        "plan_update" => text("title").map(Summary::tail),
+        "plan_get" | "todo_get" => None,
+        // The count plus the first changed item. A bare count says nothing about the work,
+        // and the whole change set is not a summary — it is the thing being summarised.
+        "todo_update" => {
+            let changes = value.get("changes").and_then(Value::as_array)?;
+            let first = changes
                 .first()
-                .and_then(|item| field(item, "content"))
+                .and_then(|item| field(item, "subject").or_else(|| field(item, "id")))
                 .unwrap_or_default();
-            Some(Summary::tail(format!("{} items · {first}", todos.len())))
+            Some(Summary::tail(format!(
+                "{} changes · {first}",
+                changes.len()
+            )))
         }
         // The first question, and how many follow. A user is about to be asked these, so
         // the text matters more here than for any other tool.
@@ -341,16 +349,16 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
                 None => operation,
             }))
         }
-        "create_goal" => text("objective").map(Summary::tail),
+        "goal_propose" => text("objective").map(Summary::tail),
         // The blocking condition is the informative half when there is one — `blocked`
         // without a reason is a state a reader cannot act on.
-        "update_goal" => text("status").map(|status| {
+        "goal_update" => text("status").map(|status| {
             Summary::tail(match text("blocking_condition") {
                 Some(reason) => format!("{status}: {reason}"),
                 None => status,
             })
         }),
-        // `plan_exit` and `get_goal` take no arguments, so there is nothing to summarise
+        // `plan_exit` and `goal_get` take no arguments, so there is nothing to summarise
         // and nothing is invented. Anything else is a plugin or MCP tool whose argument
         // shape this table cannot know.
         _ => None,
@@ -465,10 +473,10 @@ pub fn status_style(
     match status {
         ToolStatus::Error => context.error(),
         ToolStatus::Blocked => context.warning(),
-        ToolStatus::Completed if intent == zuno_tool::ToolUiIntent::Subagent => context.secondary(),
-        ToolStatus::Completed => context.accent(),
-        // Muted while in flight: an unfinished call has not earned the reader's attention
-        // yet, and the spinner on the row is already saying it is alive.
-        ToolStatus::Pending | ToolStatus::Running => context.muted(),
+        ToolStatus::Completed if intent == zuno_tool::ToolUiIntent::Subagent => {
+            context.delegation()
+        }
+        ToolStatus::Completed | ToolStatus::Pending => context.tool(),
+        ToolStatus::Running => context.running(),
     }
 }

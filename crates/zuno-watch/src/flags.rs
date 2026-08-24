@@ -15,7 +15,7 @@
 //! `Config.boolean` accepts a wider set than `truthy` and, crucially, **fails**
 //! on a value it cannot parse instead of quietly reading it as `false`. That
 //! difference is observable, so it is modelled here rather than flattened into
-//! [`zuno_paths::Env::flag`]. See `.omo/notepads/opencode-rust/issues.md` for the
+//! [`zuno_paths::Env::flag`]. See the project's engineering notes for the
 //! part of this that could not be confirmed against the 1.18.12 binary.
 //!
 //! # Why an unparseable value disables the watcher

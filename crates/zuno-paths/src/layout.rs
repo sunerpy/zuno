@@ -29,7 +29,7 @@
 //! before any command has decided it needs them. Nothing here does: every
 //! getter is a pure computation and creation happens only in
 //! [`Layout::ensure`](crate::Layout::ensure). This divergence is intentional and
-//! is recorded in `.omo/notepads/opencode-rust/decisions.md` — a differential
+//! is recorded in the project's engineering notes — a differential
 //! test cannot see it, because both binaries report the same *paths*.
 //!
 //! The eager `mkdir` is observable in the oracle, though: `TMPDIR=/ opencode

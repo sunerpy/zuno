@@ -58,10 +58,10 @@ plugin runtime capability list, controls which model-visible tools it can use:
 - `task` delegates again, subject to the configured depth bound.
 
 This reuses the same authorization path as native agents. There is no second
-plugin-only permission language. `authorization.strict: true` still requires a
-fresh human approval for every side-effecting call, even when an agent rule says
-`allow`. A rule that says `ask` cannot run on a headless surface without an
-attached approver.
+plugin-only permission language. Top-level `permission.mode: "strict"` still
+requires a fresh human approval for every side-effecting call, even when an
+agent rule says `allow`. A rule that says `ask` cannot run on a headless surface
+without an attached approver.
 
 The bundled review example explicitly permits repository reads and network
 research and asks before shell/environment access:
@@ -77,14 +77,17 @@ research and asks before shell/environment access:
       "mode": "subagent",
       "prompt": "Use repository, environment, and current external evidence. Do not delegate.",
       "permission": {
-        "*": "deny",
-        "read": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "lsp": "allow",
-        "webfetch": "allow",
-        "web_search": "allow",
-        "bash": "ask"
+        "mode": "standard",
+        "rules": {
+          "*": "deny",
+          "read": "allow",
+          "glob": "allow",
+          "grep": "allow",
+          "lsp": "allow",
+          "webfetch": "allow",
+          "web_search": "allow",
+          "bash": "ask"
+        }
       }
     }
   },

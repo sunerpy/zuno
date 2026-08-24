@@ -53,6 +53,14 @@ pub enum DbError {
     #[error("no row in {table} with id {id}")]
     NotFound { table: String, id: String },
 
+    /// An optimistic or lifecycle precondition no longer matches durable state.
+    #[error("conflict updating {table} row {id}: {detail}")]
+    Conflict {
+        table: String,
+        id: String,
+        detail: String,
+    },
+
     /// A stored value could not be decoded into the type the schema promises.
     /// This is corruption or a schema/code mismatch, never a transient fault.
     #[error("stored value in {table} could not be decoded")]
@@ -86,6 +94,7 @@ impl DbError {
             | Self::SchemaMismatch { .. }
             | Self::Query { .. }
             | Self::NotFound { .. }
+            | Self::Conflict { .. }
             | Self::Decode { .. } => None,
         }
     }
@@ -102,6 +111,7 @@ impl Recoverable for DbError {
             | Self::SchemaMismatch { .. }
             | Self::Query { .. }
             | Self::NotFound { .. }
+            | Self::Conflict { .. }
             | Self::Decode { .. } => Recovery::Fail,
         }
     }
@@ -135,6 +145,11 @@ mod tests {
             DbError::NotFound {
                 table: "message".to_owned(),
                 id: "msg_01".to_owned(),
+            },
+            DbError::Conflict {
+                table: "session_input".to_owned(),
+                id: "input_01".to_owned(),
+                detail: "revision conflict".to_owned(),
             },
             DbError::Decode {
                 table: "message".to_owned(),

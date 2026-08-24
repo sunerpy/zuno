@@ -33,7 +33,7 @@ use zuno_tool::{ToolContext, ToolEffect, ToolOutput, TypedTool};
 /// The id the model calls, and the key the registry stores.
 ///
 /// Registry key and wire id agree here — `registry.ts:206` keys it `invalid` and
-/// `invalid.ts:10` names it `invalid` — unlike `todowrite` and `plan_exit`.
+/// `invalid.ts:10` names it `invalid` — unlike upstream's `plan_exit` registry key.
 pub const WIRE_ID: &str = "invalid";
 
 /// The description the model reads.

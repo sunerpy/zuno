@@ -572,6 +572,8 @@ pub enum DebugCommand {
     Paths,
     Config,
     Agent(DebugAgentArgs),
+    Prompt(DebugPromptArgs),
+    Permissions,
     Skill,
     Rg(DebugRgArgs),
     Lsp(DebugLspArgs),
@@ -585,6 +587,19 @@ pub struct DebugAgentArgs {
     pub tool: Option<String>,
     #[arg(long)]
     pub params: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DebugPromptArgs {
+    /// Session whose prompt receipt should be shown; defaults to the latest receipt.
+    #[arg(value_name = "session")]
+    pub session_id: Option<String>,
+    /// One-based model step within the session; defaults to its latest receipt.
+    #[arg(value_name = "turn")]
+    pub turn: Option<u32>,
+    /// Include model-visible instruction, AGENTS, skill, and memory content.
+    #[arg(long)]
+    pub show_sensitive: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1217,6 +1232,40 @@ mod tests {
         assert!(args.include_recent);
         assert!(args.force);
         assert_eq!(args.format, SessionFormat::Json);
+    }
+
+    #[test]
+    fn debug_prompt_accepts_optional_session_turn_and_sensitive_flag() {
+        let cli = Cli::try_parse_from([
+            "zuno",
+            "debug",
+            "prompt",
+            "ses_example",
+            "7",
+            "--show-sensitive",
+        ])
+        .expect("debug prompt parses");
+        let Some(Command::Debug(DebugArgs {
+            command: Some(DebugCommand::Prompt(args)),
+        })) = cli.command
+        else {
+            panic!("expected debug prompt");
+        };
+        assert_eq!(args.session_id.as_deref(), Some("ses_example"));
+        assert_eq!(args.turn, Some(7));
+        assert!(args.show_sensitive);
+
+        let latest =
+            Cli::try_parse_from(["zuno", "debug", "prompt"]).expect("latest prompt receipt parses");
+        let Some(Command::Debug(DebugArgs {
+            command: Some(DebugCommand::Prompt(args)),
+        })) = latest.command
+        else {
+            panic!("expected latest debug prompt");
+        };
+        assert!(args.session_id.is_none());
+        assert!(args.turn.is_none());
+        assert!(!args.show_sensitive);
     }
 
     #[test]

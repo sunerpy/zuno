@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use zuno_catalog::lsp_config::ResolvedLsp;
 use zuno_catalog::skill::discovery::SkillOptions;
@@ -10,7 +11,8 @@ use zuno_search::{GlobRequest, GrepRequest, NeverCancelled, Ripgrep};
 use zuno_snapshot::{Location, Store};
 
 use crate::command::{
-    DebugAgentArgs, DebugArgs, DebugCommand, DebugLspCommand, DebugRgCommand, DebugSnapshotCommand,
+    DebugAgentArgs, DebugArgs, DebugCommand, DebugLspCommand, DebugPromptArgs, DebugRgCommand,
+    DebugSnapshotCommand,
 };
 use crate::environment::StartupEnvironment;
 
@@ -28,6 +30,11 @@ pub(super) fn execute(args: &DebugArgs, environment: &StartupEnvironment) -> Res
         DebugCommand::Agent(args) => {
             let context = Context::resolve(environment)?;
             agent(args, &context)
+        }
+        DebugCommand::Prompt(args) => prompt(args),
+        DebugCommand::Permissions => {
+            let context = Context::resolve(environment)?;
+            permissions(&context)
         }
         DebugCommand::Skill => {
             let context = Context::resolve(environment)?;
@@ -119,6 +126,102 @@ fn normalize_json_numbers(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+fn permissions(context: &Context) -> Result<(), String> {
+    let rules = context
+        .config
+        .permission
+        .as_ref()
+        .map(|permission| permission.rules.clone())
+        .unwrap_or_default();
+    print_json(&serde_json::json!({
+        "mode": context.config.permission_mode(),
+        "rules": rules,
+        "strictSideEffectsRequireApproval": context.config.strict_authorization(),
+        "allowAllStillEnforces": ["explicit deny", "sandbox", "argument validation"],
+    }))
+}
+
+fn prompt(args: &DebugPromptArgs) -> Result<(), String> {
+    let pool = zuno_db::Pool::open_default().map_err(to_string)?;
+    let mut connection = pool.get().map_err(to_string)?;
+    zuno_db::migration::apply(&mut connection).map_err(to_string)?;
+    let row = match (&args.session_id, args.turn) {
+        (Some(session_id), Some(turn)) => connection
+            .query_row(
+                "SELECT id, aggregate_id, seq, data FROM event \
+                 WHERE type = 'session.prompt.assembled.1' AND aggregate_id = ?1 \
+                 AND CAST(json_extract(data, '$.step') AS INTEGER) = ?2 \
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![session_id, turn],
+                prompt_row,
+            )
+            .optional(),
+        (Some(session_id), None) => connection
+            .query_row(
+                "SELECT id, aggregate_id, seq, data FROM event \
+                 WHERE type = 'session.prompt.assembled.1' AND aggregate_id = ?1 \
+                 ORDER BY seq DESC LIMIT 1",
+                [session_id],
+                prompt_row,
+            )
+            .optional(),
+        (None, None) => connection
+            .query_row(
+                "SELECT id, aggregate_id, seq, data FROM event \
+                 WHERE type = 'session.prompt.assembled.1' ORDER BY rowid DESC LIMIT 1",
+                [],
+                prompt_row,
+            )
+            .optional(),
+        (None, Some(_)) => unreachable!("turn is positional after session"),
+    }
+    .map_err(to_string)?;
+    let Some((event_id, session_id, sequence, data)) = row else {
+        let target = args
+            .session_id
+            .as_deref()
+            .map_or_else(|| "the database".to_owned(), |id| format!("session `{id}`"));
+        return Err(format!("no prompt receipt found for {target}"));
+    };
+    let mut properties: serde_json::Value = serde_json::from_str(&data).map_err(to_string)?;
+    if !args.show_sensitive {
+        redact_prompt_content(&mut properties);
+    }
+    print_json(&serde_json::json!({
+        "eventId": event_id,
+        "eventType": "session.prompt.assembled",
+        "sessionId": session_id,
+        "sequence": sequence,
+        "properties": properties,
+    }))
+}
+
+fn prompt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, i64, String)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+}
+
+fn redact_prompt_content(value: &mut serde_json::Value) {
+    let Some(properties) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(sections) = properties
+        .get_mut("sections")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for section in sections {
+            if let Some(section) = section.as_object_mut() {
+                section.insert("content".to_owned(), serde_json::json!("<redacted>"));
+            }
+        }
+    }
+    if properties.contains_key("actualSystemPrompt") {
+        properties.insert(
+            "actualSystemPrompt".to_owned(),
+            serde_json::json!("<redacted>"),
+        );
     }
 }
 
@@ -354,6 +457,44 @@ mod tests {
             combined_glob(&["*.rs".to_owned(), "*.toml".to_owned()]).as_deref(),
             Some("{*.rs,*.toml}")
         );
+    }
+
+    #[test]
+    fn prompt_debug_redacts_model_visible_bodies_but_keeps_provenance() {
+        let mut receipt = serde_json::json!({
+            "assemblySha256": "assembly-digest",
+            "actualSha256": "actual-digest",
+            "actualSystemPrompt": "hook-transformed secret",
+            "sections": [{
+                "id": "instructions.project.0",
+                "role": "project_instructions",
+                "source": "/repo/AGENTS.md",
+                "sha256": "section-digest",
+                "bytes": 12,
+                "content": "private rule"
+            }]
+        });
+
+        redact_prompt_content(&mut receipt);
+
+        assert_eq!(receipt["sections"][0]["content"], "<redacted>");
+        assert_eq!(receipt["actualSystemPrompt"], "<redacted>");
+        assert_eq!(receipt["sections"][0]["source"], "/repo/AGENTS.md");
+        assert_eq!(receipt["sections"][0]["sha256"], "section-digest");
+        assert_eq!(receipt["assemblySha256"], "assembly-digest");
+    }
+
+    #[test]
+    fn prompt_debug_does_not_invent_a_post_hook_body_when_none_was_stored() {
+        let mut receipt = serde_json::json!({
+            "sections": [{"content": "private rule"}],
+            "hookTransformed": false
+        });
+
+        redact_prompt_content(&mut receipt);
+
+        assert_eq!(receipt["sections"][0]["content"], "<redacted>");
+        assert!(receipt.get("actualSystemPrompt").is_none());
     }
 
     #[test]

@@ -168,6 +168,10 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "session.materialized",
             object(json!({"sessionID": session_id, "title": title})),
         ),
+        TurnEvent::SkillLoaded { name, source } => (
+            "skill.loaded",
+            object(json!({"name": name, "source": source})),
+        ),
         TurnEvent::TurnStarted { session_id } => {
             ("turn.started", object(json!({"sessionID": session_id})))
         }
@@ -208,9 +212,14 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
         TurnEvent::ProviderRequestStarted {
             step,
             message_count,
+            estimated_prompt_tokens,
         } => (
             "provider.request.started",
-            object(json!({"step": step, "messageCount": message_count})),
+            object(json!({
+                "step": step,
+                "messageCount": message_count,
+                "estimatedPromptTokens": estimated_prompt_tokens,
+            })),
         ),
         TurnEvent::Provider { step, event } => (
             "provider",

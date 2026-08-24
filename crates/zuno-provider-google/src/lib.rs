@@ -323,7 +323,8 @@ impl GoogleGenerativeAi {
     ) -> Result<PreparedRequest, GoogleProviderError> {
         let base = self.options.base_url.as_deref().unwrap_or(GOOGLE_BASE_URL);
         let url = gemini_api_endpoint(base, &request.model_id)?;
-        let mut body = build_gemini_body(&request.messages, &self.options)?;
+        let mut body =
+            build_gemini_body(&request.messages, &request.developer_context, &self.options)?;
         // Gemini's `generateContent` is neither OpenAI surface; `Messages` selects
         // no OpenAI-specific rename, and the Google rule nests `thinkingConfig`
         // under `generationConfig` on every surface.
@@ -421,7 +422,8 @@ impl VertexGemini {
         } else {
             vertex_gemini_endpoint(&self.project, &self.location, &request.model_id)?
         };
-        let mut body = build_gemini_body(&request.messages, &self.options)?;
+        let mut body =
+            build_gemini_body(&request.messages, &request.developer_context, &self.options)?;
         // Gemini's `generateContent` is neither OpenAI surface; `Messages` selects
         // no OpenAI-specific rename, and the Google rule nests `thinkingConfig`
         // under `generationConfig` on every surface.
@@ -478,6 +480,7 @@ fn gemini_capabilities() -> Capabilities {
 
 fn build_gemini_body(
     messages: &[Message],
+    developer_context: &[String],
     options: &GeminiOptions,
 ) -> Result<Value, GoogleProviderError> {
     let tool_names = collect_tool_names(messages);
@@ -488,7 +491,9 @@ fn build_gemini_body(
         if message.role == Role::System {
             for block in &message.content {
                 match block {
-                    RequestContentBlock::Text { text } => system.push(text.clone()),
+                    RequestContentBlock::Text { text } => {
+                        system.push(json!({"text": text}));
+                    }
                     other => {
                         return Err(unsupported_content(
                             GOOGLE_PROVIDER_ID,
@@ -514,13 +519,17 @@ fn build_gemini_body(
         contents.push(json!({"role": role, "parts": parts}));
     }
 
+    system.extend(
+        developer_context
+            .iter()
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| json!({"text": content})),
+    );
+
     let mut body = Map::new();
     body.insert("contents".to_owned(), Value::Array(contents));
     if !system.is_empty() {
-        body.insert(
-            "systemInstruction".to_owned(),
-            json!({"parts": [{"text": system.join("\n")}]}),
-        );
+        body.insert("systemInstruction".to_owned(), json!({"parts": system}));
     }
     if !options.tools.is_empty() && !matches!(options.tool_choice, Some(GeminiToolChoice::None)) {
         let declarations: Vec<Value> = options
@@ -1188,7 +1197,11 @@ impl VertexAnthropic {
             Some(base) => vertex_anthropic_custom_endpoint(base, &request.model_id)?,
             None => vertex_anthropic_endpoint(&self.project, &self.location, &request.model_id)?,
         };
-        let mut body = build_vertex_anthropic_body(&request.messages, &self.options)?;
+        let mut body = build_vertex_anthropic_body(
+            &request.messages,
+            &request.developer_context,
+            &self.options,
+        )?;
         request.apply_parameters(&mut body, ApiSurface::Messages);
         let mut prepared = PreparedRequest::new(url, body);
         prepared.headers.extend(request.headers.clone());
@@ -1263,6 +1276,7 @@ fn vertex_anthropic_custom_endpoint(
 
 fn build_vertex_anthropic_body(
     messages: &[Message],
+    developer_context: &[String],
     options: &VertexAnthropicOptions,
 ) -> Result<Value, GoogleProviderError> {
     let mut system = options.system.clone();
@@ -1294,6 +1308,12 @@ fn build_vertex_anthropic_body(
         }
         wire_messages.push(json!({"role": role, "content": content}));
     }
+    system.extend(
+        developer_context
+            .iter()
+            .filter(|content| !content.trim().is_empty())
+            .cloned(),
+    );
 
     let mut body = Map::from_iter([
         (

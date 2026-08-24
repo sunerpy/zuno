@@ -154,9 +154,11 @@ pub struct Ambient {
     /// `provider/model`.
     pub model: Option<String>,
     /// Token accounting, folded by the transcript and handed over each frame.
-    pub tokens: crate::views::message::TokenUsage,
+    pub tokens: zuno_types::TokenUsage,
     /// Whether those token figures are durable, unavailable, or not reported yet.
     pub usage_state: crate::views::message::UsageState,
+    /// Failed turns are counted separately from confirmed token usage.
+    pub failed_turns: u64,
     /// Most recent prompt occupancy, kept separate from cumulative session usage.
     pub context: Option<crate::views::message::ContextWindowUsage>,
     /// Language servers.
@@ -274,6 +276,22 @@ impl WorkState {
             return;
         }
         projected.state = state;
+        projected.generation = projected.generation.wrapping_add(1);
+    }
+
+    /// Replace only the background-terminal slice from its independent event stream.
+    pub fn replace_background_executions(
+        &self,
+        executions: Vec<zuno_types::BackgroundExecutionProjection>,
+    ) {
+        let mut projected = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if projected.state.background_executions == executions {
+            return;
+        }
+        projected.state.background_executions = executions;
         projected.generation = projected.generation.wrapping_add(1);
     }
 
@@ -420,14 +438,43 @@ pub fn compact(value: u64) -> String {
     }
 }
 
+/// Render a system-owned elapsed duration compactly enough for sidebar rows.
+#[must_use]
+fn span_duration(span: &zuno_types::ExecutionSpan) -> String {
+    compact_duration(i64::try_from(span.elapsed_ms).unwrap_or(i64::MAX))
+}
+
+fn span_usage(span: &zuno_types::ExecutionSpan) -> String {
+    if span.accounting_known {
+        format!("{} tokens", compact(span.usage.total()))
+    } else {
+        String::from("— tokens")
+    }
+}
+
+pub(crate) fn compact_duration(milliseconds: i64) -> String {
+    if milliseconds < 1_000 {
+        return format!("{}ms", milliseconds.max(0));
+    }
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    format!("{}m {}s", seconds / 60, seconds % 60)
+}
+
 /// Which sidebar sections are expanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Expanded {
     /// Whether the active-goal summary is open.
     pub goal: bool,
+    /// Whether the durable plan is open.
+    pub plan: bool,
     /// Whether the todo list is open.
     pub todos: bool,
-    /// Whether the durable job list is open.
+    /// Whether the background terminal list is open.
+    pub background: bool,
+    /// Whether the durable agent/workflow job list is open.
     pub jobs: bool,
     /// Whether memory candidates and entries are open.
     pub memory: bool,
@@ -448,7 +495,9 @@ impl Default for Expanded {
     fn default() -> Self {
         Self {
             goal: true,
+            plan: true,
             todos: true,
+            background: true,
             jobs: true,
             memory: false,
             lsp: true,
@@ -467,9 +516,13 @@ impl Default for Expanded {
 pub enum Section {
     /// The active goal.
     Goal,
+    /// The durable plan.
+    Plan,
     /// The durable todo list.
     Todos,
-    /// Background jobs.
+    /// Background terminal processes.
+    Background,
+    /// Background agent and workflow jobs.
     Jobs,
     /// Resident-memory candidates and entries.
     Memory,
@@ -564,7 +617,9 @@ impl SidebarView {
     pub const fn toggle(&mut self, section: Section) {
         match section {
             Section::Goal => self.expanded.goal = !self.expanded.goal,
+            Section::Plan => self.expanded.plan = !self.expanded.plan,
             Section::Todos => self.expanded.todos = !self.expanded.todos,
+            Section::Background => self.expanded.background = !self.expanded.background,
             Section::Jobs => self.expanded.jobs = !self.expanded.jobs,
             Section::Memory => self.expanded.memory = !self.expanded.memory,
             Section::Lsp => self.toggle_lsp(),
@@ -879,19 +934,17 @@ impl SidebarView {
         let blank = || padded("", width, self.context.surface());
 
         lines.push(self.heading("Context", "", None, width));
-        if self.ambient.usage_state == crate::views::message::UsageState::Unavailable {
-            lines.push(padded("  — usage unavailable", width, self.context.muted()));
-        } else if self.ambient.usage_state == crate::views::message::UsageState::NotReported {
-            lines.push(padded(
-                "  no usage reported yet",
-                width,
-                self.context.muted(),
-            ));
-        } else if let Some(context) = self.ambient.context {
+        if let Some(context) = self.ambient.context {
             let percent = context.percent();
+            let estimate = if context.estimated { "≈" } else { "" };
+            let kind = if context.estimated {
+                "estimate"
+            } else {
+                "current prompt"
+            };
             lines.push(padded(
                 &format!(
-                    "  {} / {} current prompt",
+                    "  {estimate}{} / {} {kind}",
                     compact(context.prompt_tokens),
                     compact(context.limit)
                 ),
@@ -899,19 +952,39 @@ impl SidebarView {
                 self.context.text(),
             ));
             lines.push(padded(
-                &format!("  {percent:.1}% of model window"),
+                &format!("  {estimate}{percent:.1}% of model window"),
                 width,
                 if percent >= 80.0 {
                     self.context.warning()
                 } else {
-                    self.context.muted()
+                    self.context.secondary()
                 },
+            ));
+        } else if self.ambient.usage_state == crate::views::message::UsageState::Unavailable {
+            lines.push(padded("  — usage unavailable", width, self.context.muted()));
+        } else if self.ambient.usage_state == crate::views::message::UsageState::NotReported {
+            lines.push(padded(
+                "  no usage reported yet",
+                width,
+                self.context.muted(),
             ));
         } else {
             lines.push(padded(
                 "  — current prompt unavailable",
                 width,
                 self.context.muted(),
+            ));
+        }
+        if self.ambient.failed_turns > 0 {
+            let plural = if self.ambient.failed_turns == 1 {
+                ""
+            } else {
+                "s"
+            };
+            lines.push(padded(
+                &format!("  ! {} failed turn{plural}", self.ambient.failed_turns),
+                width,
+                self.context.warning(),
             ));
         }
 
@@ -928,17 +1001,81 @@ impl SidebarView {
                 for row in wrap(&goal.objective, usize::from(width).saturating_sub(2), 3) {
                     lines.push(padded(&format!("  {row}"), width, self.context.text()));
                 }
+                for criterion in goal.success_criteria.iter().take(3) {
+                    for row in wrap(criterion, usize::from(width).saturating_sub(4), 2) {
+                        lines.push(padded(
+                            &format!("  · {row}"),
+                            width,
+                            self.context.secondary(),
+                        ));
+                    }
+                }
+                if let Some(reason) = goal.blocked_reason.as_deref() {
+                    for row in wrap(reason, usize::from(width).saturating_sub(4), 2) {
+                        lines.push(padded(&format!("  ! {row}"), width, self.context.warning()));
+                    }
+                }
                 let usage = goal.token_budget.map_or_else(
-                    || format!("{} tokens", compact(goal.tokens_used.max(0) as u64)),
+                    || span_usage(&goal.span),
                     |budget| {
-                        format!(
-                            "{} / {} tokens",
-                            compact(goal.tokens_used.max(0) as u64),
-                            compact(budget.max(0) as u64)
-                        )
+                        if goal.span.accounting_known {
+                            format!(
+                                "{} / {} tokens",
+                                compact(goal.span.usage.total()),
+                                compact(budget.max(0) as u64)
+                            )
+                        } else {
+                            format!("— / {} tokens", compact(budget.max(0) as u64))
+                        }
                     },
                 );
-                lines.push(padded(&format!("  {usage}"), width, self.context.muted()));
+                lines.push(padded(
+                    &format!("  {} · {usage}", span_duration(&goal.span)),
+                    width,
+                    self.context.secondary(),
+                ));
+            }
+        }
+
+        if let Some(plan) = &self.ambient.work.plan {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Plan));
+            let completed = plan
+                .steps
+                .iter()
+                .filter(|step| step.status == "completed")
+                .count();
+            lines.push(self.heading(
+                "Plan",
+                &format!("{completed}/{} complete", plan.steps.len()),
+                self.disclosure(self.expanded.plan),
+                width,
+            ));
+            if self.expanded.plan {
+                lines.push(padded(
+                    &format!("  {} · r{}", plan.title, plan.revision),
+                    width,
+                    self.context.text(),
+                ));
+                lines.push(padded(
+                    &format!(
+                        "  {} · {}",
+                        span_duration(&plan.span),
+                        span_usage(&plan.span)
+                    ),
+                    width,
+                    self.context.secondary(),
+                ));
+                for step in &plan.steps {
+                    let (glyph, style) = match step.status.as_str() {
+                        "completed" => ("✓", self.context.muted()),
+                        "in_progress" => ("◐", self.context.accent()),
+                        "blocked" => ("!", self.context.warning()),
+                        "cancelled" => ("×", self.context.muted()),
+                        _ => ("○", self.context.text()),
+                    };
+                    lines.push(padded(&format!("  {glyph} {}", step.title), width, style));
+                }
             }
         }
 
@@ -963,11 +1100,96 @@ impl SidebarView {
                     let (glyph, style) = match todo.status.as_str() {
                         "completed" => ("✓", self.context.muted()),
                         "in_progress" => ("◐", self.context.accent()),
+                        "blocked" => ("!", self.context.warning()),
                         "cancelled" => ("×", self.context.muted()),
                         _ => ("○", self.context.text()),
                     };
-                    lines.push(padded(&format!("  {glyph} {}", todo.content), width, style));
+                    let label = if todo.status == "in_progress" {
+                        todo.active_form.as_deref().unwrap_or(&todo.subject)
+                    } else {
+                        &todo.subject
+                    };
+                    lines.push(padded(&format!("  {glyph} {label}"), width, style));
+                    let details = match &todo.owner {
+                        Some(owner) => {
+                            format!("    {} · {owner} · r{}", todo.priority, todo.revision)
+                        }
+                        None => format!("    {} · r{}", todo.priority, todo.revision),
+                    };
+                    lines.push(padded(&details, width, self.context.muted()));
+                    lines.push(padded(
+                        &format!(
+                            "    {} · {}",
+                            span_duration(&todo.span),
+                            span_usage(&todo.span)
+                        ),
+                        width,
+                        self.context.secondary(),
+                    ));
                 }
+            }
+        }
+
+        if !self.ambient.work.background_executions.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Background));
+            let running = self
+                .ambient
+                .work
+                .background_executions
+                .iter()
+                .filter(|execution| execution.status == "running")
+                .count();
+            lines.push(self.heading(
+                "Background",
+                &format!(
+                    "{running}/{} running · /ps",
+                    self.ambient.work.background_executions.len()
+                ),
+                self.disclosure(self.expanded.background),
+                width,
+            ));
+            if self.expanded.background {
+                for execution in &self.ambient.work.background_executions {
+                    let (glyph, style) = match execution.status.as_str() {
+                        "running" => ("◐", self.context.accent()),
+                        "completed" => ("✓", self.context.text()),
+                        "cancelled" => ("×", self.context.muted()),
+                        "uncertain" => ("?", self.context.warning()),
+                        _ => ("!", self.context.error()),
+                    };
+                    lines.push(padded(
+                        &format!("  {glyph} {} · {}", execution.title, execution.status),
+                        width,
+                        style,
+                    ));
+                    let process = execution.pid.map_or_else(
+                        || span_duration(&execution.span),
+                        |pid| format!("pid {pid} · {}", span_duration(&execution.span)),
+                    );
+                    lines.push(padded(
+                        &format!("    {process}"),
+                        width,
+                        self.context.secondary(),
+                    ));
+                    for row in wrap(&execution.command, usize::from(width).saturating_sub(4), 1) {
+                        lines.push(padded(&format!("    {row}"), width, self.context.muted()));
+                    }
+                    if let Some(error) = execution.error.as_deref() {
+                        for row in wrap(error, usize::from(width).saturating_sub(4), 2) {
+                            lines.push(padded(
+                                &format!("    ! {row}"),
+                                width,
+                                self.context.error(),
+                            ));
+                        }
+                    }
+                }
+                lines.push(padded(
+                    "  /ps to inspect output",
+                    width,
+                    self.context.secondary(),
+                ));
             }
         }
 
@@ -983,7 +1205,10 @@ impl SidebarView {
                 .count();
             lines.push(self.heading(
                 "Jobs",
-                &format!("{running}/{} running", self.ambient.work.jobs.len()),
+                &format!(
+                    "{running}/{} running · /subagent",
+                    self.ambient.work.jobs.len()
+                ),
                 self.disclosure(self.expanded.jobs),
                 width,
             ));
@@ -1004,13 +1229,30 @@ impl SidebarView {
                             instance,
                             ..
                         } => format!("{product} · {instance}"),
+                        zuno_types::JobSubjectProjection::Workflow { workflow, .. } => {
+                            format!("workflow · {workflow}")
+                        }
                     };
                     lines.push(padded(
                         &format!("  {subject} · {}", job.status),
                         width,
                         style,
                     ));
+                    lines.push(padded(
+                        &format!(
+                            "    {} · {}",
+                            span_duration(&job.span),
+                            span_usage(&job.span)
+                        ),
+                        width,
+                        self.context.secondary(),
+                    ));
                 }
+                lines.push(padded(
+                    "  /subagent to inspect details",
+                    width,
+                    self.context.secondary(),
+                ));
             }
         }
 

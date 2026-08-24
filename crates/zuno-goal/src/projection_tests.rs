@@ -101,6 +101,7 @@ impl Field {
         match self {
             Self::Status => GoalStatus::Complete.as_str().to_owned(),
             Self::TokenBudget => "999999".to_owned(),
+            Self::UsageKnown => (!goal.usage_known).to_string(),
             Self::SessionId | Self::GoalId => format!("{}-tampered", self.value(goal)),
             Self::CreatedAtMs
             | Self::UpdatedAtMs
@@ -156,6 +157,10 @@ fn the_document_renders_the_objective_status_budget_counters_and_checklist() {
         Some("100000")
     );
     assert_eq!(
+        parsed.fields.get("usage_known").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
         parsed.fields.get("tokens_used").map(String::as_str),
         Some("0")
     );
@@ -185,6 +190,49 @@ fn an_unbounded_budget_renders_as_none_and_unbounded() {
     assert_eq!(
         parsed.fields.get("tokens_remaining").map(String::as_str),
         Some("unbounded")
+    );
+}
+
+#[test]
+fn unknown_usage_never_renders_as_a_trustworthy_zero_or_remaining_budget() {
+    let fixture = Fixture::new();
+    fixture.create("uncertain accounting", Some(10_000));
+    fixture
+        .store
+        .record_usage(SESSION, 0, 1, false)
+        .expect("record unknown usage");
+    fixture
+        .projection
+        .write(&fixture.goal())
+        .expect("render unknown usage");
+
+    let parsed = parse(&fixture.read()).expect("parse unknown usage");
+    assert_eq!(
+        parsed.fields.get("usage_known").map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(
+        parsed.fields.get("tokens_used").map(String::as_str),
+        Some("—")
+    );
+    assert_eq!(
+        parsed.fields.get("tokens_remaining").map(String::as_str),
+        Some("—")
+    );
+    assert_eq!(parsed.checks.get("within_budget"), Some(&false));
+
+    fixture
+        .store
+        .record_usage(SESSION, 1_200, 1, true)
+        .expect("record later confirmed lower bound");
+    fixture
+        .projection
+        .write(&fixture.goal())
+        .expect("render confirmed lower bound");
+    let parsed = parse(&fixture.read()).expect("parse confirmed lower bound");
+    assert_eq!(
+        parsed.fields.get("tokens_used").map(String::as_str),
+        Some("≥1200")
     );
 }
 
@@ -254,7 +302,7 @@ fn an_edited_counter_is_rejected_the_same_way_as_status() {
     fixture.create("counting", Some(10_000));
     fixture
         .store
-        .record_usage(SESSION, 1_200, 30)
+        .record_usage(SESSION, 1_200, 30, true)
         .expect("record usage");
     let goal = fixture.goal();
     fixture.projection.write(&goal).expect("re-render");
@@ -474,7 +522,7 @@ fn an_untouched_field_is_not_reported_when_sql_moved_on_since_the_render() {
     // them, and a naive comparison against current SQL would report three edits.
     fixture
         .store
-        .record_usage(SESSION, 500, 5)
+        .record_usage(SESSION, 500, 5, true)
         .expect("record usage");
 
     let ingest = fixture.ingest();

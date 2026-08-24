@@ -29,7 +29,7 @@ all = "warn"
 # e.g. `tokio = { workspace = true, features = ["test-util"] }`.
 #
 # This is deliberately the opposite of the reference implementation in
-# `.omo/refs/claw-code/rust/Cargo.toml`, which hoists only `serde_json` and then
+# `claw-code`, which hoists only `serde_json` and then
 # re-declares `reqwest` and `tokio` five to six times across its crates with
 # divergent feature sets.
 # ---------------------------------------------------------------------------
@@ -87,7 +87,7 @@ tokio-util = { version = "0.7.19", features = ["io", "codec"] }
 #
 # NOTE for todo 91: reqwest 0.13 renamed the 0.12-era `rustls-tls` feature to
 # `rustls`, and that feature selects the `aws-lc-rs` crypto provider, which
-# builds C. See `.omo/notepads/opencode-rust/issues.md` (task 1) — the
+# builds C. See the project's engineering notes (task 1) — the
 # "no C toolchain in a default build" constraint is not satisfiable by any
 # production-grade Rust TLS stack and is todo 91's call, not a silent default.
 reqwest = { version = "0.13.4", default-features = false, features = [
@@ -128,12 +128,15 @@ clap_complete = "4.6.9"
 # SHA256SUMS itself before exposing the extracted executable to self-replace.
 # Keep reqwest + rustls explicit so this reuses the workspace's TLS stack and
 # never introduces native-tls/OpenSSL.
-self_update = { version = "0.44.0", default-features = false, features = [
+self-replace = "1.5.0"
+self_update = { version = "=1.0.0-rc.6", default-features = false, features = [
   "reqwest",
   "rustls",
+  "github",
+  "progress-bar",
   "archive-tar",
   "archive-zip",
-  "compression-flate2",
+  "compression-tar-gz",
   "compression-zip-deflate",
 ] }
 
@@ -299,7 +302,7 @@ split-debuginfo = "unpacked"
 # opt-level = 0 those inner loops dominate the frame budget and read as
 # input-line lag while a response streams. These are stable third-party crates
 # that almost never recompile, so pinning them costs one compile and removes the
-# lag. Technique taken from `.omo/refs/jcode/Cargo.toml:340-404`.
+# lag. Technique taken from `jcode`.
 [profile.dev.package.ratatui]
 opt-level = 3
 [profile.test.package.ratatui]

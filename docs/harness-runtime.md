@@ -52,6 +52,13 @@ user choice. Goal tools separately enforce creation authority and terminal-state
 audits, so prompt wording is guidance over typed runtime policy rather than the
 only safety mechanism.
 
+Plan and Work are also typed collaboration contracts. `collaboration.mode` is a
+runtime-trust prompt block, separate from the native kernel, agent role, project
+instructions, work state, and user input. Plan tells the model to inspect and
+update durable planning state without product mutation; Work tells it to execute
+against the durable Goal, Plan, Todo, Job, and queue projections. Neither block
+grants capabilities or authorizes a mode transition by itself.
+
 Static tool descriptions live in dedicated text files and are byte-pinned by the
 prompt golden test. Prompt changes are therefore reviewed as model-visible
 behavior, while schemas, permission policy, replay policy, and execution remain
@@ -155,7 +162,7 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 | `worker` | Bounded, well-specified implementation and verification. |
 | `looker` | Visual artifact inspection when a vision-capable model is available. |
 
-`compaction`, `title`, and `summary` are hidden engine agents. A user-defined agent may be declared under `agent.<name>` or as Markdown under `.zuno/agent/**/*.md`; it enters the same resolution, permission, prompt, and provenance pipeline as a native agent.
+`compaction`, `title`, and `summary` are hidden engine agents. A user-defined agent may be declared under `agents.<name>` or as Markdown under `.zuno/agent/**/*.md`; it enters the same resolution, permission, prompt, and provenance pipeline as a native agent.
 
 User-facing agents answer in natural Markdown. Zuno does not require XML-like
 reply envelopes unless a typed runtime consumer exists for that exact structure.
@@ -170,11 +177,12 @@ Prompt assembly is ordered data, not string concatenation spread across the CLI.
 
 1. native or configured agent base prompt;
 2. generated agent policy;
-3. global and project memory;
-4. extension lifecycle guidance and the exact active package projection;
-5. discovered instruction files;
-6. the skill trigger policy;
-7. the bounded skill metadata catalog.
+3. the typed Plan or Work collaboration mode;
+4. global and project memory;
+5. extension lifecycle guidance and the exact active package projection;
+6. discovered instruction files;
+7. the skill trigger policy;
+8. the bounded skill metadata catalog.
 
 The trigger policy makes a named or clearly matching skill a pre-action requirement. The base prompt carries bounded name, description, and source metadata; descriptions are shortened before a source identity is omitted. `skills.maxContextTokens` overrides the default two-percent context budget, while `skills.includeInstructions: false` disables prompt injection. The `skill` tool pages the complete catalog with `list`, searches it with `search`, reads a selected body with `load`, and resolves relative text with `read_resource`. Same-named sources remain distinct and require the advertised source locator. Reads use content-bound cursors and must continue to completion; disk bodies are read after selection rather than retained for the process lifetime.
 
@@ -186,6 +194,13 @@ de-duplicated, including symlink aliases, but same-named files from distinct
 sources remain separate identities that require source-qualified selection.
 Discovery order controls presentation and provenance; it does not silently
 choose a same-name winner.
+
+A visible Skill whose name is unique across sources and does not collide with a
+real command is also advertised as `/<skill-name>`. A bare invocation loads the
+complete body, emits the loaded projection, and does not create a model turn.
+Supplying arguments loads the Skill first and then admits the exact canonical
+slash text as user input. Real commands always win; ambiguous names remain
+available through `/skills` and source-qualified `skill` operations.
 
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 
@@ -260,17 +275,23 @@ User prompts and subagent reports share this protocol:
 - An idle parent is claimed and driven immediately.
 - A restarted process recovers pending reports from the durable inbox.
 
-Interactive TUI input uses the same durable boundary. Text and rich content
-submitted during an active turn target `steer`, request a soft interrupt, and
-become model-visible at the nearest safe step boundary. A provider stream or
-provider-retry delay is wakeable: Zuno checkpoints any partial assistant output
-with `finish: steer`, promotes the durable input, and starts the next model step
-without emitting `TurnInterrupted`. An executing tool is not abandoned merely to
-steer; its result reaches the next tool-safe point first. Commands and host
-actions target `nextStep`. If the turn ends before a steer is consumed, the
-already admitted item remains pending and is promoted in FIFO order on the next
-turn; it is never lost or duplicated. The bounded in-process prompt channel is
-only a wakeup and handoff path, not the queue of record.
+Interactive TUI input uses the same durable boundary. When idle, `Enter`
+starts a turn. During an active turn, `Enter` admits a FIFO `queue` item for the
+next turn; `Ctrl+Enter` is the explicit `steer` override and requests a soft
+interrupt at the nearest safe step boundary. `Shift+Enter`, `Alt+Enter`, and
+`Ctrl+J` insert a newline. The UI reports an item as queued only after SQLite
+commits it, and pending items can be edited or cancelled by revision and survive
+a process restart.
+
+A provider stream or provider-retry delay is wakeable for explicit steering:
+Zuno checkpoints any partial assistant output with `finish: steer`, promotes the
+durable input, and starts the next model step without emitting
+`TurnInterrupted`. An executing tool is not abandoned merely to steer; its
+result reaches the next tool-safe point first. Commands and ordinary active-turn
+submissions target the FIFO queue. If the turn ends before a steer is consumed,
+the already admitted item remains pending and is promoted in FIFO order on the
+next turn; it is never lost or duplicated. The bounded in-process prompt channel
+is only a wakeup and handoff path, not the queue of record.
 
 Tool-owned human input is projected separately from execution. A permission
 prompt reports `awaiting approval`; a structured question reports `awaiting
@@ -304,6 +325,22 @@ Context occupancy is the most recent complete provider prompt divided by the cat
 context limit. It is replaced on each provider report rather than accumulated across
 the session; cumulative disjoint token buckets remain available in the usage
 projection and sidebar.
+
+## Plan and Work transitions
+
+`/plan` is the interactive mode switch. In Work mode it opens a confirmation in
+the same keyboard- and mouse-capable dialog system used by other TUI choices. In
+Plan mode it becomes the handoff path to implementation: a durable plan must
+exist, and the confirmation names its title, revision, and completed-step count.
+`/start-plan` enters Plan mode directly; `/start-work` performs the same durable
+plan check and confirmation without first toggling through `/plan`.
+
+Plan is enforced below the prompt by a deny-by-default capability overlay. It
+allows repository inspection, read-only LSP and search, questions, Skills, and
+typed Goal/Plan/Todo operations, while shell and file mutation remain denied.
+The model can recommend Start Work but cannot select it for the user. A confirmed
+selection is persisted as the session agent, so explicit resume and in-process
+session switching restore the collaboration mode without restarting the TUI.
 
 ## Compaction and hard interruption
 
@@ -384,8 +421,9 @@ its own effect.
 
 ```json
 {
-  "authorization": {
-    "strict": true
+  "permission": {
+    "mode": "strict",
+    "rules": {}
   }
 }
 ```
@@ -526,7 +564,12 @@ replays it.
 
 `StartupEnvironment` shares one service per workspace across parent sessions,
 child turns, and in-process session switches. Client projections and `/ps` use
-that same service rather than maintaining a second process list.
+that same service rather than maintaining a second process list. The TUI
+subscribes to created and settled execution events, refreshes from the
+authoritative service after lag, and updates the right-sidebar `Background`
+section even while a model turn is active. Each row carries status, command,
+pid, elapsed time, and failure context; the section advertises `/ps` for the
+scrollable output view.
 
 ## Background subagents and product agents
 
@@ -539,7 +582,7 @@ Enabled `productAgent` instances register independent static tools backed by a h
 - `nextStep` (default): settle the job and admit the report to the parent inbox atomically, then wake the parent.
 - `quiet`: settle the job without admitting a parent input.
 
-The `job` tool reads durable status for jobs owned by the current parent session. `JobSubject` distinguishes `ChildSession` from `ProductAgent`; status is `running`, `completed`, `failed`, `cancelled`, or `uncertain`, together with delivery policy, result, error, and subject identity.
+The `job` tool reads durable status for jobs owned by the current parent session. `JobSubject` distinguishes `ChildSession` from `ProductAgent`; status is `running`, `completed`, `failed`, `cancelled`, or `uncertain`, together with delivery policy, result, error, and subject identity. The same durable projection feeds the right-sidebar `Jobs` section, which tracks background agents and product agents with elapsed time and report-delivery state and advertises `/subagent` for detailed inspection.
 
 `job_cancel` verifies parent ownership and requests cancellation from the live supervisor. It never pre-settles a job and has `ToolReplayPolicy::Never`; the executor records `cancelled` only after the child session or complete product process tree has stopped. Product protocol or process loss after work may have begun records `uncertain`. A restart reconciles still-running product jobs to `uncertain` and never replays them.
 

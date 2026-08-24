@@ -36,7 +36,7 @@
 //!   `cache.rs` (todo 31), applied to the request before it reaches a provider.
 //! - **SSE framing.** One parser in `sse.rs` (todo 27) serves every family.
 
-pub use crate::event::{FinishReason, Message, Role, StreamEvent};
+pub use crate::event::{FinishReason, Message, RequestContentBlock, Role, StreamEvent};
 use crate::registry::spec::ApiSurface;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -153,8 +153,13 @@ pub struct CompletionRequest {
     /// endpoint and then by a `gpt-N` version check. See
     /// [`ApiSurface`](crate::registry::ApiSurface).
     pub surface: ApiSurface,
-    /// The turn, in order.
+    /// The durable conversation and static instruction messages, in order.
     pub messages: Vec<Message>,
+    /// Volatile non-user policy for this request, such as active Goal state or memory.
+    ///
+    /// Providers map each item to their native developer/system context without
+    /// inserting it into replayable user history or the cacheable static prefix.
+    pub developer_context: Vec<String>,
     /// The tools this request offers the model, already frozen for the turn.
     ///
     /// Carried here rather than on the provider because the set is a property of
@@ -188,6 +193,18 @@ pub struct ToolSchema {
     pub parameters: Value,
 }
 
+/// A provider-bound tool call whose arguments are not a JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "tool call `{call_id}` for `{tool}` in message {message_index} block {block_index} has non-object arguments"
+)]
+pub struct InvalidToolArguments {
+    pub message_index: usize,
+    pub block_index: usize,
+    pub call_id: String,
+    pub tool: String,
+}
+
 impl CompletionRequest {
     /// A request for `model_id` carrying `messages` on the provider's default
     /// surface, offering no tools.
@@ -197,10 +214,18 @@ impl CompletionRequest {
             model_id: model_id.into(),
             surface: ApiSurface::Default,
             messages,
+            developer_context: Vec::new(),
             tools: Vec::new(),
             parameters: serde_json::Map::new(),
             headers: BTreeMap::new(),
         }
+    }
+
+    /// Attach independent volatile developer-context items.
+    #[must_use]
+    pub fn with_developer_context(mut self, developer_context: Vec<String>) -> Self {
+        self.developer_context = developer_context;
+        self
     }
 
     /// Offer `tools` to the model on this request.
@@ -215,6 +240,32 @@ impl CompletionRequest {
     pub fn on_surface(mut self, surface: ApiSurface) -> Self {
         self.surface = surface;
         self
+    }
+
+    /// Reject a request that would serialize a scalar tool argument value.
+    ///
+    /// Provider protocols disagree on many details, but they all require tool
+    /// arguments to be an object. Keeping this validation on the provider-neutral
+    /// request makes malformed persisted history fail locally instead of becoming
+    /// a remote HTTP 400 whose field path is difficult to diagnose.
+    pub fn validate_tool_arguments(&self) -> Result<(), InvalidToolArguments> {
+        for (message_index, message) in self.messages.iter().enumerate() {
+            for (block_index, block) in message.content.iter().enumerate() {
+                if let RequestContentBlock::ToolUse {
+                    id, name, input, ..
+                } = block
+                    && !input.is_object()
+                {
+                    return Err(InvalidToolArguments {
+                        message_index,
+                        block_index,
+                        call_id: id.clone(),
+                        tool: name.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Overlay request-local parameters onto an object-shaped provider body.
@@ -289,5 +340,52 @@ impl<T: CredentialPresence + ?Sized> CredentialPresence for &T {
 impl<T: CredentialPresence + ?Sized> CredentialPresence for Arc<T> {
     fn has_credential(&self, provider: &str) -> bool {
         (**self).has_credential(provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn provider_bound_tool_arguments_must_be_json_objects() {
+        for input in [json!("malformed string"), json!(["array"]), Value::Null] {
+            let request = CompletionRequest::new(
+                "gpt-test",
+                vec![Message::from_content(
+                    Role::Assistant,
+                    vec![RequestContentBlock::ToolUse {
+                        id: "call_bad".to_owned(),
+                        name: "write".to_owned(),
+                        input,
+                        thought_signature: None,
+                    }],
+                )],
+            );
+            let error = request
+                .validate_tool_arguments()
+                .expect_err("non-object tool arguments must be rejected locally");
+            assert_eq!(error.message_index, 0);
+            assert_eq!(error.block_index, 0);
+            assert_eq!(error.call_id, "call_bad");
+            assert_eq!(error.tool, "write");
+        }
+
+        let valid = CompletionRequest::new(
+            "gpt-test",
+            vec![Message::from_content(
+                Role::Assistant,
+                vec![RequestContentBlock::ToolUse {
+                    id: "call_ok".to_owned(),
+                    name: "write".to_owned(),
+                    input: json!({"filePath":"README.md","content":"ok"}),
+                    thought_signature: None,
+                }],
+            )],
+        );
+        valid
+            .validate_tool_arguments()
+            .expect("object tool arguments remain valid");
     }
 }

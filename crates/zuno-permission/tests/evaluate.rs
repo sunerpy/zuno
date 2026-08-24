@@ -64,12 +64,15 @@ fn arbitrary_custom_permission_keys_are_evaluated() {
 fn config_conversion_preserves_outer_and_nested_source_order() {
     let config = serde_json::from_str(
         r#"{
-            "*": "deny",
-            "bash": {
-                "git *": "allow",
-                "*": "ask"
-            },
-            "deploy_production": "allow"
+            "mode": "standard",
+            "rules": {
+                "*": "deny",
+                "bash": {
+                    "git *": "allow",
+                    "*": "ask"
+                },
+                "deploy_production": "allow"
+            }
         }"#,
     )
     .expect("fixture is valid permission config");
@@ -89,7 +92,7 @@ fn config_conversion_preserves_outer_and_nested_source_order() {
 
 #[test]
 fn outer_config_key_order_controls_overlapping_permission_keys() {
-    let config = serde_json::from_str(r#"{"bash":"allow","*":"ask"}"#)
+    let config = serde_json::from_str(r#"{"mode":"standard","rules":{"bash":"allow","*":"ask"}}"#)
         .expect("fixture is valid permission config");
     let rules = rules_from_config(&config);
 

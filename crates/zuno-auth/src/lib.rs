@@ -26,7 +26,7 @@
 //! [`store`].
 //!
 //! The failure this is guarding against is not hypothetical. The reference
-//! implementation in `.omo/refs/claw-code` writes its `credentials.json` through
+//! implementation in `claw-code` writes its `credentials.json` through
 //! `save_oauth_credentials` in `rust/crates/runtime/src/oauth.rs` and the file
 //! contains no `set_permissions`, no `PermissionsExt`, and no `mode(` anywhere in
 //! it — the credentials land at whatever the umask allows, world-readable on a

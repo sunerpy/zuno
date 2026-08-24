@@ -259,6 +259,33 @@ impl ViewContext {
             .bg(palette.background_panel.into())
     }
 
+    /// Ordinary tool activity: a cool accent that remains distinct from success.
+    #[must_use]
+    pub fn tool(&self) -> Style {
+        let palette = self.palette();
+        Style::new()
+            .fg(palette.accent.into())
+            .bg(palette.background_panel.into())
+    }
+
+    /// Delegated agent or workflow activity.
+    #[must_use]
+    pub fn delegation(&self) -> Style {
+        self.secondary()
+    }
+
+    /// Work that is actively progressing. The spinner is not left in muted text.
+    #[must_use]
+    pub fn running(&self) -> Style {
+        self.tool().add_modifier(Modifier::BOLD)
+    }
+
+    /// Human-readable tool output. Metadata alone uses [`Self::muted`].
+    #[must_use]
+    pub fn tool_output(&self) -> Style {
+        self.text()
+    }
+
     /// The style for a row the cursor is on.
     ///
     /// `crate::theme::selected_foreground` decides the foreground, because a theme
@@ -300,23 +327,13 @@ impl ViewContext {
             .bg(palette.background_panel.into())
     }
 
-    /// Reasoning text, dimmed by the theme's own `thinkingOpacity`.
+    /// Reasoning text: secondary accent, never a whole-block DIM treatment.
     ///
-    /// Upstream composites `warning` at `thinkingOpacity` over the background
-    /// (`routes/session/index.tsx:1645`). Terminals have no alpha channel, so the
-    /// composite is performed here with [`crate::theme::tint`] and a concrete
-    /// colour is emitted.
+    /// Indentation, italics and default collapse preserve hierarchy while this
+    /// readable foreground remains visible on terminal-derived system themes.
     #[must_use]
     pub fn thinking(&self) -> Style {
-        let palette = self.palette();
-        let color = crate::theme::tint(
-            palette.background,
-            palette.text_muted,
-            palette.thinking_opacity,
-        );
-        Style::new()
-            .fg(color.into())
-            .bg(palette.background_panel.into())
+        self.secondary()
     }
 
     /// The fill used behind a whole surface.

@@ -19,11 +19,14 @@ fn agent(name: &str) -> Agent {
         hidden: None,
         model: None,
         variant: None,
+        reasoning: None,
         temperature: None,
         top_p: None,
         color: None,
         prompt: None,
         steps: None,
+        tools: None,
+        delegates: None,
         options: serde_json::Map::new(),
         permission: None,
         source: AgentSource::Native,
@@ -138,6 +141,24 @@ impl zuno_tools::job_cancel::JobController for NoJobController {
 
 fn test_product_agents() -> Arc<dyn zuno_tools::product_agent::ProductAgentHost> {
     Arc::new(NoProductAgents)
+}
+
+#[derive(Debug, Default)]
+struct NoWorkflows;
+
+#[async_trait::async_trait]
+impl zuno_tools::workflow::WorkflowHost for NoWorkflows {
+    async fn dispatch(
+        &self,
+        _request: zuno_tools::workflow::WorkflowRequest,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<zuno_tools::workflow::WorkflowTurn, String> {
+        Err("test fixture has no workflows".to_owned())
+    }
+}
+
+fn test_workflows() -> Arc<dyn zuno_tools::workflow::WorkflowHost> {
+    Arc::new(NoWorkflows)
 }
 
 fn test_job_controller() -> Arc<dyn zuno_tools::job_cancel::JobController> {
@@ -546,7 +567,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             "memory.global",
             "memory.project",
             "extensions",
-            "instructions.0",
+            "instructions.project.0",
             "skills.policy",
             "skills.index",
         ]
@@ -591,7 +612,7 @@ fn catalog_with_two_models_and_a_title_override() -> (Catalog, zuno_config::sche
     .expect("catalog document");
     let config = serde_json::from_str(
         r#"{"provider":{"test":{"options":{"baseURL":"https://gateway.test/v1"}}},
-             "agent":{"title":{"model":"test/small"}}}"#,
+             "agents":{"title":{"model":"test/small"}}}"#,
     )
     .expect("config");
     let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
@@ -1650,7 +1671,7 @@ fn new_session_is_lazy_and_first_user_message_commits_with_it() {
                 "message": message.to_json(),
                 "parts": parts.iter().map(zuno_db::message::PartRecord::to_json).collect::<Vec<_>>(),
             }),
-            zuno_db::inbox::InputDelivery::NextStep,
+            zuno_db::inbox::InputDelivery::Queue,
             now,
         ),
     )
@@ -2023,7 +2044,7 @@ fn an_internal_pointed_at_another_provider_falls_back_and_says_why() {
     // does not wire.
     let (catalog, _) = catalog_with_two_models_and_a_title_override();
     let config: zuno_config::schema::Config =
-        serde_json::from_str(r#"{"agent":{"summary":{"model":"elsewhere/some-model"}}}"#)
+        serde_json::from_str(r#"{"agents":{"summary":{"model":"elsewhere/some-model"}}}"#)
             .expect("config");
     let session_model = catalog.model("test", "big").expect("the session model");
     let mut notes = Vec::new();
@@ -2661,7 +2682,7 @@ fn an_internal_whose_model_has_no_endpoint_falls_back_and_says_why() {
         r#"{"provider":{"test":{"models":{
              "big":{"provider":{"api":"https://gateway.test/v1"}},
              "small":{}}}},
-             "agent":{"title":{"model":"test/small"}}}"#,
+             "agents":{"title":{"model":"test/small"}}}"#,
     )
     .expect("config");
     let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
@@ -2740,6 +2761,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
+            workflows: test_workflows(),
             job_controller: test_job_controller(),
             memory: None,
         },
@@ -2751,7 +2773,7 @@ fn production_registry_exposes_all_three_goal_tools() {
         .map(|tool| tool.id())
         .collect::<Vec<_>>();
 
-    for goal_tool in ["get_goal", "create_goal", "update_goal"] {
+    for goal_tool in ["goal_get", "goal_propose", "goal_update"] {
         assert!(
             ids.contains(&goal_tool),
             "production registry is missing `{goal_tool}`; visible tools: {ids:?}"
@@ -2798,7 +2820,30 @@ fn goal_dynamic_context_is_rebuilt_from_authoritative_sql_for_each_request() {
 }
 
 #[test]
-fn goal_usage_delta_includes_every_assistant_step_and_token_bucket() {
+fn goal_usage_delta_includes_every_confirmed_assistant_step_and_token_bucket() {
+    fn checkpoint(connection: &mut rusqlite::Connection, record: &zuno_db::message::MessageRecord) {
+        let transaction = connection.transaction().expect("start checkpoint");
+        {
+            let store = zuno_db::message::MessageStore::new(&transaction);
+            let previous = store
+                .find_message(&record.id)
+                .expect("read prior checkpoint")
+                .map(|message| zuno_db::session::MessageUsage::from_data(&message.data));
+            store
+                .put_message(record)
+                .expect("persist assistant checkpoint");
+            zuno_db::session::reconcile_usage(
+                &transaction,
+                &record.session_id,
+                previous,
+                zuno_db::session::MessageUsage::from_data(&record.data),
+                None,
+            )
+            .expect("reconcile session usage");
+        }
+        transaction.commit().expect("commit checkpoint");
+    }
+
     let mut connection =
         zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
     zuno_db::migration::apply(&mut connection).expect("apply schema");
@@ -2807,7 +2852,6 @@ fn goal_usage_delta_includes_every_assistant_step_and_token_bucket() {
     ensure_project(&connection, &fixture_plan.project, now).expect("persist project");
     let session =
         resolve_session(&mut connection, &fixture_plan, now).expect("create fixture session");
-    let store = zuno_db::message::MessageStore::new(&connection);
     let assistant = |id: &str, created: i64, values: [i64; 5]| {
         zuno_db::message::MessageRecord::from_json(serde_json::json!({
             "id": id,
@@ -2825,25 +2869,89 @@ fn goal_usage_delta_includes_every_assistant_step_and_token_bucket() {
                 "input": values[0],
                 "output": values[1],
                 "reasoning": values[2],
-                "cache": { "read": values[3], "write": values[4] }
+                "cache": { "read": values[3], "write": values[4] },
+                "accounting": "cache-beside-input"
             },
             "finish": "stop"
         }))
         .expect("valid assistant message")
     };
-    store
-        .put_message(&assistant("msg_baseline", now, [1, 1, 1, 1, 1]))
-        .expect("persist baseline assistant");
+    let baseline = assistant("msg_baseline", now, [1, 1, 1, 1, 1]);
+    checkpoint(&mut connection, &baseline);
     let before = goal_usage(&connection, &session.id).expect("read usage before turn");
-    store
-        .put_message(&assistant("msg_step_1", now + 2, [1, 2, 3, 4, 5]))
-        .expect("persist first assistant step");
-    store
-        .put_message(&assistant("msg_step_2", now + 4, [10, 20, 30, 40, 50]))
-        .expect("persist second assistant step");
+    let step_one = assistant("msg_step_1", now + 2, [1, 2, 3, 4, 5]);
+    checkpoint(&mut connection, &step_one);
+    let step_two = assistant("msg_step_2", now + 4, [10, 20, 30, 40, 50]);
+    checkpoint(&mut connection, &step_two);
     let after = goal_usage(&connection, &session.id).expect("read usage after turn");
 
     assert_eq!(after.tokens - before.tokens, 165);
+    assert!(goal_turn_accounting_known(before, after));
+}
+
+#[test]
+fn failed_provider_request_keeps_confirmed_goal_usage_and_marks_the_turn_unknown() {
+    let mut connection =
+        zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    let fixture_plan = plan("/workspace", SessionChoice::New);
+    let now = 1_780_000_000_000;
+    ensure_project(&connection, &fixture_plan.project, now).expect("persist project");
+    let session =
+        resolve_session(&mut connection, &fixture_plan, now).expect("create fixture session");
+
+    let assistant = zuno_db::message::MessageRecord::from_json(serde_json::json!({
+        "id": "msg_confirmed",
+        "sessionID": session.id,
+        "role": "assistant",
+        "time": { "created": now, "completed": now + 1 },
+        "parentID": "msg_parent",
+        "modelID": "model",
+        "providerID": "provider",
+        "mode": "build",
+        "agent": "build",
+        "path": { "cwd": "/workspace", "root": "/workspace" },
+        "cost": 0,
+        "tokens": {
+            "input": 10,
+            "output": 5,
+            "reasoning": 2,
+            "cache": { "read": 3, "write": 4 },
+            "accounting": "cache-beside-input"
+        },
+        "finish": "stop"
+    }))
+    .expect("valid assistant message");
+    let transaction = connection.transaction().expect("start checkpoint");
+    {
+        let store = zuno_db::message::MessageStore::new(&transaction);
+        store
+            .put_message(&assistant)
+            .expect("persist confirmed checkpoint");
+        zuno_db::session::reconcile_usage(
+            &transaction,
+            &session.id,
+            None,
+            zuno_db::session::MessageUsage::from_data(&assistant.data),
+            None,
+        )
+        .expect("reconcile confirmed usage");
+    }
+    transaction.commit().expect("commit checkpoint");
+
+    let before = goal_usage(&connection, &session.id).expect("read confirmed usage");
+    zuno_db::session::record_provider_request_started(&connection, &session.id, 1_234, Some(8_192))
+        .expect("record attempted request");
+    zuno_db::session::record_turn_failure(&connection, &session.id).expect("record failed turn");
+    let after = goal_usage(&connection, &session.id).expect("read failed request usage");
+
+    assert_eq!(
+        after.tokens, before.tokens,
+        "confirmed usage must be monotonic"
+    );
+    assert_eq!(after.estimated_pending_prompt_tokens, Some(1_234));
+    assert_eq!(after.failed_turns, before.failed_turns + 1);
+    assert!(!goal_turn_accounting_known(before, after));
 }
 
 /// Neither surface may compose a turn or bypass the selected driver.
@@ -2956,6 +3064,10 @@ fn every_turn_error() -> Vec<TurnError> {
             step: 8,
             call_id: "signature-call-in-the-message".to_owned(),
         },
+        TurnError::InvalidToolCalls {
+            count: 3,
+            tool: "write-in-the-message".to_owned(),
+        },
         TurnError::EventConsumerClosed,
         TurnError::Hook(
             "plugin `fixture-plugin` failed hook `chat.params`: fixture failure".to_owned(),
@@ -3035,6 +3147,7 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::ToolInputWithoutStart { .. } => "ToolInputWithoutStart",
             TurnError::ToolUseEndWithoutStart { .. } => "ToolUseEndWithoutStart",
             TurnError::ToolSignatureWithoutStart { .. } => "ToolSignatureWithoutStart",
+            TurnError::InvalidToolCalls { .. } => "InvalidToolCalls",
             TurnError::EventConsumerClosed => "EventConsumerClosed",
             TurnError::Hook(_) => "Hook",
             TurnError::Database(_) => "Database",
@@ -3047,7 +3160,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        17,
+        18,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
@@ -3576,6 +3689,7 @@ mod production_registry {
                 skills: Arc::new(skills),
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
+                workflows: test_workflows(),
                 job_controller: test_job_controller(),
                 memory: None,
             },
@@ -3727,7 +3841,7 @@ mod production_registry {
             (
                 r#"{
                     "productAgent": {
-                        "one": {"kind":"codex","enabled":true,"toolName":"get_goal"}
+                        "one": {"kind":"codex","enabled":true,"toolName":"goal_get"}
                     }
                 }"#,
                 "collides with a native tool",
@@ -3787,6 +3901,7 @@ mod production_registry {
                 skills: Arc::new(skills),
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
+                workflows: test_workflows(),
                 job_controller: test_job_controller(),
                 memory: None,
             },
@@ -3885,6 +4000,153 @@ mod skill_prompt {
         assert!(
             resolver.system_prompt.contains("action `load`"),
             "the prompt does not require loading the selected skill body"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_unique_skill_is_loaded_before_the_first_model_request() {
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "codegraph",
+                Some("Navigate indexed code.".to_owned()),
+                PathBuf::from("/skills/codegraph/SKILL.md"),
+                "# Complete codegraph guidance",
+            ),
+        ]);
+        let mut resolver = resolver();
+        announce_skills(&mut resolver, &skills, 0, None).expect("announce skills");
+        let mut loaded = BTreeSet::new();
+
+        let selected = preload_explicit_skills(
+            &mut resolver,
+            &skills,
+            &mut loaded,
+            "请按照codegraph指导分析本项目",
+        )
+        .await
+        .expect("preload explicit skill");
+
+        assert_eq!(
+            selected,
+            vec![SelectedSkillIdentity {
+                name: "codegraph".to_owned(),
+                source: "/skills/codegraph/SKILL.md".to_owned(),
+            }]
+        );
+        let envelope = resolver
+            .prompt_assembly
+            .as_ref()
+            .expect("structured prompt")
+            .envelope();
+        assert_eq!(envelope.selected_skills.len(), 1);
+        assert_eq!(
+            envelope.selected_skills[0].content(),
+            "# Complete codegraph guidance"
+        );
+        assert!(
+            resolver
+                .system_prompt
+                .contains("# Complete codegraph guidance"),
+            "the first request would not receive the named Skill body"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_names_and_identifier_substrings_are_not_preloaded() {
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "review",
+                Some("first review".to_owned()),
+                PathBuf::from("/skills/one/SKILL.md"),
+                "one",
+            ),
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "review",
+                Some("second review".to_owned()),
+                PathBuf::from("/skills/two/SKILL.md"),
+                "two",
+            ),
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "git",
+                Some("Git guidance".to_owned()),
+                PathBuf::from("/skills/git/SKILL.md"),
+                "git body",
+            ),
+        ]);
+        let mut resolver = resolver();
+        let mut loaded = BTreeSet::new();
+
+        let selected = preload_explicit_skills(
+            &mut resolver,
+            &skills,
+            &mut loaded,
+            "review the github project",
+        )
+        .await
+        .expect("ambiguous names are deferred to source-aware tool loading");
+
+        assert!(selected.is_empty());
+        assert!(loaded.is_empty());
+        assert!(
+            resolver
+                .prompt_assembly
+                .as_ref()
+                .expect("prompt")
+                .envelope()
+                .selected_skills
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn selected_skill_prompt_blocks_restore_from_the_latest_receipt() {
+        let mut connection =
+            zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        let mut recorded = PromptAssembly::new();
+        recorded
+            .push("agent.base", "native:build", "BUILD")
+            .expect("base");
+        recorded
+            .push_selected_skill("release", "/skills/release/SKILL.md", "RELEASE BODY")
+            .expect("selected skill");
+        let data = serde_json::to_string(&Value::Object(recorded.event_properties(
+            "build",
+            1,
+            &recorded.provider_projection(),
+        )))
+        .expect("encode receipt");
+        connection
+            .execute(
+                "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_restore', 0)",
+                [],
+            )
+            .expect("event sequence");
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) \
+                 VALUES ('evt_restore', 'ses_restore', 0, 'session.prompt.assembled.1', ?1)",
+                [data],
+            )
+            .expect("prompt receipt");
+        let mut restored_prompt = resolver();
+
+        let restored = restore_selected_skills(&connection, "ses_restore", &mut restored_prompt)
+            .expect("restore selected Skill");
+
+        assert!(restored.contains(&SelectedSkillIdentity {
+            name: "release".to_owned(),
+            source: "/skills/release/SKILL.md".to_owned(),
+        }));
+        assert_eq!(
+            restored_prompt
+                .prompt_assembly
+                .as_ref()
+                .expect("prompt")
+                .envelope()
+                .selected_skills[0]
+                .content(),
+            "RELEASE BODY"
         );
     }
 
@@ -4064,21 +4326,16 @@ mod instruction_prompt {
             .find("ROOT_RULE_MARKER")
             .expect("the worktree level must reach the prompt too, not only the nearest");
         assert!(
-            sub_at < root_at,
-            "the cascade renders deepest first: {}",
+            root_at < sub_at,
+            "the project cascade must render root to cwd so the nearest rule has the highest later priority: {}",
             resolver.system_prompt
         );
         assert!(notes.is_empty(), "{notes:?}");
     }
 
-    /// The cascade's sharp edge, preserved deliberately.
-    ///
-    /// The first *filename* found anywhere on the chain claims the whole chain, so a
-    /// nearer `CLAUDE.md` loses to a further `AGENTS.md` and is not loaded at all. That
-    /// is the oracle's behaviour (`instruction.ts:122-132`), it surprises people, and
-    /// this exists so nobody "fixes" it into a per-level merge.
+    /// Cross-product instruction files never participate in Zuno's native cascade.
     #[tokio::test]
-    async fn a_nearer_claude_md_is_not_loaded_once_a_further_agents_md_exists() {
+    async fn claude_md_is_never_loaded_implicitly() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
@@ -4093,8 +4350,7 @@ mod instruction_prompt {
         );
         assert!(
             !resolver.system_prompt.contains("SUB_CLAUDE_MARKER"),
-            "`AGENTS.md` anywhere on the chain claims it, so this `CLAUDE.md` must not be \
-             loaded: {}",
+            "Zuno must not load `CLAUDE.md` implicitly: {}",
             resolver.system_prompt
         );
         assert!(notes.is_empty(), "{notes:?}");
@@ -4567,7 +4823,7 @@ fn declared_reasoning_variants_enable_selection_without_a_coarse_capability_flag
 /// in. Going through `AgentConfig` means the JSON a user writes is the input.
 fn configured_agent(definition: serde_json::Value) -> zuno_catalog::agent::Agent {
     let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
-        "agent": { "tuned": definition }
+        "agents": { "tuned": definition }
     }))
     .expect("agent fixture config");
     zuno_catalog::agent::resolve(
@@ -4793,7 +5049,7 @@ fn an_agents_sampling_declarations_reach_the_request_body() {
     assert_eq!(
         body.get("temperature"),
         Some(&serde_json::json!(0.21)),
-        "`agent.tuned.temperature` was parsed, merged, and listed, and then the request \
+        "`agents.tuned.temperature` was parsed, merged, and listed, and then the request \
          went out on the provider's default"
     );
     assert_eq!(
@@ -4850,7 +5106,7 @@ fn an_agents_option_bag_reaches_the_provider_and_can_override_the_cap() {
     assert_eq!(
         body.get("max_tokens"),
         Some(&serde_json::json!(4_096)),
-        "`agent.tuned.options` never reached the provider, so an agent could not raise \
+        "`agents.tuned.options` never reached the provider, so an agent could not raise \
          or lower the cap the catalog set"
     );
     assert_eq!(
@@ -4905,7 +5161,7 @@ fn an_agents_variant_selects_the_models_declared_reasoning_options() {
     assert_eq!(
         body.get("reasoning_effort"),
         Some(&serde_json::json!("high")),
-        "`agent.reasoner.variant` was accepted and never resolved, so an agent \
+        "`agents.reasoner.variant` was accepted and never resolved, so an agent \
          configured to think hard reasoned at the provider's default"
     );
 }

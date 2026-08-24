@@ -1,8 +1,9 @@
 {
   "model": "myopenai/primary-model",
   "small_model": "myopenai/fast-model",
-  "authorization": {
-    "strict": false
+  "permission": {
+    "mode": "standard",
+    "rules": {}
   },
   "concurrency": {
     "tool_calls": 8,

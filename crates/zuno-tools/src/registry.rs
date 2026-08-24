@@ -80,7 +80,6 @@ pub enum BuiltinSlot {
     Task,
     Job,
     Fetch,
-    Todo,
     Search,
     Skill,
     Patch,
@@ -106,7 +105,6 @@ impl BuiltinSlot {
             Self::Task => "task",
             Self::Job => "job",
             Self::Fetch => "webfetch",
-            Self::Todo => "todowrite",
             Self::Search => "web_search",
             Self::Skill => "skill",
             Self::Patch => "apply_patch",
@@ -132,7 +130,7 @@ impl BuiltinSlot {
 }
 
 /// The exact built-in order used before custom and MCP tools are appended.
-pub const BUILTIN_ORDER: [BuiltinSlot; 19] = [
+pub const BUILTIN_ORDER: [BuiltinSlot; 18] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
     BuiltinSlot::Shell,
@@ -145,7 +143,6 @@ pub const BUILTIN_ORDER: [BuiltinSlot; 19] = [
     BuiltinSlot::Task,
     BuiltinSlot::Job,
     BuiltinSlot::Fetch,
-    BuiltinSlot::Todo,
     BuiltinSlot::Search,
     BuiltinSlot::Skill,
     BuiltinSlot::Patch,
@@ -159,7 +156,7 @@ pub const BUILTIN_ORDER: [BuiltinSlot; 19] = [
 /// `execute`, `lsp`, and `plan_exit` remain extension slots. The default harness must
 /// not claim them until production assembly supplies their missing configuration or
 /// host collaborator.
-pub const DEFAULT_BUILTINS: [BuiltinSlot; 16] = [
+pub const DEFAULT_BUILTINS: [BuiltinSlot; 15] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
     BuiltinSlot::Shell,
@@ -172,7 +169,6 @@ pub const DEFAULT_BUILTINS: [BuiltinSlot; 16] = [
     BuiltinSlot::Task,
     BuiltinSlot::Job,
     BuiltinSlot::Fetch,
-    BuiltinSlot::Todo,
     BuiltinSlot::Search,
     BuiltinSlot::Skill,
     BuiltinSlot::Patch,
@@ -633,7 +629,10 @@ pub(crate) fn canonical_tool_name(name: &str) -> &str {
         "file_grep" | "Grep" => "grep",
         "skill_manage" | "Skill" => "skill",
         "discover_tools" => "integration_tools",
-        "todoread" | "todo_read" | "todo_write" | "todos" | "todo" | "TodoWrite" => "todowrite",
+        "PlanGet" => "plan_get",
+        "PlanUpdate" => "plan_update",
+        "TodoGet" => "todo_get",
+        "TodoUpdate" => "todo_update",
         "WebFetch" => "webfetch",
         "WebSearch" => "web_search",
         "ApplyPatch" => "apply_patch",

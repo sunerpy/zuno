@@ -18,13 +18,17 @@ fn ambient() -> Ambient {
         tokens: TokenUsage {
             input: 12_000,
             output: 3_400,
+            reasoning: 0,
             cache_read: 800,
             cache_write: 200,
+            unclassified: 0,
         },
         usage_state: UsageState::Known,
+        failed_turns: 0,
         context: Some(ContextWindowUsage {
             prompt_tokens: 64_000,
             limit: 100_000,
+            estimated: false,
         }),
         lsp: vec![
             Service::new("rust-analyzer", Health::Ready).detailed("/config/workspace/zuno"),
@@ -124,15 +128,60 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
     let mut view = view();
     view.ambient_mut().work = zuno_types::WorkStateProjection {
         goal: Some(zuno_types::GoalStateProjection {
+            id: "goal_1".to_owned(),
+            revision: 3,
             objective: "finish the durable runtime upgrade".to_owned(),
+            success_criteria: vec!["workspace gates pass".to_owned()],
             status: "active".to_owned(),
-            tokens_used: 1_200,
+            blocked_reason: None,
+            span: zuno_types::ExecutionSpan::from_aggregate(1, None, 42_000, 1_200, true),
             token_budget: Some(5_000),
+            time_created: 1,
+            time_updated: 2,
+        }),
+        plan: Some(zuno_types::PlanProjection {
+            id: "plan_1".to_owned(),
+            goal_id: Some("goal_1".to_owned()),
+            revision: 2,
+            title: "Release hardening".to_owned(),
+            steps: vec![zuno_types::PlanStepProjection {
+                id: "verify".to_owned(),
+                title: "Run workspace gates".to_owned(),
+                status: "in_progress".to_owned(),
+            }],
+            span: zuno_types::ExecutionSpan::from_aggregate(1, None, 21_000, 600, true),
+            time_created: 1,
+            time_updated: 2,
         }),
         todos: vec![zuno_types::TodoProjection {
-            content: "run the workspace gates".to_owned(),
+            id: "todo_1".to_owned(),
+            goal_id: Some("goal_1".to_owned()),
+            plan_step_id: Some("verify".to_owned()),
+            parent_id: None,
+            subject: "run the workspace gates".to_owned(),
+            description: "validate the release surface".to_owned(),
+            active_form: Some("Running workspace gates".to_owned()),
             status: "in_progress".to_owned(),
             priority: "high".to_owned(),
+            dependencies: Vec::new(),
+            owner: Some("build".to_owned()),
+            revision: 4,
+            span: zuno_types::ExecutionSpan::from_aggregate(1, None, 21_000, 600, true),
+            time_created: 1,
+            time_updated: 2,
+        }],
+        background_executions: vec![zuno_types::BackgroundExecutionProjection {
+            id: "bg_1".to_owned(),
+            title: "preview server".to_owned(),
+            command: "python3 -m http.server 4173".to_owned(),
+            status: "running".to_owned(),
+            pid: Some(4173),
+            exit_code: None,
+            timed_out: false,
+            error: None,
+            span: zuno_types::ExecutionSpan::from_aggregate(1, None, 18_000, 0, false),
+            time_created: 1,
+            time_completed: None,
         }],
         jobs: vec![zuno_types::JobProjection {
             id: "job_1".to_owned(),
@@ -146,6 +195,7 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
             report_delivery: "quiet".to_owned(),
             result: None,
             error: None,
+            span: zuno_types::ExecutionSpan::from_aggregate(1, None, 21_000, 0, false),
             time_created: 1,
             time_completed: None,
         }],
@@ -182,10 +232,17 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
     for expected in [
         "Goal",
         "finish the durable runtime upgrade",
+        "Plan",
+        "Release hardening · r2",
         "Todos",
-        "run the workspace gates",
+        "Running workspace gates",
+        "21s · 600 tokens",
+        "Background",
+        "preview server · running",
+        "/ps to inspect output",
         "Jobs",
         "codex · review patch",
+        "/subagent to inspect details",
         "Memory",
         "1 review · 1 saved",
         "run cargo fmt",
@@ -273,11 +330,30 @@ fn views_sidebar_says_so_when_no_usage_has_arrived() {
 }
 
 #[test]
+fn views_sidebar_labels_unconfirmed_prompt_usage_as_an_estimate() {
+    let mut view = view();
+    view.ambient_mut().usage_state = UsageState::NotReported;
+    view.ambient_mut().context = Some(ContextWindowUsage {
+        prompt_tokens: 81_000,
+        limit: 100_000,
+        estimated: true,
+    });
+    let joined = drawn(&mut view);
+    assert!(
+        joined.contains("≈81.0k / 100.0k estimate"),
+        "the local estimate is not labelled clearly:\n{joined}"
+    );
+    assert!(joined.contains("≈81.0% of model window"));
+    assert!(!joined.contains("no usage reported yet"));
+}
+
+#[test]
 fn views_sidebar_warns_once_the_context_window_is_nearly_full() {
     let mut view = view();
     view.ambient_mut().context = Some(ContextWindowUsage {
         prompt_tokens: 91_000,
         limit: 100_000,
+        estimated: false,
     });
     let buffer = render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible");
     let warning = ratatui::style::Color::from(ViewContext::defaults().palette().warning);

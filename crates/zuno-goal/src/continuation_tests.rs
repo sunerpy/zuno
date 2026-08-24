@@ -78,6 +78,22 @@ fn goal_is_regenerated_from_sql_after_compaction_discards_old_context() {
 }
 
 #[test]
+fn unknown_usage_is_explicit_in_goal_context() {
+    let fixture = Fixture::new();
+    fixture.create("keep accounting honest");
+    let goal = fixture
+        .store
+        .record_usage("ses_goal", 1_200, 3, false)
+        .expect("record unknown usage")
+        .expect("goal exists");
+
+    let rendered = render_goal_context(&goal);
+    assert!(rendered.contains("Tokens used: unknown (confirmed lower bound: 1200)"));
+    assert!(rendered.contains("Tokens remaining: unknown"));
+    assert!(!rendered.contains("Tokens remaining: 8800"));
+}
+
+#[test]
 fn idle_active_goal_prepares_exactly_one_continuation() {
     let fixture = Fixture::new();
     fixture.create("continue once");
@@ -337,7 +353,7 @@ fn retry_backoff_suppresses_until_due_then_prepares_the_goal() {
 fn a_reopened_continuation_honors_the_persisted_retry_deadline() {
     let database = tempfile::tempdir().expect("create database directory");
     let spill = tempfile::tempdir().expect("create spill directory");
-    let path = database.path().join(crate::GOAL_DB_FILE);
+    let path = database.path().join("goal-test.db");
     {
         let store = GoalStore::open_at(&path, spill.path().to_owned()).expect("open goal store");
         store
@@ -489,7 +505,7 @@ fn uncertain_tool_recovery_forbids_replay_until_external_state_is_verified() {
 fn failure_streak_survives_restart_and_resume_clears_it() {
     let database = tempfile::tempdir().expect("create database directory");
     let spill = tempfile::tempdir().expect("create spill directory");
-    let path = database.path().join(crate::GOAL_DB_FILE);
+    let path = database.path().join("goal-test.db");
     {
         let store = GoalStore::open_at(&path, spill.path().to_owned()).expect("open goal store");
         store
@@ -542,7 +558,7 @@ fn goal_survives_two_consecutive_compactions_with_objective_and_counters_intact(
     fixture.create(OBJECTIVE);
     fixture
         .store
-        .record_usage("ses_goal", 1_500, 30)
+        .record_usage("ses_goal", 1_500, 30, true)
         .expect("record first usage");
     fixture
         .continuation
@@ -583,7 +599,7 @@ fn goal_survives_two_consecutive_compactions_with_objective_and_counters_intact(
 
         fixture
             .store
-            .record_usage("ses_goal", 350, 10)
+            .record_usage("ses_goal", 350, 10, true)
             .unwrap_or_else(|error| panic!("round {round}: record post-compaction usage: {error}"));
     }
     assert_eq!(compacted.len(), 2, "two boundaries must have been selected");

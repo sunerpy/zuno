@@ -9,10 +9,9 @@ use std::sync::Arc;
 use zuno_error::DbError;
 
 const TABLE: &str = "agent_job";
-const SELECT_COLUMNS: &str = "id, parent_session_id, subject_kind, child_session_id, product_run_id, \
-     product_kind, product_instance, product_tool, status, report_delivery, result, \
-     error, report_input_id, created_seq, settled_seq, time_created, time_updated, \
-     time_completed";
+const SELECT_COLUMNS: &str = "id, parent_session_id, subject_kind, subject_payload, status, \
+     report_delivery, result, error, report_input_id, created_seq, settled_seq, time_created, \
+     time_updated, time_completed";
 
 /// Whether a settled background job should wake its parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +61,13 @@ pub enum JobSubject {
         /// Static tool name that admitted the invocation.
         tool: String,
     },
+    /// A configured multi-agent workflow run.
+    Workflow {
+        /// Unique workflow invocation id, distinct from the durable job id.
+        run_id: String,
+        /// Configured workflow template name.
+        workflow: String,
+    },
 }
 
 impl JobSubject {
@@ -89,6 +95,25 @@ impl JobSubject {
         }
     }
 
+    /// A workflow-run subject.
+    #[must_use]
+    pub fn workflow(run_id: impl Into<String>, workflow: impl Into<String>) -> Self {
+        Self::Workflow {
+            run_id: run_id.into(),
+            workflow: workflow.into(),
+        }
+    }
+
+    /// Stable durable discriminator.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::ChildSession { .. } => "child-session",
+            Self::ProductAgent { .. } => "product-agent",
+            Self::Workflow { .. } => "workflow",
+        }
+    }
+
     /// Stable JSON exposed in events, tools, and clients.
     #[must_use]
     pub fn as_json(&self) -> Value {
@@ -107,6 +132,11 @@ impl JobSubject {
                 "product":product,
                 "instance":instance,
                 "tool":tool
+            }),
+            Self::Workflow { run_id, workflow } => json!({
+                "kind":"workflow",
+                "runID":run_id,
+                "workflow":workflow
             }),
         }
     }
@@ -325,6 +355,20 @@ impl AgentJobStore {
         )
     }
 
+    /// Read running workflows which cannot survive process loss.
+    pub fn running_workflows_for(&self, parent_session_id: &str) -> Result<Vec<AgentJob>, DbError> {
+        let connection = self.pool.get()?;
+        query_jobs(
+            &connection,
+            &format!(
+                "SELECT {SELECT_COLUMNS} FROM agent_job \
+                 WHERE parent_session_id = ?1 AND subject_kind = 'workflow' \
+                   AND status = 'running' ORDER BY time_created, id"
+            ),
+            parent_session_id,
+        )
+    }
+
     /// Read running product invocations which cannot survive process loss.
     pub fn running_product_agents_for(
         &self,
@@ -426,6 +470,14 @@ fn validate_new_job(job: &NewAgentJob) -> Result<(), DbError> {
             )));
         }
         JobSubject::ProductAgent { .. } => {}
+        JobSubject::Workflow { run_id, workflow }
+            if run_id.trim().is_empty() || workflow.trim().is_empty() =>
+        {
+            return Err(query_error(std::io::Error::other(
+                "workflow run id and workflow name must not be empty",
+            )));
+        }
+        JobSubject::Workflow { .. } => {}
     }
     Ok(())
 }
@@ -436,25 +488,19 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
         &job.parent_session_id,
         NewSessionEvent::new("agent.job.created", created_properties(&job))?,
     )?;
-    let subject = subject_columns(&job.subject);
+    let subject_payload = serde_json::to_string(&job.subject.as_json()).map_err(query_error)?;
     transaction
         .execute(
             "INSERT INTO agent_job \
-             (id, parent_session_id, subject_kind, child_session_id, product_run_id, \
-              product_kind, product_instance, product_tool, status, report_delivery, \
+             (id, parent_session_id, subject_kind, subject_payload, status, report_delivery, \
               result, error, report_input_id, created_seq, settled_seq, time_created, \
               time_updated, time_completed) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, NULL, NULL, \
-                     NULL, ?10, NULL, ?11, ?11, NULL)",
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, NULL, NULL, NULL, ?6, NULL, ?7, ?7, NULL)",
             params![
                 job.id,
                 job.parent_session_id,
-                subject.kind,
-                subject.child_session_id,
-                subject.product_run_id,
-                subject.product_kind,
-                subject.product_instance,
-                subject.product_tool,
+                job.subject.kind(),
+                subject_payload,
                 job.report_delivery.as_str(),
                 event.sequence,
                 job.time_created,
@@ -476,41 +522,6 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
         time_updated: job.time_created,
         time_completed: None,
     })
-}
-
-struct SubjectColumns<'a> {
-    kind: &'static str,
-    child_session_id: Option<&'a str>,
-    product_run_id: Option<&'a str>,
-    product_kind: Option<&'a str>,
-    product_instance: Option<&'a str>,
-    product_tool: Option<&'a str>,
-}
-
-fn subject_columns(subject: &JobSubject) -> SubjectColumns<'_> {
-    match subject {
-        JobSubject::ChildSession { session_id } => SubjectColumns {
-            kind: "child-session",
-            child_session_id: Some(session_id),
-            product_run_id: None,
-            product_kind: None,
-            product_instance: None,
-            product_tool: None,
-        },
-        JobSubject::ProductAgent {
-            run_id,
-            product,
-            instance,
-            tool,
-        } => SubjectColumns {
-            kind: "product-agent",
-            child_session_id: None,
-            product_run_id: Some(run_id),
-            product_kind: Some(product),
-            product_instance: Some(instance),
-            product_tool: Some(tool),
-        },
-    }
 }
 
 fn settle_in(
@@ -590,7 +601,7 @@ fn validate_settlement(job: &AgentJob, settlement: &JobSettlement) -> Result<(),
                     "a job report must target its parent session",
                 )));
             }
-            if report.delivery != crate::inbox::InputDelivery::NextStep {
+            if report.delivery != crate::inbox::InputDelivery::Queue {
                 return Err(query_error(std::io::Error::other(
                     "a job report must use next-step delivery",
                 )));
@@ -681,11 +692,7 @@ struct StoredJob {
     id: String,
     parent_session_id: String,
     subject_kind: String,
-    child_session_id: Option<String>,
-    product_run_id: Option<String>,
-    product_kind: Option<String>,
-    product_instance: Option<String>,
-    product_tool: Option<String>,
+    subject_payload: String,
     status: String,
     report_delivery: String,
     result: Option<String>,
@@ -729,34 +736,33 @@ fn decode_stored_job(row: &Row<'_>) -> rusqlite::Result<StoredJob> {
         id: row.get(0)?,
         parent_session_id: row.get(1)?,
         subject_kind: row.get(2)?,
-        child_session_id: row.get(3)?,
-        product_run_id: row.get(4)?,
-        product_kind: row.get(5)?,
-        product_instance: row.get(6)?,
-        product_tool: row.get(7)?,
-        status: row.get(8)?,
-        report_delivery: row.get(9)?,
-        result: row.get(10)?,
-        error: row.get(11)?,
-        report_input_id: row.get(12)?,
-        created_sequence: row.get(13)?,
-        settled_sequence: row.get(14)?,
-        time_created: row.get(15)?,
-        time_updated: row.get(16)?,
-        time_completed: row.get(17)?,
+        subject_payload: row.get(3)?,
+        status: row.get(4)?,
+        report_delivery: row.get(5)?,
+        result: row.get(6)?,
+        error: row.get(7)?,
+        report_input_id: row.get(8)?,
+        created_sequence: row.get(9)?,
+        settled_sequence: row.get(10)?,
+        time_created: row.get(11)?,
+        time_updated: row.get(12)?,
+        time_completed: row.get(13)?,
     })
 }
 
 fn decode_job(stored: StoredJob) -> Result<AgentJob, DbError> {
+    let payload: Value = serde_json::from_str(&stored.subject_payload).map_err(query_error)?;
     let subject = match stored.subject_kind.as_str() {
-        "child-session" => {
-            JobSubject::child_session(required(stored.child_session_id, "child_session_id")?)
-        }
+        "child-session" => JobSubject::child_session(required_json(&payload, "sessionID")?),
         "product-agent" => JobSubject::product_agent(
-            required(stored.product_run_id, "product_run_id")?,
-            required(stored.product_kind, "product_kind")?,
-            required(stored.product_instance, "product_instance")?,
-            required(stored.product_tool, "product_tool")?,
+            required_json(&payload, "runID")?,
+            required_json(&payload, "product")?,
+            required_json(&payload, "instance")?,
+            required_json(&payload, "tool")?,
+        ),
+        "workflow" => JobSubject::workflow(
+            required_json(&payload, "runID")?,
+            required_json(&payload, "workflow")?,
         ),
         other => {
             return Err(query_error(std::io::Error::other(format!(
@@ -784,10 +790,15 @@ fn decode_job(stored: StoredJob) -> Result<AgentJob, DbError> {
     })
 }
 
-fn required(value: Option<String>, column: &str) -> Result<String, DbError> {
-    value.ok_or_else(|| {
-        query_error(std::io::Error::other(format!(
-            "job subject is missing `{column}`"
-        )))
-    })
+fn required_json(value: &Value, field: &str) -> Result<String, DbError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            query_error(std::io::Error::other(format!(
+                "job subject payload requires non-empty `{field}`"
+            )))
+        })
 }

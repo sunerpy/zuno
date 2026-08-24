@@ -15,9 +15,7 @@ pub const DESCRIPTION: &str = include_str!("description/edit.txt");
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct EditParams {
-    /// The absolute path to the file to modify.
-    pub file_path: String,
+pub struct EditOperation {
     /// The text to replace.
     pub old_string: String,
     /// The text to replace it with (must be different from oldString).
@@ -25,6 +23,15 @@ pub struct EditParams {
     /// Replace all occurrences of oldString (default false).
     #[serde(default)]
     pub replace_all: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditParams {
+    /// The absolute path to the file to modify.
+    pub file_path: String,
+    /// Ordered edits applied atomically to one in-memory file image.
+    pub edits: Vec<EditOperation>,
 }
 
 pub struct EditTool {
@@ -50,7 +57,7 @@ impl TypedTool for EditTool {
     }
 
     async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        validate_params(&params)?;
+        validate_params(&params.edits)?;
         check_interrupt("edit", &ctx)?;
         let target = self
             .runtime
@@ -73,26 +80,36 @@ impl TypedTool for EditTool {
         } else {
             "\n"
         };
-        let old_string = convert_line_endings(&params.old_string, ending);
-        let new_string = convert_line_endings(&params.new_string, ending);
-        let replacements = count_occurrences(&decoded.text, &old_string, &ctx)?;
-        if replacements == 0 {
-            return Err(invalid(
-                "edit",
-                "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.",
-            ));
+        let mut next = decoded.text.clone();
+        let mut replacements = 0usize;
+        for (index, edit) in params.edits.iter().enumerate() {
+            check_interrupt("edit", &ctx)?;
+            let old_string = convert_line_endings(&edit.old_string, ending);
+            let new_string = convert_line_endings(&edit.new_string, ending);
+            let matches = count_occurrences(&next, &old_string, &ctx)?;
+            if matches == 0 {
+                return Err(invalid(
+                    "edit",
+                    format!(
+                        "edits[{index}].oldString was not found. It must match the current file image exactly, including whitespace, indentation, and line endings."
+                    ),
+                ));
+            }
+            if matches > 1 && !edit.replace_all {
+                return Err(invalid(
+                    "edit",
+                    format!(
+                        "edits[{index}].oldString matched {matches} locations; provide more context or set replaceAll."
+                    ),
+                ));
+            }
+            next = if edit.replace_all {
+                next.replace(&old_string, &new_string)
+            } else {
+                next.replacen(&old_string, &new_string, 1)
+            };
+            replacements = replacements.saturating_add(if edit.replace_all { matches } else { 1 });
         }
-        if replacements > 1 && !params.replace_all {
-            return Err(invalid(
-                "edit",
-                "Found multiple matches for oldString; provide more context or use replaceAll.",
-            ));
-        }
-        let next = if params.replace_all {
-            decoded.text.replace(&old_string, &new_string)
-        } else {
-            decoded.text.replacen(&old_string, &new_string, 1)
-        };
         let bytes = encode_text(&next, decoded.bom);
         write_with_dirs(&target.canonical, &bytes).map_err(|error| failed("edit", error))?;
         let applied = vec![target.canonical.clone()];
@@ -148,18 +165,28 @@ impl TypedTool for EditTool {
     }
 }
 
-fn validate_params(params: &EditParams) -> Result<(), ToolError> {
-    if params.old_string == params.new_string {
+fn validate_params(edits: &[EditOperation]) -> Result<(), ToolError> {
+    if edits.is_empty() {
         return Err(invalid(
             "edit",
-            "No changes to apply: oldString and newString are identical.",
+            "edits must contain at least one operation.",
         ));
     }
-    if params.old_string.is_empty() {
-        return Err(invalid(
-            "edit",
-            "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use write for an intentional full-file replacement.",
-        ));
+    for (index, edit) in edits.iter().enumerate() {
+        if edit.old_string == edit.new_string {
+            return Err(invalid(
+                "edit",
+                format!("edits[{index}] makes no change: oldString and newString are identical."),
+            ));
+        }
+        if edit.old_string.is_empty() {
+            return Err(invalid(
+                "edit",
+                format!(
+                    "edits[{index}].oldString cannot be empty. Provide exact text, or use write for an intentional full-file replacement."
+                ),
+            ));
+        }
     }
     Ok(())
 }

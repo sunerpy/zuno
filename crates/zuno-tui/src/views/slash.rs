@@ -38,6 +38,8 @@ pub struct CatalogCommand {
     pub name: String,
     /// Human-readable summary shown by autocomplete.
     pub description: Option<String>,
+    /// Whether this name expands a command template or selects one exact Skill.
+    pub kind: CatalogCommandKind,
 }
 
 impl CatalogCommand {
@@ -47,8 +49,37 @@ impl CatalogCommand {
         Self {
             name: name.into(),
             description,
+            kind: CatalogCommandKind::Command,
         }
     }
+
+    /// Construct a direct Skill command whose source identity must survive dispatch.
+    #[must_use]
+    pub fn skill(
+        name: impl Into<String>,
+        description: Option<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description,
+            kind: CatalogCommandKind::Skill {
+                source: source.into(),
+            },
+        }
+    }
+}
+
+/// Host-neutral catalog command semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogCommandKind {
+    /// Resolve a configured, built-in, or MCP command template.
+    Command,
+    /// Select and load one exact Skill source before any provider request.
+    Skill {
+        /// Absolute `SKILL.md` path or native source locator.
+        source: String,
+    },
 }
 
 /// What selecting or submitting a slash command does.
@@ -58,6 +89,11 @@ pub enum SlashCommandKind {
     UiAction(&'static str),
     /// Ask the host to resolve a catalog template.
     Catalog,
+    /// Ask the host to load one exact Skill before optional user arguments.
+    Skill {
+        /// Exact Skill source locator.
+        source: String,
+    },
     /// Ask the runtime host to perform a session-local control operation.
     Host(HostCommand),
 }
@@ -72,6 +108,14 @@ pub enum HostCommand {
     Undo,
     /// Reapply the most recently undone turn boundary.
     Redo,
+    /// Inspect or mutate the durable top-level goal for this session.
+    Goal(String),
+    /// Interactively enter or leave Plan mode.
+    Plan,
+    /// Enter Plan mode without another prompt.
+    StartPlan,
+    /// Confirm the durable plan and switch to implementation.
+    StartWork,
     /// Stop one background execution, or open the selector when omitted.
     Stop(Option<String>),
 }
@@ -109,6 +153,15 @@ pub enum SlashSubmission {
         /// Unexpanded argument tail.
         arguments: String,
     },
+    /// A direct Skill invocation preserving the discovered source identity.
+    Skill {
+        /// Skill name without `/`.
+        name: String,
+        /// Exact source selected by discovery.
+        source: String,
+        /// Optional task text following the slash name.
+        arguments: String,
+    },
     /// A session-local operation for the runtime host.
     Host(HostCommand),
     /// A slash-prefixed name owned by neither command class.
@@ -143,7 +196,10 @@ impl SlashRouter {
         // append its spelling to a deny-list.
         let mut catalog = catalog
             .into_iter()
-            .filter(|command| command_family(&command.name) == CommandFamily::Local)
+            .filter(|command| {
+                matches!(command.kind, CatalogCommandKind::Skill { .. })
+                    || command_family(&command.name) == CommandFamily::Local
+            })
             .collect::<Vec<_>>();
         catalog.sort_by(|left, right| left.name.cmp(&right.name));
         catalog.dedup_by(|left, right| left.name == right.name);
@@ -157,7 +213,10 @@ impl SlashRouter {
                     description: command
                         .description
                         .unwrap_or_else(|| "Run catalog command".to_owned()),
-                    kind: SlashCommandKind::Catalog,
+                    kind: match command.kind {
+                        CatalogCommandKind::Command => SlashCommandKind::Catalog,
+                        CatalogCommandKind::Skill { source } => SlashCommandKind::Skill { source },
+                    },
                 }),
         );
         Self { commands }
@@ -190,9 +249,17 @@ impl SlashRouter {
                 command: command.name.clone(),
                 arguments,
             },
+            SlashCommandKind::Skill { source } => SlashSubmission::Skill {
+                name: command.name.clone(),
+                source: source.clone(),
+                arguments,
+            },
             SlashCommandKind::Host(HostCommand::Stop(_)) => SlashSubmission::Host(
                 HostCommand::Stop((!arguments.is_empty()).then_some(arguments)),
             ),
+            SlashCommandKind::Host(HostCommand::Goal(_)) => {
+                SlashSubmission::Host(HostCommand::Goal(arguments))
+            }
             SlashCommandKind::Host(command) => SlashSubmission::Host(command.clone()),
         }
     }
@@ -343,6 +410,31 @@ fn ui_commands() -> Vec<SlashCommand> {
                 aliases: Vec::new(),
                 description: "Reapply the most recently undone turn".to_owned(),
                 kind: SlashCommandKind::Host(HostCommand::Redo),
+            },
+            SlashCommand {
+                name: "goal".to_owned(),
+                aliases: Vec::new(),
+                description: "View or manage the durable session goal".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Goal(String::new())),
+            },
+            SlashCommand {
+                name: "plan".to_owned(),
+                aliases: Vec::new(),
+                description: "Enter Plan mode, or confirm starting work when already planning"
+                    .to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Plan),
+            },
+            SlashCommand {
+                name: "start-plan".to_owned(),
+                aliases: Vec::new(),
+                description: "Enter read-only Plan mode immediately".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::StartPlan),
+            },
+            SlashCommand {
+                name: "start-work".to_owned(),
+                aliases: Vec::new(),
+                description: "Review the durable plan and confirm implementation".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::StartWork),
             },
             SlashCommand {
                 name: "stop".to_owned(),

@@ -273,6 +273,15 @@ const CHANNELS: &[ChannelGate] = &[
         "match prompts.try_send(submission) {",
     ),
     gate(
+        "tui-queue-mutations",
+        "zuno-cli/src/cmd/tui.rs",
+        "mpsc::channel(QUEUE_MUTATION_CHANNEL_CAPACITY);",
+        "QUEUE_MUTATION_CHANNEL_CAPACITY=8",
+        Policy::RefuseNewest,
+        "zuno-tui/src/views/session.rs",
+        "sink.try_send(mutation).is_ok()",
+    ),
+    gate(
         "tui-mcp-toggles",
         "zuno-cli/src/cmd/tui.rs",
         "let (mcp_toggle_sender, mcp_toggle_receiver) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);",
@@ -406,7 +415,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 37);
+    assert_eq!(CHANNELS.len(), 38);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -543,6 +552,10 @@ channel_gate!(
     "tui-terminal-events"
 );
 channel_gate!(tui_prompts_refuse_the_newest_prompt, "tui-prompts");
+channel_gate!(
+    tui_queue_mutations_refuse_the_newest_request,
+    "tui-queue-mutations"
+);
 channel_gate!(tui_edit_signal_coalesces_when_full, "tui-edit-signal");
 channel_gate!(
     tui_diagnostic_reports_apply_backpressure,

@@ -1,6 +1,6 @@
 //! What a transcript frame costs, measured before any cache is built.
 //!
-//! `.omo/plans/memory-perf-optimization.md` §11.3 lists R2-R5 — a prepared-frame
+//! The perf plan §11.3 lists R2-R5 — a prepared-frame
 //! cache, incremental body reuse, a per-message line cache and a large-buffer shrink.
 //! §10.1 forbids adopting the reference implementation's figures, and §1 sets the
 //! standard that an optimisation without a measured number does not ship. So this

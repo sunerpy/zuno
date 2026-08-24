@@ -32,7 +32,7 @@
 //! `mkdir`s seven directories at import — so creation lives in exactly one
 //! place, [`Layout::ensure`]. This is a deliberate divergence a differential
 //! test cannot detect, and it is recorded in
-//! `.omo/notepads/opencode-rust/decisions.md`.
+//! the project's engineering notes.
 //!
 //! **Joining is Node's, not Rust's.** `path.join` normalizes; `PathBuf::push`
 //! concatenates. With `XDG_DATA_HOME=/tmp/x/../y` the oracle reports

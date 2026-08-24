@@ -2117,7 +2117,7 @@ pub const DEFINITIONS: &[Definition] = &[
     Definition {
         name: "input_newline",
         scope: "input",
-        keys: "shift+return,ctrl+return,alt+return,ctrl+j",
+        keys: "shift+return,alt+return,ctrl+j",
         command: "input.newline",
         prevent_default: None,
         description: "Insert newline in input",
@@ -2706,6 +2706,14 @@ pub const DEFINITIONS: &[Definition] = &[
 /// auditable row-for-row. These still pass through the same parser, conflict
 /// detection, user overrides, and action dispatcher as every upstream binding.
 pub const LOCAL_DEFINITIONS: &[Definition] = &[
+    Definition {
+        name: "input_force_submit",
+        scope: "input",
+        keys: "ctrl+return",
+        command: "input.force_submit",
+        prevent_default: None,
+        description: "Steer the active turn immediately",
+    },
     Definition {
         name: "dialog.question.prev_question",
         scope: "dialog.question",

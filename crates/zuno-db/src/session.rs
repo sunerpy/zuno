@@ -88,9 +88,10 @@ const COLUMNS: &str = "id, project_id, workspace_id, parent_id, slug, directory,
      version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, \
      metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, \
      tokens_cache_write, tokens_last_prompt, tokens_context_limit, tokens_accounting, \
-     tokens_known, revert, permission, agent, model, time_created, time_updated, \
+     tokens_known, tokens_estimated_pending_prompt, tokens_last_confirmed_at, failed_turns, \
+     last_failed_at, revert, permission, agent, model, time_created, time_updated, \
      time_compacting, time_archived";
-pub(crate) const COLUMN_COUNT: usize = 33;
+pub(crate) const COLUMN_COUNT: usize = 37;
 
 /// One row of the `session` table.
 ///
@@ -245,17 +246,66 @@ pub struct SessionUsage {
     pub tokens: Tokens,
     /// Whole prompt sent by the most recent provider request.
     pub last_prompt_tokens: Option<i64>,
+    /// Deterministic local estimate for the latest request without confirmed usage.
+    pub estimated_pending_prompt_tokens: Option<i64>,
     /// Context ceiling used for the most recent request.
     pub context_limit: Option<i64>,
     /// Accounting mode reported by the most recent request.
     pub accounting: Option<TokenAccounting>,
     /// Whether every assistant token snapshot in this session can be normalized.
     pub known: bool,
+    /// Last checkpoint that supplied provider-confirmed usage.
+    pub last_confirmed_at: Option<i64>,
+    /// Number of turns that ended in an error rather than completion or user cancellation.
+    pub failed_turns: i64,
+    /// Most recent failed turn timestamp.
+    pub last_failed_at: Option<i64>,
+}
+
+impl SessionUsage {
+    /// Frontend-neutral snapshot. Unknown values remain absent rather than becoming zero.
+    #[must_use]
+    pub fn snapshot(self) -> zuno_types::UsageSnapshot {
+        zuno_types::UsageSnapshot {
+            confirmed: zuno_types::TokenUsage {
+                input: u64::try_from(self.tokens.input).unwrap_or_default(),
+                output: u64::try_from(self.tokens.output).unwrap_or_default(),
+                reasoning: u64::try_from(self.tokens.reasoning).unwrap_or_default(),
+                cache_read: u64::try_from(self.tokens.cache_read).unwrap_or_default(),
+                cache_write: u64::try_from(self.tokens.cache_write).unwrap_or_default(),
+                unclassified: 0,
+            },
+            last_prompt_tokens: self
+                .last_prompt_tokens
+                .and_then(|value| value.try_into().ok()),
+            estimated_pending_prompt_tokens: self
+                .estimated_pending_prompt_tokens
+                .and_then(|value| value.try_into().ok()),
+            context_limit: self.context_limit.and_then(|value| value.try_into().ok()),
+            accounting: self.accounting.map_or(
+                zuno_types::UsageAccounting::Unknown,
+                |accounting| match accounting {
+                    TokenAccounting::CacheInsideInput => {
+                        zuno_types::UsageAccounting::CacheInsideInput
+                    }
+                    TokenAccounting::CacheBesideInput => {
+                        zuno_types::UsageAccounting::CacheBesideInput
+                    }
+                },
+            ),
+            confirmed_known: self.known,
+            last_confirmed_at: self.last_confirmed_at,
+            failed_turns: u64::try_from(self.failed_turns).unwrap_or_default(),
+            last_failed_at: self.last_failed_at,
+        }
+    }
 }
 
 /// One assistant message's usage snapshot, before it is folded into a session.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MessageUsage {
+    /// Whether the provider emitted a usage snapshot for this message.
+    pub reported: bool,
     /// Cost stored on the assistant message.
     pub cost: f64,
     /// Provider-reported token buckets.
@@ -273,6 +323,7 @@ impl MessageUsage {
             .and_then(|tokens| tokens.get("cache"))
             .and_then(JsonValue::as_object);
         Self {
+            reported: tokens.is_some(),
             cost: data.get("cost").and_then(JsonValue::as_f64).unwrap_or(0.0),
             tokens: Tokens {
                 input: json_i64(tokens.and_then(|tokens| tokens.get("input"))),
@@ -884,6 +935,10 @@ pub fn reconcile_usage(
     current: MessageUsage,
     context_limit: Option<i64>,
 ) -> Result<(), DbError> {
+    if !current.reported {
+        return Ok(());
+    }
+
     let was_known = transaction
         .query_row(
             "SELECT tokens_known FROM session WHERE id = ?1",
@@ -903,11 +958,13 @@ pub fn reconcile_usage(
                  SELECT 1 FROM message
                  WHERE session_id = ?1
                    AND json_extract(data, '$.role') = 'assistant'
+                   AND json_type(data, '$.tokens') = 'object'
                )
                AND NOT EXISTS (
                  SELECT 1 FROM message
                  WHERE session_id = ?1
                    AND json_extract(data, '$.role') = 'assistant'
+                   AND json_type(data, '$.tokens') = 'object'
                    AND (
                      json_extract(data, '$.tokens.accounting') IS NULL
                      OR json_extract(data, '$.tokens.accounting')
@@ -922,6 +979,7 @@ pub fn reconcile_usage(
     let accounting = current.accounting.map(TokenAccounting::as_str);
     let last_prompt = current.last_prompt_tokens();
     let context_limit = context_limit.filter(|value| *value > 0);
+    let confirmed_at = unix_milliseconds()?;
 
     if all_known && was_known {
         let old = previous
@@ -940,7 +998,9 @@ pub fn reconcile_usage(
                      tokens_last_prompt = ?14,
                      tokens_context_limit = coalesce(?15, tokens_context_limit),
                      tokens_accounting = ?16,
-                     tokens_known = 1
+                     tokens_known = 1,
+                     tokens_estimated_pending_prompt = NULL,
+                     tokens_last_confirmed_at = ?17
                  WHERE id = ?1",
                 params![
                     session_id,
@@ -959,6 +1019,7 @@ pub fn reconcile_usage(
                     last_prompt,
                     context_limit,
                     accounting,
+                    confirmed_at,
                 ],
             )
             .map_err(open::map_error)?;
@@ -1018,9 +1079,17 @@ pub fn reconcile_usage(
                      tokens_last_prompt = ?2,
                      tokens_context_limit = coalesce(?3, tokens_context_limit),
                      tokens_accounting = ?4,
-                     tokens_known = 1
+                     tokens_known = 1,
+                     tokens_estimated_pending_prompt = NULL,
+                     tokens_last_confirmed_at = ?5
                  WHERE id = ?1",
-                params![session_id, last_prompt, context_limit, accounting],
+                params![
+                    session_id,
+                    last_prompt,
+                    context_limit,
+                    accounting,
+                    confirmed_at
+                ],
             )
             .map_err(open::map_error)?;
         return Ok(());
@@ -1033,7 +1102,9 @@ pub fn reconcile_usage(
                  tokens_last_prompt = ?4,
                  tokens_context_limit = coalesce(?5, tokens_context_limit),
                  tokens_accounting = ?6,
-                 tokens_known = 0
+                 tokens_known = 0,
+                 tokens_estimated_pending_prompt = NULL,
+                 tokens_last_confirmed_at = ?7
              WHERE id = ?1",
             params![
                 session_id,
@@ -1042,10 +1113,63 @@ pub fn reconcile_usage(
                 last_prompt,
                 context_limit,
                 accounting,
+                confirmed_at,
             ],
         )
         .map_err(open::map_error)?;
     Ok(())
+}
+
+/// Persist the local prompt estimate before an HTTP request is attempted.
+///
+/// This never changes confirmed counters. A provider rejection, timeout, or cancellation
+/// therefore leaves the last trustworthy total intact while the client can still show
+/// the request that was attempted as an approximation.
+pub fn record_provider_request_started(
+    connection: &Connection,
+    session_id: &str,
+    estimated_prompt_tokens: u64,
+    context_limit: Option<u64>,
+) -> Result<(), DbError> {
+    let estimated = i64::try_from(estimated_prompt_tokens).unwrap_or(i64::MAX);
+    let context_limit = context_limit.and_then(|value| i64::try_from(value).ok());
+    let updated = connection
+        .execute(
+            "UPDATE session
+             SET tokens_estimated_pending_prompt = ?2,
+                 tokens_context_limit = coalesce(?3, tokens_context_limit)
+             WHERE id = ?1",
+            params![session_id, estimated, context_limit],
+        )
+        .map_err(open::map_error)?;
+    if updated == 0 {
+        return Err(DbError::NotFound {
+            table: TABLE.to_owned(),
+            id: session_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Record one failed top-level turn without mutating confirmed usage.
+pub fn record_turn_failure(connection: &Connection, session_id: &str) -> Result<i64, DbError> {
+    let failed_at = unix_milliseconds()?;
+    let updated = connection
+        .execute(
+            "UPDATE session
+             SET failed_turns = failed_turns + 1,
+                 last_failed_at = ?2
+             WHERE id = ?1",
+            params![session_id, failed_at],
+        )
+        .map_err(open::map_error)?;
+    if updated == 0 {
+        return Err(DbError::NotFound {
+            table: TABLE.to_owned(),
+            id: session_id.to_owned(),
+        });
+    }
+    Ok(failed_at)
 }
 
 /// Replace a session's title, returning the millisecond it was updated at.
@@ -1453,8 +1577,9 @@ pub fn subtree(connection: &Connection, id: &str) -> Result<Vec<String>, DbError
 /// Per id, in this order:
 ///
 /// 1. `DELETE FROM session`, which cascades `message`, `session_message`,
-///    `session_input`, `session_context_epoch`, `session_share` and `todo`, and
-///    reaches `part` through `message`;
+///    `session_input`, `session_context_epoch`, `session_share`, `agent_job`,
+///    `work_plan`, `work_item`, and reflection delivery rows, and reaches `part`
+///    through `message`;
 /// 2. `DELETE FROM part WHERE session_id = ?`, the sweep for parts the cascade
 ///    could not see;
 /// 3. `DELETE FROM event_sequence`, then `DELETE FROM event`, keyed by
@@ -1887,15 +2012,19 @@ pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
                 .as_deref()
                 .and_then(TokenAccounting::parse),
             known: row.get(24)?,
+            estimated_pending_prompt_tokens: row.get(25)?,
+            last_confirmed_at: row.get(26)?,
+            failed_turns: row.get(27)?,
+            last_failed_at: row.get(28)?,
         },
-        revert: row.get(25)?,
-        permission: row.get(26)?,
-        agent: row.get(27)?,
-        model: row.get(28)?,
-        time_created: row.get(29)?,
-        time_updated: row.get(30)?,
-        time_compacting: row.get(31)?,
-        time_archived: row.get(32)?,
+        revert: row.get(29)?,
+        permission: row.get(30)?,
+        agent: row.get(31)?,
+        model: row.get(32)?,
+        time_created: row.get(33)?,
+        time_updated: row.get(34)?,
+        time_compacting: row.get(35)?,
+        time_archived: row.get(36)?,
     })
 }
 

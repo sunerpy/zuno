@@ -9,7 +9,7 @@
 //! because a delegation refusal is read by a model, not a human, and a model can
 //! only act on a message that says what to send instead. `oh-my-opencode-slim` pays
 //! for the absence of that property with an entire hook family —
-//! `.omo/refs/omo-slim/src/hooks/delegate-task-retry/patterns.ts` maps nine error
+//! `omo-slim` maps nine error
 //! substrings onto nine `fixHint` strings after the fact, because the tool's own
 //! errors did not carry them.
 //!
@@ -472,6 +472,7 @@ pub struct DelegationPlan {
 }
 
 /// Delegation to a child session, gated on depth and permission.
+#[derive(Clone)]
 pub struct TaskTool {
     host: Arc<dyn ChildTurnHost>,
     facts: Arc<dyn ProviderFacts>,
@@ -541,7 +542,7 @@ impl TaskTool {
         self
     }
 
-    fn targets(&self) -> Vec<String> {
+    pub(crate) fn targets(&self) -> Vec<String> {
         self.targets.as_ref().map_or_else(
             || valid_targets(self.vision_available),
             |targets| targets.as_slice().to_vec(),
@@ -725,7 +726,7 @@ impl TaskTool {
         }
     }
 
-    async fn guard_depth(&self, ctx: &ToolContext) -> Result<(), ToolError> {
+    pub(crate) async fn guard_depth(&self, ctx: &ToolContext) -> Result<(), ToolError> {
         let ancestry = self
             .host
             .delegation_depth(&ctx.session_id)

@@ -27,7 +27,7 @@
 //!
 //! POSIX semantics only. `path.win32` is a separate algorithm (drive letters,
 //! UNC roots, `\` separators) and is out of scope for this todo; see
-//! `.omo/notepads/opencode-rust/issues.md`.
+//! the project's engineering notes.
 
 /// The POSIX separator. Node hard-codes `'/'` in `path.posix`.
 const SEP: char = '/';

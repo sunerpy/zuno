@@ -318,11 +318,16 @@ mod tests {
             .expect("operation enum");
         assert!(operations.contains(&json!("goToDefinition")));
         assert!(operations.contains(&json!("outgoingCalls")));
+        assert_eq!(
+            definition.parameters["properties"][INTENT_KEY]["type"],
+            "string"
+        );
         assert!(
-            definition.parameters["required"]
+            !definition.parameters["required"]
                 .as_array()
                 .expect("required fields")
-                .contains(&json!(INTENT_KEY))
+                .contains(&json!(INTENT_KEY)),
+            "intent is optional metadata for LSP just as it is for every tool"
         );
     }
 }

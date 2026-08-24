@@ -62,6 +62,38 @@ fn compact_undo_and_redo_are_host_commands_not_ui_actions_or_catalog_prompts() {
 }
 
 #[test]
+fn goal_is_a_host_command_and_preserves_its_argument_tail() {
+    assert_eq!(
+        route("/goal"),
+        SlashSubmission::Host(HostCommand::Goal(String::new()))
+    );
+    assert_eq!(
+        route("/goal create ship a public release"),
+        SlashSubmission::Host(HostCommand::Goal("create ship a public release".to_owned()))
+    );
+    let router = SlashRouter::default();
+    let command = router
+        .commands()
+        .iter()
+        .find(|command| command.name == "goal")
+        .expect("/goal is absent from autocomplete");
+    assert!(matches!(command.kind, SlashCommandKind::Host(_)));
+}
+
+#[test]
+fn plan_controls_are_host_commands_and_never_model_text() {
+    assert_eq!(route("/plan"), SlashSubmission::Host(HostCommand::Plan));
+    assert_eq!(
+        route("/start-plan"),
+        SlashSubmission::Host(HostCommand::StartPlan)
+    );
+    assert_eq!(
+        route("/start-work"),
+        SlashSubmission::Host(HostCommand::StartWork)
+    );
+}
+
+#[test]
 fn host_commands_win_catalog_name_collisions() {
     let router = SlashRouter::new([
         CatalogCommand::new("compact", None),
@@ -217,6 +249,29 @@ fn unsupported_command_families_never_enter_the_merged_slash_table() {
             "`/{name}` resolves despite being outside the product boundary"
         );
     }
+}
+
+#[test]
+fn a_direct_skill_preserves_its_exact_source_and_argument_tail() {
+    let router = SlashRouter::new([CatalogCommand::skill(
+        "github-project-scaffold",
+        Some("Prepare a public repository".to_owned()),
+        "/config/.agents/skills/github-project-scaffold/SKILL.md",
+    )]);
+    assert_eq!(
+        router.resolve("/github-project-scaffold audit this repository"),
+        SlashSubmission::Skill {
+            name: "github-project-scaffold".to_owned(),
+            source: "/config/.agents/skills/github-project-scaffold/SKILL.md".to_owned(),
+            arguments: "audit this repository".to_owned(),
+        }
+    );
+    let command = router
+        .commands()
+        .iter()
+        .find(|command| command.name == "github-project-scaffold")
+        .expect("direct Skill is discoverable");
+    assert!(matches!(command.kind, SlashCommandKind::Skill { .. }));
 }
 
 #[test]

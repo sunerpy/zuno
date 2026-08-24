@@ -172,7 +172,7 @@ pub async fn question_reject(
         .requests
         .claim_question(&session_id, &request_id)
         .ok_or_else(|| request_not_found("question", &session_id, &request_id))?;
-    let decision = QuestionDecision::Rejected;
+    let decision = QuestionDecision::Cancelled;
     services
         .requests
         .publish_question_reply(&session_id, &request_id, &decision)

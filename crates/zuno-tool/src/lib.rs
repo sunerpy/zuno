@@ -6,7 +6,7 @@
 //! [`schemars`], and the same struct is what [`serde`] deserializes the model's
 //! arguments into. There is no second declaration to fall out of step with the
 //! first, which is the single defect this crate exists to prevent: the reference
-//! implementation in `.omo/refs/claw-code/rust/crates/tools/src/lib.rs` hand-writes
+//! implementation in `claw-code` hand-writes
 //! 250 `json!` schemas and pairs them with independently declared serde structs
 //! hundreds of lines away, so a renamed field advertises a parameter the
 //! deserializer will never read and nothing fails until a model tries to use it.
@@ -45,8 +45,9 @@
 //!
 //! let definition = erase(Greet).definition();
 //! assert_eq!(definition.parameters["properties"]["name"]["type"], "string");
-//! // Injected centrally, by nothing the tool wrote:
+//! // Optional metadata is injected centrally, by nothing the tool wrote:
 //! assert_eq!(definition.parameters["properties"]["intent"]["type"], "string");
+//! assert_eq!(definition.parameters["required"], serde_json::json!(["name"]));
 //! ```
 //!
 //! # The layers
@@ -551,10 +552,7 @@ mod tests {
             definition.parameters["properties"]["text"]["description"],
             "The text to echo."
         );
-        assert_eq!(
-            definition.parameters["required"],
-            json!(["text", INTENT_KEY])
-        );
+        assert_eq!(definition.parameters["required"], json!(["text"]));
     }
 
     #[test]
@@ -594,10 +592,7 @@ mod tests {
             definition.parameters["properties"][ACCEPT_LARGE_OUTPUT_KEY]["type"],
             "boolean"
         );
-        assert_eq!(
-            definition.parameters["required"],
-            json!(["query", INTENT_KEY])
-        );
+        assert_eq!(definition.parameters["required"], json!(["query"]));
     }
 
     #[test]

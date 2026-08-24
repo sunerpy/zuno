@@ -29,6 +29,7 @@ fn registry_sources() -> Vec<PathBuf> {
     vec![
         workspace.join("crates/zuno-tools/src/registry.rs"),
         workspace.join("crates/zuno-tools/src/memory.rs"),
+        workspace.join("crates/zuno-tools/src/work_state.rs"),
         workspace.join("crates/zuno-goal/src/tools.rs"),
     ]
 }
@@ -180,9 +181,9 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
             "explore: find the parser",
         ),
         (
-            "todowrite",
-            r#"{"todos":[{"content":"wire the tree","status":"pending","priority":"high"}]}"#,
-            "1 items · wire the tree",
+            "todo_update",
+            r#"{"changes":[{"action":"add","id":"todo_wire","subject":"wire the tree","description":"wire the tree","status":"pending","priority":"high"}]}"#,
+            "1 changes · wire the tree",
         ),
         (
             "question",
@@ -211,9 +212,9 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
             r#"{"target":"project","action":"add","content":"run cargo fmt"}"#,
             "add project: run cargo fmt",
         ),
-        ("create_goal", r#"{"objective":"ship P2-4"}"#, "ship P2-4"),
+        ("goal_propose", r#"{"objective":"ship P2-4"}"#, "ship P2-4"),
         (
-            "update_goal",
+            "goal_update",
             r#"{"status":"blocked","blocking_condition":"no key"}"#,
             "blocked: no key",
         ),
@@ -240,9 +241,9 @@ fn tool_summary_is_absent_rather_than_invented_when_there_is_nothing_to_say() {
         "plan_exit takes no arguments"
     );
     assert_eq!(
-        summary("get_goal", "{}"),
+        summary("goal_get", "{}"),
         None,
-        "get_goal takes no arguments"
+        "goal_get takes no arguments"
     );
     assert_eq!(
         summary("some_mcp_tool", r#"{"whatever":1}"#),
@@ -456,8 +457,8 @@ fn tool_status_style_paints_from_the_palette_and_separates_the_terminal_states()
          cannot find the failure"
     );
     assert_ne!(
-        running.fg, completed.fg,
-        "an in-flight call paints as finished"
+        running, completed,
+        "an in-flight call paints as finished; the running style must retain its emphasis"
     );
     assert_eq!(
         error.fg,
@@ -480,8 +481,8 @@ fn tool_status_style_paints_from_the_palette_and_separates_the_terminal_states()
     );
     assert_eq!(
         completed.fg,
-        Some(ratatui::style::Color::from(context.palette().border_active)),
-        "ordinary completed tools must use the readable accent, not success green"
+        Some(ratatui::style::Color::from(context.palette().accent)),
+        "ordinary completed tools must use the semantic tool accent, not border grey or success green"
     );
     assert_eq!(
         delegated.fg,

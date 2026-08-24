@@ -28,11 +28,11 @@ fn baseline_config_allows_custom_tool_without_ui_permission_flow() {
     let config: serde_json::Value =
         serde_json::from_str(&provider_config("http://127.0.0.1:1234")).expect("valid config");
 
-    // When: the wildcard permission is read from the generated config.
-    let action = &config["permission"]["*"];
+    // When: the canonical permission mode is read from the generated config.
+    let mode = &config["permission"]["mode"];
 
     // Then: the tool is allowed without an interactive permission round trip.
-    assert_eq!(action, "allow");
+    assert_eq!(mode, "allow_all");
 }
 
 #[test]

@@ -678,7 +678,7 @@ fn the_workspace_roster_matches_the_declared_crate_list() {
         undeclared.is_empty() && missing.is_empty(),
         "the workspace roster and {} disagree. The roster is a closed list: a new \
          crate is a deliberate amendment to {}, to the enumeration in \
-         `.omo/plans/opencode-rust.md` and to its stated count, in the same commit \
+         the project plan and to its stated count, in the same commit \
          — never a silent consequence of `members = [\"crates/*\"]`.\n  \
          in the workspace but not declared: {undeclared:?}\n  \
          declared but not in the workspace: {missing:?}\n  \

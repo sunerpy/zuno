@@ -7,7 +7,9 @@ use zuno_config::discovery::{
     DiscoveryOptions, ManagedPreferences, discover_with, json_error_byte_offset, merge_layers,
 };
 use zuno_config::schema::ordered::OrderedMap;
-use zuno_config::schema::permission::{PermissionAction, PermissionConfig, PermissionRule};
+use zuno_config::schema::permission::{
+    PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
+};
 use zuno_error::ConfigError;
 use zuno_paths::Env;
 
@@ -357,7 +359,8 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
         [
             (
                 "ZUNO_CONFIG_CONTENT".to_owned(),
-                r#"{"tools":{"bash":false,"write":true},"permission":{"read":"ask"}}"#.to_owned(),
+                r#"{"tools":{"bash":false,"write":true},"permission":{"rules":{"read":"ask"}}}"#
+                    .to_owned(),
             ),
             (
                 "ZUNO_PERMISSION".to_owned(),
@@ -367,13 +370,11 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
     )
     .with_managed_preferences(ManagedPreferences::new(
         "mobileconfig:test",
-        r#"{"permission":{"read":"deny","glob":"ask"}}"#,
+        r#"{"permission":{"rules":{"read":"deny","glob":"ask"}}}"#,
     ));
 
     let config = discover_with(&options).expect("discover permissions");
-    let PermissionConfig::Object(permission) = config.permission.expect("permission object") else {
-        panic!("permission should be normalized to an object");
-    };
+    let permission = config.permission.expect("permission policy").rules;
     let expected = [
         ("bash", PermissionAction::Allow),
         ("edit", PermissionAction::Deny),
@@ -396,20 +397,19 @@ fn discovery_preserves_permission_pattern_order() {
     patterns.insert("*.secret", PermissionAction::Deny);
     patterns.insert("README.md", PermissionAction::Allow);
     let config = Config {
-        permission: Some(PermissionConfig::Object(
-            zuno_config::schema::permission::PermissionObject(
+        permission: Some(PermissionConfig {
+            mode: PermissionMode::Standard,
+            rules: PermissionObject(
                 [("read".to_owned(), PermissionRule::Patterns(patterns))]
                     .into_iter()
                     .collect(),
             ),
-        )),
+        }),
         ..Config::default()
     };
 
     let merged = merge_layers([config]).expect("merge permission");
-    let PermissionConfig::Object(permission) = merged.permission.expect("permission") else {
-        panic!("object permission expected");
-    };
+    let permission = merged.permission.expect("permission").rules;
     let Some(PermissionRule::Patterns(patterns)) = permission.get("read") else {
         panic!("read patterns expected");
     };

@@ -25,7 +25,7 @@ publish.workspace = true
 #
 # The technique, and the note explaining why an unused reverse edge is worth
 # deleting rather than tolerating, is taken from
-# `.omo/refs/jcode/crates/jcode-app-core/Cargo.toml:64-67`.
+# `jcode`.
 # ---------------------------------------------------------------------------
 [dependencies]
 zuno-auth = { workspace = true }

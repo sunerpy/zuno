@@ -1,8 +1,8 @@
 //! Which conditional tools reach the model, as predicates rather than branches.
 //!
-//! # Why this is a module and not four `if`s in the registry
+//! # Why this is a module and not three `if`s in the registry
 //!
-//! Four of the built-in tools are not always offered. Upstream expresses each
+//! Three of the built-in tools are not always offered. Upstream expresses each
 //! condition inline in the array literal that builds the tool list
 //! (`packages/opencode/src/tool/registry.ts:226-244`), so the conditions are
 //! unreachable from a test: to learn whether `plan_exit` is offered you have to
@@ -19,19 +19,17 @@
 //!
 //! Read off the real 1.18.12 binary rather than only off the source. `opencode debug
 //! agent <name>` prints the resolved `tools` map; the full 18-case transcript
-//! is in `.omo/evidence/task-43-opencode-rust.txt`. Summary:
+//! is in the task-43 verification transcript. Summary:
 //!
 //! | wire id | condition | oracle |
 //! |---|---|---|
 //! | `invalid` | always | `registry.ts:227` |
-//! | `todowrite` | always | `registry.ts:237` |
 //! | `question` | client ∈ {`app`,`cli`,`desktop`} **or** [`ENV_ENABLE_QUESTION_TOOL`] | `registry.ts:202,228` |
 //! | `plan_exit` | plan mode **and** client == `cli` | `registry.ts:243` |
 //!
-//! `invalid` and `todowrite` really are unconditional, and their predicates say so
-//! by returning `true` for every input. That is not a placeholder: the tests drive
-//! the whole flag matrix through them, so gating one later fails a test instead of
-//! passing silently.
+//! `invalid` is unconditional, and its predicate says so by returning `true` for
+//! every input. That is not a placeholder: the tests drive the whole flag matrix
+//! through it, so gating it later fails a test instead of passing silently.
 //!
 //! # Two layers, and only the first one is here
 //!
@@ -278,16 +276,6 @@ pub fn exposes_invalid(_flags: &ExposureFlags) -> bool {
     true
 }
 
-/// Whether `todowrite` is offered. Always.
-///
-/// Oracle: `registry.ts:237` lists `tool.todo` unguarded. Verified present in all 18
-/// measured cases, including with the client set to `tui` and with every
-/// experimental flag off.
-#[must_use]
-pub fn exposes_todowrite(_flags: &ExposureFlags) -> bool {
-    true
-}
-
 /// Whether `question` is offered.
 ///
 /// Oracle, verbatim in structure (`registry.ts:202`):
@@ -330,18 +318,16 @@ pub type ExposurePredicate = fn(&ExposureFlags) -> bool;
 /// Every conditional tool this module gates, as `(wire id, predicate)`.
 ///
 /// The registry's element type is keyed by [`zuno_tool::Tool::id`], which is the wire
-/// id, so these are wire ids and not upstream's internal registry keys. Two of the
-/// four differ: upstream keys `todowrite` as `todo` (`registry.ts:214`) and
-/// `plan_exit` as `plan` (`registry.ts:220`), while `invalid` and `question` are the
-/// same in both spaces.
-pub const CONDITIONAL_TOOLS: [(&str, ExposurePredicate); 4] = [
+/// id, so these are wire ids and not upstream's internal registry keys. Upstream
+/// keys `plan_exit` as `plan` (`registry.ts:220`), while `invalid` and `question`
+/// are the same in both spaces.
+pub const CONDITIONAL_TOOLS: [(&str, ExposurePredicate); 3] = [
     (crate::invalid::WIRE_ID, exposes_invalid),
     (crate::question::WIRE_ID, exposes_question),
-    (crate::todo::WIRE_ID, exposes_todowrite),
     (crate::plan_exit::WIRE_ID, exposes_plan_exit),
 ];
 
-/// The predicate gating `wire_id`, or `None` when the tool is not one of these four.
+/// The predicate gating `wire_id`, or `None` when the tool is not one of these three.
 ///
 /// Todo 44's filter is meant to be `predicate(&flags)` for the tools this returns
 /// something for, and unconditional for the rest — one lookup instead of a `match`
@@ -420,24 +406,6 @@ mod tests {
             assert!(
                 exposes_invalid(&configuration),
                 "invalid must be offered for {configuration:?}"
-            );
-        }
-    }
-
-    // --- todowrite: same shape ---
-
-    #[test]
-    fn conditional_todowrite_is_present_under_its_enabling_condition() {
-        assert!(exposes_todowrite(&ExposureFlags::default()));
-        assert!(exposed_conditional_tools(&ExposureFlags::default()).contains(&"todowrite"));
-    }
-
-    #[test]
-    fn conditional_todowrite_is_never_absent_for_any_flag_configuration() {
-        for configuration in matrix() {
-            assert!(
-                exposes_todowrite(&configuration),
-                "todowrite must be offered for {configuration:?}"
             );
         }
     }
@@ -614,7 +582,7 @@ mod tests {
 
     #[test]
     fn conditional_every_gated_tool_has_a_predicate_reachable_by_wire_id() {
-        for wire_id in ["invalid", "question", "todowrite", "plan_exit"] {
+        for wire_id in ["invalid", "question", "plan_exit"] {
             assert!(
                 exposure_predicate(wire_id).is_some(),
                 "{wire_id} must be reachable by its wire id"
@@ -626,10 +594,19 @@ mod tests {
     fn conditional_an_unconditional_tool_has_no_predicate() {
         // `read` and friends are not gated; the registry must not be handed a
         // predicate for them and silently start filtering.
-        for wire_id in ["read", "write", "glob", "grep", "todo", "plan"] {
+        for wire_id in [
+            "read",
+            "write",
+            "glob",
+            "grep",
+            "plan_get",
+            "plan_update",
+            "todo_get",
+            "todo_update",
+        ] {
             assert!(
                 exposure_predicate(wire_id).is_none(),
-                "{wire_id} is not one of the four conditional tools"
+                "{wire_id} is not one of the three conditional tools"
             );
         }
     }
@@ -637,19 +614,18 @@ mod tests {
     #[test]
     fn conditional_the_wire_ids_are_the_wire_ids_and_not_the_registry_keys() {
         let ids: Vec<&str> = CONDITIONAL_TOOLS.iter().map(|(id, _)| *id).collect();
-        assert_eq!(ids, vec!["invalid", "question", "todowrite", "plan_exit"]);
-        // Upstream's registry keys for two of them; neither is a wire id.
-        assert!(!ids.contains(&"todo"));
+        assert_eq!(ids, vec!["invalid", "question", "plan_exit"]);
+        // Upstream's registry key for plan_exit is not its wire id.
         assert!(!ids.contains(&"plan"));
     }
 
     #[test]
     fn conditional_the_default_configuration_matches_the_measured_baseline() {
-        // Transcript case 1: a bare invocation offers invalid, question, todowrite
-        // and withholds plan_exit.
+        // Transcript case 1: a bare invocation offers invalid and question and
+        // withholds plan_exit.
         assert_eq!(
             exposed_conditional_tools(&ExposureFlags::default()),
-            vec!["invalid", "question", "todowrite"]
+            vec!["invalid", "question"]
         );
     }
 
@@ -657,7 +633,7 @@ mod tests {
     fn conditional_the_full_plan_mode_cli_configuration_offers_all_four() {
         assert_eq!(
             exposed_conditional_tools(&ExposureFlags::default().with_plan_mode()),
-            vec!["invalid", "question", "todowrite", "plan_exit"]
+            vec!["invalid", "question", "plan_exit"]
         );
     }
 
@@ -668,7 +644,7 @@ mod tests {
             exposed_conditional_tools(
                 &ExposureFlags::default().with_client("tui").with_plan_mode()
             ),
-            vec!["invalid", "todowrite"]
+            vec!["invalid"]
         );
     }
 }

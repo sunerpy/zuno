@@ -76,7 +76,7 @@ impl Env {
     /// a non-UTF-8 variable. The oracle reads `process.env` as JavaScript
     /// strings, so a byte sequence that is not valid UTF-8 is already mangled
     /// there; matching that with a lossy conversion is closer to parity than
-    /// aborting. See `.omo/notepads/opencode-rust/issues.md`.
+    /// aborting. See the project's engineering notes.
     #[must_use]
     pub fn from_process() -> Self {
         let vars = std::env::vars_os()

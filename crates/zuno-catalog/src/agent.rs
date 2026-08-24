@@ -1,4 +1,4 @@
-//! Zuno's native agents, `agent.<name>` config entries, and Markdown definitions
+//! Zuno's native agents, `agents.<name>` config entries, and Markdown definitions
 //! discovered under `{agent,agents}/**/*.md`.
 //!
 //! # Name rule
@@ -21,8 +21,8 @@
 //! # What is deliberately not here
 //!
 //! * `{mode,modes}/*.md` is not scanned. Zuno reads only `agent/` and `agents/`.
-//! * `tools` and `maxSteps` are not accepted. [`AgentConfig`] rejects them as
-//!   unsupported fields.
+//! * `maxSteps` is not accepted. `tools` is a sequence of exact tool names;
+//!   legacy boolean maps are rejected by [`AgentConfig`].
 //! * The unknown-key sweep into `options` is not reimplemented.
 //!   [`zuno_config::schema::agent::AgentConfig`]'s `Deserialize` performs it, and
 //!   this module simply consumes the result.
@@ -38,7 +38,7 @@ use serde_json::Value;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use zuno_config::discovery::{DiscoveryOptions, discover_with};
-use zuno_config::schema::agent::{AgentColor, AgentConfig};
+use zuno_config::schema::agent::{AgentColor, AgentConfig, AgentReasoning};
 use zuno_config::schema::ordered::OrderedMap;
 use zuno_config::schema::permission::PermissionConfig;
 use zuno_config::schema::{Config, JsonMap};
@@ -67,7 +67,7 @@ pub enum AgentSource {
     Native,
     /// A native agent a user definition has modified.
     NativeOverridden,
-    /// An `agent.<name>` entry in a config file or env layer.
+    /// An `agents.<name>` entry in a config file or env layer.
     Config,
     /// A Markdown file, named by its path.
     Markdown {
@@ -107,9 +107,12 @@ pub struct Agent {
     /// Model in `provider/model` form, unparsed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Model variant, applied only with the agent's own model.
+    /// Model-specific variant, applied only with the agent's own model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    /// Provider-neutral reasoning level, applied only with the agent's own model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<AgentReasoning>,
     /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -125,6 +128,12 @@ pub struct Agent {
     /// Maximum agentic iterations before a text-only response is forced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steps: Option<NonZeroU32>,
+    /// Exact model-visible tool allowlist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// Exact child-agent allowlist for direct delegation and workflows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegates: Option<Vec<String>>,
     /// Provider options, including every unknown key swept in by
     /// [`AgentConfig`]'s deserializer.
     pub options: JsonMap,
@@ -173,7 +182,7 @@ pub type MarkdownOrigins = Vec<(String, PathBuf)>;
 /// The merged agent map and the provenance of its Markdown-defined entries.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LoadedAgents {
-    /// Every `agent.<name>` entry, after all layers have merged.
+    /// Every `agents.<name>` entry, after all layers have merged.
     pub agents: OrderedMap<AgentConfig>,
     /// Where each Markdown-defined agent came from.
     pub origins: MarkdownOrigins,
@@ -483,11 +492,14 @@ fn from_builtin(builtin: builtin::Builtin) -> Agent {
         hidden: builtin.hidden.then_some(true),
         model: None,
         variant: None,
+        reasoning: None,
         temperature: builtin.temperature,
         top_p: None,
         color: None,
         prompt: builtin.prompt.map(str::to_owned),
         steps: None,
+        tools: None,
+        delegates: None,
         options: JsonMap::new(),
         permission: None,
         source: AgentSource::Native,
@@ -503,11 +515,14 @@ fn new_agent(name: &str) -> Agent {
         hidden: None,
         model: None,
         variant: None,
+        reasoning: None,
         temperature: None,
         top_p: None,
         color: None,
         prompt: None,
         steps: None,
+        tools: None,
+        delegates: None,
         options: JsonMap::new(),
         permission: None,
         source: AgentSource::Config,
@@ -524,6 +539,11 @@ fn apply(agent: &mut Agent, config: &AgentConfig) {
     }
     if let Some(variant) = &config.variant {
         agent.variant = Some(variant.clone());
+        agent.reasoning = None;
+    }
+    if let Some(reasoning) = config.reasoning {
+        agent.reasoning = Some(reasoning);
+        agent.variant = None;
     }
     if let Some(prompt) = &config.prompt {
         agent.prompt = Some(prompt.clone());
@@ -548,6 +568,12 @@ fn apply(agent: &mut Agent, config: &AgentConfig) {
     }
     if let Some(steps) = config.steps {
         agent.steps = Some(steps);
+    }
+    if let Some(tools) = &config.tools {
+        agent.tools = Some(tools.clone());
+    }
+    if let Some(delegates) = &config.delegates {
+        agent.delegates = Some(delegates.clone());
     }
 
     // A `name` key renames the resolved agent while the config lookup key remains

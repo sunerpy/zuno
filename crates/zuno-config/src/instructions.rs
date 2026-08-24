@@ -1,54 +1,25 @@
 //! Instruction-file discovery and the `instructions[]` loader.
 //!
-//! Port of `packages/opencode/src/session/instruction.ts` (opencode 1.18.13).
-//! Instruction files are the `AGENTS.md`-style rules injected into *every*
-//! prompt, so this module has two failure modes that both cost the user money on
-//! every single turn: loading a file the TypeScript binary would not load
-//! changes how the agent behaves, and loading the same file twice pays for the
-//! tokens twice, forever.
+//! AGENTS instructions are injected into every prompt, so discovery is native,
+//! ordered, and path-de-duplicated. Zuno deliberately has no implicit OpenCode
+//! or Claude instruction fallback.
 //!
 //! # Three mechanisms, deliberately kept apart
 //!
-//! **1. The global file** (`:60-63`, applied at `:115-120`) — `$CONFIG/AGENTS.md`,
-//! else `~/.claude/CLAUDE.md`. The loop `break`s, so **at most one** global file
-//! is ever loaded, and the Claude fallback disappears when Claude-Code
-//! compatibility is off ([`InstructionOptions::claude_prompt_disabled`]).
+//! **1. Global instructions** — only `$XDG_CONFIG_HOME/zuno/AGENTS.md`.
 //!
-//! **2. The project filename cascade** (`:64-68`, applied at `:122-133`) — the
-//! rule that is easiest to get subtly wrong. The oracle iterates *filenames*
-//! and, for each, calls `findUp(name, directory, worktree)`, which returns
-//! **every** ancestor level holding that name; the `break` then stops it from
-//! trying the next filename:
+//! **2. Project instructions** — walk from the worktree root to the current
+//! directory. In each directory, `AGENTS.local.md` replaces `AGENTS.md`; nearer
+//! directories are appended later and therefore have higher priority.
 //!
-//! ```text
-//! for (const file of instructionFiles) {                     // instruction.ts:123
-//!   const matches = yield* fs.findUp(file, ctx.directory, ctx.worktree)
-//!   if (matches.length > 0) { matches.forEach(add); break }   // :127-130
-//! }
-//! ```
+//! **3. Nearby instructions** ([`Instructions::nearby`]) — when a file is read
+//! mid-session, walk upward from that file and attach instruction files not
+//! already accounted for. The system set, paths already read in the session,
+//! and the current message's claims ensure each canonical file is charged once.
 //!
-//! *first class wins* therefore means the first **filename** that exists
-//! anywhere on the chain claims the whole chain. A repo with `sub/AGENTS.md` and
-//! `root/AGENTS.md` loads **both**; a repo with `sub/CLAUDE.md` and
-//! `root/AGENTS.md` loads **only** `root/AGENTS.md`. It is a cascade across
-//! *filenames*, not a single-file pick — the oracle's own comment at `:122`
-//! ("so we don't stack AGENTS.md/CLAUDE.md from every ancestor") is about mixing
-//! the two names, not about collapsing the levels.
-//!
-//! **3. The upward append** (`:179-220`, [`Instructions::nearby`]) — a separate
-//! mechanism, triggered when a *file* is read mid-session. It walks up from that
-//! file's directory and attaches any instruction file it passes that is not
-//! already accounted for. It uses [`Instructions::find`] (the first cascade
-//! filename present in **one** directory, no walk) and applies three
-//! independent guards — the system set, the paths already read this session, and
-//! this message's claims — so each file is charged for exactly once.
-//!
-//! # `CONTEXT.md` is not here
-//!
-//! The oracle's cascade has a third filename, `CONTEXT.md`, marked
-//! `// deprecated` at `:67`. This project rejects deprecated forms (todo 10), so
-//! the cascade here is `AGENTS.md` → `CLAUDE.md` only. A deliberate, recorded
-//! divergence.
+//! Configured `instructions[]` paths and URLs remain a separate explicit source.
+//! `CLAUDE.md`, `CONTEXT.md`, and other product directories are never loaded
+//! implicitly.
 //!
 //! # Bounds
 //!
@@ -66,7 +37,7 @@ use futures::stream::StreamExt;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use zuno_paths::{Env, Layout, node_path, walk};
+use zuno_paths::{Env, Layout, node_path};
 
 /// How many local instruction files are read at once (`instruction.ts:157`).
 pub const LOCAL_CONCURRENCY: usize = 8;
@@ -77,26 +48,14 @@ pub const REMOTE_CONCURRENCY: usize = 4;
 /// The per-URL budget for a remote instruction (`instruction.ts:97`).
 pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The project-level filename cascade, in probe order.
+/// Per-directory instruction names, highest priority first.
 ///
-/// The oracle's `instructionFiles` (`instruction.ts:64-68`) also lists
-/// `CONTEXT.md`; see the module documentation for why this port stops here.
-pub const INSTRUCTION_FILENAMES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+/// `AGENTS.local.md` replaces `AGENTS.md` in the same directory. Directories
+/// load root-to-current so nearer project rules win later.
+pub const INSTRUCTION_FILENAMES: [&str; 2] = ["AGENTS.local.md", "AGENTS.md"];
 
 /// The filename probed inside the global config directory.
 pub const GLOBAL_INSTRUCTION_FILENAME: &str = "AGENTS.md";
-
-/// The Claude-Code global instruction file, relative to `$HOME`.
-pub const CLAUDE_GLOBAL_RELATIVE: [&str; 2] = [".claude", "CLAUDE.md"];
-
-/// `ZUNO_DISABLE_CLAUDE_CODE` — the broad switch
-/// (`packages/opencode/src/effect/runtime-flags.ts:24`).
-pub const ZUNO_DISABLE_CLAUDE_CODE: &str = "ZUNO_DISABLE_CLAUDE_CODE";
-
-/// `ZUNO_DISABLE_CLAUDE_CODE_PROMPT` — the targeted switch
-/// (`runtime-flags.ts:25`). Either variable disables the Claude instruction
-/// files.
-pub const ZUNO_DISABLE_CLAUDE_CODE_PROMPT: &str = "ZUNO_DISABLE_CLAUDE_CODE_PROMPT";
 
 /// The header the oracle puts above every instruction body (`instruction.ts:162`).
 const HEADER: &str = "Instructions from: ";
@@ -108,7 +67,7 @@ const HEADER: &str = "Instructions from: ";
 /// file is in their prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Origin {
-    /// `$CONFIG/AGENTS.md` or `~/.claude/CLAUDE.md`.
+    /// `$XDG_CONFIG_HOME/zuno/AGENTS.md`.
     Global,
     /// A hit from the project filename cascade.
     Project,
@@ -194,7 +153,6 @@ pub struct InstructionOptions {
     worktree: Option<PathBuf>,
     layout: Layout,
     instructions: Vec<String>,
-    claude_prompt_disabled: bool,
 }
 
 impl InstructionOptions {
@@ -216,8 +174,6 @@ impl InstructionOptions {
             worktree: worktree.map(Into::into),
             layout: Layout::resolve(env),
             instructions,
-            claude_prompt_disabled: env.flag(ZUNO_DISABLE_CLAUDE_CODE)
-                || env.flag(ZUNO_DISABLE_CLAUDE_CODE_PROMPT),
         }
     }
 
@@ -267,13 +223,6 @@ impl InstructionOptions {
         self.worktree.as_deref()
     }
 
-    /// Whether `~/.claude/CLAUDE.md` and the `CLAUDE.md` cascade entry are
-    /// suppressed — the oracle's `flags.disableClaudeCodePrompt`.
-    #[must_use]
-    pub fn claude_prompt_disabled(&self) -> bool {
-        self.claude_prompt_disabled
-    }
-
     /// Whether `ZUNO_DISABLE_PROJECT_CONFIG` suppressed project discovery.
     #[must_use]
     pub fn project_config_disabled(&self) -> bool {
@@ -281,26 +230,41 @@ impl InstructionOptions {
     }
 
     fn filenames(&self) -> Vec<&'static str> {
-        INSTRUCTION_FILENAMES
-            .iter()
-            .copied()
-            .filter(|name| !(self.claude_prompt_disabled && *name == "CLAUDE.md"))
-            .collect()
+        INSTRUCTION_FILENAMES.to_vec()
     }
 
     fn global_files(&self) -> Vec<PathBuf> {
-        let mut files = vec![
+        vec![
             self.layout
                 .effective_config()
                 .join(GLOBAL_INSTRUCTION_FILENAME),
-        ];
-        if !self.claude_prompt_disabled {
-            let mut claude = self.layout.home().to_path_buf();
-            claude.extend(CLAUDE_GLOBAL_RELATIVE);
-            files.push(claude);
-        }
-        files
+        ]
     }
+}
+
+fn project_instruction_files(options: &InstructionOptions) -> Vec<PathBuf> {
+    let directory = resolve(options.directory());
+    let boundary = options
+        .worktree()
+        .map(resolve)
+        .filter(|root| directory.starts_with(root));
+    let mut directories = Vec::new();
+    let mut current = directory;
+    loop {
+        directories.push(current.clone());
+        if boundary.as_ref().is_some_and(|root| current == *root) {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    directories.reverse();
+    directories
+        .into_iter()
+        .filter_map(|directory| Instructions::find(options, &directory))
+        .collect()
 }
 
 /// The discovered instruction set: local paths in oracle order, plus the remote
@@ -330,15 +294,8 @@ impl Instructions {
         }
 
         if !options.project_config_disabled() {
-            for name in options.filenames() {
-                let matches = walk::up(&[name], &options.directory, options.worktree.as_deref());
-                if matches.is_empty() {
-                    continue;
-                }
-                for found in &matches {
-                    paths.insert(found, Origin::Project);
-                }
-                break;
+            for found in project_instruction_files(options) {
+                paths.insert(&found, Origin::Project);
             }
         }
 
@@ -821,7 +778,7 @@ mod tests {
 
     #[test]
     fn the_cascade_excludes_context_md() {
-        assert_eq!(INSTRUCTION_FILENAMES, ["AGENTS.md", "CLAUDE.md"]);
+        assert_eq!(INSTRUCTION_FILENAMES, ["AGENTS.local.md", "AGENTS.md"]);
         assert!(!INSTRUCTION_FILENAMES.contains(&"CONTEXT.md"));
     }
 
@@ -833,25 +790,16 @@ mod tests {
     }
 
     #[test]
-    fn either_claude_flag_drops_the_claude_entries() {
+    fn instruction_names_and_global_probe_are_zuno_only() {
         let root = tempfile::tempdir().expect("tempdir");
-        for flag in [ZUNO_DISABLE_CLAUDE_CODE, ZUNO_DISABLE_CLAUDE_CODE_PROMPT] {
-            let env = env_for(root.path()).with(flag, "true");
-            let options = InstructionOptions::new(root.path(), None::<PathBuf>, &env, Vec::new());
-            assert!(options.claude_prompt_disabled(), "{flag}");
-            assert_eq!(options.filenames(), vec!["AGENTS.md"], "{flag}");
-            assert_eq!(options.global_files().len(), 1, "{flag}");
-        }
-
-        let enabled = InstructionOptions::new(
+        let options = InstructionOptions::new(
             root.path(),
             None::<PathBuf>,
             &env_for(root.path()),
             Vec::new(),
         );
-        assert!(!enabled.claude_prompt_disabled());
-        assert_eq!(enabled.filenames(), vec!["AGENTS.md", "CLAUDE.md"]);
-        assert_eq!(enabled.global_files().len(), 2);
+        assert_eq!(options.filenames(), vec!["AGENTS.local.md", "AGENTS.md"]);
+        assert_eq!(options.global_files().len(), 1);
     }
 
     /// Only one global file is ever loaded: the loop `break`s at the first hit
@@ -879,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn the_claude_global_is_the_fallback_when_agents_md_is_absent() {
+    fn claude_global_is_never_loaded_implicitly() {
         let root = tempfile::tempdir().expect("tempdir");
         let claude = root.path().join("home/.claude/CLAUDE.md");
         write(&claude, "global claude");
@@ -890,19 +838,17 @@ mod tests {
             root.path().join("repo"),
             Vec::new(),
         ));
-        assert_eq!(found.paths()[0].path(), resolve(&claude));
+        assert!(found.paths().is_empty());
     }
 
-    /// The heart of the task: the first *filename* claims the chain, and the
-    /// second filename is never probed.
+    /// Project rules load root-to-current, with local replacing base in one directory.
     #[test]
-    fn the_first_filename_class_wins_and_claims_every_level() {
+    fn project_rules_are_ordered_by_scope_and_local_overrides_the_same_directory() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "root agents");
-        write(&repo.join("CLAUDE.md"), "root claude");
         write(&repo.join("sub/AGENTS.md"), "sub agents");
-        write(&repo.join("sub/CLAUDE.md"), "sub claude");
+        write(&repo.join("sub/AGENTS.local.md"), "sub local");
 
         let found = Instructions::discover(&options_for(root.path(), repo.join("sub"), Vec::new()));
         let project: Vec<&Path> = found
@@ -914,19 +860,13 @@ mod tests {
         assert_eq!(
             project,
             vec![
-                resolve(&repo.join("sub/AGENTS.md")).as_path(),
                 resolve(&repo.join("AGENTS.md")).as_path(),
+                resolve(&repo.join("sub/AGENTS.local.md")).as_path(),
             ]
-        );
-        assert!(
-            !found.contains(&repo.join("CLAUDE.md")),
-            "CLAUDE.md must not be loaded once AGENTS.md exists"
         );
     }
 
-    /// The cascade falls through to `CLAUDE.md` only when no level has an
-    /// `AGENTS.md` at all — a nearer `CLAUDE.md` does not beat a further
-    /// `AGENTS.md`.
+    /// Claude instruction files never participate in the project cascade.
     #[test]
     fn a_nearer_claude_md_does_not_beat_a_further_agents_md() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -945,14 +885,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_md_is_used_when_no_level_has_agents_md() {
+    fn claude_md_is_ignored_when_no_level_has_agents_md() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         write(&repo.join("CLAUDE.md"), "root claude");
         write(&repo.join("sub/CLAUDE.md"), "sub claude");
 
         let found = Instructions::discover(&options_for(root.path(), repo.join("sub"), Vec::new()));
-        assert_eq!(found.paths().len(), 2);
+        assert!(found.paths().is_empty());
     }
 
     #[test]
@@ -1045,19 +985,16 @@ mod tests {
     fn find_probes_one_directory_in_cascade_order() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        write(&repo.join("sub/CLAUDE.md"), "sub claude");
         write(&repo.join("sub/AGENTS.md"), "sub agents");
+        write(&repo.join("sub/AGENTS.local.md"), "sub local");
         write(&repo.join("other/CLAUDE.md"), "other claude");
 
         let options = options_for(root.path(), repo.clone(), Vec::new());
         assert_eq!(
             Instructions::find(&options, &repo.join("sub")),
-            Some(resolve(&repo.join("sub/AGENTS.md")))
+            Some(resolve(&repo.join("sub/AGENTS.local.md")))
         );
-        assert_eq!(
-            Instructions::find(&options, &repo.join("other")),
-            Some(resolve(&repo.join("other/CLAUDE.md")))
-        );
+        assert_eq!(Instructions::find(&options, &repo.join("other")), None);
         assert_eq!(Instructions::find(&options, &repo.join("nope")), None);
     }
 

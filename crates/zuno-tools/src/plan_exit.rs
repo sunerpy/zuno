@@ -38,11 +38,12 @@
 //! not two.
 
 use crate::exposure::{ExposureFlags, exposes_plan_exit};
-use crate::question::{QuestionAsker, QuestionOption, QuestionRequest};
+use crate::question::{QuestionAsker, QuestionOption, QuestionOutcome, QuestionRequest};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 use zuno_error::ToolError;
 use zuno_tool::{ToolContext, ToolEffect, ToolOutput, TypedTool};
 
@@ -237,14 +238,37 @@ impl TypedTool for PlanExitTool {
         ctx: ToolContext,
     ) -> Result<ToolOutput, ToolError> {
         let plan = self.host.plan_path(&ctx.session_id).await?;
-        let answers = self
+        let started = Instant::now();
+        let answers = match self
             .asker
             .ask(
                 &ctx.session_id,
                 &[Self::approval_question(&plan)],
                 Some((&ctx.message_id, &ctx.call_id)),
             )
-            .await?;
+            .await?
+        {
+            QuestionOutcome::Answered(answers) => answers,
+            QuestionOutcome::Cancelled => {
+                return Err(ToolError::Denied {
+                    tool: WIRE_ID.to_owned(),
+                });
+            }
+            QuestionOutcome::Expired => {
+                return Err(ToolError::Timeout {
+                    tool: WIRE_ID.to_owned(),
+                    elapsed: started.elapsed(),
+                });
+            }
+            QuestionOutcome::Failed => {
+                return Err(ToolError::Failed {
+                    tool: WIRE_ID.to_owned(),
+                    source: Box::new(std::io::Error::other(
+                        "question request failed before the user could answer",
+                    )),
+                });
+            }
+        };
 
         // Upstream tests the *first selected label* of the first answer
         // (`plan.ts:46`), so an empty answer is not a refusal and falls through to the

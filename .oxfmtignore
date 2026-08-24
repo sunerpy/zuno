@@ -1,6 +1,7 @@
-# Generated or evidence-owned Markdown
-README.md
-.omo/
+# The Chinese README. oxfmt reflows by character count, which mismeasures CJK
+# text and produces lines that render ragged, so this translation is formatted
+# by hand and is deliberately absent from the Makefile's OXFMT_FILES list.
+docs/readme/README.zh-CN.md
 
 # Fixtures and snapshots
 fixtures/

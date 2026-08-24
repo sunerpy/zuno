@@ -23,7 +23,7 @@
 # the SQLite amalgamation (required for byte-level `opencode.db` parity), and
 # `reqwest`'s `rustls` feature selects `aws-lc-rs`, whose `aws-lc-sys` compiles C
 # through cc/cmake. That is measured, not assumed — see
-# `.omo/notepads/opencode-rust/issues.md` under "RESOLVED".
+# the project's engineering notes under "RESOLVED".
 #
 # A C dependency is cheap for a NATIVE build and expensive for a cross build: it
 # normally means assembling a per-target C cross-toolchain, or `cross`'s docker

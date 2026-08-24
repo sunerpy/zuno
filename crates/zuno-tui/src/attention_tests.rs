@@ -1047,7 +1047,7 @@ fn attention_no_audio_asset_is_compiled_into_this_crate() {
     // package must not be pulled into the build for four mp3 files, and no audio
     // whose licence cannot be stated may be vendored. Both are the same
     // observable: no audio bytes anywhere under this crate, and nothing embedding
-    // any. The floor assertions are mandatory per `.omo/WORKTREE.md` — a scan that
+    // any. The floor assertions are mandatory per the project's review policy — a scan that
     // walks the wrong directory would otherwise pass vacuously.
     let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let audio_extensions = ["mp3", "aac", "wav", "ogg", "opus", "flac", "m4a"];

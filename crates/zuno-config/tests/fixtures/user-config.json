@@ -78,9 +78,12 @@
     }
   },
   "permission": {
-    "lsp": "allow",
-    "todoread": "allow",
-    "todowrite": "allow"
+    "mode": "standard",
+    "rules": {
+      "lsp": "allow",
+      "todo_get": "allow",
+      "todo_update": "allow"
+    }
   },
   "provider": {
     "awsopenai": {

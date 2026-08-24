@@ -1,11 +1,12 @@
 {
-  "agent": {
+  "agents": {
     "code-reviewer": {
       "description": "Reviews code for best practices and potential issues",
       "model": "anthropic/claude-sonnet-4-5",
       "prompt": "You are a code reviewer. Focus on security, performance, and maintainability.",
       "permission": {
-        "edit": "deny"
+        "mode": "standard",
+        "rules": { "edit": "deny" }
       }
     }
   }

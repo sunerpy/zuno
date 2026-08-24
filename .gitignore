@@ -1,4 +1,3 @@
-.omo
 /target
 /examples/plugins/wasi-word-count/plugin.wasm
 
@@ -6,26 +5,12 @@
 # Build outputs, never source.
 /dist
 
-# Reference clones of the projects this port draws on (~570 MB). Task 1 copies
-# them here from /tmp so the References lines in .omo/plans stop dangling; they
-# are other people's repositories and must never enter this history.
-.omo/refs/
-
-# Per-task verification transcripts. Originally ignored as "local proof, not
-# shared source"; that was wrong once the gates became expensive. Todo 88's
-# transcript is the only record of a ~100-minute paired memory measurement, 89's
-# of a 2-hour soak, and 90/113/114's of results no reader can reproduce cheaply.
-# Agents force-added the five costliest for exactly that reason, which left the
-# directory half-tracked and silently dropped todo 112's file. Decisive argument:
-# untracked files do not propagate into a `git worktree`, so a worktree-based
-# Final-Wave audit would see NO evidence at all. 1.5 MB for a durable audit trail
-# is the cheaper trade. Only the throwaway generator scripts stay ignored.
-.omo/evidence/*.sh
-.omo/evidence/*.mjs
-.omo/evidence/*.json
-
-.omo/run-continuation/
-.omo/delegated-runtime/
+# Local agent working directories. These hold a maintainer's own plans,
+# measurement transcripts, and reference clones of the projects this design
+# draws on. They are private working material, never distributed source, and
+# nothing under `crates/` or `docs/` may depend on a path inside them.
+.omo/
+.zuno/
 
 *.pdb
 .DS_Store

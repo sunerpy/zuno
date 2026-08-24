@@ -8,8 +8,8 @@
 ## G1 与 G2 — 峰值常驻内存
 
 <!-- generated:BEGIN memory-gate-measurement -->
-Derived from the newest committed measurement artefact,
-[`.omo/evidence/task-123-opencode-rust.txt`](../.omo/evidence/task-123-opencode-rust.txt).
+Derived from the newest recorded measurement artefact, the task-123 memory
+measurement.
 The ceilings are not measured here:
 [`benchmarks/ts-baseline.json`](../benchmarks/ts-baseline.json) freezes each
 one at half the TypeScript median for the same workload, and every other column
@@ -25,8 +25,7 @@ G2's five `W-real` peaks were 1,493,496 · 1,493,948 · 1,494,024 · 1,510,444 �
 19,472 KiB margin — 1.29% of the ceiling — is 2,440 KiB wider than the 17,032
 KiB five-run spread. That ordering is the claim worth checking: a margin
 narrower than the spread is a coin flip that landed, not a pass. The superseded
-measurement in
-[`.omo/evidence/task-122-opencode-rust.txt`](../.omo/evidence/task-122-opencode-rust.txt)
+measurement recorded for task 122
 is the shape being avoided: a 164,552 KiB spread around a median that finished
 13,692 KiB over the same ceiling — FAIL.
 <!-- generated:END memory-gate-measurement -->

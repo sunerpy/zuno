@@ -80,12 +80,15 @@ Every field is optional.
     }
   },
 
-  "agent": {
+  "agents": {
     "my-agent": {
       "model": "myopenai/primary-model",
       "mode": "subagent",
       "description": "...",
-      "permission": { "edit": "deny" }
+      "permission": {
+        "mode": "standard",
+        "rules": { "edit": "deny" }
+      }
     }
   },
 
@@ -125,11 +128,11 @@ Every field is optional.
   },
 
   "permission": {
-    "edit": "deny",
-    "bash": { "git *": "allow", "*": "ask" }
-  },
-  "authorization": {
-    "strict": false
+    "mode": "standard",
+    "rules": {
+      "edit": "deny",
+      "bash": { "git *": "allow", "*": "ask" }
+    }
   },
 
   "formatter": false,
@@ -164,10 +167,10 @@ Shape notes worth being explicit about:
 - `agent` is an object keyed by agent name, not an array.
 - `command` is an object keyed by command name, not an array.
 - `mcp[name].command` is an array of strings, never a single string. `type` is required.
-- `permission` is either a string action or an object keyed by tool name.
-- `authorization.strict` defaults to `false`; when true, side-effecting calls
-  require a fresh human approval that `allow`, plugins, `--auto`, and standing
-  grants cannot bypass.
+- `permission` has one shape only: an object with `mode` and `rules`.
+  `mode` is `standard`, `strict`, or `allow_all`; `rules` is keyed by tool name.
+- `strict` requires fresh approval for side effects. `allow_all` skips HITL but
+  never bypasses explicit denies, sandboxing, or argument validation.
 - `web_search.provider` is `"exa"` or `"parallel"`; limits are positive integers.
 
 ## Provider initialization
@@ -218,14 +221,17 @@ Example:
       "mode": "subagent",
       "prompt": "Inspect files, environment facts, current external evidence, rollback, and authorization. Do not delegate.",
       "permission": {
-        "*": "deny",
-        "read": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "lsp": "allow",
-        "webfetch": "allow",
-        "web_search": "allow",
-        "bash": "ask"
+        "mode": "standard",
+        "rules": {
+          "*": "deny",
+          "read": "allow",
+          "glob": "allow",
+          "grep": "allow",
+          "lsp": "allow",
+          "webfetch": "allow",
+          "web_search": "allow",
+          "bash": "ask"
+        }
       }
     }
   },
@@ -254,8 +260,9 @@ Agent/workflow capabilities use ordinary Zuno tools and permissions. A
 `subagent` or `all` contribution becomes a real `task` target. Repository files
 come from `read`/`glob`/`grep`/`lsp`/`edit`, network research from
 `webfetch`/`web_search`, and environment or normal process access from `bash`.
-Do not invent a second capability field for an agent. `authorization.strict`
-still asks freshly for side effects even when the agent says `allow`.
+Do not invent a second capability field for an agent. Top-level
+`permission.mode: "strict"` still asks freshly for side effects even when an
+agent rule says `allow`.
 
 Static packages may additionally declare executable `tools` backed by one
 runtime:
@@ -365,12 +372,15 @@ Two ways to define an agent. Use the file form for anything non-trivial.
 
 ```json
 {
-  "agent": {
+  "agents": {
     "my-reviewer": {
       "description": "Reviews PRs for style violations.",
       "mode": "subagent",
       "model": "myopenai/primary-model",
-      "permission": { "edit": "deny", "bash": "ask" },
+      "permission": {
+        "mode": "standard",
+        "rules": { "edit": "deny", "bash": "ask" }
+      },
       "prompt": "You are a strict PR reviewer..."
     }
   }
@@ -389,8 +399,10 @@ description: Reviews PRs for style violations.
 mode: subagent
 model: myopenai/primary-model
 permission:
-  edit: deny
-  bash: ask
+  mode: standard
+  rules:
+    edit: deny
+    bash: ask
 ---
 
 You are a strict PR reviewer. Focus on...
@@ -475,53 +487,56 @@ tokens support `{env:VAR}` interpolation (and `{file:path}`); the shell-style
 
 ## Permissions
 
+Zuno accepts one permission representation only:
+
 ```json
 "permission": {
-  "edit": "deny",
-  "bash": { "git *": "allow", "rm *": "deny", "*": "ask" },
-  "external_directory": { "~/secrets/**": "deny", "*": "allow" }
+  "mode": "standard",
+  "rules": {
+    "edit": "deny",
+    "bash": { "git *": "allow", "rm *": "deny", "*": "ask" },
+    "external_directory": { "~/secrets/**": "deny", "*": "allow" }
+  }
 }
 ```
 
-Actions: `"allow"`, `"ask"`, `"deny"`.
+`mode` is `"standard"`, `"strict"`, or `"allow_all"`:
 
-Per-tool value forms: `"allow"` shorthand (treated as `{"*": "allow"}`), or an
-object `{ pattern: action }`. Within an object, **insertion order matters**.
-Zuno evaluates the LAST matching rule, so put broad rules first and narrow
-rules last.
+- `standard` applies ordered rules and normal risk gates.
+- `strict` requires a fresh attached-user decision for every side-effecting
+  call after explicit denies are evaluated.
+- `allow_all` skips Zuno HITL prompts, but explicit denies, sandboxing, argument
+  validation, and provider/runtime safety checks still apply.
 
-`permission: "allow"` (a string at the top level) is shorthand for "allow
-everything". Use it when the user explicitly wants ordinary tool calls to run
-without confirmation. A narrower prompt-free shell setup must allow both
-`bash` and `external_directory`, because paths outside the workspace have their
-own escalation. Confirm the merged result with `zuno debug config`.
+Legacy top-level strings, direct tool maps, and `authorization.strict` are
+invalid. Confirm the effective policy with `zuno debug permissions` and
+`zuno debug config`.
+
+Actions are `"allow"`, `"ask"`, and `"deny"`. A per-tool rule is either one
+action or an object `{ pattern: action }`. Within a pattern object, **insertion
+order matters**. Zuno evaluates the last matching rule, so put broad rules first
+and narrow rules last. An explicit deny remains terminal in every mode.
 
 Known permission keys: `read, edit, glob, grep, list, bash, task,
-external_directory, todowrite, question, webfetch, web_search, lsp, doom_loop,
-skill`. Some of these (`todowrite,
-question, webfetch, web_search, doom_loop`) only accept a flat
-action, not a per-pattern object.
+external_directory, plan_get, plan_update, todo_get, todo_update, question,
+webfetch, web_search, lsp, doom_loop, skill`. `plan_get`, `plan_update`,
+`todo_get`, `todo_update`, `question`, `webfetch`, `web_search`, and `doom_loop`
+accept only a flat action, not a per-pattern object. Unknown extension/MCP tool
+keys are retained and evaluated normally.
 
 `external_directory` patterns are filesystem paths (use `~/`, absolute paths,
-or globs like `~/projects/**`).
+or globs like `~/projects/**`). A narrower prompt-free shell setup in standard
+mode must allow both `bash` and `external_directory`, because paths outside the
+workspace have their own escalation.
 
-Per-agent `permission:` overrides top-level `permission:`. Plan Mode lives on
-the `plan` agent's permission ruleset (`edit: deny *`).
-
-Strict HITL is a separate top-level policy:
-
-```json
-"authorization": { "strict": true }
-```
-
-It adds a one-call-only prompt to side-effecting tools. Reads, native
-`glob`/`grep`, LSP inspection, MCP resource reads, `webfetch`, and `web_search`
-remain subject to their normal permission rules without the extra prompt.
-Unknown harness and MCP tools default to side-effecting. `bash` is always treated
-as side-effecting because command analysis is not an OS sandbox. Independently,
-the shell risk gate keeps destructive or overwrite operations human-only even
-under `permission: "allow"`; exact non-recursive `rm -f` cleanup of an already
-absent path below the OS temporary directory is treated as a no-op.
+Per-agent `permission` policies are merged through the same runtime path as the
+top-level policy. Plan Mode's built-in agent overlay denies edits except for its
+owned plan document. Reads, native `glob`/`grep`, LSP inspection, MCP resource
+reads, `webfetch`, and `web_search` do not receive strict's extra prompt. Unknown
+harness and MCP tools default to side-effecting. `bash` is always side-effecting
+because command analysis is not an OS sandbox. The shell risk gate remains
+independent and may reject destructive or overwrite operations even in
+`allow_all`.
 
 ## Escape hatches
 

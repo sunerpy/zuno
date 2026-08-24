@@ -44,7 +44,7 @@ impl TypedTool for Read {
 }
 
 #[test]
-fn the_injected_intent_is_present_and_required() {
+fn the_injected_intent_is_present_but_optional() {
     let parameters = erase(Read).definition().parameters;
 
     assert_eq!(parameters["properties"][INTENT_KEY]["type"], "string");
@@ -55,8 +55,8 @@ fn the_injected_intent_is_present_and_required() {
         .filter_map(Value::as_str)
         .collect();
     assert!(
-        required.contains(&INTENT_KEY),
-        "an optional intent is an intent the model will skip"
+        !required.contains(&INTENT_KEY),
+        "intent is optional metadata, not part of the typed tool contract"
     );
     assert!(
         required.contains(&"file_path"),
@@ -112,8 +112,8 @@ fn a_derived_schema_is_valid_json_schema_with_no_hand_written_json() {
     assert!(properties.contains_key("offset"));
     assert_eq!(
         parameters["required"],
-        json!(["file_path", INTENT_KEY]),
-        "only the non-Option field and the injected intent are required"
+        json!(["file_path"]),
+        "only the non-Option field declared by the params type is required"
     );
 }
 
@@ -150,9 +150,6 @@ fn augmentation_is_the_only_difference_from_the_derived_schema() {
     let properties = object["properties"].as_object_mut().expect("properties");
     properties.remove(INTENT_KEY);
     properties.remove(ACCEPT_LARGE_OUTPUT_KEY);
-    let required = object["required"].as_array_mut().expect("required");
-    required.retain(|entry| entry.as_str() != Some(INTENT_KEY));
-
     assert_eq!(augmented, raw);
 }
 
@@ -206,10 +203,7 @@ fn a_proxied_tool_is_augmented_without_editing_the_remote_schema() {
         parameters["properties"][ACCEPT_LARGE_OUTPUT_KEY]["type"],
         "boolean"
     );
-    assert_eq!(
-        parameters["required"],
-        json!(["query", "projectPath", INTENT_KEY])
-    );
+    assert_eq!(parameters["required"], json!(["query", "projectPath"]));
     // The server's own keywords are untouched.
     assert_eq!(parameters["additionalProperties"], false);
 }
@@ -222,5 +216,8 @@ fn a_proxied_schema_with_no_declared_type_is_still_augmented() {
     let parameters = proxy.definition().parameters;
 
     assert_eq!(parameters["properties"][INTENT_KEY]["type"], "string");
-    assert_eq!(parameters["required"], json!([INTENT_KEY]));
+    assert!(
+        parameters.get("required").is_none(),
+        "optional metadata must not invent required parameters for an MCP tool"
+    );
 }

@@ -48,6 +48,8 @@ pub const THEME_DIALOG_ID: &str = "theme_list";
 pub const MCP_DIALOG_ID: &str = "mcp_list";
 /// The dialog id for the skill list.
 pub const SKILL_DIALOG_ID: &str = "prompt_skills";
+/// The dialog id for durable queued-input management.
+pub const QUEUED_INPUT_DIALOG_ID: &str = "queued_inputs";
 
 /// The MCP servers, as a filterable list.
 ///
@@ -604,6 +606,23 @@ impl SelectDialog {
         self.filtered
             .get(self.cursor)
             .map(|index| &self.items[*index])
+    }
+
+    /// Atomically replace the rows while retaining the selected durable value when possible.
+    fn replace_items(&mut self, items: Vec<Item>) {
+        let selected = self.selected().map(|item| item.value.clone());
+        self.items = items;
+        let filter = self.filter.clone();
+        self.set_filter(&filter);
+        if let Some(selected) = selected
+            && let Some(position) = self
+                .filtered
+                .iter()
+                .position(|index| self.items[*index].value == selected)
+        {
+            self.cursor = position;
+        }
+        self.refresh_highlight();
     }
 
     /// Set the filter and re-rank.
@@ -1182,6 +1201,314 @@ impl Dialog for SessionDialog {
     }
 }
 
+/// Delivery semantics shown beside one queued input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueuedInputDelivery {
+    /// Run after the current turn, preserving FIFO order.
+    Queue,
+    /// Inject at the next safe boundary of the active generation.
+    Steer,
+}
+
+impl QueuedInputDelivery {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Queue => "next turn",
+            Self::Steer => "steer",
+        }
+    }
+}
+
+/// One user-manageable durable input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedInputEntry {
+    pub id: String,
+    pub text: String,
+    pub delivery: QueuedInputDelivery,
+    pub revision: i64,
+    /// Commands and host operations can be cancelled but not rewritten as plain text.
+    pub editable: bool,
+}
+
+/// A mutation acknowledged only after the durable transaction commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueuedInputNoticeKind {
+    Admitted(QueuedInputDelivery),
+    Edited,
+    Cancelled,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedInputNotice {
+    pub input_id: String,
+    pub kind: QueuedInputNoticeKind,
+}
+
+#[derive(Debug, Default)]
+struct ProjectedQueuedInputs {
+    generation: u64,
+    inputs: Vec<QueuedInputEntry>,
+    notice: Option<QueuedInputNotice>,
+}
+
+/// Shared durable queue projection. Rendering and row actions perform no database I/O.
+#[derive(Debug, Clone, Default)]
+pub struct QueuedInputProjection(Arc<RwLock<ProjectedQueuedInputs>>);
+
+impl QueuedInputProjection {
+    #[must_use]
+    pub fn new(inputs: Vec<QueuedInputEntry>) -> Self {
+        Self(Arc::new(RwLock::new(ProjectedQueuedInputs {
+            generation: 0,
+            inputs,
+            notice: None,
+        })))
+    }
+
+    pub fn replace(&self, inputs: Vec<QueuedInputEntry>) {
+        self.publish(inputs, None);
+    }
+
+    /// Publish rows and an optional post-commit acknowledgement.
+    pub fn publish(&self, inputs: Vec<QueuedInputEntry>, notice: Option<QueuedInputNotice>) {
+        let mut projected = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        if projected.inputs == inputs && notice.is_none() {
+            return;
+        }
+        projected.inputs = inputs;
+        projected.notice = notice;
+        projected.generation = projected.generation.wrapping_add(1);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<QueuedInputEntry> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .inputs
+            .clone()
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .generation
+    }
+
+    #[must_use]
+    pub fn observe(&self) -> (u64, Vec<QueuedInputEntry>, Option<QueuedInputNotice>) {
+        let projected = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        (
+            projected.generation,
+            projected.inputs.clone(),
+            projected.notice.clone(),
+        )
+    }
+}
+
+/// Typed operation emitted by the durable queue dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueuedInputDialogAction {
+    Edit {
+        id: String,
+        expected_revision: i64,
+        text: String,
+    },
+    Cancel {
+        id: String,
+        expected_revision: i64,
+    },
+}
+
+/// Live queue manager. Edit overlays this dialog; cancellation keeps it open.
+pub struct QueuedInputDialog {
+    select: SelectDialog,
+    projection: QueuedInputProjection,
+    cancel_confirmation: Option<String>,
+}
+
+impl QueuedInputDialog {
+    fn new(context: ViewContext, projection: QueuedInputProjection) -> Self {
+        let mut dialog = Self {
+            select: SelectDialog::new(
+                QUEUED_INPUT_DIALOG_ID,
+                "Queued prompts",
+                context,
+                Vec::new(),
+            ),
+            projection,
+            cancel_confirmation: None,
+        };
+        dialog.sync();
+        dialog
+    }
+
+    fn sync(&mut self) {
+        let inputs = self.projection.snapshot();
+        let rows = inputs
+            .iter()
+            .map(|input| {
+                let mut detail = format!("{} · rev {}", input.delivery.label(), input.revision);
+                if !input.editable {
+                    detail.push_str(" · cancel only");
+                }
+                Item::new(flatten(&input.text))
+                    .described(detail)
+                    .valued(input.id.clone())
+            })
+            .collect();
+        self.select.replace_items(rows);
+        if self
+            .cancel_confirmation
+            .as_ref()
+            .is_some_and(|id| !inputs.iter().any(|input| &input.id == id))
+        {
+            self.cancel_confirmation = None;
+        }
+    }
+
+    fn selected_entry(&self) -> Option<QueuedInputEntry> {
+        let id = &self.select.selected()?.value;
+        self.projection
+            .snapshot()
+            .into_iter()
+            .find(|input| &input.id == id)
+    }
+
+    fn edit_step(&self) -> DialogStep {
+        let Some(input) = self.selected_entry().filter(|input| input.editable) else {
+            return DialogStep::Ignored;
+        };
+        DialogStep::Emitted(DialogOutcome::QueuedInput(QueuedInputDialogAction::Edit {
+            id: input.id,
+            expected_revision: input.revision,
+            text: input.text,
+        }))
+    }
+
+    fn map_selection_to_edit(&self, step: DialogStep) -> DialogStep {
+        match step {
+            DialogStep::Resolved(DialogOutcome::Selected { dialog, .. })
+                if dialog == QUEUED_INPUT_DIALOG_ID =>
+            {
+                self.edit_step()
+            }
+            other => other,
+        }
+    }
+}
+
+impl Dialog for QueuedInputDialog {
+    fn id(&self) -> &'static str {
+        QUEUED_INPUT_DIALOG_ID
+    }
+
+    fn title(&self) -> String {
+        format!("Queued prompts ({})", self.projection.snapshot().len())
+    }
+
+    fn lines(&mut self, width: u16) -> Vec<Line<'static>> {
+        self.sync();
+        if self.projection.snapshot().is_empty() {
+            return vec![padded(
+                " No queued prompts. Messages sent while working appear here after commit.",
+                width,
+                self.select.context.muted(),
+            )];
+        }
+        let armed = self.cancel_confirmation.as_deref();
+        let selected = self.select.selected().map(|item| item.value.as_str());
+        let selected_row = (armed == selected && armed.is_some()).then(|| {
+            self.select
+                .cursor
+                .saturating_sub(self.select.window_start())
+        });
+        let mut lines = self.select.lines(width);
+        if let Some(row) = selected_row
+            && row < lines.len()
+        {
+            lines[row] = padded(
+                " > Press ctrl+d again to cancel this queued input",
+                width,
+                self.select.context.selected(),
+            );
+        }
+        lines
+    }
+
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.projection.snapshot().is_empty() {
+            return vec![("esc", "close")];
+        }
+        vec![
+            ("enter", "edit"),
+            ("ctrl+r", "edit"),
+            ("ctrl+d", "cancel twice"),
+            ("↑↓", "move"),
+            ("type", "search"),
+            ("esc", "close"),
+        ]
+    }
+
+    fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> DialogStep {
+        self.sync();
+        match action.name {
+            "session_rename" | "dialog.select.submit" | "dialog.prompt.submit" => {
+                self.cancel_confirmation = None;
+                self.edit_step()
+            }
+            "session_delete" => {
+                let Some(input) = self.selected_entry() else {
+                    self.cancel_confirmation = None;
+                    return DialogStep::Ignored;
+                };
+                if self.cancel_confirmation.as_deref() == Some(input.id.as_str()) {
+                    self.cancel_confirmation = None;
+                    DialogStep::Emitted(DialogOutcome::QueuedInput(
+                        QueuedInputDialogAction::Cancel {
+                            id: input.id,
+                            expected_revision: input.revision,
+                        },
+                    ))
+                } else {
+                    self.cancel_confirmation = Some(input.id);
+                    DialogStep::Redraw
+                }
+            }
+            _ => {
+                self.cancel_confirmation = None;
+                let step = self.select.handle_action(action, event);
+                self.map_selection_to_edit(step)
+            }
+        }
+    }
+
+    fn handle_mouse(&mut self, event: &MouseEvent, body: Rect) -> DialogStep {
+        self.sync();
+        self.cancel_confirmation = None;
+        let step = self.select.handle_mouse(event, body);
+        self.map_selection_to_edit(step)
+    }
+
+    fn handle_typed(&mut self, key: &KeyEvent) -> DialogStep {
+        self.sync();
+        self.cancel_confirmation = None;
+        self.select.handle_typed(key)
+    }
+}
+
+/// The durable queued-input manager. It remains useful when empty, so it always opens.
+#[must_use]
+pub fn queued_input_dialog(
+    context: ViewContext,
+    projection: QueuedInputProjection,
+) -> QueuedInputDialog {
+    QueuedInputDialog::new(context, projection)
+}
+
 /// The session picker.
 #[must_use]
 pub fn session_picker(context: ViewContext, sessions: Vec<SessionEntry>) -> SessionDialog {
@@ -1233,12 +1560,12 @@ pub struct ModelEntry {
 ///
 /// None of the four reference implementations does this, and each was checked: `codex` builds
 /// one flat `SelectionItem` per preset
-/// (`.omo/refs/codex/codex-rs/tui/src/chatwidget/model_popups.rs:198-220`), `omo-slim` hands
+/// (`codex`), `omo-slim` hands
 /// the host a flattened list with the provider id as each row's description
-/// (`.omo/refs/omo-slim/src/tui-preset.ts:513-525`), `jcode`'s terminal picker makes the
+/// (`omo-slim`), `jcode`'s terminal picker makes the
 /// provider a per-row switchable option, and its desktop picker walks provider → connection →
 /// model as three separate stages
-/// (`.omo/refs/jcode/crates/jcode-desktop2/src/model_picker.rs:3-9`). The staged walk was
+/// (`jcode`). The staged walk was
 /// rejected: it hides every model until a provider is chosen, so it cannot answer "which
 /// provider has the model I want" — which is the question a search box exists for.
 #[must_use]

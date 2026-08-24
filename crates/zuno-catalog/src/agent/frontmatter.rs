@@ -17,8 +17,8 @@
 //! |---|---|
 //! | plain scalar (`mode: subagent`) | `agent/dq.md` family |
 //! | double- and single-quoted scalars | `mode: "subagent"`, `mode: 'subagent'` |
-//! | nested block map (`permission:` then indented keys) | emitted `edit`/`bash` rules |
-//! | flow map (`permission: { edit: deny }`) | emitted the same rules |
+//! | nested block map (`permission.rules:` then indented keys) | emitted `edit`/`bash` rules |
+//! | flow map (`permission: { mode: standard, rules: {...} }`) | emitted the same policy |
 //! | block scalar (`description: \|`) | agent loaded, `mode` after it still read |
 //! | comments and blank lines inside the head | agent loaded |
 //! | an unquoted colon in a value | agent loaded via the `sanitize` retry |
@@ -997,20 +997,27 @@ mod tests {
 
     #[test]
     fn a_nested_block_map_becomes_a_nested_object() {
-        let text = "---\nmode: subagent\npermission:\n  edit: deny\n  bash:\n    \"git push\": ask\n---\nbody\n";
+        let text = "---\nmode: subagent\npermission:\n  mode: standard\n  rules:\n    edit: deny\n    bash:\n      \"git push\": ask\n---\nbody\n";
         assert_eq!(
             data(text),
             json!({
                 "mode": "subagent",
-                "permission": { "edit": "deny", "bash": { "git push": "ask" } },
+                "permission": {
+                    "mode": "standard",
+                    "rules": { "edit": "deny", "bash": { "git push": "ask" } },
+                },
             })
         );
     }
 
     #[test]
     fn a_flow_map_matches_the_equivalent_block_map() {
-        let flow = data("---\npermission: { edit: deny, webfetch: allow }\n---\nb\n");
-        let block = data("---\npermission:\n  edit: deny\n  webfetch: allow\n---\nb\n");
+        let flow = data(
+            "---\npermission: { mode: standard, rules: { edit: deny, webfetch: allow } }\n---\nb\n",
+        );
+        let block = data(
+            "---\npermission:\n  mode: standard\n  rules:\n    edit: deny\n    webfetch: allow\n---\nb\n",
+        );
         assert_eq!(flow, block);
     }
 

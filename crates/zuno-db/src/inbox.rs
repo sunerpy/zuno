@@ -10,28 +10,90 @@ use zuno_error::DbError;
 /// When an admitted input should become model-visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputDelivery {
+    /// Remain FIFO-queued until the next driver turn.
+    Queue,
     /// Inject at the next safe point of an active turn.
     Steer,
-    /// Start or join the next driver step.
-    NextStep,
 }
 
 impl InputDelivery {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Queue => "queue",
             Self::Steer => "steer",
-            Self::NextStep => "next-step",
         }
     }
 
     fn parse(value: &str) -> Result<Self, DbError> {
         match value {
+            "queue" => Ok(Self::Queue),
             "steer" => Ok(Self::Steer),
-            "next-step" => Ok(Self::NextStep),
             _ => Err(query_error(std::io::Error::other(format!(
                 "unknown input delivery `{value}`"
             )))),
         }
+    }
+
+    const fn admitted_state(self) -> SubmissionState {
+        match self {
+            Self::Queue => SubmissionState::Queued,
+            Self::Steer => SubmissionState::Steering,
+        }
+    }
+}
+
+/// Durable lifecycle of one submitted input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionState {
+    /// Transient caller state before SQLite confirms admission.
+    Admitting,
+    /// Persisted FIFO work for a future turn.
+    Queued,
+    /// Persisted input waiting for an active turn safe point.
+    Steering,
+    /// Claimed exactly once by a driver or active generation.
+    Promoted,
+    /// Persisted as model-visible user input.
+    Consumed,
+    /// Removed by the user before promotion.
+    Cancelled,
+    /// Could not be decoded or persisted after admission.
+    Failed,
+}
+
+impl SubmissionState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitting => "admitting",
+            Self::Queued => "queued",
+            Self::Steering => "steering",
+            Self::Promoted => "promoted",
+            Self::Consumed => "consumed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, DbError> {
+        match value {
+            "admitting" => Ok(Self::Admitting),
+            "queued" => Ok(Self::Queued),
+            "steering" => Ok(Self::Steering),
+            "promoted" => Ok(Self::Promoted),
+            "consumed" => Ok(Self::Consumed),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            _ => Err(query_error(std::io::Error::other(format!(
+                "unknown input submission state `{value}`"
+            )))),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_pending(self) -> bool {
+        matches!(self, Self::Queued | Self::Steering)
     }
 }
 
@@ -81,12 +143,20 @@ pub struct SessionInput {
     pub prompt: Value,
     /// Requested delivery behavior.
     pub delivery: InputDelivery,
+    /// Current durable lifecycle state.
+    pub state: SubmissionState,
+    /// Optimistic revision used by queue edits and cancellation.
+    pub revision: i64,
     /// Sequence of the admission event.
     pub admitted_sequence: i64,
     /// Sequence of the promotion event, once claimed.
     pub promoted_sequence: Option<i64>,
+    /// Terminal diagnostic when the submission failed.
+    pub error: Option<String>,
     /// Creation timestamp in milliseconds since the Unix epoch.
     pub time_created: i64,
+    /// Last durable state-change timestamp.
+    pub time_updated: i64,
 }
 
 /// Durable FIFO inbox over the session event stream.
@@ -148,10 +218,10 @@ impl SessionInbox {
         self.pool.transaction(|transaction| {
             let stored = transaction
                 .query_row(
-                    "SELECT id, session_id, prompt, delivery, admitted_seq, \
-                            promoted_seq, time_created \
+                    "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
+                            promoted_seq, error, time_created, time_updated \
                      FROM session_input \
-                     WHERE session_id = ?1 AND id = ?2 AND promoted_seq IS NULL",
+                     WHERE session_id = ?1 AND id = ?2 AND state IN ('queued', 'steering')",
                     params![session_id, input_id],
                     decode_stored_input,
                 )
@@ -171,10 +241,10 @@ impl SessionInbox {
         let connection = self.pool.get()?;
         let mut statement = connection
             .prepare(
-                "SELECT id, session_id, prompt, delivery, admitted_seq, \
-                        promoted_seq, time_created \
+                "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
+                        promoted_seq, error, time_created, time_updated \
                  FROM session_input \
-                 WHERE session_id = ?1 AND promoted_seq IS NULL \
+                 WHERE session_id = ?1 AND state IN ('queued', 'steering') \
                  ORDER BY admitted_seq",
             )
             .map_err(open::map_error)?;
@@ -183,6 +253,96 @@ impl SessionInbox {
             .map_err(open::map_error)?;
         rows.map(|row| row.map_err(open::map_error).and_then(decode_input))
             .collect()
+    }
+
+    /// Read one input regardless of lifecycle state.
+    pub fn get(&self, session_id: &str, input_id: &str) -> Result<Option<SessionInput>, DbError> {
+        let connection = self.pool.get()?;
+        select_by_id(&connection, session_id, input_id)
+    }
+
+    /// Replace one still-pending prompt using optimistic concurrency.
+    pub fn edit_pending(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        expected_revision: i64,
+        prompt: Value,
+        time_updated: i64,
+    ) -> Result<SessionInput, DbError> {
+        self.pool.transaction(|transaction| {
+            edit_pending_in(
+                transaction,
+                session_id,
+                input_id,
+                expected_revision,
+                prompt,
+                time_updated,
+            )
+        })
+    }
+
+    /// Cancel one still-pending input using optimistic concurrency.
+    pub fn cancel_pending(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        expected_revision: i64,
+        time_updated: i64,
+    ) -> Result<SessionInput, DbError> {
+        self.pool.transaction(|transaction| {
+            cancel_pending_in(
+                transaction,
+                session_id,
+                input_id,
+                expected_revision,
+                time_updated,
+            )
+        })
+    }
+
+    /// Mark a promoted input as durably model-visible.
+    pub fn mark_consumed(
+        &self,
+        session_id: &str,
+        input_id: &str,
+    ) -> Result<Option<SessionInput>, DbError> {
+        self.pool.transaction(|transaction| {
+            transition_in(
+                transaction,
+                session_id,
+                input_id,
+                &[SubmissionState::Promoted],
+                SubmissionState::Consumed,
+                None,
+                "session.input.consumed",
+            )
+        })
+    }
+
+    /// Mark an admitted input failed without making it eligible for replay.
+    pub fn mark_failed(
+        &self,
+        session_id: &str,
+        input_id: &str,
+        error: impl Into<String>,
+    ) -> Result<Option<SessionInput>, DbError> {
+        let error = error.into();
+        self.pool.transaction(|transaction| {
+            transition_in(
+                transaction,
+                session_id,
+                input_id,
+                &[
+                    SubmissionState::Queued,
+                    SubmissionState::Steering,
+                    SubmissionState::Promoted,
+                ],
+                SubmissionState::Failed,
+                Some(error.as_str()),
+                "session.input.failed",
+            )
+        })
     }
 }
 
@@ -205,16 +365,19 @@ pub(crate) fn admit_in(
         NewSessionEvent::new("session.input.admitted", event_properties_new(&input))?,
     )?;
     let prompt = serde_json::to_string(&input.prompt).map_err(query_error)?;
+    let state = input.delivery.admitted_state();
     transaction
         .execute(
             "INSERT INTO session_input \
-             (id, session_id, prompt, delivery, admitted_seq, promoted_seq, time_created) \
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)",
+             (id, session_id, prompt, delivery, state, revision, admitted_seq, promoted_seq, \
+              error, time_created, time_updated) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, NULL, NULL, ?7, ?7)",
             params![
                 input.id,
                 input.session_id,
                 prompt,
                 input.delivery.as_str(),
+                state.as_str(),
                 event.sequence,
                 input.time_created
             ],
@@ -225,9 +388,13 @@ pub(crate) fn admit_in(
         session_id: input.session_id,
         prompt: input.prompt,
         delivery: input.delivery,
+        state,
+        revision: 1,
         admitted_sequence: event.sequence,
         promoted_sequence: None,
+        error: None,
         time_created: input.time_created,
+        time_updated: input.time_created,
     })
 }
 
@@ -264,10 +431,10 @@ fn select_next(
     let stored = match delivery {
         Some(delivery) => transaction
             .query_row(
-                "SELECT id, session_id, prompt, delivery, admitted_seq, \
-                        promoted_seq, time_created \
+                "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
+                        promoted_seq, error, time_created, time_updated \
                  FROM session_input \
-                 WHERE session_id = ?1 AND promoted_seq IS NULL AND delivery = ?2 \
+                 WHERE session_id = ?1 AND state IN ('queued', 'steering') AND delivery = ?2 \
                  ORDER BY admitted_seq LIMIT 1",
                 params![session_id, delivery.as_str()],
                 decode_stored_input,
@@ -276,10 +443,10 @@ fn select_next(
             .map_err(open::map_error)?,
         None => transaction
             .query_row(
-                "SELECT id, session_id, prompt, delivery, admitted_seq, \
-                        promoted_seq, time_created \
+                "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
+                        promoted_seq, error, time_created, time_updated \
                  FROM session_input \
-                 WHERE session_id = ?1 AND promoted_seq IS NULL \
+                 WHERE session_id = ?1 AND state IN ('queued', 'steering') \
                  ORDER BY admitted_seq LIMIT 1",
                 [session_id],
                 decode_stored_input,
@@ -298,6 +465,10 @@ fn promote_selected(
     let Some(mut input) = input else {
         return Ok(None);
     };
+    let previous_revision = input.revision;
+    input.state = SubmissionState::Promoted;
+    input.revision = input.revision.saturating_add(1);
+    input.time_updated = crate::message::now_millis();
     let event = append_in(
         transaction,
         session_id,
@@ -305,13 +476,25 @@ fn promote_selected(
     )?;
     let changed = transaction
         .execute(
-            "UPDATE session_input SET promoted_seq = ?1 \
-             WHERE id = ?2 AND promoted_seq IS NULL",
-            params![event.sequence, input.id],
+            "UPDATE session_input SET promoted_seq = ?1, state = ?2, revision = ?3, \
+             time_updated = ?4 WHERE id = ?5 AND session_id = ?6 AND revision = ?7 \
+             AND state IN ('queued', 'steering')",
+            params![
+                event.sequence,
+                input.state.as_str(),
+                input.revision,
+                input.time_updated,
+                input.id,
+                session_id,
+                previous_revision,
+            ],
         )
         .map_err(open::map_error)?;
-    if changed == 0 {
-        return Ok(None);
+    if changed != 1 {
+        return Err(conflict(
+            &input.id,
+            "state or revision changed while the input was being promoted",
+        ));
     }
     input.promoted_sequence = Some(event.sequence);
     Ok(Some(input))
@@ -322,9 +505,13 @@ struct StoredInput {
     session_id: String,
     prompt: String,
     delivery: String,
+    state: String,
+    revision: i64,
     admitted_sequence: i64,
     promoted_sequence: Option<i64>,
+    error: Option<String>,
     time_created: i64,
+    time_updated: i64,
 }
 
 fn decode_stored_input(row: &Row<'_>) -> rusqlite::Result<StoredInput> {
@@ -333,9 +520,13 @@ fn decode_stored_input(row: &Row<'_>) -> rusqlite::Result<StoredInput> {
         session_id: row.get(1)?,
         prompt: row.get(2)?,
         delivery: row.get(3)?,
-        admitted_sequence: row.get(4)?,
-        promoted_sequence: row.get(5)?,
-        time_created: row.get(6)?,
+        state: row.get(4)?,
+        revision: row.get(5)?,
+        admitted_sequence: row.get(6)?,
+        promoted_sequence: row.get(7)?,
+        error: row.get(8)?,
+        time_created: row.get(9)?,
+        time_updated: row.get(10)?,
     })
 }
 
@@ -345,9 +536,13 @@ fn decode_input(stored: StoredInput) -> Result<SessionInput, DbError> {
         session_id: stored.session_id,
         prompt: serde_json::from_str(&stored.prompt).map_err(query_error)?,
         delivery: InputDelivery::parse(&stored.delivery)?,
+        state: SubmissionState::parse(&stored.state)?,
+        revision: stored.revision,
         admitted_sequence: stored.admitted_sequence,
         promoted_sequence: stored.promoted_sequence,
+        error: stored.error,
         time_created: stored.time_created,
+        time_updated: stored.time_updated,
     })
 }
 
@@ -363,6 +558,11 @@ fn event_properties_new(input: &NewSessionInput) -> Map<String, Value> {
             "delivery".to_owned(),
             Value::String(input.delivery.as_str().to_owned()),
         ),
+        (
+            "state".to_owned(),
+            Value::String(input.delivery.admitted_state().as_str().to_owned()),
+        ),
+        ("revision".to_owned(), Value::Number(1.into())),
         (
             "timeCreated".to_owned(),
             Value::Number(input.time_created.into()),
@@ -383,11 +583,219 @@ fn event_properties(input: &SessionInput, include_prompt: bool) -> Map<String, V
             "delivery".to_owned(),
             Value::String(input.delivery.as_str().to_owned()),
         ),
+        (
+            "state".to_owned(),
+            Value::String(input.state.as_str().to_owned()),
+        ),
+        ("revision".to_owned(), Value::Number(input.revision.into())),
+        (
+            "timeUpdated".to_owned(),
+            Value::Number(input.time_updated.into()),
+        ),
     ]
     .into_iter()
     .collect::<Map<_, _>>();
     if include_prompt {
         properties.insert("prompt".to_owned(), input.prompt.clone());
     }
+    if let Some(error) = &input.error {
+        properties.insert("error".to_owned(), Value::String(error.clone()));
+    }
     properties
+}
+
+fn select_by_id(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    input_id: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    connection
+        .query_row(
+            "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
+                    promoted_seq, error, time_created, time_updated \
+             FROM session_input WHERE session_id = ?1 AND id = ?2",
+            params![session_id, input_id],
+            decode_stored_input,
+        )
+        .optional()
+        .map_err(open::map_error)?
+        .map(decode_input)
+        .transpose()
+}
+
+fn edit_pending_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+    expected_revision: i64,
+    prompt: Value,
+    time_updated: i64,
+) -> Result<SessionInput, DbError> {
+    let mut input = require_pending_revision(transaction, session_id, input_id, expected_revision)?;
+    let encoded = serde_json::to_string(&prompt).map_err(query_error)?;
+    input.prompt = prompt;
+    input.revision = input.revision.saturating_add(1);
+    input.time_updated = time_updated.max(input.time_updated);
+    append_in(
+        transaction,
+        session_id,
+        NewSessionEvent::new("session.input.edited", event_properties(&input, true))?,
+    )?;
+    let changed = transaction
+        .execute(
+            "UPDATE session_input SET prompt = ?1, revision = ?2, time_updated = ?3 \
+             WHERE session_id = ?4 AND id = ?5 AND revision = ?6 \
+             AND state IN ('queued', 'steering')",
+            params![
+                encoded,
+                input.revision,
+                input.time_updated,
+                session_id,
+                input_id,
+                expected_revision,
+            ],
+        )
+        .map_err(open::map_error)?;
+    require_changed(input_id, changed)?;
+    Ok(input)
+}
+
+fn cancel_pending_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+    expected_revision: i64,
+    time_updated: i64,
+) -> Result<SessionInput, DbError> {
+    let mut input = require_pending_revision(transaction, session_id, input_id, expected_revision)?;
+    input.state = SubmissionState::Cancelled;
+    input.revision = input.revision.saturating_add(1);
+    input.time_updated = time_updated.max(input.time_updated);
+    append_in(
+        transaction,
+        session_id,
+        NewSessionEvent::new("session.input.cancelled", event_properties(&input, false))?,
+    )?;
+    let changed = transaction
+        .execute(
+            "UPDATE session_input SET state = ?1, revision = ?2, time_updated = ?3 \
+             WHERE session_id = ?4 AND id = ?5 AND revision = ?6 \
+             AND state IN ('queued', 'steering')",
+            params![
+                input.state.as_str(),
+                input.revision,
+                input.time_updated,
+                session_id,
+                input_id,
+                expected_revision,
+            ],
+        )
+        .map_err(open::map_error)?;
+    require_changed(input_id, changed)?;
+    Ok(input)
+}
+
+fn require_pending_revision(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+    expected_revision: i64,
+) -> Result<SessionInput, DbError> {
+    let input =
+        select_by_id(transaction, session_id, input_id)?.ok_or_else(|| DbError::NotFound {
+            table: "session_input".to_owned(),
+            id: input_id.to_owned(),
+        })?;
+    if !input.state.is_pending() {
+        return Err(conflict(
+            input_id,
+            format!("submission is already {}", input.state.as_str()),
+        ));
+    }
+    if input.revision != expected_revision {
+        return Err(conflict(
+            input_id,
+            format!(
+                "revision conflict: expected {expected_revision}, found {}",
+                input.revision
+            ),
+        ));
+    }
+    Ok(input)
+}
+
+fn transition_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+    allowed: &[SubmissionState],
+    target: SubmissionState,
+    error: Option<&str>,
+    event_type: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    let Some(mut input) = select_by_id(transaction, session_id, input_id)? else {
+        return Ok(None);
+    };
+    if !allowed.contains(&input.state) {
+        return Ok(None);
+    }
+    let previous_revision = input.revision;
+    input.state = target;
+    input.revision = input.revision.saturating_add(1);
+    input.error = error.map(str::to_owned);
+    input.time_updated = crate::message::now_millis().max(input.time_updated);
+    append_in(
+        transaction,
+        session_id,
+        NewSessionEvent::new(event_type, event_properties(&input, false))?,
+    )?;
+    let changed = transaction
+        .execute(
+            "UPDATE session_input SET state = ?1, revision = ?2, error = ?3, time_updated = ?4 \
+             WHERE session_id = ?5 AND id = ?6 AND revision = ?7",
+            params![
+                input.state.as_str(),
+                input.revision,
+                input.error,
+                input.time_updated,
+                session_id,
+                input_id,
+                previous_revision,
+            ],
+        )
+        .map_err(open::map_error)?;
+    require_changed(input_id, changed)?;
+    Ok(Some(input))
+}
+
+/// Mark a promoted input consumed inside the caller transaction.
+pub fn mark_consumed_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    transition_in(
+        transaction,
+        session_id,
+        input_id,
+        &[SubmissionState::Promoted],
+        SubmissionState::Consumed,
+        None,
+        "session.input.consumed",
+    )
+}
+
+fn require_changed(input_id: &str, changed: usize) -> Result<(), DbError> {
+    if changed == 1 {
+        return Ok(());
+    }
+    Err(conflict(input_id, "submission changed concurrently"))
+}
+
+fn conflict(input_id: &str, detail: impl Into<String>) -> DbError {
+    DbError::Conflict {
+        table: "session_input".to_owned(),
+        id: input_id.to_owned(),
+        detail: detail.into(),
+    }
 }

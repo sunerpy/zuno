@@ -6,7 +6,8 @@ use crate::keybind::ActionComponent;
 use crate::views::dialog::{Dialog, DialogHost, ObservedBase};
 use crate::views::message::TranscriptView;
 use crate::views::testkit::{action, press, rows};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 fn render(dialog: impl Dialog + 'static, width: u16, height: u16) -> Vec<String> {
     let context = ViewContext::defaults();
@@ -159,6 +160,92 @@ fn views_session_picker_delete_emits_without_closing_so_another_row_can_follow()
         DialogStep::Redraw,
         "the emitted delete must leave the session picker ready to arm another deletion"
     );
+}
+
+fn queued_inputs() -> Vec<QueuedInputEntry> {
+    vec![
+        QueuedInputEntry {
+            id: String::from("msg_1"),
+            text: String::from("first queued request"),
+            delivery: QueuedInputDelivery::Queue,
+            revision: 1,
+            editable: true,
+        },
+        QueuedInputEntry {
+            id: String::from("msg_2"),
+            text: String::from("/compact"),
+            delivery: QueuedInputDelivery::Queue,
+            revision: 2,
+            editable: false,
+        },
+    ]
+}
+
+#[test]
+fn views_queued_input_dialog_opens_when_empty_and_explains_commit_visibility() {
+    let joined = render(
+        queued_input_dialog(ViewContext::defaults(), QueuedInputProjection::default()),
+        100,
+        8,
+    )
+    .join("\n");
+    assert!(joined.contains("Queued prompts (0)"), "{joined}");
+    assert!(joined.contains("after commit"), "{joined}");
+}
+
+#[test]
+fn views_queued_input_dialog_supports_keyboard_and_mouse_edit() {
+    let projection = QueuedInputProjection::new(queued_inputs());
+    let mut dialog = queued_input_dialog(ViewContext::defaults(), projection);
+    let expected = DialogStep::Emitted(DialogOutcome::QueuedInput(QueuedInputDialogAction::Edit {
+        id: String::from("msg_1"),
+        expected_revision: 1,
+        text: String::from("first queued request"),
+    }));
+    assert_eq!(
+        dialog.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter)),
+        expected
+    );
+    assert_eq!(
+        dialog.handle_mouse(
+            &MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 2,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 76, 8),
+        ),
+        expected
+    );
+}
+
+#[test]
+fn views_queued_input_dialog_cancels_twice_and_stays_open_for_the_next_row() {
+    let projection = QueuedInputProjection::new(queued_inputs());
+    let mut dialog = queued_input_dialog(ViewContext::defaults(), projection.clone());
+    assert_eq!(
+        dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
+        DialogStep::Redraw
+    );
+    assert_eq!(
+        dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
+        DialogStep::Emitted(DialogOutcome::QueuedInput(
+            QueuedInputDialogAction::Cancel {
+                id: String::from("msg_1"),
+                expected_revision: 1,
+            },
+        ))
+    );
+    projection.replace(vec![queued_inputs().remove(1)]);
+    let joined = dialog
+        .lines(76)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("/compact"), "{joined}");
+    assert!(!joined.contains("first queued request"), "{joined}");
 }
 
 #[test]

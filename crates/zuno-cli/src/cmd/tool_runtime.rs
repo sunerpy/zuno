@@ -86,6 +86,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) skills: Arc<zuno_catalog::skill::Skills>,
     pub(crate) delegation: Delegation,
     pub(crate) product_agents: Arc<dyn zuno_tools::product_agent::ProductAgentHost>,
+    pub(crate) workflows: Arc<dyn zuno_tools::workflow::WorkflowHost>,
     pub(crate) job_controller: Arc<dyn zuno_tools::job_cancel::JobController>,
     pub(crate) memory: Option<Arc<dyn Tool>>,
 }
@@ -168,27 +169,77 @@ pub(crate) fn assemble(
             .register_builtin(BuiltinSlot::Question, erase(QuestionTool::new(asker)))
             .map_err(|error| error.to_string())?;
     }
-    if selection.manifest.contains(BuiltinSlot::Task) {
-        let Delegation {
-            host,
-            facts,
-            targets,
-            agent_models,
-            session_model,
-            limits,
-            vision_available,
-        } = selection.delegation;
-        let mut task = zuno_tools::task::TaskTool::new(host, facts)
-            .with_targets(targets)
-            .with_session_model(session_model)
-            .with_limits(limits)
-            .with_vision_available(vision_available);
-        for (agent, model) in agent_models {
-            task = task.with_agent_override(agent, model);
+    let Delegation {
+        host,
+        facts,
+        mut targets,
+        agent_models,
+        session_model,
+        limits,
+        vision_available,
+    } = selection.delegation;
+    if let Some(delegates) = &selected_agent.delegates {
+        let allowed = delegates
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let unknown = allowed
+            .iter()
+            .filter(|name| {
+                !targets
+                    .as_slice()
+                    .iter()
+                    .any(|target| target.as_str() == **name)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "agents.{}.delegates references unavailable agents: {}",
+                selected_agent.name,
+                unknown.join(", ")
+            ));
         }
+        targets = zuno_tools::task::DelegationTargets::new(
+            targets
+                .as_slice()
+                .iter()
+                .filter(|target| allowed.contains(target.as_str()))
+                .cloned(),
+        )
+        .map_err(to_string)?;
+    }
+    let mut task = zuno_tools::task::TaskTool::new(host, facts)
+        .with_targets(targets)
+        .with_session_model(session_model)
+        .with_limits(limits)
+        .with_vision_available(vision_available);
+    for (agent, model) in agent_models {
+        task = task.with_agent_override(agent, model);
+    }
+    if selection.manifest.contains(BuiltinSlot::Task) {
         builder
-            .register_builtin(BuiltinSlot::Task, erase(task))
+            .register_builtin(BuiltinSlot::Task, erase(task.clone()))
             .map_err(|error| error.to_string())?;
+    }
+    if let Some(workflows) = &config.workflows
+        && !workflows.is_empty()
+    {
+        let agents = config
+            .agent
+            .as_ref()
+            .ok_or_else(|| "workflows require configured agents".to_owned())?;
+        for (name, workflow) in workflows {
+            workflow.validate(name, agents)?;
+        }
+        let workflow = zuno_tools::workflow::WorkflowTool::new(
+            workflows
+                .iter()
+                .map(|(name, workflow)| (name.to_owned(), workflow.clone())),
+            task,
+            Arc::clone(&selection.workflows),
+        )?;
+        builder.register_configured_builtin(erase(workflow));
     }
     if selection.manifest.contains(BuiltinSlot::Job) {
         builder
@@ -222,12 +273,6 @@ pub(crate) fn assemble(
         ),
         (BuiltinSlot::Grep, erase(zuno_tools::GrepTool::new(tooling))),
         (BuiltinSlot::Fetch, erase(zuno_tools::WebFetchTool::new())),
-        (
-            BuiltinSlot::Todo,
-            erase(zuno_tools::todo::TodoWriteTool::new(Arc::new(
-                zuno_tools::todo::SqliteTodoStore::new(Arc::clone(&selection.todo_store)),
-            ))),
-        ),
         (
             BuiltinSlot::Search,
             erase(zuno_tools::WebSearchTool::with_config(search)),
@@ -280,6 +325,9 @@ pub(crate) fn assemble(
     for tool in zuno_goal::goal_tools(Arc::clone(&selection.goal_store)) {
         builder.register_configured_builtin(tool);
     }
+    for tool in zuno_tools::work_state_tools(Arc::clone(&selection.todo_store)) {
+        builder.register_configured_builtin(tool);
+    }
 
     let registry = builder.build();
     let suppressions = registry
@@ -287,11 +335,18 @@ pub(crate) fn assemble(
         .iter()
         .map(ToString::to_string)
         .collect();
-    let tools = registry.resolve(ResolveInput::new(
+    let mut tools = registry.resolve(ResolveInput::new(
         selection.model_id,
         selection.provider_id,
         &rules,
     ));
+    if let Some(allowlist) = &selected_agent.tools {
+        let allowlist = allowlist
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        tools.retain(|tool| allowlist.contains(tool.id()));
+    }
     Ok(ToolRuntime {
         tools,
         rules,
@@ -309,6 +364,11 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
             zuno_goal::GET_GOAL_TOOL_ID,
             zuno_goal::CREATE_GOAL_TOOL_ID,
             zuno_goal::UPDATE_GOAL_TOOL_ID,
+            zuno_tools::PLAN_GET_TOOL_ID,
+            zuno_tools::PLAN_UPDATE_TOOL_ID,
+            zuno_tools::TODO_GET_TOOL_ID,
+            zuno_tools::TODO_UPDATE_TOOL_ID,
+            zuno_tools::WORKFLOW_WIRE_ID,
         ]
         .contains(&name)
         || harness_tool_names.contains(name)
@@ -361,9 +421,9 @@ mod tests {
             "task",
             "job_cancel",
             "memory_propose",
-            "get_goal",
-            "create_goal",
-            "update_goal",
+            "goal_get",
+            "goal_propose",
+            "goal_update",
             "extension_tool",
         ] {
             assert!(native_tool_name(name, &harness), "{name}");

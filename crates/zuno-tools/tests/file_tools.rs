@@ -156,9 +156,11 @@ fn file_tool_schemas_are_derived_with_the_oracle_parameter_names() {
 
     let edit = tools.edit.definition().parameters;
     assert!(edit["properties"].get("filePath").is_some());
-    assert!(edit["properties"].get("oldString").is_some());
-    assert!(edit["properties"].get("newString").is_some());
-    assert!(edit["properties"].get("replaceAll").is_some());
+    assert!(edit["properties"].get("edits").is_some());
+    let operation = &edit["properties"]["edits"]["items"]["properties"];
+    assert!(operation.get("oldString").is_some());
+    assert!(operation.get("newString").is_some());
+    assert!(operation.get("replaceAll").is_some());
 
     let patch = tools.apply_patch.definition().parameters;
     assert!(patch["properties"].get("patchText").is_some());
@@ -215,8 +217,10 @@ async fn file_edit_without_a_prior_read_is_refused_with_an_actionable_message() 
         .execute(
             json!({
                 "filePath": path,
-                "oldString": "before",
-                "newString": "after"
+                "edits": [{
+                    "oldString": "before",
+                    "newString": "after"
+                }]
             }),
             normal_context(permission),
         )
@@ -258,8 +262,10 @@ async fn file_edit_unique_match_succeeds_and_exercises_the_formatter_seam() {
         .execute(
             json!({
                 "filePath": path,
-                "oldString": "beta",
-                "newString": "gamma"
+                "edits": [{
+                    "oldString": "beta",
+                    "newString": "gamma"
+                }]
             }),
             normal_context(permission),
         )
@@ -297,8 +303,10 @@ async fn file_edit_keeps_a_written_change_when_the_formatter_service_fails() {
         .execute(
             json!({
                 "filePath": path,
-                "oldString": "before",
-                "newString": "after"
+                "edits": [{
+                    "oldString": "before",
+                    "newString": "after"
+                }]
             }),
             normal_context(permission),
         )
@@ -338,8 +346,10 @@ async fn file_edit_rejects_a_non_unique_match_with_replace_all_guidance() {
         .execute(
             json!({
                 "filePath": path,
-                "oldString": "same",
-                "newString": "changed"
+                "edits": [{
+                    "oldString": "same",
+                    "newString": "changed"
+                }]
             }),
             normal_context(permission),
         )
@@ -348,7 +358,7 @@ async fn file_edit_rejects_a_non_unique_match_with_replace_all_guidance() {
 
     assert_eq!(
         source_message(&error),
-        "Found multiple matches for oldString; provide more context or use replaceAll."
+        "edits[0].oldString matched 2 locations; provide more context or set replaceAll."
     );
     assert_eq!(
         std::fs::read_to_string(path).expect("unchanged"),
@@ -375,9 +385,11 @@ async fn file_edit_replace_all_changes_every_exact_match() {
         .execute(
             json!({
                 "filePath": path,
-                "oldString": "same",
-                "newString": "changed",
-                "replaceAll": true
+                "edits": [{
+                    "oldString": "same",
+                    "newString": "changed",
+                    "replaceAll": true
+                }]
             }),
             normal_context(permission),
         )
@@ -389,6 +401,39 @@ async fn file_edit_replace_all_changes_every_exact_match() {
         std::fs::read_to_string(path).expect("edited"),
         "changed\nchanged\n"
     );
+}
+
+#[tokio::test]
+async fn file_edit_applies_the_operation_list_atomically() {
+    let (workspace, tools, permission) = setup();
+    let path = workspace.path().join("atomic.txt");
+    std::fs::write(&path, "alpha\n").expect("fixture");
+
+    tools
+        .read
+        .execute(
+            json!({ "filePath": path }),
+            normal_context(permission.clone()),
+        )
+        .await
+        .expect("read first");
+    let error = tools
+        .edit
+        .execute(
+            json!({
+                "filePath": path,
+                "edits": [
+                    {"oldString": "alpha", "newString": "beta"},
+                    {"oldString": "missing", "newString": "gamma"}
+                ]
+            }),
+            normal_context(permission),
+        )
+        .await
+        .expect_err("a later invalid operation must reject the whole list");
+
+    assert!(source_message(&error).contains("edits[1].oldString was not found"));
+    assert_eq!(std::fs::read_to_string(path).expect("unchanged"), "alpha\n");
 }
 
 #[tokio::test]
@@ -825,7 +870,13 @@ async fn file_edit_reports_the_patch_of_what_it_changed() {
     let output = tools
         .edit
         .execute(
-            json!({ "filePath": path, "oldString": "two", "newString": "TWO" }),
+            json!({
+                "filePath": path,
+                "edits": [{
+                    "oldString": "two",
+                    "newString": "TWO"
+                }]
+            }),
             normal_context(permission),
         )
         .await

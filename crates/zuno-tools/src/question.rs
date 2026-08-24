@@ -38,6 +38,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 use zuno_error::ToolError;
 use zuno_tool::{ToolContext, ToolEffect, ToolOutput, TypedTool};
 
@@ -176,6 +177,65 @@ impl QuestionRequest {
 /// `Schema.Array(Schema.String)` (`v1/question.ts:41`) — empty means unanswered.
 pub type Answer = Vec<String>;
 
+/// The terminal state persisted on a completed question card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionStatus {
+    Answered,
+    Cancelled,
+    Expired,
+    Failed,
+}
+
+impl QuestionStatus {
+    /// Stable metadata spelling used by transcript replays and non-TUI clients.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Answered => "Answered",
+            Self::Cancelled => "Cancelled",
+            Self::Expired => "Expired",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// An authoritative result from the client that owned the human prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuestionOutcome {
+    Answered(Vec<Answer>),
+    Cancelled,
+    Expired,
+    Failed,
+}
+
+impl QuestionOutcome {
+    /// The terminal status represented by this outcome.
+    #[must_use]
+    pub const fn status(&self) -> QuestionStatus {
+        match self {
+            Self::Answered(_) => QuestionStatus::Answered,
+            Self::Cancelled => QuestionStatus::Cancelled,
+            Self::Expired => QuestionStatus::Expired,
+            Self::Failed => QuestionStatus::Failed,
+        }
+    }
+}
+
+impl Default for QuestionOutcome {
+    fn default() -> Self {
+        Self::Answered(Vec::new())
+    }
+}
+
 /// The round trip to a human.
 ///
 /// # Errors
@@ -199,14 +259,15 @@ pub trait QuestionAsker: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// [`ToolError`] when the request could not be delivered, or
-    /// [`ToolError::Denied`] when the user rejected it.
+    /// [`ToolError`] only when the asker cannot even construct the request. Delivery
+    /// and human terminal states are values so the originating tool call can be
+    /// persisted and is never re-opened after a session replay.
     async fn ask(
         &self,
         session_id: &str,
         questions: &[QuestionRequest],
         call: Option<(&str, &str)>,
-    ) -> Result<Vec<Answer>, ToolError>;
+    ) -> Result<QuestionOutcome, ToolError>;
 }
 
 /// A [`QuestionAsker`] that answers from a script and records what it was asked.
@@ -216,8 +277,7 @@ pub trait QuestionAsker: Send + Sync + 'static {
 /// module: one double, one contract.
 #[derive(Debug, Default)]
 pub struct ScriptedAnswers {
-    answers: Vec<Answer>,
-    reject: bool,
+    outcome: QuestionOutcome,
     asked: Mutex<Vec<QuestionRequest>>,
 }
 
@@ -226,8 +286,7 @@ impl ScriptedAnswers {
     #[must_use]
     pub fn new(answers: Vec<Answer>) -> Self {
         Self {
-            answers,
-            reject: false,
+            outcome: QuestionOutcome::Answered(answers),
             asked: Mutex::new(Vec::new()),
         }
     }
@@ -238,12 +297,27 @@ impl ScriptedAnswers {
         Self::new(vec![vec![label.into()]])
     }
 
-    /// Rejects every ask, as a user dismissing the prompt does.
+    /// Cancels every ask, as a user dismissing the prompt does.
     #[must_use]
     pub fn rejecting() -> Self {
+        Self::with_outcome(QuestionOutcome::Cancelled)
+    }
+
+    /// Returns an expired terminal outcome.
+    #[must_use]
+    pub fn expiring() -> Self {
+        Self::with_outcome(QuestionOutcome::Expired)
+    }
+
+    /// Returns a failed-delivery terminal outcome.
+    #[must_use]
+    pub fn failing() -> Self {
+        Self::with_outcome(QuestionOutcome::Failed)
+    }
+
+    fn with_outcome(outcome: QuestionOutcome) -> Self {
         Self {
-            answers: Vec::new(),
-            reject: true,
+            outcome,
             asked: Mutex::new(Vec::new()),
         }
     }
@@ -265,17 +339,12 @@ impl QuestionAsker for ScriptedAnswers {
         _session_id: &str,
         questions: &[QuestionRequest],
         _call: Option<(&str, &str)>,
-    ) -> Result<Vec<Answer>, ToolError> {
+    ) -> Result<QuestionOutcome, ToolError> {
         self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .extend_from_slice(questions);
-        if self.reject {
-            return Err(ToolError::Denied {
-                tool: WIRE_ID.to_owned(),
-            });
-        }
-        Ok(self.answers.clone())
+        Ok(self.outcome.clone())
     }
 }
 
@@ -308,14 +377,15 @@ impl QuestionTool {
         exposes_question(flags)
     }
 
-    /// The title upstream renders for `count` questions.
-    ///
-    /// Oracle: `question.ts:35`, which pluralises on `> 1` — so zero questions reads
-    /// "Asked 0 question", singular. Reproduced rather than corrected.
+    /// The durable completed-card title for a terminal question outcome.
     #[must_use]
-    pub fn title(count: usize) -> String {
-        let plural = if count > 1 { "s" } else { "" };
-        format!("Asked {count} question{plural}")
+    pub fn title(status: QuestionStatus, count: usize, elapsed: Duration) -> String {
+        let plural = if count == 1 { "" } else { "s" };
+        format!(
+            "{} · {count} question{plural} · {}",
+            status.label(),
+            format_elapsed(elapsed)
+        )
     }
 
     /// The `"question"="answer"` list upstream builds from the answers.
@@ -366,7 +436,8 @@ impl TypedTool for QuestionTool {
             .map(QuestionPrompt::into_request)
             .collect();
 
-        let answers = self
+        let started = Instant::now();
+        let outcome = self
             .asker
             .ask(
                 &ctx.session_id,
@@ -374,21 +445,45 @@ impl TypedTool for QuestionTool {
                 Some((&ctx.message_id, &ctx.call_id)),
             )
             .await?;
+        let elapsed = started.elapsed();
+        let status = outcome.status();
 
-        let formatted = Self::format_answers(&params.questions, &answers);
-        let metadata = serde_json::to_value(&answers).map_err(|error| ToolError::Failed {
-            tool: WIRE_ID.to_owned(),
-            source: Box::new(error),
-        })?;
-
-        Ok(ToolOutput::text(
-            Self::title(params.questions.len()),
-            format!(
-                "User has answered your questions: {formatted}. \
-                 You can now continue with the user's answers in mind."
+        let output = match outcome {
+            QuestionOutcome::Answered(answers) => {
+                let formatted = Self::format_answers(&params.questions, &answers);
+                let metadata =
+                    serde_json::to_value(&answers).map_err(|error| ToolError::Failed {
+                        tool: WIRE_ID.to_owned(),
+                        source: Box::new(error),
+                    })?;
+                ToolOutput::text(
+                    Self::title(status, params.questions.len(), elapsed),
+                    format!(
+                        "User has answered your questions: {formatted}. \
+                         You can now continue with the user's answers in mind."
+                    ),
+                )
+                .with_metadata("answers", metadata)
+            }
+            QuestionOutcome::Cancelled => ToolOutput::text(
+                Self::title(status, params.questions.len(), elapsed),
+                "The user cancelled this question request. Do not infer an answer or immediately \
+                 repeat the same question.",
             ),
-        )
-        .with_metadata("answers", metadata))
+            QuestionOutcome::Expired => ToolOutput::text(
+                Self::title(status, params.questions.len(), elapsed),
+                "This question request expired before the user answered. Do not infer an answer.",
+            ),
+            QuestionOutcome::Failed => ToolOutput::text(
+                Self::title(status, params.questions.len(), elapsed),
+                "This question request could not be delivered. Do not infer an answer.",
+            ),
+        };
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        Ok(output
+            .with_metadata("questionStatus", status.as_str())
+            .with_metadata("questionCount", params.questions.len() as u64)
+            .with_metadata("elapsedMs", elapsed_ms))
     }
 }
 
@@ -397,6 +492,17 @@ impl TypedTool for QuestionTool {
 /// # Errors
 ///
 /// [`serde_json::Error`] when the value is not a list of label lists.
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds == 0 {
+        String::from("<1s")
+    } else if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
+
 pub fn answers_from_metadata(
     metadata: &serde_json::Map<String, Value>,
 ) -> Result<Vec<Answer>, serde_json::Error> {
@@ -509,7 +615,7 @@ mod tests {
         assert_eq!(asked[0].question, "Which database?");
         assert_eq!(asked[0].header, "Database");
         assert_eq!(asked[0].options.len(), 2);
-        assert_eq!(output.title, "Asked 1 question");
+        assert!(output.title.starts_with("Answered · 1 question · "));
     }
 
     #[tokio::test]
@@ -552,23 +658,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejected_request_is_denied_not_answered() {
-        let error = tool(Arc::new(ScriptedAnswers::rejecting()))
+    async fn a_cancelled_request_is_a_durable_terminal_card() {
+        let output = tool(Arc::new(ScriptedAnswers::rejecting()))
             .execute(one_question(), context())
             .await
-            .expect_err("the user dismissed the prompt");
+            .expect("cancellation is persisted as the tool's terminal result");
 
-        assert!(matches!(error, ToolError::Denied { .. }));
-        assert_eq!(error.tool(), "question");
+        assert!(output.title.starts_with("Cancelled · 1 question · "));
+        assert_eq!(output.metadata["questionStatus"], "cancelled");
+        assert!(output.output.contains("Do not infer an answer"));
+    }
+
+    #[tokio::test]
+    async fn expired_and_failed_requests_have_distinct_terminal_states() {
+        for (asker, expected) in [
+            (ScriptedAnswers::expiring(), "expired"),
+            (ScriptedAnswers::failing(), "failed"),
+        ] {
+            let output = tool(Arc::new(asker))
+                .execute(one_question(), context())
+                .await
+                .expect("terminal question outcomes are durable tool results");
+            assert_eq!(output.metadata["questionStatus"], expected);
+        }
     }
 
     // --- rendering rules that look wrong and are upstream's ---
 
     #[test]
-    fn the_title_pluralises_on_more_than_one_so_zero_reads_singular() {
-        assert_eq!(QuestionTool::title(0), "Asked 0 question");
-        assert_eq!(QuestionTool::title(1), "Asked 1 question");
-        assert_eq!(QuestionTool::title(2), "Asked 2 questions");
+    fn the_title_marks_terminal_status_count_and_elapsed_time() {
+        assert_eq!(
+            QuestionTool::title(QuestionStatus::Answered, 0, Duration::ZERO),
+            "Answered · 0 questions · <1s"
+        );
+        assert_eq!(
+            QuestionTool::title(QuestionStatus::Cancelled, 1, Duration::from_secs(18)),
+            "Cancelled · 1 question · 18s"
+        );
+        assert_eq!(
+            QuestionTool::title(QuestionStatus::Expired, 2, Duration::from_secs(62)),
+            "Expired · 2 questions · 1m 02s"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! # Why two scopes, and why not the reference's two
 //!
-//! `.omo/refs/hermes-agent/tools/memory_tool.py:5-10` splits its stores along
+//! `hermes-agent` splits its stores along
 //! *who the note is about*: `MEMORY.md` for the agent's own observations and
 //! `USER.md` for what it has learned about the person. That is the right split for
 //! a personal assistant, whose whole context is one user.

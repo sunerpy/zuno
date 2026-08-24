@@ -1,70 +1,103 @@
+<div align="center">
+
 # Zuno
 
-> 独立的 Rust AI 编程代理，可通过原生 Harness Runtime 组合不同的 Agent 驱动、能力和工具集。
+### An independent Rust AI coding agent with a native Harness Runtime for composing drivers, capabilities, and tool sets
 
-简体中文 · [English](docs/readme/README.en.md)
+[![CI](https://github.com/sunerpy/zuno/actions/workflows/ci.yml/badge.svg)](https://github.com/sunerpy/zuno/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sunerpy/zuno)](https://github.com/sunerpy/zuno/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.96%2B-orange)](./rust-toolchain.toml)
 
-## 目录
+[Install](#install) · [Quick start](#quick-start) · [Harness runtime](#harness-runtime) · [Documentation](#documentation) · [Development](#development)
 
-- [项目定位](#项目定位)
-- [安装](#安装)
-- [快速开始](#快速开始)
-- [Harness Runtime](#harness-runtime)
-- [扩展 Agent 与 Workflow](#扩展-agent-与-workflow)
-- [文档](#文档)
-- [独立运行](#独立运行)
-- [构建与开发](#构建与开发)
-- [许可证](#许可证)
+[**English**](./README.md) · [简体中文](./docs/readme/README.zh-CN.md)
 
-## 项目定位
+</div>
 
-Zuno 是一个独立的命令行 AI 编程代理：本地会话存储、可插拔的模型 provider、自带工具集，以及
-一个内置 TUI。整个 workspace 禁止 `unsafe_code`。
+---
 
-Zuno 只定义自己的配置、数据、命令、工具参数和扩展协议。它不保留 OpenCode 插件 ABI、
-JS hook、HTTP 兼容路由或配置适配层；扩展统一使用下方的原生
-[Harness Runtime](#harness-runtime)。
+## Features
 
-## 安装
+- **One static binary, no runtime dependency.** No Node, no Python, no dynamic plugin loader.
+  `unsafe_code` is forbidden across the whole workspace.
+- **Durable sessions.** Prompts, tool results, retries, and subagent reports are reconstructable
+  from SQLite events, so a restart resumes rather than restarts.
+- **Composable harness.** `AgentDriver` and `ToolManifest` are profile services, so the agent loop
+  and tool surface are replaceable without patching a fixed main loop.
+- **Native extensions.** Agents, slash-command workflows, skills, and executable tools ship as
+  validated `zuno.extension/v1` packages — in-process WASI components or contained processes.
+- **Pluggable providers.** OpenAI, Anthropic, Google, Bedrock, and OpenAI-compatible endpoints
+  through native Rust transports.
+- **Built-in TUI**, plus headless, ACP, and HTTP surfaces that all consume the same durable events.
 
-Linux 与 macOS 可使用一行安装脚本。仓库为私有仓库，因此先运行 `gh auth login`；下列命令
-通过已认证的 GitHub CLI 读取脚本，并将 token 传给 release 下载。脚本默认安装到
-`$HOME/.local/bin`：
+## Project identity
+
+Zuno is a standalone command-line AI coding agent: local session storage, pluggable model
+providers, its own tool set, and a built-in TUI. `unsafe_code` is forbidden workspace-wide.
+
+Zuno defines only its own configuration, data, commands, tool arguments, and extension protocols.
+It does not retain the OpenCode plugin ABI, JavaScript hooks, HTTP compatibility routes, or
+configuration shims. Extensions use the native [Harness runtime](#harness-runtime).
+
+## Install
+
+Supported platforms are Linux (x86_64, aarch64, static musl), macOS (Intel, Apple silicon), and
+Windows x86_64. The installer downloads the archive for the running platform, verifies it against
+the release's `SHA256SUMS`, and refuses to extract on a digest mismatch.
+
+**Install script** — Linux and macOS. The tag in the URL pins both the script and the binary:
 
 ```sh
-GH_TOKEN="$(gh auth token)" sh -c "$(gh api -H 'Accept: application/vnd.github.raw+json' repos/sunerpy/zuno/contents/scripts/install.sh)"
+curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/v0.1.0/scripts/install.sh | sh
 ```
 
-可通过 `ZUNO_VERSION` 固定版本，通过 `ZUNO_INSTALL_DIR` 修改安装目录：
+**Install script** — Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/sunerpy/zuno/v0.1.0/scripts/install.ps1 | iex
+```
+
+Set `ZUNO_VERSION` to pin a different release and `ZUNO_INSTALL_DIR` to change the destination,
+which defaults to `$HOME/.local/bin` (`%LOCALAPPDATA%\Programs\zuno` on Windows):
 
 ```sh
-ZUNO_VERSION=0.1.0 ZUNO_INSTALL_DIR=/usr/local/bin \
-  GH_TOKEN="$(gh auth token)" sh -c "$(gh api -H 'Accept: application/vnd.github.raw+json' repos/sunerpy/zuno/contents/scripts/install.sh)"
+curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/v0.1.0/scripts/install.sh \
+  | ZUNO_VERSION=0.1.0 ZUNO_INSTALL_DIR=/usr/local/bin sh
 ```
 
-也可以从 [GitHub Releases](https://github.com/sunerpy/zuno/releases) 下载对应平台的预编译归档，
-或在克隆仓库后运行 `cargo install --path crates/zuno-cli --locked` 从源码安装。
+**Prebuilt archives** — download and verify manually from
+[GitHub Releases](https://github.com/sunerpy/zuno/releases) if you would rather not pipe a remote
+script into a shell. Every release carries five archives and one `SHA256SUMS`.
 
-已安装的 Zuno 可原地检查和更新。私有仓库需要把 GitHub token 传给进程；公开发布后可省略：
+**From source** — requires the pinned toolchain in [`rust-toolchain.toml`](./rust-toolchain.toml)
+and a C compiler, because SQLite and the TLS stack are built from source:
 
 ```sh
-GH_TOKEN="$(gh auth token)" zuno self-update --check
-GH_TOKEN="$(gh auth token)" zuno self-update
+cargo install --path crates/zuno-cli --locked
 ```
 
-更新器精确选择当前平台的 release 归档，先用同一 release 的 `SHA256SUMS` 校验，再原子替换
-当前可执行文件。`--tag v0.2.0` 固定版本，`--yes` 用于非交互确认；完整安全契约见
-[Self-update](docs/reference/self-update.md)。
+An installed Zuno can check and update itself in place:
 
-## 快速开始
+```sh
+zuno self-update --check
+zuno self-update
+```
+
+The updater selects the exact platform archive, verifies it against the same release's
+`SHA256SUMS`, and only then atomically replaces the running executable. Use `--tag v0.2.0` to pin
+a release and `--yes` for non-interactive confirmation. See
+[Self-update](./docs/reference/self-update.md) for the complete safety contract.
+
+## Quick start
 
 ```console
 $ zuno --help
 $ zuno --version --long
 ```
 
-首次配置从仓库内已校验的原生 provider 示例开始；它使用 Rust `openai` transport，不安装
-Node 包，也不加载 AI SDK：
+Start first-time configuration from the checked native provider example. It uses the Rust `openai`
+transport and neither installs Node packages nor loads an AI SDK:
 
 ```sh
 install -d -m 700 "${XDG_CONFIG_HOME:-$HOME/.config}/zuno"
@@ -75,37 +108,51 @@ zuno debug config
 zuno models myopenai --verbose
 ```
 
-如果使用预编译安装而没有源码 checkout，直接在同一配置路径创建
-[`examples/config/zuno.json`](examples/config/zuno.json) 所示内容。Provider 配置只接受原生
-`transport`；不接受 `npm` 字段。
+For a prebuilt installation without a source checkout, create the contents of
+[`examples/config/zuno.json`](./examples/config/zuno.json) directly at the same configuration
+path. Provider configuration accepts native `transport` values and has no `npm` field.
 
-`zuno export` 与 `zuno import` 构成 Zuno 自身的导出/导入闭环。两者都是**顶层命令**，
-不是 `session` 的子命令；`zuno session` 只有 `list`、`prune`、`delete`。
+`zuno export` and `zuno import` close Zuno's own round trip. Both are **top-level** commands, not
+subcommands of `session`; `zuno session` carries only `list`, `prune`, and `delete`.
 
-## Harness Runtime
+## Harness runtime
 
-Zuno 的扩展单元是原生 Rust `Component`。多个组件组成 `ProfileBundle`，再由
-`HarnessProfile` 在一次事务中挂载：候选 Profile 完整验证后才发布，失败时按逆序回滚，热替换
-期间旧 Profile 始终可用。`AgentDriver` 与 `ToolManifest` 都是 Profile 服务，因此 benchmark、
-workflow、远程执行器或专用编码 Agent 可以替换循环和工具面，而无需修改固定主循环。
+Zuno's native extension unit is a Rust `Component`. Components form a `ProfileBundle`, and a
+`HarnessProfile` mounts all bundles in one transaction: candidates are published only after full
+validation, failures roll back in reverse order, and the old profile remains available during a
+hot replacement. `AgentDriver` and `ToolManifest` are profile services, so benchmark, workflow,
+remote, and specialized coding harnesses can replace the loop and tool surface without editing a
+fixed main loop.
 
-会话输入进入持久化 FIFO inbox；用户 prompt、运行中 steer 与子代理报告共享同一交付协议。
-后台 `task` 支持 `reportDelivery: nextStep | quiet`，完成状态可用 `job` 工具查询。
-`web_search` 接收 `queries` 数组，并发执行、首错取消兄弟请求、等待收敛后按稳定顺序合并及 URL
-去重。活动 Goal 对网络、限流、断流、数据库锁和单轮步数耗尽使用持久化指数退避；进程重开后按
-SQLite 中的 deadline 恢复，人工输入优先。工具失败作为 tool result 交回模型，不会被调度器
-机械重放；只有显式声明 `Safe` 的只读或幂等工具才允许模型在后续 turn 重试，不确定的副作用
-必须先核对权威状态。认证、取消与永久配置错误分别暂停或阻断。
+Session input uses a durable FIFO inbox shared by user prompts, live steering, and subagent
+reports. In the TUI, `Enter` queues while an agent is active, `Ctrl+Enter` explicitly steers at
+the next safe boundary, and `Shift+Enter` inserts a newline. `/plan` opens the user-confirmed
+Plan/Work transition, `/start-plan` enters read-only planning directly, and `/start-work` requires
+and confirms a durable plan before implementation. Background `task` calls support
+`reportDelivery: nextStep | quiet`, while the `job` tool queries durable status. The right sidebar
+tracks background terminals and agents live and points to `/ps` and `/subagent` for details.
+`web_search` accepts a `queries` array, runs queries concurrently, cancels
+sibling requests after the first failure, waits for settlement, and merges results deterministically
+with URL deduplication. Active goals persist exponential backoff for network, rate-limit, truncated
+stream, database-lock, and turn-budget failures, then reconstruct the deadline when the session is
+reopened. Human input wins over automatic work. Tool failures become model-visible tool results and
+are never replayed mechanically. Only read-only or idempotent tools that explicitly declare `Safe`
+may be attempted by the model in a later turn; uncertain side effects require authoritative-state
+inspection. Authentication, cancellation, and permanent configuration failures pause or block.
 
-`build`、`plan`、`deep` 与各专用 Agent 都来自同一个原生 catalog。最终发给模型的 prompt
-按 agent、策略、memory、extensions、instructions、skills 分段组装，并在请求前以
-`session.prompt.assembled` 持久化其顺序、来源、内容摘要和 hook 后的实际文本。完整生命周期、
-恢复矩阵和配置见 [docs/harness-runtime.md](docs/harness-runtime.md)。
+`build`, `plan`, `deep`, and the specialist agents share one native catalog. A provider-neutral
+`PromptEnvelope` keeps kernel, agent role, collaboration mode, policy, AGENTS, work state, Skill,
+and memory blocks separate until provider encoding. OpenAI Responses maps kernel and agent role to
+`instructions`, keeps the other blocks as developer inputs, and preserves the user message
+unchanged. Every receipt is persisted as `session.prompt.assembled`; inspect the latest redacted
+receipt with `zuno debug prompt`. A visible, uniquely named Skill can be loaded directly as
+`/<skill-name>`; arguments run it only after the exact source has loaded. See
+[the Harness Runtime guide](./docs/harness-runtime.md).
 
-## 扩展 Agent 与 Workflow
+## Extending agents and workflows
 
-自定义 Agent 可以放在项目的 `.zuno/agent/` 下。文件路径决定默认名称，frontmatter 决定
-模型、模式、权限和步数，正文就是可追踪 prompt section 的内容：
+Put a custom agent under `.zuno/agent/`. Its path supplies the default name, frontmatter selects
+model, mode, permissions, and steps, and the body becomes a traced prompt section:
 
 ```markdown
 ---
@@ -127,26 +174,32 @@ trust boundaries, permission checks, durable state, and failure behavior.
 Return findings with exact file locations.
 ```
 
-Agent 也可以通过模型工具动态声明一个 `zuno.extension/v1` 包，其中包含 Agent、slash-command
-Workflow 和 Skill。`extension_define` 只在当前进程内记录不可变定义，
-`extension_run` 激活；`extension_stop`、`extension_undefine` 和
-`extension_inspect` 管理生命周期。TUI 会在该轮结束后于同一进程内重组下一轮，退出 Zuno
-后动态定义即丢失。
+An agent may also declare a `zuno.extension/v1` package containing agents, slash-command workflows,
+and skills. `extension_define` records an immutable definition only in the current process,
+`extension_run` activates it, and `extension_stop`, `extension_undefine`, and
+`extension_inspect` manage its lifecycle. The TUI recomposes the next turn inside the same process;
+exiting Zuno loses process-local definitions.
 
-需要跨重启保留时，把同一清单写到
-`.zuno/extensions/<id>/extension.json`（全局路径为
-`~/.config/zuno/extensions/<id>/extension.json`）并重启。两种加载方式共用验证与冲突检查；
-扩展中 `mode: subagent | all` 的 Agent 会进入 `task` 的真实目标列表，并在子会话中使用自身
-模型、Prompt 与原生工具权限。文件由 `read/glob/grep/lsp/edit` 提供，网络由
-`webfetch/web_search` 提供，环境与普通进程能力由受权限控制的 `bash` 提供；Strict 模式仍会
-对所有副作用调用逐次 HITL。
+For restart-persistent loading, write the same manifest to
+`.zuno/extensions/<id>/extension.json` (or
+`~/.config/zuno/extensions/<id>/extension.json`) and restart. Both lifetimes use one validator and
+collision checker. Extension agents with mode `subagent` or `all` join the real
+`task` target roster and retain their model, prompt, and native tool permissions
+inside the child session. File access comes from `read`/`glob`/`grep`/`lsp`/`edit`,
+network access from `webfetch`/`web_search`, and environment or ordinary process
+access from permission-governed `bash`. Strict authorization still applies fresh
+HITL to every side effect.
 
-静态包还可以注册可执行工具：首选进程内、按 workspace/network/env 最小授权并带 fuel、内存和
-超时限制的 WASI Component；确实需要完整宿主 API 时使用声明 `host.full` 的受控子进程。
-两者都作为 Profile effect 初始化，卸载时先撤销路由再逆序异步清理；无法确认停止则标记
-`Uncertain`，不会自动重放。Zuno 不执行 JavaScript/Cordis ABI，也不加载 Rust 动态库。
-`host.full`、WASI `network` 或 `workspace.write` 工具不能声明只读/安全重放，因此 Strict
-模式不会被插件清单中的虚假只读标记绕过。
+Static packages may also register executable tools. Prefer an in-process WASI
+component with explicit workspace, network, and environment grants plus fuel,
+memory, and wall-time bounds. Use a contained `host.full` process only when the
+plugin needs unrestricted host APIs. Both are profile effects: unload withdraws
+routing before reverse asynchronous cleanup, and an unprovable stop becomes
+`Uncertain` without replay. Zuno neither evaluates the JavaScript/Cordis ABI nor
+loads Rust dynamic libraries.
+`host.full`, WASI `network`, and WASI `workspace.write` tools cannot claim
+read-only or safe-replay policy, so a manifest cannot use those grants to bypass
+strict authorization.
 
 ```sh
 zuno plugin add examples/plugins/review-kit --project
@@ -155,11 +208,12 @@ zuno plugin update examples/plugins/review-kit --project
 zuno plugin remove review-kit --project
 ```
 
-完整清单、能力表、WIT/JSON-RPC 协议以及自定义 Agent、Workflow、WASI 和进程示例见
-[插件与扩展指南](docs/plugins.md)。
+See [the plugin guide](./docs/plugins.md) for manifests, capability tables,
+WIT/JSON-RPC protocols, and custom agent, workflow, WASI, and process examples.
 
-原生 workflow 不需要修改默认循环。实现 `AgentDriver`，选择模型可见的 `ToolManifest`，按需
-加入原生工具，再把它们组成一个事务化 Profile：
+A native workflow does not modify the default loop. Implement `AgentDriver`, select a
+model-visible `ToolManifest`, contribute any native tools, and activate the result as one
+transactional profile:
 
 ```rust
 let profile = zuno_harness::profile_with_tools(
@@ -172,47 +226,49 @@ let profile = zuno_harness::profile_with_tools(
 runtime.activate_profile(profile).await?;
 ```
 
-Profile 中还可以挂载 provider、远程执行器、审批、评测或 benchmark 组件。每个注册动作返回
-精确 disposer；候选 Profile 完整验证后一次发布，失败则逆序回滚。客户端只消费公共命令、
-持久事件、inbox 和 projection，因此同一个扩展可被 TUI、headless、ACP、HTTP 以及未来 GUI
-复用。设计取舍见 [Harness 对比](docs/design/harness-comparison.md)，客户端接口见
-[GUI/客户端架构](docs/design/client-interfaces.md)。
+Profiles can also mount providers, remote executors, approvals, evaluations, or benchmark
+components. Each registration returns its exact disposer; a candidate profile is published only
+after complete validation and otherwise rolls back in reverse order. The same extension works
+through TUI, headless, ACP, HTTP, and future GUI clients because they consume shared commands,
+durable events, the inbox, and projections. See the
+[harness comparison](./docs/design/harness-comparison.md) and
+[client interface architecture](./docs/design/client-interfaces.md).
 
-## 文档
+## Documentation
 
-| 页面 | 内容 |
-| --- | --- |
-| [docs/README.md](docs/README.md) | 后续文档站的信息架构与完整导航 |
-| [docs/reference/self-update.md](docs/reference/self-update.md) | Release 选择、SHA-256 校验、认证、代理与原子替换 |
-| [docs/reference/configuration.md](docs/reference/configuration.md) | `zuno.json` Schema、配置层与独立 `tui.json` |
-| [docs/reference/providers.md](docs/reference/providers.md) | Provider、凭证、`myopenai` 与原生 Rust 请求链 |
-| [docs/harness-runtime.md](docs/harness-runtime.md) | 原生组件、Profile 事务、持久 inbox 与自定义 Harness |
-| [docs/plugins.md](docs/plugins.md) | 插件安装、Agent/Workflow、WASI/进程能力与协议示例 |
-| [docs/design/harness-comparison.md](docs/design/harness-comparison.md) | DSH、Codex、OMO、pi-agent、OpenCode 与 Claw Code 的借鉴决策 |
-| [docs/design/client-interfaces.md](docs/design/client-interfaces.md) | TUI、ACP、HTTP 与未来 GUI 共用的事件和投影接口 |
-| [docs/design/memory-learning.md](docs/design/memory-learning.md) | 可审计记忆候选、反思提取、审核、晋升与撤销 |
-| [docs/logging.md](docs/logging.md) | 多进程安全结构化日志、`RUST_LOG`、脱敏、保留与明文诊断 |
-| [docs/migration.md](docs/migration.md) | Zuno 数据库文件选择与 schema 演进 |
-| [docs/session-retention.md](docs/session-retention.md) | 清理操作指南：`--archive` 可逆，`--delete` 不可逆 |
-| [docs/resource-gates.md](docs/resource-gates.md) | 六项资源门禁的实测结果、opt-in 命令与已知限制 |
-| [docs/perf-methodology.md](docs/perf-methodology.md) | 内存和活性门禁的测量方法 |
+| Page                                                      | Purpose                                                                  |
+| --------------------------------------------------------- | ------------------------------------------------------------------------ |
+| [Self-update](./docs/reference/self-update.md)            | Release selection, SHA-256, authentication, proxies, and atomic replace  |
+| [Harness Runtime](./docs/harness-runtime.md)              | Native components, profile transactions, durable input, custom harnesses |
+| [Plugins](./docs/plugins.md)                              | Installation, agents/workflows, WASI/process grants, and protocols       |
+| [Harness comparison](./docs/design/harness-comparison.md) | Decisions from DSH, Codex, OMO, pi-agent, OpenCode, and Claw Code        |
+| [Client interfaces](./docs/design/client-interfaces.md)   | Shared events and projections for TUI, ACP, HTTP, and a future GUI       |
+| [Memory learning](./docs/design/memory-learning.md)       | Auditable candidates, reflection, review, promotion, and undo            |
+| [Operational logging](./docs/logging.md)                  | Multi-process store, filters, redaction, retention, and plaintext debug  |
+| [Database lifecycle](./docs/migration.md)                 | Zuno database selection and schema changes                               |
+| [Session retention](./docs/session-retention.md)          | Reversible archive and irreversible delete operations                    |
+| [Resource gates](./docs/resource-gates.md)                | Measured results for the six gates, opt-in commands, and known limits    |
+| [Performance methodology](./docs/perf-methodology.md)     | How memory and liveness gates are measured                               |
 
-`cargo test -p zuno-cli --test docs` 校验 Harness 指南覆盖运行时、持久交付和并发搜索，并防止
-README 再次宣传已经退役的兼容面。
+`cargo test -p zuno-cli --test docs` checks that the Harness guide covers runtime lifecycle,
+durable delivery, and concurrent search, and prevents the READMEs from advertising retired
+compatibility surfaces.
 
-## 独立运行
+## Independent runtime
 
-Zuno 的默认配置根是 `$XDG_CONFIG_HOME/zuno`，项目配置目录是 `.zuno`，数据根是
-`$XDG_DATA_HOME/zuno`。其他产品的根目录和文件不是 Zuno 输入，也不会被探测、迁移或解释。
+Zuno uses `$XDG_CONFIG_HOME/zuno`, project `.zuno` directories, and `$XDG_DATA_HOME/zuno`. Other
+products' roots and files are not Zuno inputs and are not probed, migrated, or interpreted.
 
-配置**文件名**同样是 Zuno 自己的：每一层都只读 `zuno.jsonc` 与 `zuno.json` —— 配置根、
-从工作目录向上走到 worktree 根的裸文件、`.zuno/`、`ZUNO_CONFIG_DIR` 指定的目录，以及
-托管目录。仅支持 JSONC 与严格 JSON，**没有 TOML 配置路径**。其他文件名只是同目录中的
-普通文件，不进入 Zuno 的配置图。
+The config **filename** is Zuno's own too: every layer reads `zuno.jsonc` and `zuno.json` and
+nothing else — the config root, a bare file on the walk up from the working directory to the
+worktree root, `.zuno/`, the directory named by `ZUNO_CONFIG_DIR`, and the managed directory.
+JSONC and strict JSON only; there is **no TOML config path**. Other filenames are ordinary files in
+the directory and never enter Zuno's configuration graph.
 
-Zuno 的用户界面、默认路径、环境变量与扩展协议均使用 Zuno 身份。
+Zuno's user interface, default paths, environment variables, and extension protocol all use Zuno's
+identity.
 
-## 构建与开发
+## Development
 
 ```sh
 make build
@@ -223,14 +279,14 @@ cargo fmt --all --check
 make hooks
 ```
 
-`make build` 保留 Cargo 的 debug 构建，并在成功后将可直接运行的二进制原子投放到
-`dist/zuno`；原始 Cargo 产物仍位于 `target/debug/zuno`。`make release` 会用优化构建覆盖
-`dist/zuno`，其原始产物位于 `target/release/zuno`。
+`make build` retains Cargo's debug build and atomically stages a directly runnable binary at
+`dist/zuno`; Cargo's original remains at `target/debug/zuno`. `make release` replaces `dist/zuno`
+with the optimized build while retaining its original at `target/release/zuno`.
 
-`make hooks` 安装两个共享本地门禁：提交前运行格式化，推送前运行快速测试；完整 workspace
-测试仍由 CI 和显式 `make test` 执行。资源门禁另需显式启用，见
-[docs/resource-gates.md](docs/resource-gates.md)。
+`make hooks` installs commit-time formatting and a fast push-time test gate; the full workspace
+suite remains an explicit `make test` and CI gate. The resource gates need explicit opt-in — see
+[resource gates](./docs/resource-gates.md).
 
-## 许可证
+## License
 
-本项目采用 [MIT License](LICENSE)。
+Licensed under the [MIT License](./LICENSE).

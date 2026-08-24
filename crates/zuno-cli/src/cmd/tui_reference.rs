@@ -98,17 +98,34 @@ pub(super) async fn resolve_submission(
     root: &Path,
     submission: PromptSubmission,
 ) -> Result<PromptSubmission, String> {
+    enum Delivery {
+        Direct,
+        Queue,
+        Steer,
+    }
+    let (submission, delivery) = match submission {
+        PromptSubmission::Queue(submission) => (*submission, Delivery::Queue),
+        PromptSubmission::Steer(submission) => (*submission, Delivery::Steer),
+        submission => (submission, Delivery::Direct),
+    };
+    let wrap = |submission| match delivery {
+        Delivery::Direct => submission,
+        Delivery::Queue => PromptSubmission::Queue(Box::new(submission)),
+        Delivery::Steer => PromptSubmission::Steer(Box::new(submission)),
+    };
     let PromptSubmission::Text(text) = submission else {
-        return Ok(submission);
+        return Ok(wrap(submission));
     };
     let references = reference_tokens(&text)?;
-    if references.is_empty() {
-        return Ok(PromptSubmission::Text(text));
-    }
-    let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || resolve_text_submission(&root, text, references))
-        .await
-        .map_err(|error| format!("file reference worker failed: {error}"))?
+    let resolved = if references.is_empty() {
+        PromptSubmission::Text(text)
+    } else {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || resolve_text_submission(&root, text, references))
+            .await
+            .map_err(|error| format!("file reference worker failed: {error}"))??
+    };
+    Ok(wrap(resolved))
 }
 
 fn reference_tokens(text: &str) -> Result<Vec<String>, String> {

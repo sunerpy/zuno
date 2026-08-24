@@ -168,7 +168,7 @@ const GRAMMAR_COUNT: usize = 16;
 /// cache is keyed on a `Copy` enum, so it cannot grow with content, session length, or
 /// uptime. At its bound it holds all 16 configurations — measured below at 5,865,048
 /// bytes of RSS for the full set, against M1's 1,198,872 KiB W-real median, or 0.478%.
-/// This is deliberately *not* a content-keyed cache: `.omo/plans/memory-perf-optimization.md`
+/// This is deliberately *not* a content-keyed cache: the perf plan
 /// §10.2's rule against unbounded growth in a long-running interactive process is the class
 /// of defect this plan exists to fix, and a per-source cache would reintroduce it.
 ///

@@ -16,7 +16,7 @@ use zuno_permission::{
 };
 
 /// Every builtin tool name the model can be offered, plus the MCP resource trio.
-const TOOL_LIST: [&str; 15] = [
+const TOOL_LIST: [&str; 18] = [
     "bash",
     "edit",
     "write",
@@ -27,7 +27,10 @@ const TOOL_LIST: [&str; 15] = [
     "list",
     "task",
     "webfetch",
-    "todowrite",
+    "plan_get",
+    "plan_update",
+    "todo_get",
+    "todo_update",
     "skill",
     "list_mcp_resources",
     "list_mcp_resource_templates",
@@ -35,8 +38,9 @@ const TOOL_LIST: [&str; 15] = [
 ];
 
 fn rules(json: &str) -> Vec<Rule> {
+    let document = format!(r#"{{"mode":"standard","rules":{json}}}"#);
     let config: PermissionConfig =
-        serde_json::from_str(json).expect("permission fixture must parse");
+        serde_json::from_str(&document).expect("permission fixture must parse");
     rules_from_config(&config)
 }
 
@@ -223,16 +227,6 @@ fn visibility_a_wildcard_key_deny_hides_every_tool() {
 }
 
 #[test]
-fn visibility_a_bare_deny_action_hides_every_tool() {
-    let visible = resolved_tools(r#""deny""#);
-
-    assert!(
-        visible.is_empty(),
-        "a bare deny normalizes to the * key: {visible:?}"
-    );
-}
-
-#[test]
 fn visibility_a_later_specific_allow_survives_an_earlier_wildcard_key_deny() {
     let visible = resolved_tools(r#"{"*": "deny", "bash": "allow"}"#);
 
@@ -334,7 +328,9 @@ fn visibility_merge_rulesets_concatenates_in_argument_order() {
 
 #[test]
 fn visibility_a_plan_style_agent_exposes_no_write_capable_tools() {
-    let agent = rules(r#"{"edit": "deny", "bash": {"*": "deny", "git status": "allow"}}"#);
+    let agent = rules(
+        r#"{"edit":"deny","plan_update":"deny","todo_update":"deny","bash":{"*":"deny","git status":"allow"}}"#,
+    );
 
     let visible = visible_tools(TOOL_LIST, &agent, |tool| *tool);
 
@@ -348,7 +344,8 @@ fn visibility_a_plan_style_agent_exposes_no_write_capable_tools() {
             "list",
             "task",
             "webfetch",
-            "todowrite",
+            "plan_get",
+            "todo_get",
             "skill",
             "list_mcp_resources",
             "list_mcp_resource_templates",
@@ -447,7 +444,7 @@ proptest! {
     /// A hidden tool must be unreachable: no input may evaluate to anything but
     /// deny. The generated input deliberately excludes the glob metacharacters
     /// `*` and `?` because `wildcard_match` currently mismatches an input that
-    /// *contains* `*` against the pattern `"*"` (see `.omo/notepads` Task 17
+    /// *contains* `*` against the pattern `"*"` (see the project's engineering notes, Task 17
     /// issues: `wildcard_match("*.txt", "*")` is `false` in Rust and `true` in
     /// the oracle). That defect lives in Todo 16's matcher, not in visibility,
     /// and is reported rather than silently patched here.

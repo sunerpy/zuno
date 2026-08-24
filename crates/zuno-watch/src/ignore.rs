@@ -25,7 +25,7 @@
 //! top-level-only one. The set contains `node_modules`, `target`, and `dist`; a
 //! monorepo has one of those inside every package, and a watcher that reports
 //! them defeats its own purpose. The divergence is recorded in
-//! `.omo/notepads/opencode-rust/issues.md`.
+//! the project's engineering notes.
 //!
 //! Gitignore filtering is an **addition** the plan asks for. `@parcel/watcher`
 //! has no gitignore support at all, so nothing in the oracle consults
@@ -61,7 +61,7 @@
 //! tree with no `.git` anywhere is not applied. That rule is reproduced here
 //! (see [`FilterBuilder::require_git`]) because a fixture that means to test
 //! ignore semantics and forgets to `git init` otherwise silently tests nothing —
-//! measured during todo 41, recorded in `.omo/notepads/opencode-rust/learnings.md`.
+//! measured during todo 41, recorded in the project's engineering notes.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};

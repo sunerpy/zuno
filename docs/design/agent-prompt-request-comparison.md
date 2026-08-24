@@ -1,9 +1,10 @@
 # Build-agent prompt and request comparison
 
-Status: 2026-08-24.
+Status: current implementation plus a pinned historical capture, 2026-08-24.
 
-This document answers a concrete question: what did Zuno actually present to the
-model when the `build` agent received this user request?
+The first section describes the current structured-prompt implementation. The
+later capture answers a separate historical question: what did an older Zuno
+build present to the model when the `build` agent received this user request?
 
 > 按照skill指导 对本项目进行完整的优化设计，即将发布到github公开仓库了
 
@@ -35,7 +36,153 @@ The complete 55,314-byte local export is intentionally gitignored at
 machine-level instruction path and complete installed-skill inventory, so it
 must not be published with the repository.
 
-## The observed Zuno turn
+## Current implementation after the upgrade
+
+Zuno now carries prompt provenance in a provider-neutral `PromptEnvelope`
+instead of treating the model prompt as one anonymous system string. It groups
+ordered `PromptBlock` values into:
+
+- kernel and agent role;
+- typed collaboration mode;
+- runtime policy;
+- global and project instructions;
+- work state and routing;
+- selected Skill bodies and the bounded Skill index;
+- memory.
+
+Each block retains its stable id, source, semantic role, trust class, priority,
+SHA-256 digest, byte count, local token estimate, and model-visible content in
+the durable prompt receipt. The exact user message remains a normal user
+message rather than being copied into an instruction block.
+
+### Provider mapping
+
+The provider-neutral mapping is:
+
+| semantic content | OpenAI Responses representation |
+| --- | --- |
+| Kernel + selected agent role | top-level `instructions` |
+| Collaboration mode (`Plan` or `Work`) | independent `developer` input |
+| Runtime policy | independent `developer` input |
+| Global `AGENTS.md` | independent `developer` input |
+| Project `AGENTS.md` chain | one independent `developer` input per source |
+| Goal, plan, todo, routing, and memory context | independent dynamic `developer` inputs |
+| Selected Skill body | independent `developer` input |
+| Bounded Skill index | independent `developer` input |
+| User message | original `user` input, unchanged |
+| Tool definitions | top-level `tools`, outside prompt text |
+
+Chat-compatible, Anthropic, Bedrock, and Google adapters consume the same typed
+`developer_context` boundary and map it to their native developer/system
+representation. They do not receive a newly flattened source-less prompt.
+
+The current Responses request therefore has this shape:
+
+```jsonc
+{
+  "model": "<configured model>",
+  "instructions": "<kernel + agent role>",
+  "input": [
+    {"role": "developer", "content": "<collaboration mode>"},
+    {"role": "developer", "content": "<runtime policy>"},
+    {"role": "developer", "content": "<global AGENTS.md>"},
+    {"role": "developer", "content": "<project AGENTS.md>"},
+    {"role": "developer", "content": "<selected Skill or Skill index>"},
+    {
+      "role": "user",
+      "content": [{"type": "input_text", "text": "<exact user input>"}]
+    },
+    {"role": "developer", "content": "<dynamic Goal or memory context>"}
+  ],
+  "tools": ["<runtime ToolManifest schemas>"],
+  "stream": true
+}
+```
+
+Empty or disabled blocks are omitted. Configured reasoning, output, storage,
+and include options remain provider fields rather than prompt prose. Prompt
+receipt schema version 2 records `collaboration.mode` as a distinct runtime-trust
+block instead of merging it into an agent role or user message.
+
+### Current Plan and Work behavior
+
+- `/plan` is the interactive boundary. From Work mode it opens a keyboard- and
+  mouse-operable confirmation before selecting the read-only `plan` agent. From
+  Plan mode it reviews the durable plan and offers the Start Work confirmation.
+- `/start-plan` enters Plan mode directly. `/start-work` refuses to proceed
+  without a durable plan and still asks the user to confirm that exact plan and
+  revision before selecting `build`.
+- The Plan agent uses a deny-by-default capability overlay. It may inspect with
+  read, glob, grep, LSP, and web tools; ask questions; load Skills; and update
+  typed goal, plan, and todo state. It cannot use shell or file-mutation tools.
+- The selected collaboration agent is stored with the session. Explicitly
+  reopening or switching to an existing session restores its Plan or Work mode
+  without restarting the TUI.
+- The model may recommend `/start-work`, but it cannot switch collaboration
+  modes on the user's behalf. Durable Goal, Plan, Todo, Job, and queue state is
+  authoritative; prose checklists are not execution state.
+
+### Current Skill behavior
+
+- Every visible, uniquely named Skill that does not collide with a real command
+  is exposed as `/<skill-name>` in the slash catalog. For example,
+  `/github-project-scaffold` loads that exact advertised source without a shell
+  search.
+- A bare `/<skill-name>` loads the complete Skill and publishes its loaded state
+  without creating a model turn. `/<skill-name> <arguments>` loads it first and
+  then sends the canonical slash request as the unchanged user input.
+- Real commands retain precedence. Duplicate same-named Skill sources are not
+  guessed or exposed as one slash command; they remain available through
+  `/skills` and source-qualified `skill` operations.
+- An explicitly named, uniquely resolved Skill is fully loaded by the host
+  before the first provider request. This also works when the name is adjacent
+  to Chinese text.
+- Ambiguous same-named Skills and identifier substrings are not guessed.
+- Loaded Skill identity is persisted in the prompt receipt and restored when a
+  session resumes.
+- The initial catalog contains metadata only. Its default budget is two percent
+  of the model context, falls back to 8,000 characters when the context is
+  unknown, and is capped at 10,000 tokens.
+- Descriptions are shortened before source identities are omitted. Every
+  omitted entry remains available through `skill search` or paged `skill list`.
+
+This deliberately avoids a fixed count cap: a large installation retains
+searchable coverage without recreating the earlier “skills did not fit” failure.
+
+### Current AGENTS precedence
+
+Zuno loads only native instruction locations implicitly:
+
+1. `$XDG_CONFIG_HOME/zuno/AGENTS.md`;
+2. project directories from the worktree root to the current directory;
+3. in one directory, `AGENTS.local.md` replaces `AGENTS.md`;
+4. nearer project files are appended later and therefore have higher priority.
+
+`CLAUDE.md`, OpenCode directories, and other products' global instruction files
+are never implicit fallbacks. Explicit `instructions[]` entries remain
+available when compatibility is intentional.
+
+### Prompt diagnostics
+
+```sh
+zuno debug prompt
+zuno debug prompt <session>
+zuno debug prompt <session> <turn>
+zuno debug prompt <session> <turn> --show-sensitive
+```
+
+The command defaults to the latest durable prompt receipt and redacts
+model-visible bodies. `--show-sensitive` reveals instruction, AGENTS, Skill,
+memory, and post-hook prompt content, so its output must be handled as a secret.
+
+One audit gap remains: the receipt records the structured prompt and post-hook
+system content, but it does not yet persist a complete redacted manifest of the
+final provider HTTP body and tool-schema wire order.
+
+## Historical observed Zuno turn
+
+The rest of this section is evidence from the pinned pre-upgrade session. It is
+not a description of the current request builder.
 
 | field | exact value |
 | --- | --- |
@@ -148,7 +295,7 @@ filesystem for a named skill. The first completed tool call was:
 Only after it completed did the model invoke `bash`. The model used the source
 advertised in `skills.index` directly.
 
-## Source-reconstructed Responses request
+## Historical source-reconstructed Responses request
 
 For this provider, `surface: "responses"` uses the OpenAI Responses wire shape.
 The first request can be reconstructed at the engine/provider boundary as:
@@ -212,6 +359,21 @@ The important difference is not simply prompt length: base policy, developer
 context, user-scoped project guidance, selected skills, tools, and the actual
 user message remain distinguishable typed items.
 
+## DSH and OpenCode design influence
+
+DSH contributes the durable control-plane rule rather than another monolithic
+prompt: Goal, Plan, Todo, Job, background execution, and queue state are typed
+runtime records, and prompt blocks are projections of that state. A model's prose
+cannot complete a work item, change a mode, or erase an uncertain side effect.
+This keeps restart, cancellation, delegation, and client rendering independent
+from model wording.
+
+OpenCode contributes the discoverable command-and-Skill interaction: slash
+entries are catalog data, real commands win collisions, and a selected Skill is
+loaded before it is used. Zuno keeps those interactions typed through the TUI,
+durable queue, and runtime host rather than expanding them into an anonymous
+prompt string.
+
 ## oh-my-openagent comparison
 
 OMO's Sisyphus takes a model-family prompt approach:
@@ -240,7 +402,7 @@ larger generic catalog.
 
 ## Architecture differences
 
-| concern | Zuno observed turn | Codex | oh-my-openagent |
+| concern | Zuno historical capture | Codex | oh-my-openagent |
 | --- | --- | --- | --- |
 | Base behavior | concise native `build` text | model/session base instructions | long model-family Sisyphus prompt |
 | Role split | static sections flattened into one `system` | top-level instructions plus typed developer/user items | plugin replaces system text; OpenCode owns the rest |
@@ -254,33 +416,44 @@ larger generic catalog.
 | Audit | exact system sections and hashes | prompt-debug/input plus rollout state | plugin prompt inspectable; complete wire outside OMO |
 | Main weakness | role collapse and missing final manifest | many contextual item types | prompt inflation and duplicated model prose |
 
-## Assessment for Zuno
+The current Zuno implementation no longer matches the historical Zuno column:
+it has closed role collapse, cross-product instruction fallback, collaboration
+mode ambiguity, and named-Skill preload gaps. Its production contract combines
+Codex-like typed request boundaries, OpenCode-like discoverable Skill commands,
+DSH-like durable work-state authority, and concise OMO-inspired role guidance.
+The final provider-manifest gap remains.
+
+## Historical assessment and current disposition
 
 Keep the concise native `build` contract, ordered section IDs, byte counts,
 hashes, and explicit skill loading. Do not copy OMO's complete prompt wholesale.
 
-Recommended changes:
+Disposition of the historical recommendations:
 
-1. Persist a redacted final request manifest after provider preparation: ordered
-   roles, content hashes/bytes, tool names and schema hashes in wire order,
-   reasoning/output settings, body hash, and hook digest. Never persist secrets,
-   authorization headers, signed URLs, or binary payloads.
-2. Preserve base instructions, developer policy, project/user guidance, selected
-   skill bodies, and the actual user message as typed items until provider
-   encoding instead of flattening them all into `system`.
-3. Prefer a Zuno-owned global instruction location. Reading another product's
-   `CLAUDE.md` should require an explicit compatibility option.
-4. Reduce initial catalog weight. Keep every identity and exact source, but use
-   compact metadata, mention resolution, and search/list escalation instead of
-   spending about 81% of this system prompt on descriptions.
-5. Add `zuno debug prompt --session <id> --step <n> --manifest` so users do not
-   need direct SQLite queries.
-6. Adapt OMO's useful model-aware corrections as small capability fragments,
-   not duplicated full prompt families.
+1. **Remaining:** persist a redacted final request manifest after provider
+   preparation: ordered roles, content hashes/bytes, tool names and schema hashes
+   in wire order, reasoning/output settings, body hash, and hook digest. Never
+   persist secrets, authorization headers, signed URLs, or binary payloads.
+2. **Completed:** preserve base instructions, developer policy, project
+   guidance, selected Skill bodies, and the actual user message as typed items
+   until provider encoding instead of flattening them all into `system`.
+3. **Completed:** use a Zuno-owned global `AGENTS.md`; another product's
+   instruction file requires an explicit `instructions[]` entry.
+4. **Completed:** reduce initial catalog weight while keeping source identities
+   and complete search/list escalation.
+5. **Completed with native syntax:** `zuno debug prompt [session] [turn]`
+   exposes the durable receipt and defaults to redaction.
+6. **Completed as an architectural rule:** model-aware corrections remain small
+   capability fragments rather than duplicated full prompt families.
+7. **Completed:** Plan and Work are first-class collaboration blocks and
+   user-authorized session modes, not prose conventions hidden inside one agent
+   prompt.
+8. **Completed:** unique, non-colliding Skills are directly invocable as slash
+   commands; bare invocation loads only, while arguments start a typed turn.
 
-The matching-skill path itself worked in this run. Any remaining loading defect
-needs a separate failing session artifact and should not be inferred from this
-successful turn.
+The historical matching-Skill path worked in that run. Current host-side preload
+is additionally covered by exact-name, ambiguity, Chinese-boundary, direct-slash,
+and resume regression tests.
 
 ## Source map
 

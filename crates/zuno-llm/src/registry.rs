@@ -26,7 +26,7 @@
 //! across the whole first-party transitive closure, so it cannot be re-added
 //! quietly — not even through an intermediate crate. The technique of deleting a
 //! reverse edge and leaving a note saying why comes from
-//! `.omo/refs/jcode/crates/jcode-app-core/Cargo.toml:64-67`.
+//! `jcode`.
 //!
 //! # Wired in exactly one place
 //!
@@ -34,13 +34,13 @@
 //! [`Composition`]. One function means one place to read to learn what this build
 //! can talk to, and one place a provider todo edits. The reference implementation
 //! keeps the same discipline and says so in a comment
-//! (`.omo/refs/jcode/src/cli/startup.rs:135-139`).
+//! (`jcode`).
 //!
 //! # Where this improves on the reference
 //!
 //! The reference registry returns `Option<Arc<dyn Provider>>`, and `None` means
 //! *either* "no factory registered" or "the factory declined"
-//! (`.omo/refs/jcode/crates/jcode-base/src/provider/external.rs:219-232`). Its
+//! (`jcode`). Its
 //! caller then logs one warning for both — "the composition root must call
 //! `register_external_provider()`" — so a user with no GitHub token is told the
 //! program is miswired. Here the two are different [`RegistryError`] variants with
@@ -128,7 +128,7 @@ pub type Composition = fn() -> ProviderRegistry;
 /// Owned rather than global. The reference implementation uses a process-wide
 /// `OnceLock<RwLock<HashMap<..>>>` and documents that re-registering a key
 /// replaces the previous factory "useful for tests"
-/// (`.omo/refs/jcode/crates/jcode-base/src/provider/external.rs:184-195`) — which
+/// (`jcode`) — which
 /// is an admission that a global registry and a parallel test suite fight each
 /// other. This workspace runs its tests in parallel, so an owned value that the
 /// composition root builds and passes down is both safer and a truer expression of

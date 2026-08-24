@@ -236,6 +236,31 @@ impl SessionRunRegistry {
         Ok(())
     }
 
+    /// Remove one not-yet-delivered soft interrupt by its durable input id.
+    pub fn cancel_soft_interrupt(
+        &self,
+        session_id: &str,
+        input_id: &str,
+    ) -> Result<bool, SessionNotActive> {
+        let mut state = self.lock_state();
+        let active = state
+            .active
+            .get_mut(session_id)
+            .ok_or_else(|| SessionNotActive {
+                session_id: session_id.to_owned(),
+            })?;
+        let epoch = active.soft_interrupt.epoch();
+        let before = active.soft_interrupts.len();
+        active
+            .soft_interrupts
+            .retain(|message| message.input_id.as_deref() != Some(input_id));
+        let removed = active.soft_interrupts.len() != before;
+        if removed && active.soft_interrupts.is_empty() {
+            let _cleared = active.soft_interrupt.reset_if_epoch(epoch);
+        }
+        Ok(removed)
+    }
+
     fn take_soft_interrupts(&self, session_id: &str, token: u64) -> SoftInterruptDelivery {
         let mut state = self.lock_state();
         let Some(active) = state.active.get_mut(session_id) else {
@@ -308,6 +333,12 @@ impl SessionControl {
     ) -> Result<(), SessionNotActive> {
         self.registry
             .queue_soft_interrupt(&self.session_id, message)
+    }
+
+    /// Cancels one not-yet-delivered soft interrupt by durable input id.
+    pub fn cancel_soft_interrupt(&self, input_id: &str) -> Result<bool, SessionNotActive> {
+        self.registry
+            .cancel_soft_interrupt(&self.session_id, input_id)
     }
 }
 

@@ -88,21 +88,25 @@ Generated from `zuno_db::prune::DELETE_ORDER`. The order is pinned by
 `crates/zuno-db/tests/prune.rs::prune_delete_order_and_true_related_table_count_are_pinned`,
 because the order is what keeps foreign keys satisfied mid-transaction.
 
-**10 tables**, in this order:
+**14 tables**, in this order:
 
 <!-- generated:BEGIN prune-tables -->
 | order | table |
 |---:|---|
-| 1 | `session_context_epoch` |
-| 2 | `session_input` |
-| 3 | `session_message` |
-| 4 | `todo` |
-| 5 | `part` |
-| 6 | `message` |
-| 7 | `session_share` |
-| 8 | `session` |
-| 9 | `event_sequence` |
-| 10 | `event` |
+| 1 | `memory_reflection_job` |
+| 2 | `memory_reflection_delivery` |
+| 3 | `agent_job` |
+| 4 | `work_item` |
+| 5 | `work_plan` |
+| 6 | `session_context_epoch` |
+| 7 | `session_input` |
+| 8 | `session_message` |
+| 9 | `part` |
+| 10 | `message` |
+| 11 | `session_share` |
+| 12 | `session` |
+| 13 | `event_sequence` |
+| 14 | `event` |
 <!-- generated:END prune-tables -->
 
 Regenerate with:

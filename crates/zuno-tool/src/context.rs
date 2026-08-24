@@ -246,7 +246,7 @@ impl ToolContext {
     /// denied and one abort stops the whole tree. Anything a composing tool could
     /// vary here would be a way to launder a sub-call past a gate the parent could
     /// not pass. Pattern from
-    /// `.omo/refs/jcode/crates/jcode-tool-core/src/lib.rs:124-135`, plus the depth.
+    /// `jcode`, plus the depth.
     #[must_use]
     pub fn for_subcall(&self, call_id: impl Into<String>) -> Self {
         Self {

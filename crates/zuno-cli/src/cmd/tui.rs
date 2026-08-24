@@ -67,13 +67,19 @@ use zuno_tui::views::external::{
     ExternalError, SystemEditor,
 };
 use zuno_tui::views::message::Message;
-use zuno_tui::views::picker::{McpProjection, McpServer, McpState, McpToggleRequest};
-use zuno_tui::views::session::{PromptSubmission, SessionScreen, scopes};
+use zuno_tui::views::picker::{
+    McpProjection, McpServer, McpState, McpToggleRequest, QueuedInputDelivery, QueuedInputEntry,
+    QueuedInputNotice, QueuedInputNoticeKind, QueuedInputProjection,
+};
+use zuno_tui::views::session::{PromptSubmission, QueuedInputMutation, SessionScreen, scopes};
 use zuno_tui::views::slash::{CatalogCommand, HostCommand};
 
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
 use super::tui_question::{QuestionBridge, QuestionBroker};
-use super::turn::{SessionChoice, SessionTitleSink, TurnHost, TurnOptions, TurnPlan};
+use super::turn::{
+    SessionChoice, SessionTitleSink, TurnHost, TurnOptions, TurnPlan,
+    background_execution_projections, persisted_session_agent,
+};
 use crate::command::TuiArgs;
 use crate::environment::StartupEnvironment;
 
@@ -109,6 +115,9 @@ const CANCEL_CHANNEL_CAPACITY: usize = 1;
 /// A few, not one: a user can pick a model and an agent in quick succession, and a full
 /// channel would make the second choice a visible refusal for no reason.
 const SELECTION_CHANNEL_CAPACITY: usize = 8;
+
+/// Queue edits and cancellations remain responsive while a provider stream is active.
+const QUEUE_MUTATION_CHANNEL_CAPACITY: usize = 8;
 
 const EDITOR_CHANNEL_CAPACITY: usize = 1;
 
@@ -214,11 +223,15 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         );
     }
 
+    let session = SessionChoice::resolve(args.session.as_deref(), args.r#continue);
     let options = TurnOptions {
         directory: None,
         model: args.model.clone(),
-        agent: args.agent.clone(),
-        session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
+        agent: args
+            .agent
+            .clone()
+            .or_else(|| persisted_session_agent(&session)),
+        session,
         title: None,
         effort: None,
         extension_composition: super::turn::ExtensionComposition::Active,
@@ -484,18 +497,29 @@ fn execute_once(
     host.set_title_sink(Arc::clone(&title_sink));
     let continuity = TuiHostContinuity::new(runs, title_sink);
     let work_state = WorkState::new(host.work_state()?);
+    let queued_inputs = QueuedInputProjection::new(project_queued_inputs(
+        &host.session_inbox(),
+        host.session_id(),
+    )?);
     // Copied before the host is moved into the turn driver. The id is what the hint
     // printed after teardown has to name, and by then the host is gone — a driver task
     // owns it and is aborted, not joined, so nothing survives to be asked.
     let exit_identity = host.session_identity();
-    let slash_commands = host
+    let mut slash_commands = host
         .commands()
         .map(|command| CatalogCommand::new(command.name.clone(), command.description.clone()))
         .collect::<Vec<_>>();
+    slash_commands.extend(
+        host.slash_skills()
+            .into_iter()
+            .map(|skill| CatalogCommand::skill(skill.name, skill.description, skill.location)),
+    );
     broker.bind_session(host.session_id());
 
     let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_CHANNEL_CAPACITY);
     let (selection_sender, selection_receiver) = mpsc::channel(SELECTION_CHANNEL_CAPACITY);
+    let (queue_mutation_sender, queue_mutation_receiver) =
+        mpsc::channel(QUEUE_MUTATION_CHANNEL_CAPACITY);
     let (mcp_toggle_sender, mcp_toggle_receiver) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
     let (editor_sender, editor_receiver) = mpsc::channel(EDITOR_CHANNEL_CAPACITY);
     let (editor_result_sender, editor_result_receiver) = mpsc::channel(EDITOR_CHANNEL_CAPACITY);
@@ -510,6 +534,9 @@ fn execute_once(
     let (history_sender, history_receiver) = mpsc::channel(PROMPT_HISTORY_CHANNEL_CAPACITY);
     let background_executions = host.background_executions();
     let background_session = host.session_id().to_owned();
+    let background_projection_service = Arc::clone(&background_executions);
+    let background_projection_session = background_session.clone();
+    let background_projection_state = work_state.clone();
     let probe = super::tui_lsp::Probe::resolve(
         &lsp_config,
         lsp_workspace.as_path(),
@@ -522,6 +549,7 @@ fn execute_once(
         .with_cancel_sink(cancel_sender)
         .with_selection_sink(selection_sender)
         .with_mcp_control(mcp_projection.clone(), mcp_toggle_sender)
+        .with_queued_inputs(queued_inputs.clone(), queue_mutation_sender)
         .with_session_title(session_title)
         .with_work_state(work_state.clone())
         .with_catalog(catalog)
@@ -542,24 +570,20 @@ fn execute_once(
         host.tool_count(),
         RuntimeIdentity::resolve(&host, environment.resolved()),
     );
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .restore_loaded_skills(host.selected_skills().into_iter().map(|skill| {
+            zuno_tui::views::message::LoadedSkillIdentity {
+                name: skill.name,
+                source: Some(skill.source),
+            }
+        }));
     if host.is_session_materialized() {
-        let usage = host.session_usage();
-        let tokens = zuno_tui::views::message::TokenUsage {
-            input: u64::try_from(usage.tokens.input).unwrap_or_default(),
-            output: u64::try_from(usage.tokens.output).unwrap_or_default(),
-            cache_read: u64::try_from(usage.tokens.cache_read).unwrap_or_default(),
-            cache_write: u64::try_from(usage.tokens.cache_write).unwrap_or_default(),
-        };
-        screen.transcript_mut().transcript_mut().restore_usage(
-            tokens,
-            usage
-                .last_prompt_tokens
-                .and_then(|value| u64::try_from(value).ok()),
-            usage
-                .context_limit
-                .and_then(|value| u64::try_from(value).ok()),
-            usage.known,
-        );
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .restore_usage(host.session_usage().snapshot());
     }
     // Before every notice below, and that order is load-bearing in both directions.
     //
@@ -655,6 +679,8 @@ fn execute_once(
     let editor_wake = terminal_sender.clone();
     let mcp_wake = terminal_sender.clone();
     let work_wake = terminal_sender.clone();
+    let background_wake = terminal_sender.clone();
+    let queue_wake = terminal_sender.clone();
     let session_shutdown = terminal_sender.clone();
     let remount = CompositionRemount::default();
     let driver_remount = remount.clone();
@@ -685,14 +711,24 @@ fn execute_once(
                 snapshots: SnapshotHistory::new(snapshot_store),
                 work_state,
                 work_wake,
+                queued_inputs,
+                queue_wake,
                 continuity,
                 remount: driver_remount,
                 shutdown: session_shutdown,
             },
             prompt_receiver,
             selection_receiver,
+            queue_mutation_receiver,
             driver_environment,
             engine_sender,
+            worker_shutdown_source.clone(),
+        ));
+        let mut background = tokio::spawn(drive_background_projection(
+            background_projection_service,
+            background_projection_session,
+            background_projection_state,
+            background_wake,
             worker_shutdown_source.clone(),
         ));
         let mut mcp = tokio::spawn(drive_mcp_lifecycle(McpLifecycleWorker {
@@ -744,6 +780,7 @@ fn execute_once(
             cancellation_shutdown,
             history_shutdown,
             turn_shutdown,
+            background_shutdown,
             mcp_shutdown,
             lsp_shutdown,
         ) = tokio::join!(
@@ -752,6 +789,7 @@ fn execute_once(
             await_worker("cancellation forwarder", &mut cancels),
             await_worker("prompt history", &mut history),
             await_turn_driver(&mut turns),
+            await_worker("background projection", &mut background),
             await_worker("MCP lifecycle", &mut mcp),
             await_worker("LSP diagnostics", &mut checks),
         );
@@ -763,6 +801,7 @@ fn execute_once(
                 cancellation_shutdown,
                 history_shutdown,
                 turn_shutdown,
+                background_shutdown,
                 mcp_shutdown,
                 lsp_shutdown,
             ],
@@ -1619,6 +1658,12 @@ async fn apply_selection(
     host: &mut TurnHost,
     rebuild: &TurnRebuild<'_>,
 ) -> SelectionOutcome {
+    let selected_agent = match &selection {
+        zuno_tui::views::session::Selection::Agent(agent) if agent != host.agent_name() => {
+            Some(agent.clone())
+        }
+        _ => None,
+    };
     let mut next = rebuild.options.clone();
     next.session = host.rebuild_session_choice();
     // Seeded from the live host, not from the launch options, for the reason
@@ -1679,6 +1724,9 @@ async fn apply_selection(
                     return SelectionOutcome::Unchanged;
                 }
             };
+            if let Some(agent) = target.agent.clone() {
+                next.agent = Some(agent);
+            }
             next.directory = Some(PathBuf::from(target.directory));
             next.session = SessionChoice::Existing(target.id);
             return SelectionOutcome::Remount(RemountRequest::plain(next));
@@ -1824,9 +1872,15 @@ async fn apply_selection(
             }
             next.directory = Some(PathBuf::from(target.directory));
             if deleting_current {
-                next.session = replacement.map_or(SessionChoice::New, |session| {
-                    SessionChoice::Existing(session.id)
-                });
+                match replacement {
+                    Some(session) => {
+                        if let Some(agent) = session.agent {
+                            next.agent = Some(agent);
+                        }
+                        next.session = SessionChoice::Existing(session.id);
+                    }
+                    None => next.session = SessionChoice::New,
+                }
                 next.title = None;
             }
             return SelectionOutcome::Remount(RemountRequest::reopening_sessions(next));
@@ -1922,7 +1976,16 @@ async fn apply_selection(
     })
     .await
     {
-        Ok(()) => SelectionOutcome::Rebuilt(rebuild.events.clone()),
+        Ok(()) => {
+            if selected_agent.is_some()
+                && let Err(error) = host.persist_active_agent()
+            {
+                return SelectionOutcome::Shutdown(format!(
+                    "the collaboration mode changed in memory but could not be persisted: {error}"
+                ));
+            }
+            SelectionOutcome::Rebuilt(rebuild.events.clone())
+        }
         Err(message) => SelectionOutcome::Shutdown(format!(
             "turn host replacement could not establish a quiescent composition: {message}"
         )),
@@ -1957,6 +2020,8 @@ struct TurnDriver {
     snapshots: SnapshotHistory,
     work_state: WorkState,
     work_wake: mpsc::Sender<TerminalEvent>,
+    queued_inputs: QueuedInputProjection,
+    queue_wake: mpsc::Sender<TerminalEvent>,
     continuity: TuiHostContinuity,
     remount: CompositionRemount,
     shutdown: mpsc::Sender<TerminalEvent>,
@@ -2025,16 +2090,215 @@ enum PersistedTuiInput {
     TuiPrompt { submission: PromptSubmission },
 }
 
+fn project_queued_inputs(
+    inbox: &zuno_db::inbox::SessionInbox,
+    session_id: &str,
+) -> Result<Vec<QueuedInputEntry>, String> {
+    let mut projected = Vec::new();
+    for input in inbox.pending(session_id).map_err(to_string)? {
+        if input.prompt.get("kind").and_then(serde_json::Value::as_str) != Some("tuiPrompt") {
+            continue;
+        }
+        let PersistedTuiInput::TuiPrompt { submission } =
+            serde_json::from_value(input.prompt).map_err(to_string)?;
+        let (text, editable) = queued_submission_display(&submission);
+        projected.push(QueuedInputEntry {
+            id: input.id,
+            text,
+            delivery: match input.delivery {
+                zuno_db::inbox::InputDelivery::Queue => QueuedInputDelivery::Queue,
+                zuno_db::inbox::InputDelivery::Steer => QueuedInputDelivery::Steer,
+            },
+            revision: input.revision,
+            editable,
+        });
+    }
+    Ok(projected)
+}
+
+fn queued_submission_display(submission: &PromptSubmission) -> (String, bool) {
+    match submission {
+        PromptSubmission::Text(text) | PromptSubmission::Content { text, .. } => {
+            (text.clone(), true)
+        }
+        PromptSubmission::Command { name, arguments }
+        | PromptSubmission::Skill {
+            name, arguments, ..
+        } => (
+            format!(
+                "/{name}{}",
+                if arguments.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {arguments}")
+                }
+            ),
+            false,
+        ),
+        PromptSubmission::Host(command) => (
+            match command {
+                HostCommand::Compact => "/compact".to_owned(),
+                HostCommand::Undo => "/undo".to_owned(),
+                HostCommand::Redo => "/redo".to_owned(),
+                HostCommand::Goal(arguments) => format!("/goal {arguments}"),
+                HostCommand::Plan => "/plan".to_owned(),
+                HostCommand::StartPlan => "/start-plan".to_owned(),
+                HostCommand::StartWork => "/start-work".to_owned(),
+                HostCommand::Stop(Some(id)) => format!("/stop {id}"),
+                HostCommand::Stop(None) => "/stop".to_owned(),
+            },
+            false,
+        ),
+        PromptSubmission::Queue(inner) | PromptSubmission::Steer(inner) => {
+            queued_submission_display(inner)
+        }
+    }
+}
+
+fn refresh_queued_input_projection(
+    inbox: &zuno_db::inbox::SessionInbox,
+    session_id: &str,
+    projection: &QueuedInputProjection,
+    wake: &mpsc::Sender<TerminalEvent>,
+    notice: Option<QueuedInputNotice>,
+) {
+    match project_queued_inputs(inbox, session_id) {
+        Ok(inputs) => projection.publish(inputs, notice),
+        Err(error) => projection.publish(
+            projection.snapshot(),
+            Some(QueuedInputNotice {
+                input_id: String::new(),
+                kind: QueuedInputNoticeKind::Failed(format!(
+                    "queued inputs changed but could not be refreshed: {error}"
+                )),
+            }),
+        ),
+    }
+    let _nudged = wake.try_send(TerminalEvent::Wake);
+}
+
+async fn apply_queued_input_mutation(
+    inbox: zuno_db::inbox::SessionInbox,
+    control: zuno_engine::status::SessionControl,
+    session_id: String,
+    reference_root: PathBuf,
+    projection: QueuedInputProjection,
+    wake: mpsc::Sender<TerminalEvent>,
+    mutation: QueuedInputMutation,
+) {
+    let (input_id, outcome) = match mutation {
+        QueuedInputMutation::Edit {
+            id,
+            expected_revision,
+            text,
+        } => {
+            let outcome: Result<QueuedInputNoticeKind, String> = async {
+                let current = inbox
+                    .get(&session_id, &id)
+                    .map_err(to_string)?
+                    .ok_or_else(|| format!("queued input `{id}` no longer exists"))?;
+                let delivery = current.delivery;
+                let submission = super::tui_reference::resolve_submission(
+                    &reference_root,
+                    PromptSubmission::Text(text),
+                )
+                .await?;
+                let submission = if delivery == zuno_db::inbox::InputDelivery::Steer {
+                    PromptSubmission::Steer(Box::new(submission))
+                } else {
+                    submission
+                };
+                inbox
+                    .edit_pending(
+                        &session_id,
+                        &id,
+                        expected_revision,
+                        serde_json::to_value(PersistedTuiInput::TuiPrompt {
+                            submission: submission.clone(),
+                        })
+                        .map_err(to_string)?,
+                        zuno_db::message::now_millis(),
+                    )
+                    .map_err(to_string)?;
+                if delivery == zuno_db::inbox::InputDelivery::Steer {
+                    let _removed = control.cancel_soft_interrupt(&id);
+                    if let Some(message) = soft_interrupt(&id, &submission) {
+                        let _queued = control.queue_soft_interrupt(message);
+                    }
+                }
+                Ok(QueuedInputNoticeKind::Edited)
+            }
+            .await;
+            (id, outcome)
+        }
+        QueuedInputMutation::Cancel {
+            id,
+            expected_revision,
+        } => {
+            let outcome: Result<QueuedInputNoticeKind, String> = (|| {
+                let cancelled = inbox
+                    .cancel_pending(
+                        &session_id,
+                        &id,
+                        expected_revision,
+                        zuno_db::message::now_millis(),
+                    )
+                    .map_err(to_string)?;
+                if cancelled.delivery == zuno_db::inbox::InputDelivery::Steer {
+                    let _removed = control.cancel_soft_interrupt(&id);
+                }
+                Ok(QueuedInputNoticeKind::Cancelled)
+            })();
+            (id, outcome)
+        }
+    };
+    let kind = outcome.unwrap_or_else(|error| {
+        QueuedInputNoticeKind::Failed(format!(
+            "queued input `{input_id}` was not changed: {error}"
+        ))
+    });
+    refresh_queued_input_projection(
+        &inbox,
+        &session_id,
+        &projection,
+        &wake,
+        Some(QueuedInputNotice { input_id, kind }),
+    );
+}
+
 async fn drive_turns(
     mut driver: TurnDriver,
     mut prompts: mpsc::Receiver<PromptSubmission>,
     mut selections: mpsc::Receiver<zuno_tui::views::session::Selection>,
+    mut queue_mutations: mpsc::Receiver<QueuedInputMutation>,
     environment: StartupEnvironment,
     mut events: TurnEventSender,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut work_changes = driver.host.work_state_changes();
+    let mut queue_mutations_open = true;
     'driver: loop {
+        loop {
+            match queue_mutations.try_recv() {
+                Ok(mutation) => {
+                    apply_queued_input_mutation(
+                        driver.host.session_inbox(),
+                        driver.host.control(),
+                        driver.host.session_id().to_owned(),
+                        driver.reference_root.clone(),
+                        driver.queued_inputs.clone(),
+                        driver.queue_wake.clone(),
+                        mutation,
+                    )
+                    .await;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    queue_mutations_open = false;
+                    break;
+                }
+            }
+        }
         let queued = if prompts.is_empty() && selections.is_empty() {
             zuno_goal::QueuedUserInput::Absent
         } else {
@@ -2061,19 +2325,20 @@ async fn drive_turns(
                 report_turn_failure(&events, message).await;
             }
         }
-        let pending = match promote_pending_prompt(&driver.host) {
-            Ok(pending) => pending,
-            Err(message) => {
-                report_turn_failure(&events, message.clone()).await;
-                let shutdown = driver.host.shutdown().await;
-                return match shutdown {
-                    Ok(()) => Err(message),
-                    Err(error) => Err(format!(
-                        "{message}; final turn host shutdown also failed: {error}"
-                    )),
-                };
-            }
-        };
+        let pending =
+            match promote_pending_prompt(&driver.host, &driver.queued_inputs, &driver.queue_wake) {
+                Ok(pending) => pending,
+                Err(message) => {
+                    report_turn_failure(&events, message.clone()).await;
+                    let shutdown = driver.host.shutdown().await;
+                    return match shutdown {
+                        Ok(()) => Err(message),
+                        Err(error) => Err(format!(
+                            "{message}; final turn host shutdown also failed: {error}"
+                        )),
+                    };
+                }
+            };
         // A selection is taken only between turns, never during one: rebuilding the host
         // mid-turn would drop the stream the loop is still reading.
         let prompt = match pending {
@@ -2081,8 +2346,36 @@ async fn drive_turns(
             None => tokio::select! {
                 biased;
                 prompt = prompts.recv() => match prompt {
+                    Some(prompt @ PromptSubmission::Queue(_)) => {
+                        if let Err(message) = admit_followup(
+                            driver.host.session_inbox(),
+                            driver.host.control(),
+                            driver.reference_root.clone(),
+                            driver.queued_inputs.clone(),
+                            driver.queue_wake.clone(),
+                            prompt,
+                        ).await {
+                            report_input_failure(&events, message).await;
+                        }
+                        continue 'driver;
+                    }
                     Some(prompt) => DriverPrompt::direct(prompt),
                     None => break 'driver,
+                },
+                mutation = queue_mutations.recv(), if queue_mutations_open => {
+                    match mutation {
+                        Some(mutation) => apply_queued_input_mutation(
+                            driver.host.session_inbox(),
+                            driver.host.control(),
+                            driver.host.session_id().to_owned(),
+                            driver.reference_root.clone(),
+                            driver.queued_inputs.clone(),
+                            driver.queue_wake.clone(),
+                            mutation,
+                        ).await,
+                        None => queue_mutations_open = false,
+                    }
+                    continue;
                 },
                 selection = selections.recv() => {
                     let Some(selection) = selection else { break 'driver };
@@ -2175,12 +2468,12 @@ async fn drive_turns(
             }
         }
         drive_one(
-            &mut driver.host,
+            &mut driver,
             prompt,
             &mut prompts,
-            &driver.reference_root,
+            &mut queue_mutations,
+            &mut queue_mutations_open,
             &events,
-            &mut driver.snapshots,
         )
         .await;
         refresh_work_state(
@@ -2208,6 +2501,55 @@ async fn drive_turns(
         }
     }
     driver.host.shutdown().await
+}
+
+async fn drive_background_projection(
+    service: Arc<zuno_pty::BackgroundExecutionService>,
+    session_id: String,
+    projection: WorkState,
+    wake: mpsc::Sender<TerminalEvent>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut changes = service.subscribe();
+    refresh_background_projection(&service, &session_id, &projection, &wake);
+    loop {
+        tokio::select! {
+            changed = changes.recv() => {
+                let refresh = match changed {
+                    Ok(zuno_pty::BackgroundExecutionEvent::Created(info)
+                        | zuno_pty::BackgroundExecutionEvent::Settled(info)) => {
+                            info.session_id == session_id
+                        }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if refresh {
+                    refresh_background_projection(&service, &session_id, &projection, &wake);
+                }
+            }
+            changed = shutdown.changed() => {
+                let _changed = changed;
+                break;
+            }
+        }
+    }
+}
+
+fn refresh_background_projection(
+    service: &zuno_pty::BackgroundExecutionService,
+    session_id: &str,
+    projection: &WorkState,
+    wake: &mpsc::Sender<TerminalEvent>,
+) {
+    let generation = projection.generation();
+    projection.replace_background_executions(background_execution_projections(
+        service,
+        session_id,
+        zuno_db::message::now_millis(),
+    ));
+    if projection.generation() != generation {
+        let _nudged = wake.try_send(TerminalEvent::Wake);
+    }
 }
 
 async fn refresh_work_state(
@@ -2399,13 +2741,21 @@ async fn drive_mcp_lifecycle(worker: McpLifecycleWorker) {
 }
 
 async fn drive_one(
-    host: &mut TurnHost,
+    driver: &mut TurnDriver,
     prompt: DriverPrompt,
     prompts: &mut mpsc::Receiver<PromptSubmission>,
-    reference_root: &Path,
+    queue_mutations: &mut mpsc::Receiver<QueuedInputMutation>,
+    queue_mutations_open: &mut bool,
     events: &TurnEventSender,
-    snapshots: &mut SnapshotHistory,
 ) {
+    let TurnDriver {
+        host,
+        reference_root,
+        queued_inputs,
+        queue_wake,
+        snapshots,
+        ..
+    } = driver;
     {
         // Counted for the memory sampler's session attribution, which is what tells
         // "one session leaking" from "many sessions, each fine". A guard rather than a
@@ -2418,6 +2768,10 @@ async fn drive_one(
             } = prompt;
             let prompt =
                 super::tui_reference::resolve_submission(reference_root, submission).await?;
+            let prompt = match prompt {
+                PromptSubmission::Queue(prompt) | PromptSubmission::Steer(prompt) => *prompt,
+                prompt => prompt,
+            };
             if let PromptSubmission::Host(command) = prompt {
                 return execute_host_command(host, command, snapshots, events).await;
             }
@@ -2444,12 +2798,28 @@ async fn drive_one(
                             report_input_failure(&admission_events, message).await;
                         }
                     }
+                    mutation = queue_mutations.recv(), if *queue_mutations_open => {
+                        match mutation {
+                            Some(mutation) => apply_queued_input_mutation(
+                                inbox.clone(),
+                                control.clone(),
+                                control.session_id().to_owned(),
+                                admission_root.clone(),
+                                queued_inputs.clone(),
+                                queue_wake.clone(),
+                                mutation,
+                            ).await,
+                            None => *queue_mutations_open = false,
+                        }
+                    }
                     followup = prompts.recv(), if prompts_open => {
                         match followup {
                             Some(followup) => admissions.push(Box::pin(admit_followup(
                                 inbox.clone(),
                                 control.clone(),
                                 admission_root.clone(),
+                                queued_inputs.clone(),
+                                queue_wake.clone(),
                                 followup,
                             ))),
                             None => prompts_open = false,
@@ -2463,6 +2833,8 @@ async fn drive_one(
                     inbox.clone(),
                     control.clone(),
                     admission_root.clone(),
+                    queued_inputs.clone(),
+                    queue_wake.clone(),
                     followup,
                 )));
             }
@@ -2471,6 +2843,25 @@ async fn drive_one(
                     report_input_failure(&admission_events, message).await;
                 }
             }
+            while let Ok(mutation) = queue_mutations.try_recv() {
+                apply_queued_input_mutation(
+                    inbox.clone(),
+                    control.clone(),
+                    control.session_id().to_owned(),
+                    admission_root.clone(),
+                    queued_inputs.clone(),
+                    queue_wake.clone(),
+                    mutation,
+                )
+                .await;
+            }
+            refresh_queued_input_projection(
+                &inbox,
+                control.session_id(),
+                queued_inputs,
+                queue_wake,
+                None,
+            );
             turn_outcome?;
             loop {
                 let queued = if prompts.is_empty() {
@@ -2502,7 +2893,7 @@ async fn drive_submission(
     promoted_message_id: Option<&str>,
     events: TurnEventSender,
 ) -> Result<(), String> {
-    match (prompt, promoted_message_id) {
+    let result = match (prompt, promoted_message_id) {
         (PromptSubmission::Text(prompt), None) => host.drive(&prompt, events).await,
         (PromptSubmission::Text(prompt), Some(message_id)) => {
             host.drive_promoted(&prompt, message_id, events).await
@@ -2521,20 +2912,52 @@ async fn drive_submission(
             host.drive_promoted_command(&name, &arguments, message_id, events)
                 .await
         }
+        (
+            PromptSubmission::Skill {
+                name,
+                source,
+                arguments,
+            },
+            None,
+        ) => host.drive_skill(&name, &source, &arguments, events).await,
+        (
+            PromptSubmission::Skill {
+                name,
+                source,
+                arguments,
+            },
+            Some(message_id),
+        ) => {
+            host.drive_promoted_skill(&name, &source, &arguments, message_id, events)
+                .await
+        }
         (PromptSubmission::Host(_), _) => {
             unreachable!("host submissions are handled before a turn is started")
         }
+        (PromptSubmission::Queue(_), _) | (PromptSubmission::Steer(_), _) => {
+            unreachable!("delivery marker is removed before a turn is driven")
+        }
+    };
+    if let (Err(error), Some(message_id)) = (&result, promoted_message_id) {
+        let _settled =
+            host.session_inbox()
+                .mark_failed(host.session_id(), message_id, error.clone());
     }
+    result
 }
 
 fn followup_delivery(prompt: &PromptSubmission) -> zuno_db::inbox::InputDelivery {
     match prompt {
-        PromptSubmission::Text(_) | PromptSubmission::Content { .. } => {
+        PromptSubmission::Queue(_) => zuno_db::inbox::InputDelivery::Queue,
+        PromptSubmission::Steer(inner)
+            if matches!(
+                inner.as_ref(),
+                PromptSubmission::Text(_) | PromptSubmission::Content { .. }
+            ) =>
+        {
             zuno_db::inbox::InputDelivery::Steer
         }
-        PromptSubmission::Command { .. } | PromptSubmission::Host(_) => {
-            zuno_db::inbox::InputDelivery::NextStep
-        }
+        _ => zuno_db::inbox::InputDelivery::Queue,
     }
 }
 
@@ -2542,7 +2965,10 @@ fn soft_interrupt(
     input_id: &str,
     prompt: &PromptSubmission,
 ) -> Option<zuno_engine::interrupt::SoftInterruptMessage> {
-    let (content, images) = match prompt {
+    let PromptSubmission::Steer(prompt) = prompt else {
+        return None;
+    };
+    let (content, images) = match prompt.as_ref() {
         PromptSubmission::Text(text) => (text.clone(), Vec::new()),
         PromptSubmission::Content { content, .. } => {
             let mut text = Vec::new();
@@ -2560,7 +2986,11 @@ fn soft_interrupt(
             }
             (text.join("\n\n"), images)
         }
-        PromptSubmission::Command { .. } | PromptSubmission::Host(_) => return None,
+        PromptSubmission::Command { .. }
+        | PromptSubmission::Skill { .. }
+        | PromptSubmission::Host(_)
+        | PromptSubmission::Queue(_)
+        | PromptSubmission::Steer(_) => return None,
     };
     Some(zuno_engine::interrupt::SoftInterruptMessage {
         input_id: Some(input_id.to_owned()),
@@ -2575,6 +3005,8 @@ async fn admit_followup(
     inbox: zuno_db::inbox::SessionInbox,
     control: zuno_engine::status::SessionControl,
     reference_root: PathBuf,
+    queued_inputs: QueuedInputProjection,
+    queue_wake: mpsc::Sender<TerminalEvent>,
     prompt: PromptSubmission,
 ) -> Result<(), String> {
     let prompt = super::tui_reference::resolve_submission(&reference_root, prompt).await?;
@@ -2592,6 +3024,19 @@ async fn admit_followup(
             zuno_db::message::now_millis(),
         ))
         .map_err(to_string)?;
+    refresh_queued_input_projection(
+        &inbox,
+        control.session_id(),
+        &queued_inputs,
+        &queue_wake,
+        Some(QueuedInputNotice {
+            input_id: input_id.clone(),
+            kind: QueuedInputNoticeKind::Admitted(match delivery {
+                zuno_db::inbox::InputDelivery::Queue => QueuedInputDelivery::Queue,
+                zuno_db::inbox::InputDelivery::Steer => QueuedInputDelivery::Steer,
+            }),
+        }),
+    );
     if delivery == zuno_db::inbox::InputDelivery::Steer
         && let Some(message) = soft_interrupt(&input_id, &prompt)
     {
@@ -2613,7 +3058,11 @@ async fn admit_followup(
     Ok(())
 }
 
-fn promote_pending_prompt(host: &TurnHost) -> Result<Option<DriverPrompt>, String> {
+fn promote_pending_prompt(
+    host: &TurnHost,
+    queued_inputs: &QueuedInputProjection,
+    queue_wake: &mpsc::Sender<TerminalEvent>,
+) -> Result<Option<DriverPrompt>, String> {
     let inbox = host.session_inbox();
     let Some(input) = inbox
         .pending(host.session_id())
@@ -2630,6 +3079,7 @@ fn promote_pending_prompt(host: &TurnHost) -> Result<Option<DriverPrompt>, Strin
     else {
         return Ok(None);
     };
+    refresh_queued_input_projection(&inbox, host.session_id(), queued_inputs, queue_wake, None);
     Ok(Some(DriverPrompt::promoted(promoted.id, submission)))
 }
 
@@ -2743,6 +3193,12 @@ async fn restore_snapshot(
         HostCommand::Compact => {
             return Err("context compaction must be handled by the turn host".to_owned());
         }
+        HostCommand::Goal(_) => {
+            return Err("goal commands must be handled by the turn host".to_owned());
+        }
+        HostCommand::Plan | HostCommand::StartPlan | HostCommand::StartWork => {
+            return Err("plan mode controls must be handled by the TUI selection layer".to_owned());
+        }
         HostCommand::Stop(_) => {
             return Err("background stop must be handled by the TUI background service".to_owned());
         }
@@ -2772,19 +3228,42 @@ async fn execute_host_command(
     snapshots: &mut SnapshotHistory,
     events: &TurnEventSender,
 ) -> Result<(), String> {
-    if command != HostCommand::Compact {
-        return restore_snapshot(command, snapshots, events).await;
-    }
-    if !host.is_session_materialized() {
-        return Err("nothing to compact; send a message first".to_owned());
-    }
-    host.compact(false).await?;
+    let detail = match command {
+        HostCommand::Compact => {
+            if !host.is_session_materialized() {
+                return Err("nothing to compact; send a message first".to_owned());
+            }
+            host.compact(false).await?;
+            "context compacted; older history was summarized".to_owned()
+        }
+        HostCommand::Goal(arguments) => {
+            let was_materialized = host.is_session_materialized();
+            let outcome = host.goal_command(&arguments);
+            if !was_materialized && host.is_session_materialized() {
+                events
+                    .publish(TurnEvent::SessionMaterialized {
+                        session_id: host.session_id().to_owned(),
+                        title: host.session_title().unwrap_or("New session").to_owned(),
+                    })
+                    .await
+                    .map_err(to_string)?;
+            }
+            outcome?
+        }
+        HostCommand::Undo | HostCommand::Redo => {
+            return restore_snapshot(command, snapshots, events).await;
+        }
+        HostCommand::Plan | HostCommand::StartPlan | HostCommand::StartWork => {
+            return Err("plan mode controls must be handled by the TUI selection layer".to_owned());
+        }
+        HostCommand::Stop(_) => {
+            return Err("background stop must be handled by the TUI background service".to_owned());
+        }
+    };
     events
         .publish(TurnEvent::Provider {
             step: 0,
-            event: StreamEvent::StatusDetail {
-                detail: "context compacted; older history was summarized".to_owned(),
-            },
+            event: StreamEvent::StatusDetail { detail },
         })
         .await
         .map_err(to_string)
@@ -2986,9 +3465,21 @@ mod tests {
     }
 
     #[test]
-    fn tui_followup_delivery_steers_model_input_and_queues_host_work() {
+    fn tui_followup_delivery_queues_by_default_and_only_steers_explicit_overrides() {
         assert_eq!(
-            followup_delivery(&PromptSubmission::Text(String::from("steer"))),
+            followup_delivery(&PromptSubmission::Text(String::from("direct"))),
+            zuno_db::inbox::InputDelivery::Queue
+        );
+        assert_eq!(
+            followup_delivery(&PromptSubmission::Queue(Box::new(PromptSubmission::Text(
+                String::from("queue")
+            )))),
+            zuno_db::inbox::InputDelivery::Queue
+        );
+        assert_eq!(
+            followup_delivery(&PromptSubmission::Steer(Box::new(PromptSubmission::Text(
+                String::from("steer")
+            )))),
             zuno_db::inbox::InputDelivery::Steer
         );
         assert_eq!(
@@ -2996,11 +3487,19 @@ mod tests {
                 name: String::from("review"),
                 arguments: String::new(),
             }),
-            zuno_db::inbox::InputDelivery::NextStep
+            zuno_db::inbox::InputDelivery::Queue
+        );
+        assert_eq!(
+            followup_delivery(&PromptSubmission::Skill {
+                name: String::from("codegraph"),
+                source: String::from("/skills/codegraph/SKILL.md"),
+                arguments: String::new(),
+            }),
+            zuno_db::inbox::InputDelivery::Queue
         );
         assert_eq!(
             followup_delivery(&PromptSubmission::Host(HostCommand::Undo)),
-            zuno_db::inbox::InputDelivery::NextStep
+            zuno_db::inbox::InputDelivery::Queue
         );
     }
 
@@ -3032,12 +3531,18 @@ mod tests {
             .begin_turn("ses_tui_steer")
             .expect("fixture owns the live turn");
         let reference_root = tempfile::tempdir().expect("reference root");
+        let projection = QueuedInputProjection::default();
+        let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
 
         admit_followup(
             inbox.clone(),
             registry.control("ses_tui_steer"),
             reference_root.path().to_path_buf(),
-            PromptSubmission::Text("change direction now".to_owned()),
+            projection.clone(),
+            wake,
+            PromptSubmission::Steer(Box::new(PromptSubmission::Text(
+                "change direction now".to_owned(),
+            ))),
         )
         .await
         .expect("admit follow-up");
@@ -3045,6 +3550,11 @@ mod tests {
         let pending = inbox.pending("ses_tui_steer").expect("read durable inbox");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].delivery, zuno_db::inbox::InputDelivery::Steer);
+        assert_eq!(projection.snapshot().len(), 1);
+        assert!(matches!(
+            projection.observe().2.map(|notice| notice.kind),
+            Some(QueuedInputNoticeKind::Admitted(QueuedInputDelivery::Steer))
+        ));
         assert!(
             guard.soft_interrupt_signal().is_set(),
             "the durable admission did not wake the provider wait"
@@ -3064,7 +3574,7 @@ mod tests {
 
     #[test]
     fn tui_soft_interrupt_keeps_resolved_text_and_images() {
-        let submission = PromptSubmission::Content {
+        let submission = PromptSubmission::Steer(Box::new(PromptSubmission::Content {
             text: String::from("inspect @diagram.png"),
             content: vec![
                 zuno_llm::event::RequestContentBlock::Text {
@@ -3078,7 +3588,7 @@ mod tests {
                     data: String::from("AAAA"),
                 },
             ],
-        };
+        }));
 
         let message =
             soft_interrupt("msg_followup", &submission).expect("content can steer safely");
@@ -3110,7 +3620,18 @@ mod tests {
                 name: String::from("review"),
                 arguments: String::from("the queue"),
             },
+            PromptSubmission::Skill {
+                name: String::from("github-project-scaffold"),
+                source: String::from("/skills/github-project-scaffold/SKILL.md"),
+                arguments: String::from("audit the repository"),
+            },
             PromptSubmission::Host(HostCommand::Undo),
+            PromptSubmission::Queue(Box::new(PromptSubmission::Text(String::from(
+                "queued follow-up",
+            )))),
+            PromptSubmission::Steer(Box::new(PromptSubmission::Text(String::from(
+                "urgent correction",
+            )))),
         ];
 
         for submission in submissions {

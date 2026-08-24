@@ -6,7 +6,7 @@
 //! only what the model sees: the complete payload is stored first, then withheld.
 //! Returning a prefix would still spend context on an answer that is usually absent;
 //! this follows jcode's rationale at
-//! `.omo/refs/jcode/crates/jcode-app-core/src/tool/mod.rs:717-725`.
+//! `jcode`.
 
 use serde_json::{Value, json};
 use std::fmt;

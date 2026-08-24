@@ -429,6 +429,62 @@ async fn strict_authorization_does_not_add_prompts_to_read_only_tools() {
 }
 
 #[tokio::test]
+async fn allow_all_skips_hitl_for_side_effecting_tools() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        Vec::new(),
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::AllowAll,
+        McpToolStatus::Ready,
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-allow-all",
+            "bash",
+            json!({"command": "chmod +x scripts/install.sh", "intent": "prepare installer"}),
+        ))
+        .await;
+
+    assert!(!result.is_error, "{}", result.output.output);
+    assert!(approver.asks().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn allow_all_keeps_explicit_denies_terminal() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![deny_rule("bash", "rm -rf /")],
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::AllowAll,
+        McpToolStatus::Ready,
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-allow-all-deny",
+            "bash",
+            json!({"command": "rm -rf /", "intent": "must remain denied"}),
+        ))
+        .await;
+
+    assert!(result.is_error);
+    assert_eq!(
+        result.blocked,
+        Some(zuno_engine::r#loop::ToolBlockKind::Denied)
+    );
+    assert!(approver.asks().is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn strict_authorization_keeps_explicit_denies_terminal() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());

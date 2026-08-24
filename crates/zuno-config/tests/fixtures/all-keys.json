@@ -52,7 +52,7 @@
   "default_agent": "build",
   "subagent_depth": 0,
   "username": "ada",
-  "agent": {
+  "agents": {
     "build": {
       "model": "anthropic/claude-sonnet-4-5",
       "variant": "thinking",
@@ -67,15 +67,31 @@
       "color": "#ff5733",
       "steps": 120,
       "permission": {
-        "edit": "allow",
-        "bash": { "git push": "ask", "*": "allow" }
+        "mode": "standard",
+        "rules": {
+          "edit": "allow",
+          "bash": { "git push": "ask", "*": "allow" }
+        }
       }
     },
     "explore": {
       "description": "Read-only survey",
       "mode": "subagent",
       "color": "accent",
-      "permission": "deny"
+      "permission": {
+        "mode": "standard",
+        "rules": { "*": "deny" }
+      }
+    }
+  },
+  "workflows": {
+    "release-hardening": {
+      "maxParallel": 2,
+      "maxAgents": 2,
+      "nodes": [
+        {"id": "scan", "agent": "explore"},
+        {"id": "implement", "agent": "build", "dependsOn": ["scan"]}
+      ]
     }
   },
   "provider": {
@@ -211,25 +227,27 @@
   },
   "instructions": ["CONTRIBUTING.md", "docs/**/*.md"],
   "permission": {
-    "read": "allow",
-    "edit": { "src/**": "allow", "*": "ask" },
-    "glob": "allow",
-    "grep": "allow",
-    "list": "allow",
-    "bash": { "git status": "allow", "*": "ask" },
-    "task": "allow",
-    "external_directory": "ask",
-    "todowrite": "allow",
-    "question": "ask",
-    "webfetch": "ask",
-    "web_search": "ask",
-    "lsp": "allow",
-    "doom_loop": "deny",
-    "skill": "allow",
-    "todoread": "allow"
-  },
-  "authorization": {
-    "strict": true
+    "mode": "strict",
+    "rules": {
+      "read": "allow",
+      "edit": { "src/**": "allow", "*": "ask" },
+      "glob": "allow",
+      "grep": "allow",
+      "list": "allow",
+      "bash": { "git status": "allow", "*": "ask" },
+      "task": "allow",
+      "external_directory": "ask",
+      "plan_get": "allow",
+      "plan_update": "allow",
+      "todo_get": "allow",
+      "todo_update": "allow",
+      "question": "ask",
+      "webfetch": "ask",
+      "web_search": "ask",
+      "lsp": "allow",
+      "doom_loop": "deny",
+      "skill": "allow"
+    }
   },
   "tools": {
     "bash": true,

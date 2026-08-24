@@ -1,13 +1,14 @@
 //! Prompt assembly that preserves a provider's reusable request prefix.
 //!
 //! [`PromptCache`] owns the static system prompt for a session, so per-turn APIs
-//! cannot replace it. Dynamic context and memory have a different type and only
-//! enter the request through a trailing user message. The append-only tracker is
-//! a second line of defense for callers that assemble stable history, while the
-//! tool lock permits one intentional cache miss when asynchronous MCP discovery
+//! cannot replace it. Dynamic context and memory have a different type and enter
+//! the request through dedicated, non-cacheable developer-context items. The
+//! append-only tracker is a second line of defense for callers that assemble
+//! stable history, while the tool lock permits one intentional cache miss when
+//! asynchronous MCP discovery
 //! finishes and then freezes again.
 
-use crate::registry::{Message, Role};
+use crate::registry::Message;
 use sha2::{Digest as _, Sha256};
 use std::io;
 use std::sync::Arc;
@@ -92,27 +93,18 @@ impl DynamicContext {
                 .is_none_or(|memory| memory.trim().is_empty())
     }
 
-    fn into_trailing_message(self) -> Option<Message> {
+    fn into_developer_context(self) -> Vec<String> {
         let mut sections = Vec::with_capacity(2);
         let turn_context = self.turn_context.trim();
         if !turn_context.is_empty() {
-            sections.push(turn_context);
+            sections.push(turn_context.to_owned());
         }
         if let Some(memory) = self.memory.as_deref().map(str::trim)
             && !memory.is_empty()
         {
-            sections.push(memory);
+            sections.push(memory.to_owned());
         }
-        if sections.is_empty() {
-            return None;
-        }
-        Some(Message::new(
-            Role::User,
-            format!(
-                "<system-reminder>\n{}\n</system-reminder>",
-                sections.join("\n\n")
-            ),
-        ))
+        sections
     }
 }
 
@@ -135,24 +127,6 @@ impl SplitSystemPrompt {
     #[must_use]
     pub fn static_prefix(&self) -> &StaticSystemPrompt {
         &self.static_prefix
-    }
-
-    fn messages_with_dynamic_tail(
-        &self,
-        stable_history: &[Message],
-        dynamic: DynamicContext,
-    ) -> Vec<Message> {
-        let mut messages = stable_history.to_vec();
-        if let Some(message) = dynamic.into_trailing_message() {
-            messages.push(message);
-        }
-        messages
-    }
-
-    fn append_dynamic_tail(&self, messages: &mut Vec<Message>, dynamic: DynamicContext) {
-        if let Some(message) = dynamic.into_trailing_message() {
-            messages.push(message);
-        }
     }
 }
 
@@ -381,6 +355,7 @@ impl<T: Clone + PartialEq> LockedTools<T> {
 pub struct PreparedTurn<T> {
     system_static: StaticSystemPrompt,
     messages: Vec<Message>,
+    developer_context: Vec<String>,
     tools: Vec<T>,
     rebuilt_tools: bool,
 }
@@ -392,10 +367,16 @@ impl<T> PreparedTurn<T> {
         self.system_static.as_str()
     }
 
-    /// Persisted history followed by at most one volatile user message.
+    /// Persisted provider history. Volatile policy is kept out of user messages.
     #[must_use]
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Independent, volatile developer-context items for this request.
+    #[must_use]
+    pub fn developer_context(&self) -> &[String] {
+        &self.developer_context
     }
 
     /// Frozen tools for this request.
@@ -416,8 +397,8 @@ impl<T> PreparedTurn<T> {
     /// observing request metadata should move both vectors into that request rather
     /// than retaining this snapshot and cloning the complete prompt again.
     #[must_use]
-    pub fn into_request_parts(self) -> (Vec<Message>, Vec<T>) {
-        (self.messages, self.tools)
+    pub fn into_request_parts(self) -> (Vec<Message>, Vec<String>, Vec<T>) {
+        (self.messages, self.developer_context, self.tools)
     }
 }
 
@@ -460,9 +441,8 @@ impl<T: Clone + PartialEq> PromptCache<T> {
             .record(self.prompt.static_prefix(), stable_history)?;
         Ok(PreparedTurn {
             system_static: self.prompt.static_prefix().clone(),
-            messages: self
-                .prompt
-                .messages_with_dynamic_tail(stable_history, dynamic),
+            messages: stable_history.to_vec(),
+            developer_context: dynamic.into_developer_context(),
             tools: tool_snapshot.into_tools(),
             rebuilt_tools: self.tools.rebuild_count() == 1 && self.tracker.turn() == 1,
         })
@@ -476,7 +456,7 @@ impl<T: Clone + PartialEq> PromptCache<T> {
     /// the vector does not weaken append-only validation.
     pub fn prepare_turn_owned(
         &mut self,
-        mut stable_history: Vec<Message>,
+        stable_history: Vec<Message>,
         dynamic: DynamicContext,
         available_tools: &[T],
         mcp_status: McpToolStatus,
@@ -487,11 +467,10 @@ impl<T: Clone + PartialEq> PromptCache<T> {
         }
         self.tracker
             .record(self.prompt.static_prefix(), &stable_history)?;
-        self.prompt
-            .append_dynamic_tail(&mut stable_history, dynamic);
         Ok(PreparedTurn {
             system_static: self.prompt.static_prefix().clone(),
             messages: stable_history,
+            developer_context: dynamic.into_developer_context(),
             tools: tool_snapshot.into_tools(),
             rebuilt_tools: self.tools.rebuild_count() == 1 && self.tracker.turn() == 1,
         })
@@ -513,21 +492,10 @@ impl<T: Clone + PartialEq> PromptCache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::RequestContentBlock;
+    use crate::event::{RequestContentBlock, Role};
 
     fn message(role: Role, text: &str) -> Message {
         Message::new(role, text)
-    }
-
-    fn text_of(message: &Message) -> String {
-        message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                RequestContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]
@@ -587,17 +555,16 @@ mod tests {
                 .all(|bytes| *bytes == static_text.as_bytes())
         );
 
-        let dynamic_messages = [
-            turn_one.messages().last().unwrap(),
-            turn_two.messages().last().unwrap(),
-            turn_three.messages().last().unwrap(),
+        let dynamic_contexts = [
+            turn_one.developer_context(),
+            turn_two.developer_context(),
+            turn_three.developer_context(),
         ];
         assert!(
-            dynamic_messages
-                .iter()
-                .all(|message| message.role == Role::User)
+            dynamic_contexts.iter().all(|context| context.len() == 2),
+            "turn context and memory must remain independent developer items"
         );
-        let dynamic_texts = dynamic_messages.map(text_of);
+        let dynamic_texts = dynamic_contexts.map(|context| context.join("\n"));
         assert_ne!(dynamic_texts[0], dynamic_texts[1]);
         assert_ne!(dynamic_texts[1], dynamic_texts[2]);
         assert!(dynamic_texts[0].contains("memory generation one"));
@@ -764,5 +731,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(turn.messages(), history);
+        assert!(turn.developer_context().is_empty());
     }
 }

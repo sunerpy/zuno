@@ -57,19 +57,45 @@ pub enum GoalError {
         value: String,
     },
 
-    /// `create_goal` found a goal that is not finished yet.
+    /// `create_goal` found a goal that is not replaceable yet.
     ///
     /// Distinct from a plain conflict because the remedy is specific: finish the
     /// current goal, or have the user replace it.
     #[error(
         "session {session_id} already has a goal with status `{status}`; \
-         create_goal may replace a goal only once it is `complete`"
+         create_goal may replace a goal only once it is `complete` or `cancelled`"
     )]
     GoalNotReplaceable {
         /// The session whose goal blocked the replacement.
         session_id: String,
         /// The status that blocked it, read in the same transaction that refused.
         status: GoalStatus,
+    },
+
+    /// A writer used a stale optimistic-concurrency revision.
+    #[error(
+        "goal revision conflict for session {session_id}: expected {expected}, current {actual}"
+    )]
+    RevisionConflict {
+        /// Session whose goal changed concurrently.
+        session_id: String,
+        /// Revision supplied by the writer.
+        expected: i64,
+        /// Revision stored when the guarded update ran.
+        actual: i64,
+    },
+
+    /// Completion was requested while durable work still says the goal is unfinished.
+    #[error(
+        "goal cannot complete while {plan_steps} plan steps, {work_items} work items, and {jobs} jobs remain unfinished"
+    )]
+    CompletionBlocked {
+        /// Plan steps not completed or cancelled.
+        plan_steps: usize,
+        /// Work items not completed or cancelled.
+        work_items: usize,
+        /// Jobs not completed or cancelled.
+        jobs: usize,
     },
 
     /// An objective was empty or only whitespace.
@@ -143,6 +169,8 @@ impl GoalError {
             Self::StatusNotModelOwned { .. }
             | Self::UnknownStatus { .. }
             | Self::GoalNotReplaceable { .. }
+            | Self::RevisionConflict { .. }
+            | Self::CompletionBlocked { .. }
             | Self::EmptyObjective => true,
             Self::Db(_)
             | Self::UnknownRetryReason { .. }
@@ -159,7 +187,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_refused_replacement_names_the_blocking_status_and_the_only_status_that_would_work() {
+    fn a_refused_replacement_names_the_blocking_status_and_the_terminal_statuses_that_work() {
         let error = GoalError::GoalNotReplaceable {
             session_id: "ses_abc".to_owned(),
             status: GoalStatus::Active,
@@ -167,7 +195,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "session ses_abc already has a goal with status `active`; \
-             create_goal may replace a goal only once it is `complete`"
+             create_goal may replace a goal only once it is `complete` or `cancelled`"
         );
         assert!(error.is_model_refusal());
     }

@@ -20,11 +20,30 @@ pub fn build_request_body(
     request: &CompletionRequest,
     config: &AnthropicConfig,
 ) -> Result<Value, ProviderError> {
+    request
+        .validate_tool_arguments()
+        .map_err(ProviderError::fatal)?;
     let (system, messages) = split_system(&request.messages)?;
     let mut wire_messages = messages
         .into_iter()
         .map(message_value)
         .collect::<Result<Vec<_>, _>>()?;
+
+    let mut system_blocks = Vec::new();
+    if let Some(system) = system {
+        let mut block = json!({ "type": "text", "text": system.as_str() });
+        if config.prompt_cache() {
+            add_cache_control(&mut block);
+        }
+        system_blocks.push(block);
+    }
+    system_blocks.extend(
+        request
+            .developer_context
+            .iter()
+            .filter(|content| !content.trim().is_empty())
+            .map(|content| json!({"type": "text", "text": content})),
+    );
 
     let mut root = Map::new();
     root.insert("model".to_owned(), Value::String(request.model_id.clone()));
@@ -35,12 +54,8 @@ pub fn build_request_body(
     root.insert("messages".to_owned(), Value::Array(wire_messages.clone()));
     root.insert("stream".to_owned(), Value::Bool(true));
 
-    if let Some(system) = system {
-        let mut block = json!({ "type": "text", "text": system.as_str() });
-        if config.prompt_cache() {
-            add_cache_control(&mut block);
-        }
-        root.insert("system".to_owned(), Value::Array(vec![block]));
+    if !system_blocks.is_empty() {
+        root.insert("system".to_owned(), Value::Array(system_blocks));
     } else if config.prompt_cache() && add_last_message_cache_breakpoint(&mut wire_messages) {
         root.insert("messages".to_owned(), Value::Array(wire_messages));
     }
@@ -291,15 +306,20 @@ mod tests {
                 Message::new(Role::System, "stable system bytes"),
                 Message::new(Role::User, "volatile turn"),
             ],
-        );
+        )
+        .with_developer_context(vec!["active goal".to_owned(), "memory".to_owned()]);
         let body = build_request_body(&request, &config()).expect("request");
         assert_eq!(
             body["system"],
-            json!([{
-                "type": "text",
-                "text": "stable system bytes",
-                "cache_control": { "type": "ephemeral" },
-            }])
+            json!([
+                {
+                    "type": "text",
+                    "text": "stable system bytes",
+                    "cache_control": { "type": "ephemeral" },
+                },
+                {"type": "text", "text": "active goal"},
+                {"type": "text", "text": "memory"},
+            ])
         );
         assert!(
             body["messages"][0]["content"][0]

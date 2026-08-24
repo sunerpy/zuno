@@ -9,7 +9,7 @@
 use crate::agent::AgentMode;
 use zuno_config::schema::ordered::OrderedMap;
 use zuno_config::schema::permission::{
-    PermissionAction, PermissionConfig, PermissionObject, PermissionRule,
+    PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
 
 /// End-to-end implementation agent.
@@ -256,11 +256,27 @@ impl Builtin {
                 ("question", allow()),
                 ("plan_enter", allow()),
                 ("task", allow()),
+                ("plan_get", allow()),
+                ("plan_update", allow()),
+                ("todo_get", allow()),
+                ("todo_update", allow()),
             ],
             "plan" => vec![
+                ("*", deny()),
+                ("read", allow()),
+                ("glob", allow()),
+                ("grep", allow()),
+                ("lsp", allow()),
+                ("webfetch", allow()),
+                ("web_search", allow()),
                 ("question", allow()),
                 ("plan_exit", allow()),
-                ("task", deny()),
+                ("goal_get", allow()),
+                ("plan_get", allow()),
+                ("plan_update", allow()),
+                ("todo_get", allow()),
+                ("todo_update", allow()),
+                ("skill", allow()),
             ],
             "deep" | "worker" => vec![
                 ("*", deny()),
@@ -272,7 +288,10 @@ impl Builtin {
                 ("bash", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
-                ("todowrite", allow()),
+                ("plan_get", allow()),
+                ("plan_update", allow()),
+                ("todo_get", allow()),
+                ("todo_update", allow()),
                 ("skill", allow()),
                 ("execute", allow()),
             ],
@@ -306,7 +325,10 @@ impl Builtin {
         for (key, rule) in rules {
             object.insert(key, rule);
         }
-        Some(PermissionConfig::Object(PermissionObject(object)))
+        Some(PermissionConfig {
+            mode: PermissionMode::Standard,
+            rules: PermissionObject(object),
+        })
     }
 
     /// Whether the composition root must add runtime path rules.
@@ -378,7 +400,7 @@ mod tests {
             .into_iter()
             .filter(|builtin| builtin.mode == AgentMode::Subagent)
         {
-            let overlay = builtin.permission_overlay().expect("overlay").normalized();
+            let overlay = builtin.permission_overlay().expect("overlay").rules;
             let first = overlay.iter().next().expect("at least wildcard deny");
             assert_eq!(first.0, "*", "{} needs a wildcard deny", builtin.name);
             assert_eq!(
@@ -393,6 +415,47 @@ mod tests {
                 }),
                 "{} must not create grandchildren",
                 builtin.name
+            );
+        }
+    }
+
+    #[test]
+    fn plan_is_read_only_by_capability_not_only_by_prompt() {
+        let overlay = get("plan")
+            .expect("plan")
+            .permission_overlay()
+            .expect("overlay")
+            .rules;
+        assert_eq!(
+            overlay.iter().next(),
+            Some(("*", &PermissionRule::Action(PermissionAction::Deny)))
+        );
+        for allowed in [
+            "read",
+            "glob",
+            "grep",
+            "lsp",
+            "webfetch",
+            "web_search",
+            "question",
+            "goal_get",
+            "plan_get",
+            "plan_update",
+            "todo_get",
+            "todo_update",
+            "skill",
+        ] {
+            assert_eq!(
+                overlay.get(allowed),
+                Some(&PermissionRule::Action(PermissionAction::Allow)),
+                "Plan mode must expose `{allowed}`"
+            );
+        }
+        for denied in ["bash", "write", "edit", "patch", "task", "execute"] {
+            assert_ne!(
+                overlay.get(denied),
+                Some(&PermissionRule::Action(PermissionAction::Allow)),
+                "Plan mode unexpectedly allows `{denied}`"
             );
         }
     }

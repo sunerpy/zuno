@@ -147,7 +147,7 @@ fn permission_warning(path: &Path, file: &File) -> Result<Option<PermissionWarni
 ///
 /// Access there is governed by NTFS ACLs, which this crate does not set; the file
 /// inherits the parent directory's ACL. See the crate docs and the task-24 entry
-/// in `.omo/notepads/opencode-rust/decisions.md`.
+/// in the project's engineering notes.
 #[cfg(not(unix))]
 fn permission_warning(_path: &Path, _file: &File) -> Result<Option<PermissionWarning>, AuthError> {
     Ok(None)
@@ -224,7 +224,7 @@ fn open_for_write(path: &Path) -> std::io::Result<File> {
 /// into `orElseSucceed(() => ({}))`, so a truncated `auth.json` reads as empty
 /// and the next `set` writes that emptiness back — silently destroying every
 /// credential in the file. Surfacing it instead gives the caller the chance not
-/// to. See the task-24 entry in `.omo/notepads/opencode-rust/decisions.md`.
+/// to. See the task-24 entry in the project's engineering notes.
 pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<Read<T>, AuthError> {
     let mut file = match File::open(path) {
         Ok(file) => file,

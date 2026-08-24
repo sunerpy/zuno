@@ -26,10 +26,9 @@
 //! both in the statements that perform the write, because as Rust-side checks
 //! they would be check-then-act races. See [`store`].
 //!
-//! **The goal has its own database file.** A goal that cascaded away with
-//! unrelated session pruning or migration state would defeat the whole point.
-//! The separate file also gives the goal schema an explicit generation. See
-//! [`store`] for the full argument.
+//! **Goal and work state share the application database.** Goal, plan, todo, job,
+//! and session checkpoints can be audited and completed against one SQLite
+//! transaction boundary. Test fixtures may still use private pools.
 //!
 //! **The Markdown document is a projection, and the conflict rule is fixed.** The
 //! goal is also rendered to `.zuno/goal/<sessionID>.md` for a human to read
@@ -85,8 +84,8 @@ pub use crate::spill::{
 };
 pub use crate::status::{GoalStatus, ModelStatus, StatusOwner, SystemStatus};
 pub use crate::store::{
-    AUXILIARY_SCHEMA, FailureStreak, GOAL_DB_FILE, Goal, GoalStore, OBJECTIVE_SPILL_DIRECTORY,
-    SCHEMA, TABLE, default_db_path, default_spill_dir,
+    AUXILIARY_SCHEMA, FailureStreak, Goal, GoalHistoryEntry, GoalStore, OBJECTIVE_SPILL_DIRECTORY,
+    SCHEMA, TABLE, default_spill_dir,
 };
 pub use crate::tools::{
     CREATE_GOAL_TOOL_ID, CreateGoalParams, CreateGoalTool, GET_GOAL_TOOL_ID, GetGoalParams,

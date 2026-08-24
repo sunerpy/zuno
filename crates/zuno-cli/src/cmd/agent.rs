@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use zuno_catalog::agent;
 use zuno_catalog::reference::{ReferenceTarget, ResolvedReferences};
@@ -62,7 +62,7 @@ fn list(environment: &StartupEnvironment) -> Result<(), String> {
 /// The rule patterns that cannot be written down ahead of time.
 ///
 /// They name resolved paths — the tool-output directory, the temp directory, the
-/// discovered skill and reference directories, the plan directory — so they are
+/// discovered skill and reference directories — so they are
 /// computed once per invocation and then handed to [`resolved_rules`]. This is
 /// `pub(crate)` because `run` needs the same ruleset the listing prints: a
 /// permission set that a user can read with `agent list` but that the turn loop
@@ -70,8 +70,6 @@ fn list(environment: &StartupEnvironment) -> Result<(), String> {
 pub(crate) struct DynamicRules {
     readonly_external: Vec<Rule>,
     truncate_glob: String,
-    plan_directory_glob: String,
-    relative_plan_glob: String,
 }
 
 impl DynamicRules {
@@ -101,18 +99,9 @@ impl DynamicRules {
                 .map(|pattern| rule("external_directory", &pattern, PermissionAction::Allow)),
         );
 
-        let plan_directory_glob = glob(&layout.data().join("plans"));
-        let absolute_plan_glob = layout.data().join("plans").join("*.md");
-        let relative_plan_glob = worktree.map_or_else(
-            || absolute_plan_glob.to_string_lossy().into_owned(),
-            |root| relative_path(root, &absolute_plan_glob),
-        );
-
         Self {
             readonly_external,
             truncate_glob,
-            plan_directory_glob,
-            relative_plan_glob,
         }
     }
 }
@@ -130,19 +119,7 @@ pub(crate) fn resolved_rules(
     {
         rules.extend(rules_from_config(&overlay));
         match entry.name.as_str() {
-            "plan" => {
-                rules.push(rule(
-                    "external_directory",
-                    &dynamic.plan_directory_glob,
-                    PermissionAction::Allow,
-                ));
-                rules.extend([
-                    rule("edit", "*", PermissionAction::Deny),
-                    rule("edit", ".zuno/plans/*.md", PermissionAction::Allow),
-                    rule("edit", &dynamic.relative_plan_glob, PermissionAction::Allow),
-                ]);
-            }
-            "explorer" | "librarian" | "advisor" | "looker" => {
+            "plan" | "explorer" | "librarian" | "advisor" | "looker" => {
                 rules.extend(dynamic.readonly_external.clone())
             }
             _ => {}
@@ -220,38 +197,9 @@ fn rule(permission: &str, pattern: &str, action: PermissionAction) -> Rule {
     }
 }
 
-fn relative_path(from: &Path, to: &Path) -> String {
-    let from: Vec<Component<'_>> = from.components().collect();
-    let to: Vec<Component<'_>> = to.components().collect();
-    let shared = from
-        .iter()
-        .zip(&to)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut relative = PathBuf::new();
-    for _ in shared..from.len() {
-        relative.push("..");
-    }
-    for component in &to[shared..] {
-        relative.push(component.as_os_str());
-    }
-    relative.to_string_lossy().into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn relative_plan_path_matches_node_path_relative_shape() {
-        assert_eq!(
-            relative_path(
-                Path::new("/work/repo"),
-                Path::new("/home/user/.local/share/opencode/plans/*.md")
-            ),
-            "../../home/user/.local/share/opencode/plans/*.md"
-        );
-    }
 
     #[test]
     fn default_rules_preserve_find_last_order() {
@@ -265,8 +213,6 @@ mod tests {
                 ),
             ],
             truncate_glob: "/data/tool-output/*".to_owned(),
-            plan_directory_glob: "/data/plans/*".to_owned(),
-            relative_plan_glob: "../data/plans/*.md".to_owned(),
         };
         let rules = default_rules(&dynamic);
         assert_eq!(rules[0].permission, "*");

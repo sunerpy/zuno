@@ -737,20 +737,21 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
         Ok(TurnOutcome::Completed { steps: 1, .. })
     ));
 
-    let (stored_type, data): (String, String) = connection
+    let (prompt_event_id, stored_type, data): (String, String, String) = connection
         .query_row(
-            "SELECT type, data FROM event \
+            "SELECT id, type, data FROM event \
              WHERE aggregate_id = ?1 AND type = 'session.prompt.assembled.1'",
             [SESSION_ID],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("prompt trace event");
     assert_eq!(stored_type, "session.prompt.assembled.1");
     let trace: Value = serde_json::from_str(&data).expect("prompt trace JSON");
     assert_eq!(trace["agent"], "build");
     assert_eq!(trace["step"], 1);
+    assert_eq!(trace["turnId"], "turn-prompt-trace");
     assert_eq!(trace["hookTransformed"], true);
-    assert_eq!(trace["actualSystemPrompt"], "BASE\n\nRULES\nHOOK");
+    assert_eq!(trace["actualSystemPrompt"], "BASE\n\nRULES\n\nHOOK");
     assert_eq!(
         trace["sections"]
             .as_array()
@@ -763,12 +764,100 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
     assert_eq!(trace["sections"][0]["source"], "native:build");
     assert_eq!(trace["sections"][1]["source"], "/workspace/AGENTS.md");
 
+    let mut statement = connection
+        .prepare(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.provider.request.1' ORDER BY seq",
+        )
+        .expect("prepare provider request events");
+    let lifecycle = statement
+        .query_map([SESSION_ID], |row| row.get::<_, String>(0))
+        .expect("query provider request events")
+        .map(|row| {
+            serde_json::from_str::<Value>(&row.expect("provider request event"))
+                .expect("provider request JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lifecycle.len(), 2);
+    assert_eq!(lifecycle[0]["status"], "started");
+    assert_eq!(lifecycle[1]["status"], "completed");
+    assert_eq!(lifecycle[0]["requestID"], lifecycle[1]["requestID"]);
+    assert_eq!(lifecycle[0]["turnID"], "turn-prompt-trace");
+    assert_eq!(lifecycle[0]["promptReceiptID"], prompt_event_id);
+    assert!(lifecycle[0]["estimatedPromptTokens"].as_u64().is_some());
+
+    let usage = zuno_db::session::get(&connection, SESSION_ID)
+        .expect("session usage")
+        .usage
+        .snapshot();
+    assert!(usage.estimated_pending_prompt_tokens.is_some());
+    assert!(usage.confirmed.is_empty());
+
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(
-        requests[0].messages[0],
-        zuno_llm::event::Message::new(Role::System, "BASE\n\nRULES\nHOOK"),
-        "the durable actual prompt must equal the system message sent to the provider"
+        &requests[0].messages[..3],
+        &[
+            zuno_llm::event::Message::new(Role::System, "BASE"),
+            zuno_llm::event::Message::new(Role::System, "RULES"),
+            zuno_llm::event::Message::new(Role::System, "HOOK"),
+        ],
+        "kernel, developer rules, and hook output must keep separate provider messages"
+    );
+}
+
+#[tokio::test]
+async fn loop_routes_dynamic_goal_and_memory_outside_user_history() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_dynamic_user", 10, "continue the goal");
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("done".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        RunTurnRequest::new(
+            SESSION_ID,
+            "turn-dynamic-context",
+            DynamicContext::new("ACTIVE GOAL").with_memory("RESIDENT MEMORY"),
+        ),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    outcome.expect("dynamic-context turn succeeds");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].developer_context,
+        vec!["ACTIVE GOAL".to_owned(), "RESIDENT MEMORY".to_owned()]
+    );
+    let dynamic_text_leaked = requests[0].messages.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                RequestContentBlock::Text { text }
+                    if text == "ACTIVE GOAL" || text == "RESIDENT MEMORY"
+            )
+        })
+    });
+    assert!(
+        !dynamic_text_leaked,
+        "dynamic policy leaked into replayable history"
     );
 }
 
@@ -1198,6 +1287,25 @@ async fn loop_live_steer_wakes_provider_retry_backoff_without_replaying_stale_in
     }));
 }
 
+fn without_prompt_estimates(events: &[TurnEvent]) -> Vec<TurnEvent> {
+    events
+        .iter()
+        .cloned()
+        .map(|event| match event {
+            TurnEvent::ProviderRequestStarted {
+                step,
+                message_count,
+                ..
+            } => TurnEvent::ProviderRequestStarted {
+                step,
+                message_count,
+                estimated_prompt_tokens: 0,
+            },
+            event => event,
+        })
+        .collect()
+}
+
 fn expected_full_turn_events() -> Vec<TurnEvent> {
     vec![
         TurnEvent::TurnStarted {
@@ -1224,6 +1332,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
         TurnEvent::ProviderRequestStarted {
             step: 1,
             message_count: 2,
+            estimated_prompt_tokens: 0,
         },
         TurnEvent::Provider {
             step: 1,
@@ -1306,6 +1415,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
         TurnEvent::ProviderRequestStarted {
             step: 2,
             message_count: 4,
+            estimated_prompt_tokens: 0,
         },
         TurnEvent::Provider {
             step: 2,
@@ -1340,7 +1450,23 @@ async fn loop_full_turn_emits_the_exact_sequence_deterministically() {
 
     for run_index in 0..3 {
         let (events, requests, calls) = run_full_turn_once().await;
-        assert_eq!(events, expected, "event sequence changed");
+        assert_eq!(
+            without_prompt_estimates(&events),
+            expected,
+            "event sequence changed"
+        );
+        let estimates = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::ProviderRequestStarted {
+                    estimated_prompt_tokens,
+                    ..
+                } => Some(*estimated_prompt_tokens),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(estimates.len(), 2);
+        assert!(estimates.iter().all(|estimate| *estimate > 0));
         assert_eq!(requests.len(), 2);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].call.name, "echo");
@@ -1454,6 +1580,100 @@ async fn loop_accepts_interleaved_parallel_tool_streams_and_dispatches_in_model_
             })
             .collect::<Vec<_>>(),
         vec!["call-a", "call-b"]
+    );
+}
+
+#[tokio::test]
+async fn loop_never_replays_malformed_tool_arguments_as_a_non_object() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_malformed_tool_user",
+        10,
+        "call the tool with malformed arguments",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::complete(vec![
+            StreamEvent::ToolUseStart {
+                id: "call-malformed".to_owned(),
+                name: "echo".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call-malformed".to_owned(),
+                delta: r#"{"text":"unfinished""#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call-malformed".to_owned(),
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+        ]),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("recovered".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-malformed-tool"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 2, .. })
+    ));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let replayed_inputs = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            RequestContentBlock::ToolUse { input, .. } => Some(input),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !replayed_inputs.is_empty(),
+        "the tool exchange was not replayed"
+    );
+    assert!(
+        replayed_inputs.iter().all(|input| input.is_object()),
+        "provider-bound tool arguments must always be JSON objects: {replayed_inputs:#?}"
+    );
+
+    let assistant = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate malformed tool checkpoint")
+        .into_iter()
+        .find(|message| message.info.id == "msg_turn-malformed-tool_0001")
+        .expect("first assistant checkpoint");
+    let tool = assistant
+        .parts
+        .iter()
+        .find(|part| part.kind == PartKind::Tool)
+        .expect("malformed tool checkpoint");
+    assert!(tool.data["state"]["input"].is_object());
+    assert_eq!(
+        tool.data["state"]["raw"],
+        serde_json::Value::String(r#"{"text":"unfinished""#.to_owned())
     );
 }
 
@@ -2544,6 +2764,115 @@ async fn loop_records_token_usage_that_arrives_after_the_finish_reason() {
     assert_eq!(session.usage.tokens.cache_read, 1_024);
     assert_eq!(session.usage.tokens.cache_write, 64);
     assert_eq!(session.usage.last_prompt_tokens, Some(4_210));
+}
+
+#[tokio::test]
+async fn loop_provider_failure_preserves_the_last_confirmed_session_usage() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_usage_ok_user", 10, "record usage");
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("first response".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+            StreamEvent::TokenUsage {
+                input_tokens: Some(4_210),
+                output_tokens: Some(186),
+                cache_read_input_tokens: Some(1_024),
+                cache_write_input_tokens: Some(64),
+                accounting: PromptAccounting::CacheInsideInput,
+            },
+        ]),
+        ScriptedResponse::failed(
+            Vec::new(),
+            ProviderError::Fatal {
+                status: Some(400),
+                source: None,
+            },
+        ),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+
+    let (first_sender, first_receiver) = event_channel();
+    let first = run_turn(
+        request("turn-usage-confirmed"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        first_sender,
+    );
+    let (first_outcome, _events) = tokio::join!(first, collect_events(first_receiver));
+    first_outcome.expect("first turn succeeds");
+
+    let confirmed = zuno_db::session::get(&connection, SESSION_ID)
+        .expect("read confirmed usage")
+        .usage;
+    assert!(confirmed.known);
+    assert_eq!(confirmed.last_prompt_tokens, Some(4_210));
+
+    put_user(&connection, "msg_usage_failed_user", 20, "trigger failure");
+    let (failed_sender, failed_receiver) = event_channel();
+    let failed = run_turn(
+        request("turn-usage-failed"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        failed_sender,
+    );
+    let (failed_outcome, _events) = tokio::join!(failed, collect_events(failed_receiver));
+    assert!(matches!(
+        failed_outcome,
+        Err(TurnError::Provider(ProviderError::Fatal {
+            status: Some(400),
+            ..
+        }))
+    ));
+
+    let after_failure = zuno_db::session::get(&connection, SESSION_ID)
+        .expect("read usage after failure")
+        .usage;
+    assert_eq!(after_failure.cost, confirmed.cost);
+    assert_eq!(after_failure.tokens, confirmed.tokens);
+    assert_eq!(
+        after_failure.last_prompt_tokens,
+        confirmed.last_prompt_tokens
+    );
+    assert_eq!(after_failure.context_limit, confirmed.context_limit);
+    assert_eq!(after_failure.accounting, confirmed.accounting);
+    assert_eq!(after_failure.known, confirmed.known);
+    assert_eq!(after_failure.last_confirmed_at, confirmed.last_confirmed_at);
+    assert!(
+        after_failure
+            .estimated_pending_prompt_tokens
+            .is_some_and(|estimate| estimate > 0),
+        "the rejected request should retain its local prompt estimate"
+    );
+    assert_eq!(
+        after_failure.failed_turns, confirmed.failed_turns,
+        "the replaceable TurnHost, not the built-in engine driver, owns top-level failure counting"
+    );
+    let failed_assistant = MessageStore::new(&connection)
+        .hydrate_session(SESSION_ID)
+        .expect("hydrate failed turn")
+        .into_iter()
+        .find(|message| message.info.id == "msg_turn-usage-failed_0001")
+        .expect("failed assistant checkpoint");
+    assert!(
+        failed_assistant.info.data.get("tokens").is_none(),
+        "a request rejected before usage must not persist a synthetic zero snapshot"
+    );
 }
 
 #[tokio::test]

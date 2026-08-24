@@ -320,7 +320,7 @@ fn report_for_request(
                 "status":status,
                 "text":text,
             }),
-            InputDelivery::NextStep,
+            InputDelivery::Queue,
             created,
         )
     })
@@ -357,7 +357,7 @@ fn report_for_job(
             "status":status,
             "text":text,
         }),
-        InputDelivery::NextStep,
+        InputDelivery::Queue,
         created,
     ))
 }

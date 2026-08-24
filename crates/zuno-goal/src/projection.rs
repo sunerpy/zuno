@@ -20,7 +20,7 @@
 //! |---|---|---|
 //! | the objective text | **the document** | adopted on the next turn |
 //! | `status` | **SQL** | rejected, and the rejection is written into the document |
-//! | `token_budget`, `tokens_used`, `time_used_seconds` | **SQL** | rejected the same way |
+//! | `token_budget`, `tokens_used`, `usage_known`, `time_used_seconds` | **SQL** | rejected the same way |
 //! | `session_id`, `goal_id`, the timestamps | **SQL** | rejected the same way |
 //! | the checklist | **SQL** — it is a projection, not an input | rejected the same way |
 //!
@@ -149,6 +149,8 @@ pub enum Field {
     UpdatedAtMs,
     /// The token ceiling.
     TokenBudget,
+    /// Whether token accounting for this goal is authoritative.
+    UsageKnown,
     /// Tokens spent against this goal instance.
     TokensUsed,
     /// Tokens left before the budget flips the status.
@@ -159,13 +161,14 @@ pub enum Field {
 
 impl Field {
     /// Every projected field, in the order the document renders them.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::SessionId,
         Self::GoalId,
         Self::Status,
         Self::CreatedAtMs,
         Self::UpdatedAtMs,
         Self::TokenBudget,
+        Self::UsageKnown,
         Self::TokensUsed,
         Self::TokensRemaining,
         Self::TimeUsedSeconds,
@@ -181,6 +184,7 @@ impl Field {
             Self::CreatedAtMs => "created_at_ms",
             Self::UpdatedAtMs => "updated_at_ms",
             Self::TokenBudget => "token_budget",
+            Self::UsageKnown => "usage_known",
             Self::TokensUsed => "tokens_used",
             Self::TokensRemaining => "tokens_remaining",
             Self::TimeUsedSeconds => "time_used_seconds",
@@ -214,6 +218,7 @@ impl Field {
             Self::Status => ("the status", false),
             Self::CreatedAtMs | Self::UpdatedAtMs => ("the timestamps", true),
             Self::TokenBudget => ("the token budget", false),
+            Self::UsageKnown => ("the accounting state", false),
             Self::TokensUsed | Self::TokensRemaining | Self::TimeUsedSeconds => {
                 ("the counters", true)
             }
@@ -232,10 +237,17 @@ impl Field {
             Self::TokenBudget => goal
                 .token_budget
                 .map_or_else(|| "none".to_owned(), |budget| budget.to_string()),
-            Self::TokensUsed => goal.tokens_used.to_string(),
-            Self::TokensRemaining => goal
-                .tokens_remaining()
-                .map_or_else(|| "unbounded".to_owned(), |tokens| tokens.to_string()),
+            Self::UsageKnown => goal.usage_known.to_string(),
+            Self::TokensUsed if goal.usage_known => goal.tokens_used.to_string(),
+            Self::TokensUsed if goal.tokens_used == 0 => "—".to_owned(),
+            Self::TokensUsed => format!("≥{}", goal.tokens_used),
+            Self::TokensRemaining => match (goal.token_budget, goal.usage_known) {
+                (None, _) => "unbounded".to_owned(),
+                (Some(_), false) => "—".to_owned(),
+                (Some(_), true) => goal
+                    .tokens_remaining()
+                    .map_or_else(|| "—".to_owned(), |tokens| tokens.to_string()),
+            },
             Self::TimeUsedSeconds => goal.time_used_seconds.to_string(),
         }
     }
@@ -284,7 +296,9 @@ impl Check {
     pub fn state(self, goal: &Goal) -> bool {
         match self {
             Self::Active => goal.status.is_active(),
-            Self::WithinBudget => !goal.is_over_budget(),
+            Self::WithinBudget => {
+                goal.token_budget.is_none() || (goal.usage_known && !goal.is_over_budget())
+            }
             Self::Complete => goal.status == GoalStatus::Complete,
         }
     }
@@ -477,6 +491,7 @@ pub fn render(goal: &Goal, notes: &Notes) -> String {
     out.push_str("\n## Budget\n\n");
     for field in [
         Field::TokenBudget,
+        Field::UsageKnown,
         Field::TokensUsed,
         Field::TokensRemaining,
         Field::TimeUsedSeconds,

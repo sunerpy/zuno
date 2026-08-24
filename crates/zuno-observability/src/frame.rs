@@ -50,7 +50,7 @@ pub const SLOW_FRAME_THRESHOLD_ENV: &str = "ZUNO_SLOW_FRAME_MS";
 /// How many slow frames are retained for inspection.
 ///
 /// Protects against: an unbounded diagnostic buffer in a process that runs for
-/// days — the failure class `.omo/plans/memory-perf-optimization.md` exists to
+/// days — the failure class the perf plan exists to
 /// remove rather than relocate.
 ///
 /// Every [`SlowFrame`] is two `u64`s and a `&'static str`, 32 bytes on a 64-bit

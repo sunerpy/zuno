@@ -100,7 +100,7 @@ impl DbLocation {
 /// A build that does **not** set it reports `"local"` and consequently uses
 /// `zuno-local.db`. This means a `cargo run` build reads a different database
 /// than the installed binary. See
-/// `.omo/notepads/opencode-rust/issues.md`.
+/// the project's engineering notes.
 #[must_use]
 pub fn installation_channel() -> &'static str {
     match option_env!("ZUNO_CHANNEL") {

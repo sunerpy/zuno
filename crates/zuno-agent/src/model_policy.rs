@@ -4,7 +4,7 @@
 //! # The inversion this module exists to adopt
 //!
 //! `oh-my-opencode-slim` defaults every agent's model to nothing at all
-//! (`.omo/refs/omo-slim/src/config/constants.ts:31-41`), and says why in the
+//! (`omo-slim`), and says why in the
 //! comment above the table:
 //!
 //! > Default models for each agent.
@@ -768,11 +768,10 @@ impl<'a> ModelPolicy<'a> {
         self
     }
 
-    /// Take overrides from the user's `agent` config block.
+    /// Take overrides from the user's `agents` config block.
     ///
-    /// `agent.<name>.model` and `agent.<name>.variant` already exist in the schema
-    /// (`zuno-config/src/schema/agent.rs`), and `zuno_catalog::agent` already merges them
-    /// onto a built-in. This reads the same two keys so a user who has configured a
+    /// `agents.<name>.model`, `.reasoning`, and `.variant` already exist in the schema.
+    /// This reads the same keys so a user who has configured a
     /// model for one agent does not have to learn a second mechanism to keep it.
     /// An entry with no `model` is not an override — a `variant`-only entry has no
     /// model to attach to and is left to the rung that supplies one.
@@ -781,7 +780,10 @@ impl<'a> ModelPolicy<'a> {
         for (name, config) in agents.iter() {
             if let Some(model) = &config.model {
                 let mut choice = ModelChoice::new(model.clone());
-                choice.variant = config.variant.clone();
+                choice.variant = config
+                    .reasoning
+                    .map(|effort| effort.as_str().to_owned())
+                    .or_else(|| config.variant.clone());
                 self.overrides.insert(name.to_owned(), choice);
             }
         }

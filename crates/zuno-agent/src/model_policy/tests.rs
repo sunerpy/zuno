@@ -1,7 +1,7 @@
 //! The policy's contract, asserted rather than reviewed.
 //!
 //! Two tests carry the design. [`an_agent_with_no_configured_model_inherits_the_session_model`]
-//! is the inversion adopted from `.omo/refs/omo-slim/src/config/constants.ts:31-41`,
+//! is the inversion adopted from `omo-slim`,
 //! and [`no_source_file_in_this_crate_names_a_model`] is what keeps it true: it walks
 //! every non-test source file in the crate and fails on a model-id-shaped token, so a
 //! future edit that reintroduces omo's `CATEGORY_MODEL_REQUIREMENTS` cannot merge
@@ -226,7 +226,7 @@ fn a_per_agent_override_beats_the_preset() {
 
 #[test]
 fn overrides_come_from_the_agent_config_keys_that_already_exist() {
-    // `agent.<name>.model` / `.variant` are todo 12's schema keys, already merged onto
+    // `agents.<name>.model` / `.variant` are todo 12's schema keys, already merged onto
     // built-ins by `zuno_catalog::agent::apply`. Reading the same two keys is what stops
     // a user needing a second mechanism for something they have already configured.
     let agents: OrderedMap<AgentConfig> = serde_json::from_value(json!({

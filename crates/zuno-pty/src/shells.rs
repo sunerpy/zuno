@@ -18,7 +18,7 @@
 //! runs `Shell.acceptable`, because it injects POSIX script that fish and nushell
 //! cannot parse. Collapsing them would either break fish users' terminals or feed
 //! POSIX script to a shell that rejects it. Both are exported here for that
-//! reason; see `.omo/notepads/opencode-rust/issues.md` for how this interacts with
+//! reason; see the project's engineering notes for how this interacts with
 //! todo 40's single-selector `zuno_tools::shell::discover_shell`.
 
 use std::path::{Path, PathBuf};

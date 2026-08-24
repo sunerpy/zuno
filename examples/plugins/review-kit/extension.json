@@ -8,14 +8,17 @@
       "mode": "subagent",
       "prompt": "Review the requested change. Use read, glob, grep, and lsp for repository evidence; use webfetch or web_search when current external evidence is required; use bash only for bounded environment or verification commands. Focus on authorization, durable state, rollback, and concrete verification. Do not delegate. Return findings before summaries.",
       "permission": {
-        "*": "deny",
-        "read": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "lsp": "allow",
-        "webfetch": "allow",
-        "web_search": "allow",
-        "bash": "ask"
+        "mode": "standard",
+        "rules": {
+          "*": "deny",
+          "read": "allow",
+          "glob": "allow",
+          "grep": "allow",
+          "lsp": "allow",
+          "webfetch": "allow",
+          "web_search": "allow",
+          "bash": "ask"
+        }
       }
     }
   },

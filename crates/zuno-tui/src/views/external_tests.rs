@@ -2,9 +2,6 @@
 
 use super::*;
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt as _;
-
 // ---------------------------------------------------------------------------
 // The editor seam
 // ---------------------------------------------------------------------------
@@ -115,13 +112,7 @@ async fn views_external_system_editor_returns_the_edited_file() {
     let script = directory.path().join("editor");
     std::fs::write(&script, "#!/bin/sh\nprintf 'edited body' > \"$1\"\n")
         .expect("write editor fixture");
-    let mut permissions = std::fs::metadata(&script)
-        .expect("editor fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&script, permissions).expect("make editor fixture executable");
-
-    let editor = SystemEditor::configured(script.display().to_string());
+    let editor = SystemEditor::configured(format!("sh {}", script.display()));
     assert_eq!(
         editor
             .edit(
@@ -140,13 +131,7 @@ async fn views_external_system_editor_treats_an_empty_file_as_no_change() {
     let directory = tempfile::tempdir().expect("editor fixture directory");
     let script = directory.path().join("editor");
     std::fs::write(&script, "#!/bin/sh\n: > \"$1\"\n").expect("write editor fixture");
-    let mut permissions = std::fs::metadata(&script)
-        .expect("editor fixture metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&script, permissions).expect("make editor fixture executable");
-
-    let editor = SystemEditor::configured(script.display().to_string());
+    let editor = SystemEditor::configured(format!("sh {}", script.display()));
     assert_eq!(
         editor
             .edit(

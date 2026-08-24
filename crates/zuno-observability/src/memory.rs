@@ -3,7 +3,7 @@
 //! # What an incident is here
 //!
 //! A **runtime alert**, not a gate. G1 through G4 in
-//! `.omo/plans/memory-perf-optimization.md` decide whether a build regressed; an
+//! the perf plan decide whether a build regressed; an
 //! incident says a *running* process has reached a size or a growth rate that a
 //! human should look at. Confusing the two would either fail builds on healthy
 //! sessions or let a leaking process run silently, so the thresholds here are

@@ -19,7 +19,7 @@
 //! means editing the root `Cargo.toml`, which this todo may not touch while
 //! sibling agents hold it. SHA-1 is a fixed, fully specified 60-line algorithm
 //! (FIPS 180-4 §6.1), so implementing it is cheaper and less risky than a
-//! concurrent manifest edit. See `.omo/notepads/opencode-rust/decisions.md`.
+//! concurrent manifest edit. See the project's engineering notes.
 //!
 //! SHA-1 is used here **only to reproduce directory names**. It is never a
 //! security boundary, and nothing in this crate should be read as endorsing it

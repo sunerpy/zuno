@@ -83,15 +83,22 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
              INSERT INTO part \
                (id, message_id, session_id, time_created, time_updated, data) \
              VALUES ('part-1', 'message-1', 'session-1', 1, 1, '{}');
-             INSERT INTO todo \
-               (session_id, content, status, priority, position, time_created, time_updated) \
-             VALUES ('session-1', 'item', 'pending', 'high', 0, 1, 1);
+             INSERT INTO work_plan \
+               (session_id, id, revision, title, steps, time_created, time_updated) \
+             VALUES ('session-1', 'plan-1', 1, 'ship', '[]', 1, 1);
+             INSERT INTO work_item \
+               (id, session_id, subject, description, status, priority, dependencies, revision, \
+                time_created, time_updated) \
+             VALUES ('item-1', 'session-1', 'verify', 'verify the result', 'pending', 'high', \
+                     '[]', 1, 1, 1);
              INSERT INTO session_message \
                (id, session_id, type, seq, time_created, time_updated, data) \
              VALUES ('session-message-1', 'session-1', 'user', 1, 1, 1, '{}');
              INSERT INTO session_input \
-               (id, session_id, prompt, delivery, admitted_seq, promoted_seq, time_created) \
-             VALUES ('session-input-1', 'session-1', '{}', 'inbox', 1, 1, 1);
+               (id, session_id, prompt, delivery, state, revision, admitted_seq, promoted_seq, \
+                error, time_created, time_updated) \
+             VALUES ('session-input-1', 'session-1', '{}', 'queue', 'consumed', 3, 1, 1, \
+                     NULL, 1, 1);
              INSERT INTO session_context_epoch \
                (session_id, baseline, snapshot, baseline_seq) \
              VALUES ('session-1', 'base', '{}', 1);
@@ -99,15 +106,19 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
                (session_id, id, secret, url, time_created, time_updated) \
              VALUES ('session-1', 'share-1', 'secret', 'https://example.invalid', 1, 1);
              INSERT INTO agent_job \
-               (id, parent_session_id, subject_kind, child_session_id, status, report_delivery, created_seq, time_created, time_updated) \
-             VALUES ('job-1', 'session-1', 'child-session', 'session-child', 'running', 'next-step', 1, 1, 1);",
+               (id, parent_session_id, subject_kind, subject_payload, status, report_delivery, \
+                created_seq, time_created, time_updated) \
+             VALUES ('job-1', 'session-1', 'child-session', \
+                     json_object('kind', 'childSession', 'sessionID', 'session-child'), \
+                     'running', 'next-step', 1, 1, 1);",
         )
         .expect("seed a complete session graph");
 
     let dependent_tables = [
         "message",
         "part",
-        "todo",
+        "work_plan",
+        "work_item",
         "session_message",
         "session_input",
         "session_context_epoch",

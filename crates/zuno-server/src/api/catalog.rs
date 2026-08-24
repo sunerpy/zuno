@@ -465,7 +465,10 @@ fn v2_permissions(name: &str, layout: &zuno_paths::Layout, worktree: &Path) -> V
                 "allow",
             ),
         ]),
-        "general" => rules.push(v2_rule("todowrite", "*", "deny")),
+        "general" => rules.extend([
+            v2_rule("plan_update", "*", "deny"),
+            v2_rule("todo_update", "*", "deny"),
+        ]),
         "explore" => {
             rules.extend([
                 v2_rule("*", "*", "deny"),

@@ -22,6 +22,37 @@ fn contains_all(relative: &str, needles: &[&str]) {
 }
 
 #[test]
+fn session_retention_table_list_tracks_the_destructive_delete_order() {
+    let text = read("docs/session-retention.md");
+    let begin = text
+        .find("<!-- generated:BEGIN prune-tables -->")
+        .expect("retention guide has a generated table start");
+    let end = text
+        .find("<!-- generated:END prune-tables -->")
+        .expect("retention guide has a generated table end");
+    let block = &text[begin..end];
+    assert!(
+        text.contains(&format!(
+            "**{} tables**, in this order:",
+            zuno_db::prune::DELETE_ORDER.len()
+        )),
+        "retention guide table count drifted from DELETE_ORDER"
+    );
+    for (index, table) in zuno_db::prune::DELETE_ORDER.iter().enumerate() {
+        let row = format!("| {} | `{table}` |", index + 1);
+        assert!(block.contains(&row), "retention guide is missing {row}");
+    }
+    assert_eq!(
+        block
+            .lines()
+            .filter(|line| line.starts_with("| ") && line.contains('`'))
+            .count(),
+        zuno_db::prune::DELETE_ORDER.len(),
+        "retention guide contains an extra or stale table row"
+    );
+}
+
+#[test]
 fn harness_guide_documents_the_native_extension_contract() {
     contains_all(
         "docs/harness-runtime.md",
@@ -42,6 +73,8 @@ fn harness_guide_documents_the_native_extension_contract() {
             "Prompt provenance",
             "session.prompt.assembled",
             "durable inbox",
+            "`Ctrl+Enter`",
+            "`Shift+Enter`",
             "Durable goal recovery",
             "goal_retry",
             "initial_delay_ms",
@@ -72,7 +105,7 @@ fn plugin_guide_documents_capabilities_protocols_and_examples() {
             "`network`",
             "`environment` names",
             "`host.full`",
-            "authorization.strict",
+            "permission.mode",
             "subagent_type",
             "memoryMiB",
             "zuno.plugin/1",
@@ -158,7 +191,7 @@ fn architecture_documents_pin_the_native_harness_decisions() {
 
 #[test]
 fn readmes_document_extension_examples_and_do_not_advertise_compatibility() {
-    for relative in ["README.md", "docs/readme/README.en.md"] {
+    for relative in ["README.md", "docs/readme/README.zh-CN.md"] {
         let text = read(relative);
         assert!(
             text.contains("harness-runtime.md"),
@@ -199,7 +232,7 @@ fn readmes_document_extension_examples_and_do_not_advertise_compatibility() {
 fn provider_setup_recommends_native_transports_without_node_bootstrap() {
     for relative in [
         "README.md",
-        "docs/readme/README.en.md",
+        "docs/readme/README.zh-CN.md",
         "docs/reference/configuration.md",
         "docs/reference/providers.md",
         "crates/zuno-catalog/src/skill/customize-zuno.md",
@@ -224,7 +257,7 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
 
     for relative in [
         "README.md",
-        "docs/readme/README.en.md",
+        "docs/readme/README.zh-CN.md",
         "docs/reference/providers.md",
         "crates/zuno-catalog/src/skill/customize-zuno.md",
     ] {
@@ -276,7 +309,7 @@ fn self_update_documentation_pins_the_verified_release_contract() {
             "NO_PROXY",
         ],
     );
-    for relative in ["README.md", "docs/readme/README.en.md", "docs/README.md"] {
+    for relative in ["README.md", "docs/readme/README.zh-CN.md", "docs/README.md"] {
         contains_all(relative, &["self-update", "reference/self-update.md"]);
     }
 }

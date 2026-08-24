@@ -4,7 +4,7 @@
 # "green locally" and "green in CI" cannot drift into meaning different things.
 #
 # OFFLINE BY DEFAULT. This repository's gates run with `--offline` throughout
-# (see `.omo/premerge.sh`) because the registry here is a mirror that cannot
+# because the registry here is a mirror that cannot
 # always be reached. Every target below therefore passes `$(OFFLINE)`, which is
 # `--offline` unless you set `OFFLINE=` to allow a fetch:
 #
@@ -38,7 +38,10 @@ OFFLINE ?= --offline
 OXFMT_FILES := \
   .oxfmtrc.json \
   .pre-commit-config.yaml \
-  docs/readme/README.en.md
+  README.md \
+  CONTRIBUTING.md \
+  SECURITY.md \
+  CODE_OF_CONDUCT.md
 
 # Cross-compilation target for `release-target` / `package`, e.g.
 #   make package TARGET=x86_64-unknown-linux-musl

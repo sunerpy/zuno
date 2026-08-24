@@ -9,7 +9,7 @@
 //!
 //! The second is the whole reason two registration forms exist. The reference
 //! implementation returns `Option` from both paths and logs one warning for both
-//! (`.omo/refs/jcode/crates/jcode-base/src/provider/external.rs:219-245`), which
+//! (`jcode`), which
 //! tells a user who has simply not logged in that the program is miswired.
 
 use std::sync::Arc;

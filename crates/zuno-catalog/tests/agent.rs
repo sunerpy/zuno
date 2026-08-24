@@ -117,7 +117,7 @@ fn a_markdown_agent_with_max_steps_is_rejected_with_a_message_naming_steps()
 }
 
 #[test]
-fn a_markdown_agent_with_tools_is_rejected_too() -> Result<(), Box<dyn Error>> {
+fn a_markdown_agent_tools_must_be_a_sequence() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     write(
         dir.path(),
@@ -134,8 +134,8 @@ fn a_markdown_agent_with_tools_is_rejected_too() -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        rendered.contains("permission"),
-        "the message must point at `permission`, got: {rendered}"
+        rendered.contains("sequence"),
+        "the message must explain that `tools` is a name sequence, got: {rendered}"
     );
     Ok(())
 }

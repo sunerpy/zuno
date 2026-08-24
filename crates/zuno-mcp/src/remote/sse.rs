@@ -44,7 +44,7 @@ impl SseDecoder {
             }
         }
         // A server that never sends a blank line would otherwise grow `bytes` without
-        // limit, which is the defect `.omo/plans/memory-perf-optimization.md` §2 names.
+        // limit, which is the defect the perf plan §2 names.
         if self.bytes.len() > self.max_event_bytes {
             let stranded = self.bytes.len();
             return Err(self.reject(stranded));

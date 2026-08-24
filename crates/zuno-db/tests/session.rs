@@ -67,14 +67,24 @@ fn insert_part(connection: &Connection, id: &str, message_id: &str, session_id: 
         .expect("insert part");
 }
 
-fn insert_todo(connection: &Connection, session_id: &str, position: i64) {
+fn insert_work_state(connection: &Connection, session_id: &str) {
     connection
         .execute(
-            "INSERT INTO todo (session_id, content, status, priority, position, time_created, \
-             time_updated) VALUES (?1, 'do it', 'pending', 'high', ?2, 1, 1)",
-            rusqlite::params![session_id, position],
+            "INSERT INTO work_plan \
+             (session_id, id, revision, title, steps, time_created, time_updated) \
+             VALUES (?1, ?2, 1, 'ship', '[]', 1, 1)",
+            rusqlite::params![session_id, format!("plan_{session_id}")],
         )
-        .expect("insert todo");
+        .expect("insert work plan");
+    connection
+        .execute(
+            "INSERT INTO work_item \
+             (id, session_id, subject, description, status, priority, dependencies, revision, \
+              time_created, time_updated) \
+             VALUES (?1, ?2, 'verify', 'verify the result', 'pending', 'high', '[]', 1, 1, 1)",
+            rusqlite::params![format!("item_{session_id}"), session_id],
+        )
+        .expect("insert work item");
 }
 
 fn insert_session_message(connection: &Connection, id: &str, session_id: &str, seq: i64) {
@@ -90,8 +100,10 @@ fn insert_session_message(connection: &Connection, id: &str, session_id: &str, s
 fn insert_session_input(connection: &Connection, id: &str, session_id: &str, seq: i64) {
     connection
         .execute(
-            "INSERT INTO session_input (id, session_id, prompt, delivery, admitted_seq, \
-             time_created) VALUES (?1, ?2, '{}', 'inbox', ?3, 1)",
+            "INSERT INTO session_input \
+             (id, session_id, prompt, delivery, state, revision, admitted_seq, promoted_seq, \
+              error, time_created, time_updated) \
+             VALUES (?1, ?2, '{}', 'queue', 'queued', 1, ?3, NULL, NULL, 1, 1)",
             rusqlite::params![id, session_id, seq],
         )
         .expect("insert session_input");
@@ -210,7 +222,7 @@ impl Tree {
                 let seq = i64::try_from(index).expect("small index");
                 insert_message(&connection, &format!("msg_{id}"), id);
                 insert_part(&connection, &format!("prt_{id}"), &format!("msg_{id}"), id);
-                insert_todo(&connection, id, 0);
+                insert_work_state(&connection, id);
                 insert_session_message(&connection, &format!("smsg_{id}"), id, seq);
                 insert_session_input(&connection, &format!("sinp_{id}"), id, seq);
                 insert_context_epoch(&connection, id);
@@ -405,6 +417,73 @@ fn assistant_usage_reconciliation_is_normalized_and_idempotent() {
     assert_eq!(usage.tokens.cache_write, 10);
     assert_eq!(usage.last_prompt_tokens, Some(140));
     assert_eq!(usage.cost, 0.25);
+}
+
+#[test]
+fn failed_request_keeps_confirmed_usage_and_persists_the_local_estimate() {
+    let pool = pool();
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft(
+            "ses_failed_usage",
+            "prj_a",
+            WORKTREE,
+            "failed usage",
+        ))
+        .expect("create the session");
+
+    let checkpoint = MessageRecord::from_json(json!({
+        "id": "msg_confirmed",
+        "sessionID": "ses_failed_usage",
+        "role": "assistant",
+        "time": {"created": 10},
+        "cost": 0.5,
+        "tokens": {
+            "input": 4_200,
+            "output": 500,
+            "reasoning": 100,
+            "cache": {"read": 700, "write": 0},
+            "accounting": "cache-inside-input"
+        }
+    }))
+    .expect("confirmed checkpoint");
+    pool.transaction(|transaction| {
+        MessageStore::new(transaction).put_message_at(&checkpoint, 10)?;
+        session::reconcile_usage(
+            transaction,
+            "ses_failed_usage",
+            None,
+            MessageUsage::from_data(&checkpoint.data),
+            Some(10_000),
+        )
+    })
+    .expect("reconcile confirmed usage");
+    let confirmed = store
+        .get("ses_failed_usage")
+        .expect("confirmed session")
+        .usage
+        .snapshot();
+
+    let connection = pool.get().expect("request connection");
+    session::record_provider_request_started(&connection, "ses_failed_usage", 8_500, Some(10_000))
+        .expect("record local estimate");
+    session::record_turn_failure(&connection, "ses_failed_usage").expect("record failed turn");
+
+    let failed = store
+        .get("ses_failed_usage")
+        .expect("failed session")
+        .usage
+        .snapshot();
+    assert_eq!(failed.confirmed, confirmed.confirmed);
+    assert_eq!(failed.last_prompt_tokens, confirmed.last_prompt_tokens);
+    assert_eq!(failed.estimated_pending_prompt_tokens, Some(8_500));
+    assert_eq!(failed.failed_turns, 1);
+    assert!(failed.last_failed_at.is_some());
+    assert!(failed.confirmed_known);
 }
 
 #[test]
@@ -1246,7 +1325,8 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
             count(&connection, "SELECT count(*) FROM session"),
             count(&connection, "SELECT count(*) FROM message"),
             count(&connection, "SELECT count(*) FROM part"),
-            count(&connection, "SELECT count(*) FROM todo"),
+            count(&connection, "SELECT count(*) FROM work_plan"),
+            count(&connection, "SELECT count(*) FROM work_item"),
             count(&connection, "SELECT count(*) FROM session_message"),
             count(&connection, "SELECT count(*) FROM session_input"),
             count(&connection, "SELECT count(*) FROM session_context_epoch"),
@@ -1257,7 +1337,7 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
     };
     assert_eq!(
         before,
-        (4, 4, 5, 4, 4, 4, 4, 1, 4, 8),
+        (4, 4, 5, 4, 4, 4, 4, 4, 1, 4, 8),
         "fixture row counts before the delete"
     );
 
@@ -1319,7 +1399,8 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
     // The declared cascades did their part.
     for table in [
         "message",
-        "todo",
+        "work_plan",
+        "work_item",
         "session_message",
         "session_input",
         "session_context_epoch",
@@ -1392,7 +1473,8 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
         count(&connection, "SELECT count(*) FROM session"),
         count(&connection, "SELECT count(*) FROM message"),
         count(&connection, "SELECT count(*) FROM part"),
-        count(&connection, "SELECT count(*) FROM todo"),
+        count(&connection, "SELECT count(*) FROM work_plan"),
+        count(&connection, "SELECT count(*) FROM work_item"),
         count(&connection, "SELECT count(*) FROM session_message"),
         count(&connection, "SELECT count(*) FROM session_input"),
         count(&connection, "SELECT count(*) FROM session_context_epoch"),
@@ -1402,7 +1484,7 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
     );
     assert_eq!(
         after,
-        (1, 1, 1, 1, 1, 1, 1, 0, 1, 2),
+        (1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 2),
         "row counts after the delete: only the bystander's rows remain"
     );
 }

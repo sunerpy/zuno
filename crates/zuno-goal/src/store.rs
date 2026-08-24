@@ -1,18 +1,11 @@
 //! The `goal` table: one goal per session, and every write that touches it.
 //!
-//! # Separate durable ownership
+//! # Shared durable ownership
 //!
-//! Goals live in `goal_1.db`, separate from the session database. A goal must
-//! outlive session churn: the point of a goal is to survive the
-//! compaction that throws away the conversation which set it. That argues
-//! against sharing a file with state that gets pruned, vacuumed and cascaded,
-//! and it is why there is deliberately **no** `FOREIGN KEY (session_id)
-//! REFERENCES session(id) ON DELETE CASCADE` here: a goal is keyed *by* a
-//! session id, not owned by a session row.
-//!
-//! The `_1` filename makes the schema generation explicit. An incompatible
-//! pre-release change revs the filename rather than trying to infer an old goal
-//! format, because a corrupt continuation policy is more dangerous than a reset.
+//! Runtime goals share the main `zuno.db` pool with sessions, todos and jobs so
+//! all work-state projections have one process lifecycle and one backup boundary.
+//! There is deliberately no cascading foreign key: deleting conversation history
+//! must not erase an explicit long-running goal before the user reviews it.
 //!
 //! # Split ownership, and where it is enforced
 //!
@@ -36,7 +29,7 @@
 //!   `status_after_budget_limit` (`codex-rs/state/src/runtime/goals.rs:618-630`)
 //!   and the accounting `CASE` (`goals.rs:546-566`).
 //! * **The guarded replace.** [`GoalStore::create_goal`] is one upsert whose
-//!   `DO UPDATE` carries `WHERE goal.status = 'complete'`, exactly as
+//!   `DO UPDATE` carries a terminal-status guard, exactly as
 //!   `insert_thread_goal` does (`goals.rs:245`). A read-then-write would let two
 //!   concurrent `create_goal` calls both observe `complete` and both replace.
 //!   The refusal is the statement returning no row.
@@ -48,6 +41,7 @@ use crate::status::{GoalStatus, ModelStatus, SystemStatus};
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zuno_db::Pool;
 use zuno_error::DbError;
@@ -55,12 +49,6 @@ use zuno_paths::DbLocation;
 
 /// The table this module owns.
 pub const TABLE: &str = "goal";
-
-/// The goal database's filename under [`zuno_paths::data`].
-///
-/// An incompatible schema change revs the number instead of interpreting an
-/// earlier pre-release format.
-pub const GOAL_DB_FILE: &str = "goal_1.db";
 
 /// The directory under [`zuno_paths::data`] that oversized objectives spill into.
 pub const OBJECTIVE_SPILL_DIRECTORY: &str = "goal-objective";
@@ -72,35 +60,37 @@ pub const OBJECTIVE_SPILL_DIRECTORY: &str = "goal-objective";
 /// column name, the `CHECK` members, the defaults and the integer-Unix-
 /// milliseconds convention are unchanged.
 ///
-/// `IF NOT EXISTS` rather than a migration chain: this file has exactly one
-/// table and one version, and reopening it must be a no-op — that is what makes
-/// a goal survive a restart.
+/// The table is initialized inside the application-owned `zuno.db` pool. Goal,
+/// plan, todo, job, and session state therefore share one transaction boundary.
 pub const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS goal (
     session_id TEXT PRIMARY KEY NOT NULL,
     goal_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
     objective TEXT NOT NULL,
+    success_criteria TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN (
         'active',
         'paused',
         'blocked',
         'usage_limited',
         'budget_limited',
-        'complete'
+        'complete',
+        'cancelled'
     )),
+    blocked_reason TEXT,
     token_budget INTEGER,
     tokens_used INTEGER NOT NULL DEFAULT 0,
+    usage_known INTEGER NOT NULL DEFAULT 1 CHECK(usage_known IN (0, 1)),
     time_used_seconds INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
 )";
 
-/// Runtime-only state kept beside, but not inside, the stable [`TABLE`] schema.
+/// Runtime-only state kept beside the stable [`TABLE`] schema in the same pool.
 ///
-/// These tables may evolve without changing the `goal` table contract or the
-/// `goal_1.db` filename. Neither has a foreign key: the goal table deliberately
-/// survives unrelated session deletion, and its auxiliary state follows the same
-/// ownership rule. Goal replacement clears both rows explicitly.
+/// Neither the goal nor its auxiliary tables cascade on session deletion. Goal
+/// replacement clears only transient continuation state; history remains durable.
 pub const AUXILIARY_SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS goal_continuation_deferral (
     session_id TEXT PRIMARY KEY NOT NULL
@@ -134,10 +124,56 @@ CREATE TABLE IF NOT EXISTS goal_retry (
     delay_ms INTEGER NOT NULL CHECK(delay_ms >= 0),
     retry_at_ms INTEGER NOT NULL,
     scheduled_at_ms INTEGER NOT NULL
-)";
+);
+CREATE TABLE IF NOT EXISTS goal_history (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    goal_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    objective TEXT NOT NULL,
+    success_criteria TEXT NOT NULL,
+    status TEXT NOT NULL,
+    blocked_reason TEXT,
+    token_budget INTEGER,
+    tokens_used INTEGER NOT NULL,
+    usage_known INTEGER NOT NULL CHECK(usage_known IN (0, 1)),
+    time_used_seconds INTEGER NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE(goal_id, revision)
+);
+CREATE INDEX IF NOT EXISTS goal_history_session_sequence
+    ON goal_history(session_id, sequence);
+CREATE TRIGGER IF NOT EXISTS goal_history_after_insert
+AFTER INSERT ON goal
+BEGIN
+    INSERT INTO goal_history (
+        session_id, goal_id, revision, objective, success_criteria, status, blocked_reason,
+        token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, updated_at_ms
+    ) VALUES (
+        NEW.session_id, NEW.goal_id, NEW.revision, NEW.objective,
+        NEW.success_criteria, NEW.status, NEW.blocked_reason, NEW.token_budget,
+        NEW.tokens_used, NEW.usage_known, NEW.time_used_seconds, NEW.created_at_ms,
+        NEW.updated_at_ms
+    );
+END;
+CREATE TRIGGER IF NOT EXISTS goal_history_after_update
+AFTER UPDATE ON goal
+BEGIN
+    INSERT INTO goal_history (
+        session_id, goal_id, revision, objective, success_criteria, status, blocked_reason,
+        token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, updated_at_ms
+    ) VALUES (
+        NEW.session_id, NEW.goal_id, NEW.revision, NEW.objective,
+        NEW.success_criteria, NEW.status, NEW.blocked_reason, NEW.token_budget,
+        NEW.tokens_used, NEW.usage_known, NEW.time_used_seconds, NEW.created_at_ms,
+        NEW.updated_at_ms
+    );
+END;";
 
-const COLUMNS: &str = "session_id, goal_id, objective, status, token_budget, tokens_used, \
-     time_used_seconds, created_at_ms, updated_at_ms";
+const COLUMNS: &str = "session_id, goal_id, revision, objective, success_criteria, status, \
+     blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
+     updated_at_ms";
 
 /// One row of the `goal` table.
 ///
@@ -155,21 +191,42 @@ pub struct Goal {
     /// replacement can tell that the goal it was working on is gone. codex uses
     /// it for exactly that (`goals.rs:583-585`).
     pub goal_id: String,
+    /// Optimistic-concurrency revision for this goal instance.
+    pub revision: i64,
     /// What the agent is working towards, or the pointer sentence that names the
     /// file holding it. Never longer than [`spill::MAX_OBJECTIVE_CHARS`].
     pub objective: String,
+    /// Concrete checks that define when the objective is complete.
+    pub success_criteria: Vec<String>,
     /// Whether, and why, the agent should keep going.
     pub status: GoalStatus,
+    /// Stable explanation for a blocked goal.
+    pub blocked_reason: Option<String>,
     /// The token ceiling, or `None` for unlimited.
     pub token_budget: Option<i64>,
     /// Tokens spent against this goal instance. Reset by a replacement.
     pub tokens_used: i64,
+    /// Whether every token included in this goal's accounting is authoritative.
+    ///
+    /// `tokens_used` remains a confirmed lower bound when this is false.
+    pub usage_known: bool,
     /// Wall-clock seconds spent against this goal instance.
     pub time_used_seconds: i64,
     /// When this goal instance was created, in Unix milliseconds.
     pub created_at_ms: i64,
     /// When it last changed, in Unix milliseconds.
     pub updated_at_ms: i64,
+}
+
+/// One immutable snapshot from the durable goal revision log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalHistoryEntry {
+    /// Monotonic order across all goal instances in this session.
+    pub sequence: i64,
+    /// Monotonic revision within one goal instance.
+    pub revision: i64,
+    /// The goal state recorded at this revision.
+    pub goal: Goal,
 }
 
 /// The blocking condition observed at the end of consecutive goal turns.
@@ -200,27 +257,17 @@ impl Goal {
     }
 }
 
-/// The `goal` table, over its own SQLite database.
+/// The `goal` table over an application-owned SQLite pool.
 ///
 /// Cheap to clone-by-reference and safe to share: the pool serializes
 /// connections and every write runs in one `IMMEDIATE` transaction.
 #[derive(Debug)]
 pub struct GoalStore {
-    pool: Pool,
+    pool: Arc<Pool>,
     spill_dir: PathBuf,
 }
 
 impl GoalStore {
-    /// Open the goal database the running binary would use.
-    ///
-    /// # Errors
-    ///
-    /// [`GoalError::Db`] when the database cannot be opened, a pragma did not
-    /// take effect, or the table cannot be created.
-    pub fn open_default() -> Result<Self, GoalError> {
-        Self::open_at(&default_db_path(), default_spill_dir())
-    }
-
     /// Open the goal database at `path`, spilling objectives into `spill_dir`.
     ///
     /// # Errors
@@ -246,7 +293,16 @@ impl GoalStore {
     }
 
     fn open(location: &DbLocation, spill_dir: PathBuf) -> Result<Self, GoalError> {
-        let pool = Pool::open(location)?;
+        let pool = Arc::new(Pool::open(location)?);
+        Self::from_pool(pool, spill_dir)
+    }
+
+    /// Attach goal state to an existing application database pool.
+    ///
+    /// # Errors
+    ///
+    /// [`GoalError::Db`] when the goal tables cannot be initialized.
+    pub fn from_pool(pool: Arc<Pool>, spill_dir: PathBuf) -> Result<Self, GoalError> {
         pool.transaction(|tx| {
             tx.execute_batch(SCHEMA).map_err(zuno_db::map_error)?;
             tx.execute_batch(AUXILIARY_SCHEMA)
@@ -258,7 +314,7 @@ impl GoalStore {
     /// The pool this store writes through.
     #[must_use]
     pub fn pool(&self) -> &Pool {
-        &self.pool
+        self.pool.as_ref()
     }
 
     /// Where oversized objectives spill to.
@@ -294,10 +350,39 @@ impl GoalStore {
         read_optional(&mut statement, params![session_id])
     }
 
-    /// Create the goal for `session_id`, replacing a finished one.
+    /// Immutable revisions for every goal instance in a session, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`GoalError::Db`] on a query failure or [`GoalError::UnknownStatus`] when
+    /// a stored snapshot contains an invalid status.
+    pub fn history(&self, session_id: &str) -> Result<Vec<GoalHistoryEntry>, GoalError> {
+        let connection = self.pool.get()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT sequence, {COLUMNS} FROM goal_history \
+                 WHERE session_id = ?1 ORDER BY sequence"
+            ))
+            .map_err(zuno_db::map_error)?;
+        let mut rows = statement
+            .query(params![session_id])
+            .map_err(zuno_db::map_error)?;
+        let mut history = Vec::new();
+        while let Some(row) = rows.next().map_err(zuno_db::map_error)? {
+            let goal = from_row(row)?;
+            history.push(GoalHistoryEntry {
+                sequence: row.get("sequence").map_err(zuno_db::map_error)?,
+                revision: goal.revision,
+                goal,
+            });
+        }
+        Ok(history)
+    }
+
+    /// Create the goal for `session_id`, replacing a finished or cancelled one.
     ///
     /// The model-facing entry point. It succeeds when the session has no goal,
-    /// or when the goal it has is `complete`; anything else is
+    /// or when the goal it has is `complete` or `cancelled`; anything else is
     /// [`GoalError::GoalNotReplaceable`], naming the status that blocked it. A
     /// replacement mints a fresh `goal_id` and resets both counters, matching
     /// `goals.rs:236-244`.
@@ -319,18 +404,32 @@ impl GoalStore {
         objective: &str,
         token_budget: Option<i64>,
     ) -> Result<Goal, GoalError> {
+        self.create_goal_with_criteria(session_id, objective, &[], token_budget)
+    }
+
+    /// Create a guarded model goal with explicit immutable success criteria.
+    pub fn create_goal_with_criteria(
+        &self,
+        session_id: &str,
+        objective: &str,
+        success_criteria: &[String],
+        token_budget: Option<i64>,
+    ) -> Result<Goal, GoalError> {
         let objective = spill::store_objective(&self.spill_dir, objective)?;
         let goal_id = new_goal_id();
         let now_ms = now_ms()?;
         let outcome = self.pool.transaction(|tx| {
             let inserted = upsert(
                 tx,
-                UPSERT_IF_COMPLETE,
-                session_id,
-                &goal_id,
-                &objective,
-                token_budget,
-                now_ms,
+                GoalUpsert {
+                    tail: UPSERT_IF_COMPLETE,
+                    session_id,
+                    goal_id: &goal_id,
+                    objective: &objective,
+                    success_criteria,
+                    token_budget,
+                    now_ms,
+                },
             )?;
             if inserted.is_some() {
                 clear_auxiliary_state(tx, session_id)?;
@@ -378,12 +477,15 @@ impl GoalStore {
         let replaced = self.pool.transaction(|tx| {
             let goal = upsert(
                 tx,
-                UPSERT_UNCONDITIONAL,
-                session_id,
-                &goal_id,
-                &objective,
-                token_budget,
-                now_ms,
+                GoalUpsert {
+                    tail: UPSERT_UNCONDITIONAL,
+                    session_id,
+                    goal_id: &goal_id,
+                    objective: &objective,
+                    success_criteria: &[],
+                    token_budget,
+                    now_ms,
+                },
             )?;
             if goal.is_some() {
                 clear_auxiliary_state(tx, session_id)?;
@@ -421,7 +523,95 @@ impl GoalStore {
         session_id: &str,
         status: ModelStatus,
     ) -> Result<Option<Goal>, GoalError> {
-        self.write_status(SET_STATUS_AS_MODEL, session_id, status.as_str(), false)
+        self.write_status(
+            SET_STATUS_AS_MODEL,
+            session_id,
+            status.as_str(),
+            false,
+            None,
+        )
+    }
+
+    /// Update model-owned status only if `expected_revision` is still current.
+    pub fn update_status_as_model_checked(
+        &self,
+        session_id: &str,
+        status: ModelStatus,
+        expected_revision: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        self.write_status(
+            SET_STATUS_AS_MODEL,
+            session_id,
+            status.as_str(),
+            false,
+            Some(expected_revision),
+        )
+    }
+
+    /// Complete a goal only when all durable plan steps, work items, and jobs are terminal.
+    ///
+    /// The completion audit and status update share one `IMMEDIATE` transaction, so a
+    /// concurrent writer cannot add unfinished work between the check and the update.
+    pub fn complete_checked(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        let now_ms = now_ms()?;
+        self.pool.try_transaction(|tx| {
+            let actual = tx
+                .query_row(
+                    "SELECT revision FROM goal WHERE session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(zuno_db::map_error)?;
+            let Some(actual) = actual else {
+                return Ok(None);
+            };
+            if actual != expected_revision {
+                return Err(GoalError::RevisionConflict {
+                    session_id: session_id.to_owned(),
+                    expected: expected_revision,
+                    actual,
+                });
+            }
+
+            let (plan_steps, work_items, jobs) = completion_blockers(tx, session_id)?;
+            if plan_steps != 0 || work_items != 0 || jobs != 0 {
+                return Err(GoalError::CompletionBlocked {
+                    plan_steps,
+                    work_items,
+                    jobs,
+                });
+            }
+
+            let goal = {
+                let mut statement = tx
+                    .prepare(SET_STATUS_AS_MODEL)
+                    .map_err(zuno_db::map_error)?;
+                read_optional(
+                    &mut statement,
+                    params![
+                        ModelStatus::Complete.as_str(),
+                        now_ms,
+                        session_id,
+                        expected_revision
+                    ],
+                )
+                .map_err(into_db_error)?
+            };
+            if goal.is_some() {
+                tx.execute(
+                    "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .map_err(zuno_db::map_error)?;
+                clear_retry_state(tx, session_id)?;
+            }
+            Ok(goal)
+        })
     }
 
     /// Set a status only the runtime or the user may choose.
@@ -450,6 +640,23 @@ impl GoalStore {
             session_id,
             status.as_str(),
             matches!(status, SystemStatus::Active),
+            None,
+        )
+    }
+
+    /// Update system-owned status only if `expected_revision` is still current.
+    pub fn set_status_as_system_checked(
+        &self,
+        session_id: &str,
+        status: SystemStatus,
+        expected_revision: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        self.write_status(
+            SET_STATUS_AS_SYSTEM,
+            session_id,
+            status.as_str(),
+            matches!(status, SystemStatus::Active),
+            Some(expected_revision),
         )
     }
 
@@ -622,21 +829,47 @@ impl GoalStore {
     /// the persisted streak. The turn boundary consumes the row exactly once, so
     /// three tool retries cannot impersonate three consecutive turns.
     pub fn stage_failure_signal(&self, session_id: &str, signal: &str) -> Result<bool, GoalError> {
+        self.stage_failure_signal_with_revision(session_id, signal, None)
+    }
+
+    /// Stage a blocker only when the goal revision observed by the model is current.
+    pub fn stage_failure_signal_checked(
+        &self,
+        session_id: &str,
+        signal: &str,
+        expected_revision: i64,
+    ) -> Result<bool, GoalError> {
+        self.stage_failure_signal_with_revision(session_id, signal, Some(expected_revision))
+    }
+
+    fn stage_failure_signal_with_revision(
+        &self,
+        session_id: &str,
+        signal: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<bool, GoalError> {
         let signal = signal.trim();
         if signal.is_empty() {
             return Ok(false);
         }
-        let changed = self.pool.transaction(|tx| {
-            tx.execute(
-                "INSERT INTO goal_pending_failure_signal (session_id, signal) \
-                 SELECT session_id, ?2 FROM goal \
-                 WHERE session_id = ?1 AND status = 'active' \
-                 ON CONFLICT(session_id) DO UPDATE SET signal = excluded.signal",
-                params![session_id, signal],
-            )
-            .map_err(zuno_db::map_error)
-        })?;
-        Ok(changed > 0)
+        self.pool.transaction(|tx| {
+            let changed = tx
+                .execute(
+                    "INSERT INTO goal_pending_failure_signal (session_id, signal) \
+                     SELECT session_id, ?2 FROM goal \
+                     WHERE session_id = ?1 AND status = 'active' \
+                       AND (?3 IS NULL OR revision = ?3) \
+                     ON CONFLICT(session_id) DO UPDATE SET signal = excluded.signal",
+                    params![session_id, signal, expected_revision],
+                )
+                .map_err(zuno_db::map_error)?;
+            if changed == 0
+                && let Some(error) = revision_conflict(tx, session_id, expected_revision)?
+            {
+                return Ok(Err(error));
+            }
+            Ok(Ok(changed > 0))
+        })?
     }
 
     /// Consume the blocking condition staged by this turn, if any.
@@ -738,8 +971,11 @@ impl GoalStore {
         let goal = self.pool.transaction(|tx| {
             let goal = {
                 let mut statement = tx.prepare(SET_TOKEN_BUDGET).map_err(zuno_db::map_error)?;
-                read_optional(&mut statement, params![token_budget, now_ms, session_id])
-                    .map_err(into_db_error)?
+                read_optional(
+                    &mut statement,
+                    params![token_budget, now_ms, session_id, Option::<i64>::None],
+                )
+                .map_err(into_db_error)?
             };
             if goal.as_ref().is_some_and(|goal| !goal.status.is_active()) {
                 clear_retry_state(tx, session_id)?;
@@ -767,20 +1003,46 @@ impl GoalStore {
         session_id: &str,
         objective: &str,
     ) -> Result<Option<Goal>, GoalError> {
+        self.update_objective_with_revision(session_id, objective, None)
+    }
+
+    /// Rewrite the objective only when `expected_revision` is still current.
+    pub fn update_objective_checked(
+        &self,
+        session_id: &str,
+        objective: &str,
+        expected_revision: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        self.update_objective_with_revision(session_id, objective, Some(expected_revision))
+    }
+
+    fn update_objective_with_revision(
+        &self,
+        session_id: &str,
+        objective: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<Option<Goal>, GoalError> {
         let objective = spill::store_objective(&self.spill_dir, objective)?;
         let now_ms = now_ms()?;
-        let goal = self.pool.transaction(|tx| {
+        self.pool.transaction(|tx| {
             let goal = {
                 let mut statement = tx.prepare(SET_OBJECTIVE).map_err(zuno_db::map_error)?;
-                read_optional(&mut statement, params![objective, now_ms, session_id])
-                    .map_err(into_db_error)?
+                read_optional(
+                    &mut statement,
+                    params![objective, now_ms, session_id, expected_revision],
+                )
+                .map_err(into_db_error)?
             };
+            if goal.is_none()
+                && let Some(error) = revision_conflict(tx, session_id, expected_revision)?
+            {
+                return Ok(Err(error));
+            }
             if goal.is_some() {
                 clear_retry_state(tx, session_id)?;
             }
-            Ok(goal)
-        })?;
-        Ok(goal)
+            Ok(Ok(goal))
+        })?
     }
 
     /// Add a turn's spend to the counters, flipping to `budget_limited` in the
@@ -808,6 +1070,7 @@ impl GoalStore {
         session_id: &str,
         token_delta: i64,
         time_delta_seconds: i64,
+        accounting_known: bool,
     ) -> Result<Option<Goal>, GoalError> {
         let token_delta = token_delta.max(0);
         let time_delta_seconds = time_delta_seconds.max(0);
@@ -817,7 +1080,13 @@ impl GoalStore {
                 let mut statement = tx.prepare(RECORD_USAGE).map_err(zuno_db::map_error)?;
                 read_optional(
                     &mut statement,
-                    params![token_delta, time_delta_seconds, now_ms, session_id],
+                    params![
+                        token_delta,
+                        time_delta_seconds,
+                        accounting_known,
+                        now_ms,
+                        session_id
+                    ],
                 )
                 .map_err(into_db_error)?
             };
@@ -835,14 +1104,23 @@ impl GoalStore {
         session_id: &str,
         status: &str,
         clear_failure_streak: bool,
+        expected_revision: Option<i64>,
     ) -> Result<Option<Goal>, GoalError> {
         let now_ms = now_ms()?;
-        let goal = self.pool.transaction(|tx| {
+        self.pool.transaction(|tx| {
             let goal = {
                 let mut statement = tx.prepare(sql).map_err(zuno_db::map_error)?;
-                read_optional(&mut statement, params![status, now_ms, session_id])
-                    .map_err(into_db_error)?
+                read_optional(
+                    &mut statement,
+                    params![status, now_ms, session_id, expected_revision],
+                )
+                .map_err(into_db_error)?
             };
+            if goal.is_none()
+                && let Some(error) = revision_conflict(tx, session_id, expected_revision)?
+            {
+                return Ok(Err(error));
+            }
             if clear_failure_streak && goal.is_some() {
                 tx.execute(
                     "DELETE FROM goal_failure_streak WHERE session_id = ?1",
@@ -858,9 +1136,8 @@ impl GoalStore {
                 .map_err(zuno_db::map_error)?;
                 clear_retry_state(tx, session_id)?;
             }
-            Ok(goal)
-        })?;
-        Ok(goal)
+            Ok(Ok(goal))
+        })?
     }
 }
 
@@ -872,62 +1149,83 @@ impl GoalStore {
 /// in SQL so no caller can skip it.
 const UPSERT_BODY: &str = "\
 INSERT INTO goal (
-    session_id, goal_id, objective, status,
-    token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms
+    session_id, goal_id, revision, objective, success_criteria, status, blocked_reason,
+    token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, updated_at_ms
 ) VALUES (
-    ?1, ?2, ?3,
-    CASE WHEN ?4 IS NOT NULL AND 0 >= ?4 THEN 'budget_limited' ELSE 'active' END,
-    ?4, 0, 0, ?5, ?5
+    ?1, ?2, 1, ?3, ?4,
+    CASE WHEN ?5 IS NOT NULL AND 0 >= ?5 THEN 'budget_limited' ELSE 'active' END,
+    NULL, ?5, 0, 1, 0, ?6, ?6
 )
 ON CONFLICT(session_id) DO UPDATE SET
     goal_id = excluded.goal_id,
+    revision = 1,
     objective = excluded.objective,
+    success_criteria = excluded.success_criteria,
     status = excluded.status,
+    blocked_reason = NULL,
     token_budget = excluded.token_budget,
     tokens_used = 0,
+    usage_known = 1,
     time_used_seconds = 0,
     created_at_ms = excluded.created_at_ms,
     updated_at_ms = excluded.updated_at_ms";
 
-/// The model's replacement: refuses unless the goal in the way is finished.
+/// The model's replacement: refuses unless the goal in the way is terminal.
 ///
 /// The `WHERE` is what makes the refusal atomic. When it is false SQLite skips
 /// the row, so `RETURNING` yields nothing and there is no separate read that a
 /// concurrent writer could slip between. Ports `goals.rs:245`.
 const UPSERT_IF_COMPLETE: &str = "\
-WHERE goal.status = 'complete'
-RETURNING session_id, goal_id, objective, status, token_budget, tokens_used, \
-time_used_seconds, created_at_ms, updated_at_ms";
+WHERE goal.status IN ('complete', 'cancelled')
+RETURNING session_id, goal_id, revision, objective, success_criteria, status, \
+blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
+updated_at_ms";
 
 /// The user's replacement, with no status guard. Ports `goals.rs:179-198`.
 const UPSERT_UNCONDITIONAL: &str = "\
-RETURNING session_id, goal_id, objective, status, token_budget, tokens_used, \
-time_used_seconds, created_at_ms, updated_at_ms";
+RETURNING session_id, goal_id, revision, objective, success_criteria, status, \
+blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
+updated_at_ms";
 
 const SET_STATUS_AS_MODEL: &str = "\
 UPDATE goal
 SET status = CASE
         WHEN status = 'budget_limited' AND ?1 = 'blocked' THEN status
+        WHEN status = 'cancelled' THEN status
         ELSE ?1
     END,
+    blocked_reason = CASE
+        WHEN status = 'budget_limited' AND ?1 = 'blocked' THEN blocked_reason
+        WHEN status = 'cancelled' THEN blocked_reason
+        WHEN ?1 = 'blocked' THEN (
+            SELECT signal FROM goal_failure_streak WHERE session_id = ?3
+        )
+        ELSE NULL
+    END,
+    revision = revision + 1,
     updated_at_ms = ?2
-WHERE session_id = ?3
-RETURNING session_id, goal_id, objective, status, token_budget, tokens_used, \
-time_used_seconds, created_at_ms, updated_at_ms";
+WHERE session_id = ?3 AND (?4 IS NULL OR revision = ?4)
+RETURNING session_id, goal_id, revision, objective, success_criteria, status, \
+blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
+updated_at_ms";
 
 const SET_STATUS_AS_SYSTEM: &str = "\
 UPDATE goal
 SET status = CASE
         WHEN status = 'budget_limited' AND ?1 = 'paused' THEN status
+        WHEN status = 'cancelled' THEN status
         WHEN ?1 = 'active'
              AND token_budget IS NOT NULL
              AND tokens_used >= token_budget THEN 'budget_limited'
         ELSE ?1
     END,
+    blocked_reason = NULL,
+    revision = revision + 1,
     updated_at_ms = ?2
-WHERE session_id = ?3
-RETURNING session_id, goal_id, objective, status, token_budget, tokens_used, \
-time_used_seconds, created_at_ms, updated_at_ms";
+WHERE session_id = ?3 AND (?4 IS NULL OR revision = ?4)
+RETURNING session_id, goal_id, revision, objective, success_criteria, status, \
+blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
+updated_at_ms";
 
 const SET_TOKEN_BUDGET: &str = "\
 UPDATE goal
@@ -937,18 +1235,22 @@ SET token_budget = ?1,
             THEN 'budget_limited'
         ELSE status
     END,
+    revision = revision + 1,
     updated_at_ms = ?2
-WHERE session_id = ?3
-RETURNING session_id, goal_id, objective, status, token_budget, tokens_used, \
-time_used_seconds, created_at_ms, updated_at_ms";
+WHERE session_id = ?3 AND (?4 IS NULL OR revision = ?4)
+RETURNING session_id, goal_id, revision, objective, success_criteria, status, \
+blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
+updated_at_ms";
 
 const SET_OBJECTIVE: &str = "\
 UPDATE goal
 SET objective = ?1,
+    revision = revision + 1,
     updated_at_ms = ?2
-WHERE session_id = ?3
-RETURNING session_id, goal_id, objective, status, token_budget, tokens_used, \
-time_used_seconds, created_at_ms, updated_at_ms";
+WHERE session_id = ?3 AND (?4 IS NULL OR revision = ?4)
+RETURNING session_id, goal_id, revision, objective, success_criteria, status, \
+blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
+updated_at_ms";
 
 /// `tokens_used + ?1` reads the pre-update value, which is how the flip decides
 /// on the post-increment total inside the statement that performs the increment.
@@ -956,22 +1258,19 @@ const RECORD_USAGE: &str = "\
 UPDATE goal
 SET tokens_used = tokens_used + ?1,
     time_used_seconds = time_used_seconds + ?2,
+    usage_known = usage_known AND ?3,
+    revision = revision + 1,
     status = CASE
         WHEN status = 'active'
              AND token_budget IS NOT NULL
              AND tokens_used + ?1 >= token_budget THEN 'budget_limited'
         ELSE status
     END,
-    updated_at_ms = ?3
-WHERE session_id = ?4
-RETURNING session_id, goal_id, objective, status, token_budget, tokens_used, \
-time_used_seconds, created_at_ms, updated_at_ms";
-
-/// Where the goal database lives: `data()/goal_1.db`.
-#[must_use]
-pub fn default_db_path() -> PathBuf {
-    zuno_paths::data().join(GOAL_DB_FILE)
-}
+    updated_at_ms = ?4
+WHERE session_id = ?5
+RETURNING session_id, goal_id, revision, objective, success_criteria, status, \
+blocked_reason, token_budget, tokens_used, usage_known, time_used_seconds, created_at_ms, \
+updated_at_ms";
 
 /// Where oversized objectives spill: `data()/goal-objective`.
 #[must_use]
@@ -979,22 +1278,125 @@ pub fn default_spill_dir() -> PathBuf {
     zuno_paths::data().join(OBJECTIVE_SPILL_DIRECTORY)
 }
 
-fn upsert(
-    tx: &Transaction<'_>,
-    tail: &str,
-    session_id: &str,
-    goal_id: &str,
-    objective: &str,
+struct GoalUpsert<'a> {
+    tail: &'a str,
+    session_id: &'a str,
+    goal_id: &'a str,
+    objective: &'a str,
+    success_criteria: &'a [String],
     token_budget: Option<i64>,
     now_ms: i64,
-) -> Result<Option<Goal>, DbError> {
-    let sql = format!("{UPSERT_BODY}\n{tail}");
+}
+
+fn upsert(tx: &Transaction<'_>, input: GoalUpsert<'_>) -> Result<Option<Goal>, DbError> {
+    let sql = format!("{UPSERT_BODY}\n{}", input.tail);
+    let success_criteria =
+        serde_json::to_string(input.success_criteria).map_err(|source| DbError::Query {
+            source: Box::new(source),
+        })?;
     let mut statement = tx.prepare(&sql).map_err(zuno_db::map_error)?;
     read_optional(
         &mut statement,
-        params![session_id, goal_id, objective, token_budget, now_ms],
+        params![
+            input.session_id,
+            input.goal_id,
+            input.objective,
+            success_criteria,
+            input.token_budget,
+            input.now_ms
+        ],
     )
     .map_err(into_db_error)
+}
+
+fn completion_blockers(
+    tx: &Transaction<'_>,
+    session_id: &str,
+) -> Result<(usize, usize, usize), DbError> {
+    let plan_steps = if table_exists(tx, "work_plan")? {
+        let steps = tx
+            .query_row(
+                "SELECT steps FROM work_plan WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(zuno_db::map_error)?;
+        match steps {
+            Some(steps) => serde_json::from_str::<Vec<serde_json::Value>>(&steps)
+                .map_err(|error| DbError::Query {
+                    source: Box::new(error),
+                })?
+                .into_iter()
+                .filter(|step| {
+                    !matches!(
+                        step.get("status").and_then(serde_json::Value::as_str),
+                        Some("completed" | "cancelled")
+                    )
+                })
+                .count(),
+            None => 0,
+        }
+    } else {
+        0
+    };
+    let work_items = if table_exists(tx, "work_item")? {
+        tx.query_row(
+            "SELECT COUNT(*) FROM work_item              WHERE session_id = ?1 AND status NOT IN ('completed','cancelled')",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(zuno_db::map_error)
+        .map(|count| usize::try_from(count).unwrap_or(usize::MAX))?
+    } else {
+        0
+    };
+    let jobs = if table_exists(tx, "agent_job")? {
+        tx.query_row(
+            "SELECT COUNT(*) FROM agent_job              WHERE parent_session_id = ?1 AND status NOT IN ('completed','cancelled')",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(zuno_db::map_error)
+        .map(|count| usize::try_from(count).unwrap_or(usize::MAX))?
+    } else {
+        0
+    };
+    Ok((plan_steps, work_items, jobs))
+}
+
+fn table_exists(tx: &Transaction<'_>, table: &str) -> Result<bool, DbError> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        params![table],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(zuno_db::map_error)
+}
+
+fn revision_conflict(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    expected_revision: Option<i64>,
+) -> Result<Option<GoalError>, DbError> {
+    let Some(expected) = expected_revision else {
+        return Ok(None);
+    };
+    let actual = tx
+        .query_row(
+            "SELECT revision FROM goal WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?;
+    Ok(actual
+        .filter(|actual| *actual != expected)
+        .map(|actual| GoalError::RevisionConflict {
+            session_id: session_id.to_owned(),
+            expected,
+            actual,
+        }))
 }
 
 fn blocking_status(tx: &Transaction<'_>, session_id: &str) -> Result<GoalStatus, DbError> {
@@ -1100,10 +1502,22 @@ fn from_row(row: &Row<'_>) -> Result<Goal, GoalError> {
     Ok(Goal {
         session_id: row.get("session_id").map_err(zuno_db::map_error)?,
         goal_id: row.get("goal_id").map_err(zuno_db::map_error)?,
+        revision: row.get("revision").map_err(zuno_db::map_error)?,
         objective: row.get("objective").map_err(zuno_db::map_error)?,
+        success_criteria: serde_json::from_str(
+            &row.get::<_, String>("success_criteria")
+                .map_err(zuno_db::map_error)?,
+        )
+        .map_err(|source| {
+            GoalError::Db(DbError::Query {
+                source: Box::new(source),
+            })
+        })?,
         status: GoalStatus::parse(&status)?,
+        blocked_reason: row.get("blocked_reason").map_err(zuno_db::map_error)?,
         token_budget: row.get("token_budget").map_err(zuno_db::map_error)?,
         tokens_used: row.get("tokens_used").map_err(zuno_db::map_error)?,
+        usage_known: row.get("usage_known").map_err(zuno_db::map_error)?,
         time_used_seconds: row.get("time_used_seconds").map_err(zuno_db::map_error)?,
         created_at_ms: row.get("created_at_ms").map_err(zuno_db::map_error)?,
         updated_at_ms: row.get("updated_at_ms").map_err(zuno_db::map_error)?,

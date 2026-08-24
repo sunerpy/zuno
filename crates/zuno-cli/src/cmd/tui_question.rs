@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use zuno_error::ToolError;
-use zuno_tools::question::{Answer, QuestionAsker, QuestionRequest};
+use zuno_tools::question::{Answer, QuestionAsker, QuestionOutcome, QuestionRequest};
 use zuno_tui::app::{EventResult, TerminalEvent};
 use zuno_tui::views::ViewContext;
 use zuno_tui::views::dialog::DialogHost;
@@ -17,7 +17,7 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct PendingQuestion {
     questions: Vec<TuiQuestionRequest>,
-    answer: oneshot::Sender<Vec<Answer>>,
+    answer: oneshot::Sender<QuestionOutcome>,
 }
 
 const QUESTION_CHANNEL_CAPACITY: usize = 8;
@@ -50,9 +50,9 @@ impl QuestionAsker for QuestionBroker {
         _session_id: &str,
         questions: &[QuestionRequest],
         _call: Option<(&str, &str)>,
-    ) -> Result<Vec<Answer>, ToolError> {
+    ) -> Result<QuestionOutcome, ToolError> {
         if questions.is_empty() {
-            return Ok(Vec::new());
+            return Ok(QuestionOutcome::Answered(Vec::new()));
         }
         let questions = questions.iter().map(to_tui_request).collect();
         let (sender, receiver) = oneshot::channel();
@@ -62,13 +62,12 @@ impl QuestionAsker for QuestionBroker {
                 answer: sender,
             })
             .await
-            .map_err(|_| ToolError::Denied {
+            .map_err(|_| ToolError::Failed {
                 tool: String::from("question"),
+                source: Box::new(std::io::Error::other("question UI queue is closed")),
             })?;
         let _nudged = self.wake.try_send(TerminalEvent::Wake);
-        receiver.await.map_err(|_| ToolError::Denied {
-            tool: String::from("question"),
-        })
+        Ok(receiver.await.unwrap_or(QuestionOutcome::Failed))
     }
 }
 
@@ -92,7 +91,7 @@ fn to_tui_request(request: &QuestionRequest) -> TuiQuestionRequest {
 pub(crate) struct QuestionBridge {
     context: ViewContext,
     broker: Arc<QuestionBroker>,
-    active: Option<oneshot::Sender<Vec<Answer>>>,
+    active: Option<oneshot::Sender<QuestionOutcome>>,
 }
 
 impl QuestionBridge {
@@ -108,16 +107,16 @@ impl QuestionBridge {
         let Some(answer) = self.active.take() else {
             return EventResult::IGNORED;
         };
-        let _delivered = answer.send(answers);
+        let _delivered = answer.send(QuestionOutcome::Answered(answers));
         EventResult::REDRAW
     }
 
     pub(crate) fn cancel(&mut self) -> EventResult {
-        if self.active.take().is_some() {
-            EventResult::REDRAW
-        } else {
-            EventResult::IGNORED
-        }
+        let Some(answer) = self.active.take() else {
+            return EventResult::IGNORED;
+        };
+        let _delivered = answer.send(QuestionOutcome::Cancelled);
+        EventResult::REDRAW
     }
 
     pub(crate) fn open_next(&mut self, host: &mut DialogHost) -> EventResult {

@@ -121,9 +121,12 @@ fn extension_agents_keep_native_file_network_and_environment_tool_permissions() 
                 "mode": "subagent",
                 "prompt": "Inspect files, network evidence, and environment facts.",
                 "permission": {
-                    "read": "allow",
-                    "web_search": "allow",
-                    "bash": "ask"
+                    "mode": "standard",
+                    "rules": {
+                        "read": "allow",
+                        "web_search": "allow",
+                        "bash": "ask"
+                    }
                 }
             }
         }
@@ -144,8 +147,8 @@ fn extension_agents_keep_native_file_network_and_environment_tool_permissions() 
         .agents()
         .get("network-reviewer")
         .and_then(|agent| agent.permission.as_ref())
-        .expect("agent permission survives extension resolution")
-        .normalized();
+        .expect("agent permission survives extension resolution");
+    let permission = &permission.rules;
 
     for (tool, expected) in [
         ("read", PermissionAction::Allow),

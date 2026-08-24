@@ -71,10 +71,7 @@ mod instructions {
             .collect()
     }
 
-    /// The acceptance fixture: a tree holding **both** names must load only
-    /// `AGENTS.md`. The cascade is over filenames (`instruction.ts:123-130`), so the
-    /// first name that exists anywhere claims the chain and `CLAUDE.md` is never
-    /// probed.
+    /// A tree holding both product filenames loads only native AGENTS rules.
     #[test]
     fn a_tree_with_both_names_loads_only_agents_md() {
         let fixture = Fixture::new();
@@ -91,8 +88,7 @@ mod instructions {
         assert_eq!(found.paths().len(), 1);
     }
 
-    /// Same fixture, one level deeper: the whole `AGENTS.md` chain loads, and no
-    /// `CLAUDE.md` at any level does.
+    /// The AGENTS chain loads root-to-current so nearer rules win later.
     #[test]
     fn the_first_name_claims_every_level_and_the_second_name_none() {
         let fixture = Fixture::new();
@@ -105,7 +101,7 @@ mod instructions {
 
         assert_eq!(
             paths_of(&found, Origin::Project),
-            vec![sub_agents, root_agents]
+            vec![root_agents, sub_agents]
         );
         assert!(!found.contains(&fixture.path("repo/CLAUDE.md")));
         assert!(!found.contains(&fixture.path("repo/pkg/CLAUDE.md")));
@@ -143,26 +139,15 @@ mod instructions {
     }
 
     #[test]
-    fn disabling_claude_compatibility_drops_the_claude_global_and_cascade_entry() {
+    fn claude_instruction_files_are_never_loaded_implicitly() {
         let fixture = Fixture::new();
         let claude_global = fixture.write("home/.claude/CLAUDE.md", "global claude");
         let project_claude = fixture.write("repo/CLAUDE.md", "project claude");
 
-        let enabled = Instructions::discover(&fixture.options("repo", Vec::new()));
-        assert!(enabled.contains(&claude_global));
-        assert!(enabled.contains(&project_claude));
-
-        let env = fixture
-            .env()
-            .with("ZUNO_DISABLE_CLAUDE_CODE_PROMPT", "true");
-        let options = InstructionOptions::new(
-            fixture.path("repo"),
-            Some(fixture.path("repo")),
-            &env,
-            Vec::new(),
-        );
-        let disabled = Instructions::discover(&options);
-        assert!(disabled.paths().is_empty(), "{:?}", disabled.paths());
+        let found = Instructions::discover(&fixture.options("repo", Vec::new()));
+        assert!(!found.contains(&claude_global));
+        assert!(!found.contains(&project_claude));
+        assert!(found.paths().is_empty(), "{:?}", found.paths());
     }
 
     #[tokio::test]

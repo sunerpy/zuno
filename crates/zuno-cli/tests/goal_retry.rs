@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv};
+use zuno_testkit::{DbChoice, MockProvider, MockResponse, Scenario, ScriptedEnv};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -127,9 +127,8 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
         .respond(text_response("Goal retry probe"))
         .respond(tool_response(
             "create-goal",
-            "create_goal",
+            "goal_propose",
             json!({
-                "intent": "persist the recovery objective before the outage",
                 "objective": "finish after a transient provider outage"
             }),
         ))
@@ -138,9 +137,11 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
         .respond(transient_failure())
         .respond(tool_response(
             "complete-goal",
-            "update_goal",
+            "goal_update",
             json!({
-                "intent": "mark the fully recovered objective complete",
+                // The failed turn records its usage after goal creation, advancing
+                // the authoritative goal from revision 1 to revision 2.
+                "expected_revision": 2,
                 "status": "complete"
             }),
         ))
@@ -148,7 +149,16 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
     let provider = MockProvider::start(vec![scenario])
         .await
         .expect("bind loopback provider");
-    let env = ScriptedEnv::new().expect("isolated environment");
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let variables = variables(&env, provider.base_url());
+    let goal_database = PathBuf::from(
+        variables
+            .get("ZUNO_DB")
+            .expect("scripted file database path")
+            .as_str(),
+    );
 
     let mut command = tokio::process::Command::new(binary());
     command
@@ -162,11 +172,27 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
         ])
         .current_dir(env.working_dir())
         .env_clear()
-        .envs(variables(&env, provider.base_url()));
-    let output = tokio::time::timeout(RUN_TIMEOUT, command.output())
-        .await
-        .expect("goal recovery must finish inside its budget")
-        .expect("launch production CLI");
+        .envs(variables);
+    command.kill_on_drop(true);
+    let output = match tokio::time::timeout(RUN_TIMEOUT, command.output()).await {
+        Ok(output) => output.expect("launch production CLI"),
+        Err(error) => {
+            let request_sequence = provider
+                .captured()
+                .await
+                .into_iter()
+                .map(|request| {
+                    format!(
+                        "{} {} scenario={:?} served_index={:?}",
+                        request.method, request.path, request.scenario, request.served_index
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "goal recovery must finish inside its budget: {error}; captured requests: {request_sequence:#?}"
+            );
+        }
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -198,7 +224,6 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
         "the retry request must carry the durable side-effect audit:\n{retry_request}"
     );
 
-    let goal_database = env.xdg_data().join("zuno").join("goal_1.db");
     let connection = Connection::open(&goal_database).expect("open the completed goal database");
     let status: String = connection
         .query_row("SELECT status FROM goal", [], |row| row.get(0))

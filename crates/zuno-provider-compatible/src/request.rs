@@ -7,7 +7,7 @@
 //!    a caller that put a different `thinking` value in its options bag must not be
 //!    able to disable it by accident. Writing it last makes the required shape the
 //!    final word
-//!    (`.omo/refs/claw-code/rust/crates/api/src/providers/openai_compat.rs:1226-1227`).
+//!    (`claw-code`).
 //! 2. **Sampling parameters are gated on a capability**, never on a model name.
 //!    See [`crate::quirks`].
 //! 3. **`reasoning_content` is echoed only when the model requires it.** Sending it
@@ -55,6 +55,7 @@ pub const PROTECTED_KEYS: &[&str] = &[
     "model",
     "messages",
     "input",
+    "instructions",
     "stream",
     "tools",
     "tool_choice",
@@ -98,8 +99,10 @@ impl Sampling {
 pub struct RequestBody {
     /// The model id as the vendor names it.
     pub model: String,
-    /// The turn, in order.
+    /// The durable turn, in order.
     pub messages: Vec<Message>,
+    /// Volatile non-user context appended as independent protocol items.
+    pub developer_context: Vec<String>,
     /// Tool definitions, when the caller has any and the model accepts them.
     ///
     /// A JSON array, passed through rather than re-derived: hand-writing a schema
@@ -166,15 +169,18 @@ impl RequestBody {
     fn build_chat(&self, quirks: &Quirks) -> Value {
         let mut body = Map::new();
         body.insert("model".to_owned(), json!(self.model));
-        body.insert(
-            "messages".to_owned(),
-            Value::Array(
-                self.messages
-                    .iter()
-                    .flat_map(|message| translate_message(message, quirks))
-                    .collect(),
-            ),
+        let mut messages = self
+            .messages
+            .iter()
+            .flat_map(|message| translate_message(message, quirks))
+            .collect::<Vec<_>>();
+        messages.extend(
+            self.developer_context
+                .iter()
+                .filter(|content| !content.trim().is_empty())
+                .map(|content| json!({"role": "system", "content": content})),
         );
+        body.insert("messages".to_owned(), Value::Array(messages));
         body.insert("stream".to_owned(), json!(true));
 
         if let Some(tools) = &self.tools
@@ -234,17 +240,28 @@ impl RequestBody {
     }
 
     fn build_responses(&self, quirks: &Quirks) -> Value {
+        let mut input = Vec::new();
+        let mut instructions = None;
+        for message in &self.messages {
+            if message.role == Role::System && instructions.is_none() {
+                instructions = Some(joined_text(message));
+            } else {
+                input.extend(translate_response_message(message, quirks));
+            }
+        }
+        input.extend(
+            self.developer_context
+                .iter()
+                .filter(|content| !content.trim().is_empty())
+                .map(|content| json!({"role": "developer", "content": content})),
+        );
+
         let mut body = Map::new();
         body.insert("model".to_owned(), json!(self.model));
-        body.insert(
-            "input".to_owned(),
-            Value::Array(
-                self.messages
-                    .iter()
-                    .flat_map(|message| translate_response_message(message, quirks))
-                    .collect(),
-            ),
-        );
+        if let Some(instructions) = instructions.filter(|instructions| !instructions.is_empty()) {
+            body.insert("instructions".to_owned(), Value::String(instructions));
+        }
+        body.insert("input".to_owned(), Value::Array(input));
         body.insert("stream".to_owned(), json!(true));
 
         if let Some(tools) = &self.tools
@@ -328,7 +345,7 @@ pub fn translate_message(message: &Message, quirks: &Quirks) -> Vec<Value> {
 fn translate_response_message(message: &Message, quirks: &Quirks) -> Vec<Value> {
     match message.role {
         Role::System => vec![json!({
-            "role": "system",
+            "role": "developer",
             "content": joined_text(message),
         })],
         Role::User => vec![json!({
@@ -868,6 +885,37 @@ mod tests {
         assert!(
             built.get("reasoningEffort").is_none() && built.get("reasoning_effort").is_none(),
             "the Responses surface takes the level nested, not flat: {built}"
+        );
+    }
+
+    #[test]
+    fn responses_surface_lifts_native_instructions_and_preserves_developer_context() {
+        let mut request = RequestBody::new(
+            "gpt-5",
+            vec![
+                Message::new(Role::System, "native kernel"),
+                Message::new(Role::System, "project policy"),
+                Message::new(Role::User, "exact user text"),
+            ],
+        );
+        request.developer_context = vec!["active goal".to_owned(), "memory".to_owned()];
+        let built = request.build(&responses_quirks());
+
+        assert_eq!(built["instructions"], json!("native kernel"));
+        assert_eq!(built["input"][0]["role"], json!("developer"));
+        assert_eq!(built["input"][0]["content"], json!("project policy"));
+        assert_eq!(built["input"][1]["role"], json!("user"));
+        assert_eq!(
+            built["input"][1]["content"][0]["text"],
+            json!("exact user text")
+        );
+        assert_eq!(
+            built["input"][2],
+            json!({"role": "developer", "content": "active goal"})
+        );
+        assert_eq!(
+            built["input"][3],
+            json!({"role": "developer", "content": "memory"})
         );
     }
 

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tracing::Instrument as _;
+use zuno_config::schema::permission::PermissionMode;
 use zuno_llm::cache::McpToolStatus;
 use zuno_observability::span;
 use zuno_observability::tool::ToolLifecycle;
@@ -44,9 +45,21 @@ pub enum AuthorizationPolicy {
     Standard,
     /// Every side-effecting invocation requires a fresh attached-user decision.
     Strict,
+    /// Skip HITL prompts while keeping explicit deny rules terminal.
+    AllowAll,
 }
 
 impl AuthorizationPolicy {
+    /// Resolve the typed configuration mode at the engine boundary.
+    #[must_use]
+    pub const fn from_mode(mode: PermissionMode) -> Self {
+        match mode {
+            PermissionMode::Standard => Self::Standard,
+            PermissionMode::Strict => Self::Strict,
+            PermissionMode::AllowAll => Self::AllowAll,
+        }
+    }
+
     /// Resolve the configuration boolean without leaking config types into the engine.
     #[must_use]
     pub const fn from_strict(strict: bool) -> Self {
@@ -55,6 +68,10 @@ impl AuthorizationPolicy {
 
     const fn is_strict(self) -> bool {
         matches!(self, Self::Strict)
+    }
+
+    const fn is_allow_all(self) -> bool {
+        matches!(self, Self::AllowAll)
     }
 }
 
@@ -175,14 +192,17 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         }
 
         if let Some(input_error) = &request.call.input_error {
+            tracing::warn!(
+                tool = resolved_name,
+                call_id = %request.call.id,
+                error = input_error,
+                "provider emitted malformed tool arguments"
+            );
             return observed_ready(
                 observation,
                 blocked_result(
                     resolved_name,
-                    format!(
-                        "Malformed arguments for tool `{resolved_name}`: {input_error}. Raw input: {}",
-                        request.call.raw_input
-                    ),
+                    format!("Malformed arguments for tool `{resolved_name}`: {input_error}"),
                     ToolBlockKind::InvalidArguments,
                 ),
             );
@@ -439,6 +459,7 @@ impl RulePermissionAsker {
                 tool: tool.to_owned(),
             }),
             _ if self.requires_manual(&ask) => self.prompt_manual(tool, ask).await,
+            _ if self.authorization.is_allow_all() => Ok(()),
             RuleOutcome::Permitted => Ok(()),
             RuleOutcome::Pending(_) if plugin == PermissionHookDecision::Allow => Ok(()),
             RuleOutcome::Pending(pending) => self.prompt(tool, ask, pending).await,
@@ -536,7 +557,8 @@ pub fn permission_patterns(tool: &str, args: &Value) -> Vec<String> {
         "skill" => strings_at(args, &["name"]),
         "read_mcp_resource" => strings_at(args, &["uri", "resource_name", "server"]),
         "list_mcp_resources" | "list_mcp_resource_templates" => strings_at(args, &["server"]),
-        "todowrite" | "question" | "invalid" | "plan_exit" | "lsp" | "execute" => {
+        "plan_get" | "plan_update" | "todo_get" | "todo_update" | "question" | "invalid"
+        | "plan_exit" | "lsp" | "execute" => {
             vec!["*".to_owned()]
         }
         _ => strings_at(

@@ -30,8 +30,7 @@
 //!
 //! The chain above was read from the oracle *and* observed on the real binary
 //! (`opencode` 1.18.12, `GET /command`) against a fixture that collides all
-//! four levels on purpose. Full transcript in
-//! `.omo/evidence/task-15-opencode-rust.txt`:
+//! four levels on purpose. The recorded task-15 transcript shows:
 //!
 //! - a `command` entry named `review` replaced the built-in's description,
 //!   template, and `subtask`;

@@ -21,8 +21,7 @@
 //! Every fixture is inside a per-test `tempdir()`, so no test names a fixed path,
 //! and nothing here binds a port, reads `PATH`, or mutates the environment. The
 //! program locator is injected precisely so no test has to touch the environment to
-//! be believed (`.omo` issues: "a test may not assume exclusive use of a shared
-//! namespace").
+//! be believed: a test may not assume exclusive use of a shared namespace.
 //!
 //! # Why fixtures never edit a file to the same length
 //!
@@ -432,7 +431,7 @@ async fn a_configured_formatter_runs_after_an_edit_and_the_content_is_formatted(
     let output = tools
         .edit
         .execute(
-            json!({ "filePath": subject, "oldString": "alpha", "newString": "beta" }),
+            json!({ "filePath": subject, "edits": [{ "oldString": "alpha", "newString": "beta" }] }),
             context(),
         )
         .await
@@ -810,7 +809,7 @@ async fn a_failing_formatter_is_reported_while_the_edit_persists() {
     let output = tools
         .edit
         .execute(
-            json!({ "filePath": subject, "oldString": "alpha", "newString": "beta" }),
+            json!({ "filePath": subject, "edits": [{ "oldString": "alpha", "newString": "beta" }] }),
             context(),
         )
         .await
@@ -882,7 +881,7 @@ async fn a_formatter_that_truncates_the_file_before_failing_has_its_damage_undon
     let output = tools
         .edit
         .execute(
-            json!({ "filePath": subject, "oldString": "alpha", "newString": "beta" }),
+            json!({ "filePath": subject, "edits": [{ "oldString": "alpha", "newString": "beta" }] }),
             context(),
         )
         .await

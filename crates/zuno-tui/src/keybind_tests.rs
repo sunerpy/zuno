@@ -21,15 +21,23 @@ const EXPECTED_ROWS: usize = 185;
 /// tolerated — `table_matches_the_upstream_fixture_row_for_row` requires the shipped value to
 /// equal the declared replacement *and* to still differ from upstream, so an entry cannot
 /// linger as a blanket suppression after the reason expires.
-const SPELLING_DIVERGENCES: &[(&str, &str, &str)] = &[(
-    "agent_cycle_reverse",
-    "shift+backtab,backtab,shift+tab",
-    "upstream's `shift+tab` cannot resolve here: crossterm reports the press as \
-     `KeyCode::BackTab` with `SHIFT`, so the chord it produces is `shift+backtab` and the \
-     oracle's spelling never matches. Upstream reads keys through a different runtime and does \
-     not have this fold. The upstream spelling is kept last for the Kitty protocol, which does \
-     report `Tab` with `SHIFT`.",
-)];
+const SPELLING_DIVERGENCES: &[(&str, &str, &str)] = &[
+    (
+        "agent_cycle_reverse",
+        "shift+backtab,backtab,shift+tab",
+        "upstream's `shift+tab` cannot resolve here: crossterm reports the press as \
+         `KeyCode::BackTab` with `SHIFT`, so the chord it produces is `shift+backtab` and the \
+         oracle's spelling never matches. Upstream reads keys through a different runtime and \
+         does not have this fold. The upstream spelling is kept last for the Kitty protocol, \
+         which does report `Tab` with `SHIFT`.",
+    ),
+    (
+        "input_newline",
+        "shift+return,alt+return,ctrl+j",
+        "Zuno reserves `ctrl+return` for the explicit steer gesture while a turn is running; \
+         newline remains available through Shift+Enter, Alt+Enter, and Ctrl+J.",
+    ),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -207,12 +215,12 @@ fn every_binding_resolves_to_its_documented_action() {
             continue;
         }
 
-        let value = BindingValue::parse(&row.keys);
+        let value = BindingValue::parse(entry.keys);
         let spellings = value.spellings();
         if spellings.is_empty() {
             assert_eq!(
-                row.keys, "none",
-                "`{}` has no spellings but is not `none`",
+                entry.keys, "none",
+                "`{}` has no shipped spellings but is not `none`",
                 row.name
             );
             let keymap = keymap_with(&[]);

@@ -18,7 +18,7 @@
 //! two: `.get(key).cloned()?` and a factory returning `None` both surface as a
 //! bare `Option::None`, and the wrapper that notices logs the same
 //! "composition root must call register_external_provider()" warning either way
-//! (`.omo/refs/jcode/crates/jcode-base/src/provider/external.rs:219-245`). So a
+//! (`jcode`). So a
 //! user with no GitHub token is told the *program* is miswired. Keeping the two
 //! apart is the point of having two registration forms at all.
 

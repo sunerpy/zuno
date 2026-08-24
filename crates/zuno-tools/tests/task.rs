@@ -185,18 +185,28 @@ async fn every_delegable_agent_is_reachable_and_the_coordinator_is_not() {
 
 /// The assertion `zuno-agent/src/builtin.rs:78` explicitly defers to this crate.
 #[test]
-fn every_governed_tool_id_is_a_real_registry_builtin() {
-    let builtin_ids: Vec<&str> = BUILTIN_ORDER.iter().map(|slot| slot.wire_id()).collect();
+fn every_governed_tool_id_is_a_real_production_tool() {
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
+            .expect("open work-state tool registry fixture"),
+    );
+    let configured = zuno_tools::work_state_tools(pool);
+    let production_ids = BUILTIN_ORDER
+        .iter()
+        .map(|slot| slot.wire_id())
+        .chain(configured.iter().map(|tool| tool.id()))
+        .collect::<Vec<_>>();
 
     assert!(
-        builtin_ids.len() >= 14,
-        "the scan must see the whole builtin table, saw {}",
-        builtin_ids.len()
+        BUILTIN_ORDER.len() >= 14,
+        "the scan must see the whole fixed-slot builtin table, saw {}",
+        BUILTIN_ORDER.len()
     );
     for governed in GOVERNED_TOOL_IDS {
         assert!(
-            builtin_ids.contains(&governed),
-            "`{governed}` is named by a permission set but is not a builtin: {builtin_ids:?}"
+            production_ids.contains(&governed),
+            "`{governed}` is named by a permission set but is not a production tool: \
+             {production_ids:?}"
         );
     }
     assert!(

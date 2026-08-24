@@ -63,6 +63,51 @@ pub const READ_PAGE_CONTENT_BYTES: usize = 60 * 1024;
 /// The description the model reads.
 pub const DESCRIPTION: &str = include_str!("description/skill.txt");
 
+/// One fully validated skill document shared by host preloading and the model tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedSkillDocument {
+    pub name: String,
+    pub source: String,
+    pub resource_root: Option<PathBuf>,
+    pub content: String,
+}
+
+/// Resolve and fully materialize one skill using the same identity and size rules as
+/// the `skill load` tool.
+pub async fn load_skill_document(
+    skills: &Skills,
+    name: &str,
+    source: Option<&str>,
+) -> Result<LoadedSkillDocument, ToolError> {
+    let skill = resolve_skill(skills, name, source)?;
+    let content = skill.read_body().await.map_err(|error| {
+        reject(SkillRejection::DocumentUnavailable {
+            requested: skill.name.clone(),
+            location: skill.location.clone(),
+            detail: error.to_string(),
+        })
+    })?;
+    if content.len() > RESOURCE_MAX_BYTES {
+        return Err(reject(SkillRejection::DocumentTooLarge {
+            requested: skill.name.clone(),
+            bytes: content.len(),
+            maximum: RESOURCE_MAX_BYTES,
+        }));
+    }
+    if content.trim().is_empty() {
+        return Err(reject(SkillRejection::Bodyless {
+            requested: skill.name.clone(),
+            location: skill.location.clone(),
+        }));
+    }
+    Ok(LoadedSkillDocument {
+        name: skill.name.clone(),
+        source: skill.location.clone(),
+        resource_root: skill.resource_root().map(Path::to_path_buf),
+        content,
+    })
+}
+
 /// Search descriptions, load one skill body, or read one referenced text resource.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -363,38 +408,23 @@ impl SkillTool {
         source: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<ToolOutput, ToolError> {
-        let skill = resolve_skill(&self.skills, name, source)?;
-        let content = skill.read_body().await.map_err(|error| {
-            reject(SkillRejection::DocumentUnavailable {
-                requested: skill.name.clone(),
-                location: skill.location.clone(),
-                detail: error.to_string(),
-            })
-        })?;
-        if content.len() > RESOURCE_MAX_BYTES {
-            return Err(reject(SkillRejection::DocumentTooLarge {
-                requested: skill.name.clone(),
-                bytes: content.len(),
-                maximum: RESOURCE_MAX_BYTES,
-            }));
-        }
-        if content.trim().is_empty() {
-            return Err(reject(SkillRejection::Bodyless {
-                requested: skill.name.clone(),
-                location: skill.location.clone(),
-            }));
-        }
-        let page = text_page(SkillAction::Load, &skill.location, &content, cursor)?;
-        let root = skill.resource_root().map(Path::to_path_buf);
+        let document = load_skill_document(&self.skills, name, source).await?;
+        let page = text_page(
+            SkillAction::Load,
+            &document.source,
+            &document.content,
+            cursor,
+        )?;
+        let root = document.resource_root.clone();
         let mut context = if page.start == 0 {
             vec![
-                format!("Loaded skill `{}`.", skill.name),
-                format!("Source: `{}`", skill.location),
+                format!("Loaded skill `{}`.", document.name),
+                format!("Source: `{}`", document.source),
             ]
         } else {
             vec![
-                format!("Continuing skill `{}`.", skill.name),
-                format!("Source: `{}`", skill.location),
+                format!("Continuing skill `{}`.", document.name),
+                format!("Source: `{}`", document.source),
             ]
         };
         if page.start == 0 {
@@ -430,13 +460,13 @@ impl SkillTool {
             context.push(format!(
                 "The skill body is not complete. Call `skill` again with action `load`, \
                  name `{}`, source `{}`, and cursor `{next}` before taking task action.",
-                skill.name, skill.location
+                document.name, document.source
             ));
         }
-        let mut output = ToolOutput::text(format!("Skill: {}", skill.name), context.join("\n"))
-            .with_metadata("name", skill.name.clone())
-            .with_metadata("source", skill.location.clone())
-            .with_metadata("location", skill.location.clone())
+        let mut output = ToolOutput::text(format!("Skill: {}", document.name), context.join("\n"))
+            .with_metadata("name", document.name.clone())
+            .with_metadata("source", document.source.clone())
+            .with_metadata("location", document.source.clone())
             .with_metadata("complete", page.next_cursor.is_none());
         if let Some(root) = root {
             output = output.with_metadata("root", root.to_string_lossy().into_owned());

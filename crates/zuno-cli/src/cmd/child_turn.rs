@@ -436,6 +436,30 @@ impl ChildSessionHost {
             .map_err(|error| ChildTurnError::Host(error.to_string()))?;
         Ok(child_id)
     }
+
+    /// Drive one child turn with cancellation owned by a larger orchestration.
+    pub(crate) async fn dispatch_foreground(
+        &self,
+        request: ChildTurnRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ChildTurn, ChildTurnError> {
+        if request.background {
+            return Err(ChildTurnError::Host(
+                "dispatch_foreground cannot admit a background child".to_owned(),
+            ));
+        }
+        let session_id = self.session_for(&request)?;
+        let output = self
+            .runner
+            .run(&session_id, &request, cancellation)
+            .await
+            .map_err(ChildTurnError::Host)?;
+        Ok(ChildTurn {
+            session_id,
+            job_id: None,
+            output,
+        })
+    }
 }
 
 struct ProductionDelegatedTurnRunner {
@@ -680,20 +704,12 @@ impl ChildTurnHost for ChildSessionHost {
     }
 
     async fn dispatch(&self, request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError> {
-        let session_id = self.session_for(&request)?;
         if !request.background {
-            let cancellation = CancellationToken::new();
-            let output = self
-                .runner
-                .run(&session_id, &request, cancellation)
-                .await
-                .map_err(ChildTurnError::Host)?;
-            return Ok(ChildTurn {
-                session_id,
-                job_id: None,
-                output,
-            });
+            return self
+                .dispatch_foreground(request, CancellationToken::new())
+                .await;
         }
+        let session_id = self.session_for(&request)?;
 
         let job_id = crate::cmd::turn::prefixed_id("job");
         let delivery = match request.report_delivery {
@@ -844,7 +860,7 @@ fn report_input(
                 "status": status,
                 "text": text,
             }),
-            InputDelivery::NextStep,
+            InputDelivery::Queue,
             created,
         )
     })

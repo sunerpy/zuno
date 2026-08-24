@@ -2,8 +2,7 @@
 //!
 //! This is the shell-visible half of the differential comparison: it lets a
 //! script diff the Rust layout against the real binary without going through the
-//! test harness, which is how the QA transcripts in
-//! `.omo/evidence/task-4-opencode-rust.txt` are produced. Todo 6's `Subject`
+//! test harness, which is how the task-4 QA transcripts are produced. Todo 6's `Subject`
 //! harness needs exactly this shape too.
 //!
 //! ```sh

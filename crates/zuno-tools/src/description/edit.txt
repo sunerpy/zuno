@@ -1,9 +1,15 @@
-Performs exact string replacements in files.
+Applies one or more exact string replacements to a file atomically.
 
 Usage:
-- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.
+- Read this exact file before editing it. Zuno tracks a content digest for the current session and rejects stale edits after an external change.
+- Put ordered operations in `edits`. Each operation sees the result of the preceding operation; if any operation fails, nothing is written.
 - When editing text from Read tool output, preserve the exact indentation after the line number prefix and never include the prefix in oldString or newString.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
 - The edit fails if oldString is absent or non-unique unless replaceAll is true.
 - Use replaceAll for replacing and renaming strings across the file.
+Example:
+{"filePath":"/workspace/src/lib.rs","edits":[
+  {"oldString":"fn old_name()","newString":"fn new_name()"},
+  {"oldString":"old_name()","newString":"new_name()","replaceAll":true}
+]}

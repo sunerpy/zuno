@@ -101,7 +101,7 @@ impl Delegation {
             return "not reported".to_owned();
         };
         let ended = self.time_completed.unwrap_or_else(now_millis);
-        format_duration(ended.saturating_sub(started))
+        crate::views::ambient::compact_duration(ended.saturating_sub(started))
     }
 
     fn safety(&self) -> &'static str {
@@ -453,6 +453,13 @@ fn merge_job_projections(tasks: &mut Vec<Delegation>, jobs: &[zuno_types::JobPro
                 None,
                 Some(run_id.clone()),
             ),
+            zuno_types::JobSubjectProjection::Workflow { run_id, workflow } => (
+                "workflow".to_owned(),
+                "zuno".to_owned(),
+                Some(workflow.clone()),
+                None,
+                Some(run_id.clone()),
+            ),
         };
         if let Some(task) = tasks
             .iter_mut()
@@ -559,17 +566,6 @@ fn now_millis() -> i64 {
         .as_millis()
         .try_into()
         .unwrap_or(i64::MAX)
-}
-
-fn format_duration(milliseconds: i64) -> String {
-    if milliseconds < 1_000 {
-        return format!("{}ms", milliseconds.max(0));
-    }
-    let seconds = milliseconds / 1_000;
-    if seconds < 60 {
-        return format!("{seconds}s");
-    }
-    format!("{}m {}s", seconds / 60, seconds % 60)
 }
 
 /// Cursor, detail disclosure, and in-place cancellation confirmation.

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_llm::event::{ConnectionPhase, StreamEvent};
 
-use crate::cmd::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
+use crate::cmd::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan, persisted_session_agent};
 use crate::command::{RunArgs, RunFormat};
 use crate::environment::StartupEnvironment;
 
@@ -26,11 +26,15 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
     } else {
         prompt(args)?
     };
+    let session = SessionChoice::resolve(args.session.as_deref(), args.r#continue);
     let options = TurnOptions {
         directory: args.dir.as_deref().map(PathBuf::from),
         model: args.model.clone(),
-        agent: args.agent.clone(),
-        session: SessionChoice::resolve(args.session.as_deref(), args.r#continue),
+        agent: args
+            .agent
+            .clone()
+            .or_else(|| persisted_session_agent(&session)),
+        session,
         title: args.title.clone(),
         effort: None,
         extension_composition: super::turn::ExtensionComposition::Active,
@@ -247,6 +251,9 @@ fn event_json(event: TurnEvent) -> Value {
         TurnEvent::SessionMaterialized { session_id, title } => {
             json!({"type":"session_materialized","sessionID":session_id,"title":title})
         }
+        TurnEvent::SkillLoaded { name, source } => {
+            json!({"type":"skill_loaded","name":name,"source":source})
+        }
         TurnEvent::TurnStarted { session_id } => {
             json!({"type":"turn_started","sessionID":session_id})
         }
@@ -276,7 +283,13 @@ fn event_json(event: TurnEvent) -> Value {
         TurnEvent::ProviderRequestStarted {
             step,
             message_count,
-        } => json!({"type":"provider_request_started","step":step,"messageCount":message_count}),
+            estimated_prompt_tokens,
+        } => json!({
+            "type":"provider_request_started",
+            "step":step,
+            "messageCount":message_count,
+            "estimatedPromptTokens":estimated_prompt_tokens
+        }),
         TurnEvent::Provider { step, event } => stream_event_json(step, event),
         TurnEvent::AssistantCheckpointed {
             step,

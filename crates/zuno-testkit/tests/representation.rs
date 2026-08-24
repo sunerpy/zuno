@@ -1,6 +1,6 @@
 //! D0 — the three data-representation baselines P1 owes D1-D4.
 //!
-//! §5.2 of `.omo/plans/memory-perf-optimization.md` makes D0 a **measurement**
+//! §5.2 of the perf plan makes D0 a **measurement**
 //! and forbids D1-D4 from starting before it produces numbers. Nothing here
 //! changes a representation; every test either reads a compile-time layout fact
 //! or reads the pinned W-real snapshot read-only and counts bytes.
@@ -170,13 +170,14 @@ fn stream_event_variant_name(event: &StreamEvent) -> &'static str {
 fn turn_event_payloads() -> Vec<VariantPayload> {
     vec![
         payload("SessionMaterialized", size_of::<(String, String)>()),
+        payload("SkillLoaded", size_of::<(String, String)>()),
         payload("TurnStarted", size_of::<(String,)>()),
         payload("HistoryRepaired", size_of::<(usize,)>()),
         payload("AgentResolved", size_of::<(u32, String)>()),
         payload("ModelResolved", size_of::<(u32, String, String)>()),
         payload("AssistantMessageCreated", size_of::<(u32, String)>()),
         payload("ToolSnapshotLocked", size_of::<(u32, Vec<String>, bool)>()),
-        payload("ProviderRequestStarted", size_of::<(u32, usize)>()),
+        payload("ProviderRequestStarted", size_of::<(u32, usize, u64)>()),
         payload("Provider", size_of::<(u32, StreamEvent)>()),
         payload("AssistantCheckpointed", size_of::<(u32, String, bool)>()),
         payload("ToolDispatchStarted", size_of::<(u32, String, String)>()),
@@ -209,6 +210,7 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
 fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
     match event {
         TurnEvent::SessionMaterialized { .. } => "SessionMaterialized",
+        TurnEvent::SkillLoaded { .. } => "SkillLoaded",
         TurnEvent::TurnStarted { .. } => "TurnStarted",
         TurnEvent::HistoryRepaired { .. } => "HistoryRepaired",
         TurnEvent::AgentResolved { .. } => "AgentResolved",

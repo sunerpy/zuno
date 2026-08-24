@@ -87,7 +87,7 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::batch::DESCRIPTION,
         },
         Description {
-            wire_id: "create_goal",
+            wire_id: "goal_propose",
             file: "crates/zuno-goal/src/description/create-goal.txt",
             text: zuno_goal::tools::CREATE_DESCRIPTION,
         },
@@ -97,7 +97,7 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::edit::DESCRIPTION,
         },
         Description {
-            wire_id: "get_goal",
+            wire_id: "goal_get",
             file: "crates/zuno-goal/src/description/get-goal.txt",
             text: zuno_goal::tools::GET_DESCRIPTION,
         },
@@ -157,12 +157,27 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::task::DESCRIPTION,
         },
         Description {
-            wire_id: "todowrite",
-            file: "crates/zuno-tools/src/description/todowrite.txt",
-            text: zuno_tools::todo::DESCRIPTION,
+            wire_id: "plan_get",
+            file: "crates/zuno-tools/src/description/plan-get.txt",
+            text: zuno_tools::PLAN_GET_DESCRIPTION,
         },
         Description {
-            wire_id: "update_goal",
+            wire_id: "plan_update",
+            file: "crates/zuno-tools/src/description/plan-update.txt",
+            text: zuno_tools::PLAN_UPDATE_DESCRIPTION,
+        },
+        Description {
+            wire_id: "todo_get",
+            file: "crates/zuno-tools/src/description/todo-get.txt",
+            text: zuno_tools::TODO_GET_DESCRIPTION,
+        },
+        Description {
+            wire_id: "todo_update",
+            file: "crates/zuno-tools/src/description/todo-update.txt",
+            text: zuno_tools::TODO_UPDATE_DESCRIPTION,
+        },
+        Description {
+            wire_id: "goal_update",
             file: "crates/zuno-goal/src/description/update-goal.txt",
             text: zuno_goal::tools::UPDATE_DESCRIPTION,
         },
@@ -324,7 +339,7 @@ fn the_committed_golden_is_the_wire_text_of_every_static_description() {
 /// Only used to describe a failure, but it must be *exact*: a diagnostic that
 /// misreports a description's length sends the reader after the wrong tool. The
 /// parser is fence-driven rather than header-driven because a body may legitimately
-/// contain a line starting with `## ` — `todowrite` does — while no body contains a
+/// contain a line starting with `## ` while no body contains a
 /// whole line equal to [`CLOSE`]. Header lines are therefore only recognised
 /// *outside* a fence.
 fn parse_golden(text: &str) -> Vec<(String, String)> {

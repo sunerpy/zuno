@@ -78,6 +78,9 @@ pub const SKILL_DIALOG_ID: &str = "prompt_skills";
 /// The dialog id the session rename prompt reports under.
 pub const SESSION_RENAME_DIALOG_ID: &str = "session.rename";
 
+/// The dialog id used to edit one durable queued input.
+pub const QUEUED_INPUT_EDIT_DIALOG_ID: &str = "queued_input.edit";
+
 /// The id the `/undo` confirmation reports under.
 ///
 /// `/undo` restores the worktree to the boundary before the last completed turn, so it
@@ -90,6 +93,12 @@ pub const SESSION_RENAME_DIALOG_ID: &str = "session.rename";
 /// earlier; a second prompt for the same round trip only teaches people to press through
 /// both of them.
 pub const UNDO_CONFIRM_DIALOG_ID: &str = "confirm.undo";
+
+/// Confirmation shown by `/plan` before changing the session's collaboration mode.
+pub const PLAN_START_CONFIRM_DIALOG_ID: &str = "confirm.plan.start";
+
+/// Confirmation shown before the durable plan is handed to the build agent.
+pub const WORK_START_CONFIRM_DIALOG_ID: &str = "confirm.work.start";
 
 /// The id the per-message action menu reports under.
 pub const MESSAGE_ACTIONS_DIALOG_ID: &str = "message.actions";
@@ -571,6 +580,9 @@ pub struct SessionScreen {
     /// instead would need the push to find every open surface, and the surface a push
     /// forgets is precisely the one that goes stale.
     mcp_generation: u64,
+    queued_inputs: crate::views::picker::QueuedInputProjection,
+    queued_input_generation: u64,
+    queue_mutations: Option<mpsc::Sender<QueuedInputMutation>>,
     work: crate::views::ambient::WorkState,
     work_generation: u64,
     /// The non-MCP halves of `§8.7`'s status census, resolved once by the host.
@@ -631,6 +643,8 @@ pub struct SessionScreen {
     session_rename: Option<(String, String)>,
     /// Pending memory candidate whose edit prompt is open.
     memory_edit: Option<String>,
+    /// Durable input whose edit prompt is open: id, revision, and original text.
+    queued_input_edit: Option<(String, i64, String)>,
     /// The user's resolved keymap, for the keybinding reference.
     ///
     /// Optional because every view test builds a screen without one, and a help view
@@ -727,6 +741,20 @@ pub enum Selection {
     Effort(zuno_llm::effort::ReasoningEffort),
 }
 
+/// A durable queued-input mutation that must be acknowledged after SQLite commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueuedInputMutation {
+    Edit {
+        id: String,
+        expected_revision: i64,
+        text: String,
+    },
+    Cancel {
+        id: String,
+        expected_revision: i64,
+    },
+}
+
 /// A prompt-channel message. Catalog invocations stay typed until the CLI host
 /// resolves their templates; plain text goes directly to the turn driver.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -745,8 +773,23 @@ pub enum PromptSubmission {
     },
     /// A catalog command plus its still-unexpanded argument tail.
     Command { name: String, arguments: String },
+    /// One exact Skill selected from slash discovery before optional task text.
+    Skill {
+        name: String,
+        source: String,
+        arguments: String,
+    },
     /// A session-local operation executed by the runtime host.
     Host(HostCommand),
+    /// Explicitly retain a submission in the durable FIFO even if the active turn ends
+    /// before the driver reads the handoff channel.
+    Queue(Box<PromptSubmission>),
+    /// Explicitly steer a running generation at its next safe boundary.
+    ///
+    /// Ordinary submissions are durable FIFO work. Keeping the override in the
+    /// value prevents the user's gesture from being lost between the terminal,
+    /// admission worker, durable inbox, and resumed turn.
+    Steer(Box<PromptSubmission>),
 }
 
 /// What the pickers can offer, as the host resolved it.
@@ -819,6 +862,9 @@ impl SessionScreen {
             title_generation: 0,
             mcp: crate::views::picker::McpProjection::default(),
             mcp_generation: 0,
+            queued_inputs: crate::views::picker::QueuedInputProjection::default(),
+            queued_input_generation: 0,
+            queue_mutations: None,
             work: crate::views::ambient::WorkState::default(),
             work_generation: 0,
             census: Vec::new(),
@@ -843,6 +889,7 @@ impl SessionScreen {
             message_menu: None,
             session_rename: None,
             memory_edit: None,
+            queued_input_edit: None,
             modal: None,
             scroller: Scroller::new(&context.config),
             started: Instant::now(),
@@ -944,6 +991,19 @@ impl SessionScreen {
         self.mcp_generation = projection.generation();
         self.mcp = projection;
         self.mcp_toggles = Some(toggles);
+        self
+    }
+
+    /// Install the durable queued-input projection and mutation sink.
+    #[must_use]
+    pub fn with_queued_inputs(
+        mut self,
+        projection: crate::views::picker::QueuedInputProjection,
+        mutations: mpsc::Sender<QueuedInputMutation>,
+    ) -> Self {
+        self.queued_input_generation = projection.generation();
+        self.queued_inputs = projection;
+        self.queue_mutations = Some(mutations);
         self
     }
 
@@ -1346,7 +1406,7 @@ impl SessionScreen {
     /// invocation and a typed one cannot diverge — which is exactly the divergence a
     /// host that pushed to the transcript itself would introduce.
     pub fn submit_prompt(&mut self, text: impl Into<String>) {
-        self.submit(text.into());
+        self.submit(text.into(), false);
     }
 
     /// Hand `text` to the driver, or say in the transcript that nobody took it.
@@ -1354,10 +1414,16 @@ impl SessionScreen {
     /// Reporting the refusal is the point. A prompt that vanished because the driver
     /// had gone away, rendered identically to one accepted, is the defect where "no
     /// results" and "cannot see the data" look the same.
-    fn submit(&mut self, text: String) {
+    fn submit(&mut self, text: String, force: bool) {
         match self.slash.resolve(&text) {
             SlashSubmission::Prompt(prompt) => {
-                self.submit_to_driver(prompt.clone(), PromptSubmission::Text(prompt))
+                let submission = PromptSubmission::Text(prompt.clone());
+                let submission = if force {
+                    PromptSubmission::Steer(Box::new(submission))
+                } else {
+                    submission
+                };
+                self.submit_to_driver(prompt, submission);
             }
             SlashSubmission::UiAction(action) => {
                 self.dispatch_action(action);
@@ -1366,6 +1432,18 @@ impl SessionScreen {
                 text,
                 PromptSubmission::Command {
                     name: command,
+                    arguments,
+                },
+            ),
+            SlashSubmission::Skill {
+                name,
+                source,
+                arguments,
+            } => self.submit_to_driver(
+                text,
+                PromptSubmission::Skill {
+                    name,
+                    source,
                     arguments,
                 },
             ),
@@ -1380,6 +1458,19 @@ impl SessionScreen {
                     )
                     .with_labels("Restore", "Keep"),
                 ));
+            }
+            SlashSubmission::Host(HostCommand::Plan) => {
+                if self.plan_mode_active() {
+                    self.request_start_work();
+                } else {
+                    self.request_start_plan();
+                }
+            }
+            SlashSubmission::Host(HostCommand::StartPlan) => {
+                self.select_collaboration_agent("plan");
+            }
+            SlashSubmission::Host(HostCommand::StartWork) => {
+                self.request_start_work();
             }
             SlashSubmission::Host(HostCommand::Stop(None)) => {
                 let dialog = self.background_view();
@@ -1407,28 +1498,96 @@ impl SessionScreen {
         }
     }
 
+    fn plan_mode_active(&self) -> bool {
+        self.catalog.agent.as_deref() == Some("plan")
+    }
+
+    fn select_collaboration_agent(&mut self, agent: &str) {
+        if self.catalog.agent.as_deref() == Some(agent) {
+            self.toasts.push(Toast::info(if agent == "plan" {
+                "Plan mode is already active"
+            } else {
+                "Work mode is already active"
+            }));
+            return;
+        }
+        let (notice, level) = self.commit_selection(Selection::Agent(agent.to_owned()));
+        if level == ToastLevel::Success {
+            self.catalog.agent = Some(agent.to_owned());
+            self.status.set_configured_agent(agent);
+            self.sidebar.ambient_mut().agent = Some(agent.to_owned());
+            self.welcome.facts_mut().agent = Some(agent.to_owned());
+        }
+        self.toasts.push(Toast::new(level, notice));
+    }
+
+    fn request_start_plan(&mut self) {
+        self.requested.push(Box::new(
+            crate::views::basics::ConfirmDialog::new(
+                self.context.clone(),
+                PLAN_START_CONFIRM_DIALOG_ID,
+                "Start Plan mode",
+                "Switch to the read-only plan agent. It may inspect the repository, ask questions, and update the durable plan, but cannot modify product files.",
+            )
+            .with_labels("Start plan", "Keep working"),
+        ));
+    }
+
+    fn request_start_work(&mut self) {
+        let Some(plan) = self.work.snapshot().plan else {
+            self.toasts.push(Toast::warning(
+                "no durable plan is ready; use /start-plan and let the plan agent create one",
+            ));
+            return;
+        };
+        let completed = plan
+            .steps
+            .iter()
+            .filter(|step| step.status == "completed")
+            .count();
+        self.requested.push(Box::new(
+            crate::views::basics::ConfirmDialog::new(
+                self.context.clone(),
+                WORK_START_CONFIRM_DIALOG_ID,
+                "Start implementation",
+                format!(
+                    "Use the durable plan ‘{}’ (revision {}, {completed}/{} steps already complete) and switch to the build agent?",
+                    plan.title,
+                    plan.revision,
+                    plan.steps.len(),
+                ),
+            )
+            .with_labels("Start work", "Keep planning"),
+        ));
+    }
+
     fn submit_to_driver(&mut self, shown: String, submission: PromptSubmission) {
+        let submission = if self.status.is_running()
+            && !matches!(
+                submission,
+                PromptSubmission::Queue(_) | PromptSubmission::Steer(_)
+            ) {
+            PromptSubmission::Queue(Box::new(submission))
+        } else {
+            submission
+        };
         self.transcript
             .transcript_mut()
             .push(Message::user(shown.clone()));
         if let Some(prompts) = self.prompts.as_ref() {
-            let was_running = self.status.is_running();
-            let steer_candidate = matches!(
+            let tracks_model_turn = matches!(
                 submission,
-                PromptSubmission::Text(_) | PromptSubmission::Content { .. }
+                PromptSubmission::Text(_)
+                    | PromptSubmission::Content { .. }
+                    | PromptSubmission::Command { .. }
+                    | PromptSubmission::Skill { .. }
+                    | PromptSubmission::Queue(_)
+                    | PromptSubmission::Steer(_)
             );
-            let tracks_model_turn = !matches!(submission, PromptSubmission::Host(_));
             match prompts.try_send(submission) {
                 Ok(()) => {
                     if tracks_model_turn {
                         self.mark_turn_accepted();
-                    }
-                    if was_running {
-                        self.toasts.push(Toast::info(if steer_candidate {
-                            "message queued; it will steer at the next safe point"
-                        } else {
-                            "request queued for the next turn"
-                        }));
                     }
                 }
                 Err(error) => {
@@ -1760,6 +1919,7 @@ impl Component for SessionScreen {
         ambient.title = title;
         ambient.tokens = self.transcript.transcript().tokens();
         ambient.usage_state = self.transcript.transcript().usage_state();
+        ambient.failed_turns = self.transcript.transcript().failed_turns();
         ambient.context = self.transcript.transcript().context_window();
         let loaded_skills = self.transcript.loaded_skills();
         let mut skill_name_counts = BTreeMap::<String, usize>::new();
@@ -1884,6 +2044,7 @@ impl Component for SessionScreen {
             .merge(self.observe_session_materialized(event))
             .merge(self.observe_session_title())
             .merge(self.observe_mcp())
+            .merge(self.observe_queued_inputs())
             .merge(self.observe_work_state())
             .merge(self.drain_editor_results())
             .merge(self.drain_reports());
@@ -2037,7 +2198,8 @@ impl SessionScreen {
         let ambient = self.sidebar.ambient();
         let context = ambient.context.map(|context| {
             format!(
-                "{} ({:.0}%)",
+                "{}{} ({:.0}%)",
+                if context.estimated { "≈" } else { "" },
                 compact_live_tokens(context.prompt_tokens),
                 context.percent()
             )
@@ -2085,9 +2247,11 @@ impl SessionScreen {
         let mut trailing = Vec::new();
         if let Some(context) = ambient.context {
             trailing.push(format!(
-                "ctx {}/{} ({:.1}%)",
+                "ctx {}{}/{} ({}{:.1}%)",
+                if context.estimated { "≈" } else { "" },
                 crate::views::ambient::compact(context.prompt_tokens),
                 crate::views::ambient::compact(context.limit),
+                if context.estimated { "≈" } else { "" },
                 context.percent()
             ));
         }
@@ -2318,6 +2482,33 @@ impl SessionScreen {
     fn observe_session_title(&self) -> EventResult {
         if self.title.generation() == self.title_generation {
             return EventResult::IGNORED;
+        }
+        EventResult::REDRAW
+    }
+
+    fn observe_queued_inputs(&mut self) -> EventResult {
+        let (generation, _inputs, notice) = self.queued_inputs.observe();
+        if generation == self.queued_input_generation {
+            return EventResult::IGNORED;
+        }
+        self.queued_input_generation = generation;
+        if let Some(notice) = notice {
+            use crate::views::picker::QueuedInputNoticeKind;
+            self.toasts.push(match notice.kind {
+                QueuedInputNoticeKind::Admitted(
+                    crate::views::picker::QueuedInputDelivery::Queue,
+                ) => Toast::info("request queued for the next turn"),
+                QueuedInputNoticeKind::Admitted(
+                    crate::views::picker::QueuedInputDelivery::Steer,
+                ) => Toast::info("message queued; it will steer at the next safe point"),
+                QueuedInputNoticeKind::Edited => {
+                    Toast::success(format!("updated queued input {}", notice.input_id))
+                }
+                QueuedInputNoticeKind::Cancelled => {
+                    Toast::success(format!("cancelled queued input {}", notice.input_id))
+                }
+                QueuedInputNoticeKind::Failed(message) => Toast::error(message),
+            });
         }
         EventResult::REDRAW
     }
@@ -2798,6 +2989,7 @@ impl SessionScreen {
             "variant_cycle" => self.cycle_effort(1),
             "messages_transcript" => self.toggle_transcript(),
             "session_list" => self.request(Some(self.session_picker())),
+            "session_queued_prompts" => self.request(self.queued_input_view()),
             // Two statements because opening the theme picker also records the theme to
             // put back on escape, which needs `&mut self` while `request` does too.
             "theme_list" => {
@@ -2916,6 +3108,13 @@ impl SessionScreen {
             picker = picker.selecting(session);
         }
         Box::new(picker)
+    }
+
+    fn queued_input_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
+        Some(Box::new(crate::views::picker::queued_input_dialog(
+            self.context.clone(),
+            self.queued_inputs.clone(),
+        )))
     }
 
     fn mcp_list(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
@@ -3448,6 +3647,18 @@ impl SessionScreen {
         self.toasts.push(Toast::new(level, text));
         EventResult::REDRAW
     }
+    fn send_queue_mutation(&mut self, mutation: QueuedInputMutation) -> EventResult {
+        let delivered = self
+            .queue_mutations
+            .as_ref()
+            .is_some_and(|sink| sink.try_send(mutation).is_ok());
+        if !delivered {
+            self.toasts.push(Toast::warning(
+                "queued input was not changed: the queue manager is unavailable",
+            ));
+        }
+        EventResult::REDRAW
+    }
 }
 
 impl ActionComponent for SessionScreen {
@@ -3507,6 +3718,63 @@ impl ActionComponent for SessionScreen {
         outcome: &crate::views::dialog::DialogOutcome,
     ) -> EventResult {
         match outcome {
+            crate::views::dialog::DialogOutcome::QueuedInput(
+                crate::views::picker::QueuedInputDialogAction::Edit {
+                    id,
+                    expected_revision,
+                    text,
+                },
+            ) => {
+                self.queued_input_edit = Some((id.clone(), *expected_revision, text.clone()));
+                self.requested
+                    .push(Box::new(crate::views::basics::PromptDialog::new(
+                        self.context.clone(),
+                        QUEUED_INPUT_EDIT_DIALOG_ID,
+                        "Edit queued input",
+                        text,
+                    )));
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::QueuedInput(
+                crate::views::picker::QueuedInputDialogAction::Cancel {
+                    id,
+                    expected_revision,
+                },
+            ) => self.send_queue_mutation(QueuedInputMutation::Cancel {
+                id: id.clone(),
+                expected_revision: *expected_revision,
+            }),
+            crate::views::dialog::DialogOutcome::Submitted { text, .. }
+                if dialog == QUEUED_INPUT_EDIT_DIALOG_ID =>
+            {
+                let Some((id, expected_revision, original)) = self.queued_input_edit.take() else {
+                    return EventResult::IGNORED;
+                };
+                if text.trim().is_empty() {
+                    self.queued_input_edit = Some((id, expected_revision, original.clone()));
+                    self.requested
+                        .push(Box::new(crate::views::basics::PromptDialog::new(
+                            self.context.clone(),
+                            QUEUED_INPUT_EDIT_DIALOG_ID,
+                            "Edit queued input",
+                            original,
+                        )));
+                    self.toasts
+                        .push(Toast::warning("queued input cannot be empty"));
+                    return EventResult::REDRAW;
+                }
+                self.send_queue_mutation(QueuedInputMutation::Edit {
+                    id,
+                    expected_revision,
+                    text: text.to_owned(),
+                })
+            }
+            crate::views::dialog::DialogOutcome::Cancelled
+                if dialog == QUEUED_INPUT_EDIT_DIALOG_ID =>
+            {
+                self.queued_input_edit = None;
+                EventResult::REDRAW
+            }
             crate::views::dialog::DialogOutcome::Session(
                 crate::views::picker::SessionDialogAction::Rename { id, title },
             ) => {
@@ -3565,6 +3833,22 @@ impl ActionComponent for SessionScreen {
                 if dialog == SESSION_RENAME_DIALOG_ID =>
             {
                 self.session_rename = None;
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::Selected { value, .. }
+                if dialog == PLAN_START_CONFIRM_DIALOG_ID =>
+            {
+                if value == crate::views::basics::CONFIRM_VALUE {
+                    self.select_collaboration_agent("plan");
+                }
+                EventResult::REDRAW
+            }
+            crate::views::dialog::DialogOutcome::Selected { value, .. }
+                if dialog == WORK_START_CONFIRM_DIALOG_ID =>
+            {
+                if value == crate::views::basics::CONFIRM_VALUE {
+                    self.select_collaboration_agent("build");
+                }
                 EventResult::REDRAW
             }
             // The confirmation is checked before the general `Selected` arm because
@@ -3755,7 +4039,9 @@ impl ActionComponent for SessionScreen {
                 | "prompt.autocomplete.hide"
                 | "prompt.autocomplete.select"
                 | "prompt.autocomplete.complete" => Some(action.name),
-                "input_submit" | "prompt_submit" => Some("prompt.autocomplete.select"),
+                "input_submit" | "input_force_submit" | "prompt_submit" => {
+                    Some("prompt.autocomplete.select")
+                }
                 "input_move_up" | "command_list" => Some("prompt.autocomplete.prev"),
                 "input_move_down" => Some("prompt.autocomplete.next"),
                 "session_interrupt" => Some("prompt.autocomplete.hide"),
@@ -3794,7 +4080,7 @@ impl ActionComponent for SessionScreen {
         match self.editor.handle_action(action) {
             EditorSignal::None => EventResult::IGNORED,
             EditorSignal::Submit(text) => {
-                self.submit(text);
+                self.submit(text, action.name == "input_force_submit");
                 self.autocomplete.hide();
                 EventResult::REDRAW
             }

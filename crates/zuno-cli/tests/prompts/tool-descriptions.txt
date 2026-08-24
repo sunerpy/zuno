@@ -22,25 +22,31 @@ Executes a command with the configured shell. Commands are parsed with tree-sitt
 Run tools in parallel with optional result binding.
 >>>
 
-## create_goal | crates/zuno-goal/src/description/create-goal.txt | 308 bytes | trailing-newline: yes
+## goal_propose | crates/zuno-goal/src/description/create-goal.txt | 420 bytes | trailing-newline: yes
 <<<
-Create a durable goal only when explicitly requested by the user or higher-priority instructions. Do not infer a goal from ordinary work. Preserve the requested objective without narrowing it. An unfinished goal cannot be replaced. Set token_budget only when the user explicitly requested a positive budget.
+Create a durable goal only when explicitly requested by the user or higher-priority instructions. Do not infer a goal from ordinary work. Preserve the requested objective without narrowing it. Record concrete success_criteria when the request defines them; they are immutable to the model after creation. An unfinished goal cannot be replaced. Set token_budget only when the user explicitly requested a positive budget.
 >>>
 
-## edit | crates/zuno-tools/src/description/edit.txt | 716 bytes | trailing-newline: no
+## edit | crates/zuno-tools/src/description/edit.txt | 1064 bytes | trailing-newline: yes
 <<<
-Performs exact string replacements in files.
+Applies one or more exact string replacements to a file atomically.
 
 Usage:
-- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.
+- Read this exact file before editing it. Zuno tracks a content digest for the current session and rejects stale edits after an external change.
+- Put ordered operations in `edits`. Each operation sees the result of the preceding operation; if any operation fails, nothing is written.
 - When editing text from Read tool output, preserve the exact indentation after the line number prefix and never include the prefix in oldString or newString.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
 - The edit fails if oldString is absent or non-unique unless replaceAll is true.
 - Use replaceAll for replacing and renaming strings across the file.
+Example:
+{"filePath":"/workspace/src/lib.rs","edits":[
+  {"oldString":"fn old_name()","newString":"fn new_name()"},
+  {"oldString":"old_name()","newString":"new_name()","replaceAll":true}
+]}
 >>>
 
-## get_goal | crates/zuno-goal/src/description/get-goal.txt | 179 bytes | trailing-newline: yes
+## goal_get | crates/zuno-goal/src/description/get-goal.txt | 179 bytes | trailing-newline: yes
 <<<
 Read the current durable goal, including its objective, status, budget, usage, and remaining tokens. Use this before deciding whether a goal may be completed or reported blocked.
 >>>
@@ -163,57 +169,43 @@ Skills are not an argument: each agent's permissions already decide which skills
 Do not delegate work you are simultaneously performing yourself, and do not create overlapping children unless their ownership boundaries are explicit.
 >>>
 
-## todowrite | crates/zuno-tools/src/description/todowrite.txt | 2012 bytes | trailing-newline: yes
+## plan_get | crates/zuno-tools/src/description/plan-get.txt | 263 bytes | trailing-newline: yes
 <<<
-Create and maintain a structured task list for the current coding session. Tracks progress, organizes multi-step work, and surfaces status to the user.
-
-## When to use
-Use proactively when:
-- The task requires 3+ distinct steps or actions (not just 3 tool calls for a single conceptual step)
-- The work is non-trivial and benefits from planning
-- The user provides multiple tasks (numbered or comma-separated) or explicitly asks for a todo list
-- New instructions arrive - capture them as todos
-- You start a task - mark it `in_progress` (only one at a time) before working
-- You finish a task - mark it `completed` and add any follow-ups discovered during the work
-
-## When NOT to use
-Skip when:
-- The work is a single, straightforward task (or <3 trivial steps)
-- The request is purely informational or conversational
-- Tracking adds no organizational value
-
-## States
-- `pending` - not started
-- `in_progress` - actively working (exactly ONE at a time)
-- `completed` - finished successfully
-- `cancelled` - no longer needed
-
-## Rules
-- Update status in real time; don't batch completions
-- Mark `completed` only after the required work is actually done, including any required verification. Never based on intent.
-- Keep exactly one `in_progress` while work remains
-- If blocked or partial, keep it `in_progress` and add a follow-up todo describing the blocker
-- Preserve user-provided commands verbatim (flags, args, order)
-- Items should be specific and actionable; break large work into smaller steps
-
-## Examples
-
-Use it:
-- "Add a dark mode toggle and run the tests" -> multi-step feature + explicit verification
-- "Rename getCwd -> getCurrentWorkingDirectory across the repo" -> grep reveals 15 occurrences in 8 files
-- "Implement registration, catalog, cart, checkout" -> multiple complex features
-
-Skip it:
-- "How do I print Hello World in Python?" -> informational
-- "Add a comment to calculateTotal" -> single edit
-- "Run npm install and tell me what happened" -> one command
-
-When in doubt, use it.
+Read the durable plan for the current session.
+Returns null when no plan exists. Read it before plan_update so the update can carry the current revision and preserve stable step ids.
+This tool is read-only and safe to call in parallel with other read-only tools.
 >>>
 
-## update_goal | crates/zuno-goal/src/description/update-goal.txt | 471 bytes | trailing-newline: yes
+## plan_update | crates/zuno-tools/src/description/plan-update.txt | 541 bytes | trailing-newline: yes
 <<<
-Read the current goal before changing it. Mark it complete only when authoritative evidence proves every requirement and no required work remains. Report blocked only with a concrete blocking_condition after the same true impasse persists for three consecutive goal turns and meaningful progress is impossible without user input or external change. Do not use this tool merely because a turn is ending, work is difficult, the budget is low, or more verification remains.
+Create or update the durable plan for the current session.
+When a plan already exists, expected_revision is required and must equal the revision returned by plan_get. A stale revision is rejected without changing the plan.
+Keep every step id stable across updates. Step ids and titles must be non-empty and unique.
+Link the plan to the active goal with goal_id when one exists. Do not rewrite the user's goal or success criteria through this tool.
+This tool changes durable state and is never replayed implicitly after an uncertain failure.
+>>>
+
+## todo_get | crates/zuno-tools/src/description/todo-get.txt | 289 bytes | trailing-newline: yes
+<<<
+Read durable work items for the current session.
+Returns stable ids, revisions, goal and plan links, parent and dependency ids, owner, status, priority, timing, and token usage.
+Read the current items before todo_update so every update or removal can carry the matching expected_revision.
+>>>
+
+## todo_update | crates/zuno-tools/src/description/todo-update.txt | 797 bytes | trailing-newline: yes
+<<<
+Atomically add, update, or remove durable work items for the current session.
+Pass changes as objects tagged with action: add, update, or remove. Updates and removals require the stable id and expected_revision returned by todo_get.
+An add may omit id to let Zuno create one. Preserve an existing id instead of deleting and recreating an item.
+Every referenced parent, dependency, and plan_step_id must exist after the batch. Parent and dependency graphs must be acyclic.
+At most one item may be in_progress in a session. Use active_form for the short present-tense activity shown while that item runs.
+The whole batch rolls back on any validation or revision error; partial updates are never committed.
+This tool changes durable state and is never replayed implicitly after an uncertain failure.
+>>>
+
+## goal_update | crates/zuno-goal/src/description/update-goal.txt | 591 bytes | trailing-newline: yes
+<<<
+Read the current goal before changing it and pass its revision as expected_revision. If the revision is stale, read again instead of overwriting concurrent work. Mark it complete only when authoritative evidence proves every requirement and no required work remains. Report blocked only with a concrete blocking_condition after the same true impasse persists for three consecutive goal turns and meaningful progress is impossible without user input or external change. Do not use this tool merely because a turn is ending, work is difficult, the budget is low, or more verification remains.
 >>>
 
 ## webfetch | crates/zuno-tools/src/description/webfetch.txt | 749 bytes | trailing-newline: no
@@ -233,14 +225,16 @@ Usage notes:
   - Results may be summarized if the content is very large
 >>>
 
-## write | crates/zuno-tools/src/description/write.txt | 622 bytes | trailing-newline: no
+## write | crates/zuno-tools/src/description/write.txt | 765 bytes | trailing-newline: yes
 <<<
 Writes a file to the local filesystem.
 
 Usage:
 - This tool will overwrite the existing file if there is one at the provided path.
-- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.
+- Only `filePath` and `content` are required.
+- If this is an existing file, read that exact file first. Zuno tracks its content digest for the current session and rejects stale writes after an external change.
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
 - Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.
+Example: {"filePath":"/workspace/new.txt","content":"complete file contents\n"}
 >>>

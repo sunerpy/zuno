@@ -408,7 +408,7 @@ fn surface_every_implemented_command_reaches_its_handler_through_the_production_
 /// `export` in particular no longer reports a missing handler.
 ///
 /// Named after the defect rather than after a mechanism, so the reproduction from
-/// `.omo/evidence/F3-REPORT.md` section 9 stays executable: this is the exact
+/// the F3 verification report section 9 stays executable: this is the exact
 /// invocation that printed "`export` is registered, but its handler is pending
 /// todo 56" and exited 1.
 #[test]

@@ -363,7 +363,7 @@ fn deep_owns_cross_cutting_implementation_without_children() {
     assert_eq!(DEEP.research, Research::Allowed);
     assert_eq!(DEEP.delegation, Delegation::NoChildren);
     assert!(is_tool_hidden("task", &DEEP.rules()));
-    for capability in ["edit", "bash", "web_search", "todowrite"] {
+    for capability in ["edit", "bash", "web_search", "plan_update", "todo_update"] {
         assert!(
             !is_tool_hidden(capability, &DEEP.rules()),
             "deep needs `{capability}`"
@@ -374,7 +374,7 @@ fn deep_owns_cross_cutting_implementation_without_children() {
 #[test]
 fn the_worker_writes_researches_and_iterates_but_spawns_nothing() {
     // Slim's `fixer` forbids research and multi-step work
-    // (`.omo/refs/omo-slim/src/agents/fixer.ts:15-17`), which sends every
+    // (`omo-slim`), which sends every
     // explore-decide-implement-verify task back through the build agent between
     // phases. The bound that matters is the absence of children, not the absence of
     // memory.

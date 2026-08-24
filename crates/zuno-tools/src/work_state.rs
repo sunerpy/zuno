@@ -1,0 +1,1331 @@
+//! Durable Goal-linked plans and work items with optimistic concurrency.
+
+use async_trait::async_trait;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use zuno_db::Pool;
+use zuno_error::{DbError, ToolError};
+use zuno_tool::{
+    PermissionAsk, Tool, ToolConcurrencyPolicy, ToolContext, ToolEffect, ToolOutput,
+    ToolReplayPolicy, TypedTool, erase,
+};
+
+pub const PLAN_GET_TOOL_ID: &str = "plan_get";
+pub const PLAN_UPDATE_TOOL_ID: &str = "plan_update";
+pub const TODO_GET_TOOL_ID: &str = "todo_get";
+pub const TODO_UPDATE_TOOL_ID: &str = "todo_update";
+
+pub const PLAN_GET_DESCRIPTION: &str = include_str!("description/plan-get.txt");
+pub const PLAN_UPDATE_DESCRIPTION: &str = include_str!("description/plan-update.txt");
+pub const TODO_GET_DESCRIPTION: &str = include_str!("description/todo-get.txt");
+pub const TODO_UPDATE_DESCRIPTION: &str = include_str!("description/todo-update.txt");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+    Blocked,
+}
+
+impl WorkItemStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "cancelled" => Some(Self::Cancelled),
+            "blocked" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkItemPriority {
+    High,
+    Medium,
+    Low,
+}
+
+impl WorkItemPriority {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "high" => Some(Self::High),
+            "medium" => Some(Self::Medium),
+            "low" => Some(Self::Low),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanStep {
+    pub id: String,
+    pub title: String,
+    pub status: WorkItemStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkPlan {
+    pub id: String,
+    pub session_id: String,
+    pub goal_id: Option<String>,
+    pub revision: i64,
+    pub title: String,
+    pub steps: Vec<PlanStep>,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItem {
+    pub id: String,
+    pub session_id: String,
+    pub goal_id: Option<String>,
+    pub plan_step_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub subject: String,
+    pub description: String,
+    pub active_form: Option<String>,
+    pub status: WorkItemStatus,
+    pub priority: WorkItemPriority,
+    pub dependencies: Vec<String>,
+    pub owner: Option<String>,
+    pub revision: i64,
+    pub tokens_used: i64,
+    pub usage_known: bool,
+    pub time_used_ms: i64,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkStateSnapshot {
+    pub plan: Option<WorkPlan>,
+    pub items: Vec<WorkItem>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkStateError {
+    #[error(transparent)]
+    Database(#[from] DbError),
+    #[error("invalid work state: {0}")]
+    Invalid(String),
+    #[error("{kind} `{id}` does not exist")]
+    NotFound { kind: &'static str, id: String },
+    #[error("{kind} `{id}` revision conflict: expected {expected}, current {actual}")]
+    RevisionConflict {
+        kind: &'static str,
+        id: String,
+        expected: i64,
+        actual: i64,
+    },
+}
+
+impl WorkStateError {
+    fn correctable(&self) -> bool {
+        !matches!(self, Self::Database(_))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkStateStore {
+    pool: Arc<Pool>,
+}
+
+impl WorkStateStore {
+    #[must_use]
+    pub fn new(pool: Arc<Pool>) -> Self {
+        Self { pool }
+    }
+
+    pub fn snapshot(&self, session_id: &str) -> Result<WorkStateSnapshot, WorkStateError> {
+        let connection = self.pool.get()?;
+        Ok(WorkStateSnapshot {
+            plan: plan_in(&connection, session_id)?,
+            items: list_items_in(&connection, session_id)?,
+        })
+    }
+
+    pub fn plan(&self, session_id: &str) -> Result<Option<WorkPlan>, WorkStateError> {
+        let connection = self.pool.get()?;
+        plan_in(&connection, session_id).map_err(Into::into)
+    }
+
+    pub fn update_plan(
+        &self,
+        session_id: &str,
+        params: PlanUpdateParams,
+    ) -> Result<WorkPlan, WorkStateError> {
+        validate_plan(&params)?;
+        let steps_json = serde_json::to_string(&params.steps)
+            .map_err(|error| WorkStateError::Invalid(error.to_string()))?;
+        let now = zuno_db::message::now_millis();
+        let candidate_id = format!("plan_{}", uuid::Uuid::new_v4().simple());
+        self.pool.try_transaction(|tx| {
+            let current = plan_in(tx, session_id)?;
+            match current {
+                None => {
+                    if let Some(expected) = params.expected_revision {
+                        return Err(WorkStateError::RevisionConflict {
+                            kind: "plan",
+                            id: candidate_id.clone(),
+                            expected,
+                            actual: 0,
+                        });
+                    }
+                    tx.execute(
+                        "INSERT INTO work_plan \
+                         (session_id,id,goal_id,revision,title,steps,time_created,time_updated) \
+                         VALUES (?1,?2,?3,1,?4,?5,?6,?6)",
+                        params![
+                            session_id,
+                            candidate_id,
+                            params.goal_id,
+                            params.title,
+                            steps_json,
+                            now
+                        ],
+                    )
+                    .map_err(zuno_db::map_error)?;
+                }
+                Some(current) => {
+                    let Some(expected) = params.expected_revision else {
+                        return Err(WorkStateError::Invalid(
+                            "expected_revision is required when updating an existing plan"
+                                .to_owned(),
+                        ));
+                    };
+                    if expected != current.revision {
+                        return Err(WorkStateError::RevisionConflict {
+                            kind: "plan",
+                            id: current.id,
+                            expected,
+                            actual: current.revision,
+                        });
+                    }
+                    let changed = tx
+                        .execute(
+                            "UPDATE work_plan SET goal_id=?1,title=?2,steps=?3,\
+                             revision=revision+1,time_updated=?4 \
+                             WHERE session_id=?5 AND revision=?6",
+                            params![
+                                params.goal_id,
+                                params.title,
+                                steps_json,
+                                now,
+                                session_id,
+                                expected
+                            ],
+                        )
+                        .map_err(zuno_db::map_error)?;
+                    if changed != 1 {
+                        let actual = plan_in(tx, session_id)?
+                            .map(|plan| plan.revision)
+                            .unwrap_or_default();
+                        return Err(WorkStateError::RevisionConflict {
+                            kind: "plan",
+                            id: current.id,
+                            expected,
+                            actual,
+                        });
+                    }
+                }
+            }
+            Ok(plan_in(tx, session_id)?.expect("plan was inserted or updated"))
+        })
+    }
+
+    pub fn items(&self, session_id: &str) -> Result<Vec<WorkItem>, WorkStateError> {
+        let connection = self.pool.get()?;
+        list_items_in(&connection, session_id).map_err(Into::into)
+    }
+
+    pub fn update_items(
+        &self,
+        session_id: &str,
+        changes: Vec<WorkItemChange>,
+    ) -> Result<Vec<WorkItem>, WorkStateError> {
+        if changes.is_empty() {
+            return Err(WorkStateError::Invalid(
+                "changes must contain at least one operation".to_owned(),
+            ));
+        }
+        let now = zuno_db::message::now_millis();
+        self.pool.try_transaction(|tx| {
+            for change in &changes {
+                apply_item_change(tx, session_id, change, now)?;
+            }
+            let items = list_items_in(tx, session_id)?;
+            validate_item_graph(&items, plan_in(tx, session_id)?.as_ref())?;
+            Ok(items)
+        })
+    }
+
+    /// Advance one runtime-owned item without letting a model forge metering fields.
+    ///
+    /// Runtime transitions use the same optimistic revision guard as model updates, but
+    /// only this path may write elapsed time and provider-confirmed token usage.
+    pub fn transition_runtime_item(
+        &self,
+        session_id: &str,
+        id: &str,
+        expected_revision: i64,
+        status: WorkItemStatus,
+        elapsed_ms: Option<i64>,
+        tokens_used: Option<i64>,
+    ) -> Result<WorkItem, WorkStateError> {
+        if expected_revision <= 0 {
+            return Err(WorkStateError::Invalid(
+                "expected_revision must be positive".to_owned(),
+            ));
+        }
+        if elapsed_ms.is_some_and(|value| value < 0) || tokens_used.is_some_and(|value| value < 0) {
+            return Err(WorkStateError::Invalid(
+                "runtime usage values must not be negative".to_owned(),
+            ));
+        }
+        let now = zuno_db::message::now_millis();
+        self.pool.try_transaction(|tx| {
+            let current = list_items_in(tx, session_id)?
+                .into_iter()
+                .find(|item| item.id == id)
+                .ok_or_else(|| WorkStateError::NotFound {
+                    kind: "work item",
+                    id: id.to_owned(),
+                })?;
+            if current.revision != expected_revision {
+                return Err(WorkStateError::RevisionConflict {
+                    kind: "work item",
+                    id: id.to_owned(),
+                    expected: expected_revision,
+                    actual: current.revision,
+                });
+            }
+            if !runtime_transition_allowed(current.status, status) {
+                return Err(WorkStateError::Invalid(format!(
+                    "runtime work item `{id}` cannot move from `{}` to `{}`",
+                    current.status.as_str(),
+                    status.as_str()
+                )));
+            }
+            let changed = match elapsed_ms {
+                Some(elapsed_ms) => tx
+                    .execute(
+                        "UPDATE work_item SET status=?1,\
+                         active_form=CASE WHEN ?2 THEN NULL ELSE active_form END,\
+                         revision=revision+1,tokens_used=?3,usage_known=?4,time_used_ms=?5,\
+                         time_updated=?6 WHERE id=?7 AND session_id=?8 AND revision=?9",
+                        params![
+                            status.as_str(),
+                            matches!(
+                                status,
+                                WorkItemStatus::Completed
+                                    | WorkItemStatus::Cancelled
+                                    | WorkItemStatus::Blocked
+                            ),
+                            tokens_used.unwrap_or_default(),
+                            tokens_used.is_some(),
+                            elapsed_ms,
+                            now,
+                            id,
+                            session_id,
+                            expected_revision
+                        ],
+                    )
+                    .map_err(zuno_db::map_error)?,
+                None => tx
+                    .execute(
+                        "UPDATE work_item SET status=?1,revision=revision+1,time_updated=?2 \
+                         WHERE id=?3 AND session_id=?4 AND revision=?5",
+                        params![status.as_str(), now, id, session_id, expected_revision],
+                    )
+                    .map_err(zuno_db::map_error)?,
+            };
+            if changed != 1 {
+                return Err(item_write_error(tx, session_id, id, expected_revision)?);
+            }
+            list_items_in(tx, session_id)?
+                .into_iter()
+                .find(|item| item.id == id)
+                .ok_or_else(|| WorkStateError::NotFound {
+                    kind: "work item",
+                    id: id.to_owned(),
+                })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlanUpdateParams {
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    pub title: String,
+    pub steps: Vec<PlanStep>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkItemChange {
+    Add {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        goal_id: Option<String>,
+        #[serde(default)]
+        plan_step_id: Option<String>,
+        #[serde(default)]
+        parent_id: Option<String>,
+        subject: String,
+        description: String,
+        #[serde(default)]
+        active_form: Option<String>,
+        status: WorkItemStatus,
+        priority: WorkItemPriority,
+        #[serde(default)]
+        dependencies: Vec<String>,
+        #[serde(default)]
+        owner: Option<String>,
+    },
+    Update {
+        id: String,
+        expected_revision: i64,
+        #[serde(default)]
+        goal_id: Option<String>,
+        #[serde(default)]
+        plan_step_id: Option<String>,
+        #[serde(default)]
+        parent_id: Option<String>,
+        subject: String,
+        description: String,
+        #[serde(default)]
+        active_form: Option<String>,
+        status: WorkItemStatus,
+        priority: WorkItemPriority,
+        #[serde(default)]
+        dependencies: Vec<String>,
+        #[serde(default)]
+        owner: Option<String>,
+    },
+    Remove {
+        id: String,
+        expected_revision: i64,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TodoUpdateParams {
+    pub changes: Vec<WorkItemChange>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkStateGetParams {}
+
+fn validate_plan(params: &PlanUpdateParams) -> Result<(), WorkStateError> {
+    if params.title.trim().is_empty() {
+        return Err(WorkStateError::Invalid(
+            "plan title must not be empty".to_owned(),
+        ));
+    }
+    if params
+        .expected_revision
+        .is_some_and(|revision| revision <= 0)
+    {
+        return Err(WorkStateError::Invalid(
+            "expected_revision must be positive".to_owned(),
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for step in &params.steps {
+        if step.id.trim().is_empty() || step.title.trim().is_empty() {
+            return Err(WorkStateError::Invalid(
+                "plan step id and title must not be empty".to_owned(),
+            ));
+        }
+        if !ids.insert(step.id.as_str()) {
+            return Err(WorkStateError::Invalid(format!(
+                "duplicate plan step id `{}`",
+                step.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_item_fields(
+    id: &str,
+    subject: &str,
+    description: &str,
+    dependencies: &[String],
+    expected_revision: Option<i64>,
+) -> Result<(), WorkStateError> {
+    if id.trim().is_empty() || subject.trim().is_empty() || description.trim().is_empty() {
+        return Err(WorkStateError::Invalid(
+            "work item id, subject, and description must not be empty".to_owned(),
+        ));
+    }
+    if expected_revision.is_some_and(|revision| revision <= 0) {
+        return Err(WorkStateError::Invalid(
+            "expected_revision must be positive".to_owned(),
+        ));
+    }
+    if dependencies.iter().any(|dependency| dependency == id) {
+        return Err(WorkStateError::Invalid(format!(
+            "work item `{id}` cannot depend on itself"
+        )));
+    }
+    let unique = dependencies.iter().collect::<BTreeSet<_>>();
+    if unique.len() != dependencies.len() {
+        return Err(WorkStateError::Invalid(format!(
+            "work item `{id}` contains duplicate dependencies"
+        )));
+    }
+    Ok(())
+}
+
+fn apply_item_change(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    change: &WorkItemChange,
+    now: i64,
+) -> Result<(), WorkStateError> {
+    match change {
+        WorkItemChange::Add {
+            id,
+            goal_id,
+            plan_step_id,
+            parent_id,
+            subject,
+            description,
+            active_form,
+            status,
+            priority,
+            dependencies,
+            owner,
+        } => {
+            let id = id
+                .clone()
+                .unwrap_or_else(|| format!("todo_{}", uuid::Uuid::new_v4().simple()));
+            validate_item_fields(&id, subject, description, dependencies, None)?;
+            let dependencies = serde_json::to_string(dependencies)
+                .map_err(|error| WorkStateError::Invalid(error.to_string()))?;
+            tx.execute(
+                "INSERT INTO work_item \
+                 (id,session_id,goal_id,plan_step_id,parent_id,subject,description,active_form,\
+                  status,priority,dependencies,owner,revision,tokens_used,usage_known,time_used_ms,\
+                  time_created,time_updated) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,1,0,0,0,?13,?13)",
+                params![
+                    id,
+                    session_id,
+                    goal_id,
+                    plan_step_id,
+                    parent_id,
+                    subject,
+                    description,
+                    active_form,
+                    status.as_str(),
+                    priority.as_str(),
+                    dependencies,
+                    owner,
+                    now
+                ],
+            )
+            .map_err(zuno_db::map_error)?;
+        }
+        WorkItemChange::Update {
+            id,
+            expected_revision,
+            goal_id,
+            plan_step_id,
+            parent_id,
+            subject,
+            description,
+            active_form,
+            status,
+            priority,
+            dependencies,
+            owner,
+        } => {
+            validate_item_fields(
+                id,
+                subject,
+                description,
+                dependencies,
+                Some(*expected_revision),
+            )?;
+            let dependencies = serde_json::to_string(dependencies)
+                .map_err(|error| WorkStateError::Invalid(error.to_string()))?;
+            let changed = tx
+                .execute(
+                    "UPDATE work_item SET goal_id=?1,plan_step_id=?2,parent_id=?3,subject=?4,\
+                     description=?5,active_form=?6,status=?7,priority=?8,dependencies=?9,owner=?10,\
+                     revision=revision+1,time_updated=?11 \
+                     WHERE id=?12 AND session_id=?13 AND revision=?14",
+                    params![
+                        goal_id,
+                        plan_step_id,
+                        parent_id,
+                        subject,
+                        description,
+                        active_form,
+                        status.as_str(),
+                        priority.as_str(),
+                        dependencies,
+                        owner,
+                        now,
+                        id,
+                        session_id,
+                        expected_revision
+                    ],
+                )
+                .map_err(zuno_db::map_error)?;
+            if changed != 1 {
+                return Err(item_write_error(tx, session_id, id, *expected_revision)?);
+            }
+        }
+        WorkItemChange::Remove {
+            id,
+            expected_revision,
+        } => {
+            if *expected_revision <= 0 {
+                return Err(WorkStateError::Invalid(
+                    "expected_revision must be positive".to_owned(),
+                ));
+            }
+            let changed = tx
+                .execute(
+                    "DELETE FROM work_item WHERE id=?1 AND session_id=?2 AND revision=?3",
+                    params![id, session_id, expected_revision],
+                )
+                .map_err(zuno_db::map_error)?;
+            if changed != 1 {
+                return Err(item_write_error(tx, session_id, id, *expected_revision)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn item_write_error(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    id: &str,
+    expected: i64,
+) -> Result<WorkStateError, DbError> {
+    let actual = tx
+        .query_row(
+            "SELECT revision FROM work_item WHERE id=?1 AND session_id=?2",
+            params![id, session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?;
+    Ok(match actual {
+        Some(actual) => WorkStateError::RevisionConflict {
+            kind: "work item",
+            id: id.to_owned(),
+            expected,
+            actual,
+        },
+        None => WorkStateError::NotFound {
+            kind: "work item",
+            id: id.to_owned(),
+        },
+    })
+}
+
+fn validate_item_graph(items: &[WorkItem], plan: Option<&WorkPlan>) -> Result<(), WorkStateError> {
+    let ids = items
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let plan_steps = plan
+        .into_iter()
+        .flat_map(|plan| plan.steps.iter().map(|step| step.id.as_str()))
+        .collect::<BTreeSet<_>>();
+    for item in items {
+        if let Some(parent_id) = item.parent_id.as_deref()
+            && !ids.contains(parent_id)
+        {
+            return Err(WorkStateError::Invalid(format!(
+                "work item `{}` references missing parent `{parent_id}`",
+                item.id
+            )));
+        }
+        if let Some(step_id) = item.plan_step_id.as_deref()
+            && !plan_steps.contains(step_id)
+        {
+            return Err(WorkStateError::Invalid(format!(
+                "work item `{}` references missing plan step `{step_id}`",
+                item.id
+            )));
+        }
+        for dependency in &item.dependencies {
+            if !ids.contains(dependency.as_str()) {
+                return Err(WorkStateError::Invalid(format!(
+                    "work item `{}` references missing dependency `{dependency}`",
+                    item.id
+                )));
+            }
+        }
+    }
+    validate_item_graph_is_acyclic(items)?;
+    Ok(())
+}
+
+fn runtime_transition_allowed(from: WorkItemStatus, to: WorkItemStatus) -> bool {
+    matches!(
+        (from, to),
+        (
+            WorkItemStatus::Pending,
+            WorkItemStatus::InProgress | WorkItemStatus::Cancelled | WorkItemStatus::Blocked
+        ) | (
+            WorkItemStatus::InProgress,
+            WorkItemStatus::Completed | WorkItemStatus::Cancelled | WorkItemStatus::Blocked
+        )
+    )
+}
+
+fn validate_item_graph_is_acyclic(items: &[WorkItem]) -> Result<(), WorkStateError> {
+    let graph = items
+        .iter()
+        .map(|item| {
+            let mut edges = item
+                .dependencies
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if let Some(parent_id) = item.parent_id.as_deref() {
+                edges.push(parent_id);
+            }
+            (item.id.as_str(), edges)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for id in graph.keys().copied() {
+        visit_item(id, &graph, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn visit_item<'a>(
+    id: &'a str,
+    graph: &BTreeMap<&'a str, Vec<&'a str>>,
+    visiting: &mut BTreeSet<&'a str>,
+    visited: &mut BTreeSet<&'a str>,
+) -> Result<(), WorkStateError> {
+    if visited.contains(id) {
+        return Ok(());
+    }
+    if !visiting.insert(id) {
+        return Err(WorkStateError::Invalid(format!(
+            "work item graph contains a cycle through `{id}`"
+        )));
+    }
+    if let Some(edges) = graph.get(id) {
+        for next in edges {
+            visit_item(next, graph, visiting, visited)?;
+        }
+    }
+    visiting.remove(id);
+    visited.insert(id);
+    Ok(())
+}
+
+fn plan_in(connection: &Connection, session_id: &str) -> Result<Option<WorkPlan>, DbError> {
+    let row = connection
+        .query_row(
+            "SELECT id,goal_id,revision,title,steps,time_created,time_updated \
+             FROM work_plan WHERE session_id=?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?;
+    let Some((id, goal_id, revision, title, steps, time_created, time_updated)) = row else {
+        return Ok(None);
+    };
+    let steps = serde_json::from_str(&steps).map_err(json_db_error)?;
+    Ok(Some(WorkPlan {
+        id,
+        session_id: session_id.to_owned(),
+        goal_id,
+        revision,
+        title,
+        steps,
+        time_created,
+        time_updated,
+    }))
+}
+
+fn list_items_in(connection: &Connection, session_id: &str) -> Result<Vec<WorkItem>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id,goal_id,plan_step_id,parent_id,subject,description,active_form,status,\
+             priority,dependencies,owner,revision,tokens_used,usage_known,time_used_ms,\
+             time_created,time_updated FROM work_item WHERE session_id=?1 ORDER BY time_created,id",
+        )
+        .map_err(zuno_db::map_error)?;
+    let mut rows = statement.query([session_id]).map_err(zuno_db::map_error)?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().map_err(zuno_db::map_error)? {
+        let status: String = row.get(7).map_err(zuno_db::map_error)?;
+        let priority: String = row.get(8).map_err(zuno_db::map_error)?;
+        let dependencies: String = row.get(9).map_err(zuno_db::map_error)?;
+        items.push(WorkItem {
+            id: row.get(0).map_err(zuno_db::map_error)?,
+            session_id: session_id.to_owned(),
+            goal_id: row.get(1).map_err(zuno_db::map_error)?,
+            plan_step_id: row.get(2).map_err(zuno_db::map_error)?,
+            parent_id: row.get(3).map_err(zuno_db::map_error)?,
+            subject: row.get(4).map_err(zuno_db::map_error)?,
+            description: row.get(5).map_err(zuno_db::map_error)?,
+            active_form: row.get(6).map_err(zuno_db::map_error)?,
+            status: WorkItemStatus::parse(&status)
+                .ok_or_else(|| json_db_error(format!("unknown work item status `{status}`")))?,
+            priority: WorkItemPriority::parse(&priority)
+                .ok_or_else(|| json_db_error(format!("unknown work item priority `{priority}`")))?,
+            dependencies: serde_json::from_str(&dependencies).map_err(json_db_error)?,
+            owner: row.get(10).map_err(zuno_db::map_error)?,
+            revision: row.get(11).map_err(zuno_db::map_error)?,
+            tokens_used: row.get(12).map_err(zuno_db::map_error)?,
+            usage_known: row.get(13).map_err(zuno_db::map_error)?,
+            time_used_ms: row.get(14).map_err(zuno_db::map_error)?,
+            time_created: row.get(15).map_err(zuno_db::map_error)?,
+            time_updated: row.get(16).map_err(zuno_db::map_error)?,
+        });
+    }
+    Ok(items)
+}
+
+fn json_db_error(error: impl std::fmt::Display) -> DbError {
+    DbError::Query {
+        source: Box::new(std::io::Error::other(error.to_string())),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanGetTool(WorkStateStore);
+#[derive(Debug, Clone)]
+pub struct PlanUpdateTool(WorkStateStore);
+#[derive(Debug, Clone)]
+pub struct TodoGetTool(WorkStateStore);
+#[derive(Debug, Clone)]
+pub struct TodoUpdateTool(WorkStateStore);
+
+impl PlanGetTool {
+    #[must_use]
+    pub fn new(store: WorkStateStore) -> Self {
+        Self(store)
+    }
+}
+impl PlanUpdateTool {
+    #[must_use]
+    pub fn new(store: WorkStateStore) -> Self {
+        Self(store)
+    }
+}
+impl TodoGetTool {
+    #[must_use]
+    pub fn new(store: WorkStateStore) -> Self {
+        Self(store)
+    }
+}
+impl TodoUpdateTool {
+    #[must_use]
+    pub fn new(store: WorkStateStore) -> Self {
+        Self(store)
+    }
+}
+
+#[async_trait]
+impl TypedTool for PlanGetTool {
+    type Params = WorkStateGetParams;
+    fn id(&self) -> &str {
+        PLAN_GET_TOOL_ID
+    }
+    fn description(&self) -> &str {
+        PLAN_GET_DESCRIPTION
+    }
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
+    }
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::ParallelSafe
+    }
+    async fn run(&self, _params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let store = self.0.clone();
+        let session_id = ctx.session_id;
+        let plan = tokio::task::spawn_blocking(move || store.plan(&session_id))
+            .await
+            .map_err(|error| failed(PLAN_GET_TOOL_ID, error))?
+            .map_err(|error| map_error(PLAN_GET_TOOL_ID, error))?;
+        output(PLAN_GET_TOOL_ID, "Plan", "plan", plan)
+    }
+}
+
+#[async_trait]
+impl TypedTool for PlanUpdateTool {
+    type Params = PlanUpdateParams;
+    fn id(&self) -> &str {
+        PLAN_UPDATE_TOOL_ID
+    }
+    fn description(&self) -> &str {
+        PLAN_UPDATE_DESCRIPTION
+    }
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::SideEffecting
+    }
+    async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        authorize(&ctx, PLAN_UPDATE_TOOL_ID).await?;
+        let store = self.0.clone();
+        let session_id = ctx.session_id;
+        let plan = tokio::task::spawn_blocking(move || store.update_plan(&session_id, params))
+            .await
+            .map_err(|error| failed(PLAN_UPDATE_TOOL_ID, error))?
+            .map_err(|error| map_error(PLAN_UPDATE_TOOL_ID, error))?;
+        output(PLAN_UPDATE_TOOL_ID, "Plan updated", "plan", Some(plan))
+    }
+}
+
+#[async_trait]
+impl TypedTool for TodoGetTool {
+    type Params = WorkStateGetParams;
+    fn id(&self) -> &str {
+        TODO_GET_TOOL_ID
+    }
+    fn description(&self) -> &str {
+        TODO_GET_DESCRIPTION
+    }
+    fn replay_policy(&self) -> ToolReplayPolicy {
+        ToolReplayPolicy::Safe
+    }
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::ParallelSafe
+    }
+    async fn run(&self, _params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let store = self.0.clone();
+        let session_id = ctx.session_id;
+        let items = tokio::task::spawn_blocking(move || store.items(&session_id))
+            .await
+            .map_err(|error| failed(TODO_GET_TOOL_ID, error))?
+            .map_err(|error| map_error(TODO_GET_TOOL_ID, error))?;
+        output(
+            TODO_GET_TOOL_ID,
+            &format!("{} work items", items.len()),
+            "todos",
+            items,
+        )
+    }
+}
+
+#[async_trait]
+impl TypedTool for TodoUpdateTool {
+    type Params = TodoUpdateParams;
+    fn id(&self) -> &str {
+        TODO_UPDATE_TOOL_ID
+    }
+    fn description(&self) -> &str {
+        TODO_UPDATE_DESCRIPTION
+    }
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::SideEffecting
+    }
+    async fn run(&self, params: Self::Params, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        authorize(&ctx, TODO_UPDATE_TOOL_ID).await?;
+        let store = self.0.clone();
+        let session_id = ctx.session_id;
+        let items =
+            tokio::task::spawn_blocking(move || store.update_items(&session_id, params.changes))
+                .await
+                .map_err(|error| failed(TODO_UPDATE_TOOL_ID, error))?
+                .map_err(|error| map_error(TODO_UPDATE_TOOL_ID, error))?;
+        output(
+            TODO_UPDATE_TOOL_ID,
+            &format!("{} work items", items.len()),
+            "todos",
+            items,
+        )
+    }
+}
+
+pub fn work_state_tools(pool: Arc<Pool>) -> Vec<Arc<dyn Tool>> {
+    let store = WorkStateStore::new(pool);
+    vec![
+        erase(PlanGetTool::new(store.clone())),
+        erase(PlanUpdateTool::new(store.clone())),
+        erase(TodoGetTool::new(store.clone())),
+        erase(TodoUpdateTool::new(store)),
+    ]
+}
+
+async fn authorize(ctx: &ToolContext, tool: &str) -> Result<(), ToolError> {
+    ctx.permission
+        .ask(
+            tool,
+            PermissionAsk {
+                permission: tool.to_owned(),
+                patterns: vec!["*".to_owned()],
+                metadata: Map::new(),
+                always: vec!["*".to_owned()],
+                ..PermissionAsk::default()
+            },
+        )
+        .await
+}
+
+fn output<T: Serialize>(
+    tool: &str,
+    title: &str,
+    key: &str,
+    value: T,
+) -> Result<ToolOutput, ToolError> {
+    let value = serde_json::to_value(value).map_err(|error| failed(tool, error))?;
+    let rendered = serde_json::to_string_pretty(&value).map_err(|error| failed(tool, error))?;
+    Ok(ToolOutput::text(title, rendered).with_metadata(key, value))
+}
+
+fn map_error(tool: &str, error: WorkStateError) -> ToolError {
+    if error.correctable() {
+        ToolError::InvalidArgs {
+            tool: tool.to_owned(),
+            source: Box::new(error),
+        }
+    } else {
+        ToolError::Failed {
+            tool: tool.to_owned(),
+            source: Box::new(error),
+        }
+    }
+}
+
+fn failed(tool: &str, error: impl std::error::Error + Send + Sync + 'static) -> ToolError {
+    ToolError::Failed {
+        tool: tool.to_owned(),
+        source: Box::new(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> WorkStateStore {
+        let pool =
+            Arc::new(Pool::open(&zuno_paths::DbLocation::Memory).expect("open in-memory database"));
+        let mut connection = pool.open_connection().expect("open connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute(
+                "INSERT INTO project \
+                 (id,worktree,vcs,name,icon_url,icon_url_override,icon_color,time_created,\
+                  time_updated,time_initialized,sandboxes,commands) \
+                 VALUES ('prj','/tmp',NULL,NULL,NULL,NULL,NULL,1,1,NULL,'[]',NULL)",
+                [],
+            )
+            .expect("insert project");
+        connection
+            .execute(
+                "INSERT INTO session \
+                 (id,project_id,slug,directory,title,version,time_created,time_updated) \
+                 VALUES ('ses','prj','ses','/tmp','session','test',1,1)",
+                [],
+            )
+            .expect("insert session");
+        WorkStateStore::new(pool)
+    }
+
+    fn step(id: &str) -> PlanStep {
+        PlanStep {
+            id: id.to_owned(),
+            title: format!("step {id}"),
+            status: WorkItemStatus::Pending,
+        }
+    }
+
+    #[test]
+    fn plan_updates_require_the_current_revision() {
+        let store = store();
+        let first = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: Some("goal".to_owned()),
+                    title: "release".to_owned(),
+                    steps: vec![step("scan")],
+                },
+            )
+            .expect("create plan");
+        assert_eq!(first.revision, 1);
+        let second = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(1),
+                    goal_id: first.goal_id.clone(),
+                    title: "release safely".to_owned(),
+                    steps: vec![step("scan"), step("verify")],
+                },
+            )
+            .expect("update plan");
+        assert_eq!(second.revision, 2);
+        assert!(matches!(
+            store.update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(1),
+                    goal_id: None,
+                    title: "stale".to_owned(),
+                    steps: vec![],
+                }
+            ),
+            Err(WorkStateError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn work_items_keep_ids_revisions_and_validate_dependencies_atomically() {
+        let store = store();
+        let added = store
+            .update_items(
+                "ses",
+                vec![WorkItemChange::Add {
+                    id: Some("todo_a".to_owned()),
+                    goal_id: None,
+                    plan_step_id: None,
+                    parent_id: None,
+                    subject: "scan".to_owned(),
+                    description: "scan repository".to_owned(),
+                    active_form: Some("Scanning".to_owned()),
+                    status: WorkItemStatus::InProgress,
+                    priority: WorkItemPriority::High,
+                    dependencies: vec![],
+                    owner: Some("researcher".to_owned()),
+                }],
+            )
+            .expect("add work item");
+        assert_eq!(added[0].revision, 1);
+        let updated = store
+            .update_items(
+                "ses",
+                vec![WorkItemChange::Update {
+                    id: "todo_a".to_owned(),
+                    expected_revision: 1,
+                    goal_id: None,
+                    plan_step_id: None,
+                    parent_id: None,
+                    subject: "scan".to_owned(),
+                    description: "scan complete".to_owned(),
+                    active_form: None,
+                    status: WorkItemStatus::Completed,
+                    priority: WorkItemPriority::High,
+                    dependencies: vec![],
+                    owner: Some("researcher".to_owned()),
+                }],
+            )
+            .expect("update work item");
+        assert_eq!(updated[0].revision, 2);
+        let invalid = store.update_items(
+            "ses",
+            vec![WorkItemChange::Add {
+                id: Some("todo_b".to_owned()),
+                goal_id: None,
+                plan_step_id: None,
+                parent_id: None,
+                subject: "verify".to_owned(),
+                description: "verify".to_owned(),
+                active_form: None,
+                status: WorkItemStatus::Pending,
+                priority: WorkItemPriority::Medium,
+                dependencies: vec!["missing".to_owned()],
+                owner: None,
+            }],
+        );
+        assert!(matches!(invalid, Err(WorkStateError::Invalid(_))));
+        assert_eq!(store.items("ses").expect("list items").len(), 1);
+    }
+
+    #[test]
+    fn parallel_runtime_items_are_metered_without_model_owned_usage_fields() {
+        let store = store();
+        store
+            .update_items(
+                "ses",
+                ["scan", "review"]
+                    .into_iter()
+                    .map(|id| WorkItemChange::Add {
+                        id: Some(format!("todo_{id}")),
+                        goal_id: None,
+                        plan_step_id: None,
+                        parent_id: None,
+                        subject: id.to_owned(),
+                        description: format!("run {id}"),
+                        active_form: Some(format!("Running {id}")),
+                        status: WorkItemStatus::Pending,
+                        priority: WorkItemPriority::Medium,
+                        dependencies: Vec::new(),
+                        owner: Some("workflow".to_owned()),
+                    })
+                    .collect(),
+            )
+            .expect("admit parallel work");
+
+        let scan = store
+            .transition_runtime_item(
+                "ses",
+                "todo_scan",
+                1,
+                WorkItemStatus::InProgress,
+                None,
+                None,
+            )
+            .expect("start scan");
+        let review = store
+            .transition_runtime_item(
+                "ses",
+                "todo_review",
+                1,
+                WorkItemStatus::InProgress,
+                None,
+                None,
+            )
+            .expect("start review concurrently");
+        assert_eq!((scan.revision, review.revision), (2, 2));
+
+        let scan = store
+            .transition_runtime_item(
+                "ses",
+                "todo_scan",
+                2,
+                WorkItemStatus::Completed,
+                Some(25),
+                Some(42),
+            )
+            .expect("complete scan");
+        assert_eq!(scan.revision, 3);
+        assert_eq!(scan.tokens_used, 42);
+        assert!(scan.usage_known);
+        assert_eq!(scan.time_used_ms, 25);
+        assert!(scan.active_form.is_none());
+
+        let review = store
+            .transition_runtime_item(
+                "ses",
+                "todo_review",
+                2,
+                WorkItemStatus::Cancelled,
+                Some(10),
+                None,
+            )
+            .expect("cancel review");
+        assert!(!review.usage_known);
+        assert_eq!(review.tokens_used, 0);
+        assert!(matches!(
+            store.transition_runtime_item(
+                "ses",
+                "todo_scan",
+                2,
+                WorkItemStatus::Blocked,
+                Some(30),
+                None,
+            ),
+            Err(WorkStateError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn cyclic_work_item_batch_rolls_back_atomically() {
+        let store = store();
+        let invalid = store.update_items(
+            "ses",
+            vec![
+                WorkItemChange::Add {
+                    id: Some("todo_a".to_owned()),
+                    goal_id: None,
+                    plan_step_id: None,
+                    parent_id: None,
+                    subject: "scan".to_owned(),
+                    description: "scan repository".to_owned(),
+                    active_form: None,
+                    status: WorkItemStatus::Pending,
+                    priority: WorkItemPriority::High,
+                    dependencies: vec!["todo_b".to_owned()],
+                    owner: Some("researcher".to_owned()),
+                },
+                WorkItemChange::Add {
+                    id: Some("todo_b".to_owned()),
+                    goal_id: None,
+                    plan_step_id: None,
+                    parent_id: None,
+                    subject: "review".to_owned(),
+                    description: "review scan".to_owned(),
+                    active_form: None,
+                    status: WorkItemStatus::Pending,
+                    priority: WorkItemPriority::Medium,
+                    dependencies: vec!["todo_a".to_owned()],
+                    owner: Some("reviewer".to_owned()),
+                },
+            ],
+        );
+        assert!(
+            matches!(invalid, Err(WorkStateError::Invalid(message)) if message.contains("cycle"))
+        );
+        assert!(
+            store.items("ses").expect("list items").is_empty(),
+            "a rejected graph must not leave either row behind"
+        );
+    }
+}

@@ -568,7 +568,7 @@ impl InputEditor {
     pub fn handle_action(&mut self, action: &'static Definition) -> EditorSignal {
         match action.name {
             // -- submission and external surfaces ---------------------------
-            "input_submit" | "prompt_submit" => {
+            "input_submit" | "input_force_submit" | "prompt_submit" => {
                 let text = self.submission_text();
                 if text.trim().is_empty() {
                     return EditorSignal::None;

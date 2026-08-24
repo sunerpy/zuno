@@ -12,7 +12,7 @@
 //! `tests/guard_key.rs` proves the two agree behaviourally, not just textually.
 //!
 //! `jcode` centralizes the `accept_large_output` key this way
-//! (`.omo/refs/jcode/crates/jcode-app-core/src/tool/mod.rs:112`) but leaves
+//! (`jcode`) but leaves
 //! `"intent"` as a bare literal in three places
 //! (`jcode-message-types/src/lib.rs:595`, `tool/batch.rs:133`). Both keys are
 //! constants here.
@@ -22,8 +22,8 @@ use serde_json::Value;
 
 /// The model's stated reason for this call, trimmed, or `None` when absent or blank.
 ///
-/// A present-but-empty `intent` is treated as absent: the schema asks for a label
-/// to show a human, and whitespace is not one.
+/// A present-but-empty `intent` is treated as absent: optional metadata still has
+/// to be meaningful before it is shown to a human.
 #[must_use]
 pub fn intent(input: &Value) -> Option<&str> {
     input

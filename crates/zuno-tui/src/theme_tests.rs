@@ -1164,7 +1164,7 @@ fn theme_config_round_trips_through_serde() {
 fn theme_no_view_hardcodes_a_color() {
     // The acceptance requirement stated as a guard: only this module may name a
     // colour. Every other source file in the crate must reach colours through the
-    // palette. The floor assertion is mandatory per `.omo/WORKTREE.md` — a scan
+    // palette. The floor assertion is mandatory per the project's review policy — a scan
     // that finds no files would otherwise pass vacuously.
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut scanned = 0usize;

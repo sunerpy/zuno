@@ -14,7 +14,7 @@
 //! # Models
 //!
 //! [`model_policy`] decides which model an agent runs on, and it decides it the way
-//! `.omo/refs/omo-slim/src/config/constants.ts:31-41` does: nothing at all by
+//! `omo-slim` does: nothing at all by
 //! default, so every agent inherits the session model. A user selects a named
 //! *preset* — a flat `{agent → {model, variant}}` map — and may override any single
 //! agent on top of it. No model id appears anywhere in this crate, and a test walks

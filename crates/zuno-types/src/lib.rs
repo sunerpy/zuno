@@ -49,6 +49,172 @@ impl ActivityProjection {
     }
 }
 
+/// Disjoint token buckets shared by durable storage and every client surface.
+///
+/// `unclassified` is used by work-state meters that receive only a trustworthy
+/// aggregate from a child process. It keeps that total honest without pretending the
+/// provider identified it as prompt, completion, reasoning, or cache usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub unclassified: u64,
+}
+
+impl TokenUsage {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.total() == 0
+    }
+
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.reasoning)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.unclassified)
+    }
+
+    #[must_use]
+    pub const fn unclassified(total: u64) -> Self {
+        Self {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+            unclassified: total,
+        }
+    }
+
+    /// Add a provider report that has no separate reasoning bucket.
+    pub const fn add(&mut self, input: u64, output: u64, cache_read: u64, cache_write: u64) {
+        self.input = self.input.saturating_add(input);
+        self.output = self.output.saturating_add(output);
+        self.cache_read = self.cache_read.saturating_add(cache_read);
+        self.cache_write = self.cache_write.saturating_add(cache_write);
+    }
+
+    pub const fn add_usage(&mut self, usage: Self) {
+        self.input = self.input.saturating_add(usage.input);
+        self.output = self.output.saturating_add(usage.output);
+        self.reasoning = self.reasoning.saturating_add(usage.reasoning);
+        self.cache_read = self.cache_read.saturating_add(usage.cache_read);
+        self.cache_write = self.cache_write.saturating_add(usage.cache_write);
+        self.unclassified = self.unclassified.saturating_add(usage.unclassified);
+    }
+}
+
+/// How a provider's prompt count relates to its cache buckets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageAccounting {
+    #[default]
+    Unknown,
+    CacheInsideInput,
+    CacheBesideInput,
+}
+
+impl UsageAccounting {
+    #[must_use]
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::Unknown => None,
+            Self::CacheInsideInput => Some("cache-inside-input"),
+            Self::CacheBesideInput => Some("cache-beside-input"),
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "cache-inside-input" => Self::CacheInsideInput,
+            "cache-beside-input" => Self::CacheBesideInput,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub const fn prompt_total(self, usage: TokenUsage) -> Option<u64> {
+        match self {
+            Self::Unknown => None,
+            Self::CacheInsideInput => Some(usage.input),
+            Self::CacheBesideInput => Some(
+                usage
+                    .input
+                    .saturating_add(usage.cache_read)
+                    .saturating_add(usage.cache_write),
+            ),
+        }
+    }
+
+    #[must_use]
+    pub const fn normalize(self, usage: TokenUsage) -> Option<TokenUsage> {
+        match self {
+            Self::Unknown => None,
+            Self::CacheInsideInput => Some(TokenUsage {
+                input: usage
+                    .input
+                    .saturating_sub(usage.cache_read)
+                    .saturating_sub(usage.cache_write),
+                ..usage
+            }),
+            Self::CacheBesideInput => Some(usage),
+        }
+    }
+}
+
+/// Durable usage state for a session or execution owner.
+///
+/// Confirmed counters never decrease on a failed request. A request rejected before a
+/// provider usage frame keeps its local estimate separately, so clients render `≈N`
+/// instead of replacing the last trustworthy value with zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageSnapshot {
+    pub confirmed: TokenUsage,
+    pub last_prompt_tokens: Option<u64>,
+    pub estimated_pending_prompt_tokens: Option<u64>,
+    pub context_limit: Option<u64>,
+    pub accounting: UsageAccounting,
+    pub confirmed_known: bool,
+    pub last_confirmed_at: Option<i64>,
+    pub failed_turns: u64,
+    pub last_failed_at: Option<i64>,
+}
+
+/// Timing and usage owned by one Goal, Plan, WorkItem, Job, or workflow node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionSpan {
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    pub elapsed_ms: u64,
+    pub usage: TokenUsage,
+    pub accounting_known: bool,
+}
+
+impl ExecutionSpan {
+    #[must_use]
+    pub const fn from_aggregate(
+        started_at: i64,
+        completed_at: Option<i64>,
+        elapsed_ms: u64,
+        tokens: u64,
+        accounting_known: bool,
+    ) -> Self {
+        Self {
+            started_at,
+            completed_at,
+            elapsed_ms,
+            usage: TokenUsage::unclassified(tokens),
+            accounting_known,
+        }
+    }
+}
+
 /// Resident-memory scope shared by storage, tools, and clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryScope {
@@ -207,18 +373,57 @@ pub struct MemoryEntryProjection {
 /// Active goal summary shown by clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalStateProjection {
+    pub id: String,
+    pub revision: i64,
     pub objective: String,
+    pub success_criteria: Vec<String>,
     pub status: String,
-    pub tokens_used: i64,
+    pub blocked_reason: Option<String>,
+    pub span: ExecutionSpan,
     pub token_budget: Option<i64>,
+    pub time_created: i64,
+    pub time_updated: i64,
 }
 
-/// One durable todo row shown by clients.
+/// One stable step in the current durable plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStepProjection {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+}
+
+/// The current durable plan shown by clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanProjection {
+    pub id: String,
+    pub goal_id: Option<String>,
+    pub revision: i64,
+    pub title: String,
+    pub steps: Vec<PlanStepProjection>,
+    pub span: ExecutionSpan,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+/// One durable work item shown by clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TodoProjection {
-    pub content: String,
+    pub id: String,
+    pub goal_id: Option<String>,
+    pub plan_step_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub subject: String,
+    pub description: String,
+    pub active_form: Option<String>,
     pub status: String,
     pub priority: String,
+    pub dependencies: Vec<String>,
+    pub owner: Option<String>,
+    pub revision: i64,
+    pub span: ExecutionSpan,
+    pub time_created: i64,
+    pub time_updated: i64,
 }
 
 /// The typed subject owned by one durable background job.
@@ -233,6 +438,10 @@ pub enum JobSubjectProjection {
         instance: String,
         tool: String,
     },
+    Workflow {
+        run_id: String,
+        workflow: String,
+    },
 }
 
 /// One durable background job shown by clients.
@@ -244,6 +453,23 @@ pub struct JobProjection {
     pub report_delivery: String,
     pub result: Option<String>,
     pub error: Option<String>,
+    pub span: ExecutionSpan,
+    pub time_created: i64,
+    pub time_completed: Option<i64>,
+}
+
+/// One durable background terminal shown by clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundExecutionProjection {
+    pub id: String,
+    pub title: String,
+    pub command: String,
+    pub status: String,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub error: Option<String>,
+    pub span: ExecutionSpan,
     pub time_created: i64,
     pub time_completed: Option<i64>,
 }
@@ -252,7 +478,9 @@ pub struct JobProjection {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkStateProjection {
     pub goal: Option<GoalStateProjection>,
+    pub plan: Option<PlanProjection>,
     pub todos: Vec<TodoProjection>,
+    pub background_executions: Vec<BackgroundExecutionProjection>,
     pub jobs: Vec<JobProjection>,
     pub memory_candidates: Vec<MemoryCandidateProjection>,
     pub memory_entries: Vec<MemoryEntryProjection>,

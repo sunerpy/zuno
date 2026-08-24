@@ -142,7 +142,7 @@ fn tool_retry_reasons_have_stable_persisted_discriminators() {
 fn retry_schedule_survives_reopen_and_increments_for_the_same_goal() {
     let database = tempfile::tempdir().expect("create database directory");
     let spill = tempfile::tempdir().expect("create spill directory");
-    let path = database.path().join(crate::GOAL_DB_FILE);
+    let path = database.path().join("goal-test.db");
     let first_goal_id;
     {
         let store = GoalStore::open_at(&path, spill.path().to_owned()).expect("open goal store");
@@ -197,7 +197,7 @@ fn retry_schedule_survives_reopen_and_increments_for_the_same_goal() {
 fn durable_context_compaction_phase_survives_restart_without_incrementing_backoff() {
     let database = tempfile::tempdir().expect("create database directory");
     let spill = tempfile::tempdir().expect("create spill directory");
-    let path = database.path().join(crate::GOAL_DB_FILE);
+    let path = database.path().join("goal-test.db");
     {
         let store = GoalStore::open_at(&path, spill.path().to_owned()).expect("open goal store");
         store

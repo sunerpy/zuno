@@ -33,12 +33,11 @@
 //!
 //! # The conditional tools
 //!
-//! Four tools are not always offered: [`invalid`], [`question`], [`todo`]'s
-//! `todowrite`, and [`plan_exit`]. Their conditions live in [`exposure`] as named
-//! predicates over one flags struct, not as branches inside a registry builder, so
-//! each is callable and tested at both polarities. Two of the four have a registry key
-//! that differs from the wire id — upstream keys `todowrite` as `todo` and `plan_exit`
-//! as `plan` — and it is the **wire** id that [`zuno_tool::Tool::id`] returns.
+//! Three tools are not always offered: [`invalid`], [`question`], and
+//! [`plan_exit`]. Their conditions live in [`exposure`] as named predicates over one
+//! flags struct, not as branches inside a registry builder, so each is callable and
+//! tested at both polarities. Upstream keys `plan_exit` as `plan`, while it is the
+//! **wire** id that [`zuno_tool::Tool::id`] returns.
 //!
 //! [`exposure`] answers only the first of two gates. The permission ruleset withholds
 //! `plan_exit` again from every agent but `plan`; that layer is [`zuno_permission`]'s and
@@ -201,11 +200,12 @@ pub mod plan_exit;
 pub mod product_agent;
 pub mod question;
 pub mod registry;
-pub mod todo;
+pub mod work_state;
+pub mod workflow;
 
 pub use crate::exposure::{
     CONDITIONAL_TOOLS, Client, ExposureFlags, exposed_conditional_tools, exposes_invalid,
-    exposes_plan_exit, exposes_question, exposes_todowrite, exposure_predicate,
+    exposes_plan_exit, exposes_question, exposure_predicate,
 };
 pub use crate::invalid::{InvalidParams, InvalidTool};
 pub use crate::job::{DESCRIPTION as JOB_DESCRIPTION, JobParams, JobTool, WIRE_ID as JOB_WIRE_ID};
@@ -220,9 +220,16 @@ pub use crate::question::{
     Answer, QuestionAsker, QuestionOption, QuestionParams, QuestionPrompt, QuestionRequest,
     QuestionTool, ScriptedAnswers,
 };
-pub use crate::todo::{
-    MemoryTodoStore, SqliteTodoStore, TodoItem, TodoPriority, TodoStatus, TodoStore,
-    TodoStoreError, TodoWriteParams, TodoWriteTool,
+pub use crate::work_state::{
+    PLAN_GET_DESCRIPTION, PLAN_GET_TOOL_ID, PLAN_UPDATE_DESCRIPTION, PLAN_UPDATE_TOOL_ID,
+    PlanGetTool, PlanStep, PlanUpdateParams, PlanUpdateTool, TODO_GET_DESCRIPTION,
+    TODO_GET_TOOL_ID, TODO_UPDATE_DESCRIPTION, TODO_UPDATE_TOOL_ID, TodoGetTool, TodoUpdateParams,
+    TodoUpdateTool, WorkItem, WorkItemChange, WorkItemPriority, WorkItemStatus, WorkPlan,
+    WorkStateError, WorkStateGetParams, WorkStateSnapshot, WorkStateStore, work_state_tools,
+};
+pub use crate::workflow::{
+    WIRE_ID as WORKFLOW_WIRE_ID, WorkflowHost, WorkflowNodeRequest, WorkflowParams,
+    WorkflowRequest, WorkflowTool, WorkflowTurn,
 };
 
 pub mod memory;
@@ -231,10 +238,11 @@ pub mod task;
 
 pub use crate::skill::{
     DEFAULT_SEARCH_LIMIT as SKILL_DEFAULT_SEARCH_LIMIT, DESCRIPTION as SKILL_DESCRIPTION,
-    MAX_SEARCH_LIMIT as SKILL_MAX_SEARCH_LIMIT, RESOURCE_MAX_BYTES as SKILL_RESOURCE_MAX_BYTES,
+    LoadedSkillDocument, MAX_SEARCH_LIMIT as SKILL_MAX_SEARCH_LIMIT,
+    RESOURCE_MAX_BYTES as SKILL_RESOURCE_MAX_BYTES,
     SEARCH_DESCRIPTION_MAX_BYTES as SKILL_SEARCH_DESCRIPTION_MAX_BYTES,
     SUGGESTION_LIMIT as SKILL_SUGGESTION_LIMIT, SkillParams, SkillRejection, SkillTool,
-    WIRE_ID as SKILL_WIRE_ID,
+    WIRE_ID as SKILL_WIRE_ID, load_skill_document,
 };
 
 pub use crate::task::{

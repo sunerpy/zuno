@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use ::self_update::update::{Release, ReleaseAsset, ReleaseUpdate};
+use ::self_update::{Release, ReleaseAsset, ReleaseUpdate};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
 use sha2::{Digest as _, Sha256};
 
@@ -26,27 +26,27 @@ fn execute_inner(args: &SelfUpdateArgs) -> Result<(), UpdateError> {
         Some(tag) => source.tagged(tag)?,
         None => source.latest()?,
     };
-    validate_version(&release.version)?;
+    validate_version(release.version())?;
 
     let current = env!("CARGO_PKG_VERSION");
-    let relation = version_relation(current, &release.version)?;
+    let relation = version_relation(current, release.version())?;
     if args.check {
-        print_check_result(current, &release.version, relation);
+        print_check_result(current, release.version(), relation);
         return Ok(());
     }
     if !args.force && explicit_tag.is_none() && relation != VersionRelation::Newer {
-        print_no_update_result(current, &release.version, relation);
+        print_no_update_result(current, release.version(), relation);
         return Ok(());
     }
 
-    let archive_name = archive_asset_name(&release.version, platform);
+    let archive_name = archive_asset_name(release.version(), platform);
     let archive = exact_asset(&release, &archive_name)?;
     let checksums = exact_asset(&release, CHECKSUM_ASSET)?;
     let executable = std::env::current_exe().map_err(UpdateError::LocateExecutable)?;
 
     println!("Zuno self-update");
     println!("  current: {current} ({})", executable.display());
-    println!("  release: {}", release.version);
+    println!("  release: {}", release.version());
     println!("  target:  {}", platform.target);
     println!("  asset:   {archive_name}");
     println!("  verify:  {CHECKSUM_ASSET} (SHA-256)");
@@ -56,7 +56,7 @@ fn execute_inner(args: &SelfUpdateArgs) -> Result<(), UpdateError> {
         return Ok(());
     }
 
-    let temporary = ::self_update::TempDir::new().map_err(UpdateError::TemporaryDirectory)?;
+    let temporary = tempfile::TempDir::new().map_err(UpdateError::TemporaryDirectory)?;
     let checksum_path = temporary.path().join(CHECKSUM_ASSET);
     let archive_path = temporary.path().join(&archive_name);
     source.download(checksums, &checksum_path)?;
@@ -84,13 +84,11 @@ fn execute_inner(args: &SelfUpdateArgs) -> Result<(), UpdateError> {
     let replacement = extracted.join(platform.executable);
     validate_replacement(&replacement)?;
 
-    ::self_update::self_replace::self_replace(&replacement).map_err(|source| {
-        UpdateError::Replace {
-            executable,
-            detail: source.to_string(),
-        }
+    self_replace::self_replace(&replacement).map_err(|source| UpdateError::Replace {
+        executable,
+        detail: source.to_string(),
     })?;
-    println!("Updated Zuno to {}.", release.version);
+    println!("Updated Zuno to {}.", release.version());
     Ok(())
 }
 
@@ -169,13 +167,21 @@ impl GithubReleaseSource {
         let backend = builder.build().map_err(|source| UpdateError::Configure {
             detail: source.to_string(),
         })?;
-        Ok(Self { backend, token })
+        Ok(Self {
+            backend: Box::new(backend),
+            token,
+        })
     }
 
     fn latest(&self) -> Result<Release, UpdateError> {
-        self.backend
+        let releases = self
+            .backend
             .get_latest_release()
-            .map_err(|source| github_error("querying the latest GitHub release", source))
+            .map_err(|source| github_error("querying the latest GitHub release", source))?;
+        releases
+            .latest()
+            .cloned()
+            .ok_or(UpdateError::MissingLatestRelease)
     }
 
     fn tagged(&self, tag: &str) -> Result<Release, UpdateError> {
@@ -189,22 +195,22 @@ impl GithubReleaseSource {
             path: destination.to_path_buf(),
             source,
         })?;
-        let mut download = ::self_update::Download::from_url(&asset.download_url);
+        let mut download = ::self_update::Download::from_url(asset.download_url());
         download
-            .show_progress(io::stderr().is_terminal())
-            .set_header(ACCEPT, HeaderValue::from_static("application/octet-stream"));
+            .show_download_progress(io::stderr().is_terminal())
+            .request_header(ACCEPT, HeaderValue::from_static("application/octet-stream"));
         if let Some(token) = self.token.as_deref() {
             let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|source| {
                 UpdateError::AuthorizationHeader {
                     detail: source.to_string(),
                 }
             })?;
-            download.set_header(AUTHORIZATION, value);
+            download.request_header(AUTHORIZATION, value);
         }
         download
             .download_to(&mut file)
             .map_err(|source| UpdateError::Download {
-                asset: asset.name.clone(),
+                asset: asset.name().to_owned(),
                 detail: source.to_string(),
             })?;
         file.sync_all().map_err(|source| UpdateError::WriteFile {
@@ -303,18 +309,18 @@ fn exact_asset<'a>(
     expected_name: &str,
 ) -> Result<&'a ReleaseAsset, UpdateError> {
     let mut matches = release
-        .assets
+        .assets()
         .iter()
-        .filter(|asset| asset.name == expected_name);
+        .filter(|asset| asset.name() == expected_name);
     let Some(asset) = matches.next() else {
         return Err(UpdateError::MissingAsset {
-            version: release.version.clone(),
+            version: release.version().to_owned(),
             asset: expected_name.to_owned(),
         });
     };
     if matches.next().is_some() {
         return Err(UpdateError::DuplicateAsset {
-            version: release.version.clone(),
+            version: release.version().to_owned(),
             asset: expected_name.to_owned(),
         });
     }
@@ -445,6 +451,8 @@ enum UpdateError {
     UnsupportedPlatform { os: String, arch: String },
     #[error("could not configure the GitHub release updater: {detail}")]
     Configure { detail: String },
+    #[error("GitHub returned no latest release")]
+    MissingLatestRelease,
     #[error(
         "{action}: {detail}\n\nhint: for a private repository, set GITHUB_TOKEN or GH_TOKEN; for example:\n  GH_TOKEN=\"$(gh auth token)\" zuno self-update"
     )]
@@ -535,18 +543,15 @@ mod tests {
     use super::*;
 
     fn asset(name: &str) -> ReleaseAsset {
-        ReleaseAsset {
-            name: name.to_owned(),
-            download_url: format!("https://example.invalid/{name}"),
-        }
+        ReleaseAsset::new(name, format!("https://example.invalid/{name}"))
     }
 
     fn release(assets: Vec<ReleaseAsset>) -> Release {
-        Release {
-            version: "0.2.0".to_owned(),
-            assets,
-            ..Release::default()
-        }
+        Release::builder()
+            .version("0.2.0")
+            .assets(assets)
+            .build()
+            .expect("release fixture")
     }
 
     fn getter(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -658,7 +663,7 @@ mod tests {
 
     #[test]
     fn downloaded_bytes_must_match_the_release_checksum() {
-        let temporary = ::self_update::TempDir::new().expect("temporary directory");
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
         let archive = temporary.path().join("zuno.tar.gz");
         let mut file = File::create(&archive).expect("archive fixture");
         file.write_all(b"verified release bytes")

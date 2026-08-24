@@ -3,12 +3,14 @@
 //! Named `schema::tests::*` so `cargo test -p zuno-config schema` selects them.
 
 use super::*;
-use crate::schema::agent::{AgentColor, AgentConfig, AgentMode, SWEEP_EXEMPT_KEYS, ThemeColor};
+use crate::schema::agent::{
+    AgentColor, AgentConfig, AgentMode, AgentReasoning, SWEEP_EXEMPT_KEYS, ThemeColor,
+};
 use crate::schema::formatter::FormatterConfig;
 use crate::schema::lsp::{BUILTIN_SERVER_IDS, LspConfig};
 use crate::schema::mcp::{McpOauth, McpServerConfig};
 use crate::schema::ordered::False;
-use crate::schema::permission::{PermissionAction, PermissionConfig, PermissionRule};
+use crate::schema::permission::{PermissionAction, PermissionMode, PermissionRule};
 use crate::schema::product_agent::{ProductAgentKind, ProductAgentPermissionMode};
 use crate::schema::provider::Timeout;
 use crate::schema::reference::ReferenceEntry;
@@ -165,18 +167,35 @@ fn memory_false_dominates_every_enabled_default() {
 }
 
 #[test]
-fn strict_authorization_defaults_off_and_can_be_enabled() {
+fn permission_mode_defaults_to_standard_and_legacy_authorization_is_rejected() {
+    assert_eq!(
+        Config::default().permission_mode(),
+        PermissionMode::Standard
+    );
     assert!(!Config::default().strict_authorization());
-    assert!(
-        parse(r#"{"authorization":{"strict":true}}"#)
-            .expect("strict authorization parses")
-            .strict_authorization()
+
+    let error = parse(r#"{"authorization":{"strict":true}}"#)
+        .expect_err("legacy authorization configuration must be rejected");
+    assert_eq!(issue_path(&error), "authorization");
+}
+
+#[test]
+fn canonical_permission_modes_keep_ordered_rules_and_allow_all() {
+    let config = parse(r#"{"permission":{"mode":"strict","rules":{"bash":"ask","read":"allow"}}}"#)
+        .expect("canonical permission policy parses");
+    assert_eq!(config.permission_mode(), PermissionMode::Strict);
+    let policy = config
+        .permission
+        .expect("canonical permission policy was not retained");
+    assert_eq!(
+        policy.rules.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+        vec!["bash", "read"]
     );
-    assert!(
-        !parse(r#"{"authorization":{"strict":false}}"#)
-            .expect("strict authorization can be disabled explicitly")
-            .strict_authorization()
-    );
+
+    let allow_all = parse(r#"{"permission":{"mode":"allow_all"}}"#)
+        .expect("allow_all permission policy parses");
+    assert_eq!(allow_all.permission_mode(), PermissionMode::AllowAll);
+    assert!(!allow_all.strict_authorization());
 }
 
 #[test]
@@ -202,10 +221,10 @@ fn compaction_threshold_percent_is_typed_and_bounded() {
 }
 
 #[test]
-fn authorization_rejects_unknown_nested_keys() {
-    let error = parse(r#"{"authorization":{"strict":true,"remember":true}}"#)
-        .expect_err("authorization must not silently ignore unknown policy");
-    assert_eq!(issue_path(&error), "authorization.remember");
+fn permission_rejects_unknown_policy_keys() {
+    let error = parse(r#"{"permission":{"mode":"strict","remember":true}}"#)
+        .expect_err("permission must not silently ignore unknown policy fields");
+    assert_eq!(issue_path(&error), "permission.remember");
 }
 
 #[test]
@@ -420,7 +439,7 @@ fn sweep_exempt_keys_never_become_provider_options() {
 #[test]
 fn an_agent_with_swept_keys_loses_nothing_on_round_trip() {
     let before = json!({
-        "agent": {
+        "agents": {
             "build": {
                 "model": "anthropic/claude-sonnet-4-5",
                 "reasoningEffort": "high",
@@ -431,7 +450,7 @@ fn an_agent_with_swept_keys_loses_nothing_on_round_trip() {
     let config = parse_value(before.clone()).expect("deserializes");
     let after = serde_json::to_value(&config).expect("serializes");
     assert_contains(&after, &before, "$");
-    let build = &after["agent"]["build"];
+    let build = &after["agents"]["build"];
     assert_eq!(build["options"]["reasoningEffort"], json!("high"));
     assert_eq!(build["options"]["thinking"]["budgetTokens"], json!(32000));
 }
@@ -442,13 +461,22 @@ fn agent_named_fields_are_not_swept() {
         "model": "m", "variant": "v", "temperature": 0.5, "top_p": 0.9,
         "prompt": "p", "disable": false, "description": "d", "mode": "subagent",
         "hidden": true, "color": "primary", "steps": 10,
-        "permission": "allow",
+        "tools": ["read", "grep"], "delegates": ["researcher"],
+        "permission": { "mode": "allow_all" },
     }));
     assert!(agent.options.is_none(), "no named key may reach options");
     assert!(agent.extra.is_empty());
     assert_eq!(agent.mode, Some(AgentMode::Subagent));
     assert_eq!(agent.color, Some(AgentColor::Theme(ThemeColor::Primary)));
     assert_eq!(agent.steps.map(|s| s.get()), Some(10));
+    assert_eq!(
+        agent.tools.as_deref(),
+        Some(["read".to_owned(), "grep".to_owned()].as_slice())
+    );
+    assert_eq!(
+        agent.delegates.as_deref(),
+        Some(["researcher".to_owned()].as_slice())
+    );
 }
 
 #[test]
@@ -462,9 +490,9 @@ fn agent_colour_takes_hex_and_theme_names_only() {
         Some(AgentColor::Theme(ThemeColor::Error))
     );
     for bad in ["banana", "#fff", "#12345g", "ff5733"] {
-        let error = parse_value(json!({ "agent": { "a": { "color": bad } } }))
+        let error = parse_value(json!({ "agents": { "a": { "color": bad } } }))
             .expect_err("invalid colour must be rejected");
-        assert_eq!(issue_path(&error), "agent.a.color", "for {bad}");
+        assert_eq!(issue_path(&error), "agents.a.color", "for {bad}");
     }
 }
 
@@ -514,22 +542,74 @@ fn retired_tui_keys_are_unknown_top_level_fields() {
 
 #[test]
 fn unsupported_agent_fields_fail_inside_the_native_schema() {
-    for key in ["tools", "maxSteps"] {
-        let error = parse_value(json!({ "agent": { "build": { key: {} } } }))
-            .expect_err("unsupported field");
-        assert!(error.report().contains(key), "{}", error.report());
-    }
+    let error = parse_value(json!({ "agents": { "build": { "maxSteps": 4 } } }))
+        .expect_err("unsupported field");
+    assert!(error.report().contains("maxSteps"), "{}", error.report());
 }
 
 #[test]
 fn an_agent_variant_requires_an_explicit_model() {
-    let error = parse_value(json!({ "agent": { "build": { "variant": "high" } } }))
-        .expect_err("a model owns its variant vocabulary");
-    assert!(
-        error.report().contains("requires an explicit `model`"),
-        "{}",
-        error.report()
+    for field in ["variant", "reasoning"] {
+        let error = parse_value(json!({ "agents": { "build": { field: "high" } } }))
+            .expect_err("a model owns its reasoning vocabulary");
+        assert!(
+            error.report().contains("require an explicit `model`"),
+            "{}",
+            error.report()
+        );
+    }
+}
+
+#[test]
+fn agent_orchestration_fields_are_structured_and_validated() {
+    let config = parse_value(json!({
+        "agents": {
+            "researcher": {
+                "model": "myopenai/gpt-5.6-sol",
+                "reasoning": "high",
+                "tools": ["read", "grep", "web_search"]
+            },
+            "implementer": {
+                "model": "myopenai/gpt-5.6-sol",
+                "reasoning": "max",
+                "tools": ["read", "edit", "bash"],
+                "delegates": ["researcher"]
+            }
+        },
+        "workflows": {
+            "release-hardening": {
+                "maxParallel": 4,
+                "maxAgents": 12,
+                "nodes": [
+                    {"id":"scan","agent":"researcher"},
+                    {"id":"review","agent":"researcher"},
+                    {"id":"implement","agent":"implementer","dependsOn":["scan","review"]},
+                    {"id":"verify","agent":"implementer","dependsOn":["implement"]}
+                ]
+            }
+        }
+    }))
+    .expect("structured orchestration config");
+    let agents = config.agent.expect("agents");
+    assert_eq!(
+        agents.get("researcher").and_then(|agent| agent.reasoning),
+        Some(AgentReasoning::High)
     );
+    let workflow = config
+        .workflows
+        .expect("workflows")
+        .get("release-hardening")
+        .expect("workflow")
+        .clone();
+    workflow
+        .validate("release-hardening", &agents)
+        .expect("valid workflow");
+
+    for bad in [json!([]), json!(["read", "read"]), json!([""])] {
+        let error = parse_value(json!({"agents":{"worker":{"tools":bad}}}))
+            .expect_err("invalid tool allowlist");
+        assert!(error.report().contains("tools"), "{}", error.report());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -728,15 +808,13 @@ fn unknown_provider_options_are_kept_for_the_sdk() {
 
 #[test]
 fn permission_keeps_the_authors_key_order() {
-    // `config/permission.ts:14-16`: precedence depends on this order.
+    // Rule precedence follows the order authored inside `permission.rules`.
     let config = parse(
-        r#"{"permission": {"zebra": "deny", "bash": "ask", "alpha": "allow", "read": "allow"}}"#,
+        r#"{"permission":{"rules":{"zebra":"deny","bash":"ask","alpha":"allow","read":"allow"}}}"#,
     )
     .expect("deserializes");
-    let Some(PermissionConfig::Object(object)) = &config.permission else {
-        panic!("expected the object arm");
-    };
-    let keys: Vec<&str> = object.iter().map(|(key, _)| key).collect();
+    let rules = &config.permission.as_ref().expect("permission").rules;
+    let keys: Vec<&str> = rules.iter().map(|(key, _)| key).collect();
     assert_eq!(keys, vec!["zebra", "bash", "alpha", "read"]);
 }
 
@@ -746,62 +824,56 @@ fn parsing_through_a_json_value_forfeits_key_order() {
     // document that has been through `Value` is already sorted and no downstream
     // type can recover the author's order. Anything that needs permission
     // precedence must parse from the text.
-    let text = r#"{"permission": {"zebra": "deny", "alpha": "allow"}}"#;
+    let text = r#"{"permission":{"rules":{"zebra":"deny","alpha":"allow"}}}"#;
     let value: Value = serde_json::from_str(text).expect("valid JSON");
     let from_value = parse_value(value).expect("deserializes");
-    let Some(PermissionConfig::Object(object)) = &from_value.permission else {
-        panic!("expected the object arm");
-    };
+    let value_rules = &from_value.permission.as_ref().expect("permission").rules;
     assert_eq!(
-        object.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        value_rules.iter().map(|(k, _)| k).collect::<Vec<_>>(),
         vec!["alpha", "zebra"]
     );
 
     let from_text = parse(text).expect("deserializes");
-    let Some(PermissionConfig::Object(object)) = &from_text.permission else {
-        panic!("expected the object arm");
-    };
+    let text_rules = &from_text.permission.as_ref().expect("permission").rules;
     assert_eq!(
-        object.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+        text_rules.iter().map(|(k, _)| k).collect::<Vec<_>>(),
         vec!["zebra", "alpha"]
     );
 }
 
 #[test]
-fn a_bare_permission_action_normalizes_to_a_star_rule() {
-    let config = parse_value(json!({ "permission": "deny" })).expect("deserializes");
-    let permission = config.permission.as_ref().expect("permission present");
-    assert_eq!(
-        permission,
-        &PermissionConfig::Action(PermissionAction::Deny),
-        "the parsed value keeps the form the author wrote"
-    );
-    let normalized = permission.normalized();
-    assert_eq!(
-        normalized.get("*"),
-        Some(&PermissionRule::Action(PermissionAction::Deny))
-    );
+fn legacy_permission_shorthands_are_rejected() {
+    for value in [
+        json!({ "permission": "deny" }),
+        json!({ "permission": { "read": "allow" } }),
+    ] {
+        parse_value(value).expect_err("only permission.mode/rules is accepted");
+    }
 }
 
 #[test]
 fn action_only_permissions_reject_per_pattern_rules() {
-    let error = parse_value(json!({ "permission": { "webfetch": { "*": "allow" } } }))
-        .expect_err("webfetch takes a bare action");
-    assert_eq!(issue_path(&error), "permission.webfetch");
+    let error = parse_value(json!({
+        "permission": { "rules": { "webfetch": { "*": "allow" } } }
+    }))
+    .expect_err("webfetch takes a bare action");
+    assert_eq!(issue_path(&error), "permission.rules.webfetch");
     assert!(issue_detail(&error).contains("webfetch"));
-    parse_value(json!({ "permission": { "bash": { "git push": "ask" } } }))
-        .expect("bash does take per-pattern rules");
+    parse_value(json!({
+        "permission": { "rules": { "bash": { "git push": "ask" } } }
+    }))
+    .expect("bash does take per-pattern rules");
 }
 
 #[test]
 fn an_unknown_permission_key_is_kept() {
-    let config =
-        parse_value(json!({ "permission": { "todoread": "allow" } })).expect("deserializes");
-    let Some(PermissionConfig::Object(object)) = &config.permission else {
-        panic!("expected the object arm");
-    };
+    let config = parse_value(json!({
+        "permission": { "rules": { "custom_audit": "allow" } }
+    }))
+    .expect("deserializes");
+    let rules = &config.permission.as_ref().expect("permission").rules;
     assert_eq!(
-        object.get("todoread"),
+        rules.get("custom_audit"),
         Some(&PermissionRule::Action(PermissionAction::Allow))
     );
 }
@@ -983,11 +1055,9 @@ fn the_real_user_config_deserializes() {
 
     assert_contains(&after, &before, "user-config.json");
     assert!(config.mcp.as_ref().expect("mcp present").len() >= 8);
-    // `permission.todoread` is not one of the oracle's named keys and must survive.
-    let Some(PermissionConfig::Object(permission)) = &config.permission else {
-        panic!("expected the object arm");
-    };
-    assert!(permission.get("todoread").is_some());
+    // Canonical permission rules survive the checked user fixture.
+    let permission = &config.permission.as_ref().expect("permission").rules;
+    assert!(permission.get("todo_get").is_some());
 }
 
 #[test]

@@ -93,13 +93,6 @@ else
     "install with 'cargo install cargo-deny'; needed by the supply-chain gate, not by a normal build"
 fi
 
-if [ -d .omo/refs ] && [ -n "$(ls -A .omo/refs 2>/dev/null)" ]; then
-  pass "reference clones present ($(find .omo/refs -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') trees)"
-else
-  warn ".omo/refs is missing or empty" \
-    "reference clones are gitignored; re-clone them if a task cites .omo/refs paths"
-fi
-
 echo
 if [ "$failures" -gt 0 ]; then
   echo "preflight FAILED: $failures required check(s) failed, $warnings warning(s)"

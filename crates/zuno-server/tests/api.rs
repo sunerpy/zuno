@@ -1071,7 +1071,7 @@ async fn malformed_owned_question_reply_rejects_and_removes_the_request() {
             .await
             .expect("owned malformed cleanup must release the question asker")
             .expect("question asker task does not panic"),
-        QuestionDecision::Rejected
+        QuestionDecision::Failed
     );
     assert!(
         requests.questions(None).is_empty(),
@@ -1147,7 +1147,7 @@ async fn question_without_an_observer_is_rejected_by_the_deadline() {
             .await
             .expect("an unobserved question request must have a finite deadline")
             .expect("question asker task does not panic"),
-        QuestionDecision::Rejected,
+        QuestionDecision::Expired,
         "the deadline must fail closed rather than invent an answer"
     );
     assert!(
@@ -1373,7 +1373,7 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
                 "status": "completed",
                 "text": "background result"
             }),
-            InputDelivery::NextStep,
+            InputDelivery::Queue,
             1,
         ))
         .expect("admit background report");
@@ -1426,7 +1426,7 @@ async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the
             "input_malformed",
             "ses_malformed",
             json!({"kind": "unknown"}),
-            InputDelivery::NextStep,
+            InputDelivery::Queue,
             1,
         ))
         .expect("admit malformed input");

@@ -72,6 +72,8 @@ pub enum GoalStatus {
     BudgetLimited,
     /// The model reported the objective met.
     Complete,
+    /// The user explicitly abandoned this goal instance.
+    Cancelled,
 }
 
 impl GoalStatus {
@@ -79,13 +81,14 @@ impl GoalStatus {
     ///
     /// Exported so a test can walk the whole matrix rather than the handful of
     /// transitions whoever wrote it happened to think of.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Active,
         Self::Paused,
         Self::Blocked,
         Self::UsageLimited,
         Self::BudgetLimited,
         Self::Complete,
+        Self::Cancelled,
     ];
 
     /// The stored string.
@@ -98,6 +101,7 @@ impl GoalStatus {
             Self::UsageLimited => "usage_limited",
             Self::BudgetLimited => "budget_limited",
             Self::Complete => "complete",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -126,9 +130,11 @@ impl GoalStatus {
     pub fn owner(self) -> StatusOwner {
         match self {
             Self::Blocked | Self::Complete => StatusOwner::Model,
-            Self::Active | Self::Paused | Self::UsageLimited | Self::BudgetLimited => {
-                StatusOwner::System
-            }
+            Self::Active
+            | Self::Paused
+            | Self::UsageLimited
+            | Self::BudgetLimited
+            | Self::Cancelled => StatusOwner::System,
         }
     }
 
@@ -144,7 +150,7 @@ impl GoalStatus {
     /// to resume, so a continuation board must not retire them.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::BudgetLimited | Self::Complete)
+        matches!(self, Self::BudgetLimited | Self::Complete | Self::Cancelled)
     }
 
     /// Every status string, for an error message.
@@ -230,7 +236,8 @@ impl ModelStatus {
             GoalStatus::Active
             | GoalStatus::Paused
             | GoalStatus::UsageLimited
-            | GoalStatus::BudgetLimited => Err(GoalError::StatusNotModelOwned {
+            | GoalStatus::BudgetLimited
+            | GoalStatus::Cancelled => Err(GoalError::StatusNotModelOwned {
                 requested: status,
                 allowed: Self::rendered_values(),
             }),
@@ -272,15 +279,18 @@ pub enum SystemStatus {
     UsageLimited,
     /// The token budget is spent.
     BudgetLimited,
+    /// The user permanently abandoned this goal instance.
+    Cancelled,
 }
 
 impl SystemStatus {
     /// Every status the system may write.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Active,
         Self::Paused,
         Self::UsageLimited,
         Self::BudgetLimited,
+        Self::Cancelled,
     ];
 
     /// The stored string.
@@ -297,6 +307,7 @@ impl SystemStatus {
             Self::Paused => GoalStatus::Paused,
             Self::UsageLimited => GoalStatus::UsageLimited,
             Self::BudgetLimited => GoalStatus::BudgetLimited,
+            Self::Cancelled => GoalStatus::Cancelled,
         }
     }
 
@@ -311,6 +322,7 @@ impl SystemStatus {
             GoalStatus::Paused => Some(Self::Paused),
             GoalStatus::UsageLimited => Some(Self::UsageLimited),
             GoalStatus::BudgetLimited => Some(Self::BudgetLimited),
+            GoalStatus::Cancelled => Some(Self::Cancelled),
             GoalStatus::Blocked | GoalStatus::Complete => None,
         }
     }
@@ -400,7 +412,7 @@ mod tests {
             .filter(|status| status.is_terminal())
             .map(GoalStatus::as_str)
             .collect();
-        assert_eq!(terminal, ["budget_limited", "complete"]);
+        assert_eq!(terminal, ["budget_limited", "complete", "cancelled"]);
         let active: Vec<&str> = GoalStatus::ALL
             .into_iter()
             .filter(|status| status.is_active())

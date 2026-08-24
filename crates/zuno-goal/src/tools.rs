@@ -10,11 +10,11 @@ use zuno_error::ToolError;
 use zuno_tool::{Tool, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool, erase};
 
 /// Wire name of the goal reader.
-pub const GET_GOAL_TOOL_ID: &str = "get_goal";
+pub const GET_GOAL_TOOL_ID: &str = "goal_get";
 /// Wire name of the model-authorized goal creator.
-pub const CREATE_GOAL_TOOL_ID: &str = "create_goal";
+pub const CREATE_GOAL_TOOL_ID: &str = "goal_propose";
 /// Wire name of the model-authorized status updater.
-pub const UPDATE_GOAL_TOOL_ID: &str = "update_goal";
+pub const UPDATE_GOAL_TOOL_ID: &str = "goal_update";
 
 /// The description the model reads for [`GetGoalTool`].
 pub const GET_DESCRIPTION: &str = include_str!("description/get-goal.txt");
@@ -34,6 +34,9 @@ pub struct GetGoalParams {}
 pub struct CreateGoalParams {
     /// Concrete objective the goal should pursue.
     pub objective: String,
+    /// Concrete checks that define completion. The model cannot later rewrite them.
+    #[serde(default)]
+    pub success_criteria: Vec<String>,
     /// Positive token ceiling, only when explicitly requested.
     #[serde(default)]
     pub token_budget: Option<i64>,
@@ -62,6 +65,8 @@ impl From<UpdateGoalStatus> for ModelStatus {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateGoalParams {
+    /// Revision returned by `goal_get`; stale revisions are rejected.
+    pub expected_revision: i64,
     /// Terminal status justified by the completion or blocked audit.
     pub status: UpdateGoalStatus,
     /// Stable description of the impasse. Required only with `status: blocked`.
@@ -154,9 +159,20 @@ impl TypedTool for CreateGoalTool {
         let store = Arc::clone(&self.store);
         let session_id = ctx.session_id;
         let objective = params.objective;
+        let success_criteria = params
+            .success_criteria
+            .into_iter()
+            .map(|criterion| criterion.trim().to_owned())
+            .filter(|criterion| !criterion.is_empty())
+            .collect::<Vec<_>>();
         let token_budget = params.token_budget;
         let goal = tokio::task::spawn_blocking(move || {
-            store.create_goal(&session_id, &objective, token_budget)
+            store.create_goal_with_criteria(
+                &session_id,
+                &objective,
+                &success_criteria,
+                token_budget,
+            )
         })
         .await
         .map_err(|error| failed(CREATE_GOAL_TOOL_ID, error))?
@@ -196,8 +212,15 @@ impl TypedTool for UpdateGoalTool {
         params: UpdateGoalParams,
         ctx: ToolContext,
     ) -> Result<ToolOutput, ToolError> {
+        if params.expected_revision <= 0 {
+            return Err(invalid(
+                UPDATE_GOAL_TOOL_ID,
+                "expected_revision must be a positive integer returned by goal_get",
+            ));
+        }
         let store = Arc::clone(&self.store);
         let session_id = ctx.session_id;
+        let expected_revision = params.expected_revision;
         let status = ModelStatus::from(params.status);
         if matches!(status, ModelStatus::Blocked) {
             let condition = params
@@ -215,7 +238,11 @@ impl TypedTool for UpdateGoalTool {
             let staged_session_id = session_id.clone();
             let condition = condition.to_owned();
             let staged = tokio::task::spawn_blocking(move || {
-                staged_store.stage_failure_signal(&staged_session_id, &condition)
+                staged_store.stage_failure_signal_checked(
+                    &staged_session_id,
+                    &condition,
+                    expected_revision,
+                )
             })
             .await
             .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
@@ -238,11 +265,16 @@ impl TypedTool for UpdateGoalTool {
                 "blocking_condition is only valid when status is blocked",
             ));
         }
-        let goal =
-            tokio::task::spawn_blocking(move || store.update_status_as_model(&session_id, status))
-                .await
-                .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
-                .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
+        let goal = tokio::task::spawn_blocking(move || {
+            if matches!(status, ModelStatus::Complete) {
+                store.complete_checked(&session_id, expected_revision)
+            } else {
+                store.update_status_as_model_checked(&session_id, status, expected_revision)
+            }
+        })
+        .await
+        .map_err(|error| failed(UPDATE_GOAL_TOOL_ID, error))?
+        .map_err(|error| map_goal_error(UPDATE_GOAL_TOOL_ID, error))?;
         if goal.is_none() {
             return Err(invalid(
                 UPDATE_GOAL_TOOL_ID,
@@ -273,6 +305,7 @@ fn goal_output(tool: &str, goal: Option<Goal>) -> Result<ToolOutput, ToolError> 
         crate::GoalStatus::UsageLimited => "Goal usage limited",
         crate::GoalStatus::BudgetLimited => "Goal budget limited",
         crate::GoalStatus::Complete => "Goal complete",
+        crate::GoalStatus::Cancelled => "Goal cancelled",
     });
     Ok(ToolOutput::text(title, rendered).with_metadata("goal", value))
 }

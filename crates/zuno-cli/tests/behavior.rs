@@ -369,11 +369,14 @@ fn plugin_add_update_list_and_remove_use_project_extension_storage() {
       "mode": "subagent",
       "prompt": "Use native tools to review the request.",
       "permission": {
-        "read": "allow",
-        "glob": "allow",
-        "grep": "allow",
-        "web_search": "allow",
-        "bash": "ask"
+        "mode": "standard",
+        "rules": {
+          "read": "allow",
+          "glob": "allow",
+          "grep": "allow",
+          "web_search": "allow",
+          "bash": "ask"
+        }
       }
     }
   },

@@ -46,7 +46,7 @@ fn fixture() -> Result<ConfigFixture, Box<dyn Error>> {
     let fixture = ConfigFixture::new()?.mark_worktree_root("")?.global(
         r#"{
   "model": "differential/model",
-  "agent": {
+  "agents": {
     "plan": { "description": "overridden plan", "mode": "all" },
     "title": { "description": "overridden title", "temperature": 0.9 }
   }

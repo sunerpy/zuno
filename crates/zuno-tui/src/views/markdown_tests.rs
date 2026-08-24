@@ -833,7 +833,7 @@ fn markdown_a_degenerate_width_does_not_panic() {
 
 #[test]
 fn markdown_render_is_a_pure_function_of_source_width_and_palette() {
-    // `.omo/plans/memory-perf-optimization.md` §3.3 R2-R5 memoise this function. A
+    // The perf plan §3.3 R2-R5 memoise this function. A
     // memoised function that consults hidden state returns the wrong answer, so equal
     // inputs must give equal output and a changed palette must give a different one.
     let dark = palette();

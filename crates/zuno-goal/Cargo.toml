@@ -12,9 +12,8 @@ publish.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 # `zuno-db` supplies the connection, the pragmas and the `IMMEDIATE` transaction
-# helper. It is a dependency and *not* a host: the goal lives in its own database
-# file so session pruning and schema evolution cannot cascade goal state. See
-# `store.rs`.
+# helper. Goal records live in the host session database so Goal, Plan, Todo,
+# Job and message checkpoints share one transactional boundary. See `store.rs`.
 zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }

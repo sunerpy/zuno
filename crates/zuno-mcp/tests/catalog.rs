@@ -181,9 +181,12 @@ fn prompt(name: &str, arguments: &[&str]) -> PromptDefinition {
 
 /// Rules from a literal config object, so a test states `{"read": "deny"}` the
 /// way a user writes it rather than hand-building `Rule` values.
-fn rules(config: Value) -> Vec<Rule> {
-    let config: PermissionConfig =
-        serde_json::from_value(config).expect("permission config fixture parses");
+fn rules(rules: Value) -> Vec<Rule> {
+    let config: PermissionConfig = serde_json::from_value(json!({
+        "mode": "standard",
+        "rules": rules,
+    }))
+    .expect("permission config fixture parses");
     rules_from_config(&config)
 }
 

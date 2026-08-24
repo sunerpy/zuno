@@ -181,7 +181,7 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
         }
     }
 
-    result.insert_if_absent("agent", RawJson::empty_object());
+    result.insert_if_absent("agents", RawJson::empty_object());
 
     for directory in
         read_config_directories(&options.layout, &options.directory, options.worktree())
@@ -216,8 +216,9 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     if let Some(permission) = options.env.truthy_value(ZUNO_PERMISSION)
         && let Ok(layer) = serde_json::from_str::<RawJson>(permission)
     {
-        let target = result.entry_or_insert("permission", RawJson::empty_object());
-        merge_deep(target, layer);
+        let policy = result.entry_or_insert("permission", RawJson::empty_object());
+        let rules = policy.entry_or_insert("rules", RawJson::empty_object());
+        merge_deep(rules, layer);
     }
 
     apply_tools_permissions(&mut result);
@@ -373,7 +374,7 @@ fn restore_merged_agent_options(
     let Some(agents) = config.agent.take() else {
         return Ok(());
     };
-    let raw_agents = raw.get("agent");
+    let raw_agents = raw.get("agents");
     let mut restored = crate::schema::ordered::OrderedMap::new();
     for (name, mut agent) in agents {
         if let Some(options) = raw_agents
@@ -458,10 +459,11 @@ fn apply_tools_permissions(result: &mut RawJson) {
             RawJson::String(if enabled { "allow" } else { "deny" }.to_owned()),
         );
     }
-    if let Some(permission) = result.get("permission").cloned() {
-        merge_deep(&mut defaults, permission);
+    let policy = result.entry_or_insert("permission", RawJson::empty_object());
+    if let Some(rules) = policy.get("rules").cloned() {
+        merge_deep(&mut defaults, rules);
     }
-    result.insert("permission", defaults);
+    policy.insert("rules", defaults);
 }
 
 fn apply_username(result: &mut RawJson, fallback: &str) {
