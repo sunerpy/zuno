@@ -100,9 +100,10 @@ system. They should be completed and simplified rather than reimplemented.
 6. Skill resolution, Agent capability selection, and prompt generation need one
    immutable snapshot shared by the parent, child tasks, workflow recovery, and
    diagnostics.
-7. `apply_patch` guidance is too terse. Multi-file application can become
-   partially applied if a later filesystem operation fails, after which Zuno
-   can only report `Uncertain`.
+7. `apply_patch` now teaches direct invocation, generator/write selection,
+   context-conflict recovery, and uncertain-outcome inspection. Multi-file
+   application can still become partially applied if a later filesystem
+   operation fails, after which Zuno can only report `Uncertain`.
 8. Prompt receipts still lack a complete redacted manifest of final provider
    request ordering and the exact advertised tool-schema digests.
 9. Agent/workflow/Skill contributions are not yet first-class transactional
@@ -372,8 +373,10 @@ raw Git unified diff. Zuno already implements the same high-level
 The prompt should teach:
 
 - use `apply_patch` for focused source edits and coherent multi-file changes;
-- use `edit` for a small exact replacement when that is clearer;
-- use `write` only for a new file or an intentional full replacement;
+- call the dedicated tool directly rather than routing it through `bash` or a
+  heredoc;
+- use `write` only for a new file best expressed as complete content or an
+  intentional full replacement;
 - do not patch generated output when the owning generator or formatter should
   run instead;
 - use enough unique hunk context and keep patches narrow;
@@ -382,6 +385,13 @@ The prompt should teach:
 - after a successful tool receipt, use its returned diff and content digests
   rather than re-reading files without a reason;
 - verify behavior with the narrowest relevant test or check.
+
+The production model surface now exposes `read`, `write`, and `apply_patch`.
+The older exact-replacement `edit` implementation remains an internal runtime
+capability but is not advertised as a competing model editor. The tool
+description and context-conflict errors implement the selection and recovery
+rules above, and tests pin those clauses. This does not complete the
+transactional requirements below.
 
 ### Transactional apply
 

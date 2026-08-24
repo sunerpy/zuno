@@ -640,6 +640,43 @@ async fn file_apply_patch_adds_updates_moves_and_deletes_files() {
 }
 
 #[tokio::test]
+async fn file_apply_patch_context_drift_tells_the_model_how_to_recover() {
+    let (workspace, tools, permission) = setup();
+    let path = workspace.path().join("drifted.txt");
+    std::fs::write(&path, "current\n").expect("fixture");
+
+    let error = tools
+        .apply_patch
+        .execute(
+            json!({
+                "patchText": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: drifted.txt\n",
+                    "@@\n",
+                    "-stale\n",
+                    "+updated\n",
+                    "*** End Patch"
+                )
+            }),
+            normal_context(permission),
+        )
+        .await
+        .expect_err("stale hunk context must be rejected");
+
+    let message = source_message(&error);
+    assert!(message.contains("read the current file"), "{message}");
+    assert!(message.contains("smaller patch"), "{message}");
+    assert!(
+        message.contains("do not resend the same patch"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).expect("unchanged file"),
+        "current\n"
+    );
+}
+
+#[tokio::test]
 async fn file_apply_patch_reports_an_uncertain_multi_file_outcome_after_a_late_failure() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     let tools = FileTools::with_formatter(workspace.path(), Arc::new(FailingFormatter::on_call(2)))
@@ -848,6 +885,28 @@ fn file_model_surface_has_one_structured_editor_and_one_full_write_fallback() {
         .collect::<Vec<_>>();
 
     assert_eq!(ids, ["read", "write", "apply_patch"]);
+}
+
+#[test]
+fn file_apply_patch_description_defines_selection_and_recovery_rules() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tools = FileTools::new(workspace.path()).expect("file tools");
+    let description = tools.apply_patch.description();
+
+    for clause in [
+        "Call this tool directly",
+        "generated files or bulk mechanical rewrites",
+        "read the affected file",
+        "smaller patch",
+        "Do not resend the same patch",
+        "uncertain",
+        "Use `write` only",
+    ] {
+        assert!(
+            description.contains(clause),
+            "apply_patch description is missing `{clause}`:\n{description}"
+        );
+    }
 }
 
 /// Defect: the TUI diff viewer was permanently empty for every tool that edits code,

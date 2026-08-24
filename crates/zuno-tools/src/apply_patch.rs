@@ -19,6 +19,9 @@ use zuno_tool::{ToolContext, ToolOutput, TypedTool};
 /// The description the model reads.
 pub const DESCRIPTION: &str = include_str!("description/apply-patch.txt");
 
+const CONTEXT_RECOVERY: &str = "read the current file and retry with a smaller patch using fresh, \
+                                unique context; do not resend the same patch";
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApplyPatchParams {
@@ -425,8 +428,9 @@ fn apply_chunks(
                 invalid(
                     "apply_patch",
                     format!(
-                        "apply_patch verification failed: hunk header `{header}` was not found in {}",
-                        path.display()
+                        "apply_patch verification failed: hunk header `{header}` was not found in \
+                         {}; {CONTEXT_RECOVERY}",
+                        path.display(),
                     ),
                 )
             })?
@@ -466,8 +470,9 @@ fn apply_chunks(
             return Err(invalid(
                 "apply_patch",
                 format!(
-                    "apply_patch verification failed: hunk context was not found in {}",
-                    path.display()
+                    "apply_patch verification failed: hunk context was not found in {}; \
+                     {CONTEXT_RECOVERY}",
+                    path.display(),
                 ),
             ));
         };
