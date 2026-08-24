@@ -1,4 +1,4 @@
-//! `plan_exit` — leaving plan mode for the build agent, with the user's consent.
+//! `plan_exit` — leaving plan mode for the orchestrator, with the user's consent.
 //!
 //! # The registry key is not the wire id, and the condition is a conjunction
 //!
@@ -29,8 +29,8 @@
 //!    staying in plan mode is an error result and not a successful no-op. This port
 //!    reports [`zuno_error::ToolError::Denied`], which is the same claim: the call
 //!    cannot proceed until a human decides differently.
-//! 3. Otherwise switch the session to the `build` agent by appending a synthetic user
-//!    message, and return "Switching to build agent".
+//! 3. Otherwise switch the session to the `orchestrator` agent by appending a
+//!    synthetic user message, and return "Switching to orchestrator".
 //!
 //! Step 3 writes session messages, which this crate cannot do, so it is the
 //! [`PlanExitHost`] seam. Step 1 goes through the same [`crate::question::QuestionAsker`]
@@ -56,7 +56,7 @@ pub const WIRE_ID: &str = "plan_exit";
 pub const DESCRIPTION: &str = include_str!("description/plan-exit.txt");
 
 /// The short label beside the approval prompt, verbatim from `plan.ts:35`.
-pub const QUESTION_HEADER: &str = "Build Agent";
+pub const QUESTION_HEADER: &str = "Orchestrator";
 
 /// The label that approves the switch, verbatim from `plan.ts:38`.
 pub const APPROVE_LABEL: &str = "Yes";
@@ -64,15 +64,15 @@ pub const APPROVE_LABEL: &str = "Yes";
 /// The label that declines it, verbatim from `plan.ts:39`.
 pub const DECLINE_LABEL: &str = "No";
 
-/// The agent the session switches to, verbatim from `plan.ts:58`.
-pub const BUILD_AGENT: &str = "build";
+/// The Agent the session switches to after approval.
+pub const WORK_AGENT: &str = "orchestrator";
 
 /// The title on the rendered result, verbatim from `plan.ts:72`.
-pub const TITLE: &str = "Switching to build agent";
+pub const TITLE: &str = "Switching to orchestrator";
 
 /// The output the model reads on approval, verbatim from `plan.ts:73`.
 pub const APPROVED_OUTPUT: &str =
-    "User approved switching to build agent. Wait for further instructions.";
+    "User approved switching to the orchestrator. Wait for further instructions.";
 
 /// The session-layer effects this tool needs and this crate cannot perform.
 ///
@@ -94,7 +94,7 @@ pub trait PlanExitHost: Send + Sync + 'static {
     /// [`ToolError`] when the session or its plan path cannot be resolved.
     async fn plan_path(&self, session_id: &str) -> Result<String, ToolError>;
 
-    /// Record the approval: switch `session_id` to the `build` agent.
+    /// Record the approval: switch `session_id` to the work orchestrator.
     ///
     /// Upstream appends a synthetic user message carrying the agent switch and a
     /// text part naming the approved plan (`plan.ts:53-69`). The model that comes
@@ -104,7 +104,7 @@ pub trait PlanExitHost: Send + Sync + 'static {
     /// # Errors
     ///
     /// [`ToolError`] when the switch could not be recorded.
-    async fn switch_to_build(&self, session_id: &str, plan: &str) -> Result<(), ToolError>;
+    async fn switch_to_work(&self, session_id: &str, plan: &str) -> Result<(), ToolError>;
 }
 
 /// A [`PlanExitHost`] that records the switch instead of performing it.
@@ -148,7 +148,7 @@ impl PlanExitHost for RecordingHost {
         Ok(self.plan.clone())
     }
 
-    async fn switch_to_build(&self, session_id: &str, plan: &str) -> Result<(), ToolError> {
+    async fn switch_to_work(&self, session_id: &str, plan: &str) -> Result<(), ToolError> {
         self.switched
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -166,7 +166,7 @@ impl PlanExitHost for RecordingHost {
 #[serde(deny_unknown_fields)]
 pub struct PlanExitParams {}
 
-/// Asks the user to approve the plan, then switches the session to `build`.
+/// Asks the user to approve the plan, then switches the session to `orchestrator`.
 pub struct PlanExitTool {
     asker: Arc<dyn QuestionAsker>,
     host: Arc<dyn PlanExitHost>,
@@ -199,13 +199,13 @@ impl PlanExitTool {
         QuestionRequest::closed(
             format!(
                 "Plan at {plan} is complete. \
-                 Would you like to switch to the build agent and start implementing?"
+                 Would you like to switch to the orchestrator and start implementing?"
             ),
             QUESTION_HEADER,
             vec![
                 QuestionOption::new(
                     APPROVE_LABEL,
-                    "Switch to build agent and start implementing the plan",
+                    "Switch to the orchestrator and start implementing the plan",
                 ),
                 QuestionOption::new(
                     DECLINE_LABEL,
@@ -284,10 +284,10 @@ impl TypedTool for PlanExitTool {
             });
         }
 
-        self.host.switch_to_build(&ctx.session_id, &plan).await?;
+        self.host.switch_to_work(&ctx.session_id, &plan).await?;
 
         Ok(ToolOutput::text(TITLE, APPROVED_OUTPUT)
-            .with_metadata("agent", serde_json::Value::String(BUILD_AGENT.to_owned()))
+            .with_metadata("agent", serde_json::Value::String(WORK_AGENT.to_owned()))
             .with_metadata("plan", serde_json::Value::String(plan)))
     }
 }
@@ -387,9 +387,9 @@ mod tests {
         assert_eq!(
             question.question,
             "Plan at .zuno/plans/auth.md is complete. \
-             Would you like to switch to the build agent and start implementing?"
+             Would you like to switch to the orchestrator and start implementing?"
         );
-        assert_eq!(question.header, "Build Agent");
+        assert_eq!(question.header, "Orchestrator");
         assert_eq!(question.custom, Some(false));
         let labels: Vec<&str> = question
             .options
@@ -419,7 +419,7 @@ mod tests {
     // --- approval ---
 
     #[tokio::test]
-    async fn an_approval_switches_the_session_to_the_build_agent() {
+    async fn an_approval_switches_the_session_to_the_orchestrator() {
         let host = Arc::new(RecordingHost::new("plans/x.md"));
         let output = tool(
             Arc::new(ScriptedAnswers::selecting("Yes")),
@@ -429,12 +429,12 @@ mod tests {
         .await
         .expect("approved");
 
-        assert_eq!(output.title, "Switching to build agent");
+        assert_eq!(output.title, "Switching to orchestrator");
         assert_eq!(
             output.output,
-            "User approved switching to build agent. Wait for further instructions."
+            "User approved switching to the orchestrator. Wait for further instructions."
         );
-        assert_eq!(output.metadata["agent"], "build");
+        assert_eq!(output.metadata["agent"], "orchestrator");
         assert_eq!(output.metadata["plan"], "plans/x.md");
         assert_eq!(
             host.switched(),

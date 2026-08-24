@@ -99,7 +99,7 @@ const REFLECTION_LEASE_MILLIS: i64 = 60 * 60 * 1_000;
 const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 
 /// The agent every surface falls back to.
-pub(crate) const DEFAULT_AGENT: &str = "build";
+pub(crate) const DEFAULT_AGENT: &str = "orchestrator";
 
 const DEFAULT_MAX_STEPS: u32 = 100;
 const ZUNO_ENABLE_EXPERIMENTAL_MODELS: &str = "ZUNO_ENABLE_EXPERIMENTAL_MODELS";
@@ -241,7 +241,7 @@ pub(crate) struct TurnOptions {
     pub(crate) directory: Option<PathBuf>,
     /// `provider/model`, defaulting through the agent, config, and catalog.
     pub(crate) model: Option<String>,
-    /// The agent name, defaulting to [`DEFAULT_AGENT`].
+    /// The agent name, defaulting through config and then [`DEFAULT_AGENT`].
     pub(crate) agent: Option<String>,
     /// Which session to talk in.
     pub(crate) session: SessionChoice,
@@ -484,7 +484,8 @@ impl TurnPlan {
             zuno_catalog::agent::merge_agent_maps(&loaded_agents.agents, extensions.agents())
                 .map_err(to_string)?;
         let agents = zuno_catalog::agent::list(&merged_agents, &loaded_agents.origins);
-        let agent_name = options.agent.as_deref().unwrap_or(DEFAULT_AGENT);
+        let agent_name =
+            resolve_agent_name(options.agent.as_deref(), config.default_agent.as_deref());
         let agent = agents
             .iter()
             .find(|entry| entry.name == agent_name)
@@ -1028,11 +1029,18 @@ fn collaboration_mode_prompt(agent: &str) -> Option<&'static str> {
         "plan" => Some(
             "Collaboration mode: Plan. Inspect and reason in read-only mode. The durable plan and              work items are the authoritative result; prose alone does not change execution state.              Do not modify product files or start implementation. Ask only questions that materially              change the design. When the plan is decision-complete, tell the user to confirm Start              Work or run `/start-work`; never switch modes on the user's behalf.",
         ),
+        "orchestrator" => Some(
+            "Collaboration mode: Orchestrated Work. Deliver the requested outcome and use              delegation only when specialization or safe parallelism provides clear value. Treat the              durable plan, goal, todos, jobs, and queued input as authoritative execution state. Keep              those records current, independently verify child results, and use `/start-plan` when a              new read-only design pass is required.",
+        ),
         "build" => Some(
-            "Collaboration mode: Work. Implement the requested outcome and treat any durable plan,              goal, todos, jobs, and queued input as authoritative execution state. Keep those records              current while work proceeds. Use `/start-plan` when a new read-only design pass is              required; do not represent a prose checklist as durable plan state.",
+            "Collaboration mode: Direct Work. Implement the requested outcome in this Agent              without delegation. Treat any durable plan, goal, todos, jobs, and queued input as              authoritative execution state. Keep those records current while work proceeds. Use              `/start-plan` when a new read-only design pass is required; do not represent a prose              checklist as durable plan state.",
         ),
         _ => None,
     }
+}
+
+fn resolve_agent_name<'a>(requested: Option<&'a str>, configured: Option<&'a str>) -> &'a str {
+    requested.or(configured).unwrap_or(DEFAULT_AGENT)
 }
 
 fn internal_prompt(name: &str) -> Result<String, String> {

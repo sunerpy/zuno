@@ -99,11 +99,11 @@ Inspect a background task by the jobID returned from task. Returns its durable r
 Propose one durable resident-memory change for user review. Use global only for cross-project preferences and project for repository-specific rules. Record stable facts, user corrections, or verified reusable recovery knowledge. Never record secrets, temporary environment failures, unresolved guesses, task progress, or one-off narratives. This tool creates an auditable candidate; it does not imply the resident file was changed.
 >>>
 
-## plan_exit | crates/zuno-tools/src/description/plan-exit.txt | 815 bytes | trailing-newline: yes
+## plan_exit | crates/zuno-tools/src/description/plan-exit.txt | 812 bytes | trailing-newline: yes
 <<<
 Use this tool when you have completed the planning phase and are ready to exit plan agent.
 
-This tool will ask the user if they want to switch to build agent to start implementing the plan.
+This tool asks the user whether to switch to the orchestrator and start implementing the plan.
 
 Call this tool:
 - After you have written a complete plan to the plan file
@@ -168,10 +168,10 @@ Use action `load` with the selected `name` and `source`. Follow `next_cursor` un
 Use action `read_resource` with the same `name` and `source`, a relative `path` such as `references/ci.md`, and any returned continuation cursor. Do not use shell, find, glob, or broad filesystem scans to rediscover an advertised skill or locate its referenced files.
 >>>
 
-## task | crates/zuno-tools/src/description/task.txt | 1078 bytes | trailing-newline: yes
+## task | crates/zuno-tools/src/description/task.txt | 1079 bytes | trailing-newline: yes
 <<<
 Delegate a self-contained unit of work to a subagent in its own session.
-Name exactly one of `subagent_type` (a specific agent) or `category` (a preset shorthand, which runs the generic worker at that preset's model).
+Name exactly one of `subagent_type` (a specific Agent) or `category` (a preset shorthand, which runs the `general` Agent at that preset's model).
 State the goal, success evidence, relevant files or sources, constraints, and explicit in/out-of-scope boundaries. The parent retains integration decisions and final verification.
 Foreground is the default and blocks until the child answers; `background: true` returns immediately with a fresh job id.
 Background jobs default to `reportDelivery: "nextStep"`, which adds the terminal report to the parent's next step and wakes it. Use `"quiet"` only when the persisted job result will be inspected separately.

@@ -63,7 +63,7 @@ pub const AGENT_GLOB: &str = "{agent,agents}/**/*.md";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSource {
-    /// One of the eleven native agents, with no user definition on top.
+    /// One of the thirteen native agents, with no user definition on top.
     Native,
     /// A native agent a user definition has modified.
     NativeOverridden,
@@ -447,14 +447,14 @@ fn merge_deep(target: &mut Value, source: Value) {
     }
 }
 
-/// Fold an agent map over the eleven native agents.
+/// Fold an agent map over the thirteen native agents.
 ///
 /// * `disable: true` removes the agent, native or not.
 /// * A name that is not native becomes a new agent with `mode: "all"`.
 /// * An absent key leaves the native value in place.
 /// * `options` deep-merges rather than replacing.
 ///
-/// The returned order is the eleven native agents first, then new agents in map
+/// The returned order is the thirteen native agents first, then new agents in map
 /// order. [`list`] applies the display sort separately.
 #[must_use]
 pub fn resolve(agents: &OrderedMap<AgentConfig>, origins: &[(String, PathBuf)]) -> Vec<Agent> {
@@ -499,7 +499,9 @@ fn from_builtin(builtin: builtin::Builtin) -> Agent {
         prompt: builtin.prompt.map(str::to_owned),
         steps: None,
         tools: None,
-        delegates: None,
+        delegates: builtin
+            .delegates
+            .map(|targets| targets.iter().map(|target| (*target).to_owned()).collect()),
         options: JsonMap::new(),
         permission: None,
         source: AgentSource::Native,
@@ -759,13 +761,15 @@ mod tests {
         assert_eq!(
             names(&agents),
             vec![
+                "orchestrator",
                 "build",
                 "plan",
                 "deep",
+                "fixer",
+                "general",
                 "explorer",
                 "librarian",
-                "advisor",
-                "worker",
+                "oracle",
                 "looker",
                 "compaction",
                 "title",
@@ -788,6 +792,36 @@ mod tests {
             .expect("the new agent should exist");
         assert_eq!(fresh.mode, AgentMode::All);
         assert_eq!(fresh.source, AgentSource::Config);
+    }
+
+    #[test]
+    fn native_orchestrator_carries_the_exact_delegate_allowlist() {
+        let agents = resolve(&OrderedMap::new(), &[]);
+        let orchestrator = agents
+            .iter()
+            .find(|agent| agent.name == "orchestrator")
+            .expect("orchestrator exists");
+        assert_eq!(
+            orchestrator
+                .delegates
+                .as_ref()
+                .map(|targets| { targets.iter().map(String::as_str).collect::<Vec<_>>() }),
+            Some(vec![
+                "deep",
+                "fixer",
+                "general",
+                "explorer",
+                "librarian",
+                "oracle",
+                "looker"
+            ])
+        );
+        assert!(
+            agents
+                .iter()
+                .filter(|agent| agent.name != "orchestrator")
+                .all(|agent| agent.delegates.is_none())
+        );
     }
 
     #[test]
@@ -838,7 +872,7 @@ mod tests {
             &[],
         );
         assert!(!names(&agents).contains(&"plan"));
-        assert_eq!(agents.len(), 10);
+        assert_eq!(agents.len(), 12);
     }
 
     #[test]
@@ -921,17 +955,19 @@ mod tests {
         assert_eq!(
             names(&agents),
             vec![
-                "advisor",
                 "build",
                 "compaction",
                 "deep",
                 "explorer",
+                "fixer",
+                "general",
                 "librarian",
                 "looker",
+                "oracle",
+                "orchestrator",
                 "plan",
                 "summary",
                 "title",
-                "worker",
                 "alpha",
                 "zebra"
             ]
@@ -942,7 +978,8 @@ mod tests {
     fn the_header_is_the_line_agent_list_prints() {
         let agents = list(&OrderedMap::new(), &[]);
         let headers: Vec<String> = agents.iter().map(Agent::header).collect();
-        assert_eq!(headers[0], "advisor (subagent)");
+        assert_eq!(headers[0], "build (primary)");
+        assert!(headers.contains(&"orchestrator (primary)".to_owned()));
         assert!(headers.contains(&"build (primary)".to_owned()));
         assert!(headers.contains(&"deep (subagent)".to_owned()));
     }

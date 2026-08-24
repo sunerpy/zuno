@@ -424,10 +424,12 @@ file, `disable: true` in frontmatter.
 
 ### Built-in agents
 
-Zuno ships with primary agents `build` and `plan`, plus `deep`, `explorer`,
-`librarian`, `advisor`, `worker`, and `looker` specialist entries. Hidden
-internal agents are `compaction`, `title`, and `summary`. To override a native
-agent's fields, define the same key in `agent: { <name>: { ... } }`.
+Zuno ships with primary agents `orchestrator`, `build`, and `plan`, plus `deep`,
+`fixer`, `general`, `explorer`, `librarian`, `oracle`, and `looker` specialist
+entries. `orchestrator` is the default and the only native Agent that may delegate;
+`build` is the direct single-lane alternative. Hidden internal agents are
+`compaction`, `title`, and `summary`. To override a native agent's fields, define
+the same key in `agent: { <name>: { ... } }`.
 
 ## Commands
 

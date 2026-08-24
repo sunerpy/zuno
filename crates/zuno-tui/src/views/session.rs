@@ -97,7 +97,7 @@ pub const UNDO_CONFIRM_DIALOG_ID: &str = "confirm.undo";
 /// Confirmation shown by `/plan` before changing the session's collaboration mode.
 pub const PLAN_START_CONFIRM_DIALOG_ID: &str = "confirm.plan.start";
 
-/// Confirmation shown before the durable plan is handed to the build agent.
+/// Confirmation shown before the durable plan is handed to the orchestrator.
 pub const WORK_START_CONFIRM_DIALOG_ID: &str = "confirm.work.start";
 
 /// The id the per-message action menu reports under.
@@ -1551,7 +1551,7 @@ impl SessionScreen {
                 WORK_START_CONFIRM_DIALOG_ID,
                 "Start implementation",
                 format!(
-                    "Use the durable plan ‘{}’ (revision {}, {completed}/{} steps already complete) and switch to the build agent?",
+                    "Use the durable plan ‘{}’ (revision {}, {completed}/{} steps already complete) and switch to the orchestrator?",
                     plan.title,
                     plan.revision,
                     plan.steps.len(),
@@ -3847,7 +3847,7 @@ impl ActionComponent for SessionScreen {
                 if dialog == WORK_START_CONFIRM_DIALOG_ID =>
             {
                 if value == crate::views::basics::CONFIRM_VALUE {
-                    self.select_collaboration_agent("build");
+                    self.select_collaboration_agent("orchestrator");
                 }
                 EventResult::REDRAW
             }

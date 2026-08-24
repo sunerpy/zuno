@@ -23,7 +23,7 @@ use zuno_tools::FileTools;
 use zuno_tools::registry::{BUILTIN_ORDER, BuiltinSlot, RegistryFlags, ToolRegistryBuilder};
 use zuno_tools::task::{
     COORDINATOR, ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, FixedFacts,
-    RecordingHost, TaskTool, WIRE_ID, valid_targets,
+    GENERIC_EXECUTOR, RecordingHost, TaskTool, WIRE_ID, valid_targets,
 };
 
 const REASONER: &str = "acme/reasoner";
@@ -150,7 +150,7 @@ async fn naming_build_is_rejected_with_a_message_listing_valid_targets() {
     let targets = valid_targets(false);
     assert_eq!(
         targets.len(),
-        5,
+        6,
         "the native roster's delegable set: {targets:?}"
     );
     for target in &targets {
@@ -258,7 +258,7 @@ async fn a_child_session_cannot_delegate_again_at_the_default_bound() {
 
     let error = TaskTool::new(Arc::new(InChildSession), facts())
         .run_erased(
-            json!({ "prompt": "delegate deeper", "subagent_type": "worker" }),
+            json!({ "prompt": "delegate deeper", "subagent_type": GENERIC_EXECUTOR }),
             context(),
         )
         .await

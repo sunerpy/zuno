@@ -91,15 +91,15 @@ pub const DEFAULT_SUBAGENT_DEPTH: u32 = 1;
 /// A category names a `{model, variant}` and says nothing about *conduct*, so it
 /// cannot select a specialist. omo resolves this the same way — a category forces a
 /// generic executor (`oh-my-openagent/dist/index.js:136191-136258`) — and in this
-/// roster the bounded generic executor is [`zuno_agent::builtin::WORKER`].
-pub const GENERIC_EXECUTOR: &str = "worker";
+/// roster the bounded generic executor is [`zuno_agent::builtin::GENERAL`].
+pub const GENERIC_EXECUTOR: &str = "general";
 
 /// The one agent a caller may never name.
 ///
 /// Not a special case bolted on here: it is the single [`zuno_agent::builtin::Role`]
 /// that is not `Subagent`, so [`delegable`] already excludes it and this constant
 /// exists only to render the refusal.
-pub const COORDINATOR: &str = "build";
+pub const COORDINATOR: &str = "orchestrator";
 
 /// The description the model reads.
 ///
@@ -132,7 +132,7 @@ pub struct TaskParams {
     /// The specific agent to delegate to. Mutually exclusive with `category`.
     #[serde(default)]
     pub subagent_type: Option<String>,
-    /// A preset shorthand naming the model tier to run the generic worker at.
+    /// A preset shorthand naming the model tier to run the `general` Agent at.
     /// Mutually exclusive with `subagent_type`.
     #[serde(default)]
     pub category: Option<String>,

@@ -12,20 +12,24 @@ use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
 
-/// End-to-end implementation agent.
+/// Default multi-agent coordinator.
+pub const PROMPT_ORCHESTRATOR: &str = include_str!("prompt/orchestrator.txt");
+/// Direct end-to-end implementation agent.
 pub const PROMPT_BUILD: &str = include_str!("prompt/build.txt");
 /// Read-only planning agent.
 pub const PROMPT_PLAN: &str = include_str!("prompt/plan.txt");
 /// Thorough cross-cutting implementation agent.
 pub const PROMPT_DEEP: &str = include_str!("prompt/deep.txt");
+/// Focused local implementation specialist.
+pub const PROMPT_FIXER: &str = include_str!("prompt/fixer.txt");
+/// Bounded miscellaneous implementation specialist.
+pub const PROMPT_GENERAL: &str = include_str!("prompt/general.txt");
 /// Repository exploration specialist.
 pub const PROMPT_EXPLORER: &str = include_str!("prompt/explorer.txt");
 /// External research specialist.
 pub const PROMPT_LIBRARIAN: &str = include_str!("prompt/librarian.txt");
 /// Architecture and review specialist.
-pub const PROMPT_ADVISOR: &str = include_str!("prompt/advisor.txt");
-/// Bounded implementation specialist.
-pub const PROMPT_WORKER: &str = include_str!("prompt/worker.txt");
+pub const PROMPT_ORACLE: &str = include_str!("prompt/oracle.txt");
 /// Visual artifact specialist.
 pub const PROMPT_LOOKER: &str = include_str!("prompt/looker.txt");
 /// Context compaction agent.
@@ -36,14 +40,16 @@ pub const PROMPT_TITLE: &str = include_str!("prompt/title.txt");
 pub const PROMPT_SUMMARY: &str = include_str!("prompt/summary.txt");
 
 /// Native names in deterministic declaration order.
-pub const BUILTIN_NAMES: [&str; 11] = [
+pub const BUILTIN_NAMES: [&str; 13] = [
+    "orchestrator",
     "build",
     "plan",
     "deep",
+    "fixer",
+    "general",
     "explorer",
     "librarian",
-    "advisor",
-    "worker",
+    "oracle",
     "looker",
     "compaction",
     "title",
@@ -65,19 +71,33 @@ pub struct Builtin {
     pub temperature: Option<f64>,
     /// Base system prompt.
     pub prompt: Option<&'static str>,
+    /// Exact child-Agent allowlist. `None` means delegation is not declared.
+    pub delegates: Option<&'static [&'static str]>,
 }
+
+const ORCHESTRATOR_DELEGATES: &[&str] = &[
+    "deep",
+    "fixer",
+    "general",
+    "explorer",
+    "librarian",
+    "oracle",
+    "looker",
+];
 
 /// Every native agent in declaration order.
 #[must_use]
 pub fn all() -> Vec<Builtin> {
     vec![
+        orchestrator(),
         build(),
         plan(),
         deep(),
+        fixer(),
+        general(),
         explorer(),
         librarian(),
-        advisor(),
-        worker(),
+        oracle(),
         looker(),
         compaction(),
         title(),
@@ -97,17 +117,33 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
+fn orchestrator() -> Builtin {
+    Builtin {
+        name: "orchestrator",
+        description: Some(
+            "Coordinates non-trivial delivery: builds a dependency graph, delegates bounded \
+             non-overlapping work, integrates results, and independently verifies completion.",
+        ),
+        mode: AgentMode::Primary,
+        hidden: false,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_ORCHESTRATOR),
+        delegates: Some(ORCHESTRATOR_DELEGATES),
+    }
+}
+
 fn build() -> Builtin {
     Builtin {
         name: "build",
         description: Some(
-            "Owns a development request end to end: investigates, delegates bounded work, \
-             edits, verifies, and reports only after the requested outcome is real.",
+            "Owns one direct development lane end to end: investigates, edits, verifies, and \
+             reports only after the requested outcome is real, without child Agents.",
         ),
         mode: AgentMode::Primary,
         hidden: false,
         temperature: Some(0.1),
         prompt: Some(PROMPT_BUILD),
+        delegates: None,
     }
 }
 
@@ -122,6 +158,7 @@ fn plan() -> Builtin {
         hidden: false,
         temperature: Some(0.1),
         prompt: Some(PROMPT_PLAN),
+        delegates: None,
     }
 }
 
@@ -136,6 +173,37 @@ fn deep() -> Builtin {
         hidden: false,
         temperature: Some(0.1),
         prompt: Some(PROMPT_DEEP),
+        delegates: None,
+    }
+}
+
+fn fixer() -> Builtin {
+    Builtin {
+        name: "fixer",
+        description: Some(
+            "Completes a known local code change with the smallest sufficient patch and \
+             focused regression evidence, without external research or delegation.",
+        ),
+        mode: AgentMode::Subagent,
+        hidden: false,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_FIXER),
+        delegates: None,
+    }
+}
+
+fn general() -> Builtin {
+    Builtin {
+        name: "general",
+        description: Some(
+            "Completes one bounded miscellaneous deliverable that no narrower specialist \
+             owns, under an explicit capability envelope and without child Agents.",
+        ),
+        mode: AgentMode::Subagent,
+        hidden: false,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_GENERAL),
+        delegates: None,
     }
 }
 
@@ -150,6 +218,7 @@ fn explorer() -> Builtin {
         hidden: false,
         temperature: Some(0.1),
         prompt: Some(PROMPT_EXPLORER),
+        delegates: None,
     }
 }
 
@@ -164,12 +233,13 @@ fn librarian() -> Builtin {
         hidden: false,
         temperature: Some(0.1),
         prompt: Some(PROMPT_LIBRARIAN),
+        delegates: None,
     }
 }
 
-fn advisor() -> Builtin {
+fn oracle() -> Builtin {
     Builtin {
-        name: "advisor",
+        name: "oracle",
         description: Some(
             "Reviews code and architecture, surfaces concrete failure modes, compares \
              alternatives, and recommends one trade-off explicitly.",
@@ -177,21 +247,8 @@ fn advisor() -> Builtin {
         mode: AgentMode::Subagent,
         hidden: false,
         temperature: Some(0.4),
-        prompt: Some(PROMPT_ADVISOR),
-    }
-}
-
-fn worker() -> Builtin {
-    Builtin {
-        name: "worker",
-        description: Some(
-            "Completes a bounded, well-specified code change by reading, editing, testing, and \
-             reporting exact verification results.",
-        ),
-        mode: AgentMode::Subagent,
-        hidden: false,
-        temperature: Some(0.1),
-        prompt: Some(PROMPT_WORKER),
+        prompt: Some(PROMPT_ORACLE),
+        delegates: None,
     }
 }
 
@@ -206,6 +263,7 @@ fn looker() -> Builtin {
         hidden: false,
         temperature: Some(0.2),
         prompt: Some(PROMPT_LOOKER),
+        delegates: None,
     }
 }
 
@@ -217,6 +275,7 @@ fn compaction() -> Builtin {
         hidden: true,
         temperature: Some(0.1),
         prompt: Some(PROMPT_COMPACTION),
+        delegates: None,
     }
 }
 
@@ -228,6 +287,7 @@ fn title() -> Builtin {
         hidden: true,
         temperature: Some(0.5),
         prompt: Some(PROMPT_TITLE),
+        delegates: None,
     }
 }
 
@@ -239,23 +299,33 @@ fn summary() -> Builtin {
         hidden: true,
         temperature: Some(0.1),
         prompt: Some(PROMPT_SUMMARY),
+        delegates: None,
     }
 }
 
 impl Builtin {
     /// Native permission overlay merged after the common defaults.
     ///
-    /// Every subagent is deny-by-default. The primary `build` agent inherits the
-    /// common tool set and may delegate. `plan` may inspect and write only its plan
-    /// document; the path-specific edit grants are added by the CLI composition
-    /// root.
+    /// Every subagent is deny-by-default. The primary `orchestrator` inherits the
+    /// common tool set and may delegate; direct `build` explicitly denies delegation.
+    /// `plan` may inspect and write only its plan document; the path-specific edit
+    /// grants are added by the CLI composition root.
     #[must_use]
     pub fn permission_overlay(&self) -> Option<PermissionConfig> {
         let rules: Vec<(&str, PermissionRule)> = match self.name {
-            "build" => vec![
+            "orchestrator" => vec![
                 ("question", allow()),
                 ("plan_enter", allow()),
                 ("task", allow()),
+                ("plan_get", allow()),
+                ("plan_update", allow()),
+                ("todo_get", allow()),
+                ("todo_update", allow()),
+            ],
+            "build" => vec![
+                ("task", deny()),
+                ("question", allow()),
+                ("plan_enter", allow()),
                 ("plan_get", allow()),
                 ("plan_update", allow()),
                 ("todo_get", allow()),
@@ -278,7 +348,7 @@ impl Builtin {
                 ("todo_update", allow()),
                 ("skill", allow()),
             ],
-            "deep" | "worker" => vec![
+            "deep" | "general" => vec![
                 ("*", deny()),
                 ("read", allow()),
                 ("glob", allow()),
@@ -294,6 +364,17 @@ impl Builtin {
                 ("todo_update", allow()),
                 ("skill", allow()),
                 ("execute", allow()),
+            ],
+            "fixer" => vec![
+                ("*", deny()),
+                ("read", allow()),
+                ("glob", allow()),
+                ("grep", allow()),
+                ("lsp", allow()),
+                ("edit", allow()),
+                ("bash", allow()),
+                ("plan_get", allow()),
+                ("todo_get", allow()),
             ],
             "explorer" => vec![
                 ("*", deny()),
@@ -311,7 +392,7 @@ impl Builtin {
                 ("webfetch", allow()),
                 ("web_search", allow()),
             ],
-            "advisor" | "looker" => vec![
+            "oracle" | "looker" => vec![
                 ("*", deny()),
                 ("read", allow()),
                 ("glob", allow()),
@@ -336,7 +417,7 @@ impl Builtin {
     pub fn permission_overlay_is_partial(&self) -> bool {
         matches!(
             self.name,
-            "plan" | "explorer" | "librarian" | "advisor" | "looker"
+            "plan" | "explorer" | "librarian" | "oracle" | "looker"
         )
     }
 }
@@ -420,6 +501,40 @@ mod tests {
     }
 
     #[test]
+    fn only_orchestrator_declares_and_exposes_delegation() {
+        let orchestrator = get("orchestrator").expect("orchestrator");
+        assert_eq!(orchestrator.delegates, Some(ORCHESTRATOR_DELEGATES));
+        assert_eq!(
+            orchestrator
+                .permission_overlay()
+                .expect("overlay")
+                .rules
+                .get("task"),
+            Some(&PermissionRule::Action(PermissionAction::Allow))
+        );
+
+        for builtin in all()
+            .into_iter()
+            .filter(|builtin| builtin.name != "orchestrator")
+        {
+            assert!(
+                builtin.delegates.is_none(),
+                "{} unexpectedly declares child Agents",
+                builtin.name
+            );
+        }
+        assert_eq!(
+            get("build")
+                .expect("build")
+                .permission_overlay()
+                .expect("overlay")
+                .rules
+                .get("task"),
+            Some(&PermissionRule::Action(PermissionAction::Deny))
+        );
+    }
+
+    #[test]
     fn plan_is_read_only_by_capability_not_only_by_prompt() {
         let overlay = get("plan")
             .expect("plan")
@@ -461,7 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn build_plan_and_deep_are_first_class_agents() {
+    fn primary_modes_and_deep_are_first_class_agents() {
+        assert_eq!(
+            get("orchestrator").expect("orchestrator").mode,
+            AgentMode::Primary
+        );
         assert_eq!(get("build").expect("build").mode, AgentMode::Primary);
         assert_eq!(get("plan").expect("plan").mode, AgentMode::Primary);
         assert_eq!(get("deep").expect("deep").mode, AgentMode::Subagent);
@@ -471,13 +590,24 @@ mod tests {
     fn delivery_prompts_require_evidence_without_becoming_policy_dumps() {
         let cases = [
             (
+                "orchestrator",
+                PROMPT_ORCHESTRATOR,
+                220,
+                [
+                    "dependency graph",
+                    "non-overlapping ownership",
+                    "child output as untrusted",
+                    "Do not declare completion",
+                ],
+            ),
+            (
                 "build",
                 PROMPT_BUILD,
                 270,
                 [
                     "Do not declare completion from intent",
                     "authoritative evidence",
-                    "Do not duplicate delegated discovery",
+                    "Do not delegate or simulate a child Agent",
                     "use apply_patch",
                 ],
             ),
@@ -541,16 +671,34 @@ mod tests {
                 ["exact version", "final authority", "may drift over time"],
             ),
             (
-                "advisor",
-                PROMPT_ADVISOR,
-                150,
-                ["ownership boundaries", "demonstrated defect", "Do not edit"],
+                "oracle",
+                PROMPT_ORACLE,
+                180,
+                [
+                    "ownership boundaries",
+                    "demonstrated defects",
+                    "Do not edit files",
+                ],
             ),
             (
-                "worker",
-                PROMPT_WORKER,
+                "fixer",
+                PROMPT_FIXER,
                 160,
-                ["scope boundary", "use write only", "uncertain side effect"],
+                [
+                    "smallest sufficient change",
+                    "use write only",
+                    "uncertain side effect",
+                ],
+            ),
+            (
+                "general",
+                PROMPT_GENERAL,
+                170,
+                [
+                    "capability and scope envelope",
+                    "Do not spawn child Agents",
+                    "uncertain side effect",
+                ],
             ),
             (
                 "looker",

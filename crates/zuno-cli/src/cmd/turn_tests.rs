@@ -44,6 +44,13 @@ fn agent_profile(
 }
 
 #[test]
+fn agent_selection_prefers_the_request_then_config_then_orchestrator() {
+    assert_eq!(resolve_agent_name(Some("build"), Some("plan")), "build");
+    assert_eq!(resolve_agent_name(None, Some("plan")), "plan");
+    assert_eq!(resolve_agent_name(None, None), "orchestrator");
+}
+
+#[test]
 fn configured_subagents_reach_task_with_their_model_choice() {
     let mut explorer = agent("explorer");
     explorer.mode = AgentMode::Subagent;
@@ -3731,9 +3738,22 @@ mod production_registry {
         skills: zuno_catalog::skill::Skills,
         config: zuno_config::schema::Config,
     ) -> Result<Fixture, String> {
+        try_assemble_for_agent_with("orchestrator", skills, config)
+    }
+
+    fn try_assemble_for_agent_with(
+        agent_name: &str,
+        skills: zuno_catalog::skill::Skills,
+        config: zuno_config::schema::Config,
+    ) -> Result<Fixture, String> {
         let directory = tempfile::TempDir::new().expect("temporary tool workspace");
         let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
-        let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+        let selected_definition =
+            zuno_catalog::agent::resolve(&zuno_config::schema::ordered::OrderedMap::new(), &[])
+                .into_iter()
+                .find(|entry| entry.name == agent_name)
+                .unwrap_or_else(|| panic!("native Agent `{agent_name}`"));
+        let selected_agent = agent_profile(selected_definition, directory.path(), &config);
         let runtime = tool_runtime::assemble(
             directory.path(),
             None,
@@ -3814,6 +3834,59 @@ mod production_registry {
              visible tools: {:?}",
             zuno_tools::TASK_WIRE_ID,
             fixture.ids
+        );
+    }
+
+    #[test]
+    fn direct_build_mode_hides_every_subagent_intent_tool() {
+        let config = zuno_config::schema::Config::from_json_str(
+            Path::new("opencode.json"),
+            r#"{
+                "agents": {
+                    "general": {"mode": "subagent"}
+                },
+                "workflows": {
+                    "bounded": {
+                        "nodes": [
+                            {"id": "work", "agent": "general"}
+                        ]
+                    }
+                },
+                "productAgent": {
+                    "codex-review": {
+                        "kind": "codex",
+                        "enabled": true,
+                        "command": "codex",
+                        "toolName": "subagent_codex_review",
+                        "permissionMode": "never"
+                    }
+                }
+            }"#,
+        )
+        .expect("build-mode config");
+
+        let fixture =
+            try_assemble_for_agent_with("build", zuno_catalog::skill::Skills::default(), config)
+                .expect("direct build registry assembles");
+
+        for id in [
+            zuno_tools::TASK_WIRE_ID,
+            zuno_tools::WORKFLOW_WIRE_ID,
+            "subagent_codex_review",
+        ] {
+            assert!(
+                !fixture.ids.iter().any(|candidate| candidate == id),
+                "direct build exposed `{id}`: {:?}",
+                fixture.ids
+            );
+        }
+        assert!(
+            fixture
+                .intents
+                .values()
+                .all(|intent| *intent != zuno_tool::ToolUiIntent::Subagent),
+            "direct build retained a subagent-intent tool: {:?}",
+            fixture.intents
         );
     }
 

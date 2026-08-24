@@ -575,7 +575,7 @@ fn session_screen_start_work_requires_a_durable_plan() {
 }
 
 #[test]
-fn session_screen_start_work_confirms_the_durable_plan_before_build_mode() {
+fn session_screen_start_work_confirms_the_durable_plan_before_orchestrated_work() {
     let (sender, _shutdown) = terminal_event_channel();
     let (selections, mut chosen) = mpsc::channel(1);
     let mut offered = catalog();
@@ -623,9 +623,9 @@ fn session_screen_start_work_confirms_the_durable_plan_before_build_mode() {
 
     assert_eq!(
         chosen.try_recv(),
-        Ok(Selection::Agent(String::from("build")))
+        Ok(Selection::Agent(String::from("orchestrator")))
     );
-    assert_eq!(screen.catalog.agent.as_deref(), Some("build"));
+    assert_eq!(screen.catalog.agent.as_deref(), Some("orchestrator"));
 }
 
 #[test]

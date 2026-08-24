@@ -49,7 +49,7 @@ use zuno_error::ToolError;
 use zuno_paths::Env;
 use zuno_permission::Rule;
 use zuno_permission::visibility::permission_key;
-use zuno_tool::{PermissionAsk, PermissionAsker, Tool, erase};
+use zuno_tool::{PermissionAsk, PermissionAsker, Tool, ToolUiIntent, erase};
 use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::question::{QuestionAsker, QuestionTool};
@@ -178,7 +178,7 @@ pub(crate) fn assemble(
         limits,
         vision_available,
     } = selection.delegation;
-    if let Some(delegates) = &selected_agent.delegates {
+    if let Some(delegates) = selected_profile.capabilities().delegation_targets() {
         let allowed = delegates
             .iter()
             .map(String::as_str)
@@ -346,6 +346,9 @@ pub(crate) fn assemble(
             .map(String::as_str)
             .collect::<BTreeSet<_>>();
         tools.retain(|tool| allowlist.contains(tool.id()));
+    }
+    if !selected_profile.capabilities().can_delegate() {
+        tools.retain(|tool| tool.ui_intent() != ToolUiIntent::Subagent);
     }
     Ok(ToolRuntime {
         tools,

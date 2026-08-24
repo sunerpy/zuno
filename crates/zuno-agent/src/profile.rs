@@ -19,10 +19,16 @@ pub struct CapabilityPolicy {
 }
 
 impl CapabilityPolicy {
-    fn resolve(definition: &Agent, rules: Vec<Rule>) -> Self {
+    fn resolve(definition: &Agent, rules: Vec<Rule>, vision_available: bool) -> Self {
         Self {
             rules,
-            delegation_targets: definition.delegates.clone(),
+            delegation_targets: definition.delegates.as_ref().map(|targets| {
+                targets
+                    .iter()
+                    .filter(|target| delegation_target_available(target, vision_available))
+                    .cloned()
+                    .collect()
+            }),
         }
     }
 
@@ -71,7 +77,7 @@ impl AgentProfile {
     /// Freeze a resolved catalog entry and permission rules into one profile.
     #[must_use]
     pub fn resolve(definition: Agent, rules: Vec<Rule>, vision_available: bool) -> Self {
-        let capabilities = CapabilityPolicy::resolve(&definition, rules);
+        let capabilities = CapabilityPolicy::resolve(&definition, rules, vision_available);
         let prompt_policy = render_prompt_policy(&definition, &capabilities, vision_available);
         Self {
             definition,
@@ -103,6 +109,17 @@ impl AgentProfile {
     pub fn prompt_policy(&self) -> &str {
         &self.prompt_policy
     }
+}
+
+fn delegation_target_available(target: &str, vision_available: bool) -> bool {
+    if vision_available {
+        return true;
+    }
+
+    // Preserve configured/custom names for the composition root's explicit
+    // validation. Only omit a target known to the native roster and known to be
+    // absent solely because its capability gate is closed.
+    builtin::get(target, false).is_some() || builtin::get(target, true).is_none()
 }
 
 fn render_prompt_policy(

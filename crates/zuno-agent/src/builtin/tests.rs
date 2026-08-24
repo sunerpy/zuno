@@ -60,16 +60,23 @@ fn every_agent_states_every_column() {
                 );
             }
             Boundary::NotDelegable { reason } => {
-                assert_eq!(
-                    agent.role,
-                    Role::Internal,
-                    "{name}: only an engine-internal agent may skip a delegation boundary"
-                );
-                assert!(
-                    INTERNAL_NAMES.contains(&name),
-                    "{name}: claims the internal exemption but is not one of the engine's \
-                     own agents"
-                );
+                match agent.role {
+                    Role::Primary => {
+                        assert_eq!(
+                            name, "build",
+                            "{name}: only the direct build primary may be non-delegable"
+                        );
+                        assert_eq!(agent.delegation, Delegation::NoChildren);
+                    }
+                    Role::Internal => assert!(
+                        INTERNAL_NAMES.contains(&name),
+                        "{name}: claims the internal exemption but is not one of the engine's \
+                         own agents"
+                    ),
+                    Role::Orchestrator | Role::Subagent => panic!(
+                        "{name}: a routing role must state when the caller should not delegate"
+                    ),
+                }
                 assert!(
                     reason.trim().len() >= 40,
                     "{name}: the exemption needs an argument, not a shrug"
@@ -91,7 +98,7 @@ fn every_agent_states_every_column() {
              10.0 must not survive",
             agent.temperature
         );
-        if agent.role != Role::Internal {
+        if !matches!(agent.role, Role::Internal) {
             assert!(
                 (0.1..=0.5).contains(&agent.temperature),
                 "{name}: temperature {} leaves the roster's 0.1-0.2 band by more than the \
@@ -140,17 +147,16 @@ fn every_agent_states_every_column() {
 }
 
 #[test]
-fn the_native_seven_are_the_designed_roster_and_nothing_else() {
+fn the_native_nine_are_the_designed_roster_and_nothing_else() {
     let names: Vec<&str> = lean().iter().map(|agent| agent.name).collect();
     assert_eq!(names, LEAN_NAMES.to_vec());
 }
 
 #[test]
 fn the_dropped_agents_stay_dropped() {
-    // Every name here was deliberately cut or never adopted: the planner triad and
-    // Team Mode (omo), `council`/`councillor` (priced at 3x cost by slim's own note),
-    // `designer` (no UI-first lane in this tool), and the four names whose jobs were
-    // merged — `oracle`/`observer` into `advisor`, `fixer` into `worker`.
+    // Every name here was deliberately cut or replaced: the planner triad and Team
+    // Mode (omo), Council's runtime profiles (implemented later as a workflow), the
+    // deferred designer lane, and the unpublished advisor/worker names.
     for forbidden in [
         "prometheus",
         "metis",
@@ -158,9 +164,9 @@ fn the_dropped_agents_stay_dropped() {
         "council",
         "councillor",
         "designer",
-        "oracle",
         "observer",
-        "fixer",
+        "advisor",
+        "worker",
         "team",
         "teammode",
     ] {
@@ -296,13 +302,13 @@ fn no_agent_names_a_model() {
 }
 
 #[test]
-fn only_build_may_delegate() {
+fn only_orchestrator_may_delegate() {
     let may_delegate: Vec<&str> = roster(true)
         .iter()
         .filter(|agent| agent.delegation == Delegation::MayDelegate)
         .map(|agent| agent.name)
         .collect();
-    assert_eq!(may_delegate, vec!["build"]);
+    assert_eq!(may_delegate, vec!["orchestrator"]);
 
     for agent in roster(true) {
         if agent.delegation == Delegation::NoChildren {
@@ -313,28 +319,31 @@ fn only_build_may_delegate() {
             );
         }
     }
-    assert!(!is_tool_hidden("task", &BUILD.rules()));
+    assert!(!is_tool_hidden("task", &ORCHESTRATOR.rules()));
+    assert!(is_tool_hidden("task", &BUILD.rules()));
 }
 
 #[test]
-fn the_build_agent_is_the_only_agent_a_caller_cannot_target() {
+fn only_subagents_are_valid_delegation_targets() {
     let targets: Vec<&str> = delegable(true).iter().map(|agent| agent.name).collect();
     assert_eq!(
         targets,
         vec![
             "deep",
+            "fixer",
+            "general",
             "explorer",
             "librarian",
-            "advisor",
-            "worker",
+            "oracle",
             "looker"
         ]
     );
     assert!(!targets.contains(&"build"));
+    assert!(!targets.contains(&"orchestrator"));
     for internal in INTERNAL_NAMES {
         assert!(!targets.contains(&internal));
     }
-    assert_eq!(delegable(false).len(), 5);
+    assert_eq!(delegable(false).len(), 6);
 }
 
 #[test]
@@ -372,38 +381,42 @@ fn deep_owns_cross_cutting_implementation_without_children() {
 }
 
 #[test]
-fn the_worker_writes_researches_and_iterates_but_spawns_nothing() {
-    // Slim's `fixer` forbids research and multi-step work
-    // (`omo-slim`), which sends every
-    // explore-decide-implement-verify task back through the build agent between
-    // phases. The bound that matters is the absence of children, not the absence of
-    // memory.
-    assert_eq!(WORKER.write, Write::Capable);
-    assert_eq!(WORKER.research, Research::Allowed);
-    assert_eq!(WORKER.delegation, Delegation::NoChildren);
+fn fixer_is_a_focused_writer_and_general_is_the_bounded_fallback() {
+    assert_eq!(FIXER.write, Write::Capable);
+    assert_eq!(FIXER.research, Research::Confined);
+    assert_eq!(FIXER.delegation, Delegation::NoChildren);
 
-    let rules = WORKER.rules();
-    for allowed in [
-        "read",
-        "grep",
-        "glob",
-        "edit",
-        "bash",
-        "webfetch",
-        "web_search",
-    ] {
+    let fixer = FIXER.rules();
+    for allowed in ["read", "grep", "glob", "lsp", "edit", "bash"] {
         assert!(
-            !is_tool_hidden(allowed, &rules),
-            "the worker needs `{allowed}` to research, edit, and verify"
+            !is_tool_hidden(allowed, &fixer),
+            "the fixer needs `{allowed}` to inspect, edit, and verify"
         );
     }
-    assert!(is_tool_hidden("task", &rules));
+    for forbidden in ["task", "webfetch", "web_search", "skill", "execute"] {
+        assert!(
+            is_tool_hidden(forbidden, &fixer),
+            "fixer sees `{forbidden}`"
+        );
+    }
+
+    assert_eq!(GENERAL.write, Write::Capable);
+    assert_eq!(GENERAL.research, Research::Allowed);
+    assert_eq!(GENERAL.delegation, Delegation::NoChildren);
+    let general = GENERAL.rules();
+    for allowed in ["read", "edit", "bash", "web_search", "skill", "execute"] {
+        assert!(
+            !is_tool_hidden(allowed, &general),
+            "general needs bounded access to `{allowed}`"
+        );
+    }
+    assert!(is_tool_hidden("task", &general));
 
     // Editing is one permission key, so granting `edit` grants the whole family and
     // there is no way to allow one alias while denying another.
     for alias in ["write", "apply_patch"] {
         assert_eq!(permission_key(alias), "edit");
-        assert!(!is_tool_hidden(alias, &rules));
+        assert!(!is_tool_hidden(alias, &fixer));
     }
 }
 
@@ -525,24 +538,27 @@ fn the_allows_survive_the_catch_all_deny() {
 }
 
 #[test]
-fn only_the_primary_agent_inherits_extension_tools() {
+fn work_capable_primary_agents_inherit_extension_tools() {
     let mcp = ["playwright_navigate", "github_create_issue"];
 
-    let orchestrator = BUILD.rules_with_extension_tools(&mcp);
-    for tool in mcp {
+    for primary in [ORCHESTRATOR, BUILD] {
+        let rules = primary.rules_with_extension_tools(&mcp);
+        for tool in mcp {
+            assert!(
+                !is_tool_hidden(tool, &rules),
+                "{} must see a server the user configured",
+                primary.name
+            );
+        }
         assert!(
-            !is_tool_hidden(tool, &orchestrator),
-            "the primary agent must see a server the user configured"
+            is_tool_hidden(UNKNOWN_TOOL, &rules),
+            "deny-by-default survives: only named extension tools are allowed"
         );
     }
-    assert!(
-        is_tool_hidden(UNKNOWN_TOOL, &orchestrator),
-        "deny-by-default survives: only the named extension tools are allowed"
-    );
 
     for agent in roster(true) {
         if agent.permissions.extension_tools == ExtensionTools::Inherit {
-            assert_eq!(agent.name, "build");
+            assert!(["orchestrator", "build"].contains(&agent.name));
             continue;
         }
         let rules = agent.rules_with_extension_tools(&mcp);
@@ -554,7 +570,7 @@ fn only_the_primary_agent_inherits_extension_tools() {
 }
 
 #[test]
-fn the_advisor_is_the_only_agent_above_the_low_band() {
+fn oracle_is_the_only_agent_above_the_low_band() {
     let above: Vec<(&str, f64)> = lean()
         .iter()
         .filter(|agent| agent.temperature > 0.2)
@@ -562,14 +578,14 @@ fn the_advisor_is_the_only_agent_above_the_low_band() {
         .collect();
     assert_eq!(
         above,
-        vec![("advisor", 0.4)],
+        vec![("oracle", 0.4)],
         "exactly one agent spends temperature, and it is the one that has to disagree"
     );
 
-    assert_eq!(ADVISOR.output, OutputContract::Natural);
-    let prompt = zuno_catalog::agent::builtin::get("advisor")
+    assert_eq!(ORACLE.output, OutputContract::Natural);
+    let prompt = zuno_catalog::agent::builtin::get("oracle")
         .and_then(|agent| agent.prompt)
-        .expect("the advisor prompt");
+        .expect("the oracle prompt");
     assert!(
         prompt.contains("compare at least two viable options") && prompt.contains("recommend one"),
         "the higher-temperature review lane must still require alternatives and a decision"
@@ -680,7 +696,7 @@ fn build_prompt_does_not_turn_self_contained_reasoning_into_shell_work() {
 }
 
 #[test]
-fn the_rendered_list_shows_the_seven_with_their_boundaries() {
+fn the_rendered_list_shows_the_nine_with_their_boundaries() {
     let listed = render_list(true);
     for name in LEAN_NAMES {
         assert!(listed.contains(name), "{name} must appear in `agent list`");

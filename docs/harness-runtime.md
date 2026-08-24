@@ -153,13 +153,15 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 
 | agent | role |
 | --- | --- |
-| `build` | End-to-end implementation owner and the only agent that may delegate. |
+| `orchestrator` | Default multi-agent delivery owner and the only native agent that may delegate. |
+| `build` | Direct end-to-end implementation in one lane, with all subagent tools withheld. |
 | `plan` | Read-only repository research and implementation-ready planning. |
 | `deep` | Difficult cross-cutting implementation without recursive delegation. |
+| `fixer` | Focused local implementation with minimal change and regression scope. |
+| `general` | Bounded miscellaneous execution when no narrower specialist owns the work. |
 | `explorer` | Read-only repository structure, definition, caller, and impact discovery. |
 | `librarian` | Current external documentation, release, and upstream research. |
-| `advisor` | Architecture review, failure-mode analysis, and explicit trade-off advice. |
-| `worker` | Bounded, well-specified implementation and verification. |
+| `oracle` | Read-only architecture review, root-cause analysis, and explicit trade-off advice. |
 | `looker` | Visual artifact inspection when a vision-capable model is available. |
 
 `compaction`, `title`, and `summary` are hidden engine agents. A user-defined agent may be declared under `agents.<name>` or as Markdown under `.zuno/agent/**/*.md`; it enters the same resolution, permission, prompt, and provenance pipeline as a native agent.

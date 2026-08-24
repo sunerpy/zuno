@@ -91,7 +91,7 @@ instead of allowing a model to rewrite a memory directory directly.
 
 ### oh-my-openagent
 
-oh-my-openagent contributes a useful orchestration lesson: a bounded roster is easier for a primary agent to route than a large collection of overlapping personas. Each Zuno specialist therefore carries both a responsibility and a negative delegation boundary. `build` is the only recursive coordinator; `deep` and `worker` can implement but cannot fan out.
+oh-my-openagent contributes a useful orchestration lesson: a bounded roster is easier for a primary agent to route than a large collection of overlapping personas. Each Zuno specialist therefore carries both a responsibility and a negative delegation boundary. `orchestrator` is the only recursive coordinator; `build` is a direct no-child mode, while `deep`, `fixer`, and `general` can implement but cannot fan out.
 
 Zuno keeps agent identity, permissions, delegation boundaries, and prompt policy as data so validation and rendered prompts cannot drift apart. It adapts OMO's explicit positive and negative role boundaries, but rejects unconsumed XML reply envelopes: user-facing agents return concise natural Markdown, while structured output is reserved for typed runtime consumers.
 
@@ -133,7 +133,7 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | Durable memory extraction and consolidation | adapt | Per-session delivered-turn cadence, isolated small-model review with the resident snapshot, and audited add/replace/remove candidates instead of direct model-owned file rewrites |
 | Tool replay after failure | adapt | `Never` by default; explicit `Safe` only for read-only/idempotent tools |
 | Codex and Claude Code product subagents | adapt | Native app-server/stream-json providers, static configured tools, durable jobs, explicit cancellation, and uncertain non-replay |
-| Bounded specialist roster | adopt | `build`, `plan`, `deep`, `explorer`, `librarian`, `advisor`, `worker`, `looker` |
+| Bounded specialist roster | adopt | `orchestrator`, `build`, `plan`, `deep`, `fixer`, `general`, `explorer`, `librarian`, `oracle`, `looker` |
 | Provider-specific batch search | reject | concurrency belongs in the shared consumer above single-query providers |
 | UI-owned agent behavior | reject | clients render events and submit commands; they do not run a private loop |
 | Cross-project compatibility | reject | Zuno-native config, data, commands, tools, events, and extension interfaces |

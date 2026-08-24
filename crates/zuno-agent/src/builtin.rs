@@ -1,20 +1,20 @@
-//! The native delegation roster: `build`, six specialists, and engine internals.
+//! The native execution roster: two primary modes, seven specialists, and internals.
 //!
 //! # Why this roster is bounded on purpose
 //!
 //! A delegation surface fails in two directions. Too few agents and every task
-//! funnels through one context window; too many and the primary agent spends its
-//! turn choosing a lane instead of doing work. Each entry must justify what the
-//! caller loses if it is absent. `deep` is the deliberate seventh lane: unlike the
-//! bounded `worker`, it owns ambiguous cross-cutting implementation that needs a
-//! sustained research-to-verification pass.
+//! funnels through one context window; too many and the orchestrator spends its turn
+//! choosing a lane instead of doing work. The primary modes are deliberately distinct:
+//! [`ORCHESTRATOR`] owns decomposition and integration, while [`BUILD`] is one direct
+//! execution lane with delegation removed by capability. Specialists then separate
+//! cross-cutting implementation ([`DEEP`]), a known local change ([`FIXER`]), bounded
+//! miscellaneous execution ([`GENERAL`]), local evidence, external evidence,
+//! architecture/review, and visual inspection.
 //!
-//! The mapping from the OMO references: `oracle` and `observer`'s advisory half
-//! collapse into [`ADVISOR`]; `fixer` becomes [`WORKER`] **without its amnesia**;
-//! `designer` is dropped (this is not a UI-first tool, and its 0.7 temperature was
-//! the only thing the roster spent taste on); `council`/`councillor` are dropped —
-//! slim's own note prices multi-model consensus at "3x slower … 3x or more cost"
-//! (`src/agents/orchestrator.ts:95`) and the advisor owns explicit alternatives.
+//! The roster adapts role boundaries from the pinned OMO references without copying
+//! their prompt-only security model. Read-only and no-child contracts are enforced by
+//! deny-by-default permissions. Council remains a durable workflow concern, not a
+//! nominal agent that asks the model to simulate a scheduler.
 //!
 //! # Why every agent carries a *negative* boundary
 //!
@@ -92,6 +92,8 @@ pub const GOVERNED_TOOL_IDS: [&str; 17] = [
 pub enum Role {
     /// The user-facing primary agent. The only role that may delegate.
     Orchestrator,
+    /// A user-facing direct execution mode that may not delegate.
+    Primary,
     /// Reachable through `task`, and therefore needs a delegation boundary.
     Subagent,
     /// Driven by the engine, never by a `task` call. See [`Boundary::NotDelegable`].
@@ -123,15 +125,11 @@ pub enum Write {
 
 /// Whether the agent may gather context it was not handed.
 ///
-/// This exists as a field because of a specific defect worth naming. Slim's
-/// `fixer` is deliberately amnesiac — "NO external research", "No multi-step
-/// research/planning" (`omo-slim`) — so any
-/// *explore → decide → implement → verify* task has to bounce back through the
-/// orchestrator between every phase, and the orchestrator's context absorbs all of
-/// it. [`WORKER`] is [`Self::Allowed`] instead; that is deviation (1) of the three
-/// recorded in the design notes. It keeps the property that actually
-/// bounds a worker — [`Delegation::NoChildren`] — and drops the one that only
-/// bounded its usefulness.
+/// The field makes the difference between a focused local fix and a broad execution
+/// lane executable rather than rhetorical. [`FIXER`] is intentionally confined to
+/// repository evidence and focused verification; [`GENERAL`] and [`DEEP`] may gather
+/// external context when the assigned outcome genuinely depends on it. Every lane is
+/// still bounded by [`Delegation::NoChildren`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Research {
     /// May search, read, fetch, and iterate until the task is done.
@@ -180,9 +178,8 @@ pub enum ExtensionTools {
 ///
 /// The variants are the table's exemption mechanism. A newly added agent cannot
 /// quietly skip its boundary: it must either supply one, or claim
-/// [`Self::NotDelegable`] — which [`tests`] only accepts for [`Role::Internal`]
-/// entries whose names appear in [`INTERNAL_NAMES`], a list fixed by the upstream
-/// engine rather than by this roster.
+/// [`Self::NotDelegable`] — which [`tests`] accepts only for the direct [`Role::Primary`]
+/// mode and [`Role::Internal`] entries whose names appear in [`INTERNAL_NAMES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Boundary {
     /// The "Don't delegate when…" clause, without its label.
@@ -382,14 +379,16 @@ impl Agent {
     }
 }
 
-/// The names of the seven user-facing agents, in roster order.
-pub const LEAN_NAMES: [&str; 7] = [
+/// The names of the nine user-facing agents, in roster order.
+pub const LEAN_NAMES: [&str; 9] = [
+    "orchestrator",
     "build",
     "deep",
+    "fixer",
+    "general",
     "explorer",
     "librarian",
-    "advisor",
-    "worker",
+    "oracle",
     "looker",
 ];
 
@@ -424,15 +423,15 @@ const READ_ONLY_DENIED: &[&str] = &[
 /// The inspection tools every read-only agent may call.
 const READ_ONLY_ALLOWED: &[&str] = &["read", "glob", "grep", "lsp", "plan_get", "todo_get"];
 
-/// The primary, write-capable agent - the only one that may delegate.
-pub const BUILD: Agent = Agent {
-    name: "build",
+/// The default primary coordinator and the only Agent that may delegate.
+pub const ORCHESTRATOR: Agent = Agent {
+    name: "orchestrator",
     role: Role::Orchestrator,
     mode: AgentMode::Primary,
     hidden: false,
-    description: "Owns the user's request end to end: decides what must be true, routes \
-                  discovery and bounded execution to specialists, and synthesises the result. \
-                  The only agent that may spawn children.",
+    description: "Owns multi-agent delivery end to end: builds the dependency graph, routes \
+                  bounded non-overlapping work to specialists, integrates their evidence, and \
+                  verifies the user's outcome. The only Agent that may spawn children.",
     boundary: Boundary::DontDelegateWhen(
         "the whole task is smaller than the briefing it would take • you already have the \
          file path and need its contents • the answer is in this conversation • explaining \
@@ -469,6 +468,48 @@ pub const BUILD: Agent = Agent {
     gate: Gate::Always,
 };
 
+/// Direct end-to-end delivery in one execution lane, without child Agents.
+pub const BUILD: Agent = Agent {
+    name: "build",
+    role: Role::Primary,
+    mode: AgentMode::Primary,
+    hidden: false,
+    description: "Owns the user's requested change directly from inspection through verified \
+                  completion. Use this mode when one execution lane should retain the whole \
+                  implementation context and no child-Agent coordination is wanted.",
+    boundary: Boundary::NotDelegable {
+        reason: "build is the explicit single-lane work mode; it performs the request directly \
+                 and the runtime withholds every subagent-intent tool.",
+    },
+    temperature: 0.1,
+    output: OutputContract::Natural,
+    permissions: Permissions {
+        denied: &["task", "plan_exit"],
+        allowed: &[
+            "read",
+            "glob",
+            "grep",
+            "lsp",
+            "edit",
+            "bash",
+            "webfetch",
+            "web_search",
+            "plan_get",
+            "plan_update",
+            "todo_get",
+            "todo_update",
+            "skill",
+            "execute",
+            "question",
+        ],
+        extension_tools: ExtensionTools::Inherit,
+    },
+    delegation: Delegation::NoChildren,
+    write: Write::Capable,
+    research: Research::Allowed,
+    gate: Gate::Always,
+};
+
 /// Thorough cross-cutting implementation without recursive delegation.
 pub const DEEP: Agent = Agent {
     name: "deep",
@@ -477,9 +518,9 @@ pub const DEEP: Agent = Agent {
     hidden: false,
     description: "Owns one difficult cross-cutting objective from evidence gathering through \
                   implementation and verification. Uses a larger investigation budget than a \
-                  bounded worker but cannot spawn children.",
+                  bounded fixer but cannot spawn children.",
     boundary: Boundary::DontDelegateWhen(
-        "the change is already well specified and local enough for `worker` • the caller needs \
+        "the change is already well specified and local enough for `fixer` • the caller needs \
          only repository locations or external research • the task still needs product \
          decisions from the primary session • the work can be verified in one small edit.",
     ),
@@ -584,29 +625,22 @@ pub const LIBRARIAN: Agent = Agent {
     gate: Gate::Always,
 };
 
-/// Read-only consulting and hostile review, in one lane.
-pub const ADVISOR: Agent = Agent {
-    name: "advisor",
+/// Read-only architecture, root-cause analysis, and hostile review.
+pub const ORACLE: Agent = Agent {
+    name: "oracle",
     role: Role::Subagent,
     mode: AgentMode::Subagent,
     hidden: false,
-    description: "Second opinion on high-stakes calls, and hostile review of work already \
-                  done. Architecture trade-offs, a bug that survived two fixes, and \
-                  \"tell me why this patch is wrong\" are the same lane: read the code, \
-                  argue with it, name what it costs.",
+    description: "Provides read-only architecture decisions, complex root-cause analysis, and \
+                  hostile review. Reads the implementation, separates demonstrated defects \
+                  from risks, compares viable options, and recommends one trade-off.",
     boundary: Boundary::DontDelegateWhen(
         "it is your first attempt at the bug • the trade-off has an obvious answer • you \
          want confirmation rather than disagreement • the decision is cheap to reverse • a \
          test would settle it faster than an argument.",
     ),
-    // The one agent above the 0.1-0.2 band. Cutting `council` removed the only
-    // place in slim's roster where two independent readings of a problem were
-    // generated on purpose (`src/agents/orchestrator.ts:95` prices that at 3x cost,
-    // which is why it is cut). The advisor inherits that job through its required
-    // `<alternatives>` section, and at 0.1 a model collapses onto the single most
-    // probable reading — exactly the failure the council existed to prevent. 0.4 is
-    // enough divergence to surface a second option and well short of the 0.7 slim
-    // spent on prose taste, where review starts inventing facts.
+    // The only user-facing Agent above the 0.1-0.2 band. Oracle must surface a
+    // credible alternative rather than merely ratify the caller's current design.
     temperature: 0.4,
     output: OutputContract::Natural,
     permissions: Permissions {
@@ -620,27 +654,62 @@ pub const ADVISOR: Agent = Agent {
     gate: Gate::Always,
 };
 
-/// Write-capable bounded execution — allowed to research, forbidden to delegate.
-pub const WORKER: Agent = Agent {
-    name: "worker",
+/// Focused local implementation with no external-research or delegation lane.
+pub const FIXER: Agent = Agent {
+    name: "fixer",
     role: Role::Subagent,
     mode: AgentMode::Subagent,
     hidden: false,
-    description: "Takes a bounded, well-specified change and finishes it: reads what it \
-                  needs, edits, runs the checks, and iterates until they pass. Reports what \
-                  it could not verify rather than claiming it did.",
+    description: "Takes a known, local code change and finishes it within the supplied scope: \
+                  reads the owning files, edits, runs focused checks, and reports exact \
+                  evidence without making architecture or product decisions.",
     boundary: Boundary::DontDelegateWhen(
-        "the requirements are still moving • it is one small edit in a file you have open • \
-         the work is tangled with the change you are already making • what you actually need \
-         is a decision, not an implementation • the task would need children of its own to \
-         finish.",
+        "the requirements are ambiguous or still moving • the change crosses several owning \
+         abstractions • current external behavior must be researched • design judgment is the \
+         actual deliverable • the caller already has the file open for one trivial edit.",
     ),
     temperature: 0.1,
     output: OutputContract::Natural,
     permissions: Permissions {
-        // `task` is the one capability a worker must not have: without it the lane
-        // is bounded by construction, and with it the depth limit becomes the only
-        // thing standing between one delegation and a fan-out tree.
+        denied: &[
+            "task",
+            "webfetch",
+            "plan_update",
+            "todo_update",
+            "web_search",
+            "skill",
+            "execute",
+            "question",
+            "plan_exit",
+        ],
+        allowed: &[
+            "read", "glob", "grep", "lsp", "edit", "bash", "plan_get", "todo_get",
+        ],
+        extension_tools: ExtensionTools::Excluded,
+    },
+    delegation: Delegation::NoChildren,
+    write: Write::Capable,
+    research: Research::Confined,
+    gate: Gate::Always,
+};
+
+/// Bounded miscellaneous execution that does not fit a narrower specialist.
+pub const GENERAL: Agent = Agent {
+    name: "general",
+    role: Role::Subagent,
+    mode: AgentMode::Subagent,
+    hidden: false,
+    description: "Handles one bounded miscellaneous deliverable under an explicit capability \
+                  envelope when no narrower specialist owns it. May inspect, research, edit, \
+                  and verify, but cannot spawn children or make broad architecture decisions.",
+    boundary: Boundary::DontDelegateWhen(
+        "a named specialist clearly owns the work • the task is ambiguous or cross-cutting \
+         enough for `deep` • the deliverable is an architecture decision for `oracle` • the \
+         scope cannot be bounded to one child outcome • direct work is cheaper than briefing.",
+    ),
+    temperature: 0.1,
+    output: OutputContract::Natural,
+    permissions: Permissions {
         denied: &["task", "question", "plan_exit"],
         allowed: &[
             "read",
@@ -696,13 +765,23 @@ pub const LOOKER: Agent = Agent {
     gate: Gate::VisionModel,
 };
 
-/// The seven named agents, gate ignored.
+/// The nine named agents, gate ignored.
 ///
 /// Use [`roster`] for the set that actually ships; this is the complete design, for
 /// tests and for `agent list --all`.
 #[must_use]
 pub fn lean() -> Vec<Agent> {
-    vec![BUILD, DEEP, EXPLORER, LIBRARIAN, ADVISOR, WORKER, LOOKER]
+    vec![
+        ORCHESTRATOR,
+        BUILD,
+        DEEP,
+        FIXER,
+        GENERAL,
+        EXPLORER,
+        LIBRARIAN,
+        ORACLE,
+        LOOKER,
+    ]
 }
 
 /// The engine's internal agents.
@@ -829,10 +908,9 @@ pub fn get(name: &str, vision_available: bool) -> Option<Agent> {
 
 /// Valid `task` targets: everything a caller may actually name.
 ///
-/// The `task` tool rejects a `subagent_type` outside this set, and rejects `build`
-/// specifically: a coordinator cannot be a delegation target without reopening
-/// the recursion this roster closes with
-/// [`Delegation::NoChildren`].
+/// The `task` tool rejects a `subagent_type` outside this set. Neither primary mode
+/// appears here: the orchestrator cannot target itself, and direct build mode has no
+/// children by construction.
 #[must_use]
 pub fn delegable(vision_available: bool) -> Vec<Agent> {
     roster(vision_available)
