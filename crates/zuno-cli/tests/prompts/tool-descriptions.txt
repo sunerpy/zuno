@@ -143,11 +143,12 @@ Usage:
 Search past sessions with local FTS5, scroll around a matched message, or browse recent sessions. No provider or LLM calls are made.
 >>>
 
-## skill | crates/zuno-tools/src/description/skill.txt | 362 bytes | trailing-newline: no
+## skill | crates/zuno-tools/src/description/skill.txt | 724 bytes | trailing-newline: yes
 <<<
-Load the full instructions for one skill named in <available_skills>.
-Pass the skill's `name` exactly as the catalog gives it. The reply is that skill's complete SKILL.md body; follow it for the current task.
-Call this before acting whenever a skill's description matches what you are about to do — the catalog only tells you a skill exists, not how to use it.
+Discover and read reusable skill instructions through progressive disclosure.
+Use action `list` to page through all model-visible skills, or action `search` with a concise task intent; optional search `limit` is 1-20. Metadata results include the exact `source` needed to distinguish same-named skills.
+Use action `load` with the selected `name` and `source`. Follow `next_cursor` until `complete` before acting; a partial SKILL.md is not usable guidance.
+Use action `read_resource` with the same `name` and `source`, a relative `path` such as `references/ci.md`, and any returned continuation cursor. Do not use shell, find, glob, or broad filesystem scans to rediscover an advertised skill or locate its referenced files.
 >>>
 
 ## task | crates/zuno-tools/src/description/task.txt | 1078 bytes | trailing-newline: yes

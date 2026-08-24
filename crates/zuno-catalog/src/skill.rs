@@ -1,50 +1,30 @@
-//! Native Zuno skill discovery and the two model-facing render forms.
+//! Native Zuno skill discovery and model-facing progressive disclosure.
 //!
-//! A skill is a user-authored capability pack: a `SKILL.md` whose frontmatter
-//! carries a `name` and a `description`, and whose body is loaded on demand.
-//! Zuno owns discovery and precedence. It also imports `SKILL.md` files from
-//! established Agent Skills, Claude, and OpenCode locations; that import does
-//! not imply compatibility with those products' config, plugins, hooks, tools,
-//! or runtimes. The descriptions of every visible skill go into the system
-//! prompt of **every** request ([`fmt`]), so missing or accidentally shadowing a
-//! skill is a silent and expensive capability change.
+//! A skill is a capability pack whose `SKILL.md` frontmatter advertises a name
+//! and optional description. Discovery retains bounded metadata and a stable
+//! source locator; the selected body is read only when the model calls the
+//! `skill` tool. This keeps the base prompt small and lets disk-backed skills be
+//! edited without restarting the process.
 //!
-//! # The shape of a load
+//! # Identity and selection
+//!
+//! Paths are de-duplicated during discovery, but names are not identities.
+//! Different sources may intentionally declare the same name, so [`Skills`]
+//! preserves each source and plain-name lookup succeeds only when the name is
+//! unique. The model receives source locators in the catalog and search results
+//! and must provide one when a name is ambiguous.
+//!
+//! # Discovery and materialization
 //!
 //! ```text
-//! SkillOptions ──discover──▶ SkillSources ──pull──▶ +remote dirs ──read──▶ Skills
-//!               (roots 1-7)   (paths, dirs)  (root 8)                (name-keyed)
+//! SkillOptions ──discover──▶ SkillSources ──pull──▶ source metadata ──select──▶ body
 //! ```
 //!
 //! [`SkillSources::discover`] is synchronous and never touches the network;
-//! [`load`] adds the `skills.urls[]` pull and the file reads. The roots and
-//! their exact patterns are documented on [`discovery`].
-//!
-//! # Two de-duplications that are not the same thing
-//!
-//! **By path.** The same absolute path reached through two roots is one match
-//! (`skill/index.ts:168`, a `Set<string>`). Nothing is canonicalized, so a
-//! symlink alias is *not* collapsed here.
-//!
-//! **By name.** Two different files claiming the same `name` both load, and the
-//! later one wins with a warning (`:125-131`). This is where symlink aliases
-//! land: on the surveyed machine, 27 of 136 skills exist twice, once under
-//! `~/.claude/skills/x` and once as the `~/.agents/skills/x` the first is a
-//! symlink to.
-//!
-//! # One recorded divergence: the duplicate winner is deterministic here
-//!
-//! The oracle loads every match with `Effect.forEach(..., { concurrency:
-//! "unbounded" })` (`:240-243`) and each load starts with an async file read, so
-//! the *order the writes land in* is decided by I/O timing. Measured: three runs
-//! of `opencode debug skill` over one fixture with the same `name` under
-//! `~/.claude`, `~/.agents` and a config directory reported the `~/.agents` copy
-//! once and the config copy twice. The name **set** is stable; the winner is not.
-//!
-//! This port loads in root order and lets the later root win, which reproduces
-//! the oracle's real-tree result for every alias on the surveyed machine
-//! (`.agents` beats `.claude`, a config directory beats both) and is
-//! reproducible. A racy prompt is worse than a slightly different one.
+//! [`load`] adds configured remote indexes and reads frontmatter concurrently.
+//! [`Skill::read_body`] materializes one selected document and verifies that its
+//! declared name still matches the catalog entry. The roots and exact patterns
+//! are documented on [`discovery`].
 //!
 //! # Only two frontmatter keys exist
 //!
@@ -78,31 +58,160 @@ pub use crate::skill::render::{
     locale_compare,
 };
 
-/// How many `SKILL.md` files are read at once.
+/// How many `SKILL.md` frontmatter records are read at once.
 ///
-/// The oracle reads them all at once (`skill/index.ts:241`). A bound is what
-/// makes the load reproducible; 8 matches `zuno_config::instructions`, which is the
-/// same problem.
+/// A bound prevents a large imported catalog from exhausting descriptors while
+/// keeping independent sources parallel.
 pub const LOCAL_CONCURRENCY: usize = 8;
 
-/// One loaded skill — the oracle's `Skill.Info` (`skill/index.ts:37-43`).
+/// One discovered skill.
 ///
-/// Field order is the oracle's, because `opencode debug skill` prints this struct
-/// with `JSON.stringify(skills, null, 2)` and the differential test compares the
-/// two documents.
+/// The catalog owns metadata and source identity, not a permanent copy of every
+/// instruction body. Files are read after selection; built-in and extension
+/// skills retain their embedded document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Skill {
     /// The `name` from frontmatter. The key skills are addressed by.
     pub name: String,
-    /// The `description` from frontmatter. `None` hides the skill from both render
-    /// forms while leaving it in [`Skills::all`], which is deliberate in the
-    /// oracle (`:322`).
+    /// The `description` from frontmatter. `None` hides the skill from model-facing
+    /// discovery forms while leaving it in [`Skills::all`], which is deliberate in
+    /// the imported behavior (`:322`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Where it came from: an absolute path, or the literal `<built-in>`.
     pub location: String,
-    /// The body after the frontmatter, verbatim.
-    pub content: String,
+    /// How its `SKILL.md` body is materialized.
+    #[serde(skip)]
+    document: SkillDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillDocument {
+    File(PathBuf),
+    Embedded {
+        content: String,
+        resource_root: Option<PathBuf>,
+    },
+}
+
+impl Skill {
+    /// Metadata backed by a filesystem `SKILL.md`.
+    #[must_use]
+    pub fn file(name: String, description: Option<String>, path: PathBuf) -> Self {
+        Self {
+            name,
+            description,
+            location: path.to_string_lossy().into_owned(),
+            document: SkillDocument::File(path),
+        }
+    }
+
+    /// Metadata and body owned by a native component.
+    #[must_use]
+    pub fn embedded(
+        name: impl Into<String>,
+        description: Option<String>,
+        location: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description,
+            location: location.into(),
+            document: SkillDocument::Embedded {
+                content: content.into(),
+                resource_root: None,
+            },
+        }
+    }
+
+    /// Embedded instructions whose bundled resources live beside `path`.
+    #[must_use]
+    pub fn embedded_at_path(
+        name: impl Into<String>,
+        description: Option<String>,
+        path: PathBuf,
+        content: impl Into<String>,
+    ) -> Self {
+        let resource_root = path.parent().map(Path::to_path_buf);
+        Self {
+            name: name.into(),
+            description,
+            location: path.to_string_lossy().into_owned(),
+            document: SkillDocument::Embedded {
+                content: content.into(),
+                resource_root,
+            },
+        }
+    }
+
+    /// Directory against which this skill resolves relative resources.
+    #[must_use]
+    pub fn resource_root(&self) -> Option<&Path> {
+        match &self.document {
+            SkillDocument::File(path) => path.parent(),
+            SkillDocument::Embedded { resource_root, .. } => resource_root.as_deref(),
+        }
+    }
+
+    /// Read the selected body and verify that the source still declares this skill.
+    ///
+    /// A file may change after discovery. Body edits are observed immediately;
+    /// changing the declared name turns the catalog entry stale instead of letting a
+    /// source locator silently select a different package.
+    pub async fn read_body(&self) -> Result<String, SkillReadError> {
+        match &self.document {
+            SkillDocument::Embedded { content, .. } => Ok(content.clone()),
+            SkillDocument::File(path) => {
+                let source = tokio::fs::read_to_string(path).await.map_err(|error| {
+                    SkillReadError::new(
+                        self.location.clone(),
+                        format!("failed to read the selected SKILL.md: {error}"),
+                    )
+                })?;
+                let document = parse_document(&source).map_err(|rejection| {
+                    SkillReadError::new(self.location.clone(), rejection.to_string())
+                })?;
+                if document.name != self.name {
+                    return Err(SkillReadError::new(
+                        self.location.clone(),
+                        format!(
+                            "source identity changed from `{}` to `{}`; refresh the skill catalog",
+                            self.name, document.name
+                        ),
+                    ));
+                }
+                Ok(document.content)
+            }
+        }
+    }
+}
+
+/// A selected skill source could no longer provide the document it advertised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillReadError {
+    location: String,
+    detail: String,
+}
+
+impl SkillReadError {
+    fn new(location: String, detail: String) -> Self {
+        Self { location, detail }
+    }
+}
+
+impl fmt::Display for SkillReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "failed to read skill {}: {}", self.location, self.detail)
+    }
+}
+
+impl std::error::Error for SkillReadError {}
+
+struct ParsedDocument {
+    name: String,
+    description: Option<String>,
+    content: String,
 }
 
 /// Why one skill, root, or URL did not make it in.
@@ -124,13 +233,6 @@ pub enum SkillWarningKind {
     MissingName,
     /// A `description` that is present but not a string.
     InvalidDescription,
-    /// A second file claiming a name already taken. The later file wins.
-    DuplicateName {
-        /// The contested name.
-        name: String,
-        /// Where the name was already registered.
-        existing: String,
-    },
     /// `index.json` could not be reached.
     IndexUnreachable(String),
     /// `index.json`, or one of its files, exceeded [`remote::REMOTE_TIMEOUT`].
@@ -218,11 +320,6 @@ impl fmt::Display for SkillWarning {
                 "skill {} has a `description` that is not a string",
                 self.source
             ),
-            SkillWarningKind::DuplicateName { name, existing } => write!(
-                f,
-                "duplicate skill name `{name}`: {} overrides {existing}",
-                self.source
-            ),
             SkillWarningKind::IndexUnreachable(detail) => {
                 write!(f, "failed to fetch index {}: {detail}", self.source)
             }
@@ -254,25 +351,47 @@ impl fmt::Display for SkillWarning {
     }
 }
 
-/// The loaded skill set, keyed by name, in insertion order.
+/// The loaded skill set, source-identified and kept in discovery order.
 ///
-/// The oracle's state is a JavaScript object (`skill/index.ts:83`), so
-/// re-assigning an existing name replaces the value **in place** and keeps the
-/// original position. `Skill.all()` returns `Object.values`, so that position is
-/// observable; this type reproduces it.
+/// Same-named skills remain distinct. Plain-name lookup succeeds only when one
+/// source declares that name; callers select an ambiguous skill by the source
+/// path advertised in the prompt or search result.
 #[derive(Debug, Clone, Default)]
 pub struct Skills {
     ordered: Vec<Skill>,
-    index: HashMap<String, usize>,
+    by_name: HashMap<String, Vec<usize>>,
+    by_source: HashMap<String, usize>,
     dirs: Vec<PathBuf>,
     warnings: Vec<SkillWarning>,
 }
 
 impl Skills {
-    /// `Skill.get` (`skill/index.ts:289-292`).
+    /// Resolve `name` only when it names exactly one source.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Skill> {
-        self.index.get(name).and_then(|at| self.ordered.get(*at))
+        let matches = self.by_name.get(name)?;
+        (matches.len() == 1)
+            .then(|| self.ordered.get(matches[0]))
+            .flatten()
+    }
+
+    /// Every source declaring `name`, in discovery order.
+    #[must_use]
+    pub fn named(&self, name: &str) -> Vec<&Skill> {
+        self.by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|at| self.ordered.get(*at))
+            .collect()
+    }
+
+    /// Resolve one exact advertised source.
+    #[must_use]
+    pub fn by_source(&self, source: &str) -> Option<&Skill> {
+        self.by_source
+            .get(source)
+            .and_then(|at| self.ordered.get(*at))
     }
 
     /// `Skill.all` (`:301-304`), in insertion order.
@@ -288,7 +407,9 @@ impl Skills {
     #[must_use]
     pub fn sorted(&self) -> Vec<Skill> {
         let mut list = self.ordered.clone();
-        list.sort_by(|left, right| locale_compare(&left.name, &right.name));
+        list.sort_by(|left, right| {
+            locale_compare(&left.name, &right.name).then_with(|| left.location.cmp(&right.location))
+        });
         list
     }
 
@@ -304,7 +425,7 @@ impl Skills {
         &self.warnings
     }
 
-    /// Render one of the two model-facing forms over [`Skills::all`].
+    /// Render one of the model-facing forms over [`Skills::all`].
     #[must_use]
     pub fn render(&self, form: Form) -> String {
         render(&self.ordered, form)
@@ -320,8 +441,8 @@ impl Skills {
     ///
     /// [`load`] is the production path and this is not a second one: it exists so a
     /// caller holding skills from a non-disk source — or a test that must not touch
-    /// the filesystem — gets the same name index and the same last-one-wins
-    /// precedence as discovery, rather than reimplementing either.
+    /// the filesystem — gets the same source identity and ambiguity rules as
+    /// discovery, rather than reimplementing either.
     #[must_use]
     pub fn from_loaded(skills: impl IntoIterator<Item = Skill>) -> Self {
         let mut set = Self::default();
@@ -333,9 +454,8 @@ impl Skills {
 
     /// Overlay non-disk skills while preserving discovery roots and warnings.
     ///
-    /// The same last-one-wins insertion path is used, so a process/static extension
-    /// replacing a disk skill is observable exactly like one disk root replacing
-    /// another.
+    /// The same source identity updates in place; a different source cannot shadow
+    /// a disk skill merely by reusing its name.
     #[must_use]
     pub fn with_overlay(mut self, skills: impl IntoIterator<Item = Skill>) -> Self {
         for skill in skills {
@@ -344,61 +464,39 @@ impl Skills {
         self
     }
 
-    /// `state.skills[name] = info` (`skill/index.ts:125-139`) — register a skill,
-    /// warning when it displaces one.
+    /// Register one source identity.
     fn insert(&mut self, skill: Skill) {
-        if let Some(at) = self.index.get(&skill.name).copied() {
-            let existing = self.ordered[at].location.clone();
-            warn(
-                &mut self.warnings,
-                SkillWarning::new(
-                    skill.location.clone(),
-                    SkillWarningKind::DuplicateName {
-                        name: skill.name.clone(),
-                        existing,
-                    },
-                ),
-            );
+        if let Some(at) = self.by_source.get(&skill.location).copied() {
+            let previous_name = self.ordered[at].name.clone();
             self.ordered[at] = skill;
+            if previous_name != self.ordered[at].name {
+                if let Some(matches) = self.by_name.get_mut(&previous_name) {
+                    matches.retain(|candidate| *candidate != at);
+                }
+                self.by_name
+                    .entry(self.ordered[at].name.clone())
+                    .or_default()
+                    .push(at);
+            }
             return;
         }
-        self.index.insert(skill.name.clone(), self.ordered.len());
+        let at = self.ordered.len();
+        self.by_source.insert(skill.location.clone(), at);
+        self.by_name.entry(skill.name.clone()).or_default().push(at);
         self.ordered.push(skill);
     }
 }
 
-/// Record `warning`, logging it at the level its actionability deserves.
-///
-/// Twelve of the thirteen variants name something a user must fix, so they stay at
-/// `WARN`. [`SkillWarningKind::DuplicateName`] is not a fault — the root order in
-/// [`crate::skill::discovery`] is a deliberate precedence ladder and every override
-/// it reports is that ladder working. At `WARN` it emitted **189 lines per launch**
-/// on an install whose `.claude` tree is reachable from `.agents`
-/// (`~/.local/share/zuno/log/opencode.2026-08-20.log`: 202 lines, 189 of them this
-/// one), burying the twelve that are faults. It still reaches
-/// [`Skills::warnings`] for any surface that lists it and still logs at `DEBUG`;
-/// [`load`] states the total once at `INFO`.
+/// Record one actionable discovery warning.
 fn warn(sink: &mut Vec<SkillWarning>, warning: SkillWarning) {
-    if matches!(warning.kind(), SkillWarningKind::DuplicateName { .. }) {
-        tracing::debug!(skill.source = %warning.source(), "{warning}");
-    } else {
-        tracing::warn!(skill.source = %warning.source(), "{warning}");
-    }
+    tracing::warn!(skill.source = %warning.source(), "{warning}");
     sink.push(warning);
-}
-
-/// How many of `warnings` are precedence overrides rather than faults.
-fn duplicate_count(warnings: &[SkillWarning]) -> usize {
-    warnings
-        .iter()
-        .filter(|warning| matches!(warning.kind(), SkillWarningKind::DuplicateName { .. }))
-        .count()
 }
 
 /// Discover and load every skill.
 ///
-/// The built-in `customize-zuno` is registered before disk discovery, so a
-/// user's own skill of that name replaces it and gets a duplicate warning.
+/// The built-in `customize-zuno` is registered before disk discovery. A user's
+/// same-named skill remains a distinct source.
 ///
 /// Never fails: an unreadable file, an invalid frontmatter block, or an
 /// unreachable `skills.urls[]` entry becomes a [`SkillWarning`].
@@ -465,17 +563,12 @@ pub async fn load(options: &SkillOptions) -> Skills {
         }
     }
 
-    let overrides = duplicate_count(&skills.warnings);
-    if overrides == 0 {
-        tracing::info!(count = skills.all().len(), "skills loaded");
-    } else {
-        tracing::info!(
-            count = skills.all().len(),
-            overrides,
-            "skills loaded; a later root replaced an earlier same-named skill \
-             {overrides} time(s) — run with `--log-level debug` to see each pair"
-        );
-    }
+    let ambiguous_names = skills
+        .by_name
+        .values()
+        .filter(|matches| matches.len() > 1)
+        .count();
+    tracing::info!(count = skills.all().len(), ambiguous_names, "skills loaded");
     skills
 }
 
@@ -502,6 +595,18 @@ enum Rejection {
     Frontmatter(String),
     MissingName,
     InvalidDescription,
+}
+
+impl fmt::Display for Rejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Frontmatter(detail) => write!(f, "invalid frontmatter: {detail}"),
+            Self::MissingName => write!(f, "source no longer declares a string `name`"),
+            Self::InvalidDescription => {
+                write!(f, "source no longer declares a string `description`")
+            }
+        }
+    }
 }
 
 impl From<Rejection> for SkillWarningKind {
@@ -539,6 +644,15 @@ fn config_error(path: &Path, rejection: Rejection) -> ConfigError {
 
 /// The validation half of a load, with no I/O.
 fn parse_source(path: &Path, source: &str) -> Result<Skill, Rejection> {
+    let document = parse_document(source)?;
+    Ok(Skill::file(
+        document.name,
+        document.description,
+        path.to_path_buf(),
+    ))
+}
+
+fn parse_document(source: &str) -> Result<ParsedDocument, Rejection> {
     let document =
         frontmatter::parse(source).map_err(|error| Rejection::Frontmatter(error.to_string()))?;
 
@@ -549,10 +663,9 @@ fn parse_source(path: &Path, source: &str) -> Result<Skill, Rejection> {
         return Err(Rejection::InvalidDescription);
     }
 
-    Ok(Skill {
+    Ok(ParsedDocument {
         name: name.to_string(),
         description: document.description.text().map(str::to_string),
-        location: path.to_string_lossy().into_owned(),
         content: document.content,
     })
 }
@@ -566,16 +679,17 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_skill_keeps_its_body_verbatim() {
-        let skill = at(
-            "/s/SKILL.md",
-            "---\nname: a\ndescription: d\n---\n\n# Body\n",
-        )
-        .expect("loads");
+    fn a_valid_skill_catalogs_metadata_without_retaining_the_body() {
+        let source = "---\nname: a\ndescription: d\n---\n\n# Body\n";
+        let skill = at("/s/SKILL.md", source).expect("loads");
         assert_eq!(skill.name, "a");
         assert_eq!(skill.description.as_deref(), Some("d"));
         assert_eq!(skill.location, "/s/SKILL.md");
-        assert_eq!(skill.content, "\n# Body\n");
+        assert!(matches!(skill.document, SkillDocument::File(_)));
+        assert_eq!(
+            parse_document(source).expect("document parses").content,
+            "\n# Body\n"
+        );
     }
 
     #[test]
@@ -623,50 +737,57 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_name_warns_once_and_the_later_file_wins() {
+    fn updating_the_same_source_keeps_its_position_without_a_warning() {
         let mut skills = Skills::default();
-        skills.insert(Skill {
-            name: "a".to_string(),
-            description: Some("first".to_string()),
-            location: "/first/SKILL.md".to_string(),
-            content: String::new(),
-        });
-        skills.insert(Skill {
-            name: "a".to_string(),
-            description: Some("second".to_string()),
-            location: "/second/SKILL.md".to_string(),
-            content: String::new(),
-        });
+        skills.insert(Skill::embedded(
+            "a",
+            Some("first".to_string()),
+            "/same/SKILL.md",
+            "",
+        ));
+        skills.insert(Skill::embedded(
+            "a",
+            Some("second".to_string()),
+            "/same/SKILL.md",
+            "",
+        ));
 
         assert_eq!(skills.all().len(), 1);
         assert_eq!(
-            skills.get("a").expect("present").location,
-            "/second/SKILL.md"
+            skills.get("a").expect("present").description.as_deref(),
+            Some("second")
         );
-        assert_eq!(skills.warnings().len(), 1);
+        assert!(skills.warnings().is_empty());
+    }
+
+    #[test]
+    fn same_named_skills_keep_both_source_identities_and_plain_lookup_is_ambiguous() {
+        let skills = Skills::from_loaded([
+            Skill::embedded("a", Some("first".to_string()), "/first/SKILL.md", ""),
+            Skill::embedded("a", Some("second".to_string()), "/second/SKILL.md", ""),
+        ]);
+
         assert_eq!(
-            skills.warnings()[0].kind(),
-            &SkillWarningKind::DuplicateName {
-                name: "a".to_string(),
-                existing: "/first/SKILL.md".to_string(),
-            }
+            skills.all().len(),
+            2,
+            "same-name skills are distinct packages, not precedence overrides"
+        );
+        assert!(
+            skills.get("a").is_none(),
+            "a plain name must not silently choose one of multiple sources"
         );
     }
 
     #[test]
-    fn a_replaced_skill_keeps_its_insertion_position() {
+    fn source_updates_keep_their_insertion_position() {
         let mut skills = Skills::default();
-        for (name, location) in [("a", "/1"), ("b", "/2"), ("a", "/3")] {
-            skills.insert(Skill {
-                name: name.to_string(),
-                description: Some("d".to_string()),
-                location: location.to_string(),
-                content: String::new(),
-            });
+        for (name, location) in [("a", "/1"), ("b", "/2"), ("renamed", "/1")] {
+            skills.insert(Skill::embedded(name, Some("d".to_string()), location, ""));
         }
         let names: Vec<&str> = skills.all().iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b"]);
-        assert_eq!(skills.get("a").expect("present").location, "/3");
+        assert_eq!(names, vec!["renamed", "b"]);
+        assert!(skills.get("a").is_none());
+        assert_eq!(skills.get("renamed").expect("present").location, "/1");
     }
 
     #[test]
@@ -679,45 +800,34 @@ mod tests {
         assert!(builtin::DESCRIPTION.contains("Zuno's own configuration"));
         assert!(builtin::DESCRIPTION.contains("files under .zuno/"));
         assert!(!builtin::DESCRIPTION.contains("opencode's own configuration"));
-        assert!(built_in.content.contains("# Customizing Zuno"));
-        assert!(built_in.content.contains(".zuno/agent/"));
-        assert!(
-            built_in
-                .content
-                .contains(&format!("{}.json", zuno_paths::CONFIG_FILE_STEM))
-        );
-        assert!(!built_in.content.contains("opencode.ai/config.json"));
-        assert!(!built_in.content.contains("\"plugin\""));
-        assert!(!built_in.content.contains("opencode.json"));
-        assert!(!built_in.content.contains("opencode.jsonc"));
+        assert!(builtin::CONTENT.contains("# Customizing Zuno"));
+        assert!(builtin::CONTENT.contains(".zuno/agent/"));
+        assert!(builtin::CONTENT.contains(&format!("{}.json", zuno_paths::CONFIG_FILE_STEM)));
+        assert!(!builtin::CONTENT.contains("opencode.ai/config.json"));
+        assert!(!builtin::CONTENT.contains("\"plugin\""));
+        assert!(!builtin::CONTENT.contains("opencode.json"));
+        assert!(!builtin::CONTENT.contains("opencode.jsonc"));
     }
 
     #[test]
-    fn a_user_skill_overrides_the_builtin() {
+    fn a_user_skill_does_not_silently_override_the_builtin() {
         let mut skills = Skills::default();
         skills.insert(builtin::skill());
-        skills.insert(Skill {
-            name: builtin::NAME.to_string(),
-            description: Some("mine".to_string()),
-            location: "/mine/SKILL.md".to_string(),
-            content: "mine".to_string(),
-        });
-        assert_eq!(
-            skills.get(builtin::NAME).expect("present").location,
-            "/mine/SKILL.md"
-        );
-        assert_eq!(skills.warnings().len(), 1);
+        skills.insert(Skill::embedded(
+            builtin::NAME,
+            Some("mine".to_string()),
+            "/mine/SKILL.md",
+            "mine",
+        ));
+        assert!(skills.get(builtin::NAME).is_none());
+        assert_eq!(skills.named(builtin::NAME).len(), 2);
+        assert!(skills.warnings().is_empty());
     }
 
     #[test]
-    fn debug_skill_json_omits_an_absent_description() {
-        let json = serde_json::to_string(&Skill {
-            name: "a".to_string(),
-            description: None,
-            location: "/a".to_string(),
-            content: "b".to_string(),
-        })
-        .expect("serializes");
-        assert_eq!(json, r#"{"name":"a","location":"/a","content":"b"}"#);
+    fn skill_metadata_json_omits_body_and_an_absent_description() {
+        let json = serde_json::to_string(&Skill::embedded("a", None, "/a", "secret body"))
+            .expect("serializes");
+        assert_eq!(json, r#"{"name":"a","location":"/a"}"#);
     }
 }

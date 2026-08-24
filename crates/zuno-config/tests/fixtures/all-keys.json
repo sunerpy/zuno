@@ -21,7 +21,9 @@
   },
   "skills": {
     "paths": ["./skills", "~/.config/opencode/skill"],
-    "urls": ["https://example.com/.well-known/skills/"]
+    "urls": ["https://example.com/.well-known/skills/"],
+    "includeInstructions": true,
+    "maxContextTokens": 8000
   },
   "references": {
     "shorthand": "github.com/sst/opencode",

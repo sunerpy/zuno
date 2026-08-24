@@ -90,14 +90,6 @@ fn names(skills: &Skills) -> Vec<String> {
     skills.all().iter().map(|s| s.name.clone()).collect()
 }
 
-fn located(skills: &Skills, name: &str) -> String {
-    skills
-        .get(name)
-        .unwrap_or_else(|| panic!("{name} must be loaded"))
-        .location
-        .clone()
-}
-
 #[tokio::test]
 async fn every_root_contributes_and_the_builtin_comes_first() {
     let tree = Tree::new();
@@ -185,7 +177,7 @@ async fn a_skill_file_with_no_name_is_rejected_and_the_warning_names_the_file() 
 }
 
 #[tokio::test]
-async fn a_duplicate_name_emits_exactly_one_warning_and_the_later_root_wins() {
+async fn a_duplicate_name_keeps_both_sources_and_requires_disambiguation() {
     let tree = Tree::new();
     tree.skill(
         "home/.config/opencode/skill/dupe",
@@ -196,44 +188,26 @@ async fn a_duplicate_name_emits_exactly_one_warning_and_the_later_root_wins() {
 
     let skills = load(&tree.options("proj")).await;
 
-    let duplicates: Vec<&_> = skills
-        .warnings()
-        .iter()
-        .filter(|warning| matches!(warning.kind(), SkillWarningKind::DuplicateName { .. }))
-        .collect();
-    eprintln!(
-        "QA failure scenario 2 -- {} duplicate warning(s): {}",
-        duplicates.len(),
-        duplicates
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
-    assert_eq!(duplicates.len(), 1, "{:?}", skills.warnings());
+    assert!(skills.warnings().is_empty(), "{:?}", skills.warnings());
+    assert!(skills.get("dupe").is_none());
+    let sources = skills
+        .named("dupe")
+        .into_iter()
+        .map(|skill| skill.location.as_str())
+        .collect::<Vec<_>>();
     assert_eq!(
-        duplicates[0].kind(),
-        &SkillWarningKind::DuplicateName {
-            name: "dupe".to_string(),
-            existing: tree
-                .at("home/.config/opencode/skill/dupe/SKILL.md")
-                .to_string_lossy()
-                .into_owned(),
-        }
-    );
-    assert_eq!(
-        located(&skills, "dupe"),
-        tree.at("home/.agents/skills/dupe/SKILL.md")
-            .to_string_lossy()
-    );
-    assert_eq!(
-        skills.get("dupe").expect("present").description.as_deref(),
-        Some("from agents")
+        sources,
+        [
+            tree.at("home/.config/opencode/skill/dupe/SKILL.md")
+                .to_string_lossy(),
+            tree.at("home/.agents/skills/dupe/SKILL.md")
+                .to_string_lossy(),
+        ]
     );
 }
 
 #[tokio::test]
-async fn a_config_directory_beats_both_external_roots() {
+async fn a_config_directory_does_not_hide_same_named_external_skills() {
     let tree = Tree::new();
     tree.skill("home/.claude/skills/dupe", "dupe", Some("from claude"));
     tree.skill("home/.agents/skills/dupe", "dupe", Some("from agents"));
@@ -241,26 +215,15 @@ async fn a_config_directory_beats_both_external_roots() {
 
     let skills = load(&tree.options("proj")).await;
 
-    assert_eq!(
-        located(&skills, "dupe"),
-        tree.at("home/.config/zuno/skill/dupe/SKILL.md")
-            .to_string_lossy()
-    );
-    assert_eq!(
-        skills
-            .warnings()
-            .iter()
-            .filter(|w| matches!(w.kind(), SkillWarningKind::DuplicateName { .. }))
-            .count(),
-        2,
-        "one warning per displacement"
-    );
+    assert_eq!(skills.named("dupe").len(), 3);
+    assert!(skills.get("dupe").is_none());
+    assert!(skills.warnings().is_empty());
 }
 
 /// The two de-duplication dimensions, side by side.
 ///
-/// Left: one file, two roots -> one match, **no** duplicate warning. Right: two
-/// files, one name -> two matches, **one** duplicate warning. Confusing the two
+/// Left: one file, two roots -> one source. Right: two files, one name -> two
+/// selectable sources. Confusing the two
 /// is the defect this test exists to catch.
 #[tokio::test]
 async fn path_dedup_and_name_dedup_are_different_mechanisms() {
@@ -293,13 +256,18 @@ async fn path_dedup_and_name_dedup_are_different_mechanisms() {
     let clash = load(&two_files.options("proj")).await;
     assert_eq!(
         names(&clash),
-        vec![builtin::NAME.to_string(), "solo".to_string()]
+        vec![
+            builtin::NAME.to_string(),
+            "solo".to_string(),
+            "solo".to_string()
+        ]
     );
-    assert_eq!(clash.warnings().len(), 1);
+    assert_eq!(clash.named("solo").len(), 2);
+    assert!(clash.warnings().is_empty());
 }
 
 #[tokio::test]
-async fn a_symlink_alias_is_a_duplicate_name_not_a_duplicate_path() {
+async fn a_symlink_alias_remains_a_separate_source_identity() {
     let tree = Tree::new();
     tree.skill("home/.agents/skills/aliased", "aliased", Some("real"));
     fs::create_dir_all(tree.home().join(".claude/skills")).expect("mkdir");
@@ -311,22 +279,13 @@ async fn a_symlink_alias_is_a_duplicate_name_not_a_duplicate_path() {
 
     let skills = load(&tree.options("proj")).await;
 
-    assert_eq!(skills.warnings().len(), 1, "{:?}", skills.warnings());
-    assert!(matches!(
-        skills.warnings()[0].kind(),
-        SkillWarningKind::DuplicateName { .. }
-    ));
-    // The real path wins because `.agents` is scanned after `.claude`, which is
-    // what the oracle reports for every alias on the surveyed machine.
-    assert_eq!(
-        located(&skills, "aliased"),
-        tree.at("home/.agents/skills/aliased/SKILL.md")
-            .to_string_lossy()
-    );
+    assert!(skills.warnings().is_empty(), "{:?}", skills.warnings());
+    assert_eq!(skills.named("aliased").len(), 2);
+    assert!(skills.get("aliased").is_none());
 }
 
 #[tokio::test]
-async fn a_disk_skill_overrides_the_builtin_with_one_warning() {
+async fn a_disk_skill_does_not_override_the_builtin() {
     let tree = Tree::new();
     tree.skill(
         &format!("home/.config/zuno/skill/{}", builtin::NAME),
@@ -336,16 +295,13 @@ async fn a_disk_skill_overrides_the_builtin_with_one_warning() {
 
     let skills = load(&tree.options("proj")).await;
 
-    assert_eq!(names(&skills), vec![builtin::NAME.to_string()]);
     assert_eq!(
-        skills
-            .get(builtin::NAME)
-            .expect("present")
-            .description
-            .as_deref(),
-        Some("mine")
+        names(&skills),
+        vec![builtin::NAME.to_string(), builtin::NAME.to_string()]
     );
-    assert_eq!(skills.warnings().len(), 1);
+    assert!(skills.get(builtin::NAME).is_none());
+    assert_eq!(skills.named(builtin::NAME).len(), 2);
+    assert!(skills.warnings().is_empty());
 }
 
 #[tokio::test]
@@ -401,7 +357,7 @@ async fn dirs_are_reported_for_every_match() {
 }
 
 #[tokio::test]
-async fn a_body_is_loaded_verbatim() {
+async fn a_body_is_read_verbatim_after_selection() {
     let tree = Tree::new();
     tree.write(
         "home/.agents/skills/verbatim/SKILL.md",
@@ -411,7 +367,12 @@ async fn a_body_is_loaded_verbatim() {
     let skills = load(&tree.options("proj")).await;
 
     assert_eq!(
-        skills.get("verbatim").expect("present").content,
+        skills
+            .get("verbatim")
+            .expect("present")
+            .read_body()
+            .await
+            .expect("body reads"),
         "\n  indented\ttab\r\n\nlast\n"
     );
 }
@@ -454,12 +415,7 @@ fn parse_file_round_trips_a_good_skill() {
     let path = tree.skill("home/.agents/skills/round", "round", Some("d"));
     assert_eq!(
         parse_file(&path).expect("loads"),
-        Skill {
-            name: "round".to_string(),
-            description: Some("d".to_string()),
-            location: path.to_string_lossy().into_owned(),
-            content: "\nbody of round\n".to_string(),
-        }
+        Skill::file("round".to_string(), Some("d".to_string()), path.clone(),)
     );
 }
 

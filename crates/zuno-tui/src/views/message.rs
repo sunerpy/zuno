@@ -247,6 +247,16 @@ pub enum ActivityDisplay {
     Detailed,
 }
 
+/// A successfully loaded skill as identified by the model's tool arguments.
+///
+/// Unique names may omit `source`; ambiguous names can only complete after the
+/// tool receives the exact source locator.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LoadedSkillIdentity {
+    pub name: String,
+    pub source: Option<String>,
+}
+
 impl ToolDisplay {
     /// How many rows of output this display shows.
     #[must_use]
@@ -1455,9 +1465,9 @@ impl TranscriptView {
             .unwrap_or(self.thinking)
     }
 
-    /// Skill names whose `skill` tool call completed successfully in this transcript.
+    /// Skill identities whose `skill` tool call completed successfully.
     #[must_use]
-    pub fn loaded_skills(&self) -> BTreeSet<String> {
+    pub fn loaded_skills(&self) -> BTreeSet<LoadedSkillIdentity> {
         self.transcript
             .messages
             .iter()
@@ -1476,11 +1486,18 @@ impl TranscriptView {
                     return None;
                 }
                 let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
-                value
+                if value.get("action").and_then(serde_json::Value::as_str) != Some("load") {
+                    return None;
+                }
+                let name = value
                     .get("name")
-                    .or_else(|| value.get("skill"))
+                    .and_then(serde_json::Value::as_str)?
+                    .to_owned();
+                let source = value
+                    .get("source")
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
+                    .map(str::to_owned);
+                Some(LoadedSkillIdentity { name, source })
             })
             .collect()
     }

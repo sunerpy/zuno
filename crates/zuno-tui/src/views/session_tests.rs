@@ -2642,6 +2642,7 @@ fn furnished_screen() -> SessionScreen {
     let ambient = screen.sidebar_mut().ambient_mut();
     ambient.skills = vec![crate::views::ambient::SkillSummary {
         name: String::from("codegraph"),
+        source: String::from("/skills/codegraph/SKILL.md"),
         description: String::from("navigate an indexed codebase"),
         loaded: false,
     }];
@@ -3454,6 +3455,7 @@ fn session_skill_picker_lists_discovered_skills_on_one_row_each() {
     let (mut screen, _shutdown) = screen();
     screen.sidebar_mut().ambient_mut().skills = vec![crate::views::ambient::SkillSummary {
         name: String::from("codegraph"),
+        source: String::from("/skills/codegraph/SKILL.md"),
         description: String::from("navigate\n  a  codebase"),
         loaded: false,
     }];
@@ -4477,6 +4479,7 @@ fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skil
     let (mut screen, _shutdown) = screen();
     screen.sidebar_mut().ambient_mut().skills = vec![crate::views::ambient::SkillSummary {
         name: String::from("codegraph"),
+        source: String::from("/skills/codegraph/SKILL.md"),
         description: String::from("navigate the indexed repository"),
         loaded: false,
     }];
@@ -4496,6 +4499,45 @@ fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skil
     for event in [
         TurnEvent::AssistantMessageCreated {
             step: 1,
+            message_id: String::from("assistant-resource"),
+        },
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("skill_resource_1"),
+            name: String::from("skill"),
+        }),
+        provider(StreamEvent::ToolInputDelta {
+            id: String::from("skill_resource_1"),
+            delta: String::from(
+                r#"{"action":"read_resource","name":"codegraph","path":"references/index.md"}"#,
+            ),
+        }),
+        provider(StreamEvent::ToolUseEnd {
+            id: String::from("skill_resource_1"),
+        }),
+        TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("skill_resource_1"),
+            name: String::from("skill"),
+            title: String::from("Skill resource: codegraph/references/index.md"),
+            output: String::from("reference body"),
+            diff: None,
+            written_paths: Vec::new(),
+            is_error: false,
+        },
+    ] {
+        screen.handle_event(&AppEvent::Engine(event));
+    }
+    let resource_only =
+        rows(&render_offscreen(&mut screen, 120, 32).expect("infallible")).join("\n");
+    assert!(
+        resource_only.contains("0/1 loaded") && resource_only.contains("· codegraph"),
+        "reading a resource without loading SKILL.md was incorrectly counted as loaded:\n\
+         {resource_only}"
+    );
+
+    for event in [
+        TurnEvent::AssistantMessageCreated {
+            step: 2,
             message_id: String::from("assistant"),
         },
         provider(StreamEvent::ToolUseStart {
@@ -4504,13 +4546,13 @@ fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skil
         }),
         provider(StreamEvent::ToolInputDelta {
             id: String::from("skill_1"),
-            delta: String::from(r#"{"name":"codegraph"}"#),
+            delta: String::from(r#"{"action":"load","name":"codegraph"}"#),
         }),
         provider(StreamEvent::ToolUseEnd {
             id: String::from("skill_1"),
         }),
         TurnEvent::ToolDispatchCompleted {
-            step: 1,
+            step: 2,
             call_id: String::from("skill_1"),
             name: String::from("skill"),
             title: String::from("Loaded codegraph"),
@@ -4527,6 +4569,64 @@ fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skil
     assert!(
         after.contains("1/1 loaded") && after.contains("✓ codegraph"),
         "a successfully completed skill call did not update the sidebar:\n{after}"
+    );
+}
+
+#[test]
+fn session_sidebar_tracks_same_named_skills_by_source() {
+    let (mut screen, _shutdown) = screen();
+    screen.sidebar_mut().ambient_mut().skills = vec![
+        crate::views::ambient::SkillSummary {
+            name: String::from("review"),
+            source: String::from("/skills/team-a/review/SKILL.md"),
+            description: String::from("team A review"),
+            loaded: false,
+        },
+        crate::views::ambient::SkillSummary {
+            name: String::from("review"),
+            source: String::from("/skills/team-b/review/SKILL.md"),
+            description: String::from("team B review"),
+            loaded: false,
+        },
+    ];
+    let provider = |event| TurnEvent::Provider { step: 1, event };
+    for event in [
+        TurnEvent::AssistantMessageCreated {
+            step: 1,
+            message_id: String::from("assistant"),
+        },
+        provider(StreamEvent::ToolUseStart {
+            id: String::from("skill_review"),
+            name: String::from("skill"),
+        }),
+        provider(StreamEvent::ToolInputDelta {
+            id: String::from("skill_review"),
+            delta: String::from(
+                r#"{"action":"load","name":"review","source":"/skills/team-b/review/SKILL.md"}"#,
+            ),
+        }),
+        provider(StreamEvent::ToolUseEnd {
+            id: String::from("skill_review"),
+        }),
+        TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: String::from("skill_review"),
+            name: String::from("skill"),
+            title: String::from("Loaded review"),
+            output: String::from("complete skill body"),
+            diff: None,
+            written_paths: Vec::new(),
+            is_error: false,
+        },
+    ] {
+        screen.handle_event(&AppEvent::Engine(event));
+    }
+
+    let _rendered = render_offscreen(&mut screen, 120, 32).expect("infallible");
+    let skills = &screen.sidebar_mut().ambient_mut().skills;
+    assert!(
+        !skills[0].loaded && skills[1].loaded,
+        "loading one source marked the wrong same-named skill as loaded: {skills:?}"
     );
 }
 

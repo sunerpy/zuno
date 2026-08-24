@@ -73,7 +73,7 @@ use zuno_tui::views::slash::{CatalogCommand, HostCommand};
 
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
 use super::tui_question::{QuestionBridge, QuestionBroker};
-use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
+use super::turn::{SessionChoice, SessionTitleSink, TurnHost, TurnOptions, TurnPlan};
 use crate::command::TuiArgs;
 use crate::environment::StartupEnvironment;
 
@@ -450,12 +450,13 @@ fn execute_once(
     let driver_approval = Arc::clone(&approval);
     let mut driver_options = options.clone();
     let driver_environment = environment.clone();
+    let runs = SessionRunRegistry::new();
     let mut host = runtime.block_on(TurnHost::open_with_runtime_and_mcp(
         plan,
         environment,
         approval,
         Some(Arc::clone(&question)),
-        SessionRunRegistry::new(),
+        runs.clone(),
         Some(mcp_catalog.clone()),
     ))?;
     if let Err(error) = host.activate_extension_composition() {
@@ -476,10 +477,12 @@ fn execute_once(
     // name on frame one instead of waiting for a turn that will never re-title it — the
     // generator declines outright once a session is named.
     let session_title = SessionTitle::new(host.session_title().map(str::to_owned));
-    host.set_title_sink(Arc::new(TitleProjectionSink {
+    let title_sink: Arc<dyn SessionTitleSink> = Arc::new(TitleProjectionSink {
         projection: session_title.clone(),
         wake: terminal_sender.clone(),
-    }));
+    });
+    host.set_title_sink(Arc::clone(&title_sink));
+    let continuity = TuiHostContinuity::new(runs, title_sink);
     let work_state = WorkState::new(host.work_state()?);
     // Copied before the host is moved into the turn driver. The id is what the hint
     // printed after teardown has to name, and by then the host is gone — a driver task
@@ -496,7 +499,7 @@ fn execute_once(
     let (mcp_toggle_sender, mcp_toggle_receiver) = mpsc::channel(MCP_TOGGLE_CHANNEL_CAPACITY);
     let (editor_sender, editor_receiver) = mpsc::channel(EDITOR_CHANNEL_CAPACITY);
     let (editor_result_sender, editor_result_receiver) = mpsc::channel(EDITOR_CHANNEL_CAPACITY);
-    let control = host.control();
+    let control = continuity.control(host.session_id());
 
     let (report_sender, report_receiver) = mpsc::channel(LSP_CHANNEL_CAPACITY);
     let (edit_sender, edit_receiver) = mpsc::channel(EDIT_SIGNAL_CHANNEL_CAPACITY);
@@ -682,6 +685,7 @@ fn execute_once(
                 snapshots: SnapshotHistory::new(snapshot_store),
                 work_state,
                 work_wake,
+                continuity,
                 remount: driver_remount,
                 shutdown: session_shutdown,
             },
@@ -870,6 +874,58 @@ impl super::turn::SessionTitleSink for TitleProjectionSink {
     fn publish(&self, title: &str) {
         self.projection.replace(Some(title.to_owned()));
         let _nudged = self.wake.try_send(TerminalEvent::Wake);
+    }
+}
+
+/// Process-local collaborators that survive a turn-host replacement.
+///
+/// Model, agent, effort, and MCP changes replace [`TurnHost`] without remounting the
+/// session screen. Cancellation control and the title projection belong to that mounted
+/// session, not to one host generation. Keeping both here prevents a replacement from
+/// silently moving live work to a fresh registry while the UI still targets the old one,
+/// or from dropping future title updates after the first host is gone.
+#[derive(Clone)]
+struct TuiHostContinuity {
+    runs: SessionRunRegistry,
+    title_sink: Arc<dyn SessionTitleSink>,
+}
+
+impl TuiHostContinuity {
+    fn new(runs: SessionRunRegistry, title_sink: Arc<dyn SessionTitleSink>) -> Self {
+        Self { runs, title_sink }
+    }
+
+    fn control(&self, session_id: &str) -> zuno_engine::status::SessionControl {
+        self.runs.control(session_id)
+    }
+
+    fn runs(&self) -> SessionRunRegistry {
+        self.runs.clone()
+    }
+
+    fn title_sink(&self) -> Arc<dyn SessionTitleSink> {
+        Arc::clone(&self.title_sink)
+    }
+
+    async fn open_host(
+        &self,
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        approval: Arc<dyn PermissionAsker>,
+        question: Arc<dyn QuestionAsker>,
+        mcp: zuno_mcp::Catalog,
+    ) -> Result<TurnHost, String> {
+        let mut host = TurnHost::open_with_runtime_and_mcp(
+            plan,
+            environment,
+            approval,
+            Some(question),
+            self.runs(),
+            Some(mcp),
+        )
+        .await?;
+        host.set_title_sink(self.title_sink());
+        Ok(host)
     }
 }
 
@@ -1100,6 +1156,7 @@ impl SessionFacts {
             .into_iter()
             .map(|skill| zuno_tui::views::ambient::SkillSummary {
                 name: skill.name,
+                source: skill.location,
                 description: skill.description.unwrap_or_default(),
                 loaded: false,
             })
@@ -1516,6 +1573,7 @@ struct TurnRebuild<'a> {
     environment: &'a StartupEnvironment,
     approval: &'a Arc<dyn PermissionAsker>,
     question: &'a Arc<dyn QuestionAsker>,
+    continuity: &'a TuiHostContinuity,
     events: &'a TurnEventSender,
     mcp_catalog: &'a zuno_mcp::Catalog,
 }
@@ -1848,16 +1906,17 @@ async fn apply_selection(
             return SelectionOutcome::Unchanged;
         }
     };
+    let continuity = rebuild.continuity.clone();
     match replace_host(host, || async move {
-        TurnHost::open_with_runtime_and_mcp(
-            plan,
-            rebuild.environment,
-            Arc::clone(rebuild.approval),
-            Some(Arc::clone(rebuild.question)),
-            SessionRunRegistry::new(),
-            Some(rebuild.mcp_catalog.clone()),
-        )
-        .await
+        continuity
+            .open_host(
+                plan,
+                rebuild.environment,
+                Arc::clone(rebuild.approval),
+                Arc::clone(rebuild.question),
+                rebuild.mcp_catalog.clone(),
+            )
+            .await
     })
     .await
     {
@@ -1896,6 +1955,7 @@ struct TurnDriver {
     snapshots: SnapshotHistory,
     work_state: WorkState,
     work_wake: mpsc::Sender<TerminalEvent>,
+    continuity: TuiHostContinuity,
     remount: CompositionRemount,
     shutdown: mpsc::Sender<TerminalEvent>,
 }
@@ -2029,6 +2089,7 @@ async fn drive_turns(
                         environment: &environment,
                         approval: &driver.approval,
                         question: &driver.question,
+                        continuity: &driver.continuity,
                         events: &events,
                         mcp_catalog: &driver.mcp_catalog,
                     };
@@ -2204,16 +2265,11 @@ async fn refresh_mcp_host(
     let approval = Arc::clone(&driver.approval);
     let question = Arc::clone(&driver.question);
     let mcp_catalog = driver.mcp_catalog.clone();
+    let continuity = driver.continuity.clone();
     replace_host(&mut driver.host, || async move {
-        TurnHost::open_with_runtime_and_mcp(
-            plan,
-            environment,
-            approval,
-            Some(question),
-            SessionRunRegistry::new(),
-            Some(mcp_catalog),
-        )
-        .await
+        continuity
+            .open_host(plan, environment, approval, question, mcp_catalog)
+            .await
     })
     .await
     .map(|()| Some(events.clone()))
@@ -2842,6 +2898,55 @@ mod tests {
 
         shutdown.send(true).expect("the worker observes shutdown");
         worker.await.expect("the cancellation bridge exits cleanly");
+    }
+
+    #[test]
+    fn tui_host_continuity_keeps_cancellation_bound_to_replacement_hosts() {
+        let continuity = TuiHostContinuity::new(
+            SessionRunRegistry::new(),
+            Arc::new(RecordingTitleSink::default()),
+        );
+        let control = continuity.control("ses_rebuilt");
+        let replacement_runs = continuity.runs();
+        let guard = replacement_runs
+            .begin_turn("ses_rebuilt")
+            .expect("the replacement host owns the live turn");
+
+        assert_eq!(
+            control.abort(),
+            zuno_engine::status::AbortDisposition::Active,
+            "a control created before host replacement targeted an abandoned registry"
+        );
+        assert!(
+            guard.interrupt_signal().is_set(),
+            "the replacement host did not receive the user's interrupt"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingTitleSink(Mutex<Vec<String>>);
+
+    impl SessionTitleSink for RecordingTitleSink {
+        fn publish(&self, title: &str) {
+            self.0.lock().expect("title log").push(title.to_owned());
+        }
+    }
+
+    #[test]
+    fn tui_host_continuity_keeps_title_projection_bound_to_replacement_hosts() {
+        let titles = Arc::new(RecordingTitleSink::default());
+        let continuity = TuiHostContinuity::new(
+            SessionRunRegistry::new(),
+            Arc::clone(&titles) as Arc<dyn SessionTitleSink>,
+        );
+
+        continuity.title_sink().publish("Replacement title");
+
+        assert_eq!(
+            *titles.0.lock().expect("title log"),
+            ["Replacement title"],
+            "a replacement host lost the live sidebar title projection"
+        );
     }
 
     #[test]

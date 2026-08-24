@@ -227,14 +227,32 @@ indexes. It also imports `SKILL.md` files from:
 
 The OpenCode integration is intentionally limited to skill documents. Zuno does
 not read OpenCode config, plugins, hooks, tools, permissions, or runtime state.
-Within the same global or project scope, imported OpenCode skills load first, so
-a duplicate from `.claude`, `.agents`, Zuno config, or an explicit path wins and
-emits a warning; project roots still override global roots. Set
-`ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable all imported roots, or
-`ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` to disable only Claude skill roots.
+The same source path is de-duplicated, while same-named files from different
+sources remain independently addressable; no hidden discovery precedence
+selects one. Set `ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable all imported roots,
+or `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` to disable only Claude skill roots.
 
-Use `zuno debug skill` after restarting to inspect the exact catalog, source
-location, and any duplicate warnings visible to a session. A generic prompt such
+The model prompt receives a bounded catalog rather than every `SKILL.md` body.
+By default its approximate budget is two percent of the model context (8,000
+characters when the context is unknown), capped at 10,000 tokens. Configure it
+under `skills`:
+
+```json
+{
+  "skills": {
+    "includeInstructions": true,
+    "maxContextTokens": 8000
+  }
+}
+```
+
+`includeInstructions: false` removes both the trigger policy and catalog from
+model prompts. The `skill` tool still supports paged `list` and `search`
+discovery. `load` and `read_resource` return content-bound continuation cursors;
+the caller must read through `complete: true` before applying the instructions.
+
+Use `zuno debug skill` after restarting to inspect the exact catalog and source
+locations visible to a session. A generic prompt such
 as "follow skill guidance" does not select every skill; a skill is loaded only
 when its name is explicit or its description clearly matches the request.
 

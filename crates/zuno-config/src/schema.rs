@@ -110,7 +110,7 @@ pub struct Config {
     /// Custom commands, keyed by command name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<OrderedMap<CommandConfig>>,
-    /// Additional skill sources.
+    /// Skill discovery and model-visible catalog settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsConfig>,
     /// Named git or local directory references.
@@ -327,8 +327,9 @@ pub struct CommandConfig {
     pub subtask: Option<bool>,
 }
 
-/// Additional skill sources (`config/skills.ts:5-12`).
+/// Skill discovery and model-visible catalog settings.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsConfig {
     /// Additional paths to skill folders.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -336,6 +337,16 @@ pub struct SkillsConfig {
     /// URLs to fetch skills from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
+    /// Whether turns receive the skill trigger policy and metadata catalog.
+    #[serde(
+        rename = "includeInstructions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub include_instructions: Option<bool>,
+    /// Maximum approximate tokens used by the catalog. Values above 10,000 are
+    /// clamped by the runtime.
+    #[serde(rename = "maxContextTokens", skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<NonZeroU32>,
 }
 
 /// File-watcher configuration (`config/config.ts:49`).

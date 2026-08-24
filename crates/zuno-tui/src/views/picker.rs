@@ -29,6 +29,7 @@ use crate::views::{ViewContext, padded};
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
+use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
 #[cfg(test)]
@@ -1292,12 +1293,26 @@ pub fn skill_list(
     context: ViewContext,
     skills: Vec<crate::views::ambient::SkillSummary>,
 ) -> SelectDialog {
+    let mut name_counts = BTreeMap::<String, usize>::new();
+    for skill in &skills {
+        *name_counts.entry(skill.name.clone()).or_default() += 1;
+    }
     let items = skills
         .into_iter()
         // Whitespace collapsed: a skill's description is a paragraph in `SKILL.md`, and a
         // list row is one line. Left as-is, an embedded newline ends the row early and the
         // rest of the sentence renders as a second, unlabelled row.
-        .map(|skill| Item::new(skill.name).described(flatten(&skill.description)))
+        .map(|skill| {
+            let description = flatten(&skill.description);
+            let description = if name_counts.get(&skill.name) == Some(&1) {
+                description
+            } else if description.is_empty() {
+                format!("source: {}", skill.source)
+            } else {
+                format!("{description} · source: {}", skill.source)
+            };
+            Item::new(skill.name).described(description)
+        })
         .collect();
     SelectDialog::new(SKILL_DIALOG_ID, "Skills", context, items)
 }

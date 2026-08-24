@@ -37,11 +37,13 @@ fn ambient() -> Ambient {
         skills: vec![
             SkillSummary {
                 name: String::from("commit-msg"),
+                source: String::from("/skills/commit-msg/SKILL.md"),
                 description: String::from("conventional commits"),
                 loaded: false,
             },
             SkillSummary {
                 name: String::from("codegraph"),
+                source: String::from("/skills/codegraph/SKILL.md"),
                 description: String::from("code navigation"),
                 loaded: false,
             },
@@ -335,12 +337,60 @@ fn views_sidebar_skill_names_appear_only_once_expanded() {
 }
 
 #[test]
+fn views_sidebar_groups_loaded_skills_first_and_sorts_each_group() {
+    let mut view = view();
+    view.ambient_mut().skills = vec![
+        SkillSummary {
+            name: String::from("zeta-unloaded"),
+            source: String::from("/skills/zeta-unloaded/SKILL.md"),
+            description: String::new(),
+            loaded: false,
+        },
+        SkillSummary {
+            name: String::from("zeta-loaded"),
+            source: String::from("/skills/zeta-loaded/SKILL.md"),
+            description: String::new(),
+            loaded: true,
+        },
+        SkillSummary {
+            name: String::from("alpha-unloaded"),
+            source: String::from("/skills/alpha-unloaded/SKILL.md"),
+            description: String::new(),
+            loaded: false,
+        },
+        SkillSummary {
+            name: String::from("alpha-loaded"),
+            source: String::from("/skills/alpha-loaded/SKILL.md"),
+            description: String::new(),
+            loaded: true,
+        },
+    ];
+    view.toggle_skills();
+
+    let joined = drawn(&mut view);
+    let at = |needle: &str| {
+        joined
+            .find(needle)
+            .unwrap_or_else(|| panic!("`{needle}` is missing:\n{joined}"))
+    };
+    assert!(
+        at("Loaded (2)") < at("alpha-loaded · loaded")
+            && at("alpha-loaded · loaded") < at("zeta-loaded · loaded")
+            && at("zeta-loaded · loaded") < at("Not loaded (2)")
+            && at("Not loaded (2)") < at("alpha-unloaded")
+            && at("alpha-unloaded") < at("zeta-unloaded"),
+        "skills were not grouped loaded-first and sorted within each group:\n{joined}"
+    );
+}
+
+#[test]
 fn views_sidebar_scrolls_its_body_independently_and_keeps_the_footer_pinned() {
     let mut view = view();
     view.ambient_mut().title = Some(String::from("Investigating the frozen turn"));
     view.ambient_mut().skills = (0..24)
         .map(|index| SkillSummary {
             name: format!("skill-{index:02}"),
+            source: format!("/skills/skill-{index:02}/SKILL.md"),
             description: String::new(),
             loaded: index == 23,
         })
@@ -361,8 +411,8 @@ fn views_sidebar_scrolls_its_body_independently_and_keeps_the_footer_pinned() {
     let after = rows(&render_offscreen(&mut view, SIDEBAR_WIDTH, 12).expect("infallible"));
     assert_ne!(before, after, "scrolling did not change the sidebar body");
     assert!(
-        after.join("\n").contains("skill-23 · loaded"),
-        "the loaded skill is not labelled after scrolling:\n{}",
+        after.join("\n").contains("skill-22"),
+        "scrolling did not reach the tail of the not-loaded group:\n{}",
         after.join("\n")
     );
     assert!(

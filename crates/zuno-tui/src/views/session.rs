@@ -1757,8 +1757,22 @@ impl Component for SessionScreen {
         ambient.usage_state = self.transcript.transcript().usage_state();
         ambient.context = self.transcript.transcript().context_window();
         let loaded_skills = self.transcript.loaded_skills();
+        let mut skill_name_counts = BTreeMap::<String, usize>::new();
+        for skill in &ambient.skills {
+            *skill_name_counts.entry(skill.name.clone()).or_default() += 1;
+        }
         for skill in &mut ambient.skills {
-            skill.loaded = loaded_skills.contains(&skill.name);
+            let exact = crate::views::message::LoadedSkillIdentity {
+                name: skill.name.clone(),
+                source: Some(skill.source.clone()),
+            };
+            let unique_name = skill_name_counts.get(&skill.name) == Some(&1);
+            let by_unique_name = crate::views::message::LoadedSkillIdentity {
+                name: skill.name.clone(),
+                source: None,
+            };
+            skill.loaded = loaded_skills.contains(&exact)
+                || (unique_name && loaded_skills.contains(&by_unique_name));
         }
         if let Some(aside) = aside {
             self.sidebar.render(frame, aside);

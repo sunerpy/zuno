@@ -1689,6 +1689,8 @@ impl TurnHost {
                 };
             }
         };
+        let skill_context_window = plan.window.context;
+        let skill_config = plan.config.skills.clone();
         let profile_runtime = HarnessRuntime::new("profile");
         let profile = plan.profile;
         if let Err(error) = profile_runtime.activate_profile(profile).await {
@@ -1849,7 +1851,12 @@ impl TurnHost {
                 plan.extensions.prompt_section(),
             )?;
             announce_instructions(&mut plan.resolver, &plan.instructions, &mut notes)?;
-            announce_skills(&mut plan.resolver, &plan.skills, &mut notes)?;
+            announce_skills(
+                &mut plan.resolver,
+                &plan.skills,
+                skill_context_window,
+                skill_config.as_ref(),
+            )?;
             let child_host =
                 super::child_turn::ChildSessionHost::new(super::child_turn::ChildSessionContext {
                     database: Arc::clone(&database),
@@ -3439,73 +3446,109 @@ fn dynamic_context_from_goal_entry(
     DynamicContext::new(text)
 }
 
-/// How many bytes of skill catalogue may enter the system prompt.
-///
-/// Sized against the real corpus rather than picked round: this machine's 189 skills
-/// render to roughly 113 KB verbose, and 32 KB fits the great majority of them while
-/// keeping the catalogue a fraction of a small model's context. The trim is reported,
-/// never silent — see [`announce_skills`].
-const SKILL_PROMPT_BUDGET: usize = 32 * 1024;
+const DEFAULT_SKILL_METADATA_CHAR_BUDGET: usize = 8_000;
+const MAX_SKILL_METADATA_TOKEN_BUDGET: usize = 10_000;
+const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
+const APPROX_BYTES_PER_TOKEN: usize = 4;
 
-/// System-level trigger rules for the skill catalogue below.
+/// System-level trigger rules for progressive skill discovery.
 const SKILL_USAGE_POLICY: &str = "\
-Skills are mandatory trigger rules, not optional suggestions. Before taking any task action, \
-compare the request with the advertised skill descriptions. If the user names a skill or the \
-task clearly matches one, call the `skill` tool first, read the complete skill body, and follow \
-it for that turn. Load only the minimal matching set, in the order needed. Do not claim a skill \
-was used unless its tool call completed successfully, and do not substitute the catalogue \
-description for the skill body.";
+Skills are mandatory trigger rules, not optional suggestions. The `<skill_index>` below lists \
+model-visible names, descriptions, and exact source locators. If the user names a listed skill, \
+or the request clearly matches its description, call `skill` with action `load`, its name, and \
+that exact source before taking task action. Use action `search` for a capability query and action \
+`list` when the catalog says entries were omitted. A metadata result is not instructions. Read \
+every selected SKILL.md completely, following `next_cursor` until complete, then read only the \
+referenced resources required for the task with action `read_resource` and the same name/source. \
+Do not delegate reading or interpreting skill instructions. Prefer bundled scripts, assets, and \
+templates over recreating them. Announce the minimal skill set and order you will use. Never use \
+shell, find, glob, or a broad filesystem scan to rediscover an advertised or loaded skill.";
 
-/// Put the discovered skills in the system prompt, and say so if any did not fit.
+/// Put a compact discovered-skill index in the system prompt.
 ///
 /// Discovery has run since todo 14, and until now its only consumer was a TUI status
 /// line: the model was never told a single skill existed, so no skill could ever
-/// activate and the `skill` tool had no names to be called with. This is the other
-/// half of that tool — a catalogue without a loader is unusable, and a loader without
-/// a catalogue is uncallable.
+/// activate and the `skill` tool had no names to be called with. The compact index is
+/// a fast path for exact names; search is the authoritative discovery path and covers
+/// every described skill even if a future name set exceeds the index budget.
 ///
-/// [`zuno_catalog::skill::Form::Verbose`] rather than `List` because it carries each
-/// skill's `location`, which leaves `read` as a working fallback if the `skill` tool
-/// is denied by an agent's permissions.
 fn announce_skills(
     resolver: &mut Resolver,
     skills: &zuno_catalog::skill::Skills,
-    notes: &mut Vec<String>,
+    context_window: u64,
+    config: Option<&zuno_config::schema::SkillsConfig>,
 ) -> Result<(), String> {
-    if skills.all().is_empty() {
+    if config.and_then(|settings| settings.include_instructions) == Some(false) {
         return Ok(());
     }
-    let rendered = skills.render_within(zuno_catalog::skill::Form::Verbose, SKILL_PROMPT_BUDGET);
-    if rendered.rendered == 0 {
-        notes.push(format!(
-            "warning: no skill fits the {SKILL_PROMPT_BUDGET}-byte prompt budget, so none \
-             were advertised; shorten the longest `description` in your skill frontmatter"
-        ));
+    let discoverable = skills
+        .all()
+        .iter()
+        .filter(|skill| skill.description.is_some())
+        .count();
+    if discoverable == 0 {
         return Ok(());
     }
-    if rendered.omitted > 0 {
-        notes.push(format!(
-            "warning: {} of {} skills did not fit the {SKILL_PROMPT_BUDGET}-byte prompt \
-             budget and were not advertised to the model",
-            rendered.omitted,
-            rendered.rendered + rendered.omitted,
-        ));
-    }
+    let budget = skill_metadata_budget(context_window, config);
+    let rendered = skills.render_within(zuno_catalog::skill::Form::Index, budget);
+    let index = match (rendered.rendered, rendered.omitted, rendered.truncated) {
+        (_, 0, 0) => rendered.text,
+        (_, 0, truncated) => format!(
+            "{}\n{truncated} skill description(s) were shortened to fit the model-visible \
+             metadata budget; every source identity remains available.",
+            rendered.text
+        ),
+        (0, omitted, _) => format!(
+            "<skill_index listed=\"0\" total=\"{discoverable}\" />\n\
+             The metadata budget omitted {omitted} entries. Action `list` pages through all \
+             {discoverable} described skills, and action `search` queries the same complete set."
+        ),
+        (listed, omitted, truncated) => format!(
+            "{}\nCatalog coverage: {listed} of {discoverable} source identities; {omitted} \
+             omitted entries remain available through action `list` or `search`. \
+             {truncated} rendered description(s) were shortened first.",
+            rendered.text,
+        ),
+    };
     resolver.append_prompt_section(
         "skills.policy",
         "zuno skill trigger policy",
         SKILL_USAGE_POLICY,
     )?;
-    resolver.append_prompt_section("skills.catalog", "discovered skills", rendered.text)
+    resolver.append_prompt_section("skills.index", "discovered skill index", index)
+}
+
+fn skill_metadata_budget(
+    context_window: u64,
+    config: Option<&zuno_config::schema::SkillsConfig>,
+) -> usize {
+    let configured = config
+        .and_then(|settings| settings.max_context_tokens)
+        .map(|tokens| usize::try_from(tokens.get()).unwrap_or(usize::MAX));
+    let tokens = configured.or_else(|| {
+        (context_window > 0).then(|| {
+            usize::try_from(
+                context_window
+                    .saturating_mul(SKILL_METADATA_CONTEXT_PERCENT)
+                    .saturating_div(100)
+                    .max(1),
+            )
+            .unwrap_or(usize::MAX)
+        })
+    });
+    tokens.map_or(DEFAULT_SKILL_METADATA_CHAR_BUDGET, |tokens| {
+        tokens
+            .min(MAX_SKILL_METADATA_TOKEN_BUDGET)
+            .saturating_mul(APPROX_BYTES_PER_TOKEN)
+    })
 }
 
 /// How many bytes of instruction files may enter the system prompt.
 ///
-/// Twice [`SKILL_PROMPT_BUDGET`], because these are the rules the user wrote for this
-/// repository rather than a catalogue of capabilities they may never invoke, and
-/// because the realistic corpus is larger than it looks: the `AGENTS.md` files on one
-/// developer machine here run from 4 KB to 80 KB, and the global-plus-project pair is
-/// typically under 15 KB. 64 KB admits that whole range and still bounds one
+/// These are the rules the user wrote for this repository rather than a capability
+/// index, and the realistic corpus is larger than it looks: the `AGENTS.md` files on
+/// one developer machine here run from 4 KB to 80 KB, and the global-plus-project
+/// pair is typically under 15 KB. 64 KB admits that whole range and still bounds one
 /// pathological file from consuming a small model's context.
 const INSTRUCTION_PROMPT_BUDGET: usize = 64 * 1024;
 

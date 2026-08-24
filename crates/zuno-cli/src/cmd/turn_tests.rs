@@ -505,12 +505,13 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     ))
     .load()
     .await;
-    let skills = zuno_catalog::skill::Skills::from_loaded([zuno_catalog::skill::Skill {
-        name: "verify".to_owned(),
-        description: Some("Verify the assembled result.".to_owned()),
-        location: "/skills/verify/SKILL.md".to_owned(),
-        content: "body".to_owned(),
-    }]);
+    let skills =
+        zuno_catalog::skill::Skills::from_loaded([zuno_catalog::skill::Skill::embedded_at_path(
+            "verify",
+            Some("Verify the assembled result.".to_owned()),
+            PathBuf::from("/skills/verify/SKILL.md"),
+            "body",
+        )]);
     let mut resolver = traced_resolver("AGENT");
     let mut notes = Vec::new();
 
@@ -528,7 +529,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
         )
         .expect("inject extension provenance");
     announce_instructions(&mut resolver, &loaded, &mut notes).expect("inject instructions");
-    announce_skills(&mut resolver, &skills, &mut notes).expect("inject skills");
+    announce_skills(&mut resolver, &skills, 0, None).expect("inject skills");
 
     let assembly = resolver
         .prompt_assembly
@@ -547,7 +548,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             "extensions",
             "instructions.0",
             "skills.policy",
-            "skills.catalog",
+            "skills.index",
         ]
     );
     assert_eq!(
@@ -567,7 +568,7 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
         repo.join("AGENTS.md").display().to_string()
     );
     assert_eq!(assembly.sections()[5].source(), "zuno skill trigger policy");
-    assert_eq!(assembly.sections()[6].source(), "discovered skills");
+    assert_eq!(assembly.sections()[6].source(), "discovered skill index");
     assert_eq!(resolver.system_prompt, assembly.render());
     assert!(notes.is_empty(), "{notes:?}");
 }
@@ -3743,18 +3744,20 @@ mod production_registry {
 
     /// The `skill` tool must answer from the same set the prompt advertised.
     ///
-    /// One load shared by both consumers, so a name in `<available_skills>` is
+    /// One load shared by both consumers, so a name in `<skill_index>` is
     /// necessarily a name the tool can load. Two loads would let them disagree.
     #[tokio::test]
     async fn the_skill_tool_answers_from_the_very_set_the_prompt_was_built_from() {
         use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
 
-        let skills = zuno_catalog::skill::Skills::from_loaded([zuno_catalog::skill::Skill {
-            name: "wired".to_owned(),
-            description: Some("proves the registry holds this exact set".to_owned()),
-            location: "/skills/wired/SKILL.md".to_owned(),
-            content: "the body the model must receive".to_owned(),
-        }]);
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "wired",
+                Some("proves the registry holds this exact set".to_owned()),
+                PathBuf::from("/skills/wired/SKILL.md"),
+                "the body the model must receive",
+            ),
+        ]);
         let advertised = skills.render(zuno_catalog::skill::Form::Verbose);
         let directory = tempfile::TempDir::new().expect("temporary tool workspace");
         let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
@@ -3798,7 +3801,7 @@ mod production_registry {
             .expect("the assembled registry advertises `skill`");
         let output = tool
             .invoke(
-                serde_json::json!({"name": "wired"}),
+                serde_json::json!({"action": "load", "name": "wired"}),
                 ToolContext::new(
                     "ses_registry",
                     "msg_registry",
@@ -3811,21 +3814,31 @@ mod production_registry {
             .await
             .expect("the advertised skill loads through the assembled tool");
 
-        assert_eq!(output.output, "the body the model must receive");
+        assert!(
+            output.output.contains("the body the model must receive"),
+            "{}",
+            output.output
+        );
+        assert!(
+            output.output.contains("Resource root: `/skills/wired`")
+                && output.output.contains("action `read_resource`"),
+            "the model did not receive authoritative resource guidance:\n{}",
+            output.output
+        );
     }
 }
 
-/// The skill catalogue must reach the system prompt, bounded, and say when it trims.
+/// Skill discovery must stay model-visible without embedding every description.
 mod skill_prompt {
     use super::*;
 
     fn skill(name: &str, description: &str) -> zuno_catalog::skill::Skill {
-        zuno_catalog::skill::Skill {
-            name: name.to_owned(),
-            description: Some(description.to_owned()),
-            location: format!("/skills/{name}/SKILL.md"),
-            content: "body".to_owned(),
-        }
+        zuno_catalog::skill::Skill::embedded_at_path(
+            name,
+            Some(description.to_owned()),
+            PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            "body",
+        )
     }
 
     fn resolver() -> Resolver {
@@ -3836,24 +3849,22 @@ mod skill_prompt {
     fn a_discovered_skill_reaches_the_prompt_without_displacing_the_agents_own() {
         let skills = zuno_catalog::skill::Skills::from_loaded([skill("deploy", "Ship it.")]);
         let mut resolver = resolver();
-        let mut notes = Vec::new();
-
-        announce_skills(&mut resolver, &skills, &mut notes).expect("announce skills");
+        announce_skills(&mut resolver, &skills, 0, None).expect("announce skills");
 
         assert!(
             resolver.system_prompt.starts_with("AGENT PROMPT"),
             "the agent's own prompt must stay first: {}",
             resolver.system_prompt
         );
-        assert!(resolver.system_prompt.contains("<name>deploy</name>"));
+        assert!(resolver.system_prompt.contains("name=\"deploy\""));
+        assert!(resolver.system_prompt.contains("<skill_index>"));
         assert!(
-            resolver
-                .system_prompt
-                .contains("<description>Ship it.</description>")
+            resolver.system_prompt.contains("Ship it."),
+            "the catalog must expose trigger metadata"
         );
         assert!(
             resolver.system_prompt.contains("/skills/deploy/SKILL.md"),
-            "the location is what leaves `read` as a fallback"
+            "the catalog must expose the exact source needed for loading"
         );
         let policy = resolver
             .system_prompt
@@ -3861,65 +3872,94 @@ mod skill_prompt {
             .expect("skill trigger policy");
         let catalog = resolver
             .system_prompt
-            .find("<name>deploy</name>")
+            .find("name=\"deploy\"")
             .expect("skill catalogue");
         assert!(
             policy < catalog,
             "the model saw the catalogue before the rules that make it actionable"
         );
         assert!(
-            resolver
-                .system_prompt
-                .contains("call the `skill` tool first"),
-            "the prompt does not require loading a matching skill before task actions"
+            resolver.system_prompt.contains("action `search`"),
+            "the prompt does not explain how descriptions are discovered"
         );
-        assert!(notes.is_empty(), "nothing was trimmed: {notes:?}");
+        assert!(
+            resolver.system_prompt.contains("action `load`"),
+            "the prompt does not require loading the selected skill body"
+        );
     }
 
     #[test]
     fn an_empty_catalogue_leaves_the_prompt_byte_identical() {
         let mut resolver = resolver();
         let before = resolver.system_prompt.clone();
-        let mut notes = Vec::new();
-
         announce_skills(
             &mut resolver,
             &zuno_catalog::skill::Skills::default(),
-            &mut notes,
+            0,
+            None,
         )
         .expect("empty catalogue");
 
         assert_eq!(resolver.system_prompt.as_bytes(), before.as_bytes());
-        assert!(notes.is_empty());
     }
 
-    /// A corpus past the budget is trimmed, bounded, and **reported**.
-    ///
-    /// The report is the point. A skill silently absent from the prompt is a skill the
-    /// model will never use and the user will never learn was dropped.
+    /// Large descriptions must not make any skill name undiscoverable.
     #[test]
-    fn a_corpus_past_the_budget_is_trimmed_and_the_trim_is_reported() {
+    fn a_large_corpus_keeps_every_source_identity_by_shortening_descriptions() {
         let padding = "d".repeat(2_000);
         let skills = zuno_catalog::skill::Skills::from_loaded(
-            (0..64).map(|at| skill(&format!("skill-{at:03}"), &padding)),
+            (0..137).map(|at| skill(&format!("skill-{at:03}"), &padding)),
         );
         let mut resolver = resolver();
-        let mut notes = Vec::new();
-
-        announce_skills(&mut resolver, &skills, &mut notes).expect("announce bounded skills");
+        announce_skills(&mut resolver, &skills, 1_000_000, None).expect("announce skill index");
 
         assert!(
             resolver.system_prompt.len()
-                < "AGENT PROMPT".len() + SKILL_PROMPT_BUDGET + SKILL_USAGE_POLICY.len() + 8,
-            "the prompt exceeded the budget: {} bytes",
+                < "AGENT PROMPT".len()
+                    + MAX_SKILL_METADATA_TOKEN_BUDGET * APPROX_BYTES_PER_TOKEN
+                    + SKILL_USAGE_POLICY.len()
+                    + 512,
+            "the compact index exceeded its budget: {} bytes",
             resolver.system_prompt.len()
         );
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("did not fit"), "{}", notes[0]);
+        assert!(resolver.system_prompt.contains("name=\"skill-000\""));
+        assert!(resolver.system_prompt.contains("name=\"skill-136\""));
         assert!(
-            notes[0].contains("were not advertised to the model"),
+            resolver
+                .system_prompt
+                .contains("/skills/skill-136/SKILL.md")
+        );
+        assert!(
+            !resolver.system_prompt.contains(&padding),
+            "large descriptions leaked back into the base prompt"
+        );
+    }
+
+    #[test]
+    fn a_future_name_set_past_the_index_budget_remains_searchable_without_a_warning() {
+        let long = "x".repeat(900);
+        let skills = zuno_catalog::skill::Skills::from_loaded(
+            (0..32).map(|at| skill(&format!("skill-{at:03}-{long}"), "searchable capability")),
+        );
+        let mut resolver = resolver();
+
+        announce_skills(&mut resolver, &skills, 0, None).expect("announce partial skill index");
+
+        assert!(
+            resolver.system_prompt.contains("Catalog coverage:")
+                || resolver.system_prompt.contains("metadata budget omitted"),
             "{}",
-            notes[0]
+            resolver.system_prompt
+        );
+        assert!(
+            resolver.system_prompt.contains("action `list` or `search`")
+                || resolver.system_prompt.contains("Action `list`"),
+            "{}",
+            resolver.system_prompt
+        );
+        assert!(
+            !resolver.system_prompt.contains("were not advertised"),
+            "a partial convenience index must not be reported as lost capability"
         );
     }
 }
@@ -4230,7 +4270,7 @@ fn instruction_files_are_injected_once_between_memory_and_the_skill_catalogue() 
              no request and nothing reports it",
         );
     let skills_at = turn
-        .find("announce_skills(&mut plan.resolver")
+        .find("announce_skills(")
         .expect("the skill-catalogue call site moved; this test's anchors need updating");
 
     assert!(
@@ -4274,7 +4314,8 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
 
     let turn = read("turn.rs");
     assert!(
-        turn.contains("announce_skills(&mut plan.resolver"),
+        turn.contains("announce_skills(")
+            && turn.contains("&mut plan.resolver,\n                &plan.skills,"),
         "`turn.rs` no longer injects the skill catalogue into the system prompt, so \
          discovery runs and the model is told about none of it"
     );

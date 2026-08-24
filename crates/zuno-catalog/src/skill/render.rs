@@ -1,9 +1,9 @@
-//! The two model-facing render forms.
+//! The model-facing skill render forms.
 //!
-//! Port of `Skill.fmt` (`packages/opencode/src/skill/index.ts:321-346`). These
-//! bytes go straight into the system prompt (`session/system.ts:99-110` calls the
-//! verbose form on every request), so a stray newline or a changed separator
-//! changes every request this agent ever makes. Both forms are snapshot-tested.
+//! Zuno keeps the imported list and verbose forms for client surfaces, but the
+//! runtime prompt uses [`Form::Index`]: a bounded metadata catalog carrying each
+//! skill's name, source locator, and as much description detail as fits. The
+//! selected instructions are then read through the `skill` tool.
 //!
 //! The oracle:
 //!
@@ -32,15 +32,18 @@
 //! }
 //! ```
 //!
+//! Zuno adds [`Form::Index`], a bounded progressive-discovery catalog. Every
+//! admitted entry carries the source identity needed to disambiguate same-named
+//! skills. Description detail is shortened before an identity is omitted.
+//!
 //! Three details are easy to lose and all three are load-bearing:
 //!
-//! 1. A skill with **no** `description` is dropped from both forms, but is still
+//! 1. A skill with **no** `description` is dropped from every form, but is still
 //!    in `all()`. Filtering happens before the emptiness check, so a set of
 //!    description-less skills renders as `No skills are currently available.`
-//! 2. `join("\n")` means **no trailing newline** on either form.
-//! 3. `escapeHtml` is applied to `location` **only** — never to `name` or
-//!    `description`. Reproduced exactly, entity-for-entity, even though it means
-//!    an unescaped `<` in a description reaches the model.
+//! 2. `join("\n")` means **no trailing newline** on any form.
+//! 3. The compact index escapes name, source, and description because all three
+//!    are user-controlled XML attribute values.
 
 use crate::skill::Skill;
 
@@ -51,12 +54,15 @@ pub enum Form {
     List,
     /// The `<available_skills>` XML block used in the system prompt.
     Verbose,
+    /// A compact `<skill_index>` containing bounded name, source, and description
+    /// metadata.
+    Index,
 }
 
 /// What the oracle returns when nothing describable is left.
 pub const NO_SKILLS: &str = "No skills are currently available.";
 
-/// Render a skill list into one of the two model-facing forms.
+/// Render a skill list into one of the model-facing forms.
 ///
 /// Skills without a description are dropped, the rest are sorted by
 /// [`locale_compare`], and the result has no trailing newline.
@@ -69,7 +75,7 @@ pub fn fmt(list: &[Skill], form: Form) -> String {
     assemble(&described, form)
 }
 
-/// A render that had to leave skills out, and how many.
+/// A bounded render and what was shortened or omitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budgeted {
     /// The rendered form, never longer than the requested budget.
@@ -78,13 +84,15 @@ pub struct Budgeted {
     pub rendered: usize,
     /// How many describable skills did not fit.
     pub omitted: usize,
+    /// How many rendered descriptions were shortened.
+    pub truncated: usize,
 }
 
 /// Render at most `budget` bytes of `list`, reporting what did not fit.
 ///
-/// [`fmt`] is unbounded because the oracle's is. At 189 skills averaging ~600 bytes
-/// of description that is ~113 KB prepended to **every** request in the session, so
-/// the caller that puts this in a system prompt uses this instead.
+/// [`fmt`] remains unbounded for explicit client-facing lists. The caller that
+/// assembles a model prompt uses this function so a large installed catalog does
+/// not consume the request before a skill is selected.
 ///
 /// Selection is cheapest-first — which fits the most names in — while the output
 /// stays sorted by name, so the bytes are stable across runs. Dropping the
@@ -99,7 +107,11 @@ pub fn fmt_within(list: &[Skill], form: Form, budget: usize) -> Budgeted {
             text: NO_SKILLS.to_string(),
             rendered: 0,
             omitted: 0,
+            truncated: 0,
         };
+    }
+    if form == Form::Index {
+        return index_within(&described, budget);
     }
 
     let mut by_cost: Vec<(usize, &Skill)> = described
@@ -126,6 +138,7 @@ pub fn fmt_within(list: &[Skill], form: Form, budget: usize) -> Budgeted {
             text: String::new(),
             rendered: 0,
             omitted: described.len(),
+            truncated: 0,
         };
     }
     kept.sort_by(|left, right| locale_compare(&left.name, &right.name));
@@ -134,6 +147,7 @@ pub fn fmt_within(list: &[Skill], form: Form, budget: usize) -> Budgeted {
         text: assemble(&kept, form),
         rendered: kept.len(),
         omitted: described.len() - kept.len(),
+        truncated: 0,
     }
 }
 
@@ -142,7 +156,9 @@ fn described_sorted(list: &[Skill]) -> Vec<&Skill> {
         .iter()
         .filter(|skill| skill.description.is_some())
         .collect();
-    described.sort_by(|left, right| locale_compare(&left.name, &right.name));
+    described.sort_by(|left, right| {
+        locale_compare(&left.name, &right.name).then_with(|| left.location.cmp(&right.location))
+    });
     described
 }
 
@@ -161,6 +177,7 @@ const fn open_line(form: Form) -> &'static str {
     match form {
         Form::Verbose => "<available_skills>",
         Form::List => "## Available Skills",
+        Form::Index => "<skill_index>",
     }
 }
 
@@ -168,6 +185,7 @@ const fn close_line(form: Form) -> Option<&'static str> {
     match form {
         Form::Verbose => Some("</available_skills>"),
         Form::List => None,
+        Form::Index => Some("</skill_index>"),
     }
 }
 
@@ -182,7 +200,143 @@ fn entry_lines(skill: &Skill, form: Form) -> Vec<String> {
             "  </skill>".to_string(),
         ],
         Form::List => vec![format!("- **{}**: {description}", skill.name)],
+        Form::Index => vec![index_line(skill, INDEX_DESCRIPTION_MAX_BYTES)],
     }
+}
+
+/// Maximum metadata detail one skill contributes before the global prompt budget
+/// is considered.
+const INDEX_DESCRIPTION_MAX_BYTES: usize = 1_024;
+
+fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
+    let minimum = assemble_index(described, 0);
+    if minimum.len() <= budget {
+        let full = assemble_index(described, INDEX_DESCRIPTION_MAX_BYTES);
+        if full.len() <= budget {
+            return Budgeted {
+                text: full,
+                rendered: described.len(),
+                omitted: 0,
+                truncated: 0,
+            };
+        }
+
+        let mut low = 0usize;
+        let mut high = INDEX_DESCRIPTION_MAX_BYTES;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if assemble_index(described, middle).len() <= budget {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        let text = assemble_index(described, low);
+        let truncated = described
+            .iter()
+            .filter(|skill| normalized_description(skill).len() > low)
+            .count();
+        return Budgeted {
+            text,
+            rendered: described.len(),
+            omitted: 0,
+            truncated,
+        };
+    }
+
+    let mut by_cost = described
+        .iter()
+        .map(|skill| (index_line(skill, 0).len() + 1, *skill))
+        .collect::<Vec<_>>();
+    by_cost.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| locale_compare(&left.1.name, &right.1.name))
+            .then_with(|| left.1.location.cmp(&right.1.location))
+    });
+
+    let mut kept = Vec::new();
+    let mut spent = frame_cost(Form::Index);
+    for (cost, skill) in by_cost {
+        if spent.saturating_add(cost) > budget {
+            break;
+        }
+        spent += cost;
+        kept.push(skill);
+    }
+    if kept.is_empty() {
+        return Budgeted {
+            text: String::new(),
+            rendered: 0,
+            omitted: described.len(),
+            truncated: 0,
+        };
+    }
+    kept.sort_by(|left, right| {
+        locale_compare(&left.name, &right.name).then_with(|| left.location.cmp(&right.location))
+    });
+    Budgeted {
+        text: assemble_index(&kept, 0),
+        rendered: kept.len(),
+        omitted: described.len() - kept.len(),
+        truncated: kept.len(),
+    }
+}
+
+fn assemble_index(described: &[&Skill], description_bytes: usize) -> String {
+    let mut lines = Vec::with_capacity(described.len() + 2);
+    lines.push(open_line(Form::Index).to_owned());
+    lines.extend(
+        described
+            .iter()
+            .map(|skill| index_line(skill, description_bytes)),
+    );
+    lines.push(close_line(Form::Index).unwrap_or_default().to_owned());
+    lines.join("\n")
+}
+
+fn index_line(skill: &Skill, description_bytes: usize) -> String {
+    let name = escape_html(&skill.name);
+    let source = escape_html(&skill.location);
+    let description = truncate_utf8(&normalized_description(skill), description_bytes);
+    if description.is_empty() {
+        format!("  <skill name=\"{name}\" source=\"{source}\" />")
+    } else {
+        format!(
+            "  <skill name=\"{name}\" source=\"{source}\">{}</skill>",
+            escape_html(&description)
+        )
+    }
+}
+
+fn normalized_description(skill: &Skill) -> String {
+    skill
+        .description
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_utf8(value: &str, maximum: usize) -> String {
+    if maximum == 0 {
+        return String::new();
+    }
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let suffix = "...";
+    if maximum <= suffix.len() {
+        return ".".repeat(maximum);
+    }
+    let mut end = maximum - suffix.len();
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut out = value[..end].trim_end().to_owned();
+    out.push_str(suffix);
+    out
 }
 
 /// Bytes one entry adds to [`assemble`]'s output, including its leading newline.
@@ -289,12 +443,12 @@ mod tests {
     use std::cmp::Ordering;
 
     fn skill(name: &str, description: Option<&str>, location: &str) -> Skill {
-        Skill {
-            name: name.to_string(),
-            description: description.map(str::to_string),
-            location: location.to_string(),
-            content: String::new(),
-        }
+        Skill::embedded(
+            name,
+            description.map(str::to_string),
+            location,
+            String::new(),
+        )
     }
 
     #[test]

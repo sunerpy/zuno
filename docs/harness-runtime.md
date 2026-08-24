@@ -174,9 +174,9 @@ Prompt assembly is ordered data, not string concatenation spread across the CLI.
 4. extension lifecycle guidance and the exact active package projection;
 5. discovered instruction files;
 6. the skill trigger policy;
-7. the available skill catalog.
+7. the bounded skill metadata catalog.
 
-The trigger policy makes a named or clearly matching skill a pre-action requirement: the model must load the complete body through the `skill` tool, use only the minimal matching set, and may not claim a skill was used unless that call completed successfully. The catalog remains discovery metadata rather than a substitute for the body.
+The trigger policy makes a named or clearly matching skill a pre-action requirement. The base prompt carries bounded name, description, and source metadata; descriptions are shortened before a source identity is omitted. `skills.maxContextTokens` overrides the default two-percent context budget, while `skills.includeInstructions: false` disables prompt injection. The `skill` tool pages the complete catalog with `list`, searches it with `search`, reads a selected body with `load`, and resolves relative text with `read_resource`. Same-named sources remain distinct and require the advertised source locator. Reads use content-bound cursors and must continue to completion; disk bodies are read after selection rather than retained for the process lifetime.
 
 Skill discovery is Zuno-owned. In increasing precedence it includes global
 OpenCode `SKILL.md` imports, global Claude/Agent Skills, project OpenCode
@@ -185,9 +185,8 @@ pulled URL caches. OpenCode roots are
 `$XDG_CONFIG_HOME/opencode/{skill,skills}` and project
 `.opencode/{skill,skills}`. The bridge imports skill files only; it does not load
 another product's config, plugins, hooks, permission model, tools, or runtime.
-Later definitions replace a duplicate name with a warning, so same-scope
-Zuno-native and standard Agent Skills definitions remain authoritative while
-project definitions override global ones.
+The same path is de-duplicated, but same-named files remain distinct source
+identities. Zuno never selects one by hidden discovery precedence.
 
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 
@@ -321,6 +320,12 @@ the previous run guard has dropped but an already admitted follow-up has not yet
 acquired its guard, the registry arms that next guard instead of discarding the
 interrupt. The turn starts with its interrupt signal set, emits the normal
 terminal interruption event, and issues no provider request.
+
+Within one mounted TUI session, model, agent, effort, and MCP changes may replace
+the `TurnHost`, but they must reuse the mounted session's `SessionRunRegistry`
+and rebind its `SessionTitleSink`. Cancellation controls therefore continue to
+target the current host generation, and generated title updates continue to
+reach the sidebar. Only a real session remount creates a new continuity scope.
 
 After the TUI confirms a hard interruption, it keeps the stopping state visible
 and suppresses late provider or tool presentation until `TurnInterrupted` or

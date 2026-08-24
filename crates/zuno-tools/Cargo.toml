@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
+hex = { workspace = true }
 # `task` resolves its delegation target and its model through `zuno-agent` rather than
 # re-listing either. The edge runs this way deliberately: `zuno-agent/src/builtin.rs:78`
 # states its `GOVERNED_TOOL_IDS` inline "because the dependency edge runs the other
@@ -45,6 +46,7 @@ rusqlite = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 similar = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }

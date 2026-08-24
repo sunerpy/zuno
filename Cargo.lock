@@ -6852,11 +6852,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "hex",
  "reqwest",
  "rusqlite",
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "similar",
  "tempfile",
  "thiserror 2.0.19",

@@ -124,6 +124,8 @@ impl Service {
 pub struct SkillSummary {
     /// The skill's name, which is also the command it claims.
     pub name: String,
+    /// Stable source locator used when more than one installed skill claims the name.
+    pub source: String,
     /// Its one-line description.
     pub description: String,
     /// Whether this session successfully loaded the skill through the `skill` tool.
@@ -1169,26 +1171,77 @@ impl SidebarView {
             if self.ambient.skills.is_empty() {
                 lines.push(padded("  none discovered", width, self.context.muted()));
             } else {
-                for skill in &self.ambient.skills {
-                    let style = if skill.loaded {
-                        self.context.accent().add_modifier(Modifier::BOLD)
-                    } else {
-                        self.context.text()
-                    };
+                let mut loaded_skills = self
+                    .ambient
+                    .skills
+                    .iter()
+                    .filter(|skill| skill.loaded)
+                    .collect::<Vec<_>>();
+                let mut unloaded_skills = self
+                    .ambient
+                    .skills
+                    .iter()
+                    .filter(|skill| !skill.loaded)
+                    .collect::<Vec<_>>();
+                let by_name = |left: &&SkillSummary, right: &&SkillSummary| {
+                    left.name
+                        .to_ascii_lowercase()
+                        .cmp(&right.name.to_ascii_lowercase())
+                        .then_with(|| left.name.cmp(&right.name))
+                        .then_with(|| left.source.cmp(&right.source))
+                };
+                loaded_skills.sort_by(by_name);
+                unloaded_skills.sort_by(by_name);
+
+                if !loaded_skills.is_empty() {
                     lines.push(padded(
-                        &if skill.loaded {
-                            format!("  ✓ {} · loaded", skill.name)
-                        } else {
-                            format!("  · {}", skill.name)
-                        },
+                        &format!("  Loaded ({})", loaded_skills.len()),
                         width,
-                        style,
+                        self.context.accent().add_modifier(Modifier::BOLD),
                     ));
+                    for skill in loaded_skills {
+                        let label = self.skill_label(skill);
+                        lines.push(padded(
+                            &format!("    ✓ {label} · loaded"),
+                            width,
+                            self.context.accent().add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
+                if !unloaded_skills.is_empty() {
+                    lines.push(padded(
+                        &format!("  Not loaded ({})", unloaded_skills.len()),
+                        width,
+                        self.context.muted().add_modifier(Modifier::BOLD),
+                    ));
+                    for skill in unloaded_skills {
+                        let label = self.skill_label(skill);
+                        lines.push(padded(
+                            &format!("    · {label}"),
+                            width,
+                            self.context.text(),
+                        ));
+                    }
                 }
             }
         }
 
         PanelRows { lines, headers }
+    }
+
+    fn skill_label(&self, skill: &SkillSummary) -> String {
+        let ambiguous = self
+            .ambient
+            .skills
+            .iter()
+            .filter(|candidate| candidate.name == skill.name)
+            .count()
+            > 1;
+        if ambiguous {
+            format!("{} · {}", skill.name, skill.source)
+        } else {
+            skill.name.clone()
+        }
     }
 
     /// The rows drawn at the very bottom of the panel, whatever the content above.

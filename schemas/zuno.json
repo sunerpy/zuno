@@ -2131,8 +2131,25 @@
       ]
     },
     "SkillsConfig": {
-      "description": "Additional skill sources (`config/skills.ts:5-12`).",
+      "additionalProperties": false,
+      "description": "Skill discovery and model-visible catalog settings.",
       "properties": {
+        "includeInstructions": {
+          "description": "Whether turns receive the skill trigger policy and metadata catalog.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "maxContextTokens": {
+          "description": "Maximum approximate tokens used by the catalog. Values above 10,000 are\nclamped by the runtime.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "paths": {
           "description": "Additional paths to skill folders.",
           "items": {
@@ -2616,7 +2633,7 @@
           "type": "null"
         }
       ],
-      "description": "Additional skill sources."
+      "description": "Skill discovery and model-visible catalog settings."
     },
     "small_model": {
       "description": "Model for cheap side tasks such as title generation.",

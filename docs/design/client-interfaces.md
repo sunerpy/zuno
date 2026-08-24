@@ -138,7 +138,10 @@ The TUI favors dense, keyboard-first operation:
   mounted for consecutive cancellations;
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
-  row `✓ skill-name · loaded`;
+  row `✓ skill-name · loaded`. Expanded skills are grouped with loaded skills
+  first and not-loaded skills second, with each group sorted by name and source.
+  Same-named skills display their source locator, and completion marks only the
+  exact source selected by the tool call;
 - an independently scrollable and selectable sidebar whose current-session title
   is a fixed header and whose location/version footer stays fixed. Only the
   projection body scrolls. It projects goal, todos, jobs, pending memory, token

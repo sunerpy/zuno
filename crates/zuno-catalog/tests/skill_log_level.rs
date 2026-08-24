@@ -1,4 +1,4 @@
-//! The level a duplicate-skill override logs at.
+//! Same-named skills are normal catalog entries, while broken sources still warn.
 //!
 //! # Why this is its own test binary
 //!
@@ -13,15 +13,6 @@
 //! enforce itself: a second test added here would either share this subscriber or
 //! fail loudly, never silently observe an empty capture.
 //!
-//! # Why the level is worth a test at all
-//!
-//! It is the whole of the fix. The warning was already collected into
-//! [`zuno_catalog::skill::Skills::warnings`] before and still is, so an assertion
-//! about *recording* would have passed against the storm as well. At `WARN` this one
-//! variant emitted 189 lines per launch on a real install
-//! (`~/.local/share/zuno/log/opencode.2026-08-20.log`: 202 lines, 189 of them this),
-//! burying the twelve variants that are genuine faults.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -103,7 +94,7 @@ fn options(root: &Path) -> SkillOptions {
 }
 
 #[tokio::test]
-async fn an_override_logs_below_warn_while_a_broken_skill_still_warns() {
+async fn same_named_sources_are_not_warnings_while_a_broken_skill_still_warns() {
     let tree = TempDir::new().expect("tempdir");
     let root = tree.path();
     skill(
@@ -134,35 +125,21 @@ async fn an_override_logs_below_warn_while_a_broken_skill_still_warns() {
         !warned
             .iter()
             .any(|line| line.contains("duplicate skill name")),
-        "a deliberate precedence override must not reach WARN: {warned:?}"
+        "same-named source identities must not reach WARN: {warned:?}"
     );
     assert!(
         warned.iter().any(|line| line.contains("broken")),
         "a skill that will not parse is a fault and must stay at WARN: {warned:?}"
     );
-    assert!(
-        captured
-            .at(Level::DEBUG)
-            .iter()
-            .any(|line| line.contains("duplicate skill name `dupe`")),
-        "the override must remain diagnosable at DEBUG: {:?}",
-        captured.at(Level::DEBUG)
-    );
-    assert!(
-        captured
-            .at(Level::INFO)
-            .iter()
-            .any(|line| line.contains("replaced an earlier same-named skill")),
-        "the total belongs in one INFO line: {:?}",
-        captured.at(Level::INFO)
-    );
+    assert_eq!(skills.named("dupe").len(), 2);
+    assert!(skills.get("dupe").is_none());
     assert_eq!(
         skills
             .warnings()
             .iter()
-            .filter(|warning| matches!(warning.kind(), SkillWarningKind::DuplicateName { .. }))
+            .filter(|warning| matches!(warning.kind(), SkillWarningKind::MissingName))
             .count(),
         1,
-        "lowering the level must not stop the warning being recorded"
+        "the broken source remains recorded as an actionable warning"
     );
 }

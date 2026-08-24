@@ -289,8 +289,6 @@ pub struct SkillInfo {
     pub slash: Option<bool>,
     /// Where it was loaded from.
     pub location: String,
-    /// The body after the frontmatter.
-    pub content: String,
 }
 
 /// Upstream's `Reference.Info` (`packages/schema/src/reference.ts:33-39`).
@@ -693,7 +691,7 @@ fn v2_command_template(name: &str, project_directory: &str) -> Option<String> {
     Some(template.replacen("${path}", project_directory, 1))
 }
 
-/// `GET /api/skill` — every discovered skill with its body.
+/// `GET /api/skill` — discovered skill metadata.
 ///
 /// # Errors
 /// Returns [`ApiError::ConfigInvalid`] when the config tree does not parse.
@@ -726,7 +724,6 @@ pub async fn skills(
                 },
                 name: skill.name,
                 slash: None,
-                content: skill.content,
             }
         })
         .collect();

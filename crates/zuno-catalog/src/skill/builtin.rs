@@ -2,7 +2,8 @@
 //!
 //! The model's intuition for `zuno.json` is often wrong and Zuno hard-fails on
 //! invalid config, so this skill documents the native forms. It is registered
-//! before disk discovery so a user's own `customize-zuno` overrides it.
+//! before disk discovery. A disk skill may use the same name, but remains a
+//! separate source that must be selected explicitly.
 //!
 //! Two things here have to be exact rather than approximately right:
 //!
@@ -28,10 +29,5 @@ pub const CONTENT: &str = include_str!("customize-zuno.md");
 /// The built-in skill, as it appears in `Skill.all()`.
 #[must_use]
 pub fn skill() -> Skill {
-    Skill {
-        name: NAME.to_string(),
-        description: Some(DESCRIPTION.to_string()),
-        location: LOCATION.to_string(),
-        content: CONTENT.to_string(),
-    }
+    Skill::embedded(NAME, Some(DESCRIPTION.to_string()), LOCATION, CONTENT)
 }

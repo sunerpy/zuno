@@ -199,15 +199,22 @@ pub(crate) fn resolve_active_packages(
         for skill in &package.skills {
             claim(&mut owners, "skill", &skill.name, &package.id)?;
             let location = match &resolved.origin {
-                PackageOrigin::Static { manifest } => manifest.display().to_string(),
-                PackageOrigin::Process => format!("<process-extension:{}>", package.id),
+                PackageOrigin::Static { manifest } => format!(
+                    "extension:{}/{}@{}",
+                    package.id,
+                    skill.name,
+                    manifest.display()
+                ),
+                PackageOrigin::Process => {
+                    format!("extension:{}/{}@process", package.id, skill.name)
+                }
             };
-            skills.push(zuno_catalog::skill::Skill {
-                name: skill.name.clone(),
-                description: Some(skill.description.clone()),
+            skills.push(zuno_catalog::skill::Skill::embedded(
+                skill.name.clone(),
+                Some(skill.description.clone()),
                 location,
-                content: skill.content.clone(),
-            });
+                skill.content.clone(),
+            ));
         }
         for (name, _tool) in package.tools.iter() {
             claim(&mut owners, "tool", name, &package.id)?;

@@ -1,4 +1,4 @@
-//! Byte-level snapshots of the two model-facing render forms.
+//! Byte-level snapshots of the model-facing render forms.
 //!
 //! `Skill.fmt` (`packages/opencode/src/skill/index.ts:321-346`) is unreachable
 //! from any CLI command — the verbose form is only ever called from
@@ -12,12 +12,12 @@
 use zuno_catalog::skill::{Form, NO_SKILLS, Skill, escape_html, render, render_within};
 
 fn skill(name: &str, description: Option<&str>, location: &str) -> Skill {
-    Skill {
-        name: name.to_string(),
-        description: description.map(str::to_string),
-        location: location.to_string(),
-        content: String::new(),
-    }
+    Skill::embedded(
+        name,
+        description.map(str::to_string),
+        location,
+        String::new(),
+    )
 }
 
 /// Deliberately supplied out of order, with one description-less entry and the
@@ -60,9 +60,22 @@ fn verbose_form_bytes() {
 }
 
 #[test]
+fn index_form_contains_name_description_and_exact_source() {
+    let rendered = render(&corpus(), Form::Index);
+    assert!(rendered.starts_with("<skill_index>"));
+    assert!(rendered.contains("name=\"add-office365\""));
+    assert!(rendered.contains("Adds Office 365 Outlook connector"));
+    assert!(rendered.contains(
+        "source=\"/config/.config/opencode/skill/powerapps/code-apps/skills/add-office365/SKILL.md\""
+    ));
+    assert!(rendered.contains("source=\"&lt;built-in&gt;\""));
+}
+
+#[test]
 fn empty_form_bytes() {
     insta::assert_snapshot!("empty_list_form", render(&[], Form::List));
     insta::assert_snapshot!("empty_verbose_form", render(&[], Form::Verbose));
+    assert_eq!(render(&[], Form::Index), NO_SKILLS);
 }
 
 /// `join("\n")` at `:337` and `:345` — neither form is newline-terminated. A
@@ -70,7 +83,7 @@ fn empty_form_bytes() {
 /// system prompt.
 #[test]
 fn no_form_is_newline_terminated() {
-    for form in [Form::List, Form::Verbose] {
+    for form in [Form::List, Form::Verbose, Form::Index] {
         let rendered = render(&corpus(), form);
         assert!(!rendered.ends_with('\n'), "{form:?}");
         assert!(!rendered.starts_with('\n'), "{form:?}");
@@ -84,6 +97,7 @@ fn filtering_happens_before_the_emptiness_check() {
     let hidden = vec![skill("a", None, "/a"), skill("b", None, "/b")];
     assert_eq!(render(&hidden, Form::List), NO_SKILLS);
     assert_eq!(render(&hidden, Form::Verbose), NO_SKILLS);
+    assert_eq!(render(&hidden, Form::Index), NO_SKILLS);
 }
 
 /// `escapeHtml` is applied to `location` only (`:333`). `name` and `description`
@@ -148,13 +162,73 @@ fn verbose_form_has_a_fixed_line_budget() {
 /// what reaches a prompt.
 #[test]
 fn an_unspent_budget_is_byte_identical_to_the_unbounded_form() {
-    for form in [Form::List, Form::Verbose] {
+    for form in [Form::List, Form::Verbose, Form::Index] {
         let unbounded = render(&corpus(), form);
         let budgeted = render_within(&corpus(), form, unbounded.len());
         assert_eq!(budgeted.text, unbounded, "{form:?}");
         assert_eq!(budgeted.rendered, 4, "one of the five has no description");
         assert_eq!(budgeted.omitted, 0, "{form:?}");
     }
+}
+
+#[test]
+fn a_large_index_keeps_every_source_identity_by_shortening_descriptions() {
+    let corpus = (0..137)
+        .map(|at| {
+            skill(
+                &format!("skill-{at:03}"),
+                Some(&"trigger ".repeat(750)),
+                &format!("/skills/skill-{at:03}/SKILL.md"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let budgeted = render_within(&corpus, Form::Index, 16 * 1024);
+
+    assert_eq!(budgeted.rendered, 137);
+    assert_eq!(budgeted.omitted, 0);
+    assert!(budgeted.text.len() < 16 * 1024);
+    assert!(budgeted.text.contains("name=\"skill-000\""));
+    assert!(budgeted.text.contains("name=\"skill-136\""));
+    assert!(
+        budgeted
+            .text
+            .contains("source=\"/skills/skill-136/SKILL.md\"")
+    );
+    assert!(budgeted.truncated > 0);
+    assert!(
+        !budgeted.text.contains(&"trigger ".repeat(750)),
+        "the index retained an unbounded description"
+    );
+}
+
+#[test]
+fn the_progressive_catalog_spends_budget_on_source_identity_before_description_detail() {
+    let corpus = vec![
+        skill(
+            "same",
+            Some(&"first source description ".repeat(200)),
+            "/skills/first/SKILL.md",
+        ),
+        skill(
+            "same",
+            Some(&"second source description ".repeat(200)),
+            "/skills/second/SKILL.md",
+        ),
+    ];
+
+    let minimum = "<skill_index>\n  <name>same</name>\n  <name>same</name>\n</skill_index>";
+    let budgeted = render_within(&corpus, Form::Index, 512);
+
+    assert_eq!(budgeted.rendered, 2);
+    assert_eq!(budgeted.omitted, 0);
+    assert_ne!(budgeted.text, minimum);
+    assert!(budgeted.text.contains("/skills/first/SKILL.md"));
+    assert!(budgeted.text.contains("/skills/second/SKILL.md"));
+    assert!(
+        budgeted.text.len() <= 512,
+        "descriptions must be shortened before a source identity is hidden"
+    );
 }
 
 #[test]
