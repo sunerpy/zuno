@@ -276,17 +276,20 @@ fn concurrency_defaults_and_overrides_are_fully_resolved() {
         Config::default().resolved_concurrency(),
         ResolvedConcurrencyConfig {
             tool_calls: 8,
+            delegations: 8,
             mcp_connections: 8,
             lsp_requests: 4,
         }
     );
-    let config =
-        parse(r#"{"concurrency":{"tool_calls":1,"mcp_connections":16,"lsp_requests":64}}"#)
-            .expect("bounded concurrency parses");
+    let config = parse(
+        r#"{"concurrency":{"tool_calls":1,"delegations":2,"mcp_connections":16,"lsp_requests":64}}"#,
+    )
+    .expect("bounded concurrency parses");
     assert_eq!(
         config.resolved_concurrency(),
         ResolvedConcurrencyConfig {
             tool_calls: 1,
+            delegations: 2,
             mcp_connections: 16,
             lsp_requests: 64,
         }
@@ -295,7 +298,12 @@ fn concurrency_defaults_and_overrides_are_fully_resolved() {
 
 #[test]
 fn every_concurrency_limit_is_between_one_and_sixty_four() {
-    for field in ["tool_calls", "mcp_connections", "lsp_requests"] {
+    for field in [
+        "tool_calls",
+        "delegations",
+        "mcp_connections",
+        "lsp_requests",
+    ] {
         for bad in [json!(0), json!(65), json!(-1)] {
             let mut value = json!({"concurrency": {}});
             value["concurrency"][field] = bad;

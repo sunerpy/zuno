@@ -481,10 +481,18 @@ requests may overlap across servers under one global semaphore; protocol orderin
 inside one client remains unchanged. Setting any bound to `1` restores serial
 behavior.
 
+Native child sessions, workflow nodes, and Codex/Claude Code product agents share
+one workspace-owned delegation budget. The budget survives turn-host replacement,
+so a background agent started by an earlier turn still consumes capacity. Reloading
+configuration adjusts the bound without cancelling active work: a lower bound waits
+for enough active delegations to finish, while a higher bound wakes queued work.
+Workflow `maxParallel` remains an additional per-workflow ceiling.
+
 ```json
 {
   "concurrency": {
     "tool_calls": 8,
+    "delegations": 8,
     "mcp_connections": 8,
     "lsp_requests": 4
   }

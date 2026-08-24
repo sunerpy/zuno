@@ -1,5 +1,8 @@
 use super::*;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use zuno_config::schema::product_agent::ProductAgentKind;
 use zuno_db::job::{JobStatus, ReportDelivery as DbReportDelivery};
 use zuno_paths::DbLocation;
@@ -15,6 +18,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(runner: Arc<dyn ProductAgent>) -> Self {
+        Self::with_limit(runner, 8)
+    }
+
+    fn with_limit(runner: Arc<dyn ProductAgent>, limit: usize) -> Self {
         let root = tempfile::TempDir::new().expect("temporary product-agent root");
         let pool = Arc::new(zuno_db::Pool::open(&DbLocation::Memory).expect("open database"));
         {
@@ -47,6 +54,9 @@ impl Fixture {
         .expect("create parent session");
         let wake = Arc::new(RecordingWake::default());
         let supervisor = BackgroundJobSupervisor::default();
+        let delegation_limiter = supervisor.delegation_limiter(
+            NonZeroUsize::new(limit).expect("fixture delegation limit is non-zero"),
+        );
         let agents = BTreeMap::from([(
             "reviewer".to_owned(),
             ConfiguredProduct {
@@ -60,6 +70,7 @@ impl Fixture {
             directory: root.path().to_owned(),
             jobs: AgentJobStore::new(Arc::clone(&pool)),
             wake: Arc::clone(&wake) as Arc<dyn ParentReportWake>,
+            delegation_limiter,
             supervisor: supervisor.clone(),
         };
         Self {
@@ -137,6 +148,59 @@ impl ProductAgent for CancellingAgent {
     ) -> Result<ProductAgentResult, ProductAgentError> {
         cancellation.cancelled().await;
         Err(ProductAgentError::Cancelled { product: "Codex" })
+    }
+}
+
+struct BlockingAgent {
+    started: AtomicUsize,
+    release: tokio::sync::Semaphore,
+}
+
+impl BlockingAgent {
+    fn new() -> Self {
+        Self {
+            started: AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+
+    async fn wait_for_starts(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while self.started.load(Ordering::Acquire) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("product agent reached the expected start count");
+    }
+}
+
+#[async_trait]
+impl ProductAgent for BlockingAgent {
+    fn kind(&self) -> ProductAgentKind {
+        ProductAgentKind::Codex
+    }
+
+    async fn run(
+        &self,
+        _request: NativeRequest,
+        cancellation: CancellationToken,
+    ) -> Result<ProductAgentResult, ProductAgentError> {
+        self.started.fetch_add(1, Ordering::AcqRel);
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                Err(ProductAgentError::Cancelled { product: "Codex" })
+            }
+            permit = self.release.acquire() => {
+                permit.expect("test release semaphore remains open").forget();
+                success("released")
+            }
+        }
     }
 }
 
@@ -229,6 +293,52 @@ async fn background_next_step_settles_and_wakes_with_product_identity() {
     assert_eq!(reports[0].prompt["product"], "codex");
     assert_eq!(reports[0].prompt["instance"], "reviewer");
     assert_eq!(reports[0].prompt["status"], "completed");
+}
+
+#[tokio::test]
+async fn background_product_agents_share_the_workspace_delegation_bound() {
+    let agent = Arc::new(BlockingAgent::new());
+    let fixture = Fixture::with_limit(Arc::clone(&agent) as Arc<dyn ProductAgent>, 1);
+
+    let first = fixture
+        .host
+        .dispatch(
+            fixture.request(true, ReportDelivery::Quiet),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first background dispatch");
+    let second = fixture
+        .host
+        .dispatch(
+            fixture.request(true, ReportDelivery::Quiet),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("second background dispatch");
+    agent.wait_for_starts(1).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), agent.wait_for_starts(2))
+            .await
+            .is_err(),
+        "a second product agent started while the only delegation slot was occupied"
+    );
+
+    agent.release_one();
+    agent.wait_for_starts(2).await;
+    agent.release_one();
+    fixture.supervisor.wait_all().await;
+
+    let store = AgentJobStore::new(Arc::clone(&fixture.pool));
+    for turn in [first, second] {
+        assert_eq!(
+            store
+                .get(turn.job_id.as_deref().expect("job id"))
+                .expect("settled product job")
+                .status,
+            JobStatus::Completed
+        );
+    }
 }
 
 #[tokio::test]

@@ -408,6 +408,17 @@
       "additionalProperties": false,
       "description": "Optional per-layer concurrency overrides.",
       "properties": {
+        "delegations": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrencyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum native or product-agent delegations executing at once."
+        },
         "lsp_requests": {
           "anyOf": [
             {

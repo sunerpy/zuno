@@ -561,6 +561,9 @@ pub struct ConcurrencyConfig {
     /// Maximum independent model-issued tool calls executing at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<ConcurrencyLimit>,
+    /// Maximum native or product-agent delegations executing at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegations: Option<ConcurrencyLimit>,
     /// Maximum MCP servers connecting or disconnecting at once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_connections: Option<ConcurrencyLimit>,
@@ -578,6 +581,9 @@ impl ConcurrencyConfig {
             tool_calls: self
                 .tool_calls
                 .map_or(defaults.tool_calls, ConcurrencyLimit::get),
+            delegations: self
+                .delegations
+                .map_or(defaults.delegations, ConcurrencyLimit::get),
             mcp_connections: self
                 .mcp_connections
                 .map_or(defaults.mcp_connections, ConcurrencyLimit::get),
@@ -592,6 +598,7 @@ impl ConcurrencyConfig {
 #[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedConcurrencyConfig {
     pub tool_calls: u8,
+    pub delegations: u8,
     pub mcp_connections: u8,
     pub lsp_requests: u8,
 }
@@ -600,6 +607,7 @@ impl Default for ResolvedConcurrencyConfig {
     fn default() -> Self {
         Self {
             tool_calls: 8,
+            delegations: 8,
             mcp_connections: 8,
             lsp_requests: 4,
         }

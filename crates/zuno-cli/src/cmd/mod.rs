@@ -4,6 +4,7 @@ mod completion;
 mod db;
 mod db_maint;
 mod debug;
+mod delegation;
 mod export;
 mod mcp;
 mod mcp_runtime;

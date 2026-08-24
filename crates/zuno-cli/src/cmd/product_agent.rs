@@ -24,6 +24,7 @@ use zuno_tools::product_agent::{
 use zuno_tools::task::ReportDelivery;
 
 use super::child_turn::{BackgroundJobSupervisor, ParentReportWake};
+use super::delegation::{DelegationAcquireError, DelegationLimiter};
 
 struct ConfiguredProduct {
     product: String,
@@ -38,6 +39,7 @@ pub(crate) struct NativeProductAgentHost {
     directory: PathBuf,
     jobs: AgentJobStore,
     wake: Arc<dyn ParentReportWake>,
+    delegation_limiter: DelegationLimiter,
     supervisor: BackgroundJobSupervisor,
 }
 
@@ -49,6 +51,7 @@ impl NativeProductAgentHost {
         directory: PathBuf,
         database: Arc<zuno_db::pool::Pool>,
         wake: Arc<dyn ParentReportWake>,
+        delegation_limiter: DelegationLimiter,
         supervisor: BackgroundJobSupervisor,
     ) -> Result<Self, String> {
         let mut agents = BTreeMap::new();
@@ -72,6 +75,7 @@ impl NativeProductAgentHost {
             directory,
             jobs: AgentJobStore::new(database),
             wake,
+            delegation_limiter,
             supervisor,
         })
     }
@@ -147,6 +151,11 @@ impl ProductAgentHost for NativeProductAgentHost {
             directory: self.directory.clone(),
         };
         if !request.background {
+            let _permit = self
+                .delegation_limiter
+                .acquire(&cancellation)
+                .await
+                .map_err(to_string)?;
             let result = runner.run(native, cancellation).await.map_err(to_string)?;
             return Ok(ProductAgentTurn {
                 run_id,
@@ -174,6 +183,7 @@ impl ProductAgentHost for NativeProductAgentHost {
 
         let jobs = self.jobs.clone();
         let wake = Arc::clone(&self.wake);
+        let delegation_limiter = self.delegation_limiter.clone();
         let background_job_id = job_id.clone();
         let background_run_id = run_id.clone();
         let parent_session_id = request.parent_session_id.clone();
@@ -184,7 +194,12 @@ impl ProductAgentHost for NativeProductAgentHost {
             parent_session_id,
             task_cancellation,
             async move {
-                let outcome = runner.run(native, runner_cancellation).await;
+                let outcome = match delegation_limiter.acquire(&runner_cancellation).await {
+                    Ok(_permit) => runner.run(native, runner_cancellation).await,
+                    Err(DelegationAcquireError::Cancelled) => Err(ProductAgentError::Cancelled {
+                        product: "Zuno delegation",
+                    }),
+                };
                 settle_background_product(
                     jobs,
                     wake,

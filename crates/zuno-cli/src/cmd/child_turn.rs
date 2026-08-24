@@ -7,6 +7,7 @@
 //! delivery but cannot erase the report.
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,7 @@ use zuno_tools::task::{
     ReportDelivery as ToolReportDelivery,
 };
 
+use super::delegation::DelegationLimiter;
 use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
 use crate::environment::StartupEnvironment;
 
@@ -79,15 +81,22 @@ pub(crate) struct BackgroundJobSupervisor {
     next_task: Arc<AtomicU64>,
     waiter: Arc<tokio::sync::Mutex<()>>,
     changed: ChangeNotifier,
+    delegations: DelegationLimiter,
 }
 
 impl Default for BackgroundJobSupervisor {
     fn default() -> Self {
+        let default_delegations =
+            zuno_config::schema::ResolvedConcurrencyConfig::default().delegations;
         Self {
             tasks: Arc::new(Mutex::new(Vec::new())),
             next_task: Arc::new(AtomicU64::new(0)),
             waiter: Arc::new(tokio::sync::Mutex::new(())),
             changed: ChangeNotifier::default(),
+            delegations: DelegationLimiter::new(
+                NonZeroUsize::new(usize::from(default_delegations))
+                    .expect("the config default delegation limit is non-zero"),
+            ),
         }
     }
 }
@@ -102,6 +111,12 @@ struct ManagedJob {
 }
 
 impl BackgroundJobSupervisor {
+    /// Return the workspace-wide delegation budget after applying current config.
+    pub(crate) fn delegation_limiter(&self, limit: NonZeroUsize) -> DelegationLimiter {
+        self.delegations.set_limit(limit);
+        self.delegations.clone()
+    }
+
     pub(crate) fn notifier(&self) -> ChangeNotifier {
         self.changed.clone()
     }
@@ -275,6 +290,7 @@ pub(crate) struct ChildSessionContext {
     pub(crate) parent_agent: String,
     pub(crate) parent_model: String,
     pub(crate) parent_effort: Option<zuno_llm::effort::ReasoningEffort>,
+    pub(crate) delegation_limiter: DelegationLimiter,
     pub(crate) supervisor: BackgroundJobSupervisor,
 }
 
@@ -284,6 +300,7 @@ pub(crate) struct ChildSessionHost {
     database: Arc<zuno_db::pool::Pool>,
     runner: Arc<dyn DelegatedTurnRunner>,
     wake: Arc<dyn ParentReportWake>,
+    delegation_limiter: DelegationLimiter,
     supervisor: BackgroundJobSupervisor,
     job_store: AgentJobStore,
     inbox: SessionInbox,
@@ -322,6 +339,7 @@ impl ChildSessionHost {
             database: pool,
             runner,
             wake,
+            delegation_limiter: context.delegation_limiter,
             supervisor: context.supervisor,
             job_store: AgentJobStore::new(context.database),
             inbox,
@@ -333,6 +351,7 @@ impl ChildSessionHost {
         database: zuno_paths::DbLocation,
         runner: Arc<dyn DelegatedTurnRunner>,
         wake: Arc<dyn ParentReportWake>,
+        delegation_limiter: DelegationLimiter,
         supervisor: BackgroundJobSupervisor,
     ) -> Result<Self, String> {
         let pool = Arc::new(zuno_db::pool::Pool::open(&database).map_err(to_string)?);
@@ -340,6 +359,7 @@ impl ChildSessionHost {
             database: Arc::clone(&pool),
             runner,
             wake,
+            delegation_limiter,
             supervisor,
             job_store: AgentJobStore::new(Arc::clone(&pool)),
             inbox: SessionInbox::new(pool),
@@ -448,6 +468,11 @@ impl ChildSessionHost {
                 "dispatch_foreground cannot admit a background child".to_owned(),
             ));
         }
+        let _permit = self
+            .delegation_limiter
+            .acquire(&cancellation)
+            .await
+            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
         let session_id = self.session_for(&request)?;
         let output = self
             .runner
@@ -728,6 +753,7 @@ impl ChildTurnHost for ChildSessionHost {
 
         let runner = Arc::clone(&self.runner);
         let wake = Arc::clone(&self.wake);
+        let delegation_limiter = self.delegation_limiter.clone();
         let job_store = self.job_store.clone();
         let background_job_id = job_id.clone();
         let background_session_id = session_id.clone();
@@ -739,9 +765,14 @@ impl ChildTurnHost for ChildSessionHost {
             parent_session_id,
             cancellation,
             async move {
-                let outcome = runner
-                    .run(&background_session_id, &request, task_cancellation.clone())
-                    .await;
+                let outcome = match delegation_limiter.acquire(&task_cancellation).await {
+                    Ok(_permit) => {
+                        runner
+                            .run(&background_session_id, &request, task_cancellation.clone())
+                            .await
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
                 let completed = zuno_db::message::now_millis();
                 let (settlement, report_text) = if task_cancellation.is_cancelled() {
                     let text = format!(

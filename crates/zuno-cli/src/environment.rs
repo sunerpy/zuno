@@ -381,4 +381,46 @@ mod tests {
         clone.background_jobs(directory).wait_all().await;
         assert!(!jobs.has_running_tasks("ses_test"));
     }
+
+    #[tokio::test]
+    async fn clones_share_workspace_delegation_capacity_across_turn_hosts() {
+        let first = StartupEnvironment::resolve(&Env::empty(), &GlobalOptions::default());
+        let clone = first.clone();
+        let restarted = StartupEnvironment::resolve(&Env::empty(), &GlobalOptions::default());
+        let directory = Path::new("/workspace");
+        let one = std::num::NonZeroUsize::new(1).expect("non-zero");
+
+        let running = first
+            .background_jobs(directory)
+            .delegation_limiter(one)
+            .acquire(&tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("first turn host occupies the workspace slot");
+        let independent = restarted
+            .background_jobs(directory)
+            .delegation_limiter(one)
+            .acquire(&tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("a new process owns independent capacity");
+
+        let clone_limiter = clone.background_jobs(directory).delegation_limiter(one);
+        let waiting = tokio::spawn(async move {
+            clone_limiter
+                .acquire(&tokio_util::sync::CancellationToken::new())
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "a replacement turn host bypassed the workspace-wide bound"
+        );
+
+        drop(running);
+        let _replacement = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("released workspace capacity wakes the replacement host")
+            .expect("replacement task survives")
+            .expect("replacement turn host is admitted");
+        drop(independent);
+    }
 }

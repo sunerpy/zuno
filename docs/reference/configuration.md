@@ -79,12 +79,13 @@ Dangerous modes `dangerouslyBypassApprovals` and `bypassPermissions` are accepte
 
 ## Concurrency
 
-Independent runtime work has three bounded controls:
+Independent runtime work has four bounded controls:
 
 ```json
 {
   "concurrency": {
     "tool_calls": 8,
+    "delegations": 8,
     "mcp_connections": 8,
     "lsp_requests": 4
   }
@@ -93,6 +94,10 @@ Independent runtime work has three bounded controls:
 
 - `tool_calls` limits model-issued calls that explicitly declare themselves safe
   to overlap. Permission prompts and argument preparation remain ordered.
+- `delegations` is the workspace-wide cap shared by native child sessions,
+  workflow nodes, and Codex/Claude Code product agents. Background work from an
+  earlier turn continues to consume capacity. A workflow's `maxParallel` remains
+  an additional, narrower bound for that workflow.
 - `mcp_connections` limits simultaneous lifecycle operations across different
   MCP servers. One server's operations remain serialized.
 - `lsp_requests` is the shared cap for language-server startup and request fan-out

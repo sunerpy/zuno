@@ -1882,6 +1882,11 @@ impl TurnHost {
             let memory_paths = ScopePaths::discover(memory_root);
             configure_resident_memory(&mut plan.resolver, &plan.config, memory_paths.clone())?;
             let background_jobs = environment.background_jobs(&plan.directory);
+            let concurrency = plan.config.resolved_concurrency();
+            let delegation_limiter = background_jobs.delegation_limiter(
+                std::num::NonZeroUsize::new(usize::from(concurrency.delegations))
+                    .expect("configuration validates delegation concurrency"),
+            );
             let work_changes = background_jobs.notifier();
             let memory = if memory_settings.enabled {
                 let promotion = match memory_settings.promotion {
@@ -1976,6 +1981,7 @@ impl TurnHost {
                     parent_agent: plan.agent.name.clone(),
                     parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
                     parent_effort: plan.effort,
+                    delegation_limiter: delegation_limiter.clone(),
                     supervisor: background_jobs.clone(),
                 })?;
             let product_agents = super::product_agent::NativeProductAgentHost::new(
@@ -1984,6 +1990,7 @@ impl TurnHost {
                 plan.directory.clone(),
                 Arc::clone(&database),
                 child_host.wake_handle(),
+                delegation_limiter,
                 background_jobs.clone(),
             )?;
             let workflow_host = super::workflow::NativeWorkflowHost::new(
@@ -2056,9 +2063,8 @@ impl TurnHost {
                 AuthorizationPolicy::from_mode(plan.config.permission_mode()),
                 McpToolStatus::Ready,
             );
-            let tool_concurrency =
-                ToolConcurrencyLimit::new(plan.config.resolved_concurrency().tool_calls)
-                    .expect("configuration validates tool concurrency");
+            let tool_concurrency = ToolConcurrencyLimit::new(concurrency.tool_calls)
+                .expect("configuration validates tool concurrency");
             Ok(Self {
                 profile_runtime: profile_runtime.clone(),
                 runtime,

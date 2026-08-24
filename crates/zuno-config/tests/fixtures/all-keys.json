@@ -287,6 +287,7 @@
   },
   "concurrency": {
     "tool_calls": 8,
+    "delegations": 8,
     "mcp_connections": 8,
     "lsp_requests": 4
   },

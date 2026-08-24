@@ -10,8 +10,10 @@
 use super::*;
 use crate::command::GlobalOptions;
 use std::future::pending;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use zuno_paths::{DbLocation, Env};
 use zuno_tools::task::ReportDelivery;
 
@@ -26,6 +28,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_limit(8)
+    }
+
+    fn with_limit(limit: usize) -> Self {
         let root = tempfile::TempDir::new().expect("temporary delegation root");
         let database = DbLocation::File(root.path().join("delegation.db"));
         let mut connection = zuno_db::open::open(&database).expect("open the fixture database");
@@ -36,10 +42,14 @@ impl Fixture {
         let runner = Arc::new(RecordingRunner::default());
         let wake = Arc::new(RecordingWake::default());
         let jobs = BackgroundJobSupervisor::default();
+        let delegation_limiter = jobs.delegation_limiter(
+            NonZeroUsize::new(limit).expect("fixture delegation limit is non-zero"),
+        );
         let host = ChildSessionHost::with_components(
             database.clone(),
             runner.clone(),
             wake.clone(),
+            delegation_limiter,
             jobs.clone(),
         )
         .expect("build child host");
@@ -105,12 +115,27 @@ impl Fixture {
 #[derive(Default)]
 struct RecordingRunner {
     result: Mutex<Option<Result<String, String>>>,
+    started: AtomicUsize,
 }
 
 impl RecordingRunner {
     fn complete_with(&self, result: Result<&str, &str>) {
         *self.result.lock().expect("runner result lock") =
             Some(result.map(str::to_owned).map_err(str::to_owned));
+    }
+
+    fn started(&self) -> usize {
+        self.started.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_starts(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while self.started() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delegated runner reached the expected start count");
     }
 }
 
@@ -122,6 +147,7 @@ impl DelegatedTurnRunner for RecordingRunner {
         _request: &ChildTurnRequest,
         cancellation: CancellationToken,
     ) -> Result<String, String> {
+        self.started.fetch_add(1, Ordering::AcqRel);
         loop {
             if cancellation.is_cancelled() {
                 return Err("cancelled".to_owned());
@@ -427,6 +453,46 @@ async fn background_dispatch_returns_a_durable_job_before_the_child_finishes() {
 }
 
 #[tokio::test]
+async fn background_children_share_the_workspace_delegation_bound() {
+    let fixture = Fixture::with_limit(1);
+    fixture.session("ses_owner", None);
+    let mut first = fixture.request("ses_owner");
+    first.background = true;
+    first.report_delivery = ReportDelivery::Quiet;
+    let mut second = fixture.request("ses_owner");
+    second.background = true;
+    second.report_delivery = ReportDelivery::Quiet;
+
+    let first = fixture.host.dispatch(first).await.expect("first dispatch");
+    let second = fixture
+        .host
+        .dispatch(second)
+        .await
+        .expect("second dispatch");
+    fixture.runner.wait_for_starts(1).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), fixture.runner.wait_for_starts(2))
+            .await
+            .is_err(),
+        "a second child started while the only delegation slot was occupied"
+    );
+
+    fixture.runner.complete_with(Ok("first answer"));
+    fixture.runner.wait_for_starts(2).await;
+    fixture.runner.complete_with(Ok("second answer"));
+    fixture.jobs.wait_all().await;
+
+    for turn in [first, second] {
+        let job = fixture
+            .host
+            .job_store
+            .get(turn.job_id.as_deref().expect("job id"))
+            .expect("settled job");
+        assert_eq!(job.status, zuno_db::job::JobStatus::Completed);
+    }
+}
+
+#[tokio::test]
 async fn quiet_background_dispatch_persists_the_result_without_waking_the_parent() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);
@@ -525,11 +591,15 @@ async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reop
     assert!(job.report_input_id.is_some());
 
     let recovered_wake = Arc::new(RecordingWake::default());
+    let recovered_jobs = BackgroundJobSupervisor::default();
     let recovered = ChildSessionHost::with_components(
         fixture.database.clone(),
         Arc::new(RecordingRunner::default()),
         recovered_wake.clone(),
-        BackgroundJobSupervisor::default(),
+        recovered_jobs.delegation_limiter(
+            NonZeroUsize::new(8).expect("default delegation limit is non-zero"),
+        ),
+        recovered_jobs,
     )
     .expect("reopen child host")
     .recover_pending_reports("ses_owner")
