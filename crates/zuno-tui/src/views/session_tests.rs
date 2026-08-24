@@ -5917,6 +5917,11 @@ fn cycling_wraps_at_both_ends_and_reports_a_refused_sink() {
         Selection::Agent(String::from("build")),
         "cycling forward off the last agent must wrap to the first"
     );
+    assert_eq!(
+        screen.welcome_mut().facts().agent.as_deref(),
+        Some("build"),
+        "the welcome identity did not follow the selected agent"
+    );
 
     // No sink at all: the notice-vs-silence decision is what separates this from the defect
     // family. A key that appears to switch and reaches nothing must say so.
@@ -5985,6 +5990,11 @@ fn a_delivered_model_choice_is_reported_with_the_success_affordance() {
     screen.adopt(
         crate::views::picker::MODEL_DIALOG_ID,
         "amazon-bedrock/amazon.nova-lite-v1:0",
+    );
+    assert_eq!(
+        screen.welcome_mut().facts().model.as_deref(),
+        Some("amazon-bedrock/amazon.nova-lite-v1:0"),
+        "the welcome identity did not follow the selected model"
     );
     let toasts = ActionComponent::drain_toasts(&mut screen);
     assert!(
@@ -7576,6 +7586,11 @@ fn variant_cycle_steps_the_reasoning_level_and_shows_it_on_the_model_row() {
         Some(zuno_llm::effort::ReasoningEffort::Low)
     );
     assert_eq!(
+        screen.welcome_mut().facts().reasoning.as_deref(),
+        Some("low"),
+        "the welcome identity did not follow the selected reasoning effort"
+    );
+    assert_eq!(
         chosen.try_recv(),
         Ok(Selection::Effort(zuno_llm::effort::ReasoningEffort::Low))
     );
@@ -7725,6 +7740,8 @@ fn choosing_a_model_without_reasoning_clears_the_level() {
         "the level survived onto a model whose request cannot carry it"
     );
     assert_eq!(screen.status.effort(), None);
+    assert_eq!(screen.welcome_mut().facts().model.as_deref(), Some(&*plain));
+    assert_eq!(screen.welcome_mut().facts().reasoning, None);
 }
 
 /// A reasoning model cannot inherit a level absent from its declared variants.
@@ -7748,6 +7765,8 @@ fn choosing_a_reasoning_model_clears_an_unsupported_level() {
     assert!(screen.catalog.reasoning);
     assert_eq!(screen.catalog.effort, None);
     assert_eq!(screen.status.effort(), None);
+    assert_eq!(screen.welcome_mut().facts().model.as_deref(), Some(&*next));
+    assert_eq!(screen.welcome_mut().facts().reasoning, None);
 }
 
 /// `ctrl+x` then `down` opens the delegated-task view.

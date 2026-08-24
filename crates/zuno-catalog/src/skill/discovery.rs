@@ -1,23 +1,21 @@
-//! Skill discovery roots, in Zuno precedence order.
+//! Skill discovery roots, in Zuno scope order.
 //!
-//! Zuno owns this composition. Claude and Agent Skills roots retain their
-//! established behavior; OpenCode roots are a narrow `SKILL.md` import so users
-//! can reuse skill guidance without opting into OpenCode configuration, plugins,
-//! hooks, tools, or runtime semantics.
+//! Zuno owns this composition. Project-local Zuno and Agent Skills are surfaced
+//! before user-global roots, matching Codex's repo-before-user scope. OpenCode
+//! directories are deliberately absent: a Zuno process never scans another
+//! product's private configuration tree.
 //!
-//! | precedence | root | pattern | `dot` |
+//! | order | root | pattern | `dot` |
 //! |---|------|---------|-------|
-//! | 1 | `$XDG_CONFIG_HOME/opencode` | `{skill,skills}/**/SKILL.md` | no |
-//! | 2 | `$HOME/.claude` | `skills/**/SKILL.md` | yes |
-//! | 3 | `$HOME/.agents` | `skills/**/SKILL.md` | yes |
-//! | 4 | every `.opencode` from `directory` up to `worktree` | `{skill,skills}/**/SKILL.md` | no |
-//! | 5 | every `.claude`/`.agents` from `directory` up to `worktree` | `skills/**/SKILL.md` | yes |
-//! | 6 | every Zuno config directory | `{skill,skills}/**/SKILL.md` | no |
-//! | 7 | each `skills.paths[]` entry | `**/SKILL.md` | no |
-//! | 8 | each cache dir a `skills.urls[]` index produced | `**/SKILL.md` | no |
+//! | 1 | every project `.zuno` from `directory` up to `worktree` | `{skill,skills}/**/SKILL.md` | no |
+//! | 2 | every project `.agents`, then `.claude` | `skills/**/SKILL.md` | yes |
+//! | 3 | Zuno's global/configured config directories | `{skill,skills}/**/SKILL.md` | no |
+//! | 4 | `$HOME/.agents`, then `$HOME/.claude` | `skills/**/SKILL.md` | yes |
+//! | 5 | each `skills.paths[]` entry | `**/SKILL.md` | no |
+//! | 6 | each cache dir a `skills.urls[]` index produced | `**/SKILL.md` | no |
 //!
-//! Later roots win duplicate names. This intentionally lets Zuno-native and
-//! standard Agent Skills locations replace an imported OpenCode definition.
+//! Order is presentation and provenance, not a hidden same-name winner. Distinct
+//! sources with the same declared name remain independently selectable.
 //!
 //! # Rules that are not obvious from the table
 //!
@@ -25,12 +23,12 @@
 //! for the `$HOME` probe and the ancestor walk, so
 //! `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` removes `.claude` from both.
 //!
-//! **`ZUNO_DISABLE_EXTERNAL_SKILLS` includes imported OpenCode roots.** It removes
-//! roots 1 through 5 while leaving Zuno config and explicitly configured roots.
+//! **`ZUNO_DISABLE_EXTERNAL_SKILLS` leaves Zuno roots alone.** It removes only
+//! `.agents` and `.claude`; project/global `.zuno` and explicit paths remain.
 //!
-//! **`ZUNO_DISABLE_PROJECT_CONFIG` does not reach external project roots.** It gates
-//! `ConfigPaths.directories` (root 6), not the ancestor walks. Confirmed: with the
-//! flag set, a project `.agents` skill is still found.
+//! **`ZUNO_DISABLE_PROJECT_CONFIG` gates project `.zuno`, not Agent Skills.** A
+//! project `.agents` skill remains available because it is a capability scope,
+//! not a Zuno configuration layer.
 //!
 //! **`skills.paths[]` relative entries resolve against `directory`, not the
 //! worktree** — `path.join(directory, expanded)` at `:213`. Confirmed inside a git
@@ -38,18 +36,16 @@
 //! subdirectory and *not* under the repository root. (The plan's wording, "relative
 //! to workspace", does not match the oracle.)
 //!
-//! **The path set is keyed by the walked path string, not the resolved one.**
-//! The oracle's `state.matches` is a `Set<string>` of absolute paths (`:168`) and
-//! nothing canonicalizes them. A `~/.claude/skills/lark-im -> ~/.agents/skills/lark-im`
-//! symlink therefore yields *two* matches with the same `name`, which is the
-//! duplicate-**name** case, not the duplicate-**path** case. Keeping that
-//! distinction preserves the source location a user actually configured.
+//! **Path identity is canonical when the filesystem can resolve it.** A symlinked
+//! package and its target are one source, while the first discovery spelling is
+//! retained for display. This follows Codex's canonical de-duplication without
+//! losing the project/global provenance that found the package first.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use zuno_config::Config;
-use zuno_paths::{Env, Layout, node_path, walk};
+use zuno_paths::{Env, Layout, PROJECT_CONFIG_DIRECTORY, node_path, walk};
 
 use crate::skill::scan::{self, EXTERNAL_PREFIXES, ROOT_PREFIXES, ZUNO_PREFIXES};
 use crate::skill::{SkillWarning, SkillWarningKind};
@@ -60,14 +56,7 @@ pub const CLAUDE_EXTERNAL_DIR: &str = ".claude";
 /// `AGENTS_EXTERNAL_DIR` (`skill/index.ts:22`).
 pub const AGENTS_EXTERNAL_DIR: &str = ".agents";
 
-/// A project-local OpenCode skill root. Only `SKILL.md` files are imported.
-pub const OPENCODE_EXTERNAL_DIR: &str = ".opencode";
-
-/// The sibling XDG config directory that may contain OpenCode skills.
-pub const OPENCODE_CONFIG_DIR: &str = "opencode";
-
-/// `ZUNO_DISABLE_EXTERNAL_SKILLS` (`effect/runtime-flags.ts:22`). Removes
-/// every external-product and Agent Skills root outright.
+/// Removes external Agent Skills roots while retaining Zuno-native roots.
 pub const ZUNO_DISABLE_EXTERNAL_SKILLS: &str = "ZUNO_DISABLE_EXTERNAL_SKILLS";
 
 /// `ZUNO_DISABLE_CLAUDE_CODE` (`effect/runtime-flags.ts:28`) — the broad
@@ -199,44 +188,34 @@ impl SkillOptions {
         self.layout.cache().join("skills")
     }
 
-    /// `$XDG_CONFIG_HOME/opencode`, derived from Zuno's sibling XDG directory.
-    fn opencode_config_root(&self) -> Option<PathBuf> {
-        self.layout
-            .config()
-            .parent()
-            .map(|parent| parent.join(OPENCODE_CONFIG_DIR))
-    }
-
     /// Standard Agent Skills roots used by both the home probe and project walk.
     fn external_dirs(&self) -> Vec<&'static str> {
         if self.external_disabled {
             return Vec::new();
         }
-        let mut dirs = Vec::new();
+        let mut dirs = vec![AGENTS_EXTERNAL_DIR];
         if !self.claude_skills_disabled {
             dirs.push(CLAUDE_EXTERNAL_DIR);
         }
-        dirs.push(AGENTS_EXTERNAL_DIR);
         dirs
     }
 }
 
-/// Which root produced a match. Keeping provenance lets diagnostics explain why
-/// a skill is loaded and which later root replaced it.
+/// Which root produced a match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Root {
-    /// `$XDG_CONFIG_HOME/opencode/{skill,skills}`.
-    GlobalOpenCode,
-    /// `$HOME/.claude/skills`.
-    GlobalClaude,
+    /// A project `.zuno/{skill,skills}` root.
+    ProjectZuno,
+    /// A project `.agents/skills` root.
+    ProjectAgents,
+    /// A project `.claude/skills` root.
+    ProjectClaude,
+    /// A Zuno user/config directory.
+    GlobalZuno,
     /// `$HOME/.agents/skills`.
     GlobalAgents,
-    /// A `.opencode/{skill,skills}` found by the ancestor walk.
-    ProjectOpenCode,
-    /// A `.claude/skills` or `.agents/skills` found by the ancestor walk.
-    Project,
-    /// A `{skill,skills}` directory inside a config directory.
-    ConfigDirectory,
+    /// `$HOME/.claude/skills`.
+    GlobalClaude,
     /// A `skills.paths[]` entry.
     ConfiguredPath,
     /// A cache directory a `skills.urls[]` index produced.
@@ -251,7 +230,7 @@ pub struct SkillPath {
 }
 
 impl SkillPath {
-    /// The absolute path, as walked — not canonicalized.
+    /// The first discovery spelling of the absolute path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -286,58 +265,63 @@ impl SkillSources {
         };
         let external = options.external_dirs();
 
-        // Root 1: import only OpenCode `SKILL.md` files from its sibling XDG
-        // config directory. No OpenCode config or runtime behavior crosses this
-        // boundary.
-        if !options.external_disabled
-            && let Some(root) = options.opencode_config_root()
-            && root.is_dir()
-        {
-            sources.absorb(&root, ZUNO_PREFIXES, false, Root::GlobalOpenCode);
+        // Project scope first. Keep the project Zuno roots so the broader config
+        // directory list below can skip rescanning them.
+        let project_zuno = if options.layout.project_config_disabled() {
+            Vec::new()
+        } else {
+            walk::up(
+                &[PROJECT_CONFIG_DIRECTORY],
+                &options.directory,
+                options.worktree.as_deref(),
+            )
+        };
+        let project_zuno_identities = project_zuno
+            .iter()
+            .map(|root| identity(root))
+            .collect::<HashSet<_>>();
+        for root in project_zuno {
+            sources.absorb(&root, ZUNO_PREFIXES, false, Root::ProjectZuno);
         }
 
-        // Roots 2-3: the standard `$HOME` probes.
+        if !external.is_empty() {
+            for root in walk::up(&external, &options.directory, options.worktree.as_deref()) {
+                let provenance = if root.ends_with(AGENTS_EXTERNAL_DIR) {
+                    Root::ProjectAgents
+                } else {
+                    Root::ProjectClaude
+                };
+                sources.absorb(&root, EXTERNAL_PREFIXES, true, provenance);
+            }
+        }
+
+        // Global Zuno roots before global external-product roots. The shared
+        // config-chain helper also returns project `.zuno` directories; those
+        // were already scanned above with project provenance.
+        for dir in options
+            .layout
+            .config_directories(&options.directory, options.worktree.as_deref())
+        {
+            if project_zuno_identities.contains(&identity(&dir)) {
+                continue;
+            }
+            sources.absorb(&dir, ZUNO_PREFIXES, false, Root::GlobalZuno);
+        }
+
         for dir in &external {
             let root = options.layout.home().join(dir);
             if !root.is_dir() {
                 continue;
             }
-            let provenance = if *dir == CLAUDE_EXTERNAL_DIR {
-                Root::GlobalClaude
-            } else {
+            let provenance = if *dir == AGENTS_EXTERNAL_DIR {
                 Root::GlobalAgents
+            } else {
+                Root::GlobalClaude
             };
             sources.absorb(&root, EXTERNAL_PREFIXES, true, provenance);
         }
 
-        // Root 4: project-local OpenCode skill definitions.
-        if !options.external_disabled {
-            for root in walk::up(
-                &[OPENCODE_EXTERNAL_DIR],
-                &options.directory,
-                options.worktree.as_deref(),
-            ) {
-                sources.absorb(&root, ZUNO_PREFIXES, false, Root::ProjectOpenCode);
-            }
-        }
-
-        // Root 5: the standard Agent Skills ancestor walk. `walk::up` only
-        // returns targets that exist, which is why there is no `isDir` check.
-        if !external.is_empty() {
-            for root in walk::up(&external, &options.directory, options.worktree.as_deref()) {
-                sources.absorb(&root, EXTERNAL_PREFIXES, true, Root::Project);
-            }
-        }
-
-        // Root 6: every Zuno config directory.
-        for dir in options
-            .layout
-            .config_directories(&options.directory, options.worktree.as_deref())
-        {
-            sources.absorb(&dir, ZUNO_PREFIXES, false, Root::ConfigDirectory);
-        }
-
-        // Root 7: `skills.paths[]`.
+        // Explicit paths follow native project/user scopes.
         for entry in &options.paths {
             let dir = expand_path(entry, options);
             if !dir.is_dir() {
@@ -353,7 +337,7 @@ impl SkillSources {
         sources
     }
 
-    /// Root 8: fold in the cache directories a `skills.urls[]` index produced.
+    /// Fold in the cache directories a `skills.urls[]` index produced.
     pub fn extend_remote(&mut self, dirs: &[PathBuf]) {
         for dir in dirs {
             self.absorb(dir, ROOT_PREFIXES, false, Root::Remote);
@@ -437,13 +421,11 @@ fn expand_path(entry: &str, options: &SkillOptions) -> PathBuf {
     }
 }
 
-/// The de-duplication key: the path as a normalized string.
-///
-/// Deliberately **not** `canonicalize`. See the module documentation — the oracle
-/// keys on the walked string, and collapsing symlink aliases here would change
-/// which `location` a duplicated name reports.
+/// Canonical source identity, with a normalized path fallback for races and
+/// unreadable entries. The first discovery path remains the advertised locator.
 fn identity(path: &Path) -> String {
-    node_path::normalize(&path.to_string_lossy())
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    node_path::normalize(&resolved.to_string_lossy())
 }
 
 #[cfg(test)]
@@ -513,14 +495,14 @@ mod tests {
     }
 
     #[test]
-    fn every_local_root_is_visited_in_zuno_precedence_order() {
+    fn every_local_root_is_visited_in_zuno_scope_order() {
         let fixture = Fixture::new();
-        let opencode = fixture.skill("home/.config/opencode/skill/o", "o");
-        let claude = fixture.skill("home/.claude/skills/a", "a");
-        let agents = fixture.skill("home/.agents/skills/b", "b");
-        let project_opencode = fixture.skill("proj/.opencode/skills/po", "po");
-        let project = fixture.skill("proj/.agents/skills/c", "c");
-        let config = fixture.skill("home/.config/zuno/skill/d", "d");
+        let project_zuno = fixture.skill("proj/sub/.zuno/skills/pz", "pz");
+        let project_agents = fixture.skill("proj/sub/.agents/skills/pa", "pa");
+        let project_claude = fixture.skill("proj/.claude/skills/pc", "pc");
+        let config = fixture.skill("home/.config/zuno/skill/gz", "gz");
+        let agents = fixture.skill("home/.agents/skills/ga", "ga");
+        let claude = fixture.skill("home/.claude/skills/gc", "gc");
         let configured = fixture.skill("extra/e", "e");
         fs::create_dir_all(fixture.dir.path().join("proj/sub")).expect("mkdir");
 
@@ -540,12 +522,12 @@ mod tests {
         assert_eq!(
             roots(&sources),
             vec![
-                (Root::GlobalOpenCode, opencode),
-                (Root::GlobalClaude, claude),
+                (Root::ProjectZuno, project_zuno),
+                (Root::ProjectAgents, project_agents),
+                (Root::ProjectClaude, project_claude),
+                (Root::GlobalZuno, config),
                 (Root::GlobalAgents, agents),
-                (Root::ProjectOpenCode, project_opencode),
-                (Root::Project, project),
-                (Root::ConfigDirectory, config),
+                (Root::GlobalClaude, claude),
                 (Root::ConfiguredPath, configured),
             ]
         );
@@ -553,10 +535,11 @@ mod tests {
     }
 
     #[test]
-    fn global_opencode_skills_follow_xdg_config_home() {
+    fn opencode_directories_are_not_skill_sources() {
         let fixture = Fixture::new();
         fixture.skill("home/.config/opencode/skill/wrong", "wrong");
-        let expected = fixture.skill("xdg/opencode/skills/right", "right");
+        fixture.skill("xdg/opencode/skills/still-wrong", "still-wrong");
+        fixture.skill("proj/.opencode/skills/project-wrong", "project-wrong");
         let env = fixture.env().with(
             XDG_CONFIG_HOME,
             fixture.dir.path().join("xdg").to_string_lossy().as_ref(),
@@ -569,20 +552,15 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(
-            roots(&SkillSources::discover(&options)),
-            vec![(Root::GlobalOpenCode, expected)]
-        );
+        assert!(roots(&SkillSources::discover(&options)).is_empty());
     }
 
     #[test]
     fn claude_switch_removes_both_the_home_probe_and_the_project_walk() {
         let fixture = Fixture::new();
-        let opencode = fixture.skill("home/.config/opencode/skill/o", "o");
         fixture.skill("home/.claude/skills/a", "a");
         fixture.skill("proj/.claude/skills/c", "c");
         let agents = fixture.skill("home/.agents/skills/b", "b");
-        let project_opencode = fixture.skill("proj/.opencode/skill/po", "po");
         let project = fixture.skill("proj/.agents/skills/d", "d");
 
         let env = fixture.env().with("ZUNO_DISABLE_CLAUDE_CODE_SKILLS", "1");
@@ -596,19 +574,13 @@ mod tests {
         let sources = SkillSources::discover(&options);
         assert_eq!(
             roots(&sources),
-            vec![
-                (Root::GlobalOpenCode, opencode),
-                (Root::GlobalAgents, agents),
-                (Root::ProjectOpenCode, project_opencode),
-                (Root::Project, project),
-            ]
+            vec![(Root::ProjectAgents, project), (Root::GlobalAgents, agents),]
         );
     }
 
     #[test]
     fn broad_claude_switch_behaves_like_the_targeted_one() {
         let fixture = Fixture::new();
-        let opencode = fixture.skill("home/.config/opencode/skill/o", "o");
         fixture.skill("home/.claude/skills/a", "a");
         let agents = fixture.skill("home/.agents/skills/b", "b");
         let env = fixture.env().with(ZUNO_DISABLE_CLAUDE_CODE, "1");
@@ -621,21 +593,19 @@ mod tests {
         );
         assert_eq!(
             roots(&SkillSources::discover(&options)),
-            vec![
-                (Root::GlobalOpenCode, opencode),
-                (Root::GlobalAgents, agents)
-            ]
+            vec![(Root::GlobalAgents, agents)]
         );
     }
 
     #[test]
-    fn external_switch_removes_every_imported_and_agent_skills_root() {
+    fn external_switch_removes_agent_skills_but_keeps_zuno_roots() {
         let fixture = Fixture::new();
         fixture.skill("home/.config/opencode/skill/o", "o");
         fixture.skill("home/.claude/skills/a", "a");
         fixture.skill("home/.agents/skills/b", "b");
         fixture.skill("proj/.opencode/skills/po", "po");
         fixture.skill("proj/.agents/skills/c", "c");
+        let project_zuno = fixture.skill("proj/.zuno/skills/pz", "pz");
         let config = fixture.skill("home/.config/zuno/skills/d", "d");
 
         let env = fixture.env().with("ZUNO_DISABLE_EXTERNAL_SKILLS", "1");
@@ -648,7 +618,30 @@ mod tests {
         );
         assert_eq!(
             roots(&SkillSources::discover(&options)),
-            vec![(Root::ConfigDirectory, config)]
+            vec![
+                (Root::ProjectZuno, project_zuno),
+                (Root::GlobalZuno, config),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_config_switch_only_removes_project_zuno() {
+        let fixture = Fixture::new();
+        fixture.skill("proj/.zuno/skills/zuno", "zuno");
+        let agents = fixture.skill("proj/.agents/skills/agents", "agents");
+        let env = fixture.env().with("ZUNO_DISABLE_PROJECT_CONFIG", "1");
+        let options = SkillOptions::new(
+            fixture.dir.path().join("proj"),
+            None::<PathBuf>,
+            &env,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            roots(&SkillSources::discover(&options)),
+            vec![(Root::ProjectAgents, agents)]
         );
     }
 
@@ -736,7 +729,37 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_alias_is_two_matches_because_the_oracle_does_not_canonicalize() {
+    fn project_zuno_leads_and_opencode_is_not_a_source() {
+        let fixture = Fixture::new();
+        fixture.skill(
+            "home/.config/opencode/skill/ignored-global",
+            "ignored-global",
+        );
+        fixture.skill("proj/.opencode/skills/ignored-project", "ignored-project");
+        let project_zuno = fixture.skill("proj/sub/.zuno/skills/project-zuno", "project-zuno");
+        let project_agents =
+            fixture.skill("proj/sub/.agents/skills/project-agents", "project-agents");
+        let global_zuno = fixture.skill("home/.config/zuno/skill/global-zuno", "global-zuno");
+        let global_agents = fixture.skill("home/.agents/skills/global-agents", "global-agents");
+        fs::create_dir_all(fixture.dir.path().join("proj/sub")).expect("mkdir");
+
+        let sources = SkillSources::discover(&fixture.options("proj/sub", Vec::new()));
+        let paths = sources
+            .matches()
+            .iter()
+            .map(|entry| entry.path().to_path_buf())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![project_zuno, project_agents, global_zuno, global_agents,],
+            "project Zuno and Agent Skills must precede global sources, and .opencode \
+             directories must never enter the Zuno catalog"
+        );
+    }
+
+    #[test]
+    fn a_symlink_alias_is_one_canonical_source() {
         let fixture = Fixture::new();
         let real = fixture.skill("home/.agents/skills/a", "a");
         fs::create_dir_all(fixture.home().join(".claude/skills")).expect("mkdir");
@@ -748,16 +771,7 @@ mod tests {
 
         let options = fixture.options("proj", Vec::new());
         let sources = SkillSources::discover(&options);
-        assert_eq!(
-            roots(&sources),
-            vec![
-                (
-                    Root::GlobalClaude,
-                    fixture.home().join(".claude/skills/a/SKILL.md")
-                ),
-                (Root::GlobalAgents, real),
-            ]
-        );
+        assert_eq!(roots(&sources), vec![(Root::GlobalAgents, real)]);
     }
 
     #[test]
@@ -782,7 +796,7 @@ mod tests {
         );
         assert_eq!(
             roots(&SkillSources::discover(&options)),
-            vec![(Root::ConfigDirectory, overridden)]
+            vec![(Root::GlobalZuno, overridden)]
         );
     }
 

@@ -216,21 +216,23 @@ risky call, and an explicit permission deny always wins.
 
 ## Skill discovery
 
-Zuno discovers native skills from project and global
-`.zuno/skill(s)` directories, explicit `skills.paths`, and configured remote
-indexes. It also imports `SKILL.md` files from:
+Zuno discovers skills in this scope order:
 
-- `$XDG_CONFIG_HOME/opencode/skill` and `.../skills`;
-- project `.opencode/skill` and `.opencode/skills` roots from the current
-  directory up to the worktree;
-- global and project `.claude/skills` and `.agents/skills`.
+1. project `.zuno/skill(s)` roots from the current directory to the worktree;
+2. project `.agents/skills`, then `.claude/skills`, over the same walk;
+3. Zuno's global and configured config directories;
+4. global `~/.agents/skills`, then `~/.claude/skills`;
+5. explicit `skills.paths`;
+6. configured remote indexes.
 
-The OpenCode integration is intentionally limited to skill documents. Zuno does
-not read OpenCode config, plugins, hooks, tools, permissions, or runtime state.
-The same source path is de-duplicated, while same-named files from different
-sources remain independently addressable; no hidden discovery precedence
-selects one. Set `ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable all imported roots,
-or `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` to disable only Claude skill roots.
+Project scope is therefore advertised before user-global scope. Zuno never
+scans `.opencode` or `$XDG_CONFIG_HOME/opencode` for skills. The same canonical
+source path is de-duplicated, including symlink aliases, while same-named files
+from different sources remain independently addressable; no hidden winner is
+selected. Set `ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable `.agents` and
+`.claude` roots, or `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` to disable only Claude
+skill roots. Zuno-native `.zuno` roots remain enabled by the broad external
+switch.
 
 The model prompt receives a bounded catalog rather than every `SKILL.md` body.
 By default its approximate budget is two percent of the model context (8,000

@@ -10,15 +10,19 @@ fn keymap() -> Keymap {
     Keymap::defaults().expect("the shipped binding table resolves")
 }
 
-/// The agent and model this empty state must **not** claim before a reply exists.
-const REPLY_AGENT: &str = "build";
-const REPLY_MODEL: &str = "myopenai/claude-haiku-4-5";
+/// The configured identity the empty state must make visible before the first turn.
+const WELCOME_AGENT: &str = "build";
+const WELCOME_MODEL: &str = "myopenai/gpt-5.6-sol";
+const WELCOME_REASONING: &str = "max";
 
 /// The one row `WelcomeView::lines` emits unconditionally, used to bound the block.
 const LEAD_LINE: &str = "type / for commands";
 
 fn facts() -> WelcomeFacts {
     WelcomeFacts {
+        agent: Some(String::from(WELCOME_AGENT)),
+        model: Some(String::from(WELCOME_MODEL)),
+        reasoning: Some(String::from(WELCOME_REASONING)),
         directory: Some(String::from("~/src/zuno")),
         branch: Some(String::from("task-r17-solo")),
         version: Some(String::from("0.1.0")),
@@ -111,9 +115,9 @@ fn views_welcome_fills_a_large_frame_without_sprawling_across_it() {
     // blank spacer occupies the screen exactly as much as a row of text does, and spacers
     // are how the previous version spent a third of its height.
     //
-    // The ceiling moved 18 -> 14, and the reason is not editorial. Every row above the input
+    // The ceiling moved 18 -> 15, and the reason is not editorial. Every row above the input
     // is a row the input sits further from the middle — the eighteen-row block was inside the
-    // reference band and still produced the top-heavy screen that was reported twice. 14 is
+    // reference band and still produced the top-heavy screen that was reported twice. 15 is
     // what the current composition costs exactly, so this is a ratchet: any new row has to be
     // paid for by retiring one, and there is no slack left to grow into unnoticed.
     //
@@ -140,15 +144,15 @@ fn views_welcome_fills_a_large_frame_without_sprawling_across_it() {
     let head = view.head_rows(200, 50);
     let foot = view.foot_rows(200);
     assert!(
-        head + foot <= 14,
+        head + foot <= 15,
         "the welcome surface states {head} rows above the input and {foot} below, {} in all; \
          it spanned 22, then 18, and the references it follows spend 10 (`jcode`), \
          15 (`codex`) and 17 (`claw-code`)",
         head + foot
     );
     assert!(
-        head <= 9,
-        "the welcome screen states {head} rows above the input; past nine the input cannot \
+        head <= 10,
+        "the welcome screen states {head} rows above the input; past ten the input cannot \
          reach the middle of a 24-row pane, which is what `welcome_tail_rows` centres. Move \
          the row into `foot` rather than raising this"
     );
@@ -243,8 +247,9 @@ fn views_welcome_draws_the_wordmark_when_it_fits() {
         "the wordmark is missing on a terminal with room for it:\n{wide}"
     );
     assert!(WelcomeView::wordmark_fits(200, 50));
+    assert!(WelcomeView::wordmark_fits(200, WORDMARK_MIN_HEIGHT));
     assert!(!WelcomeView::wordmark_fits(39, 50));
-    assert!(!WelcomeView::wordmark_fits(200, 12));
+    assert!(!WelcomeView::wordmark_fits(200, WORDMARK_MIN_HEIGHT - 1));
 }
 
 #[test]
@@ -286,6 +291,22 @@ fn views_welcome_paints_the_wordmark_shadow_in_its_own_colour() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn views_welcome_formats_the_configured_agent_model_and_reasoning_as_one_identity() {
+    let facts = WelcomeFacts {
+        agent: Some(String::from("build")),
+        model: Some(String::from("myopenai/gpt-5.6-sol")),
+        reasoning: Some(String::from("max")),
+        ..WelcomeFacts::default()
+    };
+
+    assert_eq!(
+        facts.identity().as_deref(),
+        Some("▣ build · myopenai/gpt-5.6-sol (max)"),
+        "the launch page needs one concise identity row before the first turn"
+    );
+}
+
+#[test]
 fn views_welcome_states_every_fact_no_other_surface_keeps_at_every_width() {
     // The positive half of the trim. The list is shorter than it was by exactly the agent
     // and the model, which the negative test below now forbids; everything still here is a
@@ -294,6 +315,9 @@ fn views_welcome_states_every_fact_no_other_surface_keeps_at_every_width() {
     let mut view = view();
     let joined = rows(&screen_buffer(&mut view, 200, 50)).join("\n");
     for needle in [
+        WELCOME_AGENT,
+        WELCOME_MODEL,
+        WELCOME_REASONING,
         "~/src/zuno",
         "task-r17-solo",
         "13 tools",
@@ -307,20 +331,16 @@ fn views_welcome_states_every_fact_no_other_surface_keeps_at_every_width() {
 }
 
 #[test]
-fn views_welcome_does_not_claim_a_reply_identity_before_a_conversation_starts() {
-    // The measured duplication this trim removes: at 120x34 the welcome screen used to claim
-    // an agent and model before any reply had resolved them.
-    //
-    // Asserted on the **composite**, not on `WelcomeView` alone, and that is the point. A
-    // welcome-only assertion would pass the moment the row was deleted here even if a host
-    // re-added it. The composite proves the host does not restore the premature identity.
+fn views_welcome_states_the_configured_identity_before_the_first_turn() {
+    // Asserted on the composite so this proves both the host wiring and the view. The launch
+    // plan has already resolved these values even though no reply exists yet.
     let mut screen = composed();
     let rendered = rows(&render_offscreen(&mut screen, 120, 34).expect("infallible"));
     let joined = rendered.join("\n");
-    // Bracketed by both halves of the welcome surface rather than by one, which is stronger
-    // than the version this replaces and is not a matter of taste: the surface now sits on
-    // **both** sides of the prompt — the census above, the lead line below — so both halves
-    // of the empty state have to be rendered for this to be meaningful.
+    let identity = rendered
+        .iter()
+        .position(|row| row.contains("▣ build · myopenai/gpt-5.6-sol (max)"))
+        .expect("the welcome screen states the configured launch identity");
     let census = rendered
         .iter()
         .position(|row| row.contains("zuno 0.1.0"))
@@ -330,26 +350,17 @@ fn views_welcome_does_not_claim_a_reply_identity_before_a_conversation_starts() 
         .position(|row| row.contains(LEAD_LINE))
         .expect("the welcome screen always teaches `/`");
     assert!(
-        census < lead,
-        "the census is meant to be above the input and the lead line below it, but they came \
-         back in rows {census} and {lead}:\n{joined}"
+        identity < census && census < lead,
+        "the identity and census belong above the input and the lead line below it, but they \
+         came back in rows {identity}, {census} and {lead}:\n{joined}"
     );
-
-    for needle in [REPLY_AGENT, REPLY_MODEL] {
-        assert!(
-            !rendered.iter().any(|row| row.contains(needle)),
-            "`{needle}` belongs to a reply identity and must not appear before a \
-             conversation starts:\n{joined}"
-        );
-    }
 }
 
 #[test]
 fn views_welcome_keeps_the_branch_when_the_sidebar_is_absent() {
-    // Agent and model wait for a real reply identity. The branch remains an empty-state fact
-    // because the sidebar is intentionally absent there and the fixed footer prioritizes the
-    // directory and command discovery. Forty columns proves the location row still keeps a
-    // useful carrier without relying on a wide layout.
+    // The branch remains an empty-state fact because the sidebar is intentionally absent
+    // there and the fixed footer prioritizes directory and command discovery. Forty columns
+    // proves the location row still keeps a useful carrier without relying on a wide layout.
     let mut screen = composed();
     let rendered = rows(&render_offscreen(&mut screen, 40, 24).expect("infallible"));
     let joined = rendered.join("\n");
@@ -985,15 +996,16 @@ fn composed() -> crate::views::session::SessionScreen {
     let mut screen = crate::views::session::SessionScreen::new(ViewContext::defaults(), sender)
         .with_keymap(keymap());
     *screen.welcome_mut().facts_mut() = facts();
-    screen.status_mut().set_configured_agent("build");
+    screen.status_mut().set_configured_agent(WELCOME_AGENT);
+    screen.status_mut().set_configured_model(WELCOME_MODEL);
     screen
         .status_mut()
-        .set_configured_model("myopenai/claude-haiku-4-5");
+        .set_effort(Some(zuno_llm::effort::ReasoningEffort::Max));
     let ambient = screen.sidebar_mut().ambient_mut();
     ambient.directory = Some(String::from("~/src/zuno"));
     ambient.branch = Some(String::from("task-r17-solo"));
-    ambient.agent = Some(String::from("build"));
-    ambient.model = Some(String::from("myopenai/claude-haiku-4-5"));
+    ambient.agent = Some(String::from(WELCOME_AGENT));
+    ambient.model = Some(String::from(WELCOME_MODEL));
     ambient.version = Some(String::from("0.1.0"));
     ambient.mcp = vec![crate::views::ambient::Service::new(
         "alpha",

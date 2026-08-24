@@ -22,8 +22,9 @@
 //! # A row is earned by being the only place a fact appears
 //!
 //! Occupying space nothing else wants is not a licence to say things twice. Measured at
-//! 120×34, the first draft spent twenty-two rows and stated the agent and model before
-//! any reply had resolved them, the branch three times over (here, the old status trailer,
+//! 120×34, the first draft spent twenty-two rows and repeated the agent and model without
+//! distinguishing configured launch state from reply state, the branch three times over
+//! (here, the old status trailer,
 //! and the sidebar's footer), and a tagline that named no
 //! fact at all — and at forty columns that tagline, the census and the tip were each cut
 //! mid-word, so the rows that duplicated the most were also the ones that read as broken.
@@ -31,8 +32,9 @@
 //! The rule the surviving rows are chosen by is *whether the fact survives without them*,
 //! and the answer differs per carrier because both other carriers degrade:
 //!
-//! * Agent and model belong to the reply identity, so the empty state does not claim a
-//!   turn has resolved either one. The first response introduces that row.
+//! * Agent, model and reasoning effort are already resolved by the launch plan. The empty
+//!   state carries that configured identity so a user can verify what the first turn will
+//!   use; the reply identity later carries the same facts beside actual output.
 //! * The branch stays here, priced at zero extra rows by sharing the directory's row.
 //!   The sidebar is intentionally absent on this surface and the idle footer prioritizes
 //!   the directory and command discovery.
@@ -47,14 +49,15 @@
 //! `jcode` draws no welcome at all on an authenticated session, and `claw-code` spends
 //! sixteen rows. Eighteen is inside that band; twenty-two was above all of it.
 //!
-//! # Fourteen rows, and then nine of them above the input and four below
+//! # Fifteen rows, and then ten of them above the input and five below
 //!
 //! Eighteen was inside the reference band and still wrong, and the reason is positional
 //! rather than editorial. Every row above the input is a row the input sits further from the
 //! middle of the frame, and cutting rows only ever moves it closer — it cannot get it there.
 //! Measured at 120×32 the eighteen-row block left nine dead rows under the prompt and none
-//! above the brand; the fourteen-row block that replaced it still put the band at rows 23–26
-//! of 32. On a twenty-four-row pane the arithmetic makes it impossible outright: half the
+//! above the brand. The fifteen-row block that replaced it keeps one concise launch identity
+//! while moving the rest of the guidance below the input. On a twenty-four-row pane the
+//! arithmetic makes the old all-above layout impossible outright: half the
 //! frame is twelve rows and the block plus the fixed footer needed fifteen.
 //!
 //! So the trim below is real and kept, and the *position* is fixed separately by splitting
@@ -171,16 +174,10 @@ pub const WORDMARK_MIN_WIDTH: u16 = WORDMARK_WIDTH + 4;
 /// The shortest terminal that still gets the wordmark.
 ///
 /// Derived rather than chosen, and re-derived when the hints moved below the prompt. The
-/// screen is now nine rows above the input — six of letterform, a separator and two facts —
-/// and four below it: a separator, the lead line, and the two hint rows sharing one more
-/// separator. With the prompt's four-row band and the one-row frame footer the whole screen
-/// is eighteen rows, so eighteen is the first frame that holds all of it and twenty is that
-/// figure with two rows to spare.
-///
-/// The spare rows are not slack, they are what the centring spends: at exactly eighteen the
-/// band would have to sit flush against the head with nothing above the wordmark, which is the
-/// flush-to-the-edge layout the arrangement exists to avoid. Two rows is the least that leaves
-/// one on each side.
+/// screen is now ten rows above the input — six of letterform, a separator and three facts —
+/// and five below it: a separator, the lead line, another separator and two hint rows. With
+/// the prompt's four-row band and the one-row frame footer, twenty rows is the first frame
+/// that can carry the complete wordmark composition without clipping.
 ///
 /// **Measured against the frame, not against the region the head is painted into.** The owner
 /// bounds the tail by this head's height, so a fit decision that read the shrunken region
@@ -206,7 +203,7 @@ const CENSUS_GAP: &str = " · ";
 /// resolved rather than spelled.
 pub const TIPS: [&str; 12] = [
     "type a question and send it; there is no mode to enter first",
-    "the reply identity names the agent and model actually in use",
+    "the launch identity names the agent, model and reasoning effort for the next turn",
     "every tool call carries its own status glyph, so a stall is visible",
     "reasoning is collapsed by default, and says how many lines it is hiding",
     "a patch is rendered as a diff, with line numbers, right in the transcript",
@@ -284,11 +281,13 @@ pub const SLASH_HINTS: [SlashHint; 3] = [
 /// most. An absent fact is omitted rather than shown as a placeholder: `unknown` in
 /// the model row would be indistinguishable from a model actually called `unknown`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-/// There is deliberately **no agent or model field**. Those facts belong to the reply
-/// identity once a turn resolves them; the empty state must not imply that a reply exists.
-/// The fields are gone rather than merely unrendered so a caller cannot quietly restore
-/// the premature duplicate.
 pub struct WelcomeFacts {
+    /// The configured agent that will serve the next turn.
+    pub agent: Option<String>,
+    /// The qualified model that will serve the next turn.
+    pub model: Option<String>,
+    /// The selected reasoning effort, when the model exposes one.
+    pub reasoning: Option<String>,
     /// The working directory, already abbreviated for display.
     pub directory: Option<String>,
     /// The version-control branch, when the directory is a checkout.
@@ -310,6 +309,26 @@ pub struct WelcomeFacts {
 }
 
 impl WelcomeFacts {
+    /// The configured launch identity, e.g. `▣ build · openai/gpt-5.6-sol (max)`.
+    ///
+    /// Reasoning is meaningful only beside a model, so an effort without one is omitted
+    /// rather than advertised as a free-standing capability.
+    #[must_use]
+    pub fn identity(&self) -> Option<String> {
+        let effort = || {
+            self.reasoning
+                .as_ref()
+                .map(|reasoning| format!(" ({reasoning})"))
+                .unwrap_or_default()
+        };
+        match (&self.agent, &self.model) {
+            (Some(agent), Some(model)) => Some(format!("▣ {agent} · {model}{}", effort())),
+            (Some(agent), None) => Some(format!("▣ {agent}")),
+            (None, Some(model)) => Some(format!("▣ {model}{}", effort())),
+            (None, None) => None,
+        }
+    }
+
     /// The location row, when a directory or a branch is known.
     #[must_use]
     pub fn location(&self) -> Option<String> {
@@ -384,6 +403,9 @@ impl WelcomeView {
         Self {
             context,
             facts: WelcomeFacts {
+                agent: None,
+                model: None,
+                reasoning: None,
                 directory: None,
                 branch: None,
                 version: None,
@@ -421,6 +443,12 @@ impl WelcomeView {
     /// The facts, mutably, for a host that resolves them after construction.
     pub const fn facts_mut(&mut self) -> &mut WelcomeFacts {
         &mut self.facts
+    }
+
+    /// The facts currently displayed.
+    #[must_use]
+    pub const fn facts(&self) -> &WelcomeFacts {
+        &self.facts
     }
 
     /// Advance to the next tip, or bring the row back if it was hidden.
@@ -739,6 +767,9 @@ impl WelcomeView {
         }
 
         let mut facts = Vec::new();
+        if let Some(identity) = self.facts.identity() {
+            facts.push((identity, self.context.accent()));
+        }
         if let Some(location) = self.facts.location() {
             facts.push((location, self.context.text()));
         }
@@ -767,9 +798,9 @@ impl WelcomeView {
     /// length. Measured at 120x32 the band landed at rows 23–26 of 32 with fourteen dead rows
     /// under it, which is what was reported: an input box pinned near the bottom.
     ///
-    /// Splitting is what makes it reachable rather than merely closer. The head is nine rows
-    /// (six of letterform, a spacer and two facts), so the rows above the band are
-    /// `9 + 1` — inside half of twenty-four — and the band centres exactly from there up.
+    /// Splitting is what makes it reachable rather than merely closer. The head is ten rows
+    /// (six of letterform, a spacer and three facts), so the rows above the band are
+    /// `10 + 1` — inside half of twenty-four — and the band centres exactly from there up.
     ///
     /// The split is also the reference layout. `opencode` puts its logo above the input and
     /// its `tab agents` / `ctrl+alt+l commands` hint row and its tip line *below*, and the

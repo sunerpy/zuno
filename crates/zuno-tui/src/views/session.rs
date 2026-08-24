@@ -1282,6 +1282,8 @@ impl SessionScreen {
                 .iter()
                 .map(|model| (model.id.clone(), model.name.clone())),
         );
+        self.welcome.facts_mut().agent = catalog.agent.clone();
+        self.welcome.facts_mut().model = catalog.model.clone();
         if let Some(agent) = catalog.agent.as_deref() {
             self.status.set_configured_agent(agent);
         }
@@ -1289,6 +1291,8 @@ impl SessionScreen {
             self.status.set_configured_model(model);
         }
         self.status.set_effort(catalog.effort);
+        self.welcome.facts_mut().reasoning =
+            catalog.effort.map(|effort| effort.as_str().to_owned());
         self.catalog = catalog;
         self
     }
@@ -1668,7 +1672,8 @@ impl Component for SessionScreen {
         // keeps only the rows it actually needs and leaves the remaining viewport below
         // its identity. Once the transcript consumes the available pane, that spare run
         // reaches zero and the same identity row becomes sticky immediately above the
-        // composer. The welcome screen retains its centred input band and has no identity.
+        // composer. The welcome screen carries the configured launch identity in its head,
+        // but does not allocate the sticky reply-identity band before a reply exists.
         let (body, identity, spacer, prompt, info) = if empty {
             let [body, prompt, spacer, info] = Layout::vertical([
                 Constraint::Min(1),
@@ -3172,6 +3177,7 @@ impl SessionScreen {
                 self.catalog.model = Some(value.to_owned());
                 self.status.set_configured_model(value);
                 self.sidebar.ambient_mut().model = Some(value.to_owned());
+                self.welcome.facts_mut().model = Some(value.to_owned());
                 self.adopt_model_reasoning(value);
                 Selection::Model(value.to_owned())
             }
@@ -3179,6 +3185,7 @@ impl SessionScreen {
                 self.catalog.agent = Some(value.to_owned());
                 self.status.set_configured_agent(value);
                 self.sidebar.ambient_mut().agent = Some(value.to_owned());
+                self.welcome.facts_mut().agent = Some(value.to_owned());
                 Selection::Agent(value.to_owned())
             }
             crate::views::picker::SESSION_DIALOG_ID => {
@@ -3341,6 +3348,7 @@ impl SessionScreen {
         self.catalog.agent = Some(name.clone());
         self.status.set_configured_agent(&name);
         self.sidebar.ambient_mut().agent = Some(name.clone());
+        self.welcome.facts_mut().agent = Some(name.clone());
         let (text, level) = self.commit_selection(Selection::Agent(name));
         self.toasts.push(Toast::new(level, text));
         EventResult::REDRAW
@@ -3377,6 +3385,7 @@ impl SessionScreen {
         if !reasoning || !supports_active {
             self.catalog.effort = None;
             self.status.set_effort(None);
+            self.welcome.facts_mut().reasoning = None;
         }
     }
 
@@ -3434,6 +3443,7 @@ impl SessionScreen {
         let chosen = levels[next];
         self.catalog.effort = Some(chosen);
         self.status.set_effort(Some(chosen));
+        self.welcome.facts_mut().reasoning = Some(chosen.as_str().to_owned());
         let (text, level) = self.commit_selection(Selection::Effort(chosen));
         self.toasts.push(Toast::new(level, text));
         EventResult::REDRAW

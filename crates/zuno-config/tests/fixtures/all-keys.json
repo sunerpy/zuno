@@ -20,7 +20,7 @@
     }
   },
   "skills": {
-    "paths": ["./skills", "~/.config/opencode/skill"],
+    "paths": ["./skills", "~/.agents/skills"],
     "urls": ["https://example.com/.well-known/skills/"],
     "includeInstructions": true,
     "maxContextTokens": 8000

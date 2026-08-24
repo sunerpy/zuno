@@ -39,8 +39,8 @@ when that process exits.
 | Global skills                 | `~/.config/zuno/skill(s)/<name>/SKILL.md`                                                                                 |
 | Project static extensions     | `.zuno/extensions/<id>/extension.json`                                                                                    |
 | Global static extensions      | `~/.config/zuno/extensions/<id>/extension.json`                                                                           |
-| Imported OpenCode skills      | `$XDG_CONFIG_HOME/opencode/skill(s)/<name>/SKILL.md`, `.opencode/skill(s)/<name>/SKILL.md`                               |
-| Agent Skills (auto-loaded)    | `~/.claude/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md`, and matching project roots                      |
+| Project Agent Skills          | `.agents/skills/<name>/SKILL.md`, then `.claude/skills/<name>/SKILL.md`, walked from cwd to worktree                     |
+| Global Agent Skills           | `~/.agents/skills/<name>/SKILL.md`, then `~/.claude/skills/<name>/SKILL.md`                                               |
 
 Configs from each scope are deep-merged. Project overrides global. Unknown
 top-level keys in `zuno.json` are rejected with `ConfigInvalidError`.
@@ -307,14 +307,12 @@ description: One sentence covering what this skill does AND when to trigger it. 
 - `description` is effectively required: skills without one are filtered out and never surfaced to the model. Cover both _what_ the skill does and _when_ to use it. Write in third person ("Use when...", not "I help with..."). Front-load concrete trigger keywords and filenames; gate with "Use ONLY when..." if the skill should stay quiet on adjacent topics.
 - Optional: `license`, `compatibility`, `metadata` (string-string map).
 
-Zuno also imports `SKILL.md` files from
-`$XDG_CONFIG_HOME/opencode/{skill,skills}` and project
-`.opencode/{skill,skills}` directories. This is a skill-only bridge: OpenCode
-config, plugins, hooks, tools, permissions, and runtime behavior are not loaded.
-Within the same scope, imported OpenCode definitions have lower precedence than
-matching `.claude`, `.agents`, and Zuno-native definitions; project roots still
-override global roots. `ZUNO_DISABLE_EXTERNAL_SKILLS=1` disables every imported
-root.
+Zuno advertises project `.zuno`, `.agents`, and `.claude` skills before their
+user-global equivalents. It does not scan OpenCode directories. A canonical
+source reached through two paths is listed once; two distinct sources declaring
+the same name both remain available and must be selected by source, so discovery
+order never becomes a hidden override. `ZUNO_DISABLE_EXTERNAL_SKILLS=1` disables
+`.agents` and `.claude` roots while retaining Zuno-native `.zuno` skills.
 
 The phrase "follow skill guidance" does not name a skill by itself. The model
 receives the available names and descriptions, then must load the smallest
@@ -536,9 +534,9 @@ When a user's config is broken and Zuno won't start, these env vars help:
 - `ZUNO_CONFIG_CONTENT='{}'`:
   inject inline JSON as a final local-scope merge.
 - `ZUNO_DISABLE_EXTERNAL_SKILLS=1`,
-  `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1`: the broad switch skips imported
-  OpenCode, Claude, and Agent Skills roots; the targeted switch skips only
-  Claude roots.
+  `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1`: the broad switch skips `.agents` and
+  `.claude` roots; the targeted switch skips only Claude roots. Neither switch
+  disables Zuno-native `.zuno` skills.
 
 ## When proposing edits
 

@@ -178,15 +178,14 @@ Prompt assembly is ordered data, not string concatenation spread across the CLI.
 
 The trigger policy makes a named or clearly matching skill a pre-action requirement. The base prompt carries bounded name, description, and source metadata; descriptions are shortened before a source identity is omitted. `skills.maxContextTokens` overrides the default two-percent context budget, while `skills.includeInstructions: false` disables prompt injection. The `skill` tool pages the complete catalog with `list`, searches it with `search`, reads a selected body with `load`, and resolves relative text with `read_resource`. Same-named sources remain distinct and require the advertised source locator. Reads use content-bound cursors and must continue to completion; disk bodies are read after selection rather than retained for the process lifetime.
 
-Skill discovery is Zuno-owned. In increasing precedence it includes global
-OpenCode `SKILL.md` imports, global Claude/Agent Skills, project OpenCode
-imports, project Claude/Agent Skills, Zuno config roots, configured paths, and
-pulled URL caches. OpenCode roots are
-`$XDG_CONFIG_HOME/opencode/{skill,skills}` and project
-`.opencode/{skill,skills}`. The bridge imports skill files only; it does not load
-another product's config, plugins, hooks, permission model, tools, or runtime.
-The same path is de-duplicated, but same-named files remain distinct source
-identities. Zuno never selects one by hidden discovery precedence.
+Skill discovery is Zuno-owned. It advertises project `.zuno`, `.agents`, and
+`.claude` roots before Zuno's user-global config and user-global Agent Skills,
+then configured paths and pulled URL caches. `.agents` precedes `.claude` within
+the same scope. Zuno does not scan OpenCode directories. Canonical paths are
+de-duplicated, including symlink aliases, but same-named files from distinct
+sources remain separate identities that require source-qualified selection.
+Discovery order controls presentation and provenance; it does not silently
+choose a same-name winner.
 
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 

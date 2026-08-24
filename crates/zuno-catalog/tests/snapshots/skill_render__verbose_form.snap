@@ -6,12 +6,12 @@ expression: "render(&corpus(), Form::Verbose)"
   <skill>
     <name>add-office365</name>
     <description>Adds Office 365 Outlook connector to a Power Apps code app.</description>
-    <location>/config/.config/opencode/skill/powerapps/code-apps/skills/add-office365/SKILL.md</location>
+    <location>/workspace/app/.zuno/skills/add-office365/SKILL.md</location>
   </skill>
   <skill>
     <name>amazon_quick_guide</name>
     <description>MUST be loaded for ANY question about Amazon Quick.</description>
-    <location>/config/.config/opencode/skill/amazon_quick_guide/SKILL.md</location>
+    <location>/config/.config/zuno/skill/amazon_quick_guide/SKILL.md</location>
   </skill>
   <skill>
     <name>customize-zuno</name>

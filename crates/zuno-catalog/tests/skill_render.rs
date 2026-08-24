@@ -39,12 +39,12 @@ fn corpus() -> Vec<Skill> {
         skill(
             "amazon_quick_guide",
             Some("MUST be loaded for ANY question about Amazon Quick."),
-            "/config/.config/opencode/skill/amazon_quick_guide/SKILL.md",
+            "/config/.config/zuno/skill/amazon_quick_guide/SKILL.md",
         ),
         skill(
             "add-office365",
             Some("Adds Office 365 Outlook connector to a Power Apps code app."),
-            "/config/.config/opencode/skill/powerapps/code-apps/skills/add-office365/SKILL.md",
+            "/workspace/app/.zuno/skills/add-office365/SKILL.md",
         ),
     ]
 }
@@ -65,9 +65,7 @@ fn index_form_contains_name_description_and_exact_source() {
     assert!(rendered.starts_with("<skill_index>"));
     assert!(rendered.contains("name=\"add-office365\""));
     assert!(rendered.contains("Adds Office 365 Outlook connector"));
-    assert!(rendered.contains(
-        "source=\"/config/.config/opencode/skill/powerapps/code-apps/skills/add-office365/SKILL.md\""
-    ));
+    assert!(rendered.contains("source=\"/workspace/app/.zuno/skills/add-office365/SKILL.md\""));
     assert!(rendered.contains("source=\"&lt;built-in&gt;\""));
 }
 

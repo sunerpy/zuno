@@ -2,7 +2,7 @@
 //!
 //! The unit tests inside the crate cover each root and each frontmatter rule in
 //! isolation. These cover the assembly: that every root composes in the intended
-//! order, that the built-in is displaced rather than duplicated, and that the two
+//! order, that the built-in remains first, and that the two
 //! de-duplication dimensions stay distinct.
 
 use std::fs;
@@ -94,21 +94,19 @@ fn names(skills: &Skills) -> Vec<String> {
 async fn every_root_contributes_and_the_builtin_comes_first() {
     let tree = Tree::new();
     tree.skill(
-        "home/.config/opencode/skill/from-opencode",
-        "from-opencode",
-        Some("o"),
-    );
-    tree.skill("home/.claude/skills/from-claude", "from-claude", Some("c"));
-    tree.skill("home/.agents/skills/from-agents", "from-agents", Some("a"));
-    tree.skill(
-        "proj/.opencode/skills/from-project-opencode",
-        "from-project-opencode",
-        Some("po"),
+        "proj/sub/.zuno/skill/from-project-zuno",
+        "from-project-zuno",
+        Some("pz"),
     );
     tree.skill(
-        "proj/.agents/skills/from-project",
-        "from-project",
-        Some("p"),
+        "proj/sub/.agents/skills/from-project-agents",
+        "from-project-agents",
+        Some("pa"),
+    );
+    tree.skill(
+        "proj/.claude/skills/from-project-claude",
+        "from-project-claude",
+        Some("pc"),
     );
     tree.skill(
         "home/.config/zuno/skill/from-config",
@@ -120,6 +118,8 @@ async fn every_root_contributes_and_the_builtin_comes_first() {
         "from-config-plural",
         Some("gp"),
     );
+    tree.skill("home/.agents/skills/from-agents", "from-agents", Some("a"));
+    tree.skill("home/.claude/skills/from-claude", "from-claude", Some("c"));
     tree.skill("extra/from-path", "from-path", Some("x"));
     fs::create_dir_all(tree.at("proj/sub")).expect("mkdir");
 
@@ -133,13 +133,13 @@ async fn every_root_contributes_and_the_builtin_comes_first() {
         names(&skills),
         vec![
             builtin::NAME.to_string(),
-            "from-opencode".to_string(),
-            "from-claude".to_string(),
-            "from-agents".to_string(),
-            "from-project-opencode".to_string(),
-            "from-project".to_string(),
+            "from-project-zuno".to_string(),
+            "from-project-agents".to_string(),
+            "from-project-claude".to_string(),
             "from-config".to_string(),
             "from-config-plural".to_string(),
+            "from-agents".to_string(),
+            "from-claude".to_string(),
             "from-path".to_string(),
         ]
     );
@@ -179,11 +179,7 @@ async fn a_skill_file_with_no_name_is_rejected_and_the_warning_names_the_file() 
 #[tokio::test]
 async fn a_duplicate_name_keeps_both_sources_and_requires_disambiguation() {
     let tree = Tree::new();
-    tree.skill(
-        "home/.config/opencode/skill/dupe",
-        "dupe",
-        Some("from opencode"),
-    );
+    tree.skill("proj/.zuno/skill/dupe", "dupe", Some("from project"));
     tree.skill("home/.agents/skills/dupe", "dupe", Some("from agents"));
 
     let skills = load(&tree.options("proj")).await;
@@ -198,8 +194,7 @@ async fn a_duplicate_name_keeps_both_sources_and_requires_disambiguation() {
     assert_eq!(
         sources,
         [
-            tree.at("home/.config/opencode/skill/dupe/SKILL.md")
-                .to_string_lossy(),
+            tree.at("proj/.zuno/skill/dupe/SKILL.md").to_string_lossy(),
             tree.at("home/.agents/skills/dupe/SKILL.md")
                 .to_string_lossy(),
         ]
@@ -267,21 +262,24 @@ async fn path_dedup_and_name_dedup_are_different_mechanisms() {
 }
 
 #[tokio::test]
-async fn a_symlink_alias_remains_a_separate_source_identity() {
+async fn a_symlink_alias_is_one_canonical_source() {
     let tree = Tree::new();
-    tree.skill("home/.agents/skills/aliased", "aliased", Some("real"));
+    tree.skill("home/.agents/skills/canonical", "canonical", Some("real"));
     fs::create_dir_all(tree.home().join(".claude/skills")).expect("mkdir");
     std::os::unix::fs::symlink(
-        tree.home().join(".agents/skills/aliased"),
-        tree.home().join(".claude/skills/aliased"),
+        tree.home().join(".agents/skills/canonical"),
+        tree.home().join(".claude/skills/canonical"),
     )
     .expect("symlink");
 
     let skills = load(&tree.options("proj")).await;
 
-    assert!(skills.warnings().is_empty(), "{:?}", skills.warnings());
-    assert_eq!(skills.named("aliased").len(), 2);
-    assert!(skills.get("aliased").is_none());
+    assert_eq!(
+        skills.named("canonical").len(),
+        1,
+        "aliases of one SKILL.md must not be advertised as ambiguous sources"
+    );
+    assert!(skills.get("canonical").is_some());
 }
 
 #[tokio::test]
@@ -350,8 +348,8 @@ async fn dirs_are_reported_for_every_match() {
     assert_eq!(
         skills.dirs(),
         [
-            one.parent().expect("parent").to_path_buf(),
-            two.parent().expect("parent").to_path_buf()
+            two.parent().expect("parent").to_path_buf(),
+            one.parent().expect("parent").to_path_buf()
         ]
     );
 }
@@ -424,8 +422,7 @@ const SKILL_CORPUS_ENV: &str = "ZUNO_SKILL_CORPUS";
 
 /// An opt-in corpus check: every `SKILL.md` under the requested roots must parse.
 ///
-/// This used to hardcode two absolute host paths
-/// (`/config/.config/opencode/skill` and `/config/.agents/skills`) and `continue`
+/// This used to hardcode absolute host paths such as `/config/.agents/skills` and `continue`
 /// past each one that was absent, so on every machine but one it walked nothing,
 /// counted nothing, and passed. That is the unfalsifiable-gate shape this project
 /// removed from `zuno-config/tests/differential.rs`, `plugin_models.rs` and

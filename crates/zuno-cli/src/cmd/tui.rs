@@ -1100,6 +1100,7 @@ struct SessionFacts {
     branch: Option<String>,
     agent: String,
     model: String,
+    effort: Option<String>,
     version: String,
     context_window: u64,
     lsp: Vec<zuno_tui::views::ambient::Service>,
@@ -1167,6 +1168,7 @@ impl SessionFacts {
             branch: worktree.and_then(current_branch),
             agent: plan.agent_name().to_owned(),
             model: plan.qualified_model(),
+            effort: plan.effort().map(|effort| effort.as_str().to_owned()),
             version: crate::version::RUST_PACKAGE_VERSION.to_owned(),
             context_window: plan.context_window(),
             lsp,
@@ -1209,10 +1211,10 @@ impl SessionFacts {
         screen.status_mut().describe(&self.agent, &self.model);
 
         let directory = (!self.directory.is_empty()).then(|| self.directory.clone());
-        // No agent or model: `status_mut().describe` above already states both on the one
-        // row that is never dropped at any width, and the welcome screen sat directly on
-        // top of it repeating them verbatim.
         *screen.welcome_mut().facts_mut() = zuno_tui::views::welcome::WelcomeFacts {
+            agent: Some(self.agent.clone()),
+            model: Some(self.model.clone()),
+            reasoning: self.effort,
             directory: directory.clone(),
             branch: self.branch.clone(),
             version: Some(self.version.clone()),
