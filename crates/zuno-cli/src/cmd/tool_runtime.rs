@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use zuno_catalog::agent;
+use zuno_agent::profile::AgentProfile;
 use zuno_config::schema::Config;
 use zuno_error::ToolError;
 use zuno_paths::Env;
@@ -127,11 +127,11 @@ pub(crate) fn assemble(
     worktree: Option<&Path>,
     env: &Env,
     config: &Config,
-    selected_agent: &agent::Agent,
+    selected_profile: &AgentProfile,
     selection: ToolSelection<'_>,
 ) -> Result<ToolRuntime, String> {
-    let dynamic = super::agent::DynamicRules::resolve(directory, worktree, env, config);
-    let rules = super::agent::resolved_rules(selected_agent, config, &dynamic);
+    let selected_agent = selected_profile.definition();
+    let rules = selected_profile.capabilities().rules().to_vec();
     let search = SearchConfig::from_profile(
         |key| env.value(key).map(str::to_owned),
         config.web_search.as_ref(),

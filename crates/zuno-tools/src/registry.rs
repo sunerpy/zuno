@@ -155,8 +155,10 @@ pub const BUILTIN_ORDER: [BuiltinSlot; 18] = [
 ///
 /// `execute`, `lsp`, and `plan_exit` remain extension slots. The default harness must
 /// not claim them until production assembly supplies their missing configuration or
-/// host collaborator.
-pub const DEFAULT_BUILTINS: [BuiltinSlot; 15] = [
+/// host collaborator. `edit` remains registered for explicitly constructed internal
+/// profiles, but the default model surface has one structured editing path:
+/// `apply_patch`, plus `write` for new files or intentional full replacement.
+pub const DEFAULT_BUILTINS: [BuiltinSlot; 14] = [
     BuiltinSlot::Invalid,
     BuiltinSlot::Question,
     BuiltinSlot::Shell,
@@ -164,7 +166,6 @@ pub const DEFAULT_BUILTINS: [BuiltinSlot; 15] = [
     BuiltinSlot::Read,
     BuiltinSlot::Glob,
     BuiltinSlot::Grep,
-    BuiltinSlot::Edit,
     BuiltinSlot::Write,
     BuiltinSlot::Task,
     BuiltinSlot::Job,

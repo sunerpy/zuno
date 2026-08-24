@@ -40,6 +40,7 @@ pub mod builtin;
 pub mod continuation;
 pub mod model_policy;
 pub mod plan_file;
+pub mod profile;
 pub mod reflection;
 
 pub use plan_file::{PLANS_DIRECTORY, PROJECT_DIRECTORY, PlanKey, PlanLocation, plan_path};

@@ -33,6 +33,16 @@ fn agent(name: &str) -> Agent {
     }
 }
 
+fn agent_profile(
+    entry: Agent,
+    directory: &Path,
+    config: &zuno_config::schema::Config,
+) -> zuno_agent::profile::AgentProfile {
+    let env = Env::empty();
+    let dynamic = crate::cmd::agent::DynamicRules::resolve(directory, None, &env, config);
+    crate::cmd::agent::resolved_profile(entry, config, &dynamic, false)
+}
+
 #[test]
 fn configured_subagents_reach_task_with_their_model_choice() {
     let mut explorer = agent("explorer");
@@ -175,6 +185,8 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         vcs: None,
     };
     let agent = agent("build");
+    let config = zuno_config::schema::Config::default();
+    let profile = agent_profile(agent.clone(), &directory, &config);
     let extension_scope = zuno_extension::Scope::new(&directory);
     TurnPlan {
         profile: zuno_harness::default_profile(),
@@ -206,8 +218,8 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         goal_retry_policy: GoalRetryPolicy::default(),
         directory,
         project,
-        config: zuno_config::schema::Config::default(),
-        agent,
+        config,
+        agent: profile,
         provider_id: "provider".to_owned(),
         model_id: "model".to_owned(),
         auth_store,
@@ -2737,12 +2749,13 @@ fn a_catalog_limit_that_is_absent_or_negative_reads_as_no_window() {
 fn production_registry_exposes_all_three_goal_tools() {
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
-    let selected_agent = agent("build");
+    let config = zuno_config::schema::Config::default();
+    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
     let runtime = tool_runtime::assemble(
         directory.path(),
         None,
         &Env::empty(),
-        &zuno_config::schema::Config::default(),
+        &config,
         &selected_agent,
         tool_runtime::ToolSelection {
             provider_id: "provider",
@@ -2779,6 +2792,63 @@ fn production_registry_exposes_all_three_goal_tools() {
             "production registry is missing `{goal_tool}`; visible tools: {ids:?}"
         );
     }
+}
+
+#[test]
+fn production_registry_uses_the_frozen_profile_rules() {
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let selected_agent = zuno_agent::profile::AgentProfile::resolve(
+        agent("build"),
+        vec![
+            zuno_permission::Rule {
+                permission: "*".to_owned(),
+                pattern: "*".to_owned(),
+                action: zuno_config::schema::permission::PermissionAction::Allow,
+            },
+            zuno_permission::Rule {
+                permission: "read".to_owned(),
+                pattern: "*".to_owned(),
+                action: zuno_config::schema::permission::PermissionAction::Deny,
+            },
+        ],
+        false,
+    );
+    let runtime = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &zuno_config::schema::Config::default(),
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            question: None,
+            background_executions: test_background_executions(directory.path()),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            job_controller: test_job_controller(),
+            memory: None,
+        },
+    )
+    .expect("production registry assembles");
+
+    assert!(
+        runtime.tools.iter().all(|tool| tool.id() != "read"),
+        "tool visibility must come from the profile snapshot, not recomputed config"
+    );
+    assert_eq!(runtime.rules, selected_agent.capabilities().rules());
 }
 
 #[test]
@@ -3663,7 +3733,7 @@ mod production_registry {
     ) -> Result<Fixture, String> {
         let directory = tempfile::TempDir::new().expect("temporary tool workspace");
         let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
-        let selected_agent = agent("build");
+        let selected_agent = agent_profile(agent("build"), directory.path(), &config);
         let runtime = tool_runtime::assemble(
             directory.path(),
             None,
@@ -3875,12 +3945,13 @@ mod production_registry {
         let advertised = skills.render(zuno_catalog::skill::Form::Verbose);
         let directory = tempfile::TempDir::new().expect("temporary tool workspace");
         let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
-        let selected_agent = agent("build");
+        let config = zuno_config::schema::Config::default();
+        let selected_agent = agent_profile(agent("build"), directory.path(), &config);
         let runtime = tool_runtime::assemble(
             directory.path(),
             None,
             &Env::empty(),
-            &zuno_config::schema::Config::default(),
+            &config,
             &selected_agent,
             tool_runtime::ToolSelection {
                 provider_id: "provider",
@@ -5235,9 +5306,11 @@ fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
          the helper the turn stopped calling."
     );
     assert!(
-        turn.contains("turn_effort(options.effort, &agent,"),
-        "`TurnPlan::resolve` no longer consults the agent's `variant`, so an agent \
-         configured to reason at one level runs at the provider's default"
+        turn.contains("let definition = agent.definition();")
+            && turn.contains("turn_effort(options.effort, definition,"),
+        "`TurnPlan::resolve` no longer carries the resolved profile's agent definition \
+         into `turn_effort`, so an agent configured with a `variant` can run at the \
+         provider's default"
     );
     assert!(
         turn.contains("generation::MAX_TOKENS, json!(output_ceiling(model))"),

@@ -42,6 +42,7 @@ use sha2::{Digest as _, Sha256};
 use tracing::Instrument as _;
 use uuid::Uuid;
 use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
+use zuno_agent::profile::AgentProfile;
 use zuno_agent::reflection::{
     CommandOutcome, ReflectionError, ReflectionFork, ReflectionMemoryEntry, ReflectionMemoryScope,
     ReflectionRequest, ReflectionRunner, ReflectionTools, ReflectionTurn, TranscriptEvent,
@@ -284,7 +285,7 @@ pub(crate) struct TurnPlan {
     project: zuno_paths::project::ResolvedProject,
     config: zuno_config::schema::Config,
     agents: Vec<zuno_catalog::agent::Agent>,
-    agent: zuno_catalog::agent::Agent,
+    agent: AgentProfile,
     extensions: zuno_extension::ResolvedExtensions,
     extension_scope: zuno_extension::Scope,
     extension_revision: u64,
@@ -520,24 +521,29 @@ impl TurnPlan {
                     .is_some_and(|model| model.capabilities.input.image)
             })
         });
+        let dynamic_rules =
+            super::agent::DynamicRules::resolve(&directory, worktree.as_deref(), env, &config);
+        let agent =
+            super::agent::resolved_profile(agent, &config, &dynamic_rules, vision_available);
+        let definition = agent.definition();
         let mut prompt_assembly = PromptAssembly::new();
         prompt_assembly
             .push(
                 "agent.base",
-                agent_prompt_source(&agent),
-                agent.prompt.clone().unwrap_or_default(),
+                agent_prompt_source(definition),
+                definition.prompt.clone().unwrap_or_default(),
             )
             .map_err(to_string)?;
-        if let Some(policy) = zuno_agent::builtin::get(&agent.name, vision_available) {
+        if !agent.prompt_policy().is_empty() {
             prompt_assembly
                 .push(
                     "agent.policy",
-                    format!("zuno-agent::builtin:{}", agent.name),
-                    policy.prompt_policy(),
+                    format!("zuno-agent::profile:{}", agent.name()),
+                    agent.prompt_policy(),
                 )
                 .map_err(to_string)?;
         }
-        if let Some(mode) = collaboration_mode_prompt(&agent.name) {
+        if let Some(mode) = collaboration_mode_prompt(agent.name()) {
             prompt_assembly
                 .push(
                     "collaboration.mode",
@@ -547,23 +553,23 @@ impl TurnPlan {
                 .map_err(to_string)?;
         }
         let resolver = Resolver {
-            requested_agent: agent.name.clone(),
+            requested_agent: agent.name().to_owned(),
             system_prompt: prompt_assembly.render(),
             prompt_assembly: Some(prompt_assembly),
-            max_steps: agent
+            max_steps: definition
                 .steps
                 .map_or(DEFAULT_MAX_STEPS, std::num::NonZeroU32::get),
             requested_provider: provider_id.clone(),
             requested_model: model_id.clone(),
             wire_model: catalog_model.api.id.clone(),
             reasoning_options: session_reasoning_options(
-                turn_effort(options.effort, &agent, &provider_id, &model_id),
+                turn_effort(options.effort, definition, &provider_id, &model_id),
                 catalog_model,
-                &agent.options,
+                &definition.options,
             ),
             spec: with_agent_options(
                 model_spec(&catalog, catalog_model, env)?,
-                &agent,
+                definition,
                 catalog_model.capabilities.temperature,
             ),
         };
@@ -683,7 +689,7 @@ impl TurnPlan {
 
     /// The agent that will answer.
     pub(crate) fn agent_name(&self) -> &str {
-        &self.agent.name
+        self.agent.name()
     }
 
     /// Every resolved agent, including active static and process extensions.
@@ -1978,7 +1984,7 @@ impl TurnHost {
                     question: question.clone(),
                     runs: runs.clone(),
                     mcp: mcp.clone(),
-                    parent_agent: plan.agent.name.clone(),
+                    parent_agent: plan.agent.name().to_owned(),
                     parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
                     parent_effort: plan.effort,
                     delegation_limiter: delegation_limiter.clone(),
@@ -2085,7 +2091,7 @@ impl TurnHost {
                 session_usage: prepared.usage,
                 session_materializer: prepared.materializer,
                 session_title: prepared.title,
-                agent: plan.agent.name,
+                agent: plan.agent.name().to_owned(),
                 provider_id: plan.provider_id,
                 model_id: plan.model_id,
                 extension_scope: plan.extension_scope,
@@ -5600,7 +5606,7 @@ fn prepare_turn_host(
         crate::RUST_PACKAGE_VERSION,
     )
     .at(now);
-    input.agent = Some(plan.agent.name.clone());
+    input.agent = Some(plan.agent.name().to_owned());
     input.model = Some(zuno_db::session::model_reference(
         &plan.provider_id,
         &plan.model_id,

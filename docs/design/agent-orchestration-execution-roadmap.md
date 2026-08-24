@@ -311,6 +311,14 @@ The same `CapabilityPolicy` controls:
 A prompt must never be the only thing making an Agent read-only or preventing
 recursive delegation.
 
+Implementation checkpoint (2026-08-24): `AgentProfile` now freezes the resolved
+catalog definition, final ordered permission rules, declared delegation targets,
+and model-visible capability summary once per turn. Prompt assembly, model and
+reasoning selection, tool visibility, dispatch authorization, and `agent list`
+consume that snapshot instead of independently recomputing permissions. The next
+profile commit still needs to collapse the remaining native routing metadata into
+the same definition while introducing the canonical roster below.
+
 ### Model and reasoning policy
 
 - Profiles inherit the session model by default.

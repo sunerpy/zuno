@@ -28,6 +28,12 @@ async fn the_default_profile_publishes_only_complete_default_host_tools() {
     assert!(tools.contains(BuiltinSlot::Task));
     assert!(tools.contains(BuiltinSlot::Job));
     assert!(tools.contains(BuiltinSlot::Search));
+    assert!(tools.contains(BuiltinSlot::Write));
+    assert!(tools.contains(BuiltinSlot::Patch));
+    assert!(
+        !tools.contains(BuiltinSlot::Edit),
+        "the legacy exact-replacement editor is runtime-internal, not model-visible"
+    );
     assert_eq!(tools.slots(), zuno_tools::registry::DEFAULT_BUILTINS);
     assert!(!tools.contains(BuiltinSlot::Execute));
     assert!(!tools.contains(BuiltinSlot::Lsp));

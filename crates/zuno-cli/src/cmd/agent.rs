@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use zuno_agent::profile::AgentProfile;
 use zuno_catalog::agent;
 use zuno_catalog::reference::{ReferenceTarget, ResolvedReferences};
 use zuno_catalog::skill::discovery::{SkillOptions, SkillSources};
@@ -49,11 +50,12 @@ fn list(environment: &StartupEnvironment) -> Result<(), String> {
     let dynamic = DynamicRules::resolve(&directory, worktree, env, &config);
 
     for entry in agents {
-        println!("{}", entry.header());
-        let rules = resolved_rules(&entry, &config, &dynamic);
+        let profile = resolved_profile(entry, &config, &dynamic, true);
+        println!("{}", profile.definition().header());
         println!(
             "  {}",
-            serde_json::to_string_pretty(&rules).map_err(|error| error.to_string())?
+            serde_json::to_string_pretty(profile.capabilities().rules())
+                .map_err(|error| error.to_string())?
         );
     }
     Ok(())
@@ -146,6 +148,17 @@ pub(crate) fn resolved_rules(
         ));
     }
     rules
+}
+
+/// Freeze one catalog entry together with the exact rules this process enforces.
+pub(crate) fn resolved_profile(
+    entry: agent::Agent,
+    config: &Config,
+    dynamic: &DynamicRules,
+    vision_available: bool,
+) -> AgentProfile {
+    let rules = resolved_rules(&entry, config, dynamic);
+    AgentProfile::resolve(entry, rules, vision_available)
 }
 
 fn default_rules(dynamic: &DynamicRules) -> Vec<Rule> {
