@@ -2508,7 +2508,7 @@ async fn api_agent_roster_is_the_resolved_native_set() {
 }
 
 #[tokio::test]
-async fn api_skill_reports_the_v2_builtin_location_and_description() {
+async fn api_skill_reports_every_first_party_location_and_description() {
     let (root, directory) = fs_fixture();
     let state = ApiState::memory(directory)
         .expect("API state")
@@ -2516,26 +2516,54 @@ async fn api_skill_reports_the_v2_builtin_location_and_description() {
     let (status, body) = fs_body(state, "/api/skill").await;
     assert_eq!(status, StatusCode::OK);
     let json: Value = serde_json::from_slice(&body).expect("skill body is JSON");
-    let builtin = json["data"]
-        .as_array()
-        .expect("skills are an array")
+    let skills = json["data"].as_array().expect("skills are an array");
+    for name in [
+        "customize-zuno",
+        "deepwork",
+        "codemap",
+        "verification-planning",
+        "reflect",
+        "worktree",
+        "git-workflow",
+    ] {
+        let builtin = skills
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("first-party Skill {name} is registered"));
+        assert_eq!(
+            builtin["location"],
+            format!("/builtin/{name}.md"),
+            "the API projects the stable embedded source into a native location"
+        );
+        assert!(
+            builtin["description"]
+                .as_str()
+                .is_some_and(|description| !description.trim().is_empty()),
+            "{name} must carry a model-facing description"
+        );
+    }
+
+    let customize = skills
         .iter()
         .find(|entry| entry["name"] == "customize-zuno")
-        .expect("the built-in skill is registered");
-    assert_eq!(
-        builtin["location"], "/builtin/customize-zuno.md",
-        "the API reports the native built-in location rather than the catalog sentinel"
-    );
-    let description = builtin["description"].as_str().expect("description");
-    for surface in ["agents", "commands", "skills", "MCP servers"] {
+        .expect("customize-zuno is registered");
+    let description = customize["description"]
+        .as_str()
+        .expect("description")
+        .to_ascii_lowercase();
+    for surface in [
+        "configuration",
+        "agents",
+        "workflows",
+        "skills",
+        "mcp servers",
+    ] {
         assert!(
             description.contains(surface),
             "the description omits native configuration surface {surface:?}: {description}"
         );
     }
-    assert!(description.contains("Zuno's own configuration"));
-    assert!(description.contains("files under .zuno/"));
-    assert!(!description.contains("opencode's own configuration"));
+    assert!(!description.contains("opencode"));
 }
 
 #[tokio::test]

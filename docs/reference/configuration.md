@@ -106,6 +106,50 @@ Independent runtime work has four bounded controls:
 Each field accepts `1..=64`; omission uses the values above. Set a field to `1`
 to restore serial behavior for that layer.
 
+## Agent model presets
+
+Presets are typed team-wide model routes. They select a model and optional
+provider-neutral reasoning level for an Agent or semantic workflow category;
+they do not create Agents, grant tools, change permissions, or authorize
+delegation.
+
+```json
+{
+  "preset": "house",
+  "presets": {
+    "house": {
+      "agents": {
+        "orchestrator": {
+          "model": "myopenai/primary-model",
+          "reasoning": "max"
+        },
+        "deep": {
+          "model": "myopenai/primary-model",
+          "reasoning": "high"
+        },
+        "explorer": "myopenai/fast-model"
+      },
+      "categories": {
+        "cheap": "myopenai/fast-model"
+      }
+    }
+  }
+}
+```
+
+Every preset body must use the explicit `agents` and/or `categories` objects;
+flat compatibility forms and provider-specific `variant` fields are rejected.
+The expanded form accepts `reasoning` values `off`, `low`, `medium`, `high`,
+`xhigh`, and `max`. A bare `provider/model` string leaves reasoning unchanged.
+
+For delegated work, an explicit task `model`/`effort` wins, followed by the
+configured Agent route, the active preset's Agent or category route, and the
+parent session model. The top-level turn follows the same specificity rule for
+its selected Agent. An unavailable route produces a visible diagnostic before
+falling through; Zuno never ships hidden model-id defaults. The selected preset
+is frozen with the turn plan, so editing configuration cannot mutate an
+in-flight attempt.
+
 ## Context compaction
 
 Zuno can compact older conversation history before the model window is exhausted:
@@ -271,6 +315,22 @@ Use `zuno debug skill` after restarting to inspect the exact catalog and source
 locations visible to a session. A generic prompt such
 as "follow skill guidance" does not select every skill; a skill is loaded only
 when its name is explicit or its description clearly matches the request.
+
+Zuno also compiles seven original first-party Skills into the
+`zuno-orchestration` pack: `customize-zuno`, `deepwork`, `codemap`,
+`verification-planning`, `reflect`, `worktree`, and `git-workflow`. Each has a
+stable `builtin://zuno-orchestration/...` source, content hash, provenance,
+allowed Agent profiles, and required-tool declaration. The active profile and
+its declared tool visibility filter the advertised set; selecting a Skill can
+never widen the runtime capability snapshot.
+
+An unambiguous Skill that does not collide with a real command is directly
+invokable as `/<skill-name>`. Zuno resolves that exact advertised source and
+loads its body before the next provider request. Same-named Skills from multiple
+sources deliberately disable the ambiguous direct slash form; use the Skill
+picker or the typed `skill` tool with an exact source instead. The current
+`worktree` Skill performs preflight guidance only. Worktree creation, leases,
+cleanup, and quota enforcement remain runtime services planned separately.
 
 ## Memory learning
 

@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod ordered;
 pub mod parse;
 pub mod permission;
+pub mod preset;
 pub mod product_agent;
 pub mod provider;
 pub mod reference;
@@ -35,6 +36,7 @@ use crate::schema::lsp::LspConfig;
 use crate::schema::mcp::McpServerConfig;
 use crate::schema::ordered::OrderedMap;
 use crate::schema::permission::{PermissionConfig, PermissionMode};
+use crate::schema::preset::PresetConfig;
 use crate::schema::product_agent::ProductAgentConfig;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
@@ -65,6 +67,8 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "enabled_providers",
     "model",
     "small_model",
+    "preset",
+    "presets",
     "default_agent",
     "subagent_depth",
     "username",
@@ -142,6 +146,12 @@ pub struct Config {
     /// Model for cheap side tasks such as title generation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub small_model: Option<String>,
+    /// Active team model-routing preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Named team model-routing presets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<OrderedMap<PresetConfig>>,
     /// Agent to use when none is named. Must be a primary agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_agent: Option<String>,

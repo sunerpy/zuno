@@ -115,6 +115,21 @@ fn config(configured: Option<&str>, aaa_base_url: &str, zzz_base_url: &str) -> S
     value.to_string()
 }
 
+fn preset_config(aaa_base_url: &str, zzz_base_url: &str) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&config(None, aaa_base_url, zzz_base_url))
+            .expect("base route config is valid JSON");
+    value["preset"] = serde_json::json!("team");
+    value["presets"] = serde_json::json!({
+        "team": {
+            "agents": {
+                "orchestrator": "zzz/zzz-model"
+            }
+        }
+    });
+    value.to_string()
+}
+
 fn variables(env: &ScriptedEnv, config: String) -> BTreeMap<String, String> {
     let mut variables = env.env_vars().into_iter().collect::<BTreeMap<_, _>>();
     variables.extend([
@@ -214,8 +229,25 @@ async fn route_once(
     zzz: &MockProvider,
     wanted: &str,
 ) -> RouteOutcome {
+    route_with_config(
+        surface,
+        config(configured, aaa.base_url(), zzz.base_url()),
+        aaa,
+        zzz,
+        wanted,
+    )
+    .await
+}
+
+async fn route_with_config(
+    surface: Surface,
+    config: String,
+    aaa: &MockProvider,
+    zzz: &MockProvider,
+    wanted: &str,
+) -> RouteOutcome {
     let env = ScriptedEnv::new().expect("isolated environment");
-    let variables = variables(&env, config(configured, aaa.base_url(), zzz.base_url()));
+    let variables = variables(&env, config);
     let aaa_before = aaa.captured().await.len();
     let zzz_before = zzz.captured().await.len();
     let output = match surface {
@@ -242,6 +274,32 @@ async fn route_once(
         zzz_requests: zzz.captured().await.len() - zzz_before,
         output,
     }
+}
+
+async fn assert_active_preset_routes_the_default_agent() {
+    let aaa = route_provider("PRESET-FALLBACK").await;
+    let zzz = route_provider("PRESET-SELECTED").await;
+    let expected = "ROUTE-PRESET-SELECTED-TURN";
+    let outcome = route_with_config(
+        Surface::Cli,
+        preset_config(aaa.base_url(), zzz.base_url()),
+        &aaa,
+        &zzz,
+        expected,
+    )
+    .await;
+
+    assert_eq!(
+        outcome.aaa_requests, 0,
+        "the active Preset was ignored and the catalog fallback provider was dialled"
+    );
+    assert_eq!(
+        outcome.zzz_requests, 2,
+        "the Preset-selected model must receive both title and foreground turn requests"
+    );
+    assert!(outcome.output.contains(expected));
+    aaa.shutdown().await;
+    zzz.shutdown().await;
 }
 
 async fn assert_configured_model(surface: Surface, aaa_label: &str, zzz_label: &str) {
@@ -309,6 +367,11 @@ async fn tui_honors_configured_model_when_zzz_is_alpha() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_keeps_deterministic_catalog_fallback_when_model_is_unset() {
     assert_deterministic_fallback(Surface::Cli).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_routes_the_default_orchestrator_through_the_active_preset() {
+    assert_active_preset_routes_the_default_agent().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

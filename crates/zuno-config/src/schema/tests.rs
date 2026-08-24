@@ -151,6 +151,67 @@ fn round_trip_is_stable_on_a_second_pass() {
 }
 
 #[test]
+fn presets_are_structured_ordered_and_use_canonical_reasoning() {
+    let config = parse(
+        r#"{
+          "preset":"house",
+          "presets":{
+            "house":{
+              "agents":{
+                "orchestrator":{"model":"vendor/frontier","reasoning":"max"},
+                "explorer":"vendor/fast"
+              },
+              "categories":{"cheap":"vendor/fast"}
+            }
+          }
+        }"#,
+    )
+    .expect("typed preset parses");
+
+    assert_eq!(config.preset.as_deref(), Some("house"));
+    let preset = config
+        .presets
+        .as_ref()
+        .and_then(|presets| presets.get("house"))
+        .expect("named preset is retained");
+    assert_eq!(
+        preset.agents.keys().collect::<Vec<_>>(),
+        vec!["orchestrator", "explorer"]
+    );
+    let orchestrator = preset
+        .agents
+        .get("orchestrator")
+        .expect("orchestrator route exists");
+    assert_eq!(orchestrator.model(), "vendor/frontier");
+    assert_eq!(orchestrator.reasoning(), Some(AgentReasoning::Max));
+    assert_eq!(
+        preset
+            .categories
+            .get("cheap")
+            .expect("category exists")
+            .model(),
+        "vendor/fast"
+    );
+}
+
+#[test]
+fn presets_reject_the_unreleased_flat_body_and_unknown_model_options() {
+    let flat = parse(r#"{"presets":{"house":{"orchestrator":"vendor/frontier"}}}"#)
+        .expect_err("a preset body must use explicit agents/categories sections");
+    assert_eq!(issue_path(&flat), "presets.house.orchestrator");
+
+    let unknown = parse(
+        r#"{"presets":{"house":{"agents":{"orchestrator":{"model":"vendor/frontier","variant":"thinking"}}}}}"#,
+    )
+    .expect_err("preset choices accept canonical reasoning, not provider-specific variants");
+    assert_eq!(
+        issue_path(&unknown),
+        "presets.house.agents.orchestrator.variant"
+    );
+    assert!(issue_detail(&unknown).contains("did not match any variant"));
+}
+
+#[test]
 fn memory_false_dominates_every_enabled_default() {
     let config = parse(r#"{"memory":false}"#).expect("master switch parses");
     let memory = config.resolved_memory();

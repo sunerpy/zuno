@@ -24,6 +24,13 @@ use zuno_catalog::skill::{SkillOptions, SkillWarningKind, Skills, builtin, load}
 use zuno_paths::Env;
 use zuno_paths::env::{HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME};
 
+fn expected_names(tail: &[&str]) -> Vec<String> {
+    builtin::names()
+        .map(str::to_owned)
+        .chain(tail.iter().map(|name| (*name).to_owned()))
+        .collect()
+}
+
 /// An address whose TCP connect is guaranteed to fail *fast*, with
 /// `ECONNREFUSED`, so the load reports `IndexUnreachable`.
 ///
@@ -134,10 +141,7 @@ async fn an_index_entry_without_skill_md_is_warned_about_and_never_downloaded() 
     let tree = Tree::new();
     let skills = load(&tree.options(vec![server.uri()])).await;
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), "usable".to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&["usable"]));
     assert_eq!(
         skills.get("usable").expect("present").location,
         tree.cache_root()
@@ -260,10 +264,7 @@ async fn a_404_index_is_warned_about_and_the_load_continues() {
     tree.local_skill("survivor");
     let skills = load(&tree.options(vec![server.uri()])).await;
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), "survivor".to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&["survivor"]));
     assert_eq!(
         skills
             .warnings()
@@ -287,10 +288,7 @@ async fn a_malformed_index_is_warned_about_and_the_load_continues() {
     tree.local_skill("survivor");
     let skills = load(&tree.options(vec![server.uri()])).await;
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), "survivor".to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&["survivor"]));
     assert!(matches!(
         skills.warnings()[0].kind(),
         SkillWarningKind::IndexMalformed(_)
@@ -305,10 +303,7 @@ async fn an_unreachable_host_is_warned_about_and_the_load_continues() {
     tree.local_skill("survivor");
     let skills = load(&tree.options(vec![format!("http://{dead}")])).await;
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), "survivor".to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&["survivor"]));
     assert!(matches!(
         skills.warnings()[0].kind(),
         SkillWarningKind::IndexUnreachable(_)
@@ -353,7 +348,7 @@ async fn a_hanging_index_is_abandoned_at_the_timeout_without_failing_the_load() 
     );
     assert_eq!(
         names(&skills),
-        vec![builtin::NAME.to_string(), "survivor".to_string()],
+        expected_names(&["survivor"]),
         "a hanging index must not cost the local skills"
     );
     assert_eq!(
@@ -450,10 +445,7 @@ async fn file_downloads_are_concurrent_and_bounded() {
     let skills = load(&tree.options(vec![format!("http://{address}")])).await;
     server.abort();
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), "wide".to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&["wide"]));
     assert_eq!(
         served.load(Ordering::SeqCst),
         file_count + 1,
@@ -552,8 +544,5 @@ async fn one_dead_url_does_not_stop_the_next_one() {
     let tree = Tree::new();
     let skills = load(&tree.options(vec![format!("http://{dead}"), good.uri()])).await;
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), "second".to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&["second"]));
 }

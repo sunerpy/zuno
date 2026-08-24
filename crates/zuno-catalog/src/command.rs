@@ -211,8 +211,8 @@ pub struct SkillCommand {
 /// Where a skill was found, which decides whether its template gets a base
 /// directory footer.
 ///
-/// Oracle: `command/index.ts:136` — `item.location === "<built-in>" ? undefined
-/// : path.dirname(item.location)`.
+/// Native embedded Skills carry no filesystem footer; file-backed Skills name the
+/// parent directory that owns their resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillLocation {
     /// A skill compiled into the binary, whose command template is its body with

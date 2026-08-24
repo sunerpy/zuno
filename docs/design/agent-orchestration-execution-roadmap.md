@@ -332,6 +332,13 @@ the same definition while introducing the canonical roster below.
   switching creates a new Attempt, explicit fork, or new session rather than
   mutating an in-flight execution.
 
+Implementation checkpoint (2026-08-24): the canonical configuration schema now
+owns typed `preset`/`presets` data. The production top-level turn and native
+`task` delegation both consume one frozen `PresetLibrary`; Agent routes,
+category shorthands, canonical reasoning levels, diagnostics, and precedence
+therefore use the same policy instead of a second JSON parser or compiled model
+table.
+
 ## 4. Prompt system
 
 The structured design described in
@@ -500,6 +507,14 @@ After the named-capability registry exists, external packages may contribute
 descriptors through a transactional capability generation. Raw provider
 objects, credentials, database handles, or `HarnessRuntime` are never exposed.
 
+Implementation checkpoint (2026-08-24): the first static
+`zuno-orchestration` crate is data-only and contributes the seven Skill
+descriptors below, including stable source ids, hashes, profile/tool gates, and
+license provenance. It deliberately owns no scheduler, provider, permission,
+session, or lifecycle service. Agent Profiles and Workflow Templates remain on
+the native runtime path until the immutable orchestration snapshot and named
+capability generation land.
+
 ## 8. Built-in Skills
 
 The first orchestration pack should adapt, not copy, these workflow ideas:
@@ -511,7 +526,7 @@ The first orchestration pack should adapt, not copy, these workflow ideas:
 | `verification-planning` | define evidence, commands, fixtures, and acceptance surfaces before implementation |
 | `reflect` | use a typed, redacted, bounded session-query API and propose reviewable memory candidates |
 | `customize-zuno` | explain native configuration, providers, auth, permissions, agents, workflows, Skills, MCP, and plugins |
-| `worktree` | request a lifecycle-owned worktree lease with quota, provenance, status, and cleanup |
+| `worktree` | perform read-only preflight now; request a lifecycle-owned lease only after the quota, provenance, status, and cleanup service lands |
 | `git-workflow` | preserve user changes, scope commits, inspect history when needed, and verify the staged diff |
 
 `git-workflow` is the adapted Zuno name for the useful portion of OMO's
@@ -523,6 +538,14 @@ content hash, allowed profiles, required capabilities, and tests.
 
 Skills do not grant tools. Selecting a Skill can only narrow or explain the
 capability snapshot already authorized for the Agent.
+
+The built-ins are registered before disk discovery with distinct
+`builtin://zuno-orchestration/...` identities. They are available through the
+same prompt catalog and typed `skill` tool as external Skills. When a name is
+unique and does not collide with a real command, the TUI also exposes
+`/<skill-name>` and loads that exact source before the next provider request.
+Same-name sources remain independently addressable and never acquire a hidden
+precedence winner.
 
 ## 9. Worktree resource management
 
@@ -656,12 +679,27 @@ Do not combine the existing large dirty working tree into one commit.
 - align prompt manifests with enforced capabilities;
 - persist final provider/tool-schema manifests.
 
-### Commit 5: orchestration pack
+### Commit 5A: preset routes and first-party Skills
 
-- move first-party Agent Profiles and Workflow Templates into the static
-  component;
-- implement Council;
-- add the selected built-in Skills and worktree lease service.
+- define typed, schema-generated Preset configuration with no legacy flat form;
+- route top-level and delegated Agent model selection through one frozen policy;
+- add the static first-party Skill pack and direct unambiguous slash loading.
+
+### Commit 5B: immutable orchestration snapshot and templates
+
+- freeze parent, child, workflow, model, reasoning, Skill, and tool capability
+  identity for one Attempt;
+- move first-party Profile and Workflow Template descriptors behind that
+  snapshot without moving runtime authority into the pack;
+- persist enough identity for restart reconciliation and diagnostics.
+
+### Commit 5C: Council and worktree resources
+
+- implement Council as durable quorum-aware fan-out/fan-in over existing child
+  sessions and workflow jobs;
+- add the lifecycle-owned worktree lease, quota, cleanup, and `Uncertain`
+  contracts;
+- keep synthesis tool-free and preserve stable seat/result order.
 
 ### Commit 6: named capabilities
 
@@ -760,13 +798,16 @@ Run one real TUI scenario using configured `myopenai` models:
 
 ## Next-task entry condition
 
-The next implementation task should begin with Commit 1 only:
+After Commit 5A, the next implementation task is Commit 5B only:
 
-1. preserve and inventory the existing uncommitted implementation;
-2. turn current concurrency, workflow, and lifecycle behavior into contract
+1. preserve the verified Preset and first-party Skill behavior as contract
    tests;
-3. finalize the configuration and core types before changing prompts or the
-   Agent roster;
-4. stop if an existing dirty change conflicts with the required ownership
-   boundary rather than overwriting it;
-5. produce a small verified commit before starting scheduler implementation.
+2. define one immutable orchestration snapshot shared by the parent, native
+   child sessions, workflow nodes, restart reconciliation, and prompt receipts;
+3. include the resolved Agent, model, reasoning, selected preset, selected Skill
+   identities, tool-schema hashes, permission/capability generation, and owner
+   lineage without copying credentials or provider clients;
+4. reject stale or mismatched snapshots visibly and never replay an ambiguous
+   child or workflow operation;
+5. produce a small verified commit before implementing Council or worktree
+   mutation services.

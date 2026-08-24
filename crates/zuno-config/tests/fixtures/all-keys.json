@@ -49,6 +49,21 @@
   "enabled_providers": ["anthropic", "google"],
   "model": "anthropic/claude-sonnet-4-5",
   "small_model": "anthropic/claude-haiku-4-5",
+  "preset": "house",
+  "presets": {
+    "house": {
+      "agents": {
+        "orchestrator": {
+          "model": "anthropic/claude-sonnet-4-5",
+          "reasoning": "max"
+        },
+        "explore": "anthropic/claude-haiku-4-5"
+      },
+      "categories": {
+        "cheap": "anthropic/claude-haiku-4-5"
+      }
+    }
+  },
   "default_agent": "build",
   "subagent_depth": 0,
   "username": "ada",

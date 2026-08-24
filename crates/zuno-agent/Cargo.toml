@@ -30,9 +30,6 @@ zuno-llm = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-tool = { workspace = true }
-# `model_policy` reads preset data — the only place a model id may exist — as
-# configuration rather than shipping it as Rust source, so it needs a deserializer.
-serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

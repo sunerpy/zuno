@@ -16,6 +16,7 @@ zuno-mcp
 zuno-memory
 zuno-network
 zuno-observability
+zuno-orchestration
 zuno-paths
 zuno-permission
 zuno-process

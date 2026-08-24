@@ -85,14 +85,6 @@ fn v2_system(name: &str) -> Option<&'static str> {
 /// has no instructions".
 const V2_BUILD_SYSTEM: &str = "You are an AI coding agent. Help the user accomplish software engineering tasks by inspecting the workspace, making targeted changes, and using tools according to the configured permissions.";
 
-/// The built-in skill's `location` on the V2 surface.
-///
-/// `packages/core/src/plugin/skill.ts:24` hard-codes this path for the embedded
-/// skill, where the v1 module the port mirrors uses the `<built-in>` sentinel
-/// (`zuno_catalog::skill::builtin::LOCATION`). Both are correct for their own
-/// surface; this is the one the HTTP response carries.
-const V2_BUILTIN_SKILL_LOCATION: &str = "/builtin/customize-zuno.md";
-
 /// The V2 native roster in its declaration order.
 ///
 /// `packages/core/src/plugin/agent.ts:124-204` calls `draft.update` in exactly this
@@ -109,9 +101,6 @@ const V2_NATIVE_ORDER: &[&str] = &[
     "title",
     "summary",
 ];
-
-/// The built-in skill's model-facing description.
-const V2_BUILTIN_SKILL_DESCRIPTION: &str = zuno_catalog::skill::builtin::DESCRIPTION;
 
 /// Upstream's `{location, data}` success envelope.
 ///
@@ -713,15 +702,11 @@ pub async fn skills(
         .sorted()
         .into_iter()
         .map(|skill| {
-            let builtin = skill.location == zuno_catalog::skill::builtin::LOCATION;
+            let builtin = zuno_catalog::skill::builtin::is_location(&skill.location);
             SkillInfo {
-                description: if builtin {
-                    Some(V2_BUILTIN_SKILL_DESCRIPTION.to_owned())
-                } else {
-                    skill.description
-                },
+                description: skill.description,
                 location: if builtin {
-                    V2_BUILTIN_SKILL_LOCATION.to_owned()
+                    format!("/builtin/{}.md", skill.name)
                 } else {
                     skill.location
                 },

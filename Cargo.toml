@@ -54,6 +54,7 @@ zuno-mcp = { path = "crates/zuno-mcp" }
 zuno-memory = { path = "crates/zuno-memory" }
 zuno-network = { path = "crates/zuno-network" }
 zuno-observability = { path = "crates/zuno-observability" }
+zuno-orchestration = { path = "crates/zuno-orchestration" }
 zuno-paths = { path = "crates/zuno-paths" }
 zuno-permission = { path = "crates/zuno-permission" }
 zuno-process = { path = "crates/zuno-process" }

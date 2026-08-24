@@ -90,6 +90,13 @@ fn names(skills: &Skills) -> Vec<String> {
     skills.all().iter().map(|s| s.name.clone()).collect()
 }
 
+fn expected_names(tail: &[&str]) -> Vec<String> {
+    builtin::names()
+        .map(str::to_owned)
+        .chain(tail.iter().map(|name| (*name).to_owned()))
+        .collect()
+}
+
 #[tokio::test]
 async fn every_root_contributes_and_the_builtin_comes_first() {
     let tree = Tree::new();
@@ -131,17 +138,16 @@ async fn every_root_contributes_and_the_builtin_comes_first() {
 
     assert_eq!(
         names(&skills),
-        vec![
-            builtin::NAME.to_string(),
-            "from-project-zuno".to_string(),
-            "from-project-agents".to_string(),
-            "from-project-claude".to_string(),
-            "from-config".to_string(),
-            "from-config-plural".to_string(),
-            "from-agents".to_string(),
-            "from-claude".to_string(),
-            "from-path".to_string(),
-        ]
+        expected_names(&[
+            "from-project-zuno",
+            "from-project-agents",
+            "from-project-claude",
+            "from-config",
+            "from-config-plural",
+            "from-agents",
+            "from-claude",
+            "from-path",
+        ])
     );
     assert!(skills.warnings().is_empty(), "{:?}", skills.warnings());
 }
@@ -157,10 +163,7 @@ async fn a_skill_file_with_no_name_is_rejected_and_the_warning_names_the_file() 
 
     let skills = load(&tree.options("proj")).await;
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), "fine".to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&["fine"]));
     let rejections: Vec<&_> = skills
         .warnings()
         .iter()
@@ -235,10 +238,7 @@ async fn path_dedup_and_name_dedup_are_different_mechanisms() {
         ],
     ))
     .await;
-    assert_eq!(
-        names(&reached_twice),
-        vec![builtin::NAME.to_string(), "solo".to_string()]
-    );
+    assert_eq!(names(&reached_twice), expected_names(&["solo"]));
     assert!(
         reached_twice.warnings().is_empty(),
         "the same path through two roots is not a duplicate name: {:?}",
@@ -249,14 +249,7 @@ async fn path_dedup_and_name_dedup_are_different_mechanisms() {
     two_files.skill("home/.agents/skills/one", "solo", Some("first"));
     two_files.skill("home/.agents/skills/two", "solo", Some("second"));
     let clash = load(&two_files.options("proj")).await;
-    assert_eq!(
-        names(&clash),
-        vec![
-            builtin::NAME.to_string(),
-            "solo".to_string(),
-            "solo".to_string()
-        ]
-    );
+    assert_eq!(names(&clash), expected_names(&["solo", "solo"]));
     assert_eq!(clash.named("solo").len(), 2);
     assert!(clash.warnings().is_empty());
 }
@@ -293,10 +286,7 @@ async fn a_disk_skill_does_not_override_the_builtin() {
 
     let skills = load(&tree.options("proj")).await;
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), builtin::NAME.to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&[builtin::NAME]));
     assert!(skills.get(builtin::NAME).is_none());
     assert_eq!(skills.named(builtin::NAME).len(), 2);
     assert!(skills.warnings().is_empty());
@@ -325,10 +315,7 @@ async fn a_broken_frontmatter_block_is_warned_about_and_skipped() {
 
     let skills = load(&tree.options("proj")).await;
 
-    assert_eq!(
-        names(&skills),
-        vec![builtin::NAME.to_string(), "good".to_string()]
-    );
+    assert_eq!(names(&skills), expected_names(&["good"]));
     let warning = skills
         .warnings()
         .iter()

@@ -1657,6 +1657,18 @@
       },
       "type": "object"
     },
+    "OrderedMap_of_PresetConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PresetConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_PresetModelConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PresetModelConfig"
+      },
+      "type": "object"
+    },
     "OrderedMap_of_ProductAgentConfig": {
       "additionalProperties": {
         "$ref": "#/$defs/ProductAgentConfig"
@@ -1800,6 +1812,59 @@
         "action",
         "effect",
         "resource"
+      ],
+      "type": "object"
+    },
+    "PresetConfig": {
+      "additionalProperties": false,
+      "description": "One named team preset.\n\nAgent routes drive direct and delegated agent selection. Categories are optional\nsemantic shorthands for workflow nodes that should not hard-code an agent name.",
+      "properties": {
+        "agents": {
+          "$ref": "#/$defs/OrderedMap_of_PresetModelConfig",
+          "description": "Per-agent model choices."
+        },
+        "categories": {
+          "$ref": "#/$defs/OrderedMap_of_PresetModelConfig",
+          "description": "Semantic category model choices."
+        }
+      },
+      "type": "object"
+    },
+    "PresetModelConfig": {
+      "anyOf": [
+        {
+          "description": "A qualified `provider/model` id with no reasoning override.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/PresetModelOptions",
+          "description": "A qualified model plus its canonical reasoning level."
+        }
+      ],
+      "description": "One model choice inside a preset.\n\nA string is the concise form. The object form adds a provider-neutral reasoning\nlevel without exposing provider-specific option objects in the team preset."
+    },
+    "PresetModelOptions": {
+      "additionalProperties": false,
+      "description": "The expanded form of a preset model choice.",
+      "properties": {
+        "model": {
+          "description": "Model in `provider/model` form.",
+          "type": "string"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentReasoning"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provider-neutral reasoning level for this route."
+        }
+      },
+      "required": [
+        "model"
       ],
       "type": "object"
     },
@@ -2720,6 +2785,24 @@
         }
       ],
       "description": "Global permissions and cross-cutting HITL mode."
+    },
+    "preset": {
+      "description": "Active team model-routing preset.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "presets": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_PresetConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Named team model-routing presets."
     },
     "productAgent": {
       "anyOf": [

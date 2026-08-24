@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument as _;
 use uuid::Uuid;
-use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy};
+use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy, PresetLibrary};
 use zuno_agent::profile::AgentProfile;
 use zuno_agent::reflection::{
     CommandOutcome, ReflectionError, ReflectionFork, ReflectionMemoryEntry, ReflectionMemoryScope,
@@ -299,6 +299,7 @@ pub(crate) struct TurnPlan {
     session: SessionChoice,
     title: Option<String>,
     internals: Internals,
+    presets: PresetLibrary,
     reflection_model: Option<EngineModel>,
     window: TokenWindow,
     notes: Vec<String>,
@@ -491,11 +492,23 @@ impl TurnPlan {
             .find(|entry| entry.name == agent_name)
             .cloned()
             .ok_or_else(|| format!("Agent not found: {agent_name}"))?;
-        let requested_model = options
-            .model
-            .as_deref()
-            .or(agent.model.as_deref())
-            .or(config.model.as_deref());
+        let presets = PresetLibrary::from_config(&config);
+        let mut notes = Vec::new();
+        let mut primary_policy = ModelPolicy::new().with_library(&presets);
+        if let Some(session_model) = &config.model {
+            primary_policy = primary_policy.with_session_model(ModelChoice::new(session_model));
+        }
+        if let Some(choice) = configured_agent_choice(&agent) {
+            primary_policy = primary_policy.with_agent_override(agent_name, choice);
+        }
+        let routed_model = primary_policy.resolve(agent_name, &catalog);
+        extend_unique_notes(&mut notes, routed_model.render_diagnostics());
+        let requested_model = options.model.as_deref().or_else(|| {
+            routed_model
+                .model
+                .as_ref()
+                .map(|choice| choice.model.as_str())
+        });
         let (provider_id, model_id, catalog_model) =
             select_model(&catalog, requested_model, loaded.provenance())?;
         if provider_factory_key(catalog_model.api.transport).is_none() {
@@ -527,6 +540,18 @@ impl TurnPlan {
         let agent =
             super::agent::resolved_profile(agent, &config, &dynamic_rules, vision_available);
         let definition = agent.definition();
+        let routed_variant = options
+            .model
+            .is_none()
+            .then(|| routed_model.model.as_ref()?.variant.as_deref())
+            .flatten();
+        let effort = turn_effort(
+            options.effort,
+            definition,
+            &provider_id,
+            &model_id,
+            routed_variant,
+        );
         let mut prompt_assembly = PromptAssembly::new();
         prompt_assembly
             .push(
@@ -564,7 +589,7 @@ impl TurnPlan {
             requested_model: model_id.clone(),
             wire_model: catalog_model.api.id.clone(),
             reasoning_options: session_reasoning_options(
-                turn_effort(options.effort, definition, &provider_id, &model_id),
+                effort,
                 catalog_model,
                 &definition.options,
             ),
@@ -578,10 +603,10 @@ impl TurnPlan {
             context: token_count(catalog_model.limit.context),
             max_output: token_count(catalog_model.limit.output),
         };
-        let mut notes = Vec::new();
         let internals = resolve_internals(
             ResolveInternalsInput {
                 config: &config,
+                presets: &presets,
                 catalog: &catalog,
                 provider_id: &provider_id,
                 model_id: &model_id,
@@ -602,7 +627,14 @@ impl TurnPlan {
                 &config,
             ))
             .await
-            .with_overlay(extensions.skills().iter().cloned()),
+            .with_overlay(extensions.skills().iter().cloned())
+            .retaining(|skill| {
+                zuno_catalog::skill::builtin::visible_to(
+                    &skill.location,
+                    agent.name(),
+                    definition.tools.as_deref(),
+                )
+            }),
         );
         let mut runtime_surface =
             zuno_extension::runtime_surface(&extensions, &directory).map_err(to_string)?;
@@ -651,6 +683,7 @@ impl TurnPlan {
             session: options.session.clone(),
             title: options.title.clone(),
             internals,
+            presets,
             reflection_model,
             window,
             notes,
@@ -661,7 +694,7 @@ impl TurnPlan {
             delegation_facts,
             vision_available,
             reasoning_supported,
-            effort: options.effort,
+            effort,
             goal_retry_policy,
         })
     }
@@ -808,11 +841,9 @@ fn resolve_goal_retry_policy(
 /// the alternative costs the user's API key. The note is emitted on the turn's event
 /// channel so the downgrade is visible rather than silent.
 ///
-/// The preset rung of the precedence chain is reachable but unfed: nothing in this
-/// workspace discovers a [`zuno_agent::model_policy::PresetLibrary`] yet, so only the
-/// per-agent override and the session model can answer today.
 struct ResolveInternalsInput<'a> {
     config: &'a zuno_config::schema::Config,
+    presets: &'a PresetLibrary,
     catalog: &'a Catalog,
     provider_id: &'a str,
     model_id: &'a str,
@@ -827,6 +858,7 @@ fn resolve_internals(
 ) -> Result<Internals, String> {
     let ResolveInternalsInput {
         config,
+        presets,
         catalog,
         provider_id,
         model_id,
@@ -835,7 +867,9 @@ fn resolve_internals(
         plugin_small_model,
     } = input;
     let session_choice = ModelChoice::new(format!("{provider_id}/{model_id}"));
-    let mut policy = ModelPolicy::new().with_session_model(session_choice);
+    let mut policy = ModelPolicy::new()
+        .with_library(presets)
+        .with_session_model(session_choice);
     if let Some(agents) = &config.agent {
         policy = policy.with_agent_overrides(agents);
     }
@@ -883,7 +917,7 @@ fn resolve_internals(
     for name in zuno_agent::builtin::INTERNAL_NAMES {
         let prompt = internal_prompt(name)?;
         let resolution = policy.resolve(name, &AnyModel);
-        notes.extend(resolution.render_diagnostics());
+        extend_unique_notes(notes, resolution.render_diagnostics());
         let chosen = if resolution.inherits_session_model() {
             inherited_small_model.map(|model| (model.id.clone(), model))
         } else {
@@ -2047,6 +2081,7 @@ impl TurnHost {
                             "{}/{}",
                             plan.provider_id, plan.model_id
                         )),
+                        presets: plan.presets.clone(),
                         limits: zuno_tools::task::DelegationLimits {
                             subagent_depth: plan
                                 .config
@@ -4634,17 +4669,29 @@ fn delegation_agents(
         .iter()
         .filter(|agent| target_names.contains(agent.name.as_str()))
         .filter_map(|agent| {
-            let model = agent.model.as_ref()?;
-            let mut choice = ModelChoice::new(model.clone());
-            choice.variant = agent
-                .reasoning
-                .map(|effort| effort.as_str().to_owned())
-                .or_else(|| agent.variant.clone());
-            Some((agent.name.clone(), choice))
+            configured_agent_choice(agent).map(|choice| (agent.name.clone(), choice))
         })
         .collect();
     let targets = zuno_tools::task::DelegationTargets::new(names).map_err(to_string)?;
     Ok(DelegationAgents { targets, models })
+}
+
+fn configured_agent_choice(agent: &zuno_catalog::agent::Agent) -> Option<ModelChoice> {
+    let model = agent.model.as_ref()?;
+    let mut choice = ModelChoice::new(model.clone());
+    choice.variant = agent
+        .reasoning
+        .map(|effort| effort.as_str().to_owned())
+        .or_else(|| agent.variant.clone());
+    Some(choice)
+}
+
+fn extend_unique_notes(notes: &mut Vec<String>, additions: impl IntoIterator<Item = String>) {
+    for note in additions {
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
 }
 
 /// Catalog facts for every reachable model, for [`zuno_tools::task::ProviderFacts`].
@@ -5326,8 +5373,10 @@ fn turn_effort(
     agent: &zuno_catalog::agent::Agent,
     provider_id: &str,
     model_id: &str,
+    routed_variant: Option<&str>,
 ) -> Option<zuno_llm::effort::ReasoningEffort> {
     session
+        .or_else(|| routed_variant?.parse().ok())
         .or_else(|| {
             let declared = agent.model.as_deref()?;
             let (declared_provider, declared_model) = declared.split_once('/')?;

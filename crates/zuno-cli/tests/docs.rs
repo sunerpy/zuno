@@ -235,7 +235,7 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
         "docs/readme/README.zh-CN.md",
         "docs/reference/configuration.md",
         "docs/reference/providers.md",
-        "crates/zuno-catalog/src/skill/customize-zuno.md",
+        "crates/zuno-orchestration/src/skills/customize-zuno.md",
         "examples/config/zuno.json",
     ] {
         let text = read(relative);
@@ -259,7 +259,7 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
         "README.md",
         "docs/readme/README.zh-CN.md",
         "docs/reference/providers.md",
-        "crates/zuno-catalog/src/skill/customize-zuno.md",
+        "crates/zuno-orchestration/src/skills/customize-zuno.md",
     ] {
         contains_all(
             relative,

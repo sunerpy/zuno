@@ -8,7 +8,7 @@
 //! quietly.
 
 use super::*;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use zuno_llm::effort::ResolutionSource;
 
@@ -530,27 +530,28 @@ fn the_resolved_catalog_answers_availability() {
 }
 
 // ---------------------------------------------------------------------------
-// Preset data is configuration, in both accepted shapes.
+// Preset data enters through the canonical Zuno configuration schema.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_preset_document_reads_the_flat_shape_an_installer_writes() {
-    // The shape `generateLiteConfig` emits (`src/cli/providers.ts:115-137`): a preset
-    // is a map from agent name to `{model, variant}`.
-    let document = PresetDocument::parse_json(&format!(
+fn typed_config_builds_the_selected_preset_library() {
+    let config: zuno_config::schema::Config = serde_json::from_str(&format!(
         r#"{{
           "preset": "installed",
           "presets": {{
             "installed": {{
-              "build": {{ "model": "{LARGE}", "variant": "xhigh" }},
-              "explorer": "{SMALL}"
+              "agents": {{
+                "build": {{ "model": "{LARGE}", "reasoning": "xhigh" }},
+                "explorer": "{SMALL}"
+              }},
+              "categories": {{ "cheap": "{SMALL}" }}
             }}
           }}
         }}"#
     ))
-    .expect("document parses");
+    .expect("typed config parses");
 
-    let library = document.library();
+    let library = PresetLibrary::from_config(&config);
     assert_eq!(library.names(), vec!["installed"]);
     assert_eq!(library.selected(), Some("installed"));
 
@@ -565,65 +566,17 @@ fn a_preset_document_reads_the_flat_shape_an_installer_writes() {
         Some(&ModelChoice::new(SMALL)),
         "a bare string is a model with no variant"
     );
-    assert!(preset.categories().is_empty());
-}
-
-#[test]
-fn a_preset_document_reads_the_structured_shape_that_declares_categories() {
-    let document = PresetDocument::parse_json(&format!(
-        r#"{{
-          "preset": "structured",
-          "presets": {{
-            "structured": {{
-              "{AGENTS_KEY}": {{ "worker": "{SMALL}" }},
-              "{CATEGORIES_KEY}": {{ "cheap": {{ "model": "{SMALL}", "variant": "low" }} }}
-            }}
-          }}
-        }}"#
-    ))
-    .expect("document parses");
-
-    let preset = document
-        .library()
-        .active()
-        .cloned()
-        .expect("the selected preset exists");
-    assert_eq!(preset.agents(), vec!["worker"]);
     assert_eq!(preset.categories(), vec!["cheap"]);
-    assert_eq!(
-        preset.category("cheap"),
-        Some(&ModelChoice::new(SMALL).with_variant("low"))
-    );
+    assert_eq!(preset.category("cheap"), Some(&ModelChoice::new(SMALL)));
 }
 
 #[test]
-fn the_flat_shape_cannot_be_silently_swallowed_by_the_structured_one() {
-    // The reason `PresetBody`'s `Deserialize` is hand-written: an untagged enum would
-    // read `{"worker": …}` as a structured body with two defaulted empty maps and drop
-    // every entry without a word.
-    let document =
-        PresetDocument::parse_json(&format!(r#"{{"presets":{{"p":{{"worker":"{SMALL}"}}}}}}"#))
-            .expect("document parses");
-    let preset = document.library().preset("p").cloned().expect("present");
-    assert_eq!(preset.agents(), vec!["worker"]);
-
-    // And a body that declares a section may declare only sections, so a typo cannot
-    // become an agent named `agent`.
-    let error = PresetDocument::parse_json(&format!(
-        r#"{{"presets":{{"p":{{"{AGENTS_KEY}":{{"worker":"{SMALL}"}},"agent":{{}}}}}}}}"#
+fn an_unselected_typed_preset_leaves_every_agent_on_the_session_model() {
+    let config: zuno_config::schema::Config = serde_json::from_str(&format!(
+        r#"{{"presets":{{"unused":{{"agents":{{"worker":"{LARGE}"}}}}}}}}"#
     ))
-    .expect_err("a mixed body is rejected");
-    let PresetError::Parse { message } = &error;
-    assert!(message.contains("not a preset section"), "{message}");
-}
-
-#[test]
-fn a_document_with_no_preset_selected_leaves_every_agent_on_the_session_model() {
-    let document = PresetDocument::parse_json(&format!(
-        r#"{{"presets":{{"unused":{{"worker":"{LARGE}"}}}}}}"#
-    ))
-    .expect("document parses");
-    let library = document.library();
+    .expect("typed config parses");
+    let library = PresetLibrary::from_config(&config);
     assert_eq!(library.selected(), None);
     assert!(library.active().is_none());
     assert!(
@@ -637,19 +590,6 @@ fn a_document_with_no_preset_selected_leaves_every_agent_on_the_session_model() 
     let resolved = policy.resolve("worker", &everything());
     assert_eq!(resolved.model, Some(session_model()));
     assert!(resolved.diagnostics.is_empty());
-}
-
-#[test]
-fn an_empty_document_and_an_unparseable_one_are_told_apart() {
-    assert_eq!(
-        PresetDocument::parse_json("{}").expect("empty is valid"),
-        PresetDocument::default()
-    );
-    assert!(PresetDocument::default().library().is_empty());
-
-    let error = PresetDocument::parse_json("{\"presets\": 7}").expect_err("not a preset map");
-    let PresetError::Parse { message } = &error;
-    assert!(!message.is_empty(), "the error has to say what was wrong");
 }
 
 // ---------------------------------------------------------------------------

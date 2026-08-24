@@ -31,10 +31,10 @@
 //!    user whose provider is not on a rung's list gets the *next* rung's model with
 //!    no way to say "no, this one".
 //!
-//! So nothing here names a model. Preset *shape* is code; preset *data* is
-//! configuration — see [`PresetDocument`]. A test walks every non-test source file
-//! in this crate and fails on a model-id-shaped token, which is what keeps the rule
-//! true after this module is no longer the newest thing in the crate.
+//! So nothing here names a model. Preset *shape* and data enter through the canonical
+//! [`zuno_config::schema::Config`] type. A test walks every non-test source file in
+//! this crate and fails on a model-id-shaped token, which is what keeps the rule true
+//! after this module is no longer the newest thing in the crate.
 //!
 //! # Categories survive only as a preset shorthand
 //!
@@ -68,27 +68,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::Deserialize;
-use serde_json::Value;
-use zuno_config::schema::JsonMap;
 use zuno_config::schema::agent::AgentConfig;
 use zuno_config::schema::ordered::OrderedMap;
+use zuno_config::schema::preset::PresetModelConfig;
+use zuno_config::schema::{Config, JsonMap};
 use zuno_llm::catalog::Catalog;
 use zuno_llm::effort::{
     DeclaredVariants, EffortCapabilities, EffortResolution, ProviderFamily, ReasoningEffort,
 };
-
-/// The key a [`PresetDocument`] entry uses for its agent map.
-///
-/// Reserved: a preset cannot configure an agent literally named `agents`. The
-/// alternative — a separate nesting level for every preset — would reject the flat
-/// shape slim's installer already writes (`src/cli/providers.ts:115-122`), and
-/// reading a config a neighbouring tool produced is worth one reserved word.
-pub const AGENTS_KEY: &str = "agents";
-
-/// The key a [`PresetDocument`] entry uses for its category map. Reserved, as
-/// [`AGENTS_KEY`] is.
-pub const CATEGORIES_KEY: &str = "categories";
 
 /// A model and, optionally, the variant to run it at.
 ///
@@ -152,34 +139,6 @@ impl fmt::Display for ModelChoice {
             Some(variant) => write!(f, "{} ({variant})", self.model),
             None => f.write_str(&self.model),
         }
-    }
-}
-
-/// Accepts both the object form and a bare `provider/model` string.
-///
-/// The bare form exists because a preset that spends no effort budget has nothing
-/// to say beyond the model, and `{"model": "…"}` for that case is noise a
-/// hand-edited config should not have to carry.
-impl<'de> Deserialize<'de> for ModelChoice {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Wire {
-            Qualified(String),
-            Pair {
-                model: String,
-                #[serde(default)]
-                variant: Option<String>,
-            },
-        }
-
-        Ok(match Wire::deserialize(deserializer)? {
-            Wire::Qualified(model) => Self {
-                model,
-                variant: None,
-            },
-            Wire::Pair { model, variant } => Self { model, variant },
-        })
     }
 }
 
@@ -330,166 +289,34 @@ impl PresetLibrary {
     pub fn is_empty(&self) -> bool {
         self.presets.is_empty()
     }
-}
 
-/// The preset data this crate reads, and the only place model ids exist.
-///
-/// # Why the data is not in this crate
-///
-/// A shipped preset would have to name models, and a model id in `zuno-agent` is the
-/// thing this module exists to prevent — the acceptance test walks the crate's
-/// sources and fails on one. That is not a loophole being dodged: a preset shipped
-/// in the binary *is* `CATEGORY_MODEL_REQUIREMENTS` with better manners, and it goes
-/// stale in exactly the same way. Slim's five presets look like a counter-example
-/// until you follow them: `MODEL_MAPPINGS` is consumed by `generateLiteConfig`
-/// (`src/cli/providers.ts:79-137`), which *writes them into the user's config file*
-/// at install time. The runtime then reads `config.presets`
-/// (`src/index.ts:209-215`) and never the constant. The installer's table is a
-/// scaffold, not a policy.
-///
-/// So the shape below is the contract, and the data is a file: whatever an installer
-/// writes, a user hand-edits, or a future config key carries. `zuno-agent` ships zero
-/// model ids and no preset asset.
-///
-/// # The shape
-///
-/// ```json
-/// {
-///   "preset": "house",
-///   "presets": {
-///     "house": {
-///       "build": { "model": "example-provider/example-large", "variant": "high" },
-///       "explorer": "example-provider/example-small"
-///     },
-///     "structured": {
-///       "agents":     { "worker": "example-provider/example-small" },
-///       "categories": { "cheap":  "example-provider/example-small" }
-///     }
-///   }
-/// }
-/// ```
-///
-/// Both preset bodies are accepted. The flat one is slim's, and is what an installer
-/// emits; the structured one is the only way to declare categories. A body is read as
-/// structured exactly when it has an [`AGENTS_KEY`] or [`CATEGORIES_KEY`] key.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-pub struct PresetDocument {
-    /// The selected preset's name.
-    #[serde(default)]
-    pub preset: Option<String>,
-    /// Presets by name.
-    #[serde(default)]
-    pub presets: BTreeMap<String, PresetBody>,
-}
-
-impl PresetDocument {
-    /// Parse a document from JSON.
-    ///
-    /// # Errors
-    ///
-    /// [`PresetError::Parse`] when the bytes are not the shape documented above.
-    pub fn parse_json(json: &str) -> Result<Self, PresetError> {
-        serde_json::from_str(json).map_err(|error| PresetError::Parse {
-            message: error.to_string(),
-        })
-    }
-
-    /// The library this document describes.
+    /// Build the runtime library from the one canonical configuration schema.
     #[must_use]
-    pub fn library(&self) -> PresetLibrary {
+    pub fn from_config(config: &Config) -> Self {
         let mut library = PresetLibrary::new();
-        for (name, body) in &self.presets {
-            library = library.with_preset(body.preset(name));
+        for (name, configured) in config.presets.iter().flat_map(|presets| presets.iter()) {
+            let mut preset = ModelPreset::named(name);
+            for (agent, choice) in &configured.agents {
+                preset = preset.with_agent(agent, configured_choice(choice));
+            }
+            for (category, choice) in &configured.categories {
+                preset = preset.with_category(category, configured_choice(choice));
+            }
+            library = library.with_preset(preset);
         }
-        match &self.preset {
+        match &config.preset {
             Some(selected) => library.select(selected),
             None => library,
         }
     }
 }
 
-/// One preset's body, in either accepted shape.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PresetBody {
-    agents: BTreeMap<String, ModelChoice>,
-    categories: BTreeMap<String, ModelChoice>,
-}
-
-impl PresetBody {
-    /// This body as a named preset.
-    #[must_use]
-    pub fn preset(&self, name: impl Into<String>) -> ModelPreset {
-        ModelPreset {
-            name: name.into(),
-            agents: self.agents.clone(),
-            categories: self.categories.clone(),
-        }
+fn configured_choice(config: &PresetModelConfig) -> ModelChoice {
+    let mut choice = ModelChoice::new(config.model());
+    if let Some(reasoning) = config.reasoning() {
+        choice = choice.with_variant(reasoning.as_str());
     }
-}
-
-/// Hand-written rather than `#[serde(untagged)]`.
-///
-/// An untagged enum would have to distinguish the two shapes by trial
-/// deserialization, and the flat shape is a superset of the structured one's field
-/// set — `{"worker": …}` deserializes happily as a structured body with two
-/// defaulted empty maps, silently discarding every entry. Deciding on the presence
-/// of a reserved key is the same rule the documentation states, and it cannot
-/// silently drop data.
-impl<'de> Deserialize<'de> for PresetBody {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = BTreeMap::<String, Value>::deserialize(deserializer)?;
-        let structured = raw.contains_key(AGENTS_KEY) || raw.contains_key(CATEGORIES_KEY);
-        if !structured {
-            return Ok(Self {
-                agents: choices(raw)?,
-                categories: BTreeMap::new(),
-            });
-        }
-
-        let mut body = Self::default();
-        for (key, value) in raw {
-            let map = serde_json::from_value::<BTreeMap<String, Value>>(value)
-                .map_err(serde::de::Error::custom)?;
-            match key.as_str() {
-                AGENTS_KEY => body.agents = choices(map)?,
-                CATEGORIES_KEY => body.categories = choices(map)?,
-                other => {
-                    return Err(serde::de::Error::custom(format!(
-                        "`{other}` is not a preset section; a preset declaring \
-                         `{AGENTS_KEY}` or `{CATEGORIES_KEY}` may declare only those"
-                    )));
-                }
-            }
-        }
-        Ok(body)
-    }
-}
-
-fn choices<E: serde::de::Error>(
-    raw: BTreeMap<String, Value>,
-) -> Result<BTreeMap<String, ModelChoice>, E> {
-    raw.into_iter()
-        .map(|(key, value)| {
-            serde_json::from_value::<ModelChoice>(value)
-                .map(|choice| (key, choice))
-                .map_err(serde::de::Error::custom)
-        })
-        .collect()
-}
-
-/// Preset data could not be read.
-///
-/// Deliberately the only error type in this module: reading a file can fail, but
-/// *resolving* cannot. Every resolution path ends at the session model, so an
-/// unusable preset degrades the answer instead of refusing to give one.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PresetError {
-    /// The bytes are not a [`PresetDocument`].
-    #[error("preset data is not valid: {message}")]
-    Parse {
-        /// What the deserializer objected to.
-        message: String,
-    },
+    choice
 }
 
 /// Which rung of the ladder produced a model.

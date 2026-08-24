@@ -1,6 +1,25 @@
 {
   "model": "myopenai/primary-model",
   "small_model": "myopenai/fast-model",
+  "preset": "house",
+  "presets": {
+    "house": {
+      "agents": {
+        "orchestrator": {
+          "model": "myopenai/primary-model",
+          "reasoning": "max"
+        },
+        "deep": {
+          "model": "myopenai/primary-model",
+          "reasoning": "high"
+        },
+        "explorer": "myopenai/fast-model"
+      },
+      "categories": {
+        "cheap": "myopenai/fast-model"
+      }
+    }
+  },
   "permission": {
     "mode": "standard",
     "rules": {}

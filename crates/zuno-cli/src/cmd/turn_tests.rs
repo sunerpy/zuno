@@ -113,6 +113,7 @@ fn test_delegation() -> tool_runtime::Delegation {
             .expect("native delegation targets are valid"),
         agent_models: Vec::new(),
         session_model: zuno_agent::model_policy::ModelChoice::new("provider/model"),
+        presets: zuno_agent::model_policy::PresetLibrary::new(),
         limits: zuno_tools::task::DelegationLimits::default(),
         vision_available: false,
     }
@@ -234,6 +235,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         session,
         title: None,
         internals: stub_internals(),
+        presets: PresetLibrary::new(),
         reflection_model: None,
         window: TokenWindow {
             context: 0,
@@ -1986,6 +1988,7 @@ fn all_three_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
     let internals = resolve_internals(
         ResolveInternalsInput {
             config: &config,
+            presets: &PresetLibrary::new(),
             catalog: &catalog,
             provider_id: "test",
             model_id: "big",
@@ -2031,6 +2034,7 @@ fn the_resolved_set_is_exactly_what_the_roster_calls_internal() {
     let internals = resolve_internals(
         ResolveInternalsInput {
             config: &config,
+            presets: &PresetLibrary::new(),
             catalog: &catalog,
             provider_id: "test",
             model_id: "big",
@@ -2072,6 +2076,7 @@ fn an_internal_pointed_at_another_provider_falls_back_and_says_why() {
     let internals = resolve_internals(
         ResolveInternalsInput {
             config: &config,
+            presets: &PresetLibrary::new(),
             catalog: &catalog,
             provider_id: "test",
             model_id: "big",
@@ -2722,6 +2727,7 @@ fn an_internal_whose_model_has_no_endpoint_falls_back_and_says_why() {
     let internals = resolve_internals(
         ResolveInternalsInput {
             config: &config,
+            presets: &PresetLibrary::new(),
             catalog: &catalog,
             provider_id: "test",
             model_id: "big",
@@ -4728,6 +4734,12 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
         turn.contains("delegation: super::tool_runtime::Delegation {"),
         "`turn.rs` no longer supplies a delegation host; `task` cannot be registered"
     );
+    assert!(
+        turn.contains("presets: plan.presets.clone()")
+            && read("tool_runtime.rs").contains(".with_presets(presets)"),
+        "the active team Preset no longer reaches the production `task` tool, so child \
+         delegation would silently fall back to the parent session model"
+    );
 
     for surface in ["run.rs", "serve.rs"] {
         let source = read(surface);
@@ -5016,7 +5028,7 @@ fn generation_body(
         parameters: serde_json::json!({"type": "object", "properties": {}}),
     }]);
     request.parameters = session_reasoning_options(
-        turn_effort(None, agent, "stub", model_id),
+        turn_effort(None, agent, "stub", model_id, None),
         model,
         &agent.options,
     );
@@ -5352,7 +5364,8 @@ fn a_session_chosen_effort_outranks_the_agents_variant() {
             Some(zuno_llm::effort::ReasoningEffort::Low),
             &reasoner,
             "stub",
-            "reasoner"
+            "reasoner",
+            None,
         ),
         Some(zuno_llm::effort::ReasoningEffort::Low),
         "the effort picker is a live user action and the agent's variant a configured \
@@ -5380,7 +5393,8 @@ fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
     );
     assert!(
         turn.contains("let definition = agent.definition();")
-            && turn.contains("turn_effort(options.effort, definition,"),
+            && turn.contains("let effort = turn_effort(")
+            && turn.contains("routed_variant,"),
         "`TurnPlan::resolve` no longer carries the resolved profile's agent definition \
          into `turn_effort`, so an agent configured with a `variant` can run at the \
          provider's default"

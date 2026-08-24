@@ -134,6 +134,7 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | Tool replay after failure | adapt | `Never` by default; explicit `Safe` only for read-only/idempotent tools |
 | Codex and Claude Code product subagents | adapt | Native app-server/stream-json providers, static configured tools, durable jobs, explicit cancellation, and uncertain non-replay |
 | Bounded specialist roster | adopt | `orchestrator`, `build`, `plan`, `deep`, `fixer`, `general`, `explorer`, `librarian`, `oracle`, `looker` |
+| Team model presets and orchestration Skills | adapt | Schema-generated Agent/category routes frozen per turn, plus an original static `zuno-orchestration` Skill pack; native permission, scheduling, persistence, and lifecycle remain the only runtime authorities |
 | Provider-specific batch search | reject | concurrency belongs in the shared consumer above single-query providers |
 | UI-owned agent behavior | reject | clients render events and submit commands; they do not run a private loop |
 | Cross-project compatibility | reject | Zuno-native config, data, commands, tools, events, and extension interfaces |

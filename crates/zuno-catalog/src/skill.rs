@@ -78,7 +78,7 @@ pub struct Skill {
     /// the imported behavior (`:322`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Where it came from: an absolute path, or the literal `<built-in>`.
+    /// Where it came from: an absolute path or a stable `builtin://` source.
     pub location: String,
     /// How its `SKILL.md` body is materialized.
     #[serde(skip)]
@@ -464,6 +464,23 @@ impl Skills {
         self
     }
 
+    /// Keep only entries accepted by `predicate`, preserving roots and warnings.
+    ///
+    /// Rebuilds both indexes from the retained source identities so ambiguity and
+    /// exact-source lookup cannot retain stale positions.
+    #[must_use]
+    pub fn retaining(mut self, mut predicate: impl FnMut(&Skill) -> bool) -> Self {
+        let ordered = std::mem::take(&mut self.ordered);
+        self.by_name.clear();
+        self.by_source.clear();
+        for skill in ordered {
+            if predicate(&skill) {
+                self.insert(skill);
+            }
+        }
+        self
+    }
+
     /// Register one source identity.
     fn insert(&mut self, skill: Skill) {
         if let Some(at) = self.by_source.get(&skill.location).copied() {
@@ -495,8 +512,8 @@ fn warn(sink: &mut Vec<SkillWarning>, warning: SkillWarning) {
 
 /// Discover and load every skill.
 ///
-/// The built-in `customize-zuno` is registered before disk discovery. A user's
-/// same-named skill remains a distinct source.
+/// First-party Skills are registered before disk discovery. A user's same-named
+/// Skill remains a distinct source.
 ///
 /// Never fails: an unreadable file, an invalid frontmatter block, or an
 /// unreachable `skills.urls[]` entry becomes a [`SkillWarning`].
@@ -528,7 +545,9 @@ pub async fn load(options: &SkillOptions) -> Skills {
         warnings: sources.take_warnings(),
         ..Skills::default()
     };
-    skills.insert(builtin::skill());
+    for skill in builtin::skills() {
+        skills.insert(skill);
+    }
 
     let paths: Vec<PathBuf> = sources
         .matches()
@@ -791,28 +810,26 @@ mod tests {
     }
 
     #[test]
-    fn the_builtin_uses_zuno_identity_and_native_configuration() {
-        let mut skills = Skills::default();
-        skills.insert(builtin::skill());
-        let built_in = skills.get(builtin::NAME).expect("present");
-        assert_eq!(built_in.location, "<built-in>");
-        assert_eq!(built_in.description.as_deref(), Some(builtin::DESCRIPTION));
-        assert!(builtin::DESCRIPTION.contains("Zuno's own configuration"));
-        assert!(builtin::DESCRIPTION.contains("files under .zuno/"));
-        assert!(!builtin::DESCRIPTION.contains("opencode's own configuration"));
-        assert!(builtin::CONTENT.contains("# Customizing Zuno"));
-        assert!(builtin::CONTENT.contains(".zuno/agent/"));
-        assert!(builtin::CONTENT.contains(&format!("{}.json", zuno_paths::CONFIG_FILE_STEM)));
-        assert!(!builtin::CONTENT.contains("opencode.ai/config.json"));
-        assert!(!builtin::CONTENT.contains("\"plugin\""));
-        assert!(!builtin::CONTENT.contains("opencode.json"));
-        assert!(!builtin::CONTENT.contains("opencode.jsonc"));
+    fn the_first_party_pack_uses_unique_stable_sources_and_original_bodies() {
+        let skills = Skills::from_loaded(builtin::skills());
+        assert_eq!(skills.all().len(), zuno_orchestration::SKILLS.len());
+        for descriptor in zuno_orchestration::SKILLS {
+            let built_in = skills.get(descriptor.name).expect("present");
+            assert_eq!(built_in.location, descriptor.location);
+            assert_eq!(
+                built_in.description.as_deref(),
+                Some(descriptor.description)
+            );
+            assert_eq!(
+                futures::executor::block_on(built_in.read_body()).expect("embedded body"),
+                descriptor.content
+            );
+        }
     }
 
     #[test]
     fn a_user_skill_does_not_silently_override_the_builtin() {
-        let mut skills = Skills::default();
-        skills.insert(builtin::skill());
+        let mut skills = Skills::from_loaded(builtin::skills());
         skills.insert(Skill::embedded(
             builtin::NAME,
             Some("mine".to_string()),
@@ -822,6 +839,30 @@ mod tests {
         assert!(skills.get(builtin::NAME).is_none());
         assert_eq!(skills.named(builtin::NAME).len(), 2);
         assert!(skills.warnings().is_empty());
+    }
+
+    #[test]
+    fn retaining_first_party_skills_rebuilds_exact_source_and_name_indexes() {
+        let skills = Skills::from_loaded(builtin::skills())
+            .retaining(|skill| builtin::visible_to(&skill.location, "plan", None));
+        assert_eq!(
+            skills
+                .all()
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "customize-zuno",
+                "deepwork",
+                "codemap",
+                "verification-planning"
+            ]
+        );
+        for skill in skills.all() {
+            assert_eq!(skills.get(&skill.name), Some(skill));
+            assert_eq!(skills.by_source(&skill.location), Some(skill));
+        }
+        assert!(skills.get("worktree").is_none());
     }
 
     #[test]

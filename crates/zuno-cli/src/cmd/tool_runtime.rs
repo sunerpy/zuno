@@ -110,6 +110,8 @@ pub(crate) struct Delegation {
     pub(crate) agent_models: Vec<(String, zuno_agent::model_policy::ModelChoice)>,
     /// The parent session's model, the precedence ladder's floor.
     pub(crate) session_model: zuno_agent::model_policy::ModelChoice,
+    /// Team-wide preset routes frozen when the parent turn was resolved.
+    pub(crate) presets: zuno_agent::model_policy::PresetLibrary,
     /// The hop budget from `subagent_depth`.
     pub(crate) limits: zuno_tools::task::DelegationLimits,
     /// Whether the catalog holds a vision-capable model, which gates one target.
@@ -175,6 +177,7 @@ pub(crate) fn assemble(
         mut targets,
         agent_models,
         session_model,
+        presets,
         limits,
         vision_available,
     } = selection.delegation;
@@ -212,6 +215,7 @@ pub(crate) fn assemble(
     let mut task = zuno_tools::task::TaskTool::new(host, facts)
         .with_targets(targets)
         .with_session_model(session_model)
+        .with_presets(presets)
         .with_limits(limits)
         .with_vision_available(vision_available);
     for (agent, model) in agent_models {
