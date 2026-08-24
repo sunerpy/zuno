@@ -96,7 +96,24 @@ fn traced_resolver(prompt: &str) -> Resolver {
         wire_model: "model".to_owned(),
         spec: Spec::new(COMPATIBLE_PROVIDER),
         reasoning_options: serde_json::Map::new(),
+        orchestration_seed: None,
     }
+}
+
+fn test_capability() -> Arc<CapabilitySnapshot> {
+    Arc::new(CapabilitySnapshot::new(
+        PackIdentity {
+            id: zuno_orchestration::PACK_ID.to_owned(),
+            version: zuno_orchestration::PACK_VERSION.to_owned(),
+            upstream_revision: zuno_orchestration::UPSTREAM_REVISION.to_owned(),
+        },
+        0,
+        sha256_text("test permission policy"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ))
 }
 
 /// The delegation collaborators a test supplies to reach [`tool_runtime::assemble`].
@@ -208,10 +225,12 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             wire_model: "model".to_owned(),
             spec: Spec::new(COMPATIBLE_PROVIDER).with_surface(ApiSurface::Chat),
             reasoning_options: serde_json::Map::new(),
+            orchestration_seed: None,
         },
         catalog_models: Vec::new(),
         reasoning_efforts: std::collections::BTreeMap::new(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
+        capability: test_capability(),
         agents: vec![agent.clone()],
         extensions: zuno_extension::ResolvedExtensions::default(),
         extension_scope,
@@ -243,6 +262,93 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         },
         notes: Vec::new(),
     }
+}
+
+fn orchestration_seed(capability: &CapabilitySnapshot) -> Arc<AttemptSeed> {
+    Arc::new(AttemptSeed {
+        capability: capability.clone(),
+        agent: AgentAttemptIdentity {
+            name: "build".to_owned(),
+            source_id: "test://agent/build".to_owned(),
+            definition_sha256: sha256_text("build definition"),
+            permission_sha256: sha256_text("build permission"),
+            prompt_policy_sha256: sha256_text("build prompt policy"),
+        },
+        preset: None,
+        parent_attempt: None,
+        workflow: None,
+        workflow_node: None,
+    })
+}
+
+fn parent_attempt(capability: CapabilitySnapshot) -> AttemptSnapshot {
+    AttemptSnapshot {
+        schema_version: zuno_orchestration::SNAPSHOT_SCHEMA_VERSION,
+        turn_id: "turn-parent".to_owned(),
+        step: 1,
+        capability,
+        owner: zuno_orchestration::OwnerLineage {
+            session_id: "ses-parent".to_owned(),
+            parent_session_id: None,
+            parent_attempt: None,
+            workflow: None,
+            workflow_node: None,
+        },
+        agent: orchestration_seed(test_capability().as_ref()).agent.clone(),
+        model: zuno_orchestration::ModelAttemptIdentity {
+            provider_id: "provider".to_owned(),
+            model_id: "model".to_owned(),
+            wire_model_id: "model".to_owned(),
+            surface: "responses".to_owned(),
+            reasoning_sha256: sha256_text("max"),
+            preset: None,
+        },
+        selected_skills: Vec::new(),
+        prompt: zuno_orchestration::PromptReceiptIdentity {
+            event_id: Some("evt-parent".to_owned()),
+            assembly_sha256: sha256_text("assembly"),
+            actual_sha256: sha256_text("actual"),
+        },
+        tools: Vec::new(),
+    }
+}
+
+#[test]
+fn delegated_turn_inherits_the_parent_attempt_and_workflow_lineage() {
+    let mut delegated = plan("/workspace", SessionChoice::New);
+    delegated.resolver.orchestration_seed = Some(orchestration_seed(delegated.capability.as_ref()));
+    let parent = parent_attempt(delegated.capability.as_ref().clone());
+    let parent_identity = parent.identity().expect("parent attempt identity");
+
+    delegated
+        .inherit_orchestration(&parent, Some("release"), Some("implement"))
+        .expect("matching capability generation is inherited");
+
+    let inherited = delegated
+        .resolver
+        .orchestration_seed
+        .as_deref()
+        .expect("delegated orchestration seed");
+    assert_eq!(inherited.capability, parent.capability);
+    assert_eq!(inherited.parent_attempt.as_ref(), Some(&parent_identity));
+    assert_eq!(inherited.workflow.as_deref(), Some("release"));
+    assert_eq!(inherited.workflow_node.as_deref(), Some("implement"));
+}
+
+#[test]
+fn delegated_turn_rejects_a_drifted_capability_generation() {
+    let mut delegated = plan("/workspace", SessionChoice::New);
+    delegated.resolver.orchestration_seed = Some(orchestration_seed(delegated.capability.as_ref()));
+    let mut drifted = delegated.capability.as_ref().clone();
+    drifted.extension_revision = drifted.extension_revision.saturating_add(1);
+    let parent = parent_attempt(drifted);
+
+    let error = delegated
+        .inherit_orchestration(&parent, None, None)
+        .expect_err("drifted capability generation must not execute");
+
+    assert!(error.contains("stale or mismatched"), "{error}");
+    assert!(error.contains("refresh the parent turn"), "{error}");
 }
 
 #[tokio::test]
@@ -2785,6 +2891,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
             workflows: test_workflows(),
@@ -2848,6 +2955,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             ),
             mcp_loader: None,
             skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
             delegation: test_delegation(),
             product_agents: test_product_agents(),
             workflows: test_workflows(),
@@ -3513,6 +3621,7 @@ async fn run_compatible_turn(
         wire_model: "model".to_owned(),
         reasoning_options: serde_json::Map::new(),
         spec,
+        orchestration_seed: None,
     };
     let mut connection =
         zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open turn fixture database");
@@ -3783,6 +3892,7 @@ mod production_registry {
                 ),
                 mcp_loader: None,
                 skills: Arc::new(skills),
+                capability: test_capability(),
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
                 workflows: test_workflows(),
@@ -4049,6 +4159,7 @@ mod production_registry {
                 ),
                 mcp_loader: None,
                 skills: Arc::new(skills),
+                capability: test_capability(),
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
                 workflows: test_workflows(),

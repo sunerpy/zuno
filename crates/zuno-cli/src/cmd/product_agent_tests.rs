@@ -85,6 +85,7 @@ impl Fixture {
     fn request(&self, background: bool, report_delivery: ReportDelivery) -> ProductAgentRequest {
         ProductAgentRequest {
             parent_session_id: "ses_parent".to_owned(),
+            parent_attempt: None,
             instance: "reviewer".to_owned(),
             product: "codex".to_owned(),
             tool: "subagent_codex".to_owned(),

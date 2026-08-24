@@ -6,6 +6,7 @@ use zuno_db::job::{
     AgentJobStore, JobSettlement, JobStatus, JobSubject, NewAgentJob, ReportDelivery,
 };
 use zuno_db::{Pool, migration, session};
+use zuno_orchestration::AttemptSnapshot;
 use zuno_paths::DbLocation;
 
 const PARENT: &str = "ses_parent";
@@ -78,13 +79,49 @@ fn report(id: &str) -> NewSessionInput {
     )
 }
 
+fn orchestration_snapshot() -> AttemptSnapshot {
+    serde_json::from_value(json!({
+        "schemaVersion": 1,
+        "turnId": "turn-parent",
+        "step": 1,
+        "capability": {
+            "schemaVersion": 1,
+            "pack": {"id":"test","version":"1","upstreamRevision":"test"},
+            "extensionRevision": 0,
+            "permissionPolicySha256": "policy",
+            "profiles": [], "presets": [], "workflows": [], "skills": []
+        },
+        "owner": {
+            "sessionId":PARENT, "parentSessionId":null, "parentAttempt":null,
+            "workflow":null, "workflowNode":null
+        },
+        "agent": {
+            "name":"build", "sourceId":"test://build",
+            "definitionSha256":"definition", "permissionSha256":"permission",
+            "promptPolicySha256":"prompt"
+        },
+        "model": {
+            "providerId":"fake", "modelId":"fake-model", "wireModelId":"fake-model",
+            "surface":"responses", "reasoningSha256":"reasoning", "preset":null
+        },
+        "selectedSkills": [],
+        "prompt": {"eventId":"evt-parent","assemblySha256":"assembly","actualSha256":"actual"},
+        "tools": []
+    }))
+    .expect("test orchestration snapshot")
+}
+
 #[test]
 fn creating_a_job_persists_running_state_and_parent_event() {
     let pool = initialized(&DbLocation::Memory);
     let store = AgentJobStore::new(Arc::clone(&pool));
+    let snapshot = orchestration_snapshot();
 
     let created = store
-        .create(running("job_1", ReportDelivery::NextStep))
+        .create(
+            running("job_1", ReportDelivery::NextStep)
+                .with_orchestration_snapshot(Some(snapshot.clone())),
+        )
         .expect("create job");
 
     assert_eq!(created.status, JobStatus::Running);
@@ -96,6 +133,16 @@ fn creating_a_job_persists_running_state_and_parent_event() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, "agent.job.created");
     assert_eq!(events[0].properties["jobID"], "job_1");
+    assert_eq!(created.orchestration_snapshot.as_ref(), Some(&snapshot));
+    assert_eq!(
+        events[0].properties["orchestrationSnapshot"],
+        snapshot.canonical_value().expect("canonical snapshot")
+    );
+    assert_eq!(
+        events[0].properties["orchestrationSnapshotID"],
+        serde_json::to_value(snapshot.identity().expect("snapshot identity"))
+            .expect("snapshot identity JSON")
+    );
     assert_eq!(
         events[0].properties["subject"],
         json!({"kind":"childSession","sessionID":CHILD})
@@ -106,14 +153,18 @@ fn creating_a_job_persists_running_state_and_parent_event() {
 fn product_agent_jobs_have_no_fake_child_session_and_can_be_uncertain() {
     let pool = initialized(&DbLocation::Memory);
     let store = AgentJobStore::new(Arc::clone(&pool));
+    let snapshot = orchestration_snapshot();
     let created = store
-        .create(NewAgentJob::new(
-            "job_product",
-            PARENT,
-            JobSubject::product_agent("run_product", "codex", "codex-work", "subagent_codex"),
-            ReportDelivery::Quiet,
-            10,
-        ))
+        .create(
+            NewAgentJob::new(
+                "job_product",
+                PARENT,
+                JobSubject::product_agent("run_product", "codex", "codex-work", "subagent_codex"),
+                ReportDelivery::Quiet,
+                10,
+            )
+            .with_orchestration_snapshot(Some(snapshot.clone())),
+        )
         .expect("create product job");
 
     assert!(matches!(
@@ -127,6 +178,7 @@ fn product_agent_jobs_have_no_fake_child_session_and_can_be_uncertain() {
         )
         .expect("mark uncertain");
     assert_eq!(settled.job.status, JobStatus::Uncertain);
+    assert_eq!(settled.job.orchestration_snapshot.as_ref(), Some(&snapshot));
     assert_eq!(
         store
             .running_product_agents_for(PARENT)
@@ -322,11 +374,15 @@ fn a_second_settlement_cannot_duplicate_the_parent_report() {
 fn pending_reports_survive_pool_reconstruction_until_promoted() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let location = DbLocation::File(directory.path().join("zuno.db"));
+    let snapshot = orchestration_snapshot();
     {
         let pool = initialized(&location);
         let store = AgentJobStore::new(pool);
         store
-            .create(running("job_1", ReportDelivery::NextStep))
+            .create(
+                running("job_1", ReportDelivery::NextStep)
+                    .with_orchestration_snapshot(Some(snapshot.clone())),
+            )
             .expect("create job");
         store
             .settle(
@@ -338,6 +394,14 @@ fn pending_reports_survive_pool_reconstruction_until_promoted() {
 
     let pool = initialized(&location);
     let store = AgentJobStore::new(Arc::clone(&pool));
+    assert_eq!(
+        store
+            .get("job_1")
+            .expect("reopened job")
+            .orchestration_snapshot
+            .as_ref(),
+        Some(&snapshot)
+    );
     assert_eq!(
         store
             .pending_reports()

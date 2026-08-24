@@ -73,6 +73,7 @@ impl Fixture {
     fn request(&self, background: bool, nodes: Vec<WorkflowNodeRequest>) -> WorkflowRequest {
         WorkflowRequest {
             parent_session_id: "ses_parent".to_owned(),
+            parent_attempt: None,
             workflow: "release".to_owned(),
             description: Some("release fixture".to_owned()),
             nodes,
@@ -160,6 +161,9 @@ fn node(id: &str, depends_on: &[&str], prompt: &str) -> WorkflowNodeRequest {
         depends_on: depends_on.iter().map(|value| (*value).to_owned()).collect(),
         turn: ChildTurnRequest {
             parent_session_id: "ses_parent".to_owned(),
+            parent_attempt: None,
+            workflow: None,
+            workflow_node: None,
             resume_session_id: None,
             agent: format!("agent-{id}"),
             description: Some(id.to_owned()),

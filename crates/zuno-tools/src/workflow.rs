@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zuno_config::schema::workflow::AgentWorkflowConfig;
 use zuno_error::ToolError;
+use zuno_orchestration::{AttemptSnapshot, WorkflowTemplateDescriptor};
 use zuno_tool::{
     PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, ToolUiIntent,
     TypedTool,
@@ -60,6 +60,8 @@ pub struct WorkflowNodeRequest {
 pub struct WorkflowRequest {
     /// Parent session that owns the workflow and its durable job.
     pub parent_session_id: String,
+    /// Immutable parent Attempt which admitted this workflow.
+    pub parent_attempt: Option<Arc<AttemptSnapshot>>,
     /// Immutable configured template name.
     pub workflow: String,
     /// Optional human-readable label.
@@ -98,7 +100,7 @@ pub trait WorkflowHost: Send + Sync + 'static {
 
 /// A model-facing tool that can only instantiate known workflow templates.
 pub struct WorkflowTool {
-    templates: Vec<(String, AgentWorkflowConfig)>,
+    templates: Vec<WorkflowTemplateDescriptor>,
     task: TaskTool,
     host: Arc<dyn WorkflowHost>,
     description: String,
@@ -107,7 +109,7 @@ pub struct WorkflowTool {
 impl WorkflowTool {
     /// Bind validated templates to the shared delegation planner and runtime host.
     pub fn new(
-        templates: impl IntoIterator<Item = (String, AgentWorkflowConfig)>,
+        templates: impl IntoIterator<Item = WorkflowTemplateDescriptor>,
         task: TaskTool,
         host: Arc<dyn WorkflowHost>,
     ) -> Result<Self, String> {
@@ -116,8 +118,19 @@ impl WorkflowTool {
             return Err("workflow tool requires at least one configured template".to_owned());
         }
         let targets = task.targets();
-        for (name, template) in &templates {
-            template.validate_structure(name)?;
+        for template in &templates {
+            let name = &template.name;
+            if name.trim().is_empty()
+                || template.source_id.trim().is_empty()
+                || template.nodes.is_empty()
+                || template.max_parallel == 0
+                || template.max_parallel > template.max_agents
+                || template.nodes.len() > template.max_agents
+            {
+                return Err(format!(
+                    "workflow descriptor `{name}` has invalid identity, graph, or bounds"
+                ));
+            }
             for node in &template.nodes {
                 if !targets.iter().any(|target| target == &node.agent) {
                     return Err(format!(
@@ -131,7 +144,7 @@ impl WorkflowTool {
         }
         let available = templates
             .iter()
-            .map(|(name, _)| name.as_str())
+            .map(|template| template.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         Ok(Self {
@@ -144,18 +157,16 @@ impl WorkflowTool {
         })
     }
 
-    fn template(&self, name: &str) -> Option<&AgentWorkflowConfig> {
-        self.templates
-            .iter()
-            .find(|(candidate, _)| candidate == name)
-            .map(|(_, template)| template)
+    fn template(&self, name: &str) -> Option<&WorkflowTemplateDescriptor> {
+        self.templates.iter().find(|template| template.name == name)
     }
 
     fn expand(
         &self,
-        template: &AgentWorkflowConfig,
+        template: &WorkflowTemplateDescriptor,
         params: &WorkflowParams,
         parent_session_id: &str,
+        parent_attempt: Option<&Arc<AttemptSnapshot>>,
     ) -> Vec<WorkflowNodeRequest> {
         template
             .nodes
@@ -186,6 +197,9 @@ impl WorkflowTool {
                     depends_on: node.depends_on.clone(),
                     turn: ChildTurnRequest {
                         parent_session_id: parent_session_id.to_owned(),
+                        parent_attempt: parent_attempt.map(Arc::clone),
+                        workflow: Some(template.name.clone()),
+                        workflow_node: Some(node.id.clone()),
                         resume_session_id: None,
                         agent: node.agent.clone(),
                         description,
@@ -245,7 +259,7 @@ impl TypedTool for WorkflowTool {
                 "unknown workflow `{name}`; choose one of: {}",
                 self.templates
                     .iter()
-                    .map(|(name, _)| name.as_str())
+                    .map(|template| template.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             ))
@@ -274,12 +288,19 @@ impl TypedTool for WorkflowTool {
         .await?;
 
         let parent_session_id = ctx.session_id.clone();
+        let parent_attempt = ctx.orchestration_snapshot().cloned();
         let request = WorkflowRequest {
             parent_session_id: parent_session_id.clone(),
+            parent_attempt: parent_attempt.clone(),
             workflow: name.to_owned(),
             description: params.description.clone(),
-            nodes: self.expand(template, &params, &parent_session_id),
-            max_parallel: template.resolved_max_parallel(),
+            nodes: self.expand(
+                template,
+                &params,
+                &parent_session_id,
+                parent_attempt.as_ref(),
+            ),
+            max_parallel: template.max_parallel,
             background,
             report_delivery: params.report_delivery.unwrap_or_default(),
         };
@@ -374,6 +395,7 @@ fn failed(message: String) -> ToolError {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use zuno_orchestration::WorkflowNodeDescriptor;
     use zuno_tool::{AllowAll, NeverInterrupted};
 
     #[derive(Default)]
@@ -400,20 +422,69 @@ mod tests {
         }
     }
 
-    fn template() -> AgentWorkflowConfig {
-        serde_json::from_value(json!({
-            "maxParallel":2,
-            "nodes":[
-                {"id":"scan","agent":"explore","prompt":"Collect evidence."},
-                {"id":"implement","agent":"worker","dependsOn":["scan"]}
-            ]
-        }))
-        .expect("workflow template")
+    fn template() -> WorkflowTemplateDescriptor {
+        WorkflowTemplateDescriptor {
+            name: "release".to_owned(),
+            source_id: "test://workflow/release".to_owned(),
+            max_parallel: 2,
+            max_agents: 2,
+            nodes: vec![
+                WorkflowNodeDescriptor {
+                    id: "scan".to_owned(),
+                    agent: "explore".to_owned(),
+                    prompt: Some("Collect evidence.".to_owned()),
+                    description: None,
+                    depends_on: Vec::new(),
+                },
+                WorkflowNodeDescriptor {
+                    id: "implement".to_owned(),
+                    agent: "worker".to_owned(),
+                    prompt: None,
+                    description: None,
+                    depends_on: vec!["scan".to_owned()],
+                },
+            ],
+        }
+    }
+
+    fn orchestration_snapshot() -> Arc<AttemptSnapshot> {
+        Arc::new(
+            serde_json::from_value(json!({
+                "schemaVersion": 1,
+                "turnId": "turn-parent",
+                "step": 1,
+                "capability": {
+                    "schemaVersion": 1,
+                    "pack": {"id":"test","version":"1","upstreamRevision":"test"},
+                    "extensionRevision": 0,
+                    "permissionPolicySha256": "policy",
+                    "profiles": [], "presets": [], "workflows": [], "skills": []
+                },
+                "owner": {
+                    "sessionId":"ses_parent", "parentSessionId":null, "parentAttempt":null,
+                    "workflow":null, "workflowNode":null
+                },
+                "agent": {
+                    "name":"build", "sourceId":"test://build",
+                    "definitionSha256":"definition", "permissionSha256":"permission",
+                    "promptPolicySha256":"prompt"
+                },
+                "model": {
+                    "providerId":"fake", "modelId":"fake-model", "wireModelId":"fake-model",
+                    "surface":"responses", "reasoningSha256":"reasoning", "preset":null
+                },
+                "selectedSkills": [],
+                "prompt": {"eventId":"evt-parent","assemblySha256":"assembly","actualSha256":"actual"},
+                "tools": []
+            }))
+            .expect("test orchestration snapshot"),
+        )
     }
 
     #[tokio::test]
     async fn expands_only_the_configured_dag_with_resolved_child_turns() {
         let host = Arc::new(RecordingWorkflowHost::default());
+        let snapshot = orchestration_snapshot();
         let task = TaskTool::new(
             Arc::new(crate::task::RecordingHost::new()),
             Arc::new(crate::task::NoProviders),
@@ -422,8 +493,7 @@ mod tests {
             crate::task::DelegationTargets::new(["explore".to_owned(), "worker".to_owned()])
                 .expect("targets"),
         );
-        let tool = WorkflowTool::new([("release".to_owned(), template())], task, host.clone())
-            .expect("workflow tool");
+        let tool = WorkflowTool::new([template()], task, host.clone()).expect("workflow tool");
         let output = tool
             .run(
                 WorkflowParams {
@@ -440,7 +510,8 @@ mod tests {
                     "build",
                     Arc::new(AllowAll),
                     Arc::new(NeverInterrupted),
-                ),
+                )
+                .with_orchestration_snapshot(Arc::clone(&snapshot)),
             )
             .await
             .expect("workflow runs");
@@ -453,6 +524,24 @@ mod tests {
         assert_eq!(requests[0].max_parallel, 2);
         assert_eq!(requests[0].nodes[1].depends_on, vec!["scan".to_owned()]);
         assert_eq!(requests[0].nodes[0].turn.agent, "explore");
+        assert!(Arc::ptr_eq(
+            requests[0]
+                .parent_attempt
+                .as_ref()
+                .expect("workflow parent attempt"),
+            &snapshot
+        ));
+        for node in &requests[0].nodes {
+            assert!(Arc::ptr_eq(
+                node.turn
+                    .parent_attempt
+                    .as_ref()
+                    .expect("workflow node parent attempt"),
+                &snapshot
+            ));
+            assert_eq!(node.turn.workflow.as_deref(), Some("release"));
+            assert_eq!(node.turn.workflow_node.as_deref(), Some(node.id.as_str()));
+        }
         assert!(
             requests[0].nodes[0]
                 .turn
@@ -470,7 +559,7 @@ mod tests {
         )
         .with_targets(crate::task::DelegationTargets::new(["worker".to_owned()]).expect("targets"));
         let error = WorkflowTool::new(
-            [("release".to_owned(), template())],
+            [template()],
             task,
             Arc::new(RecordingWorkflowHost::default()),
         )

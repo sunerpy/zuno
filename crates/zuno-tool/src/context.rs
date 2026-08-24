@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 use zuno_error::ToolError;
+use zuno_orchestration::AttemptSnapshot;
 use zuno_permission::{PermissionRequest, ToolCall};
 
 use crate::ToolEffect;
@@ -214,6 +215,11 @@ pub struct ToolContext {
     pub permission: Arc<dyn PermissionAsker>,
     /// The cancellation signal to poll at every safe point.
     pub interrupt: Arc<dyn InterruptHandle>,
+    /// Immutable identity of the provider Attempt that admitted this call.
+    ///
+    /// Direct tool tests and non-turn administrative invocation may leave this
+    /// absent. A model-originated call always receives one from `zuno-engine`.
+    orchestration_snapshot: Option<Arc<AttemptSnapshot>>,
 }
 
 impl ToolContext {
@@ -235,7 +241,21 @@ impl ToolContext {
             depth: 0,
             permission,
             interrupt,
+            orchestration_snapshot: None,
         }
+    }
+
+    /// Attach the immutable provider Attempt that admitted this call.
+    #[must_use]
+    pub fn with_orchestration_snapshot(mut self, snapshot: Arc<AttemptSnapshot>) -> Self {
+        self.orchestration_snapshot = Some(snapshot);
+        self
+    }
+
+    /// The immutable provider Attempt that admitted this call, when model-originated.
+    #[must_use]
+    pub fn orchestration_snapshot(&self) -> Option<&Arc<AttemptSnapshot>> {
+        self.orchestration_snapshot.as_ref()
     }
 
     /// Derives the context for a tool call made *by* this tool call.
@@ -257,6 +277,7 @@ impl ToolContext {
             depth: self.depth.saturating_add(1),
             permission: Arc::clone(&self.permission),
             interrupt: Arc::clone(&self.interrupt),
+            orchestration_snapshot: self.orchestration_snapshot.as_ref().map(Arc::clone),
         }
     }
 
@@ -289,6 +310,13 @@ impl std::fmt::Debug for ToolContext {
             .field("call_id", &self.call_id)
             .field("agent", &self.agent)
             .field("depth", &self.depth)
+            .field(
+                "orchestration_snapshot",
+                &self
+                    .orchestration_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.identity().ok().map(|identity| identity.sha256)),
+            )
             .field("interrupted", &self.interrupt.is_set())
             .finish_non_exhaustive()
     }
@@ -329,6 +357,40 @@ mod tests {
         )
     }
 
+    fn orchestration_snapshot() -> Arc<AttemptSnapshot> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 1,
+                "turnId": "turn-parent",
+                "step": 1,
+                "capability": {
+                    "schemaVersion": 1,
+                    "pack": {"id":"test","version":"1","upstreamRevision":"test"},
+                    "extensionRevision": 0,
+                    "permissionPolicySha256": "policy",
+                    "profiles": [], "presets": [], "workflows": [], "skills": []
+                },
+                "owner": {
+                    "sessionId":"ses_1", "parentSessionId":null, "parentAttempt":null,
+                    "workflow":null, "workflowNode":null
+                },
+                "agent": {
+                    "name":"build", "sourceId":"test://build",
+                    "definitionSha256":"definition", "permissionSha256":"permission",
+                    "promptPolicySha256":"prompt"
+                },
+                "model": {
+                    "providerId":"fake", "modelId":"fake-model", "wireModelId":"fake-model",
+                    "surface":"responses", "reasoningSha256":"reasoning", "preset":null
+                },
+                "selectedSkills": [],
+                "prompt": {"eventId":"evt-parent","assemblySha256":"assembly","actualSha256":"actual"},
+                "tools": []
+            }))
+            .expect("test orchestration snapshot"),
+        )
+    }
+
     #[test]
     fn subcall_inherits_everything_but_the_call_id_and_deepens() {
         let parent = context();
@@ -345,11 +407,26 @@ mod tests {
 
     #[test]
     fn subcall_shares_one_permission_point_and_one_interrupt() {
-        let parent = context();
+        let snapshot = orchestration_snapshot();
+        let parent = context().with_orchestration_snapshot(Arc::clone(&snapshot));
         let child = parent.for_subcall("call_2");
 
         assert!(Arc::ptr_eq(&parent.permission, &child.permission));
         assert!(Arc::ptr_eq(&parent.interrupt, &child.interrupt));
+        assert!(Arc::ptr_eq(
+            parent
+                .orchestration_snapshot()
+                .expect("parent orchestration snapshot"),
+            child
+                .orchestration_snapshot()
+                .expect("child orchestration snapshot")
+        ));
+        assert!(Arc::ptr_eq(
+            child
+                .orchestration_snapshot()
+                .expect("child orchestration snapshot"),
+            &snapshot
+        ));
     }
 
     #[test]

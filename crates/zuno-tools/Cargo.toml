@@ -33,6 +33,7 @@ zuno-error = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-memory = { workspace = true }
 zuno-network = { workspace = true }
+zuno-orchestration = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-pty = { workspace = true }

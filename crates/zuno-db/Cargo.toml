@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 zuno-error = { workspace = true }
+zuno-orchestration = { workspace = true }
 zuno-paths = { workspace = true }
 zuno-snapshot = { workspace = true }
 zuno-tool = { workspace = true }

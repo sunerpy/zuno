@@ -347,6 +347,7 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
                     agent: "build".to_owned(),
                     available_tools,
                     interrupt: InterruptSignal::new(),
+                    orchestration_snapshot: None,
                 })
                 .await
         })
@@ -422,6 +423,7 @@ async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscr
                     agent: "build".to_owned(),
                     available_tools,
                     interrupt: InterruptSignal::new(),
+                    orchestration_snapshot: None,
                 })
                 .await
         })

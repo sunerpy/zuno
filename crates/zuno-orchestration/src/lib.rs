@@ -5,6 +5,16 @@
 //! descriptors only after independently checking the active Agent profile and its
 //! enforced tool visibility.
 
+mod snapshot;
+
+pub use snapshot::{
+    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilitySnapshot, ModelAttemptIdentity,
+    OwnerLineage, PackIdentity, PresetDescriptor, PresetRouteDescriptor, PresetSelection,
+    ProfileDescriptor, PromptReceiptIdentity, SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity,
+    SkillCapabilityDescriptor, SnapshotIdentity, ToolSchemaIdentity, WorkflowNodeDescriptor,
+    WorkflowTemplateDescriptor, sha256_json, sha256_text,
+};
+
 /// Stable identifier for the first-party pack.
 pub const PACK_ID: &str = "zuno-orchestration";
 

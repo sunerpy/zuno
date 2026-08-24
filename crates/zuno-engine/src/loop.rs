@@ -40,6 +40,11 @@ use zuno_llm::event::{
 use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_observability::span;
+use zuno_orchestration::{
+    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilitySnapshot, ModelAttemptIdentity,
+    OwnerLineage, PackIdentity, PromptReceiptIdentity, SNAPSHOT_SCHEMA_VERSION,
+    SelectedSkillIdentity, ToolSchemaIdentity, sha256_json, sha256_text,
+};
 use zuno_tool::{
     ToolConcurrencyPolicy, ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
 };
@@ -503,6 +508,8 @@ pub struct ResolvedAgent {
     /// Ordered provenance for [`Self::system_prompt`].
     pub prompt_assembly: PromptAssembly,
     pub max_steps: u32,
+    /// Composition-root identity finalized at the provider request boundary.
+    pub orchestration_seed: Option<Arc<AttemptSeed>>,
 }
 
 impl ResolvedAgent {
@@ -522,6 +529,7 @@ impl ResolvedAgent {
             system_prompt,
             prompt_assembly,
             max_steps,
+            orchestration_seed: None,
         }
     }
 
@@ -530,6 +538,13 @@ impl ResolvedAgent {
     pub fn with_prompt_assembly(mut self, prompt_assembly: PromptAssembly) -> Self {
         self.system_prompt = prompt_assembly.render();
         self.prompt_assembly = prompt_assembly;
+        self
+    }
+
+    /// Attach the immutable capability and Agent identity resolved by the host.
+    #[must_use]
+    pub fn with_orchestration_seed(mut self, seed: Arc<AttemptSeed>) -> Self {
+        self.orchestration_seed = Some(seed);
         self
     }
 }
@@ -639,6 +654,7 @@ pub struct DispatchRequest {
     pub agent: String,
     pub available_tools: Arc<[ToolDefinition]>,
     pub interrupt: InterruptSignal,
+    pub orchestration_snapshot: Option<Arc<AttemptSnapshot>>,
 }
 
 /// A model-visible dispatch result. Dispatch failures are represented as error
@@ -1281,6 +1297,22 @@ async fn run_turn_in_span(
                     .prompt_assembly
                     .event_properties(&agent.name, step, &system_prompt);
             properties.insert("turnId".to_owned(), Value::String(request.turn_id.clone()));
+            if let Some(seed) = &agent.orchestration_seed {
+                let identity = seed
+                    .capability
+                    .identity()
+                    .expect("capability snapshot contains only serializable identity data");
+                properties.insert(
+                    "capabilitySnapshotID".to_owned(),
+                    serde_json::to_value(identity)
+                        .expect("capability snapshot identity is serializable"),
+                );
+                properties.insert(
+                    "capabilitySnapshot".to_owned(),
+                    serde_json::to_value(&seed.capability)
+                        .expect("capability snapshot is serializable"),
+                );
+            }
             let event = NewSessionEvent::new("session.prompt.assembled", properties)?;
             let receipt = append_with_connection(context.connection, &request.session_id, event)?;
             last_prompt_receipt_id = Some(receipt.id);
@@ -1327,7 +1359,7 @@ async fn run_turn_in_span(
                 .await
                 .map_err(TurnError::Hook)?;
         }
-        let cache = prompt_cache.get_or_insert_with(|| PromptCache::new(system_prompt));
+        let cache = prompt_cache.get_or_insert_with(|| PromptCache::new(system_prompt.clone()));
         let prepared = cache.prepare_turn_owned(
             stable_history,
             request.dynamic_context.clone(),
@@ -1370,6 +1402,17 @@ async fn run_turn_in_span(
         completion
             .validate_tool_arguments()
             .map_err(ProviderError::fatal)?;
+        let orchestration_snapshot = Arc::new(attempt_snapshot(AttemptSnapshotInput {
+            request: &request,
+            session: &session,
+            agent: &agent,
+            model: &model,
+            step,
+            prompt_receipt_id: last_prompt_receipt_id.as_deref(),
+            actual_system_prompt: &system_prompt,
+            tools: &completion.tools,
+            locked_tools: &locked_tools,
+        }));
         let request_id = format!("req_{}", Uuid::now_v7().simple());
         session::record_provider_request_started(
             context.connection,
@@ -1387,6 +1430,7 @@ async fn run_turn_in_span(
                 message_count,
                 estimated_prompt_tokens,
                 assistant_message_id: &assistant_id,
+                orchestration_snapshot: &orchestration_snapshot,
             },
         )?;
         events
@@ -1821,6 +1865,7 @@ async fn run_turn_in_span(
                     &agent.name,
                     &locked_tools,
                     context.interrupt,
+                    &orchestration_snapshot,
                 );
                 let first_policy = context.dispatcher.concurrency_policy(&first_request);
                 let mut group_end = next_call.saturating_add(1);
@@ -1833,6 +1878,7 @@ async fn run_turn_in_span(
                             &agent.name,
                             &locked_tools,
                             context.interrupt,
+                            &orchestration_snapshot,
                         );
                         if context.dispatcher.concurrency_policy(&candidate)
                             == ToolConcurrencyPolicy::Exclusive
@@ -1869,6 +1915,7 @@ async fn run_turn_in_span(
                             &agent.name,
                             &locked_tools,
                             context.interrupt,
+                            &orchestration_snapshot,
                         ))
                         .await;
                     prepared.push((call_index, call, ui_intent, dispatch));
@@ -2061,6 +2108,7 @@ fn dispatch_request(
     agent: &str,
     available_tools: &Arc<[ToolDefinition]>,
     interrupt: &InterruptSignal,
+    orchestration_snapshot: &Arc<AttemptSnapshot>,
 ) -> DispatchRequest {
     DispatchRequest {
         call,
@@ -2069,6 +2117,7 @@ fn dispatch_request(
         agent: agent.to_owned(),
         available_tools: Arc::clone(available_tools),
         interrupt: interrupt.clone(),
+        orchestration_snapshot: Some(Arc::clone(orchestration_snapshot)),
     }
 }
 
@@ -3001,6 +3050,7 @@ struct ProviderRequestStart<'a> {
     message_count: usize,
     estimated_prompt_tokens: u64,
     assistant_message_id: &'a str,
+    orchestration_snapshot: &'a AttemptSnapshot,
 }
 
 fn append_provider_request_started(
@@ -3032,12 +3082,152 @@ fn append_provider_request_started(
             Value::String(prompt_receipt_id.to_owned()),
         );
     }
+    let snapshot_identity = start
+        .orchestration_snapshot
+        .identity()
+        .expect("attempt snapshot contains only serializable identity data");
+    properties.insert(
+        "orchestrationSnapshotID".to_owned(),
+        serde_json::to_value(snapshot_identity).expect("snapshot identity is serializable"),
+    );
+    properties.insert(
+        "orchestrationSnapshot".to_owned(),
+        start
+            .orchestration_snapshot
+            .canonical_value()
+            .expect("attempt snapshot is serializable"),
+    );
     append_with_connection(
         connection,
         &request.session_id,
         NewSessionEvent::new("session.provider.request", properties)?,
     )?;
     Ok(())
+}
+
+struct AttemptSnapshotInput<'a> {
+    request: &'a RunTurnRequest,
+    session: &'a session::Session,
+    agent: &'a ResolvedAgent,
+    model: &'a ResolvedModel,
+    step: u32,
+    prompt_receipt_id: Option<&'a str>,
+    actual_system_prompt: &'a str,
+    tools: &'a [zuno_llm::registry::ToolSchema],
+    locked_tools: &'a [ToolDefinition],
+}
+
+fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
+    let AttemptSnapshotInput {
+        request,
+        session,
+        agent,
+        model,
+        step,
+        prompt_receipt_id,
+        actual_system_prompt,
+        tools,
+        locked_tools,
+    } = input;
+    let fallback_capability = CapabilitySnapshot::new(
+        PackIdentity {
+            id: zuno_orchestration::PACK_ID.to_owned(),
+            version: zuno_orchestration::PACK_VERSION.to_owned(),
+            upstream_revision: zuno_orchestration::UPSTREAM_REVISION.to_owned(),
+        },
+        0,
+        sha256_text("untracked permission generation"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let fallback_agent = AgentAttemptIdentity {
+        name: agent.name.clone(),
+        source_id: format!("resolver://{}", agent.name),
+        definition_sha256: sha256_text(&agent.system_prompt),
+        permission_sha256: sha256_text("untracked permission rules"),
+        prompt_policy_sha256: sha256_text(&agent.system_prompt),
+    };
+    let (capability, agent_identity, preset, parent_attempt, workflow, workflow_node) =
+        agent.orchestration_seed.as_deref().map_or_else(
+            || (fallback_capability, fallback_agent, None, None, None, None),
+            |seed| {
+                (
+                    seed.capability.clone(),
+                    seed.agent.clone(),
+                    seed.preset.clone(),
+                    seed.parent_attempt.clone(),
+                    seed.workflow.clone(),
+                    seed.workflow_node.clone(),
+                )
+            },
+        );
+    let selected_skills = agent
+        .prompt_assembly
+        .sections()
+        .iter()
+        .filter_map(|section| {
+            section
+                .selected_skill_name()
+                .map(|name| SelectedSkillIdentity {
+                    name: name.to_owned(),
+                    source: section.source().to_owned(),
+                    content_sha256: section.sha256().to_owned(),
+                })
+        })
+        .collect();
+    let tools = tools
+        .iter()
+        .map(|tool| ToolSchemaIdentity {
+            name: tool.name.clone(),
+            description_sha256: sha256_text(&tool.description),
+            schema_sha256: sha256_json(&tool.parameters),
+            ui_intent: locked_tools
+                .iter()
+                .find(|definition| definition.id == tool.name)
+                .map_or("generic", |definition| match definition.ui_intent {
+                    ToolUiIntent::Generic => "generic",
+                    ToolUiIntent::Subagent => "subagent",
+                })
+                .to_owned(),
+        })
+        .collect();
+    let surface = match model.surface {
+        ApiSurface::Default => "default",
+        ApiSurface::Chat => "chat",
+        ApiSurface::Responses => "responses",
+        ApiSurface::Messages => "messages",
+    };
+    AttemptSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        turn_id: request.turn_id.clone(),
+        step,
+        capability,
+        owner: OwnerLineage {
+            session_id: request.session_id.clone(),
+            parent_session_id: session.parent_id.clone(),
+            parent_attempt,
+            workflow,
+            workflow_node,
+        },
+        agent: agent_identity,
+        model: ModelAttemptIdentity {
+            provider_id: model.catalog_provider_id.clone(),
+            model_id: model.catalog_model_id.clone(),
+            wire_model_id: model.model_id.clone(),
+            surface: surface.to_owned(),
+            reasoning_sha256: sha256_json(&Value::Object(model.reasoning_options.clone())),
+            preset,
+        },
+        selected_skills,
+        prompt: PromptReceiptIdentity {
+            event_id: prompt_receipt_id.map(str::to_owned),
+            assembly_sha256: sha256_text(&agent.prompt_assembly.provider_projection()),
+            actual_sha256: sha256_text(actual_system_prompt),
+        },
+        tools,
+    }
 }
 
 fn append_provider_request_terminal(

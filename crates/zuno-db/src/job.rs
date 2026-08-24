@@ -7,11 +7,12 @@ use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use zuno_error::DbError;
+use zuno_orchestration::AttemptSnapshot;
 
 const TABLE: &str = "agent_job";
-const SELECT_COLUMNS: &str = "id, parent_session_id, subject_kind, subject_payload, status, \
-     report_delivery, result, error, report_input_id, created_seq, settled_seq, time_created, \
-     time_updated, time_completed";
+const SELECT_COLUMNS: &str = "id, parent_session_id, subject_kind, subject_payload, \
+     orchestration_snapshot, status, report_delivery, result, error, report_input_id, created_seq, \
+     settled_seq, time_created, time_updated, time_completed";
 
 /// Whether a settled background job should wake its parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +196,7 @@ pub struct NewAgentJob {
     pub id: String,
     pub parent_session_id: String,
     pub subject: JobSubject,
+    pub orchestration_snapshot: Option<AttemptSnapshot>,
     pub report_delivery: ReportDelivery,
     pub time_created: i64,
 }
@@ -213,9 +215,17 @@ impl NewAgentJob {
             id: id.into(),
             parent_session_id: parent_session_id.into(),
             subject,
+            orchestration_snapshot: None,
             report_delivery,
             time_created,
         }
+    }
+
+    /// Persist the immutable Attempt that admitted this background operation.
+    #[must_use]
+    pub fn with_orchestration_snapshot(mut self, snapshot: Option<AttemptSnapshot>) -> Self {
+        self.orchestration_snapshot = snapshot;
+        self
     }
 }
 
@@ -225,6 +235,7 @@ pub struct AgentJob {
     pub id: String,
     pub parent_session_id: String,
     pub subject: JobSubject,
+    pub orchestration_snapshot: Option<AttemptSnapshot>,
     pub status: JobStatus,
     pub report_delivery: ReportDelivery,
     pub result: Option<Value>,
@@ -489,18 +500,25 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
         NewSessionEvent::new("agent.job.created", created_properties(&job))?,
     )?;
     let subject_payload = serde_json::to_string(&job.subject.as_json()).map_err(query_error)?;
+    let orchestration_snapshot = job
+        .orchestration_snapshot
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(query_error)?;
     transaction
         .execute(
             "INSERT INTO agent_job \
-             (id, parent_session_id, subject_kind, subject_payload, status, report_delivery, \
-              result, error, report_input_id, created_seq, settled_seq, time_created, \
-              time_updated, time_completed) \
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, NULL, NULL, NULL, ?6, NULL, ?7, ?7, NULL)",
+             (id, parent_session_id, subject_kind, subject_payload, orchestration_snapshot, \
+              status, report_delivery, result, error, report_input_id, created_seq, settled_seq, \
+              time_created, time_updated, time_completed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL, NULL, NULL, ?7, NULL, ?8, ?8, NULL)",
             params![
                 job.id,
                 job.parent_session_id,
                 job.subject.kind(),
                 subject_payload,
+                orchestration_snapshot,
                 job.report_delivery.as_str(),
                 event.sequence,
                 job.time_created,
@@ -511,6 +529,7 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
         id: job.id,
         parent_session_id: job.parent_session_id,
         subject: job.subject,
+        orchestration_snapshot: job.orchestration_snapshot,
         status: JobStatus::Running,
         report_delivery: job.report_delivery,
         result: None,
@@ -640,7 +659,7 @@ fn validate_settlement(job: &AgentJob, settlement: &JobSettlement) -> Result<(),
 }
 
 fn created_properties(job: &NewAgentJob) -> Map<String, Value> {
-    [
+    let mut properties = [
         ("jobID".to_owned(), Value::String(job.id.clone())),
         (
             "parentSessionID".to_owned(),
@@ -657,7 +676,23 @@ fn created_properties(job: &NewAgentJob) -> Map<String, Value> {
         ),
     ]
     .into_iter()
-    .collect()
+    .collect::<Map<_, _>>();
+    if let Some(snapshot) = &job.orchestration_snapshot {
+        let identity = snapshot
+            .identity()
+            .expect("AttemptSnapshot contains only serializable identity data");
+        properties.insert(
+            "orchestrationSnapshotID".to_owned(),
+            serde_json::to_value(identity).expect("snapshot identity is serializable"),
+        );
+        properties.insert(
+            "orchestrationSnapshot".to_owned(),
+            snapshot
+                .canonical_value()
+                .expect("AttemptSnapshot is serializable"),
+        );
+    }
+    properties
 }
 
 fn settled_properties(job: &AgentJob, settlement: &JobSettlement) -> Map<String, Value> {
@@ -693,6 +728,7 @@ struct StoredJob {
     parent_session_id: String,
     subject_kind: String,
     subject_payload: String,
+    orchestration_snapshot: Option<String>,
     status: String,
     report_delivery: String,
     result: Option<String>,
@@ -737,16 +773,17 @@ fn decode_stored_job(row: &Row<'_>) -> rusqlite::Result<StoredJob> {
         parent_session_id: row.get(1)?,
         subject_kind: row.get(2)?,
         subject_payload: row.get(3)?,
-        status: row.get(4)?,
-        report_delivery: row.get(5)?,
-        result: row.get(6)?,
-        error: row.get(7)?,
-        report_input_id: row.get(8)?,
-        created_sequence: row.get(9)?,
-        settled_sequence: row.get(10)?,
-        time_created: row.get(11)?,
-        time_updated: row.get(12)?,
-        time_completed: row.get(13)?,
+        orchestration_snapshot: row.get(4)?,
+        status: row.get(5)?,
+        report_delivery: row.get(6)?,
+        result: row.get(7)?,
+        error: row.get(8)?,
+        report_input_id: row.get(9)?,
+        created_sequence: row.get(10)?,
+        settled_sequence: row.get(11)?,
+        time_created: row.get(12)?,
+        time_updated: row.get(13)?,
+        time_completed: row.get(14)?,
     })
 }
 
@@ -774,6 +811,10 @@ fn decode_job(stored: StoredJob) -> Result<AgentJob, DbError> {
         id: stored.id,
         parent_session_id: stored.parent_session_id,
         subject,
+        orchestration_snapshot: stored
+            .orchestration_snapshot
+            .map(|snapshot| serde_json::from_str(&snapshot).map_err(query_error))
+            .transpose()?,
         status: JobStatus::parse(&stored.status)?,
         report_delivery: ReportDelivery::parse(&stored.report_delivery)?,
         result: stored

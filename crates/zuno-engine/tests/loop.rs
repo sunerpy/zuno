@@ -26,6 +26,10 @@ use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role,
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
+use zuno_orchestration::{
+    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilitySnapshot, PackIdentity,
+    sha256_text,
+};
 use zuno_tool::{ToolDefinition, ToolOutput, ToolUiIntent};
 
 const SESSION_ID: &str = "ses_loop_test";
@@ -127,6 +131,35 @@ impl AgentModelResolver for FakeResolver {
 #[derive(Debug, Clone, Copy)]
 struct TraceResolver;
 
+fn trace_seed() -> Arc<AttemptSeed> {
+    Arc::new(AttemptSeed {
+        capability: CapabilitySnapshot::new(
+            PackIdentity {
+                id: "test-orchestration".to_owned(),
+                version: "1".to_owned(),
+                upstream_revision: "test@trace".to_owned(),
+            },
+            7,
+            sha256_text("trace permission policy"),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
+        agent: AgentAttemptIdentity {
+            name: "build".to_owned(),
+            source_id: "native:build".to_owned(),
+            definition_sha256: sha256_text("build definition"),
+            permission_sha256: sha256_text("build permission"),
+            prompt_policy_sha256: sha256_text("build prompt policy"),
+        },
+        preset: None,
+        parent_attempt: None,
+        workflow: None,
+        workflow_node: None,
+    })
+}
+
 impl AgentModelResolver for TraceResolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
         (requested == "build").then(|| {
@@ -137,7 +170,9 @@ impl AgentModelResolver for TraceResolver {
             assembly
                 .push("instructions.0", "/workspace/AGENTS.md", "RULES")
                 .expect("instruction section");
-            ResolvedAgent::new("build", assembly.render(), 8).with_prompt_assembly(assembly)
+            ResolvedAgent::new("build", assembly.render(), 8)
+                .with_prompt_assembly(assembly)
+                .with_orchestration_seed(trace_seed())
         })
     }
 
@@ -763,6 +798,16 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
     );
     assert_eq!(trace["sections"][0]["source"], "native:build");
     assert_eq!(trace["sections"][1]["source"], "/workspace/AGENTS.md");
+    let seed = trace_seed();
+    assert_eq!(
+        trace["capabilitySnapshot"],
+        serde_json::to_value(&seed.capability).expect("capability snapshot JSON")
+    );
+    assert_eq!(
+        trace["capabilitySnapshotID"],
+        serde_json::to_value(seed.capability.identity().expect("capability identity"))
+            .expect("capability identity JSON")
+    );
 
     let mut statement = connection
         .prepare(
@@ -785,6 +830,24 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
     assert_eq!(lifecycle[0]["turnID"], "turn-prompt-trace");
     assert_eq!(lifecycle[0]["promptReceiptID"], prompt_event_id);
     assert!(lifecycle[0]["estimatedPromptTokens"].as_u64().is_some());
+    let snapshot: AttemptSnapshot =
+        serde_json::from_value(lifecycle[0]["orchestrationSnapshot"].clone())
+            .expect("provider request orchestration snapshot");
+    assert_eq!(snapshot.capability, seed.capability);
+    assert_eq!(snapshot.agent, seed.agent);
+    assert_eq!(
+        snapshot.prompt.event_id.as_deref(),
+        Some(prompt_event_id.as_str())
+    );
+    assert_eq!(
+        snapshot.prompt.actual_sha256,
+        sha256_text("BASE\n\nRULES\n\nHOOK")
+    );
+    assert_eq!(
+        lifecycle[0]["orchestrationSnapshotID"],
+        serde_json::to_value(snapshot.identity().expect("attempt identity"))
+            .expect("attempt identity JSON")
+    );
 
     let usage = zuno_db::session::get(&connection, SESSION_ID)
         .expect("session usage")
@@ -1571,6 +1634,20 @@ async fn loop_accepts_interleaved_parallel_tool_streams_and_dispatches_in_model_
     assert_eq!(calls[0].call.input, json!({ "text": "first" }));
     assert_eq!(calls[1].call.id, "call-b");
     assert_eq!(calls[1].call.input, json!({ "text": "second" }));
+    let first_snapshot = calls[0]
+        .orchestration_snapshot
+        .as_ref()
+        .expect("first tool orchestration snapshot");
+    let second_snapshot = calls[1]
+        .orchestration_snapshot
+        .as_ref()
+        .expect("second tool orchestration snapshot");
+    assert!(
+        Arc::ptr_eq(first_snapshot, second_snapshot),
+        "all calls admitted by one provider Attempt must share one immutable snapshot"
+    );
+    assert_eq!(first_snapshot.turn_id, "turn-parallel");
+    assert_eq!(first_snapshot.step, 1);
     assert_eq!(
         events
             .iter()

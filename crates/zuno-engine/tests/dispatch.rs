@@ -291,6 +291,7 @@ fn request(
         agent: "build".to_owned(),
         available_tools: dispatcher.available_tools().definitions.into(),
         interrupt: InterruptSignal::new(),
+        orchestration_snapshot: None,
     }
 }
 

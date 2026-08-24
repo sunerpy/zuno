@@ -199,6 +199,7 @@ CREATE TABLE `agent_job` (
   `parent_session_id` text NOT NULL,
   `subject_kind` text NOT NULL,
   `subject_payload` text NOT NULL,
+  `orchestration_snapshot` text,
   `status` text NOT NULL,
   `report_delivery` text NOT NULL,
   `result` text,
@@ -226,6 +227,9 @@ CREATE TABLE `agent_job` (
        coalesce(length(trim(json_extract(`subject_payload`, '$.runID'))), 0) > 0 AND
        coalesce(length(trim(json_extract(`subject_payload`, '$.workflow'))), 0) > 0)
     )
+  ),
+  CONSTRAINT `agent_job_orchestration_snapshot` CHECK (
+    `orchestration_snapshot` IS NULL OR json_valid(`orchestration_snapshot`)
   ),
   CONSTRAINT `agent_job_status` CHECK (`status` IN ('running','completed','failed','cancelled','uncertain')),
   CONSTRAINT `agent_job_report_delivery` CHECK (`report_delivery` IN ('next-step','quiet')),

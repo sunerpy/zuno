@@ -65,6 +65,7 @@ use zuno_agent::model_policy::{
 };
 use zuno_error::ToolError;
 use zuno_llm::effort::{EffortCapabilities, ProviderFamily, ReasoningEffort};
+use zuno_orchestration::AttemptSnapshot;
 use zuno_tool::{
     PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolUiIntent, TypedTool,
 };
@@ -236,6 +237,12 @@ impl ModelAvailability for FactsAvailability<'_> {
 pub struct ChildTurnRequest {
     /// The session delegating.
     pub parent_session_id: String,
+    /// Immutable parent Attempt which admitted this delegation.
+    pub parent_attempt: Option<Arc<AttemptSnapshot>>,
+    /// Workflow template owning this child, when delegated by `workflow`.
+    pub workflow: Option<String>,
+    /// Workflow node owning this child, when delegated by `workflow`.
+    pub workflow_node: Option<String>,
     /// An existing child session to continue, from `task_id`.
     pub resume_session_id: Option<String>,
     /// The agent the child runs as.
@@ -807,6 +814,9 @@ impl TypedTool for TaskTool {
             .host
             .dispatch(ChildTurnRequest {
                 parent_session_id: ctx.session_id.clone(),
+                parent_attempt: ctx.orchestration_snapshot().cloned(),
+                workflow: None,
+                workflow_node: None,
                 resume_session_id: params.task_id.clone(),
                 agent,
                 description: params.description.clone(),

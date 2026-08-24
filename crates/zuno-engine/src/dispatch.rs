@@ -284,7 +284,7 @@ impl ToolDispatcher for ToolRegistryDispatcher {
         }
 
         let permission: Arc<dyn PermissionAsker> = permission;
-        let context = ToolContext::new(
+        let mut context = ToolContext::new(
             request.session_id.clone(),
             request.message_id,
             request.call.id.clone(),
@@ -292,6 +292,9 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             permission,
             Arc::new(interrupt.clone()),
         );
+        if let Some(snapshot) = request.orchestration_snapshot.as_ref() {
+            context = context.with_orchestration_snapshot(Arc::clone(snapshot));
+        }
         let args = request.call.input.clone();
         let tool_name = resolved_name.to_owned();
         let session_id = request.session_id;

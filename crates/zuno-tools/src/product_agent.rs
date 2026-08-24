@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zuno_error::ToolError;
+use zuno_orchestration::AttemptSnapshot;
 use zuno_tool::{
     PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, ToolUiIntent,
     TypedTool,
@@ -44,6 +45,8 @@ pub struct ProductAgentParams {
 pub struct ProductAgentRequest {
     /// The parent Zuno session.
     pub parent_session_id: String,
+    /// Immutable parent Attempt which admitted this external product invocation.
+    pub parent_attempt: Option<Arc<AttemptSnapshot>>,
     /// Configured instance name.
     pub instance: String,
     /// Stable product kind (`codex` or `claude-code`).
@@ -178,8 +181,10 @@ impl TypedTool for ProductAgentTool {
         .await?;
 
         let cancellation = CancellationToken::new();
+        let parent_attempt = ctx.orchestration_snapshot().cloned();
         let request = ProductAgentRequest {
             parent_session_id: ctx.session_id,
+            parent_attempt,
             instance: self.instance.clone(),
             product: self.product.clone(),
             tool: self.id.clone(),

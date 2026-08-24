@@ -18,6 +18,7 @@ zuno-db = { workspace = true }
 zuno-error = { workspace = true }
 zuno-llm = { workspace = true }
 zuno-observability = { workspace = true }
+zuno-orchestration = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-runtime = { workspace = true }
 zuno-tool = { workspace = true }

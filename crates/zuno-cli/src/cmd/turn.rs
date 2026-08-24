@@ -86,6 +86,12 @@ use zuno_llm::stream::StreamAccumulator;
 use zuno_memory::{
     MemoryObserver, MemoryService, PromotionPolicy, Scope, ScopeLimits, ScopePaths, SessionMemory,
 };
+use zuno_orchestration::{
+    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilitySnapshot, PackIdentity,
+    PresetDescriptor, PresetRouteDescriptor, PresetSelection, ProfileDescriptor,
+    SkillCapabilityDescriptor, WorkflowNodeDescriptor, WorkflowTemplateDescriptor, sha256_json,
+    sha256_text,
+};
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_runtime::HarnessRuntime;
 use zuno_tool::{
@@ -286,6 +292,7 @@ pub(crate) struct TurnPlan {
     config: zuno_config::schema::Config,
     agents: Vec<zuno_catalog::agent::Agent>,
     agent: AgentProfile,
+    capability: Arc<CapabilitySnapshot>,
     extensions: zuno_extension::ResolvedExtensions,
     extension_scope: zuno_extension::Scope,
     extension_revision: u64,
@@ -537,8 +544,18 @@ impl TurnPlan {
         });
         let dynamic_rules =
             super::agent::DynamicRules::resolve(&directory, worktree.as_deref(), env, &config);
-        let agent =
-            super::agent::resolved_profile(agent, &config, &dynamic_rules, vision_available);
+        let resolved_profiles = agents
+            .iter()
+            .cloned()
+            .map(|entry| {
+                super::agent::resolved_profile(entry, &config, &dynamic_rules, vision_available)
+            })
+            .collect::<Vec<_>>();
+        let agent = resolved_profiles
+            .iter()
+            .find(|profile| profile.name() == agent_name)
+            .cloned()
+            .ok_or_else(|| format!("Agent profile not found after resolution: {agent_name}"))?;
         let definition = agent.definition();
         let routed_variant = options
             .model
@@ -578,7 +595,7 @@ impl TurnPlan {
                 )
                 .map_err(to_string)?;
         }
-        let resolver = Resolver {
+        let mut resolver = Resolver {
             requested_agent: agent.name().to_owned(),
             system_prompt: prompt_assembly.render(),
             prompt_assembly: Some(prompt_assembly),
@@ -598,6 +615,7 @@ impl TurnPlan {
                 definition,
                 catalog_model.capabilities.temperature,
             ),
+            orchestration_seed: None,
         };
         let window = TokenWindow {
             context: token_count(catalog_model.limit.context),
@@ -619,7 +637,7 @@ impl TurnPlan {
         let reflection_model =
             resolve_reflection_model(&config, &catalog, &provider_id, env, &mut notes)?;
         let delegation_facts = Arc::new(delegation_facts(&catalog));
-        let skills = Arc::new(
+        let all_skills =
             zuno_catalog::skill::load(&zuno_catalog::skill::SkillOptions::from_config(
                 &directory,
                 worktree.as_deref(),
@@ -627,15 +645,30 @@ impl TurnPlan {
                 &config,
             ))
             .await
-            .with_overlay(extensions.skills().iter().cloned())
-            .retaining(|skill| {
-                zuno_catalog::skill::builtin::visible_to(
-                    &skill.location,
-                    agent.name(),
-                    definition.tools.as_deref(),
-                )
-            }),
-        );
+            .with_overlay(extensions.skills().iter().cloned());
+        let capability = Arc::new(orchestration_capability(
+            &config,
+            extension_revision,
+            &resolved_profiles,
+            &presets,
+            &all_skills,
+        )?);
+        let preset = selected_preset(&presets)?;
+        resolver.orchestration_seed = Some(Arc::new(AttemptSeed {
+            capability: capability.as_ref().clone(),
+            agent: agent_attempt_identity(&agent)?,
+            preset,
+            parent_attempt: None,
+            workflow: None,
+            workflow_node: None,
+        }));
+        let skills = Arc::new(all_skills.retaining(|skill| {
+            zuno_catalog::skill::builtin::visible_to(
+                &skill.location,
+                agent.name(),
+                definition.tools.as_deref(),
+            )
+        }));
         let mut runtime_surface =
             zuno_extension::runtime_surface(&extensions, &directory).map_err(to_string)?;
         let mut extension_tools = zuno_extension::lifecycle_tools(
@@ -666,6 +699,7 @@ impl TurnPlan {
             config,
             agents,
             agent,
+            capability,
             extensions,
             extension_scope,
             extension_revision,
@@ -697,6 +731,39 @@ impl TurnPlan {
             effort,
             goal_retry_policy,
         })
+    }
+
+    /// Bind a delegated turn to the immutable capability generation that admitted it.
+    pub(super) fn inherit_orchestration(
+        &mut self,
+        parent: &AttemptSnapshot,
+        workflow: Option<&str>,
+        workflow_node: Option<&str>,
+    ) -> Result<(), String> {
+        let expected = parent.capability.identity().map_err(to_string)?;
+        let actual = self.capability.identity().map_err(to_string)?;
+        if actual != expected {
+            return Err(format!(
+                "delegated turn rejected because its capability snapshot is stale or mismatched: parent={}, resolved={}; refresh the parent turn before delegating again",
+                expected.sha256, actual.sha256
+            ));
+        }
+        let parent_attempt = parent.identity().map_err(to_string)?;
+        let seed = self
+            .resolver
+            .orchestration_seed
+            .as_deref()
+            .cloned()
+            .ok_or_else(|| "delegated turn has no resolved orchestration seed".to_owned())?;
+        self.capability = Arc::new(parent.capability.clone());
+        self.resolver.orchestration_seed = Some(Arc::new(AttemptSeed {
+            capability: parent.capability.clone(),
+            parent_attempt: Some(parent_attempt),
+            workflow: workflow.map(str::to_owned),
+            workflow_node: workflow_node.map(str::to_owned),
+            ..seed
+        }));
+        Ok(())
     }
 
     /// The directory this turn runs in.
@@ -2071,6 +2138,7 @@ impl TurnHost {
                         Arc::new(catalog.loader()) as Arc<dyn zuno_tools::registry::McpToolLoader>
                     }),
                     skills: Arc::clone(&plan.skills),
+                    capability: Arc::clone(&plan.capability),
                     delegation: super::tool_runtime::Delegation {
                         host: Arc::new(child_host.clone()),
                         facts: Arc::clone(&plan.delegation_facts)
@@ -5497,6 +5565,7 @@ struct Resolver {
     wire_model: String,
     reasoning_options: serde_json::Map<String, serde_json::Value>,
     spec: Spec,
+    orchestration_seed: Option<Arc<AttemptSeed>>,
 }
 
 impl AgentModelResolver for Resolver {
@@ -5507,8 +5576,12 @@ impl AgentModelResolver for Resolver {
                 self.system_prompt.clone(),
                 self.max_steps,
             );
-            match &self.prompt_assembly {
+            let agent = match &self.prompt_assembly {
                 Some(assembly) => agent.with_prompt_assembly(assembly.clone()),
+                None => agent,
+            };
+            match &self.orchestration_seed {
+                Some(seed) => agent.with_orchestration_seed(Arc::clone(seed)),
                 None => agent,
             }
         })
@@ -5585,6 +5658,158 @@ fn agent_prompt_source(agent: &zuno_catalog::agent::Agent) -> String {
         zuno_catalog::agent::AgentSource::Config => format!("configuration:agent.{}", agent.name),
         zuno_catalog::agent::AgentSource::Markdown { path } => path.display().to_string(),
     }
+}
+
+fn orchestration_capability(
+    config: &zuno_config::schema::Config,
+    extension_revision: u64,
+    profiles: &[AgentProfile],
+    presets: &PresetLibrary,
+    skills: &zuno_catalog::skill::Skills,
+) -> Result<CapabilitySnapshot, String> {
+    let profiles = profiles
+        .iter()
+        .map(profile_descriptor)
+        .collect::<Result<Vec<_>, _>>()?;
+    let permission_policy_sha256 =
+        sha256_json(&serde_json::to_value(&config.permission).map_err(to_string)?);
+    Ok(CapabilitySnapshot::new(
+        PackIdentity {
+            id: zuno_orchestration::PACK_ID.to_owned(),
+            version: zuno_orchestration::PACK_VERSION.to_owned(),
+            upstream_revision: zuno_orchestration::UPSTREAM_REVISION.to_owned(),
+        },
+        extension_revision,
+        permission_policy_sha256,
+        profiles,
+        preset_descriptors(presets),
+        workflow_descriptors(config),
+        skill_descriptors(skills),
+    ))
+}
+
+fn profile_descriptor(profile: &AgentProfile) -> Result<ProfileDescriptor, String> {
+    let definition = profile.definition();
+    Ok(ProfileDescriptor {
+        name: profile.name().to_owned(),
+        source_id: agent_prompt_source(definition),
+        definition_sha256: sha256_json(&serde_json::to_value(definition).map_err(to_string)?),
+        permission_sha256: sha256_json(
+            &serde_json::to_value(profile.capabilities().rules()).map_err(to_string)?,
+        ),
+        tools: definition.tools.clone(),
+        delegates: profile
+            .capabilities()
+            .delegation_targets()
+            .map(<[String]>::to_vec),
+    })
+}
+
+fn agent_attempt_identity(profile: &AgentProfile) -> Result<AgentAttemptIdentity, String> {
+    let descriptor = profile_descriptor(profile)?;
+    Ok(AgentAttemptIdentity {
+        name: descriptor.name,
+        source_id: descriptor.source_id,
+        definition_sha256: descriptor.definition_sha256,
+        permission_sha256: descriptor.permission_sha256,
+        prompt_policy_sha256: sha256_text(profile.prompt_policy()),
+    })
+}
+
+fn preset_descriptors(presets: &PresetLibrary) -> Vec<PresetDescriptor> {
+    presets
+        .names()
+        .into_iter()
+        .filter_map(|name| {
+            let preset = presets.preset(name)?;
+            Some(PresetDescriptor {
+                name: name.to_owned(),
+                agents: preset
+                    .agents()
+                    .into_iter()
+                    .filter_map(|target| {
+                        preset.agent(target).map(|choice| PresetRouteDescriptor {
+                            target: target.to_owned(),
+                            model: choice.model.clone(),
+                            reasoning: choice.variant.clone(),
+                        })
+                    })
+                    .collect(),
+                categories: preset
+                    .categories()
+                    .into_iter()
+                    .filter_map(|target| {
+                        preset.category(target).map(|choice| PresetRouteDescriptor {
+                            target: target.to_owned(),
+                            model: choice.model.clone(),
+                            reasoning: choice.variant.clone(),
+                        })
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn selected_preset(presets: &PresetLibrary) -> Result<Option<PresetSelection>, String> {
+    let Some(name) = presets.selected() else {
+        return Ok(None);
+    };
+    let Some(descriptor) = preset_descriptors(presets)
+        .into_iter()
+        .find(|descriptor| descriptor.name == name)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PresetSelection {
+        name: name.to_owned(),
+        sha256: descriptor.identity().map_err(to_string)?.sha256,
+    }))
+}
+
+fn workflow_descriptors(config: &zuno_config::schema::Config) -> Vec<WorkflowTemplateDescriptor> {
+    config
+        .workflows
+        .iter()
+        .flat_map(|workflows| workflows.iter())
+        .map(|(name, workflow)| WorkflowTemplateDescriptor {
+            name: name.to_owned(),
+            source_id: format!("configuration:workflows.{name}"),
+            max_parallel: workflow.resolved_max_parallel(),
+            max_agents: workflow.resolved_max_agents(),
+            nodes: workflow
+                .nodes
+                .iter()
+                .map(|node| WorkflowNodeDescriptor {
+                    id: node.id.clone(),
+                    agent: node.agent.clone(),
+                    prompt: node.prompt.clone(),
+                    description: node.description.clone(),
+                    depends_on: node.depends_on.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn skill_descriptors(skills: &zuno_catalog::skill::Skills) -> Vec<SkillCapabilityDescriptor> {
+    skills
+        .all()
+        .iter()
+        .map(|skill| SkillCapabilityDescriptor {
+            name: skill.name.clone(),
+            source: skill.location.clone(),
+            metadata_sha256: sha256_json(&json!({
+                "name": skill.name,
+                "description": skill.description,
+                "source": skill.location,
+            })),
+            content_sha256: zuno_orchestration::skills()
+                .iter()
+                .find(|builtin| builtin.location == skill.location)
+                .map(|builtin| builtin.content_sha256.to_owned()),
+        })
+        .collect()
 }
 
 fn ensure_project(

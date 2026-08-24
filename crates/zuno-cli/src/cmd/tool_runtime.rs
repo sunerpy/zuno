@@ -46,6 +46,7 @@ use async_trait::async_trait;
 use zuno_agent::profile::AgentProfile;
 use zuno_config::schema::Config;
 use zuno_error::ToolError;
+use zuno_orchestration::CapabilitySnapshot;
 use zuno_paths::Env;
 use zuno_permission::Rule;
 use zuno_permission::visibility::permission_key;
@@ -84,6 +85,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
     pub(crate) skills: Arc<zuno_catalog::skill::Skills>,
+    pub(crate) capability: Arc<CapabilitySnapshot>,
     pub(crate) delegation: Delegation,
     pub(crate) product_agents: Arc<dyn zuno_tools::product_agent::ProductAgentHost>,
     pub(crate) workflows: Arc<dyn zuno_tools::workflow::WorkflowHost>,
@@ -226,20 +228,9 @@ pub(crate) fn assemble(
             .register_builtin(BuiltinSlot::Task, erase(task.clone()))
             .map_err(|error| error.to_string())?;
     }
-    if let Some(workflows) = &config.workflows
-        && !workflows.is_empty()
-    {
-        let agents = config
-            .agent
-            .as_ref()
-            .ok_or_else(|| "workflows require configured agents".to_owned())?;
-        for (name, workflow) in workflows {
-            workflow.validate(name, agents)?;
-        }
+    if !selection.capability.workflows.is_empty() {
         let workflow = zuno_tools::workflow::WorkflowTool::new(
-            workflows
-                .iter()
-                .map(|(name, workflow)| (name.to_owned(), workflow.clone())),
+            selection.capability.workflows.clone(),
             task,
             Arc::clone(&selection.workflows),
         )?;

@@ -167,18 +167,21 @@ impl ProductAgentHost for NativeProductAgentHost {
         let job_id = super::turn::prefixed_id("job");
         let delivery = db_delivery(request.report_delivery);
         self.jobs
-            .create(NewAgentJob::new(
-                job_id.clone(),
-                request.parent_session_id.clone(),
-                JobSubject::product_agent(
-                    run_id.clone(),
-                    request.product.clone(),
-                    request.instance.clone(),
-                    request.tool.clone(),
-                ),
-                delivery,
-                zuno_db::message::now_millis(),
-            ))
+            .create(
+                NewAgentJob::new(
+                    job_id.clone(),
+                    request.parent_session_id.clone(),
+                    JobSubject::product_agent(
+                        run_id.clone(),
+                        request.product.clone(),
+                        request.instance.clone(),
+                        request.tool.clone(),
+                    ),
+                    delivery,
+                    zuno_db::message::now_millis(),
+                )
+                .with_orchestration_snapshot(request.parent_attempt.as_deref().cloned()),
+            )
             .map_err(to_string)?;
 
         let jobs = self.jobs.clone();

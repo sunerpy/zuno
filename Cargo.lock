@@ -6251,6 +6251,7 @@ dependencies = [
  "zuno-memory",
  "zuno-network",
  "zuno-observability",
+ "zuno-orchestration",
  "zuno-paths",
  "zuno-permission",
  "zuno-process",
@@ -6308,6 +6309,7 @@ dependencies = [
  "tempfile",
  "uuid",
  "zuno-error",
+ "zuno-orchestration",
  "zuno-paths",
  "zuno-snapshot",
  "zuno-testkit",
@@ -6335,6 +6337,7 @@ dependencies = [
  "zuno-error",
  "zuno-llm",
  "zuno-observability",
+ "zuno-orchestration",
  "zuno-paths",
  "zuno-permission",
  "zuno-runtime",
@@ -6537,6 +6540,8 @@ name = "zuno-orchestration"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
 ]
 
@@ -6834,6 +6839,7 @@ dependencies = [
  "uuid",
  "zuno-config",
  "zuno-error",
+ "zuno-orchestration",
  "zuno-paths",
  "zuno-permission",
 ]
@@ -6873,6 +6879,7 @@ dependencies = [
  "zuno-llm",
  "zuno-memory",
  "zuno-network",
+ "zuno-orchestration",
  "zuno-paths",
  "zuno-permission",
  "zuno-pty",

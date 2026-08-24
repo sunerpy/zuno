@@ -517,7 +517,15 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             effort: request.effort,
             extension_composition: super::turn::ExtensionComposition::Active,
         };
-        let plan = TurnPlan::resolve(&options, &self.environment).await?;
+        let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
+        let parent_attempt = request.parent_attempt.as_deref().ok_or_else(|| {
+            "delegated child turn is missing the immutable parent Attempt snapshot".to_owned()
+        })?;
+        plan.inherit_orchestration(
+            parent_attempt,
+            request.workflow.as_deref(),
+            request.workflow_node.as_deref(),
+        )?;
         let mut host = TurnHost::open_with_runtime_mcp_and_database(
             plan,
             &self.environment,
@@ -742,13 +750,16 @@ impl ChildTurnHost for ChildSessionHost {
             ToolReportDelivery::Quiet => DbReportDelivery::Quiet,
         };
         self.job_store
-            .create(NewAgentJob::new(
-                job_id.clone(),
-                request.parent_session_id.clone(),
-                JobSubject::child_session(session_id.clone()),
-                delivery,
-                zuno_db::message::now_millis(),
-            ))
+            .create(
+                NewAgentJob::new(
+                    job_id.clone(),
+                    request.parent_session_id.clone(),
+                    JobSubject::child_session(session_id.clone()),
+                    delivery,
+                    zuno_db::message::now_millis(),
+                )
+                .with_orchestration_snapshot(request.parent_attempt.as_deref().cloned()),
+            )
             .map_err(|error| ChildTurnError::Host(error.to_string()))?;
 
         let runner = Arc::clone(&self.runner);

@@ -99,6 +99,9 @@ impl Fixture {
     fn request(&self, parent: &str) -> ChildTurnRequest {
         ChildTurnRequest {
             parent_session_id: parent.to_owned(),
+            parent_attempt: None,
+            workflow: None,
+            workflow_node: None,
             resume_session_id: None,
             agent: "worker".to_owned(),
             description: Some("a delegated unit".to_owned()),

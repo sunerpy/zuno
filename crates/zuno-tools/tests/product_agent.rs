@@ -3,6 +3,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use zuno_error::ToolError;
+use zuno_orchestration::AttemptSnapshot;
 use zuno_tool::{
     AllowAll, InterruptHandle, NeverInterrupted, PermissionAsk, PermissionAsker, Tool, ToolContext,
     ToolReplayPolicy, ToolUiIntent, erase,
@@ -108,6 +109,40 @@ fn context(
     )
 }
 
+fn orchestration_snapshot() -> Arc<AttemptSnapshot> {
+    Arc::new(
+        serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "turnId": "turn-parent",
+            "step": 1,
+            "capability": {
+                "schemaVersion": 1,
+                "pack": {"id":"test","version":"1","upstreamRevision":"test"},
+                "extensionRevision": 0,
+                "permissionPolicySha256": "policy",
+                "profiles": [], "presets": [], "workflows": [], "skills": []
+            },
+            "owner": {
+                "sessionId":"ses_parent", "parentSessionId":null, "parentAttempt":null,
+                "workflow":null, "workflowNode":null
+            },
+            "agent": {
+                "name":"build", "sourceId":"test://build",
+                "definitionSha256":"definition", "permissionSha256":"permission",
+                "promptPolicySha256":"prompt"
+            },
+            "model": {
+                "providerId":"fake", "modelId":"fake-model", "wireModelId":"fake-model",
+                "surface":"responses", "reasoningSha256":"reasoning", "preset":null
+            },
+            "selectedSkills": [],
+            "prompt": {"eventId":"evt-parent","assemblySha256":"assembly","actualSha256":"actual"},
+            "tools": []
+        }))
+        .expect("test orchestration snapshot"),
+    )
+}
+
 fn erased(host: Arc<dyn ProductAgentHost>) -> Arc<dyn Tool> {
     erase(ProductAgentTool::new(
         "subagent_codex",
@@ -147,6 +182,7 @@ async fn foreground_dispatch_carries_identity_and_uses_the_product_envelope() {
         output: "native final answer".to_owned(),
     })));
     let permission = Arc::new(RecordingPermission::default());
+    let snapshot = orchestration_snapshot();
     let output = erased(Arc::clone(&host) as Arc<dyn ProductAgentHost>)
         .invoke(
             json!({
@@ -157,7 +193,8 @@ async fn foreground_dispatch_carries_identity_and_uses_the_product_envelope() {
             context(
                 Arc::clone(&permission) as Arc<dyn PermissionAsker>,
                 Arc::new(NeverInterrupted),
-            ),
+            )
+            .with_orchestration_snapshot(Arc::clone(&snapshot)),
         )
         .await
         .expect("foreground product agent");
@@ -184,6 +221,13 @@ async fn foreground_dispatch_carries_identity_and_uses_the_product_envelope() {
     assert_eq!(requests[0].product, "codex");
     assert_eq!(requests[0].tool, "subagent_codex");
     assert!(!requests[0].background);
+    assert!(Arc::ptr_eq(
+        requests[0]
+            .parent_attempt
+            .as_ref()
+            .expect("product parent attempt"),
+        &snapshot
+    ));
     let asks = permission
         .0
         .lock()
