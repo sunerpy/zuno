@@ -1,6 +1,7 @@
 # Cordis Semantics Adoption Roadmap
 
-Status: proposed, 2026-08-24.
+Status: Phase 0 and the named-capability registry foundation are implemented,
+2026-08-25; dependency-closure reconciliation and product adoption remain.
 
 ## Decision
 
@@ -20,6 +21,19 @@ product problems:
 The first implementation remains internal to the Zuno workspace. Extraction into
 an independent crate is a later decision gated by real reuse and API stability,
 not a prerequisite for product work.
+
+The first native slice is now implemented in `zuno-runtime`. It keeps executable
+Rust services on the typed plane and adds a descriptor-only named plane with
+validated keys, contracts, provenance, scope-local generations, parent/child
+shadowing, atomic publication, withdrawal before cleanup, stale-generation
+detection, and lifecycle projection. `PrepareContext` can provide and require a
+named descriptor, and the observed provider generation is recorded in component
+requirements.
+
+This slice does not yet publish tool, Agent Profile, Workflow Template, or Skill
+descriptors from product components. It also does not implement minimal affected
+dependency closure, parking/reactivation, the event/policy bus, or runtime package
+activation. Those remain later phases and must use the same lifecycle authority.
 
 This refines, rather than reverses, the decision in
 [Native Component Lifecycle Kernel](component-lifecycle-kernel.md): Zuno adopts
@@ -106,18 +120,22 @@ out of scope.
 
 ## Problems still worth solving
 
-### 1. Dynamic capabilities are not first-class
+### 1. Dynamic capabilities need product adoption
 
-The native service plane is indexed by Rust `TypeId`. That is correct for
-compiled components but cannot express a capability selected by a manifest,
-MCP server, workflow, remote host, or model-authored package using a stable
-runtime name.
+The native service plane remains indexed by Rust `TypeId`, while the runtime now
+also owns stable named capability descriptors for dynamic boundaries. The
+registry foundation can express identity, contract, provenance, owner,
+availability, and generation without storing an unchecked executable value.
 
-Replacing `TypeId` with strings would discard useful compile-time safety. Zuno
-needs two coordinated service planes instead:
+Replacing `TypeId` with strings would discard useful compile-time safety, so the
+two coordinated planes remain intentionally distinct:
 
 - typed services for native Rust composition;
 - named capabilities for dynamic and cross-process composition.
+
+The remaining gap is vertical adoption: manifests, MCP, workflows, remote hosts,
+tools, Agent Profiles, Workflow Templates, and Skills do not yet publish their
+descriptors through this registry.
 
 ### 2. Recomposition is correct but coarse
 
@@ -125,8 +143,8 @@ Every local mutation prepares a complete candidate composition. This keeps
 replacement safe, but a small provider or contribution change can restart
 unrelated components.
 
-The runtime records requirements and ownership, but it does not yet maintain the
-provider generation observed by each consumer or calculate the minimal affected
+The runtime records requirements, ownership, and the named provider generation
+observed by each consumer, but it does not yet calculate the minimal affected
 closure.
 
 ### 3. Hooks are not one lifecycle-owned event model
@@ -190,7 +208,7 @@ There is one lifecycle authority. Registries, buses, loaders, and adapters retur
 owned handles or deferred effects to that authority; none invents an independent
 definition of “stopped”.
 
-## Proposed capability model
+## Implemented capability registry foundation
 
 The public shape should remain small:
 
@@ -213,6 +231,8 @@ pub struct CapabilityDescriptor {
     pub owner: ComponentId,
     pub generation: u64,
     pub contract: CapabilityContract,
+    pub provenance: CapabilityProvenance,
+    pub availability: CapabilityAvailability,
 }
 ```
 
@@ -232,8 +252,9 @@ Rules:
 8. A capability contract describes compatibility and schema; it is not an
    unchecked `Any` map.
 
-The first version does not need distributed discovery, semantic version solving,
-or arbitrary service migration.
+The implemented first version deliberately omits distributed discovery, semantic
+version solving, arbitrary service migration, and executable values in the named
+registry.
 
 ## Dependency reconciliation
 

@@ -50,6 +50,8 @@ facts and require an explicit compensating action.
 - provide typed services;
 - require typed services staged by an earlier component or inherited from a
   parent scope;
+- provide or require validated runtime-named capability descriptors while native
+  executable objects remain on the typed service plane;
 - register deferred effects;
 - validate configuration.
 
@@ -79,12 +81,14 @@ Every mutation builds a complete candidate composition:
 
 1. validate component and bundle identifiers;
 2. prepare all candidate components against a staging service view;
-3. mark the runtime `Stopping` and make old local services unavailable;
+3. mark the runtime `Stopping` and make old local services and named capability
+   routes unavailable;
 4. stop the previous composition completely;
 5. if any old effect is not known stopped, mark the runtime `Uncertain` and do
    not start the candidate;
 6. start candidate effects in component order;
-7. publish all candidate services atomically and mark every component `Active`;
+7. publish all candidate services and named capability descriptors atomically,
+   then mark every component `Active`;
 8. if candidate start fails, stop the partial candidate and restore the previous
    definition through a fresh prepare/start cycle;
 9. if restoration fails, expose no local services and mark the runtime
@@ -130,6 +134,7 @@ The following registrations must be acquired through an `EffectScope` adapter:
 | Resource | Stop contract |
 | --- | --- |
 | Typed service | Remove before stopping dependent activity |
+| Named capability route | Withdraw its exact owner/generation before provider cleanup |
 | Tool/provider/hook/route registration | Remove exact registration handle |
 | Tokio task | Cancel and await `JoinHandle` |
 | Guarded process tree | Request guard shutdown, let it settle the contained group, then reap the guard |
@@ -247,6 +252,11 @@ The native foundation and critical product boundaries are now in place:
 - Runtime tools use the native permission, strict-HITL, replay, concurrency, and
   UI-intent pipeline. Routing is withdrawn before reverse-order shutdown; a lost
   response or cleanup failure becomes `Uncertain`.
+- Native composition now has coordinated typed and named planes. Named
+  descriptors carry a validated key, contract, provenance, owner, runtime scope,
+  monotonic generation, and availability; duplicate local keys fail before any
+  effect starts, child scopes shadow and reveal parent descriptors, and stale
+  generations are detectable without putting executable values in a string map.
 - Runtime/component state and cleanup diagnostics are projected through
   frontend-neutral snapshot values.
 

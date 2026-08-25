@@ -5002,6 +5002,7 @@ mod tests {
                 provides: vec!["tools".to_owned()],
                 requires: Vec::new(),
             }],
+            capabilities: Vec::new(),
             diagnostics: vec![LifecycleDiagnostic {
                 component_id: "zuno.mcp".to_owned(),
                 effect_id: "remote".to_owned(),

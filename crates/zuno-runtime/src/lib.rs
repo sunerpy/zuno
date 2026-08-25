@@ -5,6 +5,13 @@
 //! starting a candidate, publishes services only after every effect starts, and
 //! records any cleanup outcome that cannot be proven stopped.
 
+mod capability;
+
+pub use capability::{
+    CapabilityAvailability, CapabilityContract, CapabilityDefinitionError, CapabilityDescriptor,
+    CapabilityKey, CapabilityProvenance, CapabilityScope, CapabilityVersion,
+};
+
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use std::any::{Any, TypeId, type_name};
@@ -182,6 +189,7 @@ pub struct RuntimeSnapshot {
     pub state: LifecycleState,
     pub profile_id: Option<String>,
     pub components: Vec<ComponentSnapshot>,
+    pub capabilities: Vec<CapabilityDescriptor>,
     pub diagnostics: Vec<LifecycleDiagnostic>,
 }
 
@@ -264,6 +272,8 @@ struct ServiceEntry {
 #[derive(Default)]
 struct ScopeState {
     services: HashMap<TypeId, Vec<ServiceEntry>>,
+    capabilities: HashMap<CapabilityKey, CapabilityDescriptor>,
+    capability_generations: HashMap<CapabilityKey, u64>,
 }
 
 struct ScopeInner {
@@ -338,9 +348,54 @@ impl Scope {
         })
     }
 
-    fn replace_all(&self, components: Vec<(String, Vec<StagedService>)>) {
+    fn capability(&self, key: &CapabilityKey) -> Option<CapabilityDescriptor> {
+        self.capability_with_owner(key, &HashSet::new())
+    }
+
+    fn capability_with_owner(
+        &self,
+        key: &CapabilityKey,
+        hidden_local_owners: &HashSet<String>,
+    ) -> Option<CapabilityDescriptor> {
+        let local = {
+            let state = self.inner.state.lock().expect("scope state poisoned");
+            state
+                .capabilities
+                .get(key)
+                .filter(|descriptor| !hidden_local_owners.contains(descriptor.owner()))
+                .cloned()
+        };
+        local.or_else(|| {
+            self.inner.parent.as_ref().and_then(|parent| {
+                Scope {
+                    inner: Arc::clone(parent),
+                }
+                .capability_with_owner(key, &HashSet::new())
+            })
+        })
+    }
+
+    fn next_capability_generation(&self, key: &CapabilityKey) -> Result<u64, RuntimeError> {
+        self.inner
+            .state
+            .lock()
+            .expect("scope state poisoned")
+            .capability_generations
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| RuntimeError::CapabilityGenerationExhausted(key.clone()))
+    }
+
+    fn replace_all(
+        &self,
+        components: Vec<(String, Vec<StagedService>)>,
+        capabilities: Vec<CapabilityDescriptor>,
+    ) {
         let mut state = self.inner.state.lock().expect("scope state poisoned");
         state.services.clear();
+        state.capabilities.clear();
         for (owner, services) in components {
             for service in services {
                 state
@@ -353,15 +408,20 @@ impl Scope {
                     });
             }
         }
+        for descriptor in capabilities {
+            state
+                .capability_generations
+                .insert(descriptor.key().clone(), descriptor.generation());
+            state
+                .capabilities
+                .insert(descriptor.key().clone(), descriptor);
+        }
     }
 
     fn clear(&self) {
-        self.inner
-            .state
-            .lock()
-            .expect("scope state poisoned")
-            .services
-            .clear();
+        let mut state = self.inner.state.lock().expect("scope state poisoned");
+        state.services.clear();
+        state.capabilities.clear();
     }
 }
 
@@ -392,7 +452,24 @@ struct ActiveEffect {
 #[derive(Clone)]
 struct Requirement {
     owner: String,
-    service: &'static str,
+    key: RequirementKey,
+}
+
+#[derive(Clone)]
+enum RequirementKey {
+    Typed(&'static str),
+    Named { key: CapabilityKey, generation: u64 },
+}
+
+impl fmt::Display for RequirementKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Typed(service) => formatter.write_str(service),
+            Self::Named { key, generation } => {
+                write!(formatter, "{key} generation {generation}")
+            }
+        }
+    }
 }
 
 /// Side-effect-free context passed to one component preparation.
@@ -400,8 +477,10 @@ pub struct PrepareContext {
     component_id: String,
     scope: Scope,
     candidate_services: Vec<OwnedService>,
+    candidate_capabilities: Vec<CapabilityDescriptor>,
     hidden_owners: Arc<HashSet<String>>,
     services: Vec<StagedService>,
+    capabilities: Vec<CapabilityDescriptor>,
     effects: Vec<PreparedEffect>,
     requirements: Vec<Requirement>,
 }
@@ -411,14 +490,17 @@ impl PrepareContext {
         component_id: String,
         scope: Scope,
         candidate_services: Vec<OwnedService>,
+        candidate_capabilities: Vec<CapabilityDescriptor>,
         hidden_owners: Arc<HashSet<String>>,
     ) -> Self {
         Self {
             component_id,
             scope,
             candidate_services,
+            candidate_capabilities,
             hidden_owners,
             services: Vec::new(),
+            capabilities: Vec::new(),
             effects: Vec::new(),
             requirements: Vec::new(),
         }
@@ -476,9 +558,74 @@ impl PrepareContext {
         let (owner, service) = resolved.ok_or(RuntimeError::MissingService(name))?;
         self.requirements.push(Requirement {
             owner,
-            service: name,
+            key: RequirementKey::Typed(name),
         });
         Ok(service)
+    }
+
+    /// Stage one runtime-named capability descriptor.
+    ///
+    /// The descriptor contains no executable value. Native providers continue to
+    /// expose their executable interface through [`Self::provide`], while dynamic
+    /// consumers resolve this stable identity, contract, generation, and provenance.
+    pub fn provide_capability(
+        &mut self,
+        key: CapabilityKey,
+        contract: CapabilityContract,
+        provenance: CapabilityProvenance,
+    ) -> Result<(), RuntimeError> {
+        if self
+            .capabilities
+            .iter()
+            .chain(self.candidate_capabilities.iter())
+            .any(|candidate| candidate.key() == &key)
+        {
+            return Err(RuntimeError::DuplicateCapability(key));
+        }
+        let generation = self.scope.next_capability_generation(&key)?;
+        self.capabilities.push(CapabilityDescriptor::available(
+            key,
+            self.component_id.clone(),
+            self.scope.name().to_owned(),
+            generation,
+            contract,
+            provenance,
+        ));
+        Ok(())
+    }
+
+    /// Resolve and record one runtime-named capability generation.
+    pub fn require_capability(
+        &mut self,
+        key: &CapabilityKey,
+    ) -> Result<CapabilityDescriptor, RuntimeError> {
+        let own = self
+            .capabilities
+            .iter()
+            .rev()
+            .find(|candidate| candidate.key() == key)
+            .cloned();
+        let candidate = own.or_else(|| {
+            self.candidate_capabilities
+                .iter()
+                .rev()
+                .find(|candidate| candidate.key() == key)
+                .cloned()
+        });
+        let descriptor = candidate
+            .or_else(|| {
+                self.scope
+                    .capability_with_owner(key, self.hidden_owners.as_ref())
+            })
+            .ok_or_else(|| RuntimeError::MissingCapability(key.clone()))?;
+        self.requirements.push(Requirement {
+            owner: descriptor.owner().to_owned(),
+            key: RequirementKey::Named {
+                key: key.clone(),
+                generation: descriptor.generation(),
+            },
+        });
+        Ok(descriptor)
     }
 
     /// Register a deferred side effect.
@@ -523,8 +670,20 @@ impl PrepareContext {
         Ok(())
     }
 
-    fn into_parts(self) -> (Vec<StagedService>, Vec<PreparedEffect>, Vec<Requirement>) {
-        (self.services, self.effects, self.requirements)
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<StagedService>,
+        Vec<CapabilityDescriptor>,
+        Vec<PreparedEffect>,
+        Vec<Requirement>,
+    ) {
+        (
+            self.services,
+            self.capabilities,
+            self.effects,
+            self.requirements,
+        )
     }
 }
 
@@ -570,6 +729,7 @@ impl CompositionDefinition {
 struct PreparedComponent {
     definition: ComponentDefinition,
     services: Vec<StagedService>,
+    capabilities: Vec<CapabilityDescriptor>,
     effects: Vec<PreparedEffect>,
     requirements: Vec<Requirement>,
 }
@@ -582,7 +742,7 @@ struct PreparedComposition {
 struct ActiveComponent {
     definition: ComponentDefinition,
     effects: Vec<ActiveEffect>,
-    provides: Vec<&'static str>,
+    provides: Vec<String>,
     requirements: Vec<Requirement>,
 }
 
@@ -596,15 +756,11 @@ impl ActiveComponent {
                 .iter()
                 .map(|effect| effect.id.clone())
                 .collect(),
-            provides: self
-                .provides
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect(),
+            provides: self.provides.iter().map(ToOwned::to_owned).collect(),
             requires: self
                 .requirements
                 .iter()
-                .map(|requirement| format!("{} <- {}", requirement.service, requirement.owner))
+                .map(|requirement| format!("{} <- {}", requirement.key, requirement.owner))
                 .collect(),
         }
     }
@@ -614,6 +770,7 @@ struct StartedComposition {
     definition: CompositionDefinition,
     active: Vec<ActiveComponent>,
     services: Vec<(String, Vec<StagedService>)>,
+    capabilities: Vec<CapabilityDescriptor>,
 }
 
 struct RuntimeState {
@@ -621,6 +778,7 @@ struct RuntimeState {
     definition: CompositionDefinition,
     active: Vec<ActiveComponent>,
     components: Vec<ComponentSnapshot>,
+    capabilities: Vec<CapabilityDescriptor>,
     diagnostics: Vec<LifecycleDiagnostic>,
     children: Vec<Weak<HarnessRuntimeInner>>,
 }
@@ -632,6 +790,7 @@ impl Default for RuntimeState {
             definition: CompositionDefinition::default(),
             active: Vec::new(),
             components: Vec::new(),
+            capabilities: Vec::new(),
             diagnostics: Vec::new(),
             children: Vec::new(),
         }
@@ -686,6 +845,7 @@ impl HarnessRuntime {
             state: state.phase,
             profile_id: state.definition.profile_id(),
             components: state.components.clone(),
+            capabilities: state.capabilities.clone(),
             diagnostics: state.diagnostics.clone(),
         }
     }
@@ -726,6 +886,19 @@ impl HarnessRuntime {
         T: ?Sized + Send + Sync + 'static,
     {
         self.inner.scope.service::<T>()
+    }
+
+    /// Resolve the nearest named capability in this runtime's scope chain.
+    #[must_use]
+    pub fn capability(&self, key: &CapabilityKey) -> Option<CapabilityDescriptor> {
+        self.inner.scope.capability(key)
+    }
+
+    /// Whether a previously resolved descriptor is still the routable generation.
+    #[must_use]
+    pub fn capability_is_current(&self, descriptor: &CapabilityDescriptor) -> bool {
+        descriptor.availability() == CapabilityAvailability::Available
+            && self.capability(descriptor.key()).as_ref() == Some(descriptor)
     }
 
     /// Return the active profile identifier.
@@ -874,6 +1047,9 @@ impl HarnessRuntime {
                 .iter()
                 .map(|component| component.snapshot(LifecycleState::Stopping))
                 .collect();
+            for descriptor in &mut state.capabilities {
+                descriptor.withdraw();
+            }
             self.inner.scope.clear();
             std::mem::take(&mut state.active)
         };
@@ -977,11 +1153,16 @@ impl HarnessRuntime {
     }
 
     fn publish_inner(&self, started: StartedComposition, diagnostic: Option<LifecycleDiagnostic>) {
-        self.inner.scope.replace_all(started.services);
+        let StartedComposition {
+            definition,
+            active,
+            services,
+            capabilities,
+        } = started;
+        self.inner.scope.replace_all(services, capabilities.clone());
         let mut state = self.inner.state.lock().expect("runtime state poisoned");
-        state.definition = started.definition;
-        state.components = started
-            .active
+        state.definition = definition;
+        state.components = active
             .iter()
             .map(|component| component.snapshot(LifecycleState::Active))
             .collect();
@@ -990,7 +1171,8 @@ impl HarnessRuntime {
         } else {
             LifecycleState::Active
         };
-        state.active = started.active;
+        state.active = active;
+        state.capabilities = capabilities;
         if let Some(diagnostic) = diagnostic {
             state.diagnostics.push(diagnostic);
         }
@@ -1018,6 +1200,9 @@ impl HarnessRuntime {
         let mut state = self.inner.state.lock().expect("runtime state poisoned");
         state.active.clear();
         state.components = components;
+        for descriptor in &mut state.capabilities {
+            descriptor.withdraw();
+        }
         state.phase = LifecycleState::Uncertain;
         state.diagnostics.extend(diagnostics);
     }
@@ -1030,6 +1215,9 @@ impl HarnessRuntime {
         let mut state = self.inner.state.lock().expect("runtime state poisoned");
         state.active.clear();
         state.components = definition_snapshots(definition, LifecycleState::Failed);
+        for descriptor in &mut state.capabilities {
+            descriptor.withdraw();
+        }
         state.phase = LifecycleState::Failed;
         state.diagnostics.extend(diagnostics);
     }
@@ -1081,23 +1269,27 @@ async fn prepare_composition(
 ) -> Result<PreparedComposition, RuntimeError> {
     let hidden_owners = Arc::new(previous.component_ids());
     let mut candidate_services = Vec::<OwnedService>::new();
+    let mut candidate_capabilities = Vec::<CapabilityDescriptor>::new();
     let mut prepared = Vec::new();
     for component in definition.components() {
         let mut context = PrepareContext::new(
             component.id.clone(),
             scope.clone(),
             candidate_services.clone(),
+            candidate_capabilities.clone(),
             Arc::clone(&hidden_owners),
         );
         component.component.prepare(&mut context).await?;
-        let (services, effects, requirements) = context.into_parts();
+        let (services, capabilities, effects, requirements) = context.into_parts();
         candidate_services.extend(services.iter().cloned().map(|service| OwnedService {
             owner: component.id.clone(),
             service,
         }));
+        candidate_capabilities.extend(capabilities.iter().cloned());
         prepared.push(PreparedComponent {
             definition: component,
             services,
+            capabilities,
             effects,
             requirements,
         });
@@ -1121,10 +1313,12 @@ async fn start_composition(
     let definition = prepared.definition;
     let mut active = Vec::<ActiveComponent>::new();
     let mut services = Vec::new();
+    let mut capabilities = Vec::new();
     for component in prepared.components {
         let PreparedComponent {
             definition: component_definition,
             services: component_services,
+            capabilities: component_capabilities,
             effects,
             requirements,
         } = component;
@@ -1140,10 +1334,7 @@ async fn start_composition(
                     active.push(ActiveComponent {
                         definition: component_definition.clone(),
                         effects: active_effects,
-                        provides: component_services
-                            .iter()
-                            .map(|service| service.name)
-                            .collect(),
+                        provides: provided_names(&component_services, &component_capabilities),
                         requirements: requirements.clone(),
                     });
                     let cleanup_failures = stop_components(active, stop_timeout).await;
@@ -1162,13 +1353,11 @@ async fn start_composition(
             }
         }
         services.push((component_definition.id.clone(), component_services.clone()));
+        capabilities.extend(component_capabilities.iter().cloned());
         active.push(ActiveComponent {
             definition: component_definition,
             effects: active_effects,
-            provides: component_services
-                .iter()
-                .map(|service| service.name)
-                .collect(),
+            provides: provided_names(&component_services, &component_capabilities),
             requirements,
         });
     }
@@ -1176,7 +1365,25 @@ async fn start_composition(
         definition,
         active,
         services,
+        capabilities,
     })
+}
+
+fn provided_names(
+    services: &[StagedService],
+    capabilities: &[CapabilityDescriptor],
+) -> Vec<String> {
+    services
+        .iter()
+        .map(|service| service.name.to_owned())
+        .chain(capabilities.iter().map(|descriptor| {
+            format!(
+                "{} generation {}",
+                descriptor.key(),
+                descriptor.generation()
+            )
+        }))
+        .collect()
 }
 
 async fn stop_components(
@@ -1232,6 +1439,9 @@ fn shutdown_inner(inner: Arc<HarnessRuntimeInner>) -> BoxFuture<'static, Vec<Lif
                     .iter()
                     .map(|component| component.snapshot(LifecycleState::Stopping))
                     .collect();
+                for descriptor in &mut state.capabilities {
+                    descriptor.withdraw();
+                }
             }
             (
                 std::mem::take(&mut state.children),
@@ -1267,6 +1477,7 @@ fn shutdown_inner(inner: Arc<HarnessRuntimeInner>) -> BoxFuture<'static, Vec<Lif
         } else if new_diagnostics.is_empty() {
             state.phase = LifecycleState::Closed;
             state.components.clear();
+            state.capabilities.clear();
         } else {
             state.phase = LifecycleState::Uncertain;
             if local_failures.is_empty() {
@@ -1371,6 +1582,15 @@ pub enum RuntimeError {
     /// One component tried to register the same typed service twice.
     #[error("service `{0}` is already staged by this component")]
     DuplicateService(&'static str),
+    /// A required runtime-named capability was absent.
+    #[error("required capability `{0}` is not registered")]
+    MissingCapability(CapabilityKey),
+    /// One local candidate declared the same runtime-named capability twice.
+    #[error("capability `{0}` is already staged in this runtime scope")]
+    DuplicateCapability(CapabilityKey),
+    /// A scope exhausted the monotonic generation counter for one capability.
+    #[error("capability `{0}` exhausted its generation counter")]
+    CapabilityGenerationExhausted(CapabilityKey),
     /// One component registered the same effect id twice.
     #[error("component `{component}` registered effect `{effect}` more than once")]
     DuplicateEffect { component: String, effect: String },

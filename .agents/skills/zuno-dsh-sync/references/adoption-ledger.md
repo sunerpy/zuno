@@ -76,6 +76,21 @@ direct model ownership of a mutable memory workspace: consolidation remains an
 audited, deduplicated, and undoable add/replace/remove candidate. The upstream
 delta remains empty and the baseline does not move.
 
+## 2026-08-25 no-delta review
+
+`dsh_delta.py` resolved both the recorded baseline and current `origin/master`
+to `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` (`dsh-v0.1.1-rc.2`). There were
+no unreviewed commits, so the baseline JSON remains unchanged.
+
+The first Cordis-semantics implementation slice was classified `adapt`. Zuno
+keeps native typed executable services and adds a descriptor-only named
+capability plane with validated identity, contracts, provenance, scope-local
+generations, parent/child shadowing, atomic publication, withdrawal before
+cleanup, and stale-generation detection. It does not adopt the Cordis JavaScript
+ABI, a Rust dylib ABI, or `cordis-rs`'s synchronous lifecycle model. Product
+descriptor publication, dependency-closure reconciliation, and the async
+event/policy bus remain later work; the DSH baseline does not move.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

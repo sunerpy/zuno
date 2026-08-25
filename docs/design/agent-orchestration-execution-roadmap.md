@@ -80,7 +80,8 @@ system. They should be completed and simplified rather than reimplemented.
 - A model-facing `apply_patch` tool using the `*** Begin Patch` grammar.
 - Read-digest freshness checks for `edit` and `write`.
 - A Tokio-native component kernel with async prepare/effect/dispose,
-  transactional replacement, reverse cleanup, and `Uncertain`.
+  transactional replacement, reverse cleanup, `Uncertain`, and a descriptor-only
+  named capability registry beside typed native services.
 
 ### Remaining correctness gaps
 
@@ -106,8 +107,9 @@ system. They should be completed and simplified rather than reimplemented.
    operation fails, after which Zuno can only report `Uncertain`.
 8. Prompt receipts still lack a complete redacted manifest of final provider
    request ordering and the exact advertised tool-schema digests.
-9. Agent/workflow/Skill contributions are not yet first-class transactional
-   named capabilities.
+9. The named capability registry foundation is implemented, but
+   Agent/workflow/Skill contributions are not yet published through it as
+   first-class transactional capabilities.
 10. Worktrees created for delegated implementation are not yet a
     lifecycle-owned, quota-controlled resource.
 
