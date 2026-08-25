@@ -781,6 +781,12 @@ pub enum PromptSubmission {
         source: String,
         arguments: String,
     },
+    /// One native Council launcher request whose user text remains unmodified.
+    Council {
+        text: String,
+        preset: String,
+        question: String,
+    },
     /// A session-local operation executed by the runtime host.
     Host(HostCommand),
     /// Explicitly retain a submission in the durable FIFO even if the active turn ends
@@ -817,6 +823,8 @@ pub struct SessionCatalog {
     pub presets: Vec<String>,
     /// The preset currently in use.
     pub preset: Option<String>,
+    /// Native Council presets reachable by the current Agent profile.
+    pub councils: Vec<crate::views::picker::CouncilEntry>,
     /// Whether the model in use accepts a reasoning level at all.
     ///
     /// Stated by the host from the resolved catalog, because the view cannot know it: a
@@ -1471,6 +1479,9 @@ impl SessionScreen {
             SlashSubmission::Host(HostCommand::Preset(Some(preset))) => {
                 self.select_preset(&preset);
             }
+            SlashSubmission::Host(HostCommand::Council(arguments)) => {
+                self.submit_council(text, &arguments);
+            }
             SlashSubmission::Host(HostCommand::Plan) => {
                 if self.plan_mode_active() {
                     self.request_start_work();
@@ -1548,6 +1559,86 @@ impl SessionScreen {
         }
         self.toasts.push(Toast::new(level, notice));
         EventResult::REDRAW
+    }
+
+    fn request_council_picker(&mut self) {
+        if self.catalog.councils.is_empty() {
+            self.toasts.push(Toast::warning(
+                "Council is unavailable for the current Agent; switch to a delegating Agent such as orchestrator",
+            ));
+            return;
+        }
+        self.requested
+            .push(Box::new(crate::views::picker::council_picker(
+                self.context.clone(),
+                self.catalog.councils.clone(),
+            )));
+    }
+
+    fn select_council_preset(&mut self, preset: &str) -> EventResult {
+        if self.catalog.councils.is_empty() {
+            self.request_council_picker();
+            return EventResult::REDRAW;
+        }
+        if !self
+            .catalog
+            .councils
+            .iter()
+            .any(|entry| entry.name == preset)
+        {
+            self.toasts.push(Toast::warning(format!(
+                "Council preset `{preset}` is unavailable; choose one of: {}",
+                self.catalog
+                    .councils
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+            return EventResult::REDRAW;
+        }
+        self.editor.set_text(&format!("/council {preset} "));
+        self.refresh_autocomplete();
+        self.toasts.push(Toast::info(format!(
+            "Council preset `{preset}` selected; describe the question and send"
+        )));
+        EventResult::REDRAW
+    }
+
+    fn submit_council(&mut self, text: String, arguments: &str) {
+        if self.catalog.councils.is_empty() {
+            self.request_council_picker();
+            return;
+        }
+        let arguments = arguments.trim();
+        if arguments.is_empty() {
+            self.request_council_picker();
+            return;
+        }
+        let split = arguments
+            .find(char::is_whitespace)
+            .unwrap_or(arguments.len());
+        let preset = arguments[..split].trim();
+        let question = arguments[split..].trim();
+        if !self
+            .catalog
+            .councils
+            .iter()
+            .any(|entry| entry.name == preset)
+        {
+            self.select_council_preset(preset);
+            return;
+        }
+        if question.is_empty() {
+            self.select_council_preset(preset);
+            return;
+        }
+        let submission = PromptSubmission::Council {
+            text: text.clone(),
+            preset: preset.to_owned(),
+            question: question.to_owned(),
+        };
+        self.submit_to_driver(text, submission);
     }
 
     fn select_collaboration_agent(&mut self, agent: &str) {
@@ -1629,6 +1720,7 @@ impl SessionScreen {
                     | PromptSubmission::Content { .. }
                     | PromptSubmission::Command { .. }
                     | PromptSubmission::Skill { .. }
+                    | PromptSubmission::Council { .. }
                     | PromptSubmission::Queue(_)
                     | PromptSubmission::Steer(_)
             );
@@ -3436,6 +3528,9 @@ impl SessionScreen {
                 Selection::Agent(value.to_owned())
             }
             crate::views::picker::PRESET_DIALOG_ID => return self.select_preset(value),
+            crate::views::picker::COUNCIL_DIALOG_ID => {
+                return self.select_council_preset(value);
+            }
             crate::views::picker::SESSION_DIALOG_ID => {
                 if self.catalog.session.as_deref() == Some(value) {
                     self.toasts.push(Toast::new(

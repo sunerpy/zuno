@@ -287,6 +287,15 @@ pub(crate) struct CatalogModelChoice {
     pub provider: String,
 }
 
+/// One frozen native Council preset the active Agent may launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CouncilChoice {
+    /// Stable preset name accepted by `council_run`.
+    pub name: String,
+    /// Human-readable seat, quorum, and concurrency summary.
+    pub description: String,
+}
+
 /// Everything resolved from configuration, with no handle open yet.
 pub(crate) struct TurnPlan {
     profile: zuno_runtime::HarnessProfile,
@@ -824,6 +833,35 @@ impl TurnPlan {
         self.presets.selected()
     }
 
+    /// Council presets the final Agent profile can actually expose.
+    pub(crate) fn council_choices(&self) -> Vec<CouncilChoice> {
+        let definition = self.agent.definition();
+        let allowed_by_agent = definition
+            .tools
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|tool| tool == zuno_tools::COUNCIL_WIRE_ID));
+        let visible_by_rule = !zuno_permission::visibility::is_tool_hidden(
+            zuno_tools::COUNCIL_WIRE_ID,
+            self.agent.capabilities().rules(),
+        );
+        if !self.agent.capabilities().can_delegate() || !allowed_by_agent || !visible_by_rule {
+            return Vec::new();
+        }
+        self.capability
+            .councils
+            .iter()
+            .map(|preset| CouncilChoice {
+                name: preset.name.clone(),
+                description: format!(
+                    "{} seats · quorum {} · up to {} parallel",
+                    preset.seats.len(),
+                    preset.quorum,
+                    preset.max_parallel
+                ),
+            })
+            .collect()
+    }
+
     /// The exact skill set shared by prompt assembly and the `skill` tool.
     pub(crate) fn skills(&self) -> &zuno_catalog::skill::Skills {
         &self.skills
@@ -1189,6 +1227,20 @@ pub(crate) struct SelectedSkillIdentity {
     pub(crate) source: String,
 }
 
+#[derive(Debug, Clone)]
+struct PromptRouting {
+    id: &'static str,
+    source: &'static str,
+    content: String,
+}
+
+struct DriveInputOptions<'a> {
+    message_id: Option<&'a str>,
+    content: Option<&'a [RequestContentBlock]>,
+    persistence: UserInputPersistence,
+    routing: Option<PromptRouting>,
+}
+
 /// An open database, an assembled tool set, and the session a turn runs in.
 pub(crate) struct TurnHost {
     profile_runtime: HarnessRuntime,
@@ -1209,6 +1261,7 @@ pub(crate) struct TurnHost {
     resolver: Resolver,
     skills: Arc<zuno_catalog::skill::Skills>,
     selected_skills: BTreeSet<SelectedSkillIdentity>,
+    council_presets: Vec<String>,
     dispatcher: ToolRegistryDispatcher,
     tool_concurrency: ToolConcurrencyLimit,
     session_id: String,
@@ -2220,6 +2273,12 @@ impl TurnHost {
                 AuthorizationPolicy::from_mode(plan.config.permission_mode()),
                 McpToolStatus::Ready,
             );
+            let council_presets = plan
+                .capability
+                .councils
+                .iter()
+                .map(|preset| preset.name.clone())
+                .collect();
             let tool_concurrency = ToolConcurrencyLimit::new(concurrency.tool_calls)
                 .expect("configuration validates tool concurrency");
             Ok(Self {
@@ -2234,6 +2293,7 @@ impl TurnHost {
                 resolver: plan.resolver,
                 skills: plan.skills,
                 selected_skills,
+                council_presets,
                 dispatcher,
                 tool_concurrency,
                 session_id: prepared.identity.id().to_owned(),
@@ -3158,6 +3218,33 @@ impl TurnHost {
         .await
     }
 
+    /// Drive one native Council launcher while keeping the user's slash text intact.
+    pub(crate) async fn drive_council(
+        &mut self,
+        text: &str,
+        preset: &str,
+        question: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let routing = self.council_routing(preset, question)?;
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input_routed(
+            text,
+            DriveInputOptions {
+                message_id: None,
+                content: None,
+                persistence: UserInputPersistence::AdmitAndPromote,
+                routing: Some(routing),
+            },
+            &guard,
+            events,
+        )
+        .await
+    }
+
     pub(crate) async fn drive_with_message_id(
         &mut self,
         prompt: &str,
@@ -3337,6 +3424,79 @@ impl TurnHost {
         .await
     }
 
+    /// Drive a promoted native Council launcher with its one-turn routing contract.
+    pub(crate) async fn drive_promoted_council(
+        &mut self,
+        text: &str,
+        preset: &str,
+        question: &str,
+        message_id: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let routing = self.council_routing(preset, question)?;
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input_routed(
+            text,
+            DriveInputOptions {
+                message_id: Some(message_id),
+                content: None,
+                persistence: UserInputPersistence::AlreadyPromoted,
+                routing: Some(routing),
+            },
+            &guard,
+            events,
+        )
+        .await
+    }
+
+    fn council_routing(&self, preset: &str, question: &str) -> Result<PromptRouting, String> {
+        use zuno_engine::r#loop::ToolDispatcher as _;
+
+        if !self
+            .dispatcher
+            .available_tools()
+            .definitions
+            .iter()
+            .any(|definition| definition.id == zuno_tools::COUNCIL_WIRE_ID)
+        {
+            return Err(
+                "Council is unavailable for the active Agent; switch to a delegating Agent such as orchestrator"
+                    .to_owned(),
+            );
+        }
+        let preset = preset.trim();
+        if !self
+            .council_presets
+            .iter()
+            .any(|candidate| candidate == preset)
+        {
+            return Err(format!(
+                "unknown Council preset `{preset}`; choose one of: {}",
+                self.council_presets.join(", ")
+            ));
+        }
+        if question.trim().is_empty() {
+            return Err("Council question must not be empty".to_owned());
+        }
+        Ok(PromptRouting {
+            id: "routing.council",
+            source: "zuno-tui:/council",
+            content: format!(
+                "The latest user message is a native `/council` launcher request. Invoke \
+                 `council_run` exactly once before replying. Use preset `{preset}`; copy the \
+                 question exactly from the text after that preset in the latest user message; \
+                 set `background` to `true`; and set `reportDelivery` to `nextStep`. Do not \
+                 replace the Council with manual `task` calls or change its frozen seats, \
+                 quorum, concurrency, retry, deadline, or synthesis policy. Once the tool \
+                 accepts the run, report its durable job id briefly; the completed synthesis \
+                 will return through the normal next-step report path."
+            ),
+        })
+    }
+
     async fn load_selected_skill(
         &mut self,
         name: &str,
@@ -3373,6 +3533,27 @@ impl TurnHost {
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        self.drive_input_routed(
+            prompt,
+            DriveInputOptions {
+                message_id,
+                content,
+                persistence,
+                routing: None,
+            },
+            guard,
+            events,
+        )
+        .await
+    }
+
+    async fn drive_input_routed(
+        &mut self,
+        prompt: &str,
+        options: DriveInputOptions<'_>,
+        guard: &SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
         self.require_active_extension_composition()?;
         let newly_loaded = preload_explicit_skills(
             &mut self.resolver,
@@ -3400,12 +3581,12 @@ impl TurnHost {
                 provider_id: &self.provider_id,
                 model_id: &self.model_id,
                 text: prompt,
-                message_id,
+                message_id: options.message_id,
                 now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
             },
-            content,
+            options.content,
         )?;
-        let materialized = match persistence {
+        let materialized = match options.persistence {
             UserInputPersistence::AdmitAndPromote => self.persist_user_input(&message, &parts)?,
             UserInputPersistence::AlreadyPromoted => {
                 self.persist_promoted_user_input(&message, &parts)?;
@@ -3427,7 +3608,9 @@ impl TurnHost {
             .map_err(to_string)?;
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
-        let result = self.drive_input_unaccounted(guard, events.clone()).await;
+        let result = self
+            .drive_input_unaccounted(guard, options.routing.as_ref(), events.clone())
+            .await;
         match result {
             Ok(outcome) => {
                 self.last_turn_completed = outcome
@@ -3447,6 +3630,7 @@ impl TurnHost {
     async fn drive_input_unaccounted(
         &mut self,
         guard: &SessionRunGuard,
+        routing: Option<&PromptRouting>,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
         let outcome = self.run_prelude().await?;
@@ -3457,7 +3641,7 @@ impl TurnHost {
             return Ok(None);
         }
         let dynamic_context = self.goal_dynamic_context().map_err(TurnFailure::host)?;
-        self.execute_turn_unaccounted(dynamic_context, guard, events)
+        self.execute_turn_unaccounted(dynamic_context, routing, guard, events)
             .await
     }
 
@@ -3622,20 +3806,32 @@ impl TurnHost {
         report_prelude(&events, &self.notes, &prelude)
             .await
             .map_err(TurnFailure::event_consumer)?;
-        self.execute_turn_unaccounted(dynamic_context, prepared.run_guard(), events)
+        self.execute_turn_unaccounted(dynamic_context, None, prepared.run_guard(), events)
             .await
     }
 
     async fn execute_turn_unaccounted(
         &mut self,
         dynamic_context: DynamicContext,
+        routing: Option<&PromptRouting>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<Option<TurnOutcome>, TurnFailure> {
+        let routed_resolver = routing
+            .map(|routing| {
+                self.resolver.with_prompt_section(
+                    routing.id,
+                    routing.source,
+                    routing.content.clone(),
+                )
+            })
+            .transpose()
+            .map_err(TurnFailure::host)?;
+        let resolver = routed_resolver.as_ref().unwrap_or(&self.resolver);
         let context = TurnContext::new(
             &mut self.connection,
             &self.providers,
-            &self.resolver,
+            resolver,
             &self.dispatcher,
             guard.interrupt_signal(),
         )
@@ -5600,6 +5796,7 @@ fn session_reasoning_options(
     options
 }
 
+#[derive(Clone)]
 struct Resolver {
     requested_agent: String,
     system_prompt: String,
@@ -5646,6 +5843,17 @@ impl AgentModelResolver for Resolver {
 }
 
 impl Resolver {
+    fn with_prompt_section(
+        &self,
+        id: impl Into<String>,
+        source: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<Self, String> {
+        let mut routed = self.clone();
+        routed.append_prompt_section(id, source, content)?;
+        Ok(routed)
+    }
+
     fn append_selected_skill(
         &mut self,
         name: impl Into<String>,

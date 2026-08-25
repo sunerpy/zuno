@@ -100,6 +100,27 @@ fn preset_is_a_host_command_and_preserves_an_optional_name() {
 }
 
 #[test]
+fn council_is_a_host_command_and_preserves_the_preset_and_question() {
+    assert_eq!(
+        route("/council"),
+        SlashSubmission::Host(HostCommand::Council(String::new()))
+    );
+    assert_eq!(
+        route("/council balanced-review Should we ship this design?"),
+        SlashSubmission::Host(HostCommand::Council(
+            "balanced-review Should we ship this design?".to_owned()
+        ))
+    );
+    let router = SlashRouter::default();
+    let command = router
+        .commands()
+        .iter()
+        .find(|command| command.name == "council")
+        .expect("/council is absent from autocomplete");
+    assert!(matches!(command.kind, SlashCommandKind::Host(_)));
+}
+
+#[test]
 fn plan_controls_are_host_commands_and_never_model_text() {
     assert_eq!(route("/plan"), SlashSubmission::Host(HostCommand::Plan));
     assert_eq!(

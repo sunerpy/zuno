@@ -176,6 +176,28 @@ reasoning choice overrides that team route for the top-level Agent while the
 preset continues to route delegations. The choice is session-local runtime
 state; set the top-level `preset` key to make a team the startup default.
 
+## Native Council launcher
+
+The TUI exposes `/council` only when the active Agent's final capability
+snapshot can actually reach the native `council_run` tool. For example, the
+native `orchestrator` Agent exposes it while a non-delegating `build` Agent does
+not. An Agent tool allowlist or permission rule that hides `council_run` also
+hides the launcher, so the picker cannot advertise a run the dispatcher would
+later reject.
+
+- `/council` opens the frozen Council preset picker.
+- `/council <preset> <question>` launches that preset for the exact question.
+- A launch submitted during an active turn enters the durable FIFO queue; it is
+  not used as a mid-turn steering message.
+
+The exact slash text remains the durable user message. For that turn only, Zuno
+adds a typed `routing.council` developer-context block that requires one
+permission-gated `council_run` invocation with background execution and
+`nextStep` report delivery. It does not synthesize assistant/tool history or
+create a second Council executor. The existing native service continues to own
+seat isolation, concurrency, retry, deadline, quorum, cancellation, synthesis,
+durable job state, and parent report delivery.
+
 ## Context compaction
 
 Zuno can compact older conversation history before the model window is exhausted:

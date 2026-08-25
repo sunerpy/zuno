@@ -44,6 +44,8 @@ pub const MODEL_DIALOG_ID: &str = "model_list";
 pub const AGENT_DIALOG_ID: &str = "agent_list";
 /// The dialog id for the model-team preset picker.
 pub const PRESET_DIALOG_ID: &str = "preset_list";
+/// The dialog id for the native Council preset picker.
+pub const COUNCIL_DIALOG_ID: &str = "council_list";
 /// The dialog id for the theme picker.
 pub const THEME_DIALOG_ID: &str = "theme_list";
 /// The dialog id for the MCP server list.
@@ -1601,6 +1603,15 @@ pub struct AgentEntry {
     pub description: String,
 }
 
+/// One native Council preset offered by the active Agent profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CouncilEntry {
+    /// Stable preset name accepted by `council_run`.
+    pub name: String,
+    /// Frozen seat, quorum, and concurrency summary.
+    pub description: String,
+}
+
 /// The agent picker.
 #[must_use]
 pub fn agent_picker(context: ViewContext, agents: Vec<AgentEntry>) -> SelectDialog {
@@ -1629,6 +1640,22 @@ pub fn preset_picker(
         Some(selected) => dialog.selecting(selected),
         None => dialog,
     }
+}
+
+/// Native Council presets reachable by the active Agent profile.
+#[must_use]
+pub fn council_picker(context: ViewContext, mut councils: Vec<CouncilEntry>) -> SelectDialog {
+    councils.sort_by(|left, right| left.name.cmp(&right.name));
+    councils.dedup_by(|left, right| left.name == right.name);
+    let items = councils
+        .into_iter()
+        .map(|council| {
+            Item::new(council.name.clone())
+                .described(council.description)
+                .valued(council.name)
+        })
+        .collect();
+    SelectDialog::new(COUNCIL_DIALOG_ID, "Council", context, items)
 }
 
 /// The discovered skills, as a filterable list.

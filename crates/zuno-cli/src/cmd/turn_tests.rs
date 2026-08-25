@@ -3024,6 +3024,42 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
 }
 
 #[test]
+fn council_picker_matches_the_final_agent_capability_snapshot() {
+    let directory = tempfile::TempDir::new().expect("temporary turn workspace");
+    let path = directory.path().to_string_lossy();
+
+    let mut orchestrator = plan(&path, SessionChoice::New);
+    orchestrator.capability = test_capability_with_council();
+    orchestrator.agent = agent_profile(
+        agent("orchestrator"),
+        directory.path(),
+        &orchestrator.config,
+    );
+    assert_eq!(
+        orchestrator.council_choices(),
+        vec![CouncilChoice {
+            name: "balanced-review".to_owned(),
+            description: "3 seats · quorum 2 · up to 3 parallel".to_owned(),
+        }]
+    );
+
+    let mut build = plan(&path, SessionChoice::New);
+    build.capability = test_capability_with_council();
+    assert!(
+        build.council_choices().is_empty(),
+        "a non-delegating Agent must not advertise a launcher its dispatcher removes"
+    );
+
+    let mut restricted = agent("orchestrator");
+    restricted.tools = Some(vec!["read".to_owned()]);
+    orchestrator.agent = agent_profile(restricted, directory.path(), &orchestrator.config);
+    assert!(
+        orchestrator.council_choices().is_empty(),
+        "an explicit tool allowlist must also hide the launcher"
+    );
+}
+
+#[test]
 fn production_registry_uses_the_frozen_profile_rules() {
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
@@ -4331,6 +4367,40 @@ mod skill_prompt {
 
     fn resolver() -> Resolver {
         traced_resolver("AGENT PROMPT")
+    }
+
+    #[test]
+    fn council_routing_is_typed_and_scoped_to_one_resolver_clone() {
+        let resolver = resolver();
+        let routed = resolver
+            .with_prompt_section(
+                "routing.council",
+                "zuno-tui:/council",
+                "Invoke council_run exactly once.",
+            )
+            .expect("Council routing block");
+
+        let base = resolver
+            .prompt_assembly
+            .as_ref()
+            .expect("structured base prompt")
+            .envelope();
+        let routed_envelope = routed
+            .prompt_assembly
+            .as_ref()
+            .expect("structured routed prompt")
+            .envelope();
+        assert!(base.routing.is_empty());
+        assert_eq!(routed_envelope.routing.len(), 1);
+        assert_eq!(
+            routed_envelope.routing[0].content(),
+            "Invoke council_run exactly once."
+        );
+        assert_eq!(resolver.system_prompt, "AGENT PROMPT");
+        assert_eq!(
+            routed.system_prompt,
+            "AGENT PROMPT\n\nInvoke council_run exactly once."
+        );
     }
 
     #[test]

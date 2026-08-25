@@ -519,6 +519,15 @@ runner. The TUI reports both states separately. On restart, queued jobs settle a
 `cancelled` because execution never began; running jobs settle as `uncertain` and
 are not replayed.
 
+`/council` is a TUI launcher over that same native execution path, not another
+scheduler. The current Agent must expose `council_run`; otherwise no Council
+preset is advertised. Zuno persists the user's original slash message and adds a
+one-turn `routing.council` prompt block to the cloned resolver. That block asks
+the Agent to invoke `council_run` exactly once with background execution and
+`nextStep` delivery, while the base resolver remains byte-identical for later
+turns. A launch entered while another turn is active waits in the durable input
+queue instead of steering the in-flight model generation.
+
 ```json
 {
   "concurrency": {

@@ -1576,6 +1576,14 @@ async fn session_catalog(
         agent: Some(plan.agent_name().to_owned()),
         presets: plan.preset_names(),
         preset: plan.preset_name().map(str::to_owned),
+        councils: plan
+            .council_choices()
+            .into_iter()
+            .map(|choice| zuno_tui::views::picker::CouncilEntry {
+                name: choice.name,
+                description: choice.description,
+            })
+            .collect(),
         reasoning: plan.reasoning_supported(),
         reasoning_efforts,
         effort: plan.effort(),
@@ -2144,6 +2152,7 @@ fn queued_submission_display(submission: &PromptSubmission) -> (String, bool) {
             ),
             false,
         ),
+        PromptSubmission::Council { text, .. } => (text.clone(), false),
         PromptSubmission::Host(command) => (
             match command {
                 HostCommand::Compact => "/compact".to_owned(),
@@ -2152,6 +2161,7 @@ fn queued_submission_display(submission: &PromptSubmission) -> (String, bool) {
                 HostCommand::Goal(arguments) => format!("/goal {arguments}"),
                 HostCommand::Preset(Some(preset)) => format!("/preset {preset}"),
                 HostCommand::Preset(None) => "/preset".to_owned(),
+                HostCommand::Council(arguments) => format!("/council {arguments}"),
                 HostCommand::Plan => "/plan".to_owned(),
                 HostCommand::StartPlan => "/start-plan".to_owned(),
                 HostCommand::StartWork => "/start-work".to_owned(),
@@ -2943,6 +2953,25 @@ async fn drive_submission(
             host.drive_promoted_skill(&name, &source, &arguments, message_id, events)
                 .await
         }
+        (
+            PromptSubmission::Council {
+                text,
+                preset,
+                question,
+            },
+            None,
+        ) => host.drive_council(&text, &preset, &question, events).await,
+        (
+            PromptSubmission::Council {
+                text,
+                preset,
+                question,
+            },
+            Some(message_id),
+        ) => {
+            host.drive_promoted_council(&text, &preset, &question, message_id, events)
+                .await
+        }
         (PromptSubmission::Host(_), _) => {
             unreachable!("host submissions are handled before a turn is started")
         }
@@ -3000,6 +3029,7 @@ fn soft_interrupt(
         }
         PromptSubmission::Command { .. }
         | PromptSubmission::Skill { .. }
+        | PromptSubmission::Council { .. }
         | PromptSubmission::Host(_)
         | PromptSubmission::Queue(_)
         | PromptSubmission::Steer(_) => return None,
@@ -3211,6 +3241,9 @@ async fn restore_snapshot(
         HostCommand::Preset(_) => {
             return Err("preset controls must be handled by the TUI selection layer".to_owned());
         }
+        HostCommand::Council(_) => {
+            return Err("Council controls must be handled by the TUI submission layer".to_owned());
+        }
         HostCommand::Plan | HostCommand::StartPlan | HostCommand::StartWork => {
             return Err("plan mode controls must be handled by the TUI selection layer".to_owned());
         }
@@ -3273,6 +3306,9 @@ async fn execute_host_command(
         }
         HostCommand::Preset(_) => {
             return Err("preset controls must be handled by the TUI selection layer".to_owned());
+        }
+        HostCommand::Council(_) => {
+            return Err("Council controls must be handled by the TUI submission layer".to_owned());
         }
         HostCommand::Stop(_) => {
             return Err("background stop must be handled by the TUI background service".to_owned());

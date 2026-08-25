@@ -112,6 +112,8 @@ pub enum HostCommand {
     Goal(String),
     /// Select a configured model-team preset, or open the picker when omitted.
     Preset(Option<String>),
+    /// Launch a native Council preset, or open the picker when omitted.
+    Council(String),
     /// Interactively enter or leave Plan mode.
     Plan,
     /// Enter Plan mode without another prompt.
@@ -265,6 +267,9 @@ impl SlashRouter {
             SlashCommandKind::Host(HostCommand::Preset(_)) => SlashSubmission::Host(
                 HostCommand::Preset((!arguments.is_empty()).then_some(arguments)),
             ),
+            SlashCommandKind::Host(HostCommand::Council(_)) => {
+                SlashSubmission::Host(HostCommand::Council(arguments))
+            }
             SlashCommandKind::Host(command) => SlashSubmission::Host(command.clone()),
         }
     }
@@ -427,6 +432,12 @@ fn ui_commands() -> Vec<SlashCommand> {
                 aliases: Vec::new(),
                 description: "Switch the configured model team, or choose one".to_owned(),
                 kind: SlashCommandKind::Host(HostCommand::Preset(None)),
+            },
+            SlashCommand {
+                name: "council".to_owned(),
+                aliases: Vec::new(),
+                description: "Run a native multi-agent Council preset".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Council(String::new())),
             },
             SlashCommand {
                 name: "plan".to_owned(),

@@ -1846,6 +1846,7 @@ fn catalog() -> SessionCatalog {
         agent: Some(String::from("build")),
         presets: Vec::new(),
         preset: None,
+        councils: Vec::new(),
         reasoning: false,
         reasoning_efforts: Default::default(),
         effort: None,
@@ -1912,6 +1913,82 @@ fn session_screen_named_preset_switches_without_opening_a_picker() {
     assert_eq!(
         chosen.try_recv(),
         Ok(Selection::Preset(String::from("fast")))
+    );
+}
+
+#[test]
+fn session_screen_council_command_opens_the_picker_and_prefills_the_composer() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let mut catalog = catalog();
+    catalog.councils = vec![crate::views::picker::CouncilEntry {
+        name: String::from("balanced-review"),
+        description: String::from("3 seats · quorum 2 · up to 3 parallel"),
+    }];
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_catalog(catalog);
+
+    screen.submit_prompt("/council");
+
+    let requested = screen.drain_dialogs();
+    assert_eq!(requested.len(), 1, "the Council picker was not requested");
+    assert_eq!(requested[0].id(), crate::views::picker::COUNCIL_DIALOG_ID);
+
+    screen.adopt(crate::views::picker::COUNCIL_DIALOG_ID, "balanced-review");
+    assert_eq!(screen.editor.text(), "/council balanced-review ");
+}
+
+#[test]
+fn session_screen_complete_council_command_keeps_the_user_text_and_typed_request() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut catalog = catalog();
+    catalog.councils = vec![crate::views::picker::CouncilEntry {
+        name: String::from("balanced-review"),
+        description: String::from("3 seats · quorum 2 · up to 3 parallel"),
+    }];
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_catalog(catalog);
+    let input = "/council balanced-review Should we ship this design?";
+
+    screen.submit_prompt(input);
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Council {
+            text: input.to_owned(),
+            preset: String::from("balanced-review"),
+            question: String::from("Should we ship this design?"),
+        })
+    );
+    assert_eq!(screen.submissions(), [input]);
+}
+
+#[test]
+fn session_screen_running_council_is_queued_even_when_force_send_is_requested() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let mut catalog = catalog();
+    catalog.councils = vec![crate::views::picker::CouncilEntry {
+        name: String::from("balanced-review"),
+        description: String::from("3 seats · quorum 2 · up to 3 parallel"),
+    }];
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_catalog(catalog);
+    screen.status.mark_running();
+    let input = "/council balanced-review Should we ship this design?";
+
+    screen.submit(input.to_owned(), true);
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(PromptSubmission::Queue(Box::new(
+            PromptSubmission::Council {
+                text: input.to_owned(),
+                preset: String::from("balanced-review"),
+                question: String::from("Should we ship this design?"),
+            }
+        )))
     );
 }
 

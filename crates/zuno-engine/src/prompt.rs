@@ -384,7 +384,7 @@ fn semantics(id: &str) -> PromptSemantics {
         || id.starts_with("work_state.")
     {
         ("work_state", "runtime", 900)
-    } else if id == "skills.policy" || id == "extensions" {
+    } else if id == "skills.policy" || id == "extensions" || id.starts_with("routing.") {
         ("routing", "native", 825)
     } else if id.starts_with("skills.selected") {
         ("selected_skill", "user", 800)
@@ -502,6 +502,26 @@ mod tests {
             prompt.provider_projection(),
             "KERNEL\n\nBUILD ROLE\n\nPLAN MODE\n\nGLOBAL\n\nPROJECT\n\nFULL SKILL\n\nSKILLS"
         );
+    }
+
+    #[test]
+    fn routing_prefix_enters_the_typed_routing_section() {
+        let mut prompt = PromptAssembly::new();
+        prompt
+            .push(
+                "routing.council",
+                "zuno-tui:/council",
+                "Invoke council_run exactly once.",
+            )
+            .expect("routing block");
+
+        let envelope = prompt.envelope();
+        assert_eq!(envelope.routing.len(), 1);
+        assert_eq!(
+            envelope.routing[0].content(),
+            "Invoke council_run exactly once."
+        );
+        assert!(envelope.runtime_policy.is_empty());
     }
 
     #[test]
