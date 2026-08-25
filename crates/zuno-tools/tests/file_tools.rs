@@ -901,11 +901,40 @@ fn file_apply_patch_description_defines_selection_and_recovery_rules() {
         "Do not resend the same patch",
         "uncertain",
         "Use `write` only",
+        "`git apply --check`",
+        "structured `edit`",
+        "not Git metadata",
+        "`git reset --hard`",
+        "`git checkout --`",
     ] {
         assert!(
             description.contains(clause),
             "apply_patch description is missing `{clause}`:\n{description}"
         );
+    }
+}
+
+#[test]
+fn file_edit_and_write_descriptions_define_git_independent_stale_read_recovery() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tools = FileTools::new(workspace.path()).expect("file tools");
+
+    for (name, description) in [
+        ("edit", tools.edit.description()),
+        ("write", tools.write.description()),
+    ] {
+        for clause in [
+            "exact bytes recorded by `read`",
+            "does not depend on a Git repository",
+            "re-read",
+            "`git reset --hard`",
+            "`git checkout --`",
+        ] {
+            assert!(
+                description.contains(clause),
+                "{name} description is missing `{clause}`:\n{description}"
+            );
+        }
     }
 }
 

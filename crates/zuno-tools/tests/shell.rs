@@ -61,6 +61,28 @@ fn params(command: impl Into<String>) -> ShellParams {
 }
 
 #[test]
+fn shell_description_bounds_git_apply_and_defines_non_destructive_recovery() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tool = ShellTool::new(workspace.path()).expect("shell tool");
+    let description = tool.description();
+
+    for clause in [
+        "prefer native `apply_patch` or structured `edit`",
+        "read every affected existing file",
+        "`git apply --check`",
+        "not a stale-read or rollback authority",
+        "`--3way` or `--reject`",
+        "`git reset --hard`",
+        "`git checkout --`",
+    ] {
+        assert!(
+            description.contains(clause),
+            "bash description is missing `{clause}`:\n{description}"
+        );
+    }
+}
+
+#[test]
 fn shell_compound_command_extracts_each_permission_resource_and_matches_real_rules() {
     let analysis =
         analyze_command("cd /tmp && git push origin main", ShellSyntax::Bash).expect("valid bash");

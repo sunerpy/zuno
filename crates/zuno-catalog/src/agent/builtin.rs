@@ -627,7 +627,7 @@ mod tests {
                     "Do not declare completion from intent",
                     "authoritative evidence",
                     "Do not delegate or simulate a child Agent",
-                    "use apply_patch",
+                    "native `apply_patch`",
                 ],
             ),
             (
@@ -649,7 +649,7 @@ mod tests {
                     "without delegating",
                     "owning abstraction",
                     "interruption and recovery",
-                    "use write only for a new file",
+                    "`write` only for new files",
                 ],
             ),
         ];
@@ -667,6 +667,31 @@ mod tests {
                 "{name} prompt grew to {words} words; concise role policy belongs here, not a \
                  second harness manual"
             );
+        }
+    }
+
+    #[test]
+    fn writing_agent_prompts_define_preflighted_git_apply_and_safe_fallback() {
+        for (name, prompt) in [
+            ("orchestrator", PROMPT_ORCHESTRATOR),
+            ("build", PROMPT_BUILD),
+            ("deep", PROMPT_DEEP),
+            ("fixer", PROMPT_FIXER),
+            ("general", PROMPT_GENERAL),
+        ] {
+            for clause in [
+                "`git apply --check`",
+                "Git metadata is not the freshness authority",
+                "re-read",
+                "smaller native patch/edit",
+                "`git reset --hard`",
+                "`git checkout --`",
+            ] {
+                assert!(
+                    prompt.contains(clause),
+                    "{name} prompt is missing `{clause}`:\n{prompt}"
+                );
+            }
         }
     }
 
@@ -705,7 +730,7 @@ mod tests {
                 160,
                 [
                     "smallest sufficient change",
-                    "use write only",
+                    "`write` only",
                     "uncertain side effect",
                 ],
             ),

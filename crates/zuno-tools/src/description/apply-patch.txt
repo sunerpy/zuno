@@ -4,10 +4,13 @@ Selection:
 - Prefer this tool over a full-file rewrite for existing hand-edited files.
 - Do not use it for generated files or bulk mechanical rewrites; run the owning generator, formatter, or narrowly scoped transformation instead.
 - Use `write` only for a new file best expressed as complete content or an intentional full replacement after reading the current file.
+- `git apply` is a shell fallback only for an already-supplied standard unified diff whose provenance and target paths you understand. Read every affected existing file and run `git apply --check` before the real command. Freshness comes from current file bytes and patch context, not Git metadata.
 
 Recovery:
 - All sections are parsed and verified before the first filesystem change. If a hunk header or context no longer matches, read the affected file and retry with a smaller patch using fresh, unique context.
 - Do not resend the same patch after a verification failure.
+- If `git apply --check` or `git apply` fails, stop and re-read every affected file. Translate the smallest still-required change to native `apply_patch` or structured `edit` when exposed; do not mechanically retry the failed diff.
+- Do not add `--3way` or `--reject` as automatic recovery, because they can change merge semantics or leave partial artifacts. Never use `git reset --hard` or `git checkout --` to make a patch fit.
 - If the result is `uncertain`, some paths may already have changed. Inspect every reported path before retrying; never replay the patch mechanically.
 
 Format:
