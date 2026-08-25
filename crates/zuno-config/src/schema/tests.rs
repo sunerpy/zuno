@@ -282,6 +282,16 @@ fn compaction_threshold_percent_is_typed_and_bounded() {
 }
 
 #[test]
+fn web_search_accepts_an_explicit_profile_master_switch() {
+    let disabled =
+        parse(r#"{"web_search":{"enabled":false}}"#).expect("the web-search master switch parses");
+    assert_eq!(
+        serde_json::to_value(disabled).expect("web-search config serializes")["web_search"]["enabled"],
+        false
+    );
+}
+
+#[test]
 fn permission_rejects_unknown_policy_keys() {
     let error = parse(r#"{"permission":{"mode":"strict","remember":true}}"#)
         .expect_err("permission must not silently ignore unknown policy fields");

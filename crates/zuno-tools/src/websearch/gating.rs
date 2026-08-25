@@ -10,9 +10,6 @@ pub const ENV_PROVIDER: &str = "ZUNO_WEB_SEARCH_PROVIDER";
 /// Enables the Exa MCP backend without requiring a key.
 pub const ENV_ENABLE_EXA: &str = "ZUNO_WEB_SEARCH_ENABLE_EXA";
 
-/// Enables the Parallel MCP backend without requiring a key.
-pub const ENV_ENABLE_PARALLEL: &str = "ZUNO_WEB_SEARCH_ENABLE_PARALLEL";
-
 /// Exa API key.
 pub const ENV_EXA_API_KEY: &str = "EXA_API_KEY";
 
@@ -70,12 +67,10 @@ impl Provider {
 /// Search-provider configuration resolved once at profile mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchConfig {
-    /// Explicit backend, when configured.
-    pub provider: Option<Provider>,
-    /// Whether Exa may be selected.
-    pub enable_exa: bool,
-    /// Whether Parallel may be selected.
-    pub enable_parallel: bool,
+    /// Selected backend after profile and environment precedence.
+    pub provider: Provider,
+    /// Whether the selected backend is enabled for this profile.
+    pub enabled: bool,
     /// Exa credential.
     pub exa_api_key: Option<String>,
     /// Parallel credential.
@@ -91,9 +86,8 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            provider: None,
-            enable_exa: false,
-            enable_parallel: false,
+            provider: Provider::Exa,
+            enabled: true,
             exa_api_key: None,
             parallel_api_key: None,
             max_queries: super::DEFAULT_MAX_QUERIES,
@@ -114,25 +108,7 @@ impl SearchConfig {
     /// Resolve through a caller-provided lookup.
     #[must_use]
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
-        let exa_api_key = lookup(ENV_EXA_API_KEY).filter(|value| !value.trim().is_empty());
-        let parallel_api_key =
-            lookup(ENV_PARALLEL_API_KEY).filter(|value| !value.trim().is_empty());
-        Self {
-            provider: lookup(ENV_PROVIDER).as_deref().and_then(Provider::parse),
-            enable_exa: lookup(ENV_ENABLE_EXA).is_some_and(|value| is_truthy(&value))
-                || exa_api_key.is_some(),
-            enable_parallel: lookup(ENV_ENABLE_PARALLEL).is_some_and(|value| is_truthy(&value))
-                || parallel_api_key.is_some(),
-            exa_api_key,
-            parallel_api_key,
-            max_queries: positive_usize(lookup(ENV_MAX_QUERIES))
-                .unwrap_or(super::DEFAULT_MAX_QUERIES),
-            max_results: positive_usize(lookup(ENV_MAX_RESULTS))
-                .unwrap_or(super::DEFAULT_MAX_RESULTS),
-            timeout: positive_u64(lookup(ENV_TIMEOUT_MS))
-                .map(Duration::from_millis)
-                .unwrap_or(super::mcp::TIMEOUT),
-        }
+        Self::from_profile(lookup, None)
     }
 
     /// Resolve profile settings, with environment values taking precedence.
@@ -141,33 +117,53 @@ impl SearchConfig {
         lookup: impl Fn(&str) -> Option<String>,
         profile: Option<&WebSearchConfig>,
     ) -> Self {
-        let env_provider = lookup(ENV_PROVIDER);
+        let exa_api_key = lookup(ENV_EXA_API_KEY).filter(|value| !value.trim().is_empty());
+        let parallel_api_key =
+            lookup(ENV_PARALLEL_API_KEY).filter(|value| !value.trim().is_empty());
+        let env_provider = lookup(ENV_PROVIDER).as_deref().and_then(Provider::parse);
+        let env_enable_exa = lookup(ENV_ENABLE_EXA).as_deref().and_then(parse_bool);
+        let profile_enabled = profile.and_then(|config| config.enabled).unwrap_or(true);
+        let profile_provider =
+            profile
+                .and_then(|config| config.provider)
+                .map(|provider| match provider {
+                    WebSearchBackend::Exa => Provider::Exa,
+                    WebSearchBackend::Parallel => Provider::Parallel,
+                });
+        let provider = env_provider.or(profile_provider).unwrap_or_else(|| {
+            if parallel_api_key.is_some() && exa_api_key.is_none() && env_enable_exa != Some(true) {
+                Provider::Parallel
+            } else {
+                Provider::Exa
+            }
+        });
+        let enabled = match provider {
+            Provider::Exa => env_enable_exa.unwrap_or(profile_enabled),
+            Provider::Parallel => profile_enabled,
+        };
         let env_max_queries = lookup(ENV_MAX_QUERIES);
         let env_max_results = lookup(ENV_MAX_RESULTS);
         let env_timeout = lookup(ENV_TIMEOUT_MS);
-        let mut resolved = Self::from_lookup(&lookup);
-
-        if env_provider.is_none()
-            && let Some(provider) = profile.and_then(|config| config.provider)
-        {
-            resolved.provider = Some(match provider {
-                WebSearchBackend::Exa => Provider::Exa,
-                WebSearchBackend::Parallel => Provider::Parallel,
-            });
-        }
-        if env_max_queries.is_none()
-            && let Some(value) = profile.and_then(|config| config.max_queries)
-        {
+        let mut resolved = Self {
+            provider,
+            enabled,
+            exa_api_key,
+            parallel_api_key,
+            ..Self::default()
+        };
+        if let Some(value) = positive_usize(env_max_queries) {
+            resolved.max_queries = value;
+        } else if let Some(value) = profile.and_then(|config| config.max_queries) {
             resolved.max_queries = usize::try_from(value.get()).unwrap_or(usize::MAX);
         }
-        if env_max_results.is_none()
-            && let Some(value) = profile.and_then(|config| config.max_results)
-        {
+        if let Some(value) = positive_usize(env_max_results) {
+            resolved.max_results = value;
+        } else if let Some(value) = profile.and_then(|config| config.max_results) {
             resolved.max_results = usize::try_from(value.get()).unwrap_or(usize::MAX);
         }
-        if env_timeout.is_none()
-            && let Some(value) = profile.and_then(|config| config.timeout_ms)
-        {
+        if let Some(value) = positive_u64(env_timeout) {
+            resolved.timeout = Duration::from_millis(value);
+        } else if let Some(value) = profile.and_then(|config| config.timeout_ms) {
             resolved.timeout = Duration::from_millis(value.get());
         }
         resolved
@@ -183,11 +179,12 @@ impl SearchConfig {
     }
 }
 
-fn is_truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn positive_usize(value: Option<String>) -> Option<usize> {
@@ -198,35 +195,33 @@ fn positive_u64(value: Option<String>) -> Option<u64> {
     value?.trim().parse().ok().filter(|value| *value > 0)
 }
 
-/// Whether the profile has at least one usable search provider.
+/// Whether the selected provider is enabled and has every required credential.
 #[must_use]
-pub fn web_search_enabled(config: &SearchConfig) -> bool {
-    config.provider.is_some() || config.enable_exa || config.enable_parallel
+pub fn web_search_usable(config: &SearchConfig) -> bool {
+    config.enabled
+        && match config.provider {
+            Provider::Exa => true,
+            Provider::Parallel => config.parallel_api_key.is_some(),
+        }
 }
 
 /// Select the configured provider deterministically.
-///
-/// An explicit provider wins. Otherwise Exa wins when enabled, then Parallel.
-/// Calling this without any configured provider is a composition error.
 #[must_use]
 pub fn select_provider(_session_id: &str, config: &SearchConfig) -> Provider {
-    if let Some(provider) = config.provider {
-        return provider;
-    }
-    if config.enable_exa {
-        return Provider::Exa;
-    }
-    if config.enable_parallel {
-        return Provider::Parallel;
-    }
-    Provider::Exa
+    config.provider
 }
 
 /// Validate that provider selection is resolvable at profile mount.
 pub fn require_provider(config: &SearchConfig) -> Result<(), WebError> {
-    web_search_enabled(config)
-        .then_some(())
-        .ok_or(WebError::NoSearchProvider)
+    if !config.enabled {
+        return Err(WebError::NoSearchProvider);
+    }
+    if config.provider == Provider::Parallel && config.parallel_api_key.is_none() {
+        return Err(WebError::MissingSearchCredential {
+            provider: Provider::Parallel.as_str(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -248,19 +243,26 @@ mod tests {
             ("ZUNO_WEBSEARCH_PROVIDER", "parallel"),
             (ENV_ENABLE_EXA, "true"),
         ]);
-        assert_eq!(settings.provider, None);
+        assert_eq!(settings.provider, Provider::Exa);
         assert_eq!(select_provider("ses", &settings), Provider::Exa);
     }
 
     #[test]
     fn credentials_enable_their_provider_without_a_second_switch() {
         let exa = config(&[(ENV_EXA_API_KEY, "secret")]);
-        assert!(web_search_enabled(&exa));
+        assert!(web_search_usable(&exa));
         assert_eq!(select_provider("ses", &exa), Provider::Exa);
 
         let parallel = config(&[(ENV_PARALLEL_API_KEY, "secret")]);
-        assert!(web_search_enabled(&parallel));
+        assert!(web_search_usable(&parallel));
         assert_eq!(select_provider("ses", &parallel), Provider::Parallel);
+    }
+
+    #[test]
+    fn an_explicit_exa_false_is_not_overridden_by_a_key() {
+        let settings = config(&[(ENV_ENABLE_EXA, "false"), (ENV_EXA_API_KEY, "secret")]);
+
+        assert!(!web_search_usable(&settings));
     }
 
     #[test]
@@ -268,7 +270,7 @@ mod tests {
         let settings = config(&[
             (ENV_PROVIDER, "parallel"),
             (ENV_ENABLE_EXA, "true"),
-            (ENV_ENABLE_PARALLEL, "true"),
+            (ENV_PARALLEL_API_KEY, "secret"),
         ]);
         assert_eq!(select_provider("ses", &settings), Provider::Parallel);
     }
@@ -276,6 +278,7 @@ mod tests {
     #[test]
     fn profile_limits_are_used_and_environment_values_override_them() {
         let profile = WebSearchConfig {
+            enabled: None,
             provider: Some(WebSearchBackend::Parallel),
             max_queries: std::num::NonZeroU32::new(3),
             max_results: std::num::NonZeroU32::new(6),
@@ -288,19 +291,45 @@ mod tests {
             },
             Some(&profile),
         );
-        assert_eq!(settings.provider, Some(Provider::Parallel));
+        assert_eq!(settings.provider, Provider::Parallel);
         assert_eq!(settings.max_queries, 3);
         assert_eq!(settings.max_results, 2);
         assert_eq!(settings.timeout, Duration::from_millis(700));
     }
 
     #[test]
-    fn no_provider_is_not_exposed() {
+    fn anonymous_exa_is_the_default_provider() {
         let settings = SearchConfig::default();
-        assert!(!web_search_enabled(&settings));
+
+        assert!(web_search_usable(&settings));
+        assert_eq!(select_provider("ses", &settings), Provider::Exa);
+        assert!(require_provider(&settings).is_ok());
+    }
+
+    #[test]
+    fn explicit_parallel_without_a_key_is_rejected() {
+        let settings = config(&[(ENV_PROVIDER, "parallel")]);
+
         assert!(matches!(
             require_provider(&settings),
-            Err(WebError::NoSearchProvider)
+            Err(WebError::MissingSearchCredential {
+                provider: "parallel"
+            })
         ));
+    }
+
+    #[test]
+    fn profile_false_hides_exa_even_when_a_key_exists() {
+        let profile = WebSearchConfig {
+            enabled: Some(false),
+            ..WebSearchConfig::default()
+        };
+        let settings = SearchConfig::from_profile(
+            |key| (key == ENV_EXA_API_KEY).then(|| "secret".to_owned()),
+            Some(&profile),
+        );
+
+        assert_eq!(settings.provider, Provider::Exa);
+        assert!(!web_search_usable(&settings));
     }
 }

@@ -189,7 +189,7 @@ pub use crate::webfetch::WebFetchTool;
 pub use crate::webfetch::bounds::WebError;
 pub use crate::websearch::WebSearchTool;
 pub use crate::websearch::gating::{
-    Provider, SearchConfig, require_provider, select_provider, web_search_enabled,
+    Provider, SearchConfig, require_provider, select_provider, web_search_usable,
 };
 
 pub mod council;

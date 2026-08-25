@@ -2481,6 +2481,13 @@
     "WebSearchConfig": {
       "description": "Web-search settings owned by the active profile.",
       "properties": {
+        "enabled": {
+          "description": "Master switch. Absence enables anonymous Exa by default.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "max_queries": {
           "description": "Maximum queries accepted in one model call.",
           "format": "uint32",

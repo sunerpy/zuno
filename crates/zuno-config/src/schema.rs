@@ -410,6 +410,9 @@ pub struct EnterpriseConfig {
 /// Web-search settings owned by the active profile.
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct WebSearchConfig {
+    /// Master switch. Absence enables anonymous Exa by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// Hosted provider selected for this profile.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<WebSearchBackend>,

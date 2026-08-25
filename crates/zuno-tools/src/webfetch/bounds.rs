@@ -153,6 +153,13 @@ pub enum WebError {
     #[error("no web search provider is configured")]
     NoSearchProvider,
 
+    /// A selected search backend requires a credential that is not present.
+    #[error("web search provider `{provider}` requires PARALLEL_API_KEY")]
+    MissingSearchCredential {
+        /// Stable provider id used in configuration and diagnostics.
+        provider: &'static str,
+    },
+
     /// The search backend's response was not the JSON-RPC envelope expected.
     #[error("could not parse the {provider} search response")]
     MalformedSearchResponse {
@@ -177,6 +184,7 @@ impl WebError {
             | Self::UnsupportedContentType { .. }
             | Self::Interrupted { .. }
             | Self::NoSearchProvider
+            | Self::MissingSearchCredential { .. }
             | Self::MalformedSearchResponse { .. } => false,
         }
     }

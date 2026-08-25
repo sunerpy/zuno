@@ -143,7 +143,7 @@ impl WebSearchTool {
     /// Whether this consumer has a usable provider.
     #[must_use]
     pub fn enabled_for(&self, _model_provider_id: &str) -> bool {
-        !self.mcp_backed || gating::web_search_enabled(&self.config)
+        !self.mcp_backed || gating::web_search_usable(&self.config)
     }
 
     /// Hosted backend selected for one session.

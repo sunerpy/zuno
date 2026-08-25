@@ -4183,6 +4183,21 @@ mod production_registry {
     }
 
     #[test]
+    fn explicit_parallel_without_a_key_fails_before_the_tool_runtime_is_published() {
+        let config = zuno_config::schema::Config::from_json_str(
+            Path::new("zuno.json"),
+            r#"{"web_search":{"provider":"parallel"}}"#,
+        )
+        .expect("parallel profile parses");
+
+        let error = try_assemble_with(zuno_catalog::skill::Skills::default(), config)
+            .expect_err("Parallel must never be registered without its credential");
+
+        assert!(error.contains("parallel"), "{error}");
+        assert!(error.contains("PARALLEL_API_KEY"), "{error}");
+    }
+
+    #[test]
     fn advertises_the_skill_tool_so_a_skill_body_can_be_loaded_on_demand() {
         let fixture = assemble();
 

@@ -58,7 +58,7 @@ use zuno_tools::registry::{
     BuiltinSlot, McpToolLoader, RegistryFlags, ResolveInput, ToolRegistryBuilder,
 };
 use zuno_tools::search_common::{SearchScope, SearchTooling};
-use zuno_tools::websearch::gating::SearchConfig;
+use zuno_tools::websearch::gating::{SearchConfig, require_provider};
 
 /// The executable tools and the ruleset that governs them, for one turn.
 pub(crate) struct ToolRuntime {
@@ -141,6 +141,9 @@ pub(crate) fn assemble(
         |key| env.value(key).map(str::to_owned),
         config.web_search.as_ref(),
     );
+    if search.enabled {
+        require_provider(&search).map_err(to_string)?;
+    }
 
     let flags = RegistryFlags {
         exposure: ExposureFlags::from_lookup(|key| env.value(key).map(str::to_owned)),

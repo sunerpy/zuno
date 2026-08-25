@@ -1,6 +1,6 @@
 //! Provider-facing types and the hosted MCP adapter for web search.
 
-use super::gating::{Provider, SearchConfig, select_provider};
+use super::gating::{Provider, SearchConfig, require_provider, select_provider};
 use super::mcp;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -167,15 +167,14 @@ impl WebSearchProvider for McpSearchProvider {
         request: SearchRequest,
         execution: SearchExecution,
     ) -> Result<SearchResult, WebSearchProviderError> {
+        require_provider(&self.config).map_err(WebSearchProviderError::from)?;
         let provider = select_provider(&execution.session_id, &self.config);
         let (tool, arguments) = match provider {
             Provider::Exa => (
                 mcp::EXA_TOOL,
                 json!({
                     "query": request.query,
-                    "type": "auto",
                     "numResults": request.max_results,
-                    "livecrawl": "fallback",
                 }),
             ),
             Provider::Parallel => (
@@ -207,17 +206,19 @@ fn auth_headers(
     provider: Provider,
     api_key: Option<&str>,
 ) -> Vec<(reqwest::header::HeaderName, String)> {
-    if provider != Provider::Parallel {
-        return Vec::new();
+    match provider {
+        Provider::Exa => Vec::new(),
+        Provider::Parallel => {
+            let key = api_key.expect("Parallel credentials were validated before request build");
+            vec![
+                (
+                    reqwest::header::USER_AGENT,
+                    format!("zuno/{}", env!("CARGO_PKG_VERSION")),
+                ),
+                (reqwest::header::AUTHORIZATION, format!("Bearer {key}")),
+            ]
+        }
     }
-    let mut headers = vec![(
-        reqwest::header::USER_AGENT,
-        format!("zuno/{}", env!("CARGO_PKG_VERSION")),
-    )];
-    if let Some(key) = api_key {
-        headers.push((reqwest::header::AUTHORIZATION, format!("Bearer {key}")));
-    }
-    headers
 }
 
 /// Preserve provider text while projecting every citeable HTTP(S) URL.

@@ -11,11 +11,10 @@ use zuno_permission::{PermissionAction, Rule};
 use zuno_tool::{AllowAll, DenyAll, NeverInterrupted, Tool, ToolContext, ToolOutput, Typed, erase};
 use zuno_tools::webfetch::bounds::WebError;
 use zuno_tools::websearch::gating::{
-    ENV_ENABLE_EXA, ENV_ENABLE_PARALLEL, ENV_EXA_API_KEY, ENV_PARALLEL_API_KEY, ENV_PROVIDER,
-    Provider, SearchConfig,
+    ENV_ENABLE_EXA, ENV_EXA_API_KEY, ENV_PARALLEL_API_KEY, ENV_PROVIDER, Provider, SearchConfig,
 };
 use zuno_tools::websearch::{ID, NO_RESULTS, WebSearchTool, mcp};
-use zuno_tools::{WebFetchTool, web_search_enabled};
+use zuno_tools::{WebFetchTool, web_search_usable};
 
 fn config(pairs: &[(&str, &str)]) -> SearchConfig {
     SearchConfig::from_lookup(|key| {
@@ -63,23 +62,23 @@ fn resolve_tool_ids(search: &WebSearchTool, rules: &[Rule]) -> Vec<String> {
 }
 
 #[test]
-fn unconfigured_search_is_absent_and_native_configuration_exposes_it() {
-    let absent = WebSearchTool::with_config(SearchConfig::default());
-    assert_eq!(resolve_tool_ids(&absent, &[]), vec!["webfetch"]);
-    assert!(!web_search_enabled(absent.config()));
+fn anonymous_exa_is_exposed_by_default_and_explicit_false_hides_it() {
+    let default = WebSearchTool::with_config(SearchConfig::default());
+    assert_eq!(
+        resolve_tool_ids(&default, &[]),
+        vec!["webfetch".to_owned(), ID.to_owned()]
+    );
+    assert!(web_search_usable(default.config()));
 
-    for settings in [
-        config(&[(ENV_ENABLE_EXA, "true")]),
-        config(&[(ENV_ENABLE_PARALLEL, "true")]),
-        config(&[(ENV_EXA_API_KEY, "key")]),
-        config(&[(ENV_PROVIDER, "parallel")]),
-    ] {
-        let search = WebSearchTool::with_config(settings);
-        assert_eq!(
-            resolve_tool_ids(&search, &[]),
-            vec!["webfetch".to_owned(), ID.to_owned()]
-        );
-    }
+    let disabled = WebSearchTool::with_config(config(&[(ENV_ENABLE_EXA, "false")]));
+    assert_eq!(resolve_tool_ids(&disabled, &[]), vec!["webfetch"]);
+    assert!(!web_search_usable(disabled.config()));
+
+    let keyed_but_disabled = WebSearchTool::with_config(config(&[
+        (ENV_ENABLE_EXA, "false"),
+        (ENV_EXA_API_KEY, "key"),
+    ]));
+    assert_eq!(resolve_tool_ids(&keyed_but_disabled, &[]), vec!["webfetch"]);
 }
 
 #[test]
@@ -133,10 +132,13 @@ async fn exa_receives_one_request_per_distinct_query_with_profile_owned_limits()
     assert_eq!(body["jsonrpc"], "2.0");
     assert_eq!(body["method"], "tools/call");
     assert_eq!(body["params"]["name"], mcp::EXA_TOOL);
-    assert_eq!(body["params"]["arguments"]["query"], "rust bounded fetch");
-    assert_eq!(body["params"]["arguments"]["numResults"], 8);
-    assert_eq!(body["params"]["arguments"]["livecrawl"], "fallback");
-    assert_eq!(body["params"]["arguments"]["type"], "auto");
+    assert_eq!(
+        body["params"]["arguments"],
+        json!({
+            "query": "rust bounded fetch",
+            "numResults": 8
+        })
+    );
 }
 
 #[tokio::test]
@@ -174,6 +176,37 @@ async fn parallel_receives_its_native_request_and_bearer_token() {
             .to_str()
             .expect("ASCII header")
             .starts_with("zuno/")
+    );
+}
+#[tokio::test]
+async fn parallel_without_a_key_fails_before_any_http_request() {
+    let server = MockServer::start().await;
+    let tool = WebSearchTool::with_config(config(&[(ENV_PROVIDER, "parallel")]))
+        .with_endpoint(format!("{}/mcp", server.uri()));
+    let error = run(
+        tool,
+        json!({ "queries": ["must not leave the process"] }),
+        context("ses_missing_parallel_key"),
+    )
+    .await
+    .expect_err("Parallel without a key must fail closed");
+
+    let ToolError::Failed { source, .. } = error else {
+        panic!("expected a classified failure, got {error:?}");
+    };
+    assert!(matches!(
+        source.downcast_ref::<WebError>(),
+        Some(WebError::MissingSearchCredential {
+            provider: "parallel"
+        })
+    ));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty(),
+        "credential validation must happen before HTTP"
     );
 }
 
@@ -376,8 +409,11 @@ async fn transport_and_parse_failures_remain_classified() {
         .mount(&malformed)
         .await;
     let error = run(
-        WebSearchTool::with_config(config(&[(ENV_PROVIDER, "parallel")]))
-            .with_endpoint(format!("{}/mcp", malformed.uri())),
+        WebSearchTool::with_config(config(&[
+            (ENV_PROVIDER, "parallel"),
+            (ENV_PARALLEL_API_KEY, "par-secret"),
+        ]))
+        .with_endpoint(format!("{}/mcp", malformed.uri())),
         json!({ "queries": ["q"] }),
         context("ses_9"),
     )
@@ -429,7 +465,7 @@ fn provider_selection_is_explicit_and_deterministic() {
     assert_eq!(exa.provider_for("one"), Provider::Exa);
     assert_eq!(exa.provider_for("two"), Provider::Exa);
 
-    let parallel = WebSearchTool::with_config(config(&[(ENV_ENABLE_PARALLEL, "true")]));
+    let parallel = WebSearchTool::with_config(config(&[(ENV_PARALLEL_API_KEY, "secret")]));
     assert_eq!(parallel.provider_for("one"), Provider::Parallel);
     assert_eq!(parallel.provider_for("two"), Provider::Parallel);
 }

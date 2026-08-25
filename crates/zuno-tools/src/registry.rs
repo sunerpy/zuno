@@ -9,7 +9,7 @@
 use crate::FileTools;
 use crate::batch::ExecuteTool;
 use crate::exposure::{ExposureFlags, exposure_predicate};
-use crate::websearch::gating::{SearchConfig, web_search_enabled};
+use crate::websearch::gating::{SearchConfig, web_search_usable};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -519,7 +519,7 @@ impl ToolRegistry {
             .iter()
             .filter(|tool| {
                 let id = tool.id();
-                if id == crate::websearch::ID && !web_search_enabled(&self.flags.search) {
+                if id == crate::websearch::ID && !web_search_usable(&self.flags.search) {
                     return false;
                 }
                 if model_conditional_file_ids.contains(&id) && !exposed_file_ids.contains(id) {

@@ -474,7 +474,7 @@ fn registry_flags(case: DifferentialCase) -> RegistryFlags {
             ExposureFlags::default()
         },
         search: SearchConfig {
-            enable_exa: case.enable_exa,
+            enabled: case.enable_exa,
             ..SearchConfig::default()
         },
         experimental_lsp_tool: case.enable_lsp,

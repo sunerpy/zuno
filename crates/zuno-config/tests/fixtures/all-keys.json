@@ -278,6 +278,7 @@
   },
   "enterprise": { "url": "https://opencode.example.com" },
   "web_search": {
+    "enabled": true,
     "provider": "exa",
     "max_queries": 4,
     "max_results": 8,
