@@ -442,6 +442,20 @@ pub enum JobSubjectProjection {
         run_id: String,
         workflow: String,
     },
+    Council {
+        run_id: String,
+        preset: String,
+    },
+}
+
+/// One durable child work item owned by a workflow or Council job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobChildProjection {
+    pub id: String,
+    pub subject: String,
+    pub owner: Option<String>,
+    pub status: String,
+    pub span: ExecutionSpan,
 }
 
 /// One durable background job shown by clients.
@@ -454,6 +468,7 @@ pub struct JobProjection {
     pub result: Option<String>,
     pub error: Option<String>,
     pub span: ExecutionSpan,
+    pub children: Vec<JobChildProjection>,
     pub time_created: i64,
     pub time_completed: Option<i64>,
 }

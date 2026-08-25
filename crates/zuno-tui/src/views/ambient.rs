@@ -1210,23 +1210,28 @@ impl SidebarView {
                 .iter()
                 .filter(|job| job.status == "queued")
                 .count();
+            let subagent_shortcut =
+                crate::views::pressable_label("session_child_first", &self.context)
+                    .unwrap_or_else(|| "/subagent".to_owned());
             lines.push(self.heading(
                 "Jobs",
                 &format!(
-                    "{queued} queued · {running} running · {} total · /subagent",
-                    self.ambient.work.jobs.len()
+                    "{queued} queued · {running} running · {} total · {subagent_shortcut}",
+                    self.ambient.work.jobs.len(),
                 ),
                 self.disclosure(self.expanded.jobs),
                 width,
             ));
             if self.expanded.jobs {
                 for job in &self.ambient.work.jobs {
-                    let style = match job.status.as_str() {
-                        "queued" => self.context.secondary(),
-                        "running" => self.context.accent(),
-                        "failed" | "uncertain" => self.context.error(),
-                        "cancelled" => self.context.muted(),
-                        _ => self.context.text(),
+                    let (glyph, style) = match job.status.as_str() {
+                        "queued" => ("○", self.context.secondary()),
+                        "running" => ("◐", self.context.accent()),
+                        "failed" => ("✗", self.context.error()),
+                        "uncertain" => ("?", self.context.warning()),
+                        "cancelled" => ("×", self.context.muted()),
+                        "completed" => ("✓", self.context.text()),
+                        _ => ("!", self.context.error()),
                     };
                     let subject = match &job.subject {
                         zuno_types::JobSubjectProjection::ChildSession { session_id } => {
@@ -1240,27 +1245,79 @@ impl SidebarView {
                         zuno_types::JobSubjectProjection::Workflow { workflow, .. } => {
                             format!("workflow · {workflow}")
                         }
+                        zuno_types::JobSubjectProjection::Council { preset, .. } => {
+                            format!("council · {preset}")
+                        }
                     };
-                    lines.push(padded(
-                        &format!("  {subject} · {}", job.status),
-                        width,
-                        style,
-                    ));
+                    lines.push(padded(&format!("  {glyph} {subject}"), width, style));
                     lines.push(padded(
                         &format!(
-                            "    {} · {}",
+                            "    {} · {} · {}",
+                            job.status,
                             span_duration(&job.span),
                             span_usage(&job.span)
                         ),
                         width,
                         self.context.secondary(),
                     ));
+                    if !job.children.is_empty() {
+                        let completed = job
+                            .children
+                            .iter()
+                            .filter(|child| child.status == "completed")
+                            .count();
+                        let running = job
+                            .children
+                            .iter()
+                            .filter(|child| {
+                                matches!(child.status.as_str(), "in_progress" | "running")
+                            })
+                            .count();
+                        let noun = match job.subject {
+                            zuno_types::JobSubjectProjection::Council { .. } => "seats",
+                            _ => "nodes",
+                        };
+                        lines.push(padded(
+                            &format!(
+                                "    {completed}/{} {noun} done · {running} running",
+                                job.children.len()
+                            ),
+                            width,
+                            self.context.secondary(),
+                        ));
+                        for child in &job.children {
+                            let (glyph, style) = match child.status.as_str() {
+                                "completed" => ("✓", self.context.muted()),
+                                "in_progress" | "running" => ("◐", self.context.accent()),
+                                "blocked" => ("!", self.context.warning()),
+                                "failed" | "uncertain" => ("✗", self.context.error()),
+                                "cancelled" => ("×", self.context.muted()),
+                                _ => ("○", self.context.text()),
+                            };
+                            lines.push(padded(
+                                &format!("    {glyph} {} · {}", child.subject, child.status),
+                                width,
+                                style,
+                            ));
+                            let owner = child.owner.as_deref().unwrap_or("unassigned");
+                            lines.push(padded(
+                                &format!(
+                                    "      {owner} · {} · {}",
+                                    span_duration(&child.span),
+                                    span_usage(&child.span)
+                                ),
+                                width,
+                                self.context.secondary(),
+                            ));
+                        }
+                    }
                 }
-                lines.push(padded(
-                    "  /subagent to inspect details",
-                    width,
-                    self.context.secondary(),
-                ));
+                let inspect_hint = if subagent_shortcut == "/subagent" {
+                    "  /subagent to inspect details".to_owned()
+                } else {
+                    format!("  {subagent_shortcut} or /subagent to inspect")
+                };
+                lines.push(padded(&inspect_hint, width, self.context.secondary()));
             }
         }
 

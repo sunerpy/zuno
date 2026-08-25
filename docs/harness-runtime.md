@@ -499,7 +499,7 @@ inside one client remains unchanged. Setting any bound to `1` restores serial
 behavior.
 
 Native child sessions, workflow nodes, Council seats, and Codex/Claude Code
-product agents share one process-local delegation budget for a workspace. The
+`ProductAgent` instances share one process-local delegation budget for a workspace. The
 budget survives turn-host replacement within that process, so a background agent
 started by an earlier turn still consumes capacity. Reloading configuration
 adjusts the bound without cancelling active work: a lower bound waits for enough
@@ -634,7 +634,9 @@ Enabled `productAgent` instances register independent static tools backed by a h
 - `nextStep` (default): settle the job and admit the report to the parent inbox atomically, then wake the parent.
 - `quiet`: settle the job without admitting a parent input.
 
-The `job` tool reads durable status for jobs owned by the current parent session. `JobSubject` distinguishes `ChildSession` from `ProductAgent`; status is `running`, `completed`, `failed`, `cancelled`, or `uncertain`, together with delivery policy, result, error, and subject identity. The same durable projection feeds the right-sidebar `Jobs` section, which tracks background agents and product agents with elapsed time and report-delivery state and advertises `/subagent` for detailed inspection.
+The `job` tool reads durable status for jobs owned by the current parent session. `JobSubject` distinguishes child sessions, product agents, and workflow runs; status is `queued`, `running`, `completed`, `failed`, `cancelled`, or `uncertain`, together with delivery policy, result, error, and subject identity. Council execution remains stored through the workflow service, while the frontend-neutral projection types `council:<preset>` as a Council and attaches its durable child WorkItems. The same child projection represents ordinary workflow nodes and Council seats, including owner, status, elapsed time, and usage.
+
+The right-sidebar `Jobs` section and `/subagent` consume that same projection rather than reconstructing state from tool output. The sidebar shows compact node or seat progress and the user's current `session_child_first` key binding, with `/subagent` as the command fallback. The detailed view keeps workflows and Councils as jobs, never fabricates child sessions, and shows each durable node or seat plus report-delivery and safety diagnostics.
 
 `job_cancel` verifies parent ownership and requests cancellation from the live supervisor. It never pre-settles a job and has `ToolReplayPolicy::Never`; the executor records `cancelled` only after the child session or complete product process tree has stopped. Product protocol or process loss after work may have begun records `uncertain`. A restart reconciles still-running product jobs to `uncertain` and never replays them.
 

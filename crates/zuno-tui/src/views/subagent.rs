@@ -73,6 +73,7 @@ pub struct Delegation {
     pub report_delivery: Option<String>,
     pub result: Option<String>,
     pub diagnostic: Option<String>,
+    pub children: Vec<zuno_types::JobChildProjection>,
     pub time_created: Option<i64>,
     pub time_completed: Option<i64>,
 }
@@ -105,7 +106,11 @@ impl Delegation {
     }
 
     fn safety(&self) -> &'static str {
-        if self.product == "zuno" {
+        if self.tool == "council_run" {
+            "Zuno native Council; durable Council seat progress and normal Zuno permissions"
+        } else if self.tool == "workflow" {
+            "Zuno native workflow; durable node progress and normal Zuno permissions"
+        } else if self.product == "zuno" {
             "Zuno child session; durable transcript and normal Zuno permissions"
         } else {
             "native login/config/model; credentials stay outside Zuno; uncertain calls are not replayed"
@@ -219,6 +224,7 @@ fn project_call(
             result: nonempty(task.result),
             diagnostic: (status == ToolStatus::Error)
                 .then(|| output.unwrap_or_default().to_owned()),
+            children: Vec::new(),
             time_created: None,
             time_completed: None,
         };
@@ -241,6 +247,7 @@ fn project_call(
             result: nonempty(product.result),
             diagnostic: (status == ToolStatus::Error)
                 .then(|| output.unwrap_or_default().to_owned()),
+            children: Vec::new(),
             time_created: None,
             time_completed: None,
         };
@@ -261,6 +268,7 @@ fn project_call(
         result: output.and_then(|value| nonempty(value.to_owned())),
         diagnostic: (status == ToolStatus::Error)
             .then(|| output.unwrap_or("subagent dispatch failed").to_owned()),
+        children: Vec::new(),
         time_created: None,
         time_completed: None,
     }
@@ -460,6 +468,13 @@ fn merge_job_projections(tasks: &mut Vec<Delegation>, jobs: &[zuno_types::JobPro
                 None,
                 Some(run_id.clone()),
             ),
+            zuno_types::JobSubjectProjection::Council { run_id, preset } => (
+                "council_run".to_owned(),
+                "zuno".to_owned(),
+                Some(preset.clone()),
+                None,
+                Some(run_id.clone()),
+            ),
         };
         if let Some(task) = tasks
             .iter_mut()
@@ -474,6 +489,7 @@ fn merge_job_projections(tasks: &mut Vec<Delegation>, jobs: &[zuno_types::JobPro
             task.report_delivery = Some(job.report_delivery.clone());
             task.result = job.result.clone().or_else(|| task.result.clone());
             task.diagnostic = job.error.clone().or_else(|| task.diagnostic.clone());
+            task.children = job.children.clone();
             task.time_created = Some(job.time_created);
             task.time_completed = job.time_completed;
             continue;
@@ -492,6 +508,7 @@ fn merge_job_projections(tasks: &mut Vec<Delegation>, jobs: &[zuno_types::JobPro
             report_delivery: Some(job.report_delivery.clone()),
             result: job.result.clone(),
             diagnostic: job.error.clone(),
+            children: job.children.clone(),
             time_created: Some(job.time_created),
             time_completed: job.time_completed,
         });
@@ -688,47 +705,100 @@ impl SubagentView {
             ))];
         };
         let mut lines = Vec::new();
-        let mut row = |label: &str, value: String| {
+        let row = |lines: &mut Vec<Line<'static>>, label: &str, value: String| {
             lines.push(Line::from(Span::styled(
                 truncate(&format!("  {label} {value}"), width),
                 self.context.muted(),
             )));
         };
-        row("product", task.product.clone());
+        row(&mut lines, "product", task.product.clone());
         row(
+            &mut lines,
             "target",
             task.target
                 .clone()
                 .unwrap_or_else(|| "not reported".to_owned()),
         );
-        row("status", task.state.clone());
-        row("elapsed", task.elapsed());
+        row(&mut lines, "status", task.state.clone());
+        row(&mut lines, "elapsed", task.elapsed());
         row(
+            &mut lines,
             "job",
             task.job_id
                 .clone()
                 .unwrap_or_else(|| "foreground".to_owned()),
         );
         row(
+            &mut lines,
             "report",
             task.report_delivery
                 .clone()
                 .unwrap_or_else(|| "foreground".to_owned()),
         );
         if let Some(session) = &task.session_id {
-            row("session", session.clone());
-            row("note", CHILD_TRANSCRIPT_NOTE.to_owned());
+            row(&mut lines, "session", session.clone());
+            row(&mut lines, "note", CHILD_TRANSCRIPT_NOTE.to_owned());
         }
         if let Some(run) = &task.run_id {
-            row("run", run.clone());
+            row(&mut lines, "run", run.clone());
+        }
+        if !task.children.is_empty() {
+            let completed = task
+                .children
+                .iter()
+                .filter(|child| child.status == "completed")
+                .count();
+            let running = task
+                .children
+                .iter()
+                .filter(|child| matches!(child.status.as_str(), "in_progress" | "running"))
+                .count();
+            let noun = if task.tool == "council_run" {
+                "seats"
+            } else {
+                "nodes"
+            };
+            row(
+                &mut lines,
+                "progress",
+                format!(
+                    "{completed}/{} {noun} done · {running} running",
+                    task.children.len()
+                ),
+            );
+            for child in &task.children {
+                let (glyph, style) = match child.status.as_str() {
+                    "completed" => ("✓", self.context.muted()),
+                    "in_progress" | "running" => ("◐", self.context.accent()),
+                    "blocked" => ("!", self.context.warning()),
+                    "failed" | "uncertain" => ("✗", self.context.error()),
+                    "cancelled" => ("×", self.context.muted()),
+                    _ => ("○", self.context.text()),
+                };
+                let owner = child.owner.as_deref().unwrap_or("unassigned");
+                lines.push(Line::from(Span::styled(
+                    truncate(
+                        &format!(
+                            "  {glyph} {} · {} · {owner} · {}",
+                            child.subject,
+                            child.status,
+                            crate::views::ambient::compact_duration(
+                                i64::try_from(child.span.elapsed_ms).unwrap_or(i64::MAX),
+                            )
+                        ),
+                        width,
+                    ),
+                    style,
+                )));
+            }
         }
         if let Some(result) = &task.result {
-            row("result", result.clone());
+            row(&mut lines, "result", result.clone());
         }
         if let Some(diagnostic) = &task.diagnostic {
-            row("diagnostic", diagnostic.clone());
+            row(&mut lines, "diagnostic", diagnostic.clone());
         }
-        row("safety", task.safety().to_owned());
+        row(&mut lines, "safety", task.safety().to_owned());
         lines
     }
 }

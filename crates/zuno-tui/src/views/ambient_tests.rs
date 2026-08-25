@@ -194,6 +194,7 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
                 result: None,
                 error: None,
                 span: zuno_types::ExecutionSpan::from_aggregate(1, None, 5_000, 0, false),
+                children: Vec::new(),
                 time_created: 1,
                 time_completed: None,
             },
@@ -210,6 +211,7 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
                 result: None,
                 error: None,
                 span: zuno_types::ExecutionSpan::from_aggregate(1, None, 21_000, 0, false),
+                children: Vec::new(),
                 time_created: 1,
                 time_completed: None,
             },
@@ -257,9 +259,10 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
         "/ps to inspect output",
         "Jobs",
         "1 queued · 1 running",
-        "child ses_waiting · queued",
+        "child ses_waiting",
+        "queued · 5s · — tokens",
         "codex · review patch",
-        "/subagent to inspect details",
+        "/subagent",
         "Memory",
         "1 review · 1 saved",
         "run cargo fmt",
@@ -268,6 +271,77 @@ fn views_sidebar_projects_goal_todos_jobs_and_reviewable_memory() {
         assert!(
             normalized.contains(expected),
             "missing `{expected}`:\n{joined}"
+        );
+    }
+}
+
+#[test]
+fn views_sidebar_projects_council_seats_and_the_real_subagent_shortcut() {
+    let mut view = view();
+    view.ambient_mut().work.jobs = vec![zuno_types::JobProjection {
+        id: "job_council".to_owned(),
+        subject: zuno_types::JobSubjectProjection::Council {
+            run_id: "run_council".to_owned(),
+            preset: "balanced-review".to_owned(),
+        },
+        status: "running".to_owned(),
+        report_delivery: "nextStep".to_owned(),
+        result: None,
+        error: None,
+        span: zuno_types::ExecutionSpan::from_aggregate(1_000, None, 8_000, 500, true),
+        children: vec![
+            zuno_types::JobChildProjection {
+                id: "work_run_council:node:0".to_owned(),
+                subject: "evidence".to_owned(),
+                owner: Some("explorer".to_owned()),
+                status: "completed".to_owned(),
+                span: zuno_types::ExecutionSpan::from_aggregate(
+                    1_000,
+                    Some(4_000),
+                    3_000,
+                    200,
+                    true,
+                ),
+            },
+            zuno_types::JobChildProjection {
+                id: "work_run_council:node:1".to_owned(),
+                subject: "judgment".to_owned(),
+                owner: Some("oracle".to_owned()),
+                status: "in_progress".to_owned(),
+                span: zuno_types::ExecutionSpan::from_aggregate(1_000, None, 5_000, 300, true),
+            },
+            zuno_types::JobChildProjection {
+                id: "work_run_council:node:2".to_owned(),
+                subject: "dissent".to_owned(),
+                owner: Some("general".to_owned()),
+                status: "pending".to_owned(),
+                span: zuno_types::ExecutionSpan::default(),
+            },
+        ],
+        time_created: 1_000,
+        time_completed: None,
+    }];
+
+    let shortcut = crate::views::pressable_label("session_child_first", &view.context)
+        .unwrap_or_else(|| "/subagent".to_owned());
+    let body = view
+        .lines(SIDEBAR_WIDTH)
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    for expected in [
+        "council · balanced-review",
+        "running · 8s · 500 tokens",
+        "1/3 seats done · 1 running",
+        "evidence · completed",
+        "explorer · 3s · 200 tokens",
+        shortcut.as_str(),
+    ] {
+        assert!(
+            normalized.contains(expected),
+            "missing `{expected}`:\n{body}"
         );
     }
 }

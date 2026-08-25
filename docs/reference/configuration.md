@@ -198,6 +198,13 @@ create a second Council executor. The existing native service continues to own
 seat isolation, concurrency, retry, deadline, quorum, cancellation, synthesis,
 durable job state, and parent report delivery.
 
+Once launched, the right-sidebar `Jobs` section shows Council preset, aggregate
+status, elapsed time, token usage, and durable seat progress. Its inspection hint
+uses the configured `session_child_first` binding (the default is the leader plus
+Down) and always keeps `/subagent` available. `/subagent` shows each seat's Agent,
+status, timing, and diagnostics without presenting the seat as a resumable child
+session. Ordinary configured workflows use the same projection for node progress.
+
 ## Context compaction
 
 Zuno can compact older conversation history before the model window is exhausted:

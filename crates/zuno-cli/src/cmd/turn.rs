@@ -1736,6 +1736,61 @@ fn work_item_span(item: &zuno_tools::WorkItem) -> zuno_types::ExecutionSpan {
     )
 }
 
+fn project_job_subject(subject: &zuno_db::job::JobSubject) -> zuno_types::JobSubjectProjection {
+    match subject {
+        zuno_db::job::JobSubject::ChildSession { session_id } => {
+            zuno_types::JobSubjectProjection::ChildSession {
+                session_id: session_id.clone(),
+            }
+        }
+        zuno_db::job::JobSubject::ProductAgent {
+            run_id,
+            product,
+            instance,
+            tool,
+        } => zuno_types::JobSubjectProjection::ProductAgent {
+            run_id: run_id.clone(),
+            product: product.clone(),
+            instance: instance.clone(),
+            tool: tool.clone(),
+        },
+        zuno_db::job::JobSubject::Workflow { run_id, workflow } => workflow
+            .strip_prefix("council:")
+            .filter(|preset| !preset.is_empty())
+            .map_or_else(
+                || zuno_types::JobSubjectProjection::Workflow {
+                    run_id: run_id.clone(),
+                    workflow: workflow.clone(),
+                },
+                |preset| zuno_types::JobSubjectProjection::Council {
+                    run_id: run_id.clone(),
+                    preset: preset.to_owned(),
+                },
+            ),
+    }
+}
+
+fn project_job_children(
+    subject: &zuno_db::job::JobSubject,
+    items: &[zuno_tools::WorkItem],
+) -> Vec<zuno_types::JobChildProjection> {
+    let zuno_db::job::JobSubject::Workflow { run_id, .. } = subject else {
+        return Vec::new();
+    };
+    let root_id = format!("work_{run_id}");
+    items
+        .iter()
+        .filter(|item| item.parent_id.as_deref() == Some(root_id.as_str()))
+        .map(|item| zuno_types::JobChildProjection {
+            id: item.id.clone(),
+            subject: item.subject.clone(),
+            owner: item.owner.clone(),
+            status: item.status.as_str().to_owned(),
+            span: work_item_span(item),
+        })
+        .collect()
+}
+
 fn aggregate_work_item_span<'a>(
     items: impl IntoIterator<Item = &'a zuno_tools::WorkItem>,
     started_at: i64,
@@ -2758,25 +2813,8 @@ impl TurnHost {
                     }
                     zuno_db::job::JobSubject::ProductAgent { .. } => {}
                 }
-                let subject = match job.subject {
-                    zuno_db::job::JobSubject::ChildSession { session_id } => {
-                        zuno_types::JobSubjectProjection::ChildSession { session_id }
-                    }
-                    zuno_db::job::JobSubject::ProductAgent {
-                        run_id,
-                        product,
-                        instance,
-                        tool,
-                    } => zuno_types::JobSubjectProjection::ProductAgent {
-                        run_id,
-                        product,
-                        instance,
-                        tool,
-                    },
-                    zuno_db::job::JobSubject::Workflow { run_id, workflow } => {
-                        zuno_types::JobSubjectProjection::Workflow { run_id, workflow }
-                    }
-                };
+                let subject = project_job_subject(&job.subject);
+                let children = project_job_children(&job.subject, &work.items);
                 Ok(zuno_types::JobProjection {
                     id: job.id,
                     subject,
@@ -2785,6 +2823,7 @@ impl TurnHost {
                     result: job.result.as_ref().and_then(job_result_text),
                     error: job.error,
                     span,
+                    children,
                     time_created: job.time_created,
                     time_completed: job.time_completed,
                 })

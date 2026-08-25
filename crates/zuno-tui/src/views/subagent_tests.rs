@@ -83,6 +83,7 @@ fn durable_job(status: &str, result: Option<&str>) -> zuno_types::JobProjection 
             0,
             false,
         ),
+        children: Vec::new(),
         time_created: 1_000,
         time_completed: (status != "running").then_some(3_500),
     }
@@ -106,8 +107,61 @@ fn durable_workflow(status: &str) -> zuno_types::JobProjection {
             0,
             false,
         ),
+        children: vec![zuno_types::JobChildProjection {
+            id: "work_run_release:node:0".to_owned(),
+            subject: "verify".to_owned(),
+            owner: Some("fixer".to_owned()),
+            status: "in_progress".to_owned(),
+            span: zuno_types::ExecutionSpan::from_aggregate(2_000, None, 2_000, 0, false),
+        }],
         time_created: 2_000,
         time_completed: (status != "running").then_some(4_000),
+    }
+}
+
+fn durable_council(status: &str) -> zuno_types::JobProjection {
+    zuno_types::JobProjection {
+        id: "job_council".to_owned(),
+        subject: zuno_types::JobSubjectProjection::Council {
+            run_id: "run_council".to_owned(),
+            preset: "balanced-review".to_owned(),
+        },
+        status: status.to_owned(),
+        report_delivery: "nextStep".to_owned(),
+        result: None,
+        error: None,
+        span: zuno_types::ExecutionSpan::from_aggregate(1_000, None, 8_000, 500, true),
+        children: vec![
+            zuno_types::JobChildProjection {
+                id: "work_run_council:node:0".to_owned(),
+                subject: "evidence".to_owned(),
+                owner: Some("explorer".to_owned()),
+                status: "completed".to_owned(),
+                span: zuno_types::ExecutionSpan::from_aggregate(
+                    1_000,
+                    Some(4_000),
+                    3_000,
+                    200,
+                    true,
+                ),
+            },
+            zuno_types::JobChildProjection {
+                id: "work_run_council:node:1".to_owned(),
+                subject: "judgment".to_owned(),
+                owner: Some("oracle".to_owned()),
+                status: "in_progress".to_owned(),
+                span: zuno_types::ExecutionSpan::from_aggregate(1_000, None, 5_000, 300, true),
+            },
+            zuno_types::JobChildProjection {
+                id: "work_run_council:node:2".to_owned(),
+                subject: "dissent".to_owned(),
+                owner: Some("general".to_owned()),
+                status: "pending".to_owned(),
+                span: zuno_types::ExecutionSpan::default(),
+            },
+        ],
+        time_created: 1_000,
+        time_completed: None,
     }
 }
 
@@ -182,6 +236,36 @@ fn workflow_jobs_are_visible_without_forging_child_sessions() {
     );
     assert_eq!(workflow.state, "uncertain");
     assert_eq!(workflow.diagnostic.as_deref(), Some("runner disconnected"));
+    assert_eq!(workflow.children.len(), 1);
+    assert_eq!(workflow.children[0].subject, "verify");
+}
+
+#[test]
+fn council_jobs_show_typed_seat_progress_without_forging_child_sessions() {
+    let rows = delegations_with_jobs(&[], &[durable_council("running")]);
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    let council = &rows[0];
+    assert_eq!(council.tool, "council_run");
+    assert_eq!(council.product, "zuno");
+    assert_eq!(council.target.as_deref(), Some("balanced-review"));
+    assert_eq!(council.run_id.as_deref(), Some("run_council"));
+    assert!(
+        council.session_id.is_none(),
+        "Council is not a child session"
+    );
+    assert_eq!(council.children.len(), 3);
+
+    let mut view = SubagentView::new(ViewContext::defaults(), rows);
+    view.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+    let body = joined(&mut view);
+    for expected in [
+        "progress 1/3 seats done · 1 running",
+        "evidence · completed · explorer",
+        "judgment · in_progress · oracle",
+        "durable Council seat progress",
+    ] {
+        assert!(body.contains(expected), "missing `{expected}`:\n{body}");
+    }
 }
 
 #[test]

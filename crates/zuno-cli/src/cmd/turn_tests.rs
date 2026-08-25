@@ -146,6 +146,114 @@ fn test_background_executions(directory: &Path) -> Arc<zuno_pty::BackgroundExecu
     )
 }
 
+#[test]
+fn workflow_job_projection_types_councils_and_keeps_child_progress_in_order() {
+    fn item(
+        id: &str,
+        parent_id: Option<&str>,
+        subject: &str,
+        owner: &str,
+        status: zuno_tools::WorkItemStatus,
+        tokens: i64,
+    ) -> zuno_tools::WorkItem {
+        zuno_tools::WorkItem {
+            id: id.to_owned(),
+            session_id: "ses_parent".to_owned(),
+            goal_id: None,
+            plan_step_id: None,
+            parent_id: parent_id.map(str::to_owned),
+            subject: subject.to_owned(),
+            description: format!("{subject} description"),
+            active_form: Some(format!("Running {subject}")),
+            status,
+            priority: zuno_tools::WorkItemPriority::Medium,
+            dependencies: Vec::new(),
+            owner: Some(owner.to_owned()),
+            revision: 1,
+            tokens_used: tokens,
+            usage_known: true,
+            time_used_ms: 5_000,
+            time_created: 1_000,
+            time_updated: 6_000,
+        }
+    }
+
+    let council = zuno_db::job::JobSubject::workflow("run_council", "council:balanced-review");
+    assert_eq!(
+        project_job_subject(&council),
+        zuno_types::JobSubjectProjection::Council {
+            run_id: "run_council".to_owned(),
+            preset: "balanced-review".to_owned(),
+        }
+    );
+
+    let items = vec![
+        item(
+            "work_run_council:node:0",
+            Some("work_run_council"),
+            "evidence",
+            "explorer",
+            zuno_tools::WorkItemStatus::Completed,
+            120,
+        ),
+        item(
+            "work_run_council:node:1",
+            Some("work_run_council"),
+            "judgment",
+            "oracle",
+            zuno_tools::WorkItemStatus::InProgress,
+            80,
+        ),
+        item(
+            "work_somewhere_else:node:0",
+            Some("work_somewhere_else"),
+            "unrelated",
+            "general",
+            zuno_tools::WorkItemStatus::Pending,
+            0,
+        ),
+    ];
+    let children = project_job_children(&council, &items);
+    assert_eq!(children.len(), 2, "{children:#?}");
+    assert_eq!(children[0].subject, "evidence");
+    assert_eq!(children[0].owner.as_deref(), Some("explorer"));
+    assert_eq!(children[0].status, "completed");
+    assert_eq!(children[0].span.usage.total(), 120);
+    assert_eq!(children[1].subject, "judgment");
+    assert_eq!(children[1].owner.as_deref(), Some("oracle"));
+    assert_eq!(children[1].status, "in_progress");
+
+    let workflow = zuno_db::job::JobSubject::workflow("run_release", "release-hardening");
+    assert_eq!(
+        project_job_subject(&workflow),
+        zuno_types::JobSubjectProjection::Workflow {
+            run_id: "run_release".to_owned(),
+            workflow: "release-hardening".to_owned(),
+        }
+    );
+    let workflow_children = project_job_children(
+        &workflow,
+        &[item(
+            "work_run_release:node:0",
+            Some("work_run_release"),
+            "verify",
+            "fixer",
+            zuno_tools::WorkItemStatus::Pending,
+            0,
+        )],
+    );
+    assert_eq!(workflow_children.len(), 1);
+    assert_eq!(workflow_children[0].subject, "verify");
+    assert_eq!(workflow_children[0].owner.as_deref(), Some("fixer"));
+    assert!(
+        project_job_children(
+            &zuno_db::job::JobSubject::child_session("ses_child"),
+            &items,
+        )
+        .is_empty()
+    );
+}
+
 #[derive(Debug, Default)]
 struct NoProductAgents;
 
