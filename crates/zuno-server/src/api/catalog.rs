@@ -700,11 +700,21 @@ pub async fn skills(
         &resolved.config,
     );
     let loaded = load_skills(options).await?;
+    let project_directory = state.project_directory().to_owned();
+    let command_sources =
+        command::Sources::new(&project_directory).with_config(resolved.config.command.as_ref());
+    let command_registry = command::Registry::build(&command_sources);
+    let slash_sources = loaded
+        .slash_invokable(command_registry.list().map(|command| command.name.as_str()))
+        .into_iter()
+        .map(|skill| skill.location.clone())
+        .collect::<std::collections::HashSet<_>>();
     let data = loaded
         .sorted()
         .into_iter()
         .map(|skill| {
             let builtin = zuno_catalog::skill::builtin::is_location(&skill.location);
+            let slash = slash_sources.contains(&skill.location).then_some(true);
             SkillInfo {
                 description: skill.description,
                 location: if builtin {
@@ -713,7 +723,7 @@ pub async fn skills(
                     skill.location
                 },
                 name: skill.name,
-                slash: None,
+                slash,
             }
         })
         .collect();

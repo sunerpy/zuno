@@ -2944,18 +2944,9 @@ impl TurnHost {
     /// through `/skills` and the typed `skill` tool, but are not exposed as an
     /// ambiguous slash name that could silently pick the wrong instructions.
     pub(crate) fn slash_skills(&self) -> Vec<zuno_catalog::skill::Skill> {
-        let command_names = self
-            .commands()
-            .map(|command| command.name.as_str())
-            .collect::<BTreeSet<_>>();
         self.skills
-            .all()
-            .iter()
-            .filter(|skill| {
-                skill.description.is_some()
-                    && self.skills.named(&skill.name).len() == 1
-                    && !command_names.contains(skill.name.as_str())
-            })
+            .slash_invokable(self.commands().map(|command| command.name.as_str()))
+            .into_iter()
             .cloned()
             .collect()
     }

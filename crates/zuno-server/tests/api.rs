@@ -2541,6 +2541,11 @@ async fn api_skill_reports_every_first_party_location_and_description() {
                 .is_some_and(|description| !description.trim().is_empty()),
             "{name} must carry a model-facing description"
         );
+        assert_eq!(
+            builtin["slash"],
+            Value::Bool(true),
+            "an unambiguous first-party Skill must be invokable as `/{name}` in every client"
+        );
     }
 
     let customize = skills

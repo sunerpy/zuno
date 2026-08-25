@@ -43,7 +43,7 @@ pub mod remote;
 pub mod render;
 pub mod scan;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -398,6 +398,35 @@ impl Skills {
     #[must_use]
     pub fn all(&self) -> &[Skill] {
         &self.ordered
+    }
+
+    /// Skills that may be exposed directly as `/<skill-name>`.
+    ///
+    /// A direct slash route must resolve to exactly one source, carry enough
+    /// metadata for discovery, and never shadow a real command. Keeping this
+    /// rule beside the source indexes makes every client project the same
+    /// answer instead of independently guessing from [`Self::all`].
+    #[must_use]
+    pub fn slash_invokable<I, S>(&self, command_names: I) -> Vec<&Skill>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let command_names = command_names
+            .into_iter()
+            .map(|name| name.as_ref().to_owned())
+            .collect::<HashSet<_>>();
+        self.ordered
+            .iter()
+            .filter(|skill| {
+                skill.description.is_some()
+                    && self
+                        .by_name
+                        .get(&skill.name)
+                        .is_some_and(|at| at.len() == 1)
+                    && !command_names.contains(&skill.name)
+            })
+            .collect()
     }
 
     /// `Skill.available(undefined)` (`:310-315`): every skill, sorted by name.
@@ -839,6 +868,47 @@ mod tests {
         assert!(skills.get(builtin::NAME).is_none());
         assert_eq!(skills.named(builtin::NAME).len(), 2);
         assert!(skills.warnings().is_empty());
+    }
+
+    #[test]
+    fn slash_invokable_skills_are_described_unambiguous_and_do_not_shadow_commands() {
+        let skills = Skills::from_loaded([
+            Skill::embedded(
+                "direct",
+                Some("directly invokable".to_owned()),
+                "/one/direct/SKILL.md",
+                "direct",
+            ),
+            Skill::embedded(
+                "duplicate",
+                Some("first source".to_owned()),
+                "/one/duplicate/SKILL.md",
+                "first",
+            ),
+            Skill::embedded(
+                "duplicate",
+                Some("second source".to_owned()),
+                "/two/duplicate/SKILL.md",
+                "second",
+            ),
+            Skill::embedded("undocumented", None, "/one/undocumented/SKILL.md", "hidden"),
+            Skill::embedded(
+                "compact",
+                Some("collides with a real command".to_owned()),
+                "/one/compact/SKILL.md",
+                "collision",
+            ),
+        ]);
+
+        let invokable = skills.slash_invokable(["compact", "goal"]);
+
+        assert_eq!(
+            invokable
+                .iter()
+                .map(|skill| (skill.name.as_str(), skill.location.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("direct", "/one/direct/SKILL.md")]
+        );
     }
 
     #[test]
