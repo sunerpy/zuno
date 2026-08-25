@@ -143,6 +143,43 @@ fn the_process_entry_point_starts_a_memory_sampler_for_a_long_running_command() 
 }
 
 #[test]
+fn headless_turn_progress_reaches_the_liveness_watchdog() {
+    // A working renderer alone is not enough: the original false-positive happened
+    // because `run_process` held a busy guard while the turn's real events had no route
+    // back to it. Lock all three production seams so the callback cannot become another
+    // fully tested but unreachable diagnostic.
+    let entry = compact(&cli_source("src/lib.rs"));
+    for needle in [
+        "let progress = || watchdog.beat(dispatch_phase);",
+        "HeadlessCommandDispatcher::new(progress)",
+    ] {
+        assert!(
+            entry.contains(&compact(needle)),
+            "the process entry point no longer wires `{needle}` into dispatch"
+        );
+    }
+
+    let dispatcher = compact(&cli_source("src/cmd/mod.rs"));
+    assert!(
+        dispatcher.contains(&compact(
+            "run::execute(args, &request.environment, self.progress)"
+        )),
+        "the dispatcher no longer forwards watchdog progress to the headless turn"
+    );
+
+    let run = compact(&cli_source("src/cmd/run.rs"));
+    for needle in [
+        "render_events(receiver, args.format, progress)",
+        "while let Some(event) = receiver.recv().await { report_progress(progress);",
+    ] {
+        assert!(
+            run.contains(&compact(needle)),
+            "headless turn events no longer drive `{needle}`"
+        );
+    }
+}
+
+#[test]
 fn the_standalone_server_binary_starts_one_too() {
     // Two long-lived entry points, so two wirings: `zuno serve` goes through the CLI's
     // `run_process`, and `zuno-server` has its own `main`. Wiring only the first is how one

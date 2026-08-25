@@ -19,7 +19,13 @@ use crate::cmd::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan, persisted
 use crate::command::{RunArgs, RunFormat};
 use crate::environment::StartupEnvironment;
 
-pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Result<(), String> {
+type ProgressPulse<'a> = Option<&'a dyn Fn()>;
+
+pub(super) fn execute(
+    args: &RunArgs,
+    environment: &StartupEnvironment,
+    progress: ProgressPulse<'_>,
+) -> Result<(), String> {
     validate_flags(args)?;
     let message = if args.command.is_some() {
         args.message.join(" ")
@@ -40,8 +46,10 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
         effort: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
+    report_progress(progress);
     let runtime = runtime()?;
     let plan = runtime.block_on(TurnPlan::resolve(&options, environment))?;
+    report_progress(progress);
     // Before the host, not after: the registry reads the MCP loader once while it is
     // being assembled, and this surface has no second turn for a late connection to
     // appear in. See `super::mcp_runtime`.
@@ -49,16 +57,19 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
         plan.config(),
         plan.worktree().unwrap_or_else(|| plan.directory()),
     );
+    report_progress(progress);
     let mcp_notes = match mcp.as_ref() {
         Some(mcp) => runtime.block_on(mcp.connect()),
         None => Vec::new(),
     };
+    report_progress(progress);
     let mut host = runtime.block_on(TurnHost::open_with_mcp(
         plan,
         environment,
         Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
         mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
     ))?;
+    report_progress(progress);
     host.activate_extension_composition()?;
     host.push_notes(mcp_notes);
 
@@ -80,13 +91,17 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
                 drop(sender);
                 Ok::<(), String>(())
             },
-            render_events(receiver, args.format)
+            render_events(receiver, args.format, progress)
         )
     });
+    report_progress(progress);
     let shutdown = runtime.block_on(host.shutdown());
+    report_progress(progress);
     runtime.block_on(environment.wait_background_jobs());
+    report_progress(progress);
     if let Some(mcp) = mcp {
         runtime.block_on(mcp.shutdown());
+        report_progress(progress);
     }
     super::turn::finish_with_shutdown(outcome, shutdown)?;
     rendered?;
@@ -154,6 +169,7 @@ fn prompt(args: &RunArgs) -> Result<String, String> {
 async fn render_events(
     receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
     format: RunFormat,
+    progress: ProgressPulse<'_>,
 ) -> Result<(), String> {
     let stderr_is_terminal = std::io::stderr().is_terminal();
     let mut stdout = std::io::stdout().lock();
@@ -164,6 +180,7 @@ async fn render_events(
         &mut stdout,
         &mut stderr,
         stderr_is_terminal,
+        progress,
     )
     .await
 }
@@ -174,6 +191,7 @@ async fn render_events_to<Stdout, Stderr>(
     stdout: &mut Stdout,
     stderr: &mut Stderr,
     stderr_is_terminal: bool,
+    progress: ProgressPulse<'_>,
 ) -> Result<(), String>
 where
     Stdout: Write,
@@ -181,6 +199,7 @@ where
 {
     let mut wrote_text = false;
     while let Some(event) = receiver.recv().await {
+        report_progress(progress);
         match format {
             RunFormat::Default => match event {
                 TurnEvent::Provider {
@@ -231,6 +250,12 @@ where
         writeln!(stdout).map_err(to_string)?;
     }
     Ok(())
+}
+
+fn report_progress(progress: ProgressPulse<'_>) {
+    if let Some(progress) = progress {
+        progress();
+    }
 }
 
 fn write_retry_notice(
@@ -485,6 +510,20 @@ fn to_string(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct StallCounter {
+        stalled: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl zuno_observability::watchdog::WatchdogSink for StallCounter {
+        fn report(&self, report: &zuno_observability::watchdog::WatchdogReport) {
+            if report.event == zuno_observability::watchdog::WatchdogEvent::Stalled {
+                self.stalled
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
     fn run_args() -> RunArgs {
         RunArgs {
             message: vec!["hello".to_owned()],
@@ -534,12 +573,67 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async move {
             let (produced, rendered) =
-                tokio::join!(producer, render_events(receiver, RunFormat::Default));
+                tokio::join!(producer, render_events(receiver, RunFormat::Default, None));
             produced.expect("producer task");
             rendered.expect("render events");
         })
         .await
         .expect("bounded channel must be consumed concurrently");
+    }
+
+    #[tokio::test]
+    async fn renderer_events_keep_a_busy_headless_turn_out_of_false_stall() {
+        let sink = StallCounter::default();
+        let watchdog = zuno_observability::watchdog::Watchdog::spawn_with_sink(
+            zuno_observability::watchdog::WatchdogConfig {
+                stall_after: std::time::Duration::from_millis(120),
+                check_every: std::time::Duration::from_millis(10),
+                alive_every: std::time::Duration::from_secs(3_600),
+                max_threads_dumped: 4,
+                max_stall_backoff: std::time::Duration::from_secs(1),
+            },
+            sink.clone(),
+        );
+        let phase = watchdog.phase("test.cli.run.progress");
+        let work = watchdog.begin_work(phase);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let producer = async move {
+            for index in 0..10 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                sender
+                    .send(TurnEvent::TurnStarted {
+                        session_id: format!("ses_{index}"),
+                    })
+                    .await
+                    .expect("renderer remains connected");
+            }
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        {
+            let progress = || watchdog.beat(phase);
+            let ((), rendered) = tokio::join!(
+                producer,
+                render_events_to(
+                    receiver,
+                    RunFormat::Default,
+                    &mut stdout,
+                    &mut stderr,
+                    false,
+                    Some(&progress),
+                )
+            );
+            rendered.expect("events render while reporting real progress");
+        }
+        drop(work);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        assert_eq!(
+            sink.stalled.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a headless turn that kept emitting real events was reported as stalled"
+        );
+        watchdog.shutdown();
     }
 
     async fn rendered_retry_notice(stderr_is_terminal: bool) -> (Vec<u8>, Vec<u8>) {
@@ -560,6 +654,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             stderr_is_terminal,
+            None,
         )
         .await
         .expect("retry notice renders");

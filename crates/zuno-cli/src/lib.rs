@@ -110,9 +110,10 @@ pub fn run_process() -> ExitCode {
     let watchdog = zuno_observability::watchdog::Watchdog::spawn(
         zuno_observability::watchdog::WatchdogConfig::default(),
     );
+    let dispatch_phase = watchdog.phase(WATCHDOG_DISPATCH_PHASE);
     let work = match &action {
         Action::Dispatch(request) if request.args.silence_is_a_stall() => {
-            Some(watchdog.begin_work(watchdog.phase(WATCHDOG_DISPATCH_PHASE)))
+            Some(watchdog.begin_work(dispatch_phase))
         }
         Action::Dispatch(_) | Action::Rejected { .. } | Action::Version { .. } => None,
     };
@@ -131,7 +132,12 @@ pub fn run_process() -> ExitCode {
         Action::Dispatch(_) | Action::Rejected { .. } | Action::Version { .. } => None,
     };
 
-    let code = execute_action(action, &mut cmd::HeadlessCommandDispatcher);
+    let code = {
+        let progress = || watchdog.beat(dispatch_phase);
+        let progress = work.as_ref().map(|_| &progress as &dyn Fn());
+        let mut dispatcher = cmd::HeadlessCommandDispatcher::new(progress);
+        execute_action(action, &mut dispatcher)
+    };
 
     drop(work);
     // Before the watchdog, so the sampler's last report still has a logging sink.

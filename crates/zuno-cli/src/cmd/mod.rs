@@ -31,10 +31,18 @@ mod workflow;
 
 use crate::{CommandDispatcher, DispatchArguments, DispatchError, DispatchRequest};
 
-#[derive(Debug, Default)]
-pub(crate) struct HeadlessCommandDispatcher;
+#[derive(Default)]
+pub(crate) struct HeadlessCommandDispatcher<'a> {
+    progress: Option<&'a dyn Fn()>,
+}
 
-impl CommandDispatcher for HeadlessCommandDispatcher {
+impl<'a> HeadlessCommandDispatcher<'a> {
+    pub(crate) const fn new(progress: Option<&'a dyn Fn()>) -> Self {
+        Self { progress }
+    }
+}
+
+impl CommandDispatcher for HeadlessCommandDispatcher<'_> {
     /// Route one request to its handler.
     ///
     /// This is one exhaustive `match` rather than a chain of `if let` probes so
@@ -71,7 +79,7 @@ impl CommandDispatcher for HeadlessCommandDispatcher {
                 serve::execute(args, &request.environment).map_err(to_error)
             }
             DispatchArguments::Run(args) => {
-                run::execute(args, &request.environment).map_err(to_error)
+                run::execute(args, &request.environment, self.progress).map_err(to_error)
             }
             DispatchArguments::Tui(args) => {
                 tui::execute(args, &request.environment).map_err(to_error)
