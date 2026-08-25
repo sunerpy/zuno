@@ -403,7 +403,7 @@ async fn supervised_handle_is_aborted_and_joined_on_process_shutdown() {
 }
 
 #[tokio::test]
-async fn background_dispatch_returns_a_durable_job_before_the_child_finishes() {
+async fn background_dispatch_returns_a_durable_active_job_before_the_child_finishes() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);
     let mut request = fixture.request("ses_owner");
@@ -416,20 +416,34 @@ async fn background_dispatch_returns_a_durable_job_before_the_child_finishes() {
         .expect("background delegation is admitted");
     let job_id = turn.job_id.expect("background job id");
     assert_ne!(job_id, turn.session_id);
-    assert_eq!(
-        fixture
-            .host
-            .job_store
-            .get(&job_id)
-            .expect("running job")
-            .status,
-        zuno_db::job::JobStatus::Running
+    assert!(
+        matches!(
+            fixture
+                .host
+                .job_store
+                .get(&job_id)
+                .expect("active job")
+                .status,
+            zuno_db::job::JobStatus::Queued | zuno_db::job::JobStatus::Running
+        ),
+        "the durable job must exist before the child finishes"
     );
     assert_eq!(
         zuno_db::session::children(&fixture.connection(), "ses_owner")
             .expect("read children")
             .len(),
         1
+    );
+
+    fixture.runner.wait_for_starts(1).await;
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(&job_id)
+            .expect("started job")
+            .status,
+        zuno_db::job::JobStatus::Running
     );
 
     fixture.runner.complete_with(Ok("child answer"));
@@ -473,6 +487,24 @@ async fn background_children_share_the_workspace_delegation_bound() {
         .await
         .expect("second dispatch");
     fixture.runner.wait_for_starts(1).await;
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(first.job_id.as_deref().expect("first job id"))
+            .expect("first job")
+            .status,
+        zuno_db::job::JobStatus::Running
+    );
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(second.job_id.as_deref().expect("second job id"))
+            .expect("second job")
+            .status,
+        zuno_db::job::JobStatus::Queued
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(30), fixture.runner.wait_for_starts(2))
             .await
@@ -493,6 +525,63 @@ async fn background_children_share_the_workspace_delegation_bound() {
             .expect("settled job");
         assert_eq!(job.status, zuno_db::job::JobStatus::Completed);
     }
+}
+
+#[tokio::test]
+async fn a_queued_background_child_can_be_cancelled_without_starting() {
+    let fixture = Fixture::with_limit(1);
+    fixture.session("ses_owner", None);
+    let mut first = fixture.request("ses_owner");
+    first.background = true;
+    first.report_delivery = ReportDelivery::Quiet;
+    let mut queued = fixture.request("ses_owner");
+    queued.background = true;
+
+    let first = fixture.host.dispatch(first).await.expect("first dispatch");
+    let queued = fixture
+        .host
+        .dispatch(queued)
+        .await
+        .expect("queued dispatch");
+    fixture.runner.wait_for_starts(1).await;
+    let queued_job_id = queued.job_id.expect("queued job id");
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(&queued_job_id)
+            .expect("queued job")
+            .status,
+        zuno_db::job::JobStatus::Queued
+    );
+
+    assert!(fixture.jobs.cancel("ses_owner", &queued_job_id));
+    fixture.runner.complete_with(Ok("first answer"));
+    fixture.jobs.wait_all().await;
+
+    assert_eq!(
+        fixture.runner.started(),
+        1,
+        "the queued child must never run"
+    );
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(&queued_job_id)
+            .expect("cancelled queued job")
+            .status,
+        zuno_db::job::JobStatus::Cancelled
+    );
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(first.job_id.as_deref().expect("first job id"))
+            .expect("first job")
+            .status,
+        zuno_db::job::JobStatus::Completed
+    );
 }
 
 #[tokio::test]
@@ -618,4 +707,85 @@ async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reop
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn restart_reconciliation_cancels_queued_children_and_marks_running_children_uncertain() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.session("ses_queued", Some("ses_owner"));
+    fixture.session("ses_running", Some("ses_owner"));
+    fixture
+        .host
+        .job_store
+        .create(
+            zuno_db::job::NewAgentJob::new(
+                "job_queued",
+                "ses_owner",
+                zuno_db::job::JobSubject::child_session("ses_queued"),
+                zuno_db::job::ReportDelivery::NextStep,
+                10,
+            )
+            .queued(),
+        )
+        .expect("create queued child job");
+    fixture
+        .host
+        .job_store
+        .create(zuno_db::job::NewAgentJob::new(
+            "job_running",
+            "ses_owner",
+            zuno_db::job::JobSubject::child_session("ses_running"),
+            zuno_db::job::ReportDelivery::NextStep,
+            11,
+        ))
+        .expect("create running child job");
+
+    assert_eq!(
+        fixture
+            .host
+            .recover_interrupted("ses_owner")
+            .expect("reconcile child jobs"),
+        2
+    );
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get("job_queued")
+            .expect("queued job")
+            .status,
+        zuno_db::job::JobStatus::Cancelled
+    );
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get("job_running")
+            .expect("running job")
+            .status,
+        zuno_db::job::JobStatus::Uncertain
+    );
+    assert_eq!(
+        fixture
+            .host
+            .recover_pending_reports("ses_owner")
+            .await
+            .expect("wake recovered reports"),
+        2
+    );
+    let statuses = fixture
+        .wake
+        .reports
+        .lock()
+        .expect("wake reports")
+        .iter()
+        .map(|report| {
+            report.prompt["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["cancelled", "uncertain"]);
 }

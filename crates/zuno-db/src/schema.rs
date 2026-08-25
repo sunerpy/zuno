@@ -231,7 +231,7 @@ CREATE TABLE `agent_job` (
   CONSTRAINT `agent_job_orchestration_snapshot` CHECK (
     `orchestration_snapshot` IS NULL OR json_valid(`orchestration_snapshot`)
   ),
-  CONSTRAINT `agent_job_status` CHECK (`status` IN ('running','completed','failed','cancelled','uncertain')),
+  CONSTRAINT `agent_job_status` CHECK (`status` IN ('queued','running','completed','failed','cancelled','uncertain')),
   CONSTRAINT `agent_job_report_delivery` CHECK (`report_delivery` IN ('next-step','quiet')),
   CONSTRAINT `fk_agent_job_parent_session_id_session_id_fk` FOREIGN KEY (`parent_session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_agent_job_report_input_id_session_input_id_fk` FOREIGN KEY (`report_input_id`) REFERENCES `session_input`(`id`) ON DELETE SET NULL

@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use zuno_config::schema::Config;
 use zuno_db::inbox::{InputDelivery, NewSessionInput};
 use zuno_db::job::{
-    AgentJob, AgentJobStore, JobSettlement, JobSubject, NewAgentJob,
+    AgentJob, AgentJobStore, JobSettlement, JobStatus, JobSubject, NewAgentJob,
     ReportDelivery as DbReportDelivery,
 };
 use zuno_product_agent::{ProductAgent, ProductAgentError, ProductAgentRequest as NativeRequest};
@@ -80,32 +80,53 @@ impl NativeProductAgentHost {
         })
     }
 
-    /// Mark process-owned invocations left running across a restart as uncertain.
+    /// Reconcile process-owned invocations left active across a restart.
     ///
     /// They are never replayed: the native product may have performed side effects
     /// before its stdio stream disappeared.
     pub(crate) async fn recover_uncertain(&self, parent_session_id: &str) -> Result<usize, String> {
-        let running = self
+        let active = self
             .jobs
-            .running_product_agents_for(parent_session_id)
+            .active_product_agents_for(parent_session_id)
             .map_err(to_string)?;
         let mut recovered = 0_usize;
-        for job in running {
-            let message = format!(
-                "Background product agent has an uncertain outcome for job `{}`: the Zuno process \
-                 restarted or lost the native product executor; the external outcome is unknown \
-                 and this invocation will not be replayed",
-                job.id
-            );
+        for job in active {
             let completed = zuno_db::message::now_millis();
-            let report = report_for_job(&job, "uncertain", &message, completed);
-            let settled = self
-                .jobs
-                .settle(
-                    &job.id,
-                    JobSettlement::uncertain(message, completed, report),
-                )
-                .map_err(to_string)?;
+            let (status, message, settlement) = match job.status {
+                JobStatus::Queued => {
+                    let message = format!(
+                        "Background product agent job `{}` was cancelled because the Zuno process \
+                         restarted before execution capacity was admitted; the native product was not run",
+                        job.id
+                    );
+                    let report = report_for_job(&job, "cancelled", &message, completed);
+                    (
+                        "cancelled",
+                        message.clone(),
+                        JobSettlement::cancelled(message, completed, report),
+                    )
+                }
+                JobStatus::Running => {
+                    let message = format!(
+                        "Background product agent has an uncertain outcome for job `{}`: the Zuno process \
+                         restarted or lost the native product executor; the external outcome is unknown \
+                         and this invocation will not be replayed",
+                        job.id
+                    );
+                    let report = report_for_job(&job, "uncertain", &message, completed);
+                    (
+                        "uncertain",
+                        message.clone(),
+                        JobSettlement::uncertain(message, completed, report),
+                    )
+                }
+                JobStatus::Completed
+                | JobStatus::Failed
+                | JobStatus::Cancelled
+                | JobStatus::Uncertain => continue,
+            };
+            let settled = self.jobs.settle(&job.id, settlement).map_err(to_string)?;
+            tracing::info!(job_id = %job.id, %status, %message, "reconciled interrupted product-agent job");
             if let Some(report) = settled.report {
                 self.wake.wake(report).await?;
             }
@@ -180,6 +201,7 @@ impl ProductAgentHost for NativeProductAgentHost {
                     delivery,
                     zuno_db::message::now_millis(),
                 )
+                .queued()
                 .with_orchestration_snapshot(request.parent_attempt.as_deref().cloned()),
             )
             .map_err(to_string)?;
@@ -198,7 +220,15 @@ impl ProductAgentHost for NativeProductAgentHost {
             task_cancellation,
             async move {
                 let outcome = match delegation_limiter.acquire(&runner_cancellation).await {
-                    Ok(_permit) => runner.run(native, runner_cancellation).await,
+                    Ok(_permit) => {
+                        match jobs.start(&background_job_id, zuno_db::message::now_millis()) {
+                            Ok(_) => runner.run(native, runner_cancellation).await,
+                            Err(error) => Err(ProductAgentError::Failed {
+                                product: "Zuno delegation",
+                                message: error.to_string(),
+                            }),
+                        }
+                    }
                     Err(DelegationAcquireError::Cancelled) => Err(ProductAgentError::Cancelled {
                         product: "Zuno delegation",
                     }),

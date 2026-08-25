@@ -146,6 +146,8 @@ impl JobSubject {
 /// Durable execution state for one background job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
+    /// The job is durably admitted but is waiting for execution capacity.
+    Queued,
     /// The background execution has not settled.
     Running,
     /// The execution produced a final answer.
@@ -162,6 +164,7 @@ impl JobStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -172,6 +175,7 @@ impl JobStatus {
 
     fn parse(value: &str) -> Result<Self, DbError> {
         match value {
+            "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
@@ -186,7 +190,7 @@ impl JobStatus {
     /// Whether no live executor may transition this state again.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running)
+        !matches!(self, Self::Queued | Self::Running)
     }
 }
 
@@ -199,6 +203,7 @@ pub struct NewAgentJob {
     pub orchestration_snapshot: Option<AttemptSnapshot>,
     pub report_delivery: ReportDelivery,
     pub time_created: i64,
+    initial_status: JobStatus,
 }
 
 impl NewAgentJob {
@@ -218,7 +223,15 @@ impl NewAgentJob {
             orchestration_snapshot: None,
             report_delivery,
             time_created,
+            initial_status: JobStatus::Running,
         }
+    }
+
+    /// Persist this job as waiting for shared execution capacity.
+    #[must_use]
+    pub fn queued(mut self) -> Self {
+        self.initial_status = JobStatus::Queued;
+        self
     }
 
     /// Persist the immutable Attempt that admitted this background operation.
@@ -344,11 +357,17 @@ impl AgentJobStore {
         Self { pool }
     }
 
-    /// Insert one running job.
+    /// Insert one admitted job in its requested initial state.
     pub fn create(&self, job: NewAgentJob) -> Result<AgentJob, DbError> {
         validate_new_job(&job)?;
         self.pool
             .transaction(|transaction| create_in(transaction, job))
+    }
+
+    /// Atomically mark one queued job as running after capacity admission.
+    pub fn start(&self, job_id: &str, time_started: i64) -> Result<AgentJob, DbError> {
+        self.pool
+            .transaction(|transaction| start_in(transaction, job_id, time_started))
     }
 
     /// Read one job by id.
@@ -404,7 +423,43 @@ impl AgentJobStore {
         )
     }
 
-    /// Settle one running job and atomically admit its parent report.
+    /// Read queued or running native child sessions which lost their process owner.
+    pub fn active_child_sessions_for(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<AgentJob>, DbError> {
+        self.active_subjects_for(parent_session_id, "child-session")
+    }
+
+    /// Read queued or running product invocations which lost their process owner.
+    pub fn active_product_agents_for(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<AgentJob>, DbError> {
+        self.active_subjects_for(parent_session_id, "product-agent")
+    }
+
+    fn active_subjects_for(
+        &self,
+        parent_session_id: &str,
+        subject_kind: &str,
+    ) -> Result<Vec<AgentJob>, DbError> {
+        let connection = self.pool.get()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {SELECT_COLUMNS} FROM agent_job \
+                 WHERE parent_session_id = ?1 AND subject_kind = ?2 \
+                   AND status IN ('queued', 'running') ORDER BY time_created, id"
+            ))
+            .map_err(open::map_error)?;
+        let rows = statement
+            .query_map(params![parent_session_id, subject_kind], decode_stored_job)
+            .map_err(open::map_error)?;
+        rows.map(|row| row.map_err(open::map_error).and_then(decode_job))
+            .collect()
+    }
+
+    /// Settle one active job and atomically admit its parent report.
     pub fn settle(&self, job_id: &str, settlement: JobSettlement) -> Result<SettledJob, DbError> {
         self.pool
             .transaction(|transaction| settle_in(transaction, job_id, settlement))
@@ -519,13 +574,14 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
              (id, parent_session_id, subject_kind, subject_payload, orchestration_snapshot, \
               status, report_delivery, result, error, report_input_id, created_seq, settled_seq, \
               time_created, time_updated, time_completed) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, NULL, NULL, NULL, ?7, NULL, ?8, ?8, NULL)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, ?8, NULL, ?9, ?9, NULL)",
             params![
                 job.id,
                 job.parent_session_id,
                 job.subject.kind(),
                 subject_payload,
                 orchestration_snapshot,
+                job.initial_status.as_str(),
                 job.report_delivery.as_str(),
                 event.sequence,
                 job.time_created,
@@ -537,7 +593,7 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
         parent_session_id: job.parent_session_id,
         subject: job.subject,
         orchestration_snapshot: job.orchestration_snapshot,
-        status: JobStatus::Running,
+        status: job.initial_status,
         report_delivery: job.report_delivery,
         result: None,
         error: None,
@@ -550,29 +606,85 @@ fn create_in(transaction: &Transaction<'_>, job: NewAgentJob) -> Result<AgentJob
     })
 }
 
+fn start_in(
+    transaction: &Transaction<'_>,
+    job_id: &str,
+    time_started: i64,
+) -> Result<AgentJob, DbError> {
+    let queued = get_in(transaction, job_id)?.ok_or_else(|| DbError::NotFound {
+        table: TABLE.to_owned(),
+        id: job_id.to_owned(),
+    })?;
+    if queued.status != JobStatus::Queued {
+        return Err(query_error(std::io::Error::other(format!(
+            "job `{job_id}` is already {}",
+            queued.status.as_str()
+        ))));
+    }
+    append_in(
+        transaction,
+        &queued.parent_session_id,
+        NewSessionEvent::new(
+            "agent.job.started",
+            [
+                ("jobID".to_owned(), Value::String(queued.id.clone())),
+                (
+                    "parentSessionID".to_owned(),
+                    Value::String(queued.parent_session_id.clone()),
+                ),
+                ("subject".to_owned(), queued.subject.as_json()),
+                ("timeStarted".to_owned(), Value::Number(time_started.into())),
+            ]
+            .into_iter()
+            .collect(),
+        )?,
+    )?;
+    let changed = transaction
+        .execute(
+            "UPDATE agent_job SET status = 'running', time_updated = ?1 \
+             WHERE id = ?2 AND status = 'queued'",
+            params![time_started, job_id],
+        )
+        .map_err(open::map_error)?;
+    if changed != 1 {
+        return Err(query_error(std::io::Error::other(format!(
+            "job `{job_id}` changed while starting"
+        ))));
+    }
+    get_in(transaction, job_id)?.ok_or_else(|| DbError::NotFound {
+        table: TABLE.to_owned(),
+        id: job_id.to_owned(),
+    })
+}
+
 fn settle_in(
     transaction: &Transaction<'_>,
     job_id: &str,
     settlement: JobSettlement,
 ) -> Result<SettledJob, DbError> {
-    let running = get_in(transaction, job_id)?.ok_or_else(|| DbError::NotFound {
+    let active = get_in(transaction, job_id)?.ok_or_else(|| DbError::NotFound {
         table: TABLE.to_owned(),
         id: job_id.to_owned(),
     })?;
-    if running.status != JobStatus::Running {
+    if active.status.is_terminal() {
         return Err(query_error(std::io::Error::other(format!(
             "job `{job_id}` is already {}",
-            running.status.as_str()
+            active.status.as_str()
         ))));
     }
-    validate_settlement(&running, &settlement)?;
+    if active.status == JobStatus::Queued && settlement.status != JobStatus::Cancelled {
+        return Err(query_error(std::io::Error::other(format!(
+            "queued job `{job_id}` may only be cancelled before it starts"
+        ))));
+    }
+    validate_settlement(&active, &settlement)?;
 
     let settled_event = append_in(
         transaction,
-        &running.parent_session_id,
+        &active.parent_session_id,
         NewSessionEvent::new(
             "agent.job.settled",
-            settled_properties(&running, &settlement),
+            settled_properties(&active, &settlement),
         )?,
     )?;
     let report = settlement
@@ -591,7 +703,7 @@ fn settle_in(
             "UPDATE agent_job \
              SET status = ?1, result = ?2, error = ?3, report_input_id = ?4, \
                  settled_seq = ?5, time_updated = ?6, time_completed = ?6 \
-             WHERE id = ?7 AND status = 'running'",
+             WHERE id = ?7 AND status IN ('queued', 'running')",
             params![
                 settlement.status.as_str(),
                 result,
@@ -658,7 +770,7 @@ fn validate_settlement(job: &AgentJob, settlement: &JobSettlement) -> Result<(),
                 "a failed, cancelled, or uncertain job requires an error",
             )))
         }
-        JobStatus::Running => unreachable!("terminal status checked above"),
+        JobStatus::Queued | JobStatus::Running => unreachable!("terminal status checked above"),
         JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled | JobStatus::Uncertain => {
             Ok(())
         }
@@ -676,6 +788,10 @@ fn created_properties(job: &NewAgentJob) -> Map<String, Value> {
         (
             "reportDelivery".to_owned(),
             Value::String(job.report_delivery.as_str().to_owned()),
+        ),
+        (
+            "status".to_owned(),
+            Value::String(job.initial_status.as_str().to_owned()),
         ),
         (
             "timeCreated".to_owned(),

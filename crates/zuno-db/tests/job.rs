@@ -150,6 +150,31 @@ fn creating_a_job_persists_running_state_and_parent_event() {
 }
 
 #[test]
+fn queued_job_becomes_running_only_after_admission() {
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+
+    let created = store
+        .create(running("job_queued", ReportDelivery::Quiet).queued())
+        .expect("create queued job");
+    assert_eq!(created.status, JobStatus::Queued);
+    assert_eq!(created.time_updated, 10);
+
+    let started = store.start("job_queued", 15).expect("start queued job");
+    assert_eq!(started.status, JobStatus::Running);
+    assert_eq!(started.time_updated, 15);
+
+    let events = SessionEventLog::new(pool)
+        .read_after(PARENT, None)
+        .expect("parent events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event_type, "agent.job.created");
+    assert_eq!(events[0].properties["status"], "queued");
+    assert_eq!(events[1].event_type, "agent.job.started");
+    assert_eq!(events[1].properties["jobID"], "job_queued");
+}
+
+#[test]
 fn product_agent_jobs_have_no_fake_child_session_and_can_be_uncertain() {
     let pool = initialized(&DbLocation::Memory);
     let store = AgentJobStore::new(Arc::clone(&pool));
@@ -337,7 +362,9 @@ fn failed_cancelled_and_uncertain_settlements_can_retain_structured_results() {
             JobStatus::Failed => JobSettlement::failed(message, 20, None),
             JobStatus::Cancelled => JobSettlement::cancelled(message, 20, None),
             JobStatus::Uncertain => JobSettlement::uncertain(message, 20, None),
-            JobStatus::Running | JobStatus::Completed => unreachable!("test terminal status"),
+            JobStatus::Queued | JobStatus::Running | JobStatus::Completed => {
+                unreachable!("test terminal status")
+            }
         }
         .with_result(expected.clone());
 

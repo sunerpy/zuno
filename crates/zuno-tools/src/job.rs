@@ -114,6 +114,7 @@ fn render(job: AgentJob) -> Result<ToolOutput, ToolError> {
 
 fn status_name(status: JobStatus) -> &'static str {
     match status {
+        JobStatus::Queued => "queued",
         JobStatus::Running => "running",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",

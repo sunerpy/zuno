@@ -20,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput};
 use zuno_db::job::{
-    AgentJobStore, JobSettlement, JobSubject, NewAgentJob, ReportDelivery as DbReportDelivery,
+    AgentJob, AgentJobStore, JobSettlement, JobStatus, JobSubject, NewAgentJob,
+    ReportDelivery as DbReportDelivery,
 };
 use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::event_channel;
@@ -393,6 +394,56 @@ impl ChildSessionHost {
         Ok(recovered)
     }
 
+    /// Reconcile process-owned native child jobs without replaying their work.
+    pub(crate) fn recover_interrupted(&self, parent_session_id: &str) -> Result<usize, String> {
+        let active = self
+            .job_store
+            .active_child_sessions_for(parent_session_id)
+            .map_err(to_string)?;
+        let mut recovered = 0_usize;
+        for job in active {
+            let completed = zuno_db::message::now_millis();
+            let (status, message, settlement) = match job.status {
+                JobStatus::Queued => {
+                    let message = format!(
+                        "Background subagent job `{}` was cancelled because the Zuno process \
+                         restarted before execution capacity was admitted; no child turn was run",
+                        job.id
+                    );
+                    let report = report_for_job(&job, "cancelled", &message, completed);
+                    (
+                        "cancelled",
+                        message.clone(),
+                        JobSettlement::cancelled(message, completed, report),
+                    )
+                }
+                JobStatus::Running => {
+                    let message = format!(
+                        "Background subagent job `{}` has an uncertain outcome because the Zuno \
+                         process lost its child-turn executor; completed side effects are not replayed",
+                        job.id
+                    );
+                    let report = report_for_job(&job, "uncertain", &message, completed);
+                    (
+                        "uncertain",
+                        message.clone(),
+                        JobSettlement::uncertain(message, completed, report),
+                    )
+                }
+                JobStatus::Completed
+                | JobStatus::Failed
+                | JobStatus::Cancelled
+                | JobStatus::Uncertain => continue,
+            };
+            self.job_store
+                .settle(&job.id, settlement)
+                .map_err(to_string)?;
+            tracing::info!(job_id = %job.id, %status, %message, "reconciled interrupted child job");
+            recovered = recovered.saturating_add(1);
+        }
+        Ok(recovered)
+    }
+
     /// Share the parent's durable report coordinator with another job provider.
     pub(crate) fn wake_handle(&self) -> Arc<dyn ParentReportWake> {
         Arc::clone(&self.wake)
@@ -758,6 +809,7 @@ impl ChildTurnHost for ChildSessionHost {
                     delivery,
                     zuno_db::message::now_millis(),
                 )
+                .queued()
                 .with_orchestration_snapshot(request.parent_attempt.as_deref().cloned()),
             )
             .map_err(|error| ChildTurnError::Host(error.to_string()))?;
@@ -778,9 +830,18 @@ impl ChildTurnHost for ChildSessionHost {
             async move {
                 let outcome = match delegation_limiter.acquire(&task_cancellation).await {
                     Ok(_permit) => {
-                        runner
-                            .run(&background_session_id, &request, task_cancellation.clone())
-                            .await
+                        match job_store.start(&background_job_id, zuno_db::message::now_millis()) {
+                            Ok(_) => {
+                                runner
+                                    .run(
+                                        &background_session_id,
+                                        &request,
+                                        task_cancellation.clone(),
+                                    )
+                                    .await
+                            }
+                            Err(error) => Err(error.to_string()),
+                        }
                     }
                     Err(error) => Err(error.to_string()),
                 };
@@ -906,6 +967,33 @@ fn report_input(
             created,
         )
     })
+}
+
+fn report_for_job(
+    job: &AgentJob,
+    status: &str,
+    text: &str,
+    created: i64,
+) -> Option<NewSessionInput> {
+    if job.report_delivery != DbReportDelivery::NextStep {
+        return None;
+    }
+    let JobSubject::ChildSession { session_id } = &job.subject else {
+        return None;
+    };
+    Some(NewSessionInput::new(
+        crate::cmd::turn::prefixed_id("input"),
+        job.parent_session_id.clone(),
+        json!({
+            "kind": "subagentReport",
+            "jobID": job.id,
+            "childSessionID": session_id,
+            "status": status,
+            "text": text,
+        }),
+        InputDelivery::Queue,
+        created,
+    ))
 }
 
 fn to_string(error: impl std::fmt::Display) -> String {

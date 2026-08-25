@@ -1203,10 +1203,17 @@ impl SidebarView {
                 .iter()
                 .filter(|job| job.status == "running")
                 .count();
+            let queued = self
+                .ambient
+                .work
+                .jobs
+                .iter()
+                .filter(|job| job.status == "queued")
+                .count();
             lines.push(self.heading(
                 "Jobs",
                 &format!(
-                    "{running}/{} running · /subagent",
+                    "{queued} queued · {running} running · {} total · /subagent",
                     self.ambient.work.jobs.len()
                 ),
                 self.disclosure(self.expanded.jobs),
@@ -1215,6 +1222,7 @@ impl SidebarView {
             if self.expanded.jobs {
                 for job in &self.ambient.work.jobs {
                     let style = match job.status.as_str() {
+                        "queued" => self.context.secondary(),
                         "running" => self.context.accent(),
                         "failed" | "uncertain" => self.context.error(),
                         "cancelled" => self.context.muted(),

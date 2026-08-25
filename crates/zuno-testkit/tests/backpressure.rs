@@ -183,15 +183,6 @@ const CHANNELS: &[ChannelGate] = &[
         "self.sender.send_modify(|generation| {",
     ),
     gate(
-        "delegation-capacity-changes",
-        "zuno-cli/src/cmd/delegation.rs",
-        "let (changed, _receiver) = watch::channel(0);",
-        "latest value",
-        Policy::LatestValue,
-        "zuno-cli/src/cmd/delegation.rs",
-        "self.inner.changed.send_modify(|generation| {",
-    ),
-    gate(
         "pty-subscriber-output",
         "zuno-pty/src/session.rs",
         "let (sender, output) = mpsc::channel(options.capacity.max(1));",
@@ -424,7 +415,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 39);
+    assert_eq!(CHANNELS.len(), 38);
 
     let crates = crates_root();
     for entry in CHANNELS {
@@ -495,10 +486,6 @@ channel_gate!(watch_events_coalesce_when_full, "watch-events");
 channel_gate!(
     turn_work_state_changes_keep_latest_value,
     "turn-work-state-changes"
-);
-channel_gate!(
-    delegation_capacity_changes_keep_latest_value,
-    "delegation-capacity-changes"
 );
 #[tokio::test]
 async fn engine_turn_events_apply_backpressure() {

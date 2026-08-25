@@ -434,7 +434,7 @@ async fn live_cancellation_settles_only_after_the_product_observes_it() {
 }
 
 #[tokio::test]
-async fn restart_reconciliation_marks_only_product_jobs_uncertain() {
+async fn restart_reconciliation_cancels_queued_products_and_marks_running_products_uncertain() {
     let fixture = Fixture::new(Arc::new(ImmediateAgent::returning(success("unused"))));
     let store = AgentJobStore::new(Arc::clone(&fixture.pool));
     store
@@ -446,6 +446,18 @@ async fn restart_reconciliation_marks_only_product_jobs_uncertain() {
             10,
         ))
         .expect("create orphaned product job");
+    store
+        .create(
+            NewAgentJob::new(
+                "job_queued_product",
+                "ses_parent",
+                JobSubject::product_agent("run_queued", "codex", "reviewer", "subagent_codex"),
+                DbReportDelivery::NextStep,
+                11,
+            )
+            .queued(),
+        )
+        .expect("create queued product job");
 
     let recovered = fixture
         .host
@@ -453,7 +465,7 @@ async fn restart_reconciliation_marks_only_product_jobs_uncertain() {
         .await
         .expect("recover product jobs");
 
-    assert_eq!(recovered, 1);
+    assert_eq!(recovered, 2);
     let job = store.get("job_orphaned_product").expect("reconciled job");
     assert_eq!(job.status, JobStatus::Uncertain);
     assert!(
@@ -461,15 +473,26 @@ async fn restart_reconciliation_marks_only_product_jobs_uncertain() {
             .as_deref()
             .is_some_and(|error| error.contains("will not be replayed"))
     );
+    let queued = store
+        .get("job_queued_product")
+        .expect("reconciled queued product");
+    assert_eq!(queued.status, JobStatus::Cancelled);
+    assert!(
+        queued
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("was not run"))
+    );
     let reports = fixture
         .wake
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(reports.len(), 1);
+    assert_eq!(reports.len(), 2);
     assert!(
         reports[0].prompt["text"]
             .as_str()
             .is_some_and(|text| text.contains("job `job_orphaned_product`"))
     );
+    assert_eq!(reports[1].prompt["status"], "cancelled");
 }

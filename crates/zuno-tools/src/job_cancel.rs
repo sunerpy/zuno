@@ -34,7 +34,7 @@ pub struct CancelOutcome {
 /// Live cancellation seam owned by the process supervisor.
 #[async_trait]
 pub trait JobController: Send + Sync + 'static {
-    /// Request cancellation of one running job.
+    /// Request cancellation of one queued or running job.
     async fn cancel(&self, parent_session_id: &str, job_id: &str) -> Result<CancelOutcome, String>;
 }
 
@@ -64,7 +64,7 @@ impl TypedTool for JobCancelTool {
     }
 
     fn description(&self) -> &str {
-        "Cancel a running background job owned by this session. Cancellation is a side effect \
+        "Cancel a queued or running background job owned by this session. Cancellation is a side effect \
          and is never automatically replayed. Terminal jobs are reported unchanged."
     }
 
@@ -87,7 +87,7 @@ impl TypedTool for JobCancelTool {
                 });
             }
         };
-        if job.status != JobStatus::Running {
+        if !matches!(job.status, JobStatus::Queued | JobStatus::Running) {
             let status = status_name(job.status);
             let body = json!({
                 "jobID": job.id,
@@ -112,7 +112,7 @@ impl TypedTool for JobCancelTool {
             })?;
         let body = json!({
             "jobID": params.job_id,
-            "status": "running",
+            "status": status_name(job.status),
             "cancellationRequested": outcome.requested,
             "message": outcome.message,
         });
@@ -134,6 +134,7 @@ impl TypedTool for JobCancelTool {
 
 fn status_name(status: JobStatus) -> &'static str {
     match status {
+        JobStatus::Queued => "queued",
         JobStatus::Running => "running",
         JobStatus::Completed => "completed",
         JobStatus::Failed => "failed",

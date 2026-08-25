@@ -215,6 +215,13 @@ The effective delegated-task limit is the minimum of:
 9. No external tool, Agent turn, process, or provider request is automatically
    replayed after an ambiguous failure.
 
+Current implementation status (2026-08-25): native child and product-agent jobs
+persist `queued` before entering a fair process-local FIFO delegation queue and
+transition atomically to `running` after admission. Restart reconciliation safely
+cancels queued jobs and marks running jobs `Uncertain`. Durable cross-process
+leases, restart-preserved FIFO admission, and per-parent/provider/model quotas
+remain roadmap work.
+
 ### Result ordering
 
 Zuno must represent two orders explicitly:

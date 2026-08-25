@@ -3163,6 +3163,8 @@ impl TurnHost {
             .recover_uncertain(&self.session_id)
             .await?;
         self.background_reports
+            .recover_interrupted(&self.session_id)?;
+        self.background_reports
             .recover_pending_reports(&self.session_id)
             .await?;
         self.background_reports_recovered = true;

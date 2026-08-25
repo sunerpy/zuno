@@ -100,6 +100,15 @@ Provider Attempt persistence now reuses the same Tool schema identity function.
 MCP/remote-host projection and affected dependency-closure reconciliation remain
 later work, and the unchanged DSH baseline does not move.
 
+Delegation admission and durable job-state hardening were classified `adapt`.
+Zuno now records background native and product-agent work as `queued`, moves it
+to `running` only after a fair process-local FIFO permit is reserved, and exposes
+both states through the shared work projection and TUI. Cancellation removes
+queued work without starting it. Restart reconciliation cancels jobs that never
+started and marks already-running work `Uncertain`, preserving the non-replay
+contract. Cross-process leases and per-parent/provider/model quotas remain later
+work; the unchanged DSH baseline does not move.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

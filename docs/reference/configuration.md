@@ -94,10 +94,12 @@ Independent runtime work has four bounded controls:
 
 - `tool_calls` limits model-issued calls that explicitly declare themselves safe
   to overlap. Permission prompts and argument preparation remain ordered.
-- `delegations` is the workspace-wide cap shared by native child sessions,
-  workflow nodes, and Codex/Claude Code product agents. Background work from an
-  earlier turn continues to consume capacity. A workflow's `maxParallel` remains
-  an additional, narrower bound for that workflow.
+- `delegations` is the per-process cap shared by every turn host for the same
+  workspace process: native child sessions, workflow nodes, Council seats, and
+  Codex/Claude Code product agents all consume it. Background work from an
+  earlier turn continues to consume capacity. Waiting delegations are admitted
+  in fair FIFO order, and a workflow's `maxParallel` remains an additional,
+  narrower bound. Independent Zuno processes do not yet coordinate this quota.
 - `mcp_connections` limits simultaneous lifecycle operations across different
   MCP servers. One server's operations remain serialized.
 - `lsp_requests` is the shared cap for language-server startup and request fan-out
@@ -105,6 +107,11 @@ Independent runtime work has four bounded controls:
 
 Each field accepts `1..=64`; omission uses the values above. Set a field to `1`
 to restore serial behavior for that layer.
+
+Background native and product-agent jobs are persisted as `queued` before they
+wait for delegation capacity and become `running` only after admission. If the
+process restarts, a still-queued job is safely cancelled because its runner never
+started; a running job becomes `uncertain` and is never replayed.
 
 ## Agent model presets
 

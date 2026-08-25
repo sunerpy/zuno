@@ -489,12 +489,21 @@ requests may overlap across servers under one global semaphore; protocol orderin
 inside one client remains unchanged. Setting any bound to `1` restores serial
 behavior.
 
-Native child sessions, workflow nodes, and Codex/Claude Code product agents share
-one workspace-owned delegation budget. The budget survives turn-host replacement,
-so a background agent started by an earlier turn still consumes capacity. Reloading
-configuration adjusts the bound without cancelling active work: a lower bound waits
-for enough active delegations to finish, while a higher bound wakes queued work.
-Workflow `maxParallel` remains an additional per-workflow ceiling.
+Native child sessions, workflow nodes, Council seats, and Codex/Claude Code
+product agents share one process-local delegation budget for a workspace. The
+budget survives turn-host replacement within that process, so a background agent
+started by an earlier turn still consumes capacity. Reloading configuration
+adjusts the bound without cancelling active work: a lower bound waits for enough
+active delegations to finish, while a higher bound admits queued work. The queue
+is explicit and fair FIFO; later calls cannot barge ahead of existing waiters.
+Workflow `maxParallel` remains an additional per-workflow ceiling. Separate Zuno
+processes do not yet share a durable quota lease.
+
+Background native and product-agent jobs commit `queued` before waiting for a
+permit, then atomically transition to `running` immediately before invoking the
+runner. The TUI reports both states separately. On restart, queued jobs settle as
+`cancelled` because execution never began; running jobs settle as `uncertain` and
+are not replayed.
 
 ```json
 {
