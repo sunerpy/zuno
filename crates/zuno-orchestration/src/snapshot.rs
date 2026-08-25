@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Version of the persisted orchestration snapshot contract.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 
 /// Stable digest identifying one immutable snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +88,8 @@ pub struct CouncilRetryPolicyDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CouncilSynthesisPolicyDescriptor {
+    /// Maximum wall-clock time reserved for synthesis inside the Council deadline.
+    pub timeout_ms: u64,
     pub max_input_bytes: usize,
 }
 
@@ -419,6 +421,7 @@ mod tests {
             seat_output_bytes: 16_384,
             retry_policy: CouncilRetryPolicyDescriptor { max_retries: 1 },
             synthesis_policy: CouncilSynthesisPolicyDescriptor {
+                timeout_ms: 60_000,
                 max_input_bytes: 32_768,
             },
             seats: vec![CouncilSeatDescriptor {

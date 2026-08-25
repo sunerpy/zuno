@@ -74,7 +74,10 @@ pub struct CouncilRequest {
     pub seats: Vec<CouncilSeatRequest>,
     pub quorum: usize,
     pub max_parallel: usize,
+    /// End-to-end wall-clock bound for seats plus synthesis.
     pub deadline: Duration,
+    /// Maximum synthesis time reserved inside [`Self::deadline`].
+    pub synthesis_timeout: Duration,
     pub max_retries: usize,
     pub seat_output_bytes: usize,
     pub synthesis_input_bytes: usize,
@@ -140,7 +143,7 @@ impl CouncilTool {
             task,
             host,
             description: format!(
-                "Run one validated Council preset. The seats, agents, model routes, quorum, concurrency, retry policy, deadline, and synthesis bounds are configuration-owned. Available presets: {available}."
+                "Run one validated Council preset. The seats, agents, model routes, quorum, concurrency, retry policy, end-to-end deadline, reserved synthesis time, and output bounds are configuration-owned. Available presets: {available}."
             ),
         })
     }
@@ -289,6 +292,7 @@ impl TypedTool for CouncilTool {
             quorum: preset.quorum,
             max_parallel: preset.max_parallel,
             deadline: Duration::from_millis(preset.deadline_ms),
+            synthesis_timeout: Duration::from_millis(preset.synthesis_policy.timeout_ms),
             max_retries: preset.retry_policy.max_retries,
             seat_output_bytes: preset.seat_output_bytes,
             synthesis_input_bytes: preset.synthesis_policy.max_input_bytes,
@@ -330,6 +334,8 @@ fn validate_preset(preset: &CouncilPresetDescriptor, targets: &[String]) -> Resu
         || preset.max_parallel > preset.seats.len()
         || preset.deadline_ms == 0
         || preset.deadline_ms > MAX_DEADLINE_MS
+        || preset.synthesis_policy.timeout_ms == 0
+        || preset.synthesis_policy.timeout_ms >= preset.deadline_ms
         || preset.retry_policy.max_retries > MAX_RETRIES
         || preset.seat_output_bytes == 0
         || preset.seat_output_bytes > MAX_SEAT_OUTPUT_BYTES
@@ -474,6 +480,7 @@ mod tests {
             seat_output_bytes: 4_096,
             retry_policy: CouncilRetryPolicyDescriptor { max_retries: 1 },
             synthesis_policy: CouncilSynthesisPolicyDescriptor {
+                timeout_ms: 1_000,
                 max_input_bytes: 8_192,
             },
             seats: vec![
@@ -579,6 +586,7 @@ mod tests {
         assert_eq!(requests[0].quorum, 2);
         assert_eq!(requests[0].max_parallel, 2);
         assert_eq!(requests[0].max_retries, 1);
+        assert_eq!(requests[0].synthesis_timeout, Duration::from_secs(1));
         assert_eq!(requests[0].seats.len(), 2);
         assert!(Arc::ptr_eq(
             requests[0].parent_attempt.as_ref().expect("parent attempt"),
@@ -625,6 +633,18 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn synthesis_timeout_must_fit_inside_the_total_deadline() {
+        let mut invalid = preset();
+        invalid.synthesis_policy.timeout_ms = invalid.deadline_ms;
+        let error =
+            match CouncilTool::new([invalid], task(), Arc::new(RecordingCouncilHost::default())) {
+                Ok(_) => panic!("an empty seat-phase budget must be rejected"),
+                Err(error) => error,
+            };
+        assert!(error.contains("invalid identity, seats, quorum, or bounds"));
     }
 
     #[tokio::test]

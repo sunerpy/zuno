@@ -328,6 +328,7 @@ fn council_request(
         quorum,
         max_parallel,
         deadline,
+        synthesis_timeout: deadline / 4,
         max_retries,
         seat_output_bytes: 16_384,
         synthesis_input_bytes: 32_768,
@@ -633,6 +634,39 @@ async fn council_seats_overlap_keep_stable_order_and_preserve_dissent() {
 }
 
 #[tokio::test]
+async fn council_quorum_survives_a_timed_out_non_quorum_seat_and_synthesizes() {
+    let fixture = Fixture::new();
+    let request = council_request(
+        false,
+        vec![
+            council_seat("fast", "explorer", "agree"),
+            council_seat("slow", "oracle", "wait"),
+        ],
+        1,
+        2,
+        0,
+        Duration::from_millis(80),
+    );
+    CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
+        .await
+        .expect("a timed-out non-quorum seat must not consume the synthesis budget");
+
+    assert_eq!(fixture.synth.payloads.lock().expect("payloads").len(), 1);
+    let jobs = fixture
+        .jobs
+        .list_for_parent("ses_parent")
+        .expect("Council job");
+    let job = jobs
+        .iter()
+        .find(|job| matches!(&job.subject, JobSubject::Workflow { workflow, .. } if workflow == "council:balanced-review"))
+        .expect("completed Council job");
+    assert_eq!(job.status, JobStatus::Completed);
+    let result = job.result.as_ref().expect("Council result");
+    assert_eq!(result["seats"][0]["status"], json!("completed"));
+    assert_eq!(result["seats"][1]["status"], json!("timed_out"));
+}
+
+#[tokio::test]
 async fn council_retries_invalid_structured_output_once_then_synthesizes() {
     let fixture = Fixture::new();
     let request = council_request(
@@ -724,6 +758,31 @@ async fn council_deadline_marks_the_seat_timed_out_without_synthesis() {
     assert_eq!(
         job.result.as_ref().expect("result")["seats"][0]["status"],
         json!("timed_out")
+    );
+}
+
+#[tokio::test]
+async fn council_rejects_a_synthesis_budget_that_consumes_the_total_deadline() {
+    let fixture = Fixture::new();
+    let mut request = council_request(
+        false,
+        vec![council_seat("fast", "explorer", "agree")],
+        1,
+        1,
+        0,
+        Duration::from_secs(1),
+    );
+    request.synthesis_timeout = request.deadline;
+    let error = CouncilHost::dispatch(&fixture.host, request, CancellationToken::new())
+        .await
+        .expect_err("an empty seat-phase budget must be rejected");
+    assert!(error.contains("invalid seats, quorum, or bounds"));
+    assert!(
+        fixture
+            .jobs
+            .list_for_parent("ses_parent")
+            .expect("jobs")
+            .is_empty()
     );
 }
 

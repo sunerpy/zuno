@@ -466,9 +466,9 @@ CouncilRequest
   question
   seats[]
   quorum
-  deadline
+  deadline              # end-to-end wall-clock bound
   retry_policy
-  synthesis_policy
+  synthesis_policy      # reserved timeout and structured-input bound
 
 SeatResult
   verdict
@@ -484,7 +484,10 @@ Rules:
 1. Seats run in isolated child contexts and consume normal delegated-task and
    provider quotas.
 2. Council members are read-only by default.
-3. The runtime owns concurrency, timeout, retry, cancellation, and quorum.
+3. The runtime owns concurrency, timeout, retry, cancellation, and quorum. A
+   preset reserves an explicit synthesis budget inside the end-to-end deadline,
+   so a timed-out non-quorum seat cannot make an already-reached quorum
+   impossible to synthesize.
 4. Empty or malformed seat output is a typed failure, not a prompt hint.
 5. The synthesizer has no tools and receives bounded structured seat results or
    artifact references, not duplicated full transcripts.

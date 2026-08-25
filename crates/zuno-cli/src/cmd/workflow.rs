@@ -1078,8 +1078,11 @@ impl NativeWorkflowHost {
         items: &mut WorkflowItems,
     ) -> CouncilOutcome {
         let started = Instant::now();
-        let deadline = started
+        let total_deadline = started
             .checked_add(request.deadline)
+            .unwrap_or_else(Instant::now);
+        let seat_deadline = started
+            .checked_add(request.deadline.saturating_sub(request.synthesis_timeout))
             .unwrap_or_else(Instant::now);
         let execution_cancellation = cancellation.child_token();
         let mut tasks = JoinSet::new();
@@ -1143,7 +1146,7 @@ impl NativeWorkflowHost {
                         runner,
                         seat,
                         seat_cancellation,
-                        deadline,
+                        seat_deadline,
                         max_retries,
                         output_limit,
                     )
@@ -1298,11 +1301,13 @@ impl NativeWorkflowHost {
                 };
             }
         };
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = request
+            .synthesis_timeout
+            .min(total_deadline.saturating_duration_since(Instant::now()));
         if remaining.is_zero() {
             return CouncilOutcome {
                 status: CouncilRunStatus::Failed,
-                message: Some("Council deadline expired before synthesis".to_owned()),
+                message: Some("Council synthesis budget expired before synthesis".to_owned()),
                 seats,
                 synthesis: None,
             };
@@ -1344,7 +1349,7 @@ impl NativeWorkflowHost {
             Err(_) => {
                 return CouncilOutcome {
                     status: CouncilRunStatus::Failed,
-                    message: Some("Council deadline expired during synthesis".to_owned()),
+                    message: Some("Council synthesis budget expired during synthesis".to_owned()),
                     seats,
                     synthesis: None,
                 };
@@ -1564,6 +1569,8 @@ impl CouncilHost for NativeWorkflowHost {
             || request.max_parallel == 0
             || request.max_parallel > request.seats.len()
             || request.deadline.is_zero()
+            || request.synthesis_timeout.is_zero()
+            || request.synthesis_timeout >= request.deadline
             || request.seat_output_bytes == 0
             || request.synthesis_input_bytes == 0
         {
@@ -1690,7 +1697,7 @@ async fn run_council_seat(
     runner: Arc<dyn WorkflowNodeRunner>,
     seat: CouncilSeatRequest,
     cancellation: CancellationToken,
-    deadline: Instant,
+    seat_deadline: Instant,
     max_retries: usize,
     output_limit: usize,
 ) -> CouncilSeatResult {
@@ -1708,14 +1715,14 @@ async fn run_council_seat(
                 "cancelled before the next seat attempt",
             );
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = seat_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return CouncilSeatResult::terminal(
                 &seat,
                 CouncilSeatStatus::TimedOut,
                 attempt.saturating_sub(1),
                 last_session_id,
-                "Council deadline expired before the next seat attempt",
+                "Council seat-phase deadline expired before the next attempt",
             );
         }
         let attempt_cancellation = cancellation.child_token();
@@ -1763,7 +1770,7 @@ async fn run_council_seat(
                         CouncilSeatStatus::TimedOut,
                         attempt,
                         last_session_id,
-                        "Council seat exceeded the shared deadline",
+                        "Council seat exceeded the seat-phase deadline",
                     )
                 } else {
                     CouncilSeatResult::terminal(

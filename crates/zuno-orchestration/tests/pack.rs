@@ -55,6 +55,8 @@ fn council_presets_are_bounded_and_reference_the_canonical_roster() {
         assert!(preset.quorum > 0 && preset.quorum <= preset.seats.len());
         assert!(preset.max_parallel > 0 && preset.max_parallel <= preset.seats.len());
         assert!(preset.deadline_ms > 0);
+        assert!(preset.synthesis_timeout_ms > 0);
+        assert!(preset.synthesis_timeout_ms < preset.deadline_ms);
         assert!(preset.seat_output_bytes > 0);
         assert!(preset.synthesis_input_bytes > 0);
         assert_eq!(

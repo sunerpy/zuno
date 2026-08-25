@@ -6084,6 +6084,7 @@ fn council_descriptors() -> Vec<CouncilPresetDescriptor> {
                 max_retries: preset.max_retries,
             },
             synthesis_policy: CouncilSynthesisPolicyDescriptor {
+                timeout_ms: preset.synthesis_timeout_ms,
                 max_input_bytes: preset.synthesis_input_bytes,
             },
             seats: preset

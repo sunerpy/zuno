@@ -78,7 +78,8 @@ pub struct BuiltinCouncilSeatDescriptor {
 /// One bounded first-party Council preset.
 ///
 /// The caller may select `name` and provide the question. Seats, quorum,
-/// concurrency, retry, deadlines, and synthesis bounds remain pack-owned.
+/// concurrency, retry, the end-to-end deadline, and synthesis bounds remain
+/// pack-owned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinCouncilPresetDescriptor {
     pub name: &'static str,
@@ -88,6 +89,7 @@ pub struct BuiltinCouncilPresetDescriptor {
     pub quorum: usize,
     pub max_parallel: usize,
     pub deadline_ms: u64,
+    pub synthesis_timeout_ms: u64,
     pub max_retries: usize,
     pub seat_output_bytes: usize,
     pub synthesis_input_bytes: usize,
@@ -260,7 +262,8 @@ pub const COUNCILS: [BuiltinCouncilPresetDescriptor; 1] = [BuiltinCouncilPresetD
     seats: &BALANCED_REVIEW_SEATS,
     quorum: 2,
     max_parallel: 3,
-    deadline_ms: 120_000,
+    deadline_ms: 180_000,
+    synthesis_timeout_ms: 60_000,
     max_retries: 1,
     seat_output_bytes: 16_384,
     synthesis_input_bytes: 32_768,
