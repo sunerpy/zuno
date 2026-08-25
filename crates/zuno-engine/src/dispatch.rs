@@ -526,6 +526,7 @@ impl PermissionAsker for RulePermissionAsker {
                 tool: tool.to_owned(),
             }),
             _ if self.requires_manual(&ask) => self.prompt_manual(tool, ask).await,
+            _ if self.authorization.is_allow_all() => Ok(()),
             RuleOutcome::Permitted => Ok(()),
             RuleOutcome::Pending(pending) => self.prompt(tool, ask, pending).await,
         }

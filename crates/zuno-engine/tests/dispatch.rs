@@ -456,6 +456,69 @@ async fn allow_all_skips_hitl_for_side_effecting_tools() {
 }
 
 #[tokio::test]
+async fn allow_all_skips_tool_owned_non_manual_gate() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(InternallyGatedTool {
+            calls: Arc::clone(&calls),
+            manual: false,
+        })],
+        Vec::new(),
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::AllowAll,
+        McpToolStatus::Ready,
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-allow-all-internal",
+            "bash",
+            json!({"command": "printf ok", "intent": "run one command"}),
+        ))
+        .await;
+
+    assert!(!result.is_error, "{}", result.output.output);
+    assert!(
+        approver.asks().is_empty(),
+        "allow_all must cover non-manual permission checks owned by the tool"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn allow_all_keeps_tool_owned_manual_gate_interactive() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let approver = Arc::new(RecordingApprover::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(InternallyGatedTool {
+            calls: Arc::clone(&calls),
+            manual: true,
+        })],
+        Vec::new(),
+        Arc::clone(&approver) as Arc<dyn PermissionAsker>,
+        zuno_engine::dispatch::AuthorizationPolicy::AllowAll,
+        McpToolStatus::Ready,
+    );
+
+    let result = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call-allow-all-manual",
+            "bash",
+            json!({"command": "rm -f /tmp/existing", "intent": "clean up"}),
+        ))
+        .await;
+
+    assert!(!result.is_error, "{}", result.output.output);
+    let asks = approver.asks();
+    assert_eq!(asks.len(), 1);
+    assert!(asks[0].manual);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn allow_all_keeps_explicit_denies_terminal() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
