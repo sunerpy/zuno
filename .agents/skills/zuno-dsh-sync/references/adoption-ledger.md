@@ -91,6 +91,15 @@ ABI, a Rust dylib ABI, or `cordis-rs`'s synchronous lifecycle model. Product
 descriptor publication, dependency-closure reconciliation, and the async
 event/policy bus remain later work; the DSH baseline does not move.
 
+The Phase 1 product-adoption follow-up was also classified `adapt`. Extension
+Tool objects remain native typed services while their exact provider schema
+digests are projected as named contracts. The immutable orchestration snapshot
+publishes Agent Profile, Workflow Template, and Skill descriptors in the same
+profile transaction; same-name Skills use source-derived isolation scopes.
+Provider Attempt persistence now reuses the same Tool schema identity function.
+MCP/remote-host projection and affected dependency-closure reconciliation remain
+later work, and the unchanged DSH baseline does not move.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

@@ -6403,9 +6403,12 @@ name = "zuno-harness"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "zuno-engine",
+ "zuno-orchestration",
  "zuno-runtime",
  "zuno-tool",
  "zuno-tools",

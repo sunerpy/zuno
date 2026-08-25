@@ -14,6 +14,12 @@ Zuno assembles an agent from a native harness profile. A profile is a set of bun
 - `AgentDriver` owns the turn-driving policy. The default driver wraps the standard agent loop; benchmark, workflow, remote, and evaluation harnesses can install another driver without modifying that loop.
 - `ToolManifest` is the profile's model-visible tool surface. The registry filters all built-ins, including automatically assembled file tools, through this manifest.
 - `ToolContributions` carries native `Tool` implementations owned by the profile. Contributions are assembled after built-ins and before MCP tools, pass through the same visibility rules, and may intentionally replace a built-in by wire id.
+- Native executable values remain typed services. A coordinated named plane
+  projects stable keys, schema contracts, provenance, owner, generation, and
+  availability for dynamic consumers without putting executable Rust values in
+  a string map. Tool contributions publish their provider-visible schema digest;
+  `orchestration_capabilities_bundle` publishes the typed immutable snapshot plus
+  Agent Profile, Workflow Template, and source-isolated Skill descriptors.
 
 Profile activation is transactional and exclusive-resource safe. Candidate
 components prepare against a staging service view, duplicate identifiers and
@@ -637,7 +643,10 @@ let profile = zuno_harness::profile_with_tools(
     Arc::new(ReviewDriver::new()),
     ToolManifest::new([BuiltinSlot::Read, BuiltinSlot::Grep, BuiltinSlot::Task])?,
     ToolContributions::new([Arc::new(ReviewSummaryTool::new())])?,
-);
+)
+.with_bundle(zuno_harness::orchestration_capabilities_bundle(
+    Arc::clone(&capability_snapshot),
+));
 
 runtime.activate_profile(profile).await?;
 ```

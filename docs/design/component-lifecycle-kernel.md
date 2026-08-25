@@ -257,6 +257,12 @@ The native foundation and critical product boundaries are now in place:
   monotonic generation, and availability; duplicate local keys fail before any
   effect starts, child scopes shadow and reveal parent descriptors, and stale
   generations are detectable without putting executable values in a string map.
+- The production profile now exercises that plane: extension Tool objects remain
+  in the typed `ToolContributions` service while their provider-visible schemas
+  are published as named contracts, and the typed orchestration snapshot
+  transactionally publishes Agent Profile, Workflow Template, and source-scoped
+  Skill descriptors. Provider Attempt records reuse the same canonical Tool
+  schema identity calculation.
 - Runtime/component state and cleanup diagnostics are projected through
   frontend-neutral snapshot values.
 

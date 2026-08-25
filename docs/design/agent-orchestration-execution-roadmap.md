@@ -98,18 +98,19 @@ system. They should be completed and simplified rather than reimplemented.
    to explain and easy to drift from actual permissions.
 5. Council behavior is not a native execution primitive with quorum, deadline,
    retry, cancellation, and synthesis contracts.
-6. Skill resolution, Agent capability selection, and prompt generation need one
-   immutable snapshot shared by the parent, child tasks, workflow recovery, and
-   diagnostics.
+6. Skill resolution, Agent capability selection, and prompt generation now use
+   one immutable snapshot and publish it through the profile lifecycle. Restart
+   reconciliation still needs a durable stale-generation refusal test spanning
+   parent, child, and workflow recovery.
 7. `apply_patch` now teaches direct invocation, generator/write selection,
    context-conflict recovery, and uncertain-outcome inspection. Multi-file
    application can still become partially applied if a later filesystem
    operation fails, after which Zuno can only report `Uncertain`.
 8. Prompt receipts still lack a complete redacted manifest of final provider
    request ordering and the exact advertised tool-schema digests.
-9. The named capability registry foundation is implemented, but
-   Agent/workflow/Skill contributions are not yet published through it as
-   first-class transactional capabilities.
+9. The first named-capability vertical slice now publishes extension Tools plus
+   Agent Profile, Workflow Template, and source-isolated Skill descriptors.
+   MCP/remote-host and final post-permission ToolRegistry descriptors remain.
 10. Worktrees created for delegated implementation are not yet a
     lifecycle-owned, quota-controlled resource.
 
@@ -509,13 +510,15 @@ After the named-capability registry exists, external packages may contribute
 descriptors through a transactional capability generation. Raw provider
 objects, credentials, database handles, or `HarnessRuntime` are never exposed.
 
-Implementation checkpoint (2026-08-24): the first static
+Implementation checkpoint (2026-08-25): the static
 `zuno-orchestration` crate is data-only and contributes the seven Skill
 descriptors below, including stable source ids, hashes, profile/tool gates, and
 license provenance. It deliberately owns no scheduler, provider, permission,
-session, or lifecycle service. Agent Profiles and Workflow Templates remain on
-the native runtime path until the immutable orchestration snapshot and named
-capability generation land.
+session, or lifecycle service. The native profile composition root publishes
+its immutable snapshot as a typed service and projects extension Tool, Agent
+Profile, Workflow Template, and Skill descriptors into one transactional named
+capability generation. Same-name Skills remain independently addressable by a
+source-derived isolation scope.
 
 ## 8. Built-in Skills
 

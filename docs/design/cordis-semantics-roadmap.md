@@ -22,18 +22,22 @@ The first implementation remains internal to the Zuno workspace. Extraction into
 an independent crate is a later decision gated by real reuse and API stability,
 not a prerequisite for product work.
 
-The first native slice is now implemented in `zuno-runtime`. It keeps executable
+The first two native slices are now implemented across `zuno-runtime` and the
+profile composition root. Zuno keeps executable
 Rust services on the typed plane and adds a descriptor-only named plane with
 validated keys, contracts, provenance, scope-local generations, parent/child
 shadowing, atomic publication, withdrawal before cleanup, stale-generation
 detection, and lifecycle projection. `PrepareContext` can provide and require a
 named descriptor, and the observed provider generation is recorded in component
-requirements.
+requirements. Product components now publish extension Tool descriptors while
+retaining their native `Tool` objects, and publish the immutable Agent Profile,
+Workflow Template, and Skill catalogue beside its typed `CapabilitySnapshot`.
+Same-name Skills use source-isolated keys rather than acquiring a hidden winner.
 
-This slice does not yet publish tool, Agent Profile, Workflow Template, or Skill
-descriptors from product components. It also does not implement minimal affected
-dependency closure, parking/reactivation, the event/policy bus, or runtime package
-activation. Those remain later phases and must use the same lifecycle authority.
+This implementation does not yet project MCP/remote-host manifests or the final
+post-permission ToolRegistry, and it does not implement minimal affected
+dependency closure, parking/reactivation, or the event/policy bus. Those remain
+later phases and must use the same lifecycle authority.
 
 This refines, rather than reverses, the decision in
 [Native Component Lifecycle Kernel](component-lifecycle-kernel.md): Zuno adopts
@@ -133,9 +137,11 @@ two coordinated planes remain intentionally distinct:
 - typed services for native Rust composition;
 - named capabilities for dynamic and cross-process composition.
 
-The remaining gap is vertical adoption: manifests, MCP, workflows, remote hosts,
-tools, Agent Profiles, Workflow Templates, and Skills do not yet publish their
-descriptors through this registry.
+The first product adoption is complete: extension Tool contributions and the
+immutable Agent Profile, Workflow Template, and Skill snapshot publish through
+the registry in the same profile transaction. The remaining vertical gap is
+MCP and remote-host manifests, runtime package descriptors, and the final
+post-permission ToolRegistry projection.
 
 ### 2. Recomposition is correct but coarse
 
@@ -543,11 +549,13 @@ real WASI/process shutdown; unit tests alone do not prove quiescence.
 
 ## Recommended next task
 
-Start with Phase 0 and Phase 1 only:
+Phase 0 and the Phase 1 product pilot now meet their exit criteria. Continue
+with one bounded Phase 2 consumer-epoch slice:
 
-> Introduce a dual typed/named capability registry in `zuno-runtime`, retain
-> full-scope recomposition, and validate transactional publication and
-> withdrawal using extension tool contributions.
+> Record named provider generations on a real consumer, replace that provider,
+> and reactivate only the affected dependency closure while preserving the
+> existing full-scope path as the correctness fallback.
 
-This produces a useful product seam without committing Zuno to a second
-lifecycle framework or to premature fine-grained reconciliation.
+MCP, remote-host, and final ToolRegistry descriptor projection can then reuse
+the proven key, contract, provenance, and generation model instead of creating
+another registry.

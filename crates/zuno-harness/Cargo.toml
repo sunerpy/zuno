@@ -11,8 +11,11 @@ publish.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 zuno-engine = { workspace = true }
+zuno-orchestration = { workspace = true }
 zuno-runtime = { workspace = true }
 zuno-tool = { workspace = true }
 zuno-tools = { workspace = true }

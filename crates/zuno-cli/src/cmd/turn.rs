@@ -680,7 +680,10 @@ impl TurnPlan {
         extension_tools.extend(runtime_surface.tools().iter().cloned());
         let extension_contributions =
             zuno_harness::ToolContributions::new(extension_tools).map_err(to_string)?;
-        let mut profile = zuno_harness::default_profile_with_tools(extension_contributions);
+        let mut profile = zuno_harness::default_profile_with_tools(extension_contributions)
+            .with_bundle(zuno_harness::orchestration_capabilities_bundle(Arc::clone(
+                &capability,
+            )));
         if let Some(bundle) = runtime_surface.take_bundle() {
             profile = profile.with_bundle(bundle);
         }

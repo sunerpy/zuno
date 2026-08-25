@@ -4974,6 +4974,7 @@ fn every_extension_contribution_reaches_its_native_consumer() {
         "with_overlay(extensions.skills().iter().cloned())",
         "zuno_extension::lifecycle_tools",
         "default_profile_with_tools",
+        "orchestration_capabilities_bundle",
         "plan.extensions.workflows()",
         "plan.extensions.prompt_section()",
     ] {
