@@ -89,6 +89,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) delegation: Delegation,
     pub(crate) product_agents: Arc<dyn zuno_tools::product_agent::ProductAgentHost>,
     pub(crate) workflows: Arc<dyn zuno_tools::workflow::WorkflowHost>,
+    pub(crate) councils: Arc<dyn zuno_tools::council::CouncilHost>,
     pub(crate) job_controller: Arc<dyn zuno_tools::job_cancel::JobController>,
     pub(crate) memory: Option<Arc<dyn Tool>>,
 }
@@ -231,10 +232,18 @@ pub(crate) fn assemble(
     if !selection.capability.workflows.is_empty() {
         let workflow = zuno_tools::workflow::WorkflowTool::new(
             selection.capability.workflows.clone(),
-            task,
+            task.clone(),
             Arc::clone(&selection.workflows),
         )?;
         builder.register_configured_builtin(erase(workflow));
+    }
+    if !selection.capability.councils.is_empty() {
+        let council = zuno_tools::council::CouncilTool::new(
+            selection.capability.councils.clone(),
+            task,
+            Arc::clone(&selection.councils),
+        )?;
+        builder.register_configured_builtin(erase(council));
     }
     if selection.manifest.contains(BuiltinSlot::Job) {
         builder
@@ -367,6 +376,7 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
             zuno_tools::TODO_GET_TOOL_ID,
             zuno_tools::TODO_UPDATE_TOOL_ID,
             zuno_tools::WORKFLOW_WIRE_ID,
+            zuno_tools::COUNCIL_WIRE_ID,
         ]
         .contains(&name)
         || harness_tool_names.contains(name)
@@ -422,6 +432,7 @@ mod tests {
             "goal_get",
             "goal_propose",
             "goal_update",
+            "council_run",
             "extension_tool",
         ] {
             assert!(native_tool_name(name, &harness), "{name}");

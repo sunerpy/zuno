@@ -469,7 +469,9 @@ fn v2_permissions(name: &str, layout: &zuno_paths::Layout, worktree: &Path) -> V
             ]);
             rules.extend(readonly_external);
         }
-        "compaction" | "title" | "summary" => rules.push(v2_rule("*", "*", "deny")),
+        "compaction" | "title" | "summary" | "council-synth" => {
+            rules.push(v2_rule("*", "*", "deny"));
+        }
         _ => {}
     }
     rules

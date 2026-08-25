@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use sha2::{Digest, Sha256};
-use zuno_orchestration::{PACK_ID, PACK_VERSION, SKILLS, pack, skill, skills};
+use zuno_orchestration::{
+    COUNCILS, PACK_ID, PACK_VERSION, SKILLS, council, councils, pack, skill, skills,
+};
 
 const EXPECTED_NAMES: [&str; 7] = [
     "customize-zuno",
@@ -20,6 +22,7 @@ fn pack_has_stable_identity_and_exact_catalog() {
     assert_eq!(pack().id, PACK_ID);
     assert_eq!(pack().version, PACK_VERSION);
     assert_eq!(pack().skills, skills());
+    assert_eq!(pack().councils, councils());
     assert_eq!(
         skills().iter().map(|entry| entry.name).collect::<Vec<_>>(),
         EXPECTED_NAMES
@@ -28,6 +31,47 @@ fn pack_has_stable_identity_and_exact_catalog() {
         assert_eq!(skill(name).map(|entry| entry.name), Some(name));
     }
     assert!(skill("missing").is_none());
+    assert_eq!(
+        councils()
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        vec!["balanced-review"]
+    );
+    assert_eq!(
+        council("balanced-review").map(|entry| entry.name),
+        Some("balanced-review")
+    );
+    assert!(council("missing").is_none());
+}
+
+#[test]
+fn council_presets_are_bounded_and_reference_the_canonical_roster() {
+    for preset in COUNCILS {
+        assert!(!preset.name.trim().is_empty());
+        assert!(!preset.description.trim().is_empty());
+        assert!(preset.source_id.contains(PACK_ID));
+        assert!(!preset.seats.is_empty());
+        assert!(preset.quorum > 0 && preset.quorum <= preset.seats.len());
+        assert!(preset.max_parallel > 0 && preset.max_parallel <= preset.seats.len());
+        assert!(preset.deadline_ms > 0);
+        assert!(preset.seat_output_bytes > 0);
+        assert!(preset.synthesis_input_bytes > 0);
+        assert_eq!(
+            preset
+                .seats
+                .iter()
+                .map(|seat| seat.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            preset.seats.len()
+        );
+        for seat in preset.seats {
+            assert!(!seat.id.trim().is_empty());
+            assert!(!seat.instruction.trim().is_empty());
+            assert!(["explorer", "librarian", "oracle"].contains(&seat.agent));
+        }
+    }
 }
 
 #[test]

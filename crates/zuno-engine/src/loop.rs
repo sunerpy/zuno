@@ -41,9 +41,9 @@ use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_observability::span;
 use zuno_orchestration::{
-    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilitySnapshot, ModelAttemptIdentity,
-    OwnerLineage, PackIdentity, PromptReceiptIdentity, SNAPSHOT_SCHEMA_VERSION,
-    SelectedSkillIdentity, ToolSchemaIdentity, sha256_json, sha256_text,
+    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
+    ModelAttemptIdentity, OwnerLineage, PackIdentity, PromptReceiptIdentity,
+    SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity, ToolSchemaIdentity, sha256_json, sha256_text,
 };
 use zuno_tool::{
     ToolConcurrencyPolicy, ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
@@ -3137,10 +3137,7 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
         },
         0,
         sha256_text("untracked permission generation"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        CapabilityContents::default(),
     );
     let fallback_agent = AgentAttemptIdentity {
         name: agent.name.clone(),

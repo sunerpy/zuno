@@ -396,7 +396,7 @@ pub const LEAN_NAMES: [&str; 9] = [
 ///
 /// The visible catalog entries are Zuno-native and align with this roster. `plan`
 /// remains a primary mode rather than a delegation target; see [`internals`].
-pub const INTERNAL_NAMES: [&str; 3] = ["compaction", "title", "summary"];
+pub const INTERNAL_NAMES: [&str; 4] = ["compaction", "title", "summary", "council-synth"];
 
 /// Tools denied by name to a reader confined to this repository.
 ///
@@ -786,10 +786,12 @@ pub fn lean() -> Vec<Agent> {
 
 /// The engine's internal agents.
 ///
-/// # Why exactly three, and why not `plan`
+/// # Why these four, and why not `plan`
 ///
 /// Upstream declares seven natives at `packages/opencode/src/agent/agent.ts:140-265`.
-/// Three of them — `compaction`, `title`, `summary` — are `hidden: true`, take a
+/// `compaction`, `title`, and `summary` retain the upstream engine roles. Zuno adds
+/// `council-synth` as a hidden, tool-free reducer for bounded structured Council
+/// results. All four are `hidden: true`, take a
 /// prompt, deny every tool, and are invoked by the engine rather than chosen by
 /// anyone; dropping any of them silently removes auto-compaction, session titles,
 /// or session summaries, with nothing else in the roster providing them. They are
@@ -824,9 +826,13 @@ fn internal(name: &str) -> Option<Agent> {
                 "Engine-internal: names a session from its first exchange, so a \
                          session list is readable."
             }
-            _ => {
+            "summary" => {
                 "Engine-internal: summarises what a session accomplished, for the caller \
                   that resumes it."
+            }
+            _ => {
+                "Engine-internal: synthesises bounded structured Council results while \
+                 preserving attribution and dissent."
             }
         },
         boundary: Boundary::NotDelegable {
@@ -841,7 +847,7 @@ fn internal(name: &str) -> Option<Agent> {
         temperature: native.temperature.unwrap_or(0.1),
         output: OutputContract::EnginePrompt { prompt },
         permissions: Permissions {
-            // `agent.ts:221`, `:241`, `:256`: all three deny everything. The
+            // Every engine internal denies everything. The
             // catch-all in `Permissions::rules` already does that; the named denies
             // make it legible, and there is nothing to allow.
             denied: GOVERNED_TOOL_IDS_SLICE,

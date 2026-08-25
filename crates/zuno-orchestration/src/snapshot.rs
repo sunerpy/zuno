@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Version of the persisted orchestration snapshot contract.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 /// Stable digest identifying one immutable snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +68,44 @@ pub struct WorkflowTemplateDescriptor {
     pub nodes: Vec<WorkflowNodeDescriptor>,
 }
 
+/// One immutable expert seat in a Council preset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CouncilSeatDescriptor {
+    pub id: String,
+    pub agent: String,
+    pub instruction: String,
+}
+
+/// Runtime-owned retry bounds for one Council seat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CouncilRetryPolicyDescriptor {
+    pub max_retries: usize,
+}
+
+/// Bounds applied before structured seat results reach the synthesizer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CouncilSynthesisPolicyDescriptor {
+    pub max_input_bytes: usize,
+}
+
+/// One configuration- or pack-owned Council preset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CouncilPresetDescriptor {
+    pub name: String,
+    pub source_id: String,
+    pub quorum: usize,
+    pub max_parallel: usize,
+    pub deadline_ms: u64,
+    pub seat_output_bytes: usize,
+    pub retry_policy: CouncilRetryPolicyDescriptor,
+    pub synthesis_policy: CouncilSynthesisPolicyDescriptor,
+    pub seats: Vec<CouncilSeatDescriptor>,
+}
+
 /// One Skill advertised by a frozen capability generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -114,6 +152,16 @@ pub struct PresetSelection {
 }
 
 /// The immutable capability catalogue shared by a parent and every admitted child.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilityContents {
+    pub profiles: Vec<ProfileDescriptor>,
+    pub presets: Vec<PresetDescriptor>,
+    pub councils: Vec<CouncilPresetDescriptor>,
+    pub workflows: Vec<WorkflowTemplateDescriptor>,
+    pub skills: Vec<SkillCapabilityDescriptor>,
+}
+
+/// The immutable capability catalogue shared by a parent and every admitted child.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilitySnapshot {
@@ -123,6 +171,7 @@ pub struct CapabilitySnapshot {
     pub permission_policy_sha256: String,
     pub profiles: Vec<ProfileDescriptor>,
     pub presets: Vec<PresetDescriptor>,
+    pub councils: Vec<CouncilPresetDescriptor>,
     pub workflows: Vec<WorkflowTemplateDescriptor>,
     pub skills: Vec<SkillCapabilityDescriptor>,
 }
@@ -134,23 +183,27 @@ impl CapabilitySnapshot {
         pack: PackIdentity,
         extension_revision: u64,
         permission_policy_sha256: impl Into<String>,
-        mut profiles: Vec<ProfileDescriptor>,
-        mut presets: Vec<PresetDescriptor>,
-        mut workflows: Vec<WorkflowTemplateDescriptor>,
-        mut skills: Vec<SkillCapabilityDescriptor>,
+        mut contents: CapabilityContents,
     ) -> Self {
-        profiles.sort_by(|left, right| {
+        contents.profiles.sort_by(|left, right| {
             left.name
                 .cmp(&right.name)
                 .then_with(|| left.source_id.cmp(&right.source_id))
         });
-        workflows.sort_by(|left, right| {
+        contents.workflows.sort_by(|left, right| {
             left.name
                 .cmp(&right.name)
                 .then_with(|| left.source_id.cmp(&right.source_id))
         });
-        presets.sort_by(|left, right| left.name.cmp(&right.name));
-        skills.sort_by(|left, right| {
+        contents.councils.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.source_id.cmp(&right.source_id))
+        });
+        contents
+            .presets
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        contents.skills.sort_by(|left, right| {
             left.name
                 .cmp(&right.name)
                 .then_with(|| left.source.cmp(&right.source))
@@ -160,10 +213,11 @@ impl CapabilitySnapshot {
             pack,
             extension_revision,
             permission_policy_sha256: permission_policy_sha256.into(),
-            profiles,
-            presets,
-            workflows,
-            skills,
+            profiles: contents.profiles,
+            presets: contents.presets,
+            councils: contents.councils,
+            workflows: contents.workflows,
+            skills: contents.skills,
         }
     }
 
@@ -355,27 +409,50 @@ mod tests {
         }
     }
 
+    fn council(name: &str) -> CouncilPresetDescriptor {
+        CouncilPresetDescriptor {
+            name: name.to_owned(),
+            source_id: format!("builtin://council/{name}"),
+            quorum: 2,
+            max_parallel: 3,
+            deadline_ms: 120_000,
+            seat_output_bytes: 16_384,
+            retry_policy: CouncilRetryPolicyDescriptor { max_retries: 1 },
+            synthesis_policy: CouncilSynthesisPolicyDescriptor {
+                max_input_bytes: 32_768,
+            },
+            seats: vec![CouncilSeatDescriptor {
+                id: "evidence".to_owned(),
+                agent: "explorer".to_owned(),
+                instruction: "Collect implementation evidence.".to_owned(),
+            }],
+        }
+    }
+
     fn capability() -> CapabilitySnapshot {
         CapabilitySnapshot::new(
             pack(),
             7,
             sha256_text("permission policy"),
-            vec![profile("orchestrator")],
-            Vec::new(),
-            vec![WorkflowTemplateDescriptor {
-                name: "release".to_owned(),
-                source_id: "config://workflows/release".to_owned(),
-                max_parallel: 2,
-                max_agents: 4,
-                nodes: vec![WorkflowNodeDescriptor {
-                    id: "scan".to_owned(),
-                    agent: "explorer".to_owned(),
-                    prompt: None,
-                    description: None,
-                    depends_on: Vec::new(),
+            CapabilityContents {
+                profiles: vec![profile("orchestrator")],
+                councils: vec![council("balanced-review")],
+                workflows: vec![WorkflowTemplateDescriptor {
+                    name: "release".to_owned(),
+                    source_id: "config://workflows/release".to_owned(),
+                    max_parallel: 2,
+                    max_agents: 4,
+                    nodes: vec![WorkflowNodeDescriptor {
+                        id: "scan".to_owned(),
+                        agent: "explorer".to_owned(),
+                        prompt: None,
+                        description: None,
+                        depends_on: Vec::new(),
+                    }],
                 }],
-            }],
-            vec![skill("codemap")],
+                skills: vec![skill("codemap")],
+                ..CapabilityContents::default()
+            },
         )
     }
 
@@ -435,19 +512,23 @@ mod tests {
             pack(),
             7,
             sha256_text("permission policy"),
-            vec![profile("plan"), profile("build")],
-            Vec::new(),
-            Vec::new(),
-            vec![skill("reflect"), skill("codemap")],
+            CapabilityContents {
+                profiles: vec![profile("plan"), profile("build")],
+                councils: vec![council("zeta"), council("alpha")],
+                skills: vec![skill("reflect"), skill("codemap")],
+                ..CapabilityContents::default()
+            },
         );
         let right = CapabilitySnapshot::new(
             pack(),
             7,
             sha256_text("permission policy"),
-            vec![profile("build"), profile("plan")],
-            Vec::new(),
-            Vec::new(),
-            vec![skill("codemap"), skill("reflect")],
+            CapabilityContents {
+                profiles: vec![profile("build"), profile("plan")],
+                councils: vec![council("alpha"), council("zeta")],
+                skills: vec![skill("codemap"), skill("reflect")],
+                ..CapabilityContents::default()
+            },
         );
         assert_eq!(left, right);
         assert_eq!(

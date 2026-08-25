@@ -8,9 +8,11 @@
 mod snapshot;
 
 pub use snapshot::{
-    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilitySnapshot, ModelAttemptIdentity,
-    OwnerLineage, PackIdentity, PresetDescriptor, PresetRouteDescriptor, PresetSelection,
-    ProfileDescriptor, PromptReceiptIdentity, SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity,
+    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
+    CouncilPresetDescriptor, CouncilRetryPolicyDescriptor, CouncilSeatDescriptor,
+    CouncilSynthesisPolicyDescriptor, ModelAttemptIdentity, OwnerLineage, PackIdentity,
+    PresetDescriptor, PresetRouteDescriptor, PresetSelection, ProfileDescriptor,
+    PromptReceiptIdentity, SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity,
     SkillCapabilityDescriptor, SnapshotIdentity, ToolSchemaIdentity, WorkflowNodeDescriptor,
     WorkflowTemplateDescriptor, sha256_json, sha256_text,
 };
@@ -62,6 +64,35 @@ pub struct BuiltinSkillDescriptor {
     pub provenance: SkillProvenance,
 }
 
+/// One immutable expert seat in a first-party Council preset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinCouncilSeatDescriptor {
+    /// Stable preset-local identity used for ordering and durable work items.
+    pub id: &'static str,
+    /// Canonical delegable Agent profile.
+    pub agent: &'static str,
+    /// Original Zuno instruction appended to the shared question.
+    pub instruction: &'static str,
+}
+
+/// One bounded first-party Council preset.
+///
+/// The caller may select `name` and provide the question. Seats, quorum,
+/// concurrency, retry, deadlines, and synthesis bounds remain pack-owned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinCouncilPresetDescriptor {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub source_id: &'static str,
+    pub seats: &'static [BuiltinCouncilSeatDescriptor],
+    pub quorum: usize,
+    pub max_parallel: usize,
+    pub deadline_ms: u64,
+    pub max_retries: usize,
+    pub seat_output_bytes: usize,
+    pub synthesis_input_bytes: usize,
+}
+
 /// A static first-party pack. It contributes data only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FirstPartyOrchestrationPack {
@@ -71,6 +102,8 @@ pub struct FirstPartyOrchestrationPack {
     pub version: &'static str,
     /// Deterministically ordered Skill descriptors.
     pub skills: &'static [BuiltinSkillDescriptor],
+    /// Deterministically ordered, configuration-owned Council presets.
+    pub councils: &'static [BuiltinCouncilPresetDescriptor],
 }
 
 const USER_FACING_PROFILES: &[&str] = &[
@@ -201,11 +234,44 @@ pub const SKILLS: [BuiltinSkillDescriptor; 7] = [
     },
 ];
 
+const BALANCED_REVIEW_SEATS: [BuiltinCouncilSeatDescriptor; 3] = [
+    BuiltinCouncilSeatDescriptor {
+        id: "implementation-evidence",
+        agent: "explorer",
+        instruction: "Inspect the relevant implementation and report concrete evidence, constraints, and unknowns.",
+    },
+    BuiltinCouncilSeatDescriptor {
+        id: "contract-evidence",
+        agent: "librarian",
+        instruction: "Inspect the relevant documented contracts and compatibility assumptions, then report evidence and gaps.",
+    },
+    BuiltinCouncilSeatDescriptor {
+        id: "decision-review",
+        agent: "oracle",
+        instruction: "Evaluate tradeoffs, failure modes, and alternatives, then recommend a decision grounded in the available evidence.",
+    },
+];
+
+/// Every Council preset shipped by the first-party pack.
+pub const COUNCILS: [BuiltinCouncilPresetDescriptor; 1] = [BuiltinCouncilPresetDescriptor {
+    name: "balanced-review",
+    description: "Run implementation, contract, and decision reviewers independently, require two valid seats, and synthesize while preserving dissent.",
+    source_id: "zuno-orchestration:council/balanced-review@0.1.0",
+    seats: &BALANCED_REVIEW_SEATS,
+    quorum: 2,
+    max_parallel: 3,
+    deadline_ms: 120_000,
+    max_retries: 1,
+    seat_output_bytes: 16_384,
+    synthesis_input_bytes: 32_768,
+}];
+
 /// The complete static first-party pack.
 pub const PACK: FirstPartyOrchestrationPack = FirstPartyOrchestrationPack {
     id: PACK_ID,
     version: PACK_VERSION,
     skills: &SKILLS,
+    councils: &COUNCILS,
 };
 
 /// Borrow the complete static first-party pack.
@@ -220,8 +286,20 @@ pub const fn skills() -> &'static [BuiltinSkillDescriptor] {
     &SKILLS
 }
 
+/// Borrow the stable ordered Council preset catalog.
+#[must_use]
+pub const fn councils() -> &'static [BuiltinCouncilPresetDescriptor] {
+    &COUNCILS
+}
+
 /// Find one built-in Skill by its exact name.
 #[must_use]
 pub fn skill(name: &str) -> Option<&'static BuiltinSkillDescriptor> {
     SKILLS.iter().find(|skill| skill.name == name)
+}
+
+/// Find one built-in Council preset by its exact name.
+#[must_use]
+pub fn council(name: &str) -> Option<&'static BuiltinCouncilPresetDescriptor> {
+    COUNCILS.iter().find(|preset| preset.name == name)
 }

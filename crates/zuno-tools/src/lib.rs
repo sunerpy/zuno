@@ -192,6 +192,7 @@ pub use crate::websearch::gating::{
     Provider, SearchConfig, require_provider, select_provider, web_search_enabled,
 };
 
+pub mod council;
 pub mod exposure;
 pub mod invalid;
 pub mod job;
@@ -203,6 +204,10 @@ pub mod registry;
 pub mod work_state;
 pub mod workflow;
 
+pub use crate::council::{
+    CouncilHost, CouncilParams, CouncilRequest, CouncilSeatRequest, CouncilTool, CouncilTurn,
+    WIRE_ID as COUNCIL_WIRE_ID,
+};
 pub use crate::exposure::{
     CONDITIONAL_TOOLS, Client, ExposureFlags, exposed_conditional_tools, exposes_invalid,
     exposes_plan_exit, exposes_question, exposure_predicate,

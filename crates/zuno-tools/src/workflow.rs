@@ -450,15 +450,15 @@ mod tests {
     fn orchestration_snapshot() -> Arc<AttemptSnapshot> {
         Arc::new(
             serde_json::from_value(json!({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "turnId": "turn-parent",
                 "step": 1,
                 "capability": {
-                    "schemaVersion": 1,
+                    "schemaVersion": 2,
                     "pack": {"id":"test","version":"1","upstreamRevision":"test"},
                     "extensionRevision": 0,
                     "permissionPolicySha256": "policy",
-                    "profiles": [], "presets": [], "workflows": [], "skills": []
+                    "profiles": [], "presets": [], "councils": [], "workflows": [], "skills": []
                 },
                 "owner": {
                     "sessionId":"ses_parent", "parentSessionId":null, "parentAttempt":null,

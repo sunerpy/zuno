@@ -81,15 +81,15 @@ fn report(id: &str) -> NewSessionInput {
 
 fn orchestration_snapshot() -> AttemptSnapshot {
     serde_json::from_value(json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "turnId": "turn-parent",
         "step": 1,
         "capability": {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "pack": {"id":"test","version":"1","upstreamRevision":"test"},
             "extensionRevision": 0,
             "permissionPolicySha256": "policy",
-            "profiles": [], "presets": [], "workflows": [], "skills": []
+            "profiles": [], "presets": [], "councils": [], "workflows": [], "skills": []
         },
         "owner": {
             "sessionId":PARENT, "parentSessionId":null, "parentAttempt":null,
@@ -300,6 +300,120 @@ fn quiet_settlement_records_the_result_without_parent_input() {
             .pending(PARENT)
             .expect("pending")
             .is_empty()
+    );
+}
+
+#[test]
+fn failed_cancelled_and_uncertain_settlements_can_retain_structured_results() {
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+
+    for (job_id, status, message) in [
+        (
+            "job_failed",
+            JobStatus::Failed,
+            "provider rejected the request",
+        ),
+        (
+            "job_cancelled",
+            JobStatus::Cancelled,
+            "cancelled by the user",
+        ),
+        (
+            "job_uncertain",
+            JobStatus::Uncertain,
+            "executor acknowledgement was lost",
+        ),
+    ] {
+        store
+            .create(running(job_id, ReportDelivery::Quiet))
+            .expect("create job");
+        let expected = json!({
+            "job": job_id,
+            "partial": true,
+            "items": ["durable", "structured"]
+        });
+        let settlement = match status {
+            JobStatus::Failed => JobSettlement::failed(message, 20, None),
+            JobStatus::Cancelled => JobSettlement::cancelled(message, 20, None),
+            JobStatus::Uncertain => JobSettlement::uncertain(message, 20, None),
+            JobStatus::Running | JobStatus::Completed => unreachable!("test terminal status"),
+        }
+        .with_result(expected.clone());
+
+        let settled = store
+            .settle(job_id, settlement)
+            .expect("settle job with structured result");
+
+        assert_eq!(settled.job.status, status);
+        assert_eq!(settled.job.result.as_ref(), Some(&expected));
+        assert_eq!(settled.job.error.as_deref(), Some(message));
+        let event = SessionEventLog::new(Arc::clone(&pool))
+            .read_after(PARENT, None)
+            .expect("parent events")
+            .into_iter()
+            .find(|event| {
+                event.event_type == "agent.job.settled"
+                    && event
+                        .properties
+                        .get("jobID")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(job_id)
+            })
+            .expect("settled event");
+        assert_eq!(event.properties.get("result"), Some(&expected));
+        assert_eq!(event.properties.get("error"), Some(&json!(message)));
+    }
+}
+
+#[test]
+fn structured_results_do_not_weaken_terminal_settlement_invariants() {
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    store
+        .create(running("job_1", ReportDelivery::Quiet))
+        .expect("create job");
+
+    let completed_error = store
+        .settle(
+            "job_1",
+            JobSettlement {
+                status: JobStatus::Completed,
+                result: Some(json!({"text": "complete"})),
+                error: Some("completed jobs must not carry errors".to_owned()),
+                time_completed: 20,
+                report: None,
+            },
+        )
+        .expect_err("completed settlement with an error must be rejected");
+    assert_eq!(
+        std::error::Error::source(&completed_error)
+            .expect("completed validation source")
+            .to_string(),
+        "a completed job requires a result and no error"
+    );
+
+    let failed_without_error = store
+        .settle(
+            "job_1",
+            JobSettlement {
+                status: JobStatus::Failed,
+                result: Some(json!({"partial": true})),
+                error: Some(String::new()),
+                time_completed: 20,
+                report: None,
+            },
+        )
+        .expect_err("failed settlement without an error must be rejected");
+    assert_eq!(
+        std::error::Error::source(&failed_without_error)
+            .expect("failed validation source")
+            .to_string(),
+        "a failed, cancelled, or uncertain job requires an error"
+    );
+    assert_eq!(
+        store.get("job_1").expect("running job").status,
+        JobStatus::Running
     );
 }
 

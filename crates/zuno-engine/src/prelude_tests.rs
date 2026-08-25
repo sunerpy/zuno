@@ -189,6 +189,11 @@ fn internals() -> Internals {
             prompt: SUMMARY_PROMPT.to_owned(),
             model: model("small"),
         },
+        council_synth: InternalAgent {
+            name: "council-synth".to_owned(),
+            prompt: "Synthesize Council results.".to_owned(),
+            model: model("small"),
+        },
     }
 }
 

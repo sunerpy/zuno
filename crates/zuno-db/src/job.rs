@@ -301,6 +301,13 @@ impl JobSettlement {
         Self::error(JobStatus::Uncertain, error, time_completed, report)
     }
 
+    /// Attach structured output without changing this settlement's status or error.
+    #[must_use]
+    pub fn with_result(mut self, result: Value) -> Self {
+        self.result = Some(result);
+        self
+    }
+
     fn error(
         status: JobStatus,
         error: impl Into<String>,

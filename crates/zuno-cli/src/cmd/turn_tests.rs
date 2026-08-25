@@ -109,11 +109,14 @@ fn test_capability() -> Arc<CapabilitySnapshot> {
         },
         0,
         sha256_text("test permission policy"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        CapabilityContents::default(),
     ))
+}
+
+fn test_capability_with_council() -> Arc<CapabilitySnapshot> {
+    let mut capability = test_capability().as_ref().clone();
+    capability.councils = council_descriptors();
+    Arc::new(capability)
 }
 
 /// The delegation collaborators a test supplies to reach [`tool_runtime::assemble`].
@@ -194,6 +197,24 @@ impl zuno_tools::workflow::WorkflowHost for NoWorkflows {
 
 fn test_workflows() -> Arc<dyn zuno_tools::workflow::WorkflowHost> {
     Arc::new(NoWorkflows)
+}
+
+#[derive(Debug, Default)]
+struct NoCouncils;
+
+#[async_trait::async_trait]
+impl zuno_tools::council::CouncilHost for NoCouncils {
+    async fn dispatch(
+        &self,
+        _request: zuno_tools::council::CouncilRequest,
+        _cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<zuno_tools::council::CouncilTurn, String> {
+        Err("test fixture has no Councils".to_owned())
+    }
+}
+
+fn test_councils() -> Arc<dyn zuno_tools::council::CouncilHost> {
+    Arc::new(NoCouncils)
 }
 
 fn test_job_controller() -> Arc<dyn zuno_tools::job_cancel::JobController> {
@@ -532,6 +553,7 @@ fn stub_internals() -> Internals {
         title: agent("title"),
         compaction: agent("compaction"),
         summary: agent("summary"),
+        council_synth: agent("council-synth"),
     }
 }
 
@@ -1105,7 +1127,8 @@ where
     let internals = Internals {
         title: internal.clone(),
         compaction: internal.clone(),
-        summary: internal,
+        summary: internal.clone(),
+        council_synth: internal,
     };
     let registry = RegistryProviders(&providers);
     let compaction = zuno_config::schema::CompactionConfig::default();
@@ -2083,7 +2106,7 @@ fn session_choice_resolves_the_two_flags_into_one_answer() {
 }
 
 #[test]
-fn all_three_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
+fn all_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
     // Given: a catalog with two models and a per-agent override for `title` only.
     let (catalog, config) = catalog_with_two_models_and_a_title_override();
     let session_model = catalog.model("test", "big").expect("the session model");
@@ -2106,12 +2129,18 @@ fn all_three_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
     )
     .expect("every internal resolves");
 
-    // Then: the overridden one took its override, the other two inherited the
-    // session's model, and all three carry the roster's prompt.
+    // Then: the overridden one took its override, the remaining internals inherited
+    // the session's model, and every internal carries the roster's prompt.
     assert_eq!(internals.title.model.model_id, "small");
     assert_eq!(internals.compaction.model.model_id, "big");
     assert_eq!(internals.summary.model.model_id, "big");
-    for internal in [&internals.title, &internals.compaction, &internals.summary] {
+    assert_eq!(internals.council_synth.model.model_id, "big");
+    for internal in [
+        &internals.title,
+        &internals.compaction,
+        &internals.summary,
+        &internals.council_synth,
+    ] {
         assert!(
             !internal.prompt.trim().is_empty(),
             "`{}` resolved with no prompt, so its request would carry no instructions",
@@ -2127,10 +2156,10 @@ fn all_three_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
 
 /// Every name the roster declares internal must resolve here.
 ///
-/// The assertion is over [`zuno_agent::builtin::INTERNAL_NAMES`] and not over three
-/// literals, so a fourth internal added to the roster fails this test rather than
-/// silently becoming another declared-and-never-invoked entry — which is the exact
-/// defect this wiring exists to remove.
+/// The assertion is over [`zuno_agent::builtin::INTERNAL_NAMES`] and not an independent
+/// list, so a new internal added to the roster fails this test rather than silently
+/// becoming another declared-and-never-invoked entry — which is the exact defect this
+/// wiring exists to remove.
 #[test]
 fn the_resolved_set_is_exactly_what_the_roster_calls_internal() {
     let (catalog, config) = catalog_with_two_models_and_a_title_override();
@@ -2156,6 +2185,7 @@ fn the_resolved_set_is_exactly_what_the_roster_calls_internal() {
         internals.title.name.as_str(),
         internals.compaction.name.as_str(),
         internals.summary.name.as_str(),
+        internals.council_synth.name.as_str(),
     ]
     .into_iter()
     .collect();
@@ -2895,6 +2925,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             delegation: test_delegation(),
             product_agents: test_product_agents(),
             workflows: test_workflows(),
+            councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
         },
@@ -2912,6 +2943,57 @@ fn production_registry_exposes_all_three_goal_tools() {
             "production registry is missing `{goal_tool}`; visible tools: {ids:?}"
         );
     }
+}
+
+#[test]
+fn production_registry_exposes_council_only_to_a_delegating_profile() {
+    fn ids_for(agent_name: &str) -> Vec<String> {
+        let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+        let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+        let config = zuno_config::schema::Config::default();
+        let selected_agent = agent_profile(agent(agent_name), directory.path(), &config);
+        let runtime = tool_runtime::assemble(
+            directory.path(),
+            None,
+            &Env::empty(),
+            &config,
+            &selected_agent,
+            tool_runtime::ToolSelection {
+                provider_id: "provider",
+                model_id: "model",
+                manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+                contributions: Arc::new(zuno_harness::ToolContributions::default()),
+                question: None,
+                background_executions: test_background_executions(directory.path()),
+                todo_store: Arc::new(
+                    zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
+                        .expect("in-memory todo store"),
+                ),
+                goal_store: Arc::new(
+                    GoalStore::open_memory(goal_spill.path().to_owned())
+                        .expect("in-memory goal store"),
+                ),
+                mcp_loader: None,
+                skills: Arc::new(zuno_catalog::skill::Skills::default()),
+                capability: test_capability_with_council(),
+                delegation: test_delegation(),
+                product_agents: test_product_agents(),
+                workflows: test_workflows(),
+                councils: test_councils(),
+                job_controller: test_job_controller(),
+                memory: None,
+            },
+        )
+        .expect("production registry assembles");
+        runtime
+            .tools
+            .iter()
+            .map(|tool| tool.id().to_owned())
+            .collect()
+    }
+
+    assert!(ids_for("orchestrator").contains(&zuno_tools::COUNCIL_WIRE_ID.to_owned()));
+    assert!(!ids_for("build").contains(&zuno_tools::COUNCIL_WIRE_ID.to_owned()));
 }
 
 #[test]
@@ -2959,6 +3041,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             delegation: test_delegation(),
             product_agents: test_product_agents(),
             workflows: test_workflows(),
+            councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
         },
@@ -3896,6 +3979,7 @@ mod production_registry {
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
                 workflows: test_workflows(),
+                councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
             },
@@ -4163,6 +4247,7 @@ mod production_registry {
                 delegation: test_delegation(),
                 product_agents: test_product_agents(),
                 workflows: test_workflows(),
+                councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
             },

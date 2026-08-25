@@ -38,9 +38,11 @@ pub const PROMPT_COMPACTION: &str = include_str!("prompt/compaction.txt");
 pub const PROMPT_TITLE: &str = include_str!("prompt/title.txt");
 /// Session summary agent.
 pub const PROMPT_SUMMARY: &str = include_str!("prompt/summary.txt");
+/// Tool-free Council synthesis agent.
+pub const PROMPT_COUNCIL_SYNTH: &str = include_str!("prompt/council-synth.txt");
 
 /// Native names in deterministic declaration order.
-pub const BUILTIN_NAMES: [&str; 13] = [
+pub const BUILTIN_NAMES: [&str; 14] = [
     "orchestrator",
     "build",
     "plan",
@@ -54,6 +56,7 @@ pub const BUILTIN_NAMES: [&str; 13] = [
     "compaction",
     "title",
     "summary",
+    "council-synth",
 ];
 
 /// One native agent before user configuration is applied.
@@ -102,6 +105,7 @@ pub fn all() -> Vec<Builtin> {
         compaction(),
         title(),
         summary(),
+        council_synth(),
     ]
 }
 
@@ -303,6 +307,18 @@ fn summary() -> Builtin {
     }
 }
 
+fn council_synth() -> Builtin {
+    Builtin {
+        name: "council-synth",
+        description: None,
+        mode: AgentMode::Primary,
+        hidden: true,
+        temperature: Some(0.1),
+        prompt: Some(PROMPT_COUNCIL_SYNTH),
+        delegates: None,
+    }
+}
+
 impl Builtin {
     /// Native permission overlay merged after the common defaults.
     ///
@@ -399,7 +415,7 @@ impl Builtin {
                 ("grep", allow()),
                 ("lsp", allow()),
             ],
-            "compaction" | "title" | "summary" => vec![("*", deny())],
+            "compaction" | "title" | "summary" | "council-synth" => vec![("*", deny())],
             _ => return None,
         };
         let mut object = OrderedMap::new();
@@ -454,7 +470,10 @@ mod tests {
             .filter(|builtin| builtin.hidden)
             .map(|builtin| builtin.name)
             .collect::<Vec<_>>();
-        assert_eq!(hidden, vec!["compaction", "title", "summary"]);
+        assert_eq!(
+            hidden,
+            vec!["compaction", "title", "summary", "council-synth"]
+        );
     }
 
     #[test]

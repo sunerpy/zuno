@@ -454,7 +454,7 @@ fn merge_deep(target: &mut Value, source: Value) {
 /// * An absent key leaves the native value in place.
 /// * `options` deep-merges rather than replacing.
 ///
-/// The returned order is the thirteen native agents first, then new agents in map
+/// The returned order is the native agents first, then new agents in map
 /// order. [`list`] applies the display sort separately.
 #[must_use]
 pub fn resolve(agents: &OrderedMap<AgentConfig>, origins: &[(String, PathBuf)]) -> Vec<Agent> {
@@ -758,24 +758,11 @@ mod tests {
     #[test]
     fn the_native_roster_exists_with_no_user_config_at_all() {
         let agents = resolve(&OrderedMap::new(), &[]);
-        assert_eq!(
-            names(&agents),
-            vec![
-                "orchestrator",
-                "build",
-                "plan",
-                "deep",
-                "fixer",
-                "general",
-                "explorer",
-                "librarian",
-                "oracle",
-                "looker",
-                "compaction",
-                "title",
-                "summary"
-            ]
-        );
+        let expected = builtin::all()
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names(&agents), expected);
         assert!(
             agents
                 .iter()
@@ -872,7 +859,7 @@ mod tests {
             &[],
         );
         assert!(!names(&agents).contains(&"plan"));
-        assert_eq!(agents.len(), 12);
+        assert_eq!(agents.len(), builtin::all().len() - 1);
     }
 
     #[test]
@@ -952,26 +939,13 @@ mod tests {
             })),
             &[],
         );
-        assert_eq!(
-            names(&agents),
-            vec![
-                "build",
-                "compaction",
-                "deep",
-                "explorer",
-                "fixer",
-                "general",
-                "librarian",
-                "looker",
-                "oracle",
-                "orchestrator",
-                "plan",
-                "summary",
-                "title",
-                "alpha",
-                "zebra"
-            ]
-        );
+        let mut expected = builtin::all()
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| locale_compare(left, right));
+        expected.extend(["alpha", "zebra"]);
+        assert_eq!(names(&agents), expected);
     }
 
     #[test]

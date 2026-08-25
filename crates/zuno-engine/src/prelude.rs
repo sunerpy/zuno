@@ -1,4 +1,4 @@
-//! The three internal agents, at the point in a turn where they actually run.
+//! Zuno's internal agents, at the point in a turn where they actually run.
 //!
 //! `zuno_agent::builtin::INTERNAL_NAMES` has named `compaction`, `title` and `summary`
 //! since todo 63, and todo 63's own doc comment predicted what dropping any of them
@@ -93,9 +93,9 @@ pub struct InternalAgent {
     pub model: ResolvedModel,
 }
 
-/// All three internal agents, resolved together.
+/// All internal agents, resolved together.
 ///
-/// One struct rather than three arguments because they are resolved by one policy
+/// One struct rather than separate arguments because they are resolved by one policy
 /// pass and a surface that has any of them has all of them. A field left unread by
 /// this crate is still resolved on the same path, which is the point: `summary`'s
 /// model comes from the same precedence chain as `title`'s, so a preset that
@@ -108,6 +108,8 @@ pub struct Internals {
     pub compaction: InternalAgent,
     /// Summarises what a session accomplished.
     pub summary: InternalAgent,
+    /// Synthesises bounded structured Council seat results without tools.
+    pub council_synth: InternalAgent,
 }
 
 /// Everything the prelude needs that is not the session itself.
@@ -119,7 +121,7 @@ pub struct PreludeContext<'a> {
     pub connection: &'a mut Connection,
     /// The provider for each internal agent's resolved model.
     pub providers: &'a dyn InternalProviders,
-    /// The three resolved internal agents.
+    /// The resolved internal agents.
     pub internals: &'a Internals,
     /// The user's compaction settings, as configured.
     pub compaction: &'a zuno_config::schema::CompactionConfig,
@@ -267,7 +269,7 @@ pub async fn generate_title(
             .map(|projected| projected.message),
     );
 
-    let text = collect_text(session_id, "title", provider.as_ref(), agent, messages)
+    let text = complete_internal_text(session_id, "title", provider.as_ref(), agent, messages)
         .await
         .map_err(TitleSkipped::Reason)?;
     let Some(title) = clean_title(&text) else {
@@ -481,7 +483,8 @@ pub async fn summarize(
             .skip(1)
             .map(|projected| projected.message),
     );
-    let text = collect_text(session_id, "summary", provider.as_ref(), agent, messages).await?;
+    let text =
+        complete_internal_text(session_id, "summary", provider.as_ref(), agent, messages).await?;
     if text.trim().is_empty() {
         return Err("the summary model returned no text".to_owned());
     }
@@ -636,10 +639,13 @@ fn requested_agent(history: &[MessageWithParts]) -> Option<String> {
 /// Collect a tool-free completion's text, or say why there is none.
 ///
 /// The `tools` vector is empty and that is the whole point of the function existing:
-/// all three internals deny every tool (`agent.ts:221`, `:241`, `:256`, ported at
-/// `zuno_agent::builtin::internal`), and a request that offered one could come back
+/// every internal denies every tool, and a request that offered one could come back
 /// with a call no dispatcher on this path would execute.
-async fn collect_text(
+///
+/// This is public for lifecycle-owned runtimes such as Council synthesis. It accepts
+/// an already resolved internal Agent and provider; it does not resolve credentials,
+/// choose a model, or expose a dispatcher.
+pub async fn complete_internal_text(
     session_id: &str,
     operation: &str,
     provider: &dyn Provider,

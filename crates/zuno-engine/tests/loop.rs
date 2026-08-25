@@ -27,8 +27,8 @@ use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
 use zuno_orchestration::{
-    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilitySnapshot, PackIdentity,
-    sha256_text,
+    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
+    PackIdentity, sha256_text,
 };
 use zuno_tool::{ToolDefinition, ToolOutput, ToolUiIntent};
 
@@ -141,10 +141,7 @@ fn trace_seed() -> Arc<AttemptSeed> {
             },
             7,
             sha256_text("trace permission policy"),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            CapabilityContents::default(),
         ),
         agent: AgentAttemptIdentity {
             name: "build".to_owned(),

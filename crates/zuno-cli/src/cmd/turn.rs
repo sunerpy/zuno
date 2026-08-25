@@ -87,10 +87,11 @@ use zuno_memory::{
     MemoryObserver, MemoryService, PromotionPolicy, Scope, ScopeLimits, ScopePaths, SessionMemory,
 };
 use zuno_orchestration::{
-    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilitySnapshot, PackIdentity,
-    PresetDescriptor, PresetRouteDescriptor, PresetSelection, ProfileDescriptor,
-    SkillCapabilityDescriptor, WorkflowNodeDescriptor, WorkflowTemplateDescriptor, sha256_json,
-    sha256_text,
+    AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
+    CouncilPresetDescriptor, CouncilRetryPolicyDescriptor, CouncilSeatDescriptor,
+    CouncilSynthesisPolicyDescriptor, PackIdentity, PresetDescriptor, PresetRouteDescriptor,
+    PresetSelection, ProfileDescriptor, SkillCapabilityDescriptor, WorkflowNodeDescriptor,
+    WorkflowTemplateDescriptor, sha256_json, sha256_text,
 };
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_runtime::HarnessRuntime;
@@ -890,9 +891,9 @@ fn resolve_goal_retry_policy(
         .map_err(|error| format!("invalid goal.retry configuration: {error}"))
 }
 
-/// Resolve `compaction`, `title` and `summary` through todo 64's model policy.
+/// Resolve every hidden internal through the same model policy.
 ///
-/// Iterates [`zuno_agent::builtin::INTERNAL_NAMES`] rather than three literals, so an
+/// Iterates [`zuno_agent::builtin::INTERNAL_NAMES`] rather than hand-written literals, so an
 /// internal added there is resolved here with no edit — which is the whole reason
 /// that constant exists. Each name's prompt comes from
 /// [`zuno_catalog::agent::builtin`], which is where the upstream native's text lives;
@@ -1054,6 +1055,7 @@ fn resolve_internals(
         title: take("title")?,
         compaction: take("compaction")?,
         summary: take("summary")?,
+        council_synth: take("council-synth")?,
     })
 }
 
@@ -2108,11 +2110,23 @@ impl TurnHost {
                 delegation_limiter,
                 background_jobs.clone(),
             )?;
+            let council_agent = plan.internals.council_synth.clone();
+            let council_provider = providers
+                .resolve(council_agent.model.provider.clone())
+                .map_err(|error| {
+                    format!(
+                        "council-synth provider for {}/{} could not start: {error}",
+                        council_agent.model.catalog_provider_id,
+                        council_agent.model.catalog_model_id
+                    )
+                })?;
             let workflow_host = super::workflow::NativeWorkflowHost::new(
                 Arc::clone(&database),
                 child_host.clone(),
                 child_host.wake_handle(),
                 background_jobs.clone(),
+                council_provider,
+                council_agent,
             );
             let background_executions = environment
                 .background_executions(&plan.directory)
@@ -2160,6 +2174,7 @@ impl TurnHost {
                     },
                     product_agents: Arc::new(product_agents.clone()),
                     workflows: Arc::new(workflow_host.clone()),
+                    councils: Arc::new(workflow_host.clone()),
                     job_controller: Arc::new(background_jobs.clone()),
                     memory: memory_tool,
                 },
@@ -4599,8 +4614,8 @@ fn without_credential(message: String, credential: Option<&str>) -> String {
 /// line written past it either vanishes or corrupts the frame — the same argument
 /// `tui.rs` makes for reporting turn failures this way. Reporting at all is the point:
 /// a session that could not be named and a history that could not be compacted are
-/// both losses the user is entitled to see, and "no output" is how the three internals
-/// stayed missing through 3,057 passing tests.
+/// both losses the user is entitled to see, and "no output" is how internal-agent
+/// wiring stayed missing through 3,057 passing tests.
 async fn report_prelude(
     events: &TurnEventSender,
     notes: &[String],
@@ -5681,10 +5696,13 @@ fn orchestration_capability(
         },
         extension_revision,
         permission_policy_sha256,
-        profiles,
-        preset_descriptors(presets),
-        workflow_descriptors(config),
-        skill_descriptors(skills),
+        CapabilityContents {
+            profiles,
+            presets: preset_descriptors(presets),
+            councils: council_descriptors(),
+            workflows: workflow_descriptors(config),
+            skills: skill_descriptors(skills),
+        },
     ))
 }
 
@@ -5765,6 +5783,35 @@ fn selected_preset(presets: &PresetLibrary) -> Result<Option<PresetSelection>, S
         name: name.to_owned(),
         sha256: descriptor.identity().map_err(to_string)?.sha256,
     }))
+}
+
+fn council_descriptors() -> Vec<CouncilPresetDescriptor> {
+    zuno_orchestration::councils()
+        .iter()
+        .map(|preset| CouncilPresetDescriptor {
+            name: preset.name.to_owned(),
+            source_id: preset.source_id.to_owned(),
+            quorum: preset.quorum,
+            max_parallel: preset.max_parallel,
+            deadline_ms: preset.deadline_ms,
+            seat_output_bytes: preset.seat_output_bytes,
+            retry_policy: CouncilRetryPolicyDescriptor {
+                max_retries: preset.max_retries,
+            },
+            synthesis_policy: CouncilSynthesisPolicyDescriptor {
+                max_input_bytes: preset.synthesis_input_bytes,
+            },
+            seats: preset
+                .seats
+                .iter()
+                .map(|seat| CouncilSeatDescriptor {
+                    id: seat.id.to_owned(),
+                    agent: seat.agent.to_owned(),
+                    instruction: seat.instruction.to_owned(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn workflow_descriptors(config: &zuno_config::schema::Config) -> Vec<WorkflowTemplateDescriptor> {
