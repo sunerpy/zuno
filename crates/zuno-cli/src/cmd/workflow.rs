@@ -1809,7 +1809,9 @@ fn parse_council_answer(output: &str, output_limit: usize) -> Result<CouncilSeat
             "seat response exceeded the {output_limit}-byte output bound"
         ));
     }
-    let answer: CouncilSeatAnswer = serde_json::from_str(output.trim())
+    let payload = council_json_payload(output)
+        .map_err(|error| format!("seat returned malformed structured output: {error}"))?;
+    let answer: CouncilSeatAnswer = serde_json::from_str(payload)
         .map_err(|error| format!("seat returned malformed structured output: {error}"))?;
     validate_council_text("verdict", &answer.verdict)?;
     validate_council_text("recommendation", &answer.recommendation)?;
@@ -1827,6 +1829,28 @@ fn parse_council_answer(output: &str, output_limit: usize) -> Result<CouncilSeat
         }
     }
     Ok(answer)
+}
+
+fn council_json_payload(output: &str) -> Result<&str, String> {
+    let trimmed = output.trim();
+    let Some(fenced) = trimmed.strip_prefix("```") else {
+        return Ok(trimmed);
+    };
+    let Some((language, body)) = fenced.split_once('\n') else {
+        return Err("JSON code fence has no body".to_owned());
+    };
+    let language = language.trim();
+    if !language.is_empty() && !language.eq_ignore_ascii_case("json") {
+        return Err(format!("unsupported code fence language `{language}`"));
+    }
+    let Some(body) = body.strip_suffix("```") else {
+        return Err("JSON code fence is not the complete response".to_owned());
+    };
+    let payload = body.trim();
+    if payload.is_empty() {
+        return Err("JSON code fence is empty".to_owned());
+    }
+    Ok(payload)
 }
 
 fn validate_council_text(field: &str, value: &str) -> Result<(), String> {

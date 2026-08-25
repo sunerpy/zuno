@@ -359,6 +359,29 @@ fn node(id: &str, depends_on: &[&str], prompt: &str) -> WorkflowNodeRequest {
     }
 }
 
+#[test]
+fn council_parser_accepts_one_json_fence_without_surrounding_prose() {
+    let answer = parse_council_answer(
+        "```json\n{\"verdict\":\"hold\",\"confidence\":0.8,\"evidence\":[\"reviewed\"],\"risks\":[\"missing tests\"],\"recommendation\":\"add tests\"}\n```",
+        4_096,
+    )
+    .expect("a single JSON transport fence is normalized");
+
+    assert_eq!(answer.verdict, "hold");
+    assert_eq!(answer.recommendation, "add tests");
+}
+
+#[test]
+fn council_parser_rejects_fenced_json_with_surrounding_prose() {
+    let error = parse_council_answer(
+        "```json\n{\"verdict\":\"hold\",\"confidence\":0.8,\"evidence\":[],\"risks\":[],\"recommendation\":\"add tests\"}\n```\nThis is the answer.",
+        4_096,
+    )
+    .expect_err("prose outside the JSON envelope remains invalid");
+
+    assert!(error.contains("malformed structured output"));
+}
+
 #[tokio::test]
 async fn independent_nodes_overlap_and_dependents_wait_with_stable_results() {
     let fixture = Fixture::new();
