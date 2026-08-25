@@ -43,7 +43,7 @@ use zuno_observability::span;
 use zuno_orchestration::{
     AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
     ModelAttemptIdentity, OwnerLineage, PackIdentity, PromptReceiptIdentity,
-    SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity, ToolSchemaIdentity, sha256_json, sha256_text,
+    SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity, sha256_json, sha256_text,
 };
 use zuno_tool::{
     ToolConcurrencyPolicy, ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
@@ -3176,18 +3176,17 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
         .collect();
     let tools = tools
         .iter()
-        .map(|tool| ToolSchemaIdentity {
-            name: tool.name.clone(),
-            description_sha256: sha256_text(&tool.description),
-            schema_sha256: sha256_json(&tool.parameters),
-            ui_intent: locked_tools
-                .iter()
-                .find(|definition| definition.id == tool.name)
-                .map_or("generic", |definition| match definition.ui_intent {
-                    ToolUiIntent::Generic => "generic",
-                    ToolUiIntent::Subagent => "subagent",
-                })
-                .to_owned(),
+        .map(|tool| {
+            ToolDefinition {
+                id: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+                ui_intent: locked_tools
+                    .iter()
+                    .find(|definition| definition.id == tool.name)
+                    .map_or(ToolUiIntent::Generic, |definition| definition.ui_intent),
+            }
+            .schema_identity()
         })
         .collect();
     let surface = match model.surface {

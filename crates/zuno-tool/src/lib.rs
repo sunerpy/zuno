@@ -92,6 +92,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use zuno_error::ToolError;
+use zuno_orchestration::{ToolSchemaIdentity, sha256_json, sha256_text};
 
 /// A tool as a provider sees it.
 ///
@@ -107,6 +108,23 @@ pub struct ToolDefinition {
     pub parameters: Value,
     /// Stable client presentation intent, independent from the wire name.
     pub ui_intent: ToolUiIntent,
+}
+
+impl ToolDefinition {
+    /// Returns the durable identity of this exact provider-visible definition.
+    #[must_use]
+    pub fn schema_identity(&self) -> ToolSchemaIdentity {
+        ToolSchemaIdentity {
+            name: self.id.clone(),
+            description_sha256: sha256_text(&self.description),
+            schema_sha256: sha256_json(&self.parameters),
+            ui_intent: match self.ui_intent {
+                ToolUiIntent::Generic => "generic",
+                ToolUiIntent::Subagent => "subagent",
+            }
+            .to_owned(),
+        }
+    }
 }
 
 /// A tool's durable client presentation category.
@@ -553,6 +571,47 @@ mod tests {
             "The text to echo."
         );
         assert_eq!(definition.parameters["required"], json!(["text"]));
+    }
+
+    #[test]
+    fn tool_definition_schema_identity_captures_the_exact_provider_surface() {
+        let definition = ToolDefinition {
+            id: "subagent_research".to_owned(),
+            description: "Delegate a bounded research task.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "background": { "type": "boolean" }
+                },
+                "required": ["prompt"]
+            }),
+            ui_intent: ToolUiIntent::Subagent,
+        };
+
+        assert_eq!(
+            definition.schema_identity(),
+            zuno_orchestration::ToolSchemaIdentity {
+                name: definition.id.clone(),
+                description_sha256: zuno_orchestration::sha256_text(&definition.description),
+                schema_sha256: zuno_orchestration::sha256_json(&definition.parameters),
+                ui_intent: "subagent".to_owned(),
+            }
+        );
+
+        let reordered_parameters = json!({
+            "required": ["prompt"],
+            "properties": {
+                "background": { "type": "boolean" },
+                "prompt": { "type": "string" }
+            },
+            "type": "object"
+        });
+        assert_eq!(
+            definition.schema_identity().schema_sha256,
+            zuno_orchestration::sha256_json(&reordered_parameters),
+            "schema identity must hash canonical JSON rather than insertion order"
+        );
     }
 
     #[test]
