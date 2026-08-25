@@ -2,8 +2,8 @@
 //!
 //! The tool layer has already fixed the graph, resolved every node's model and
 //! reasoning options, and checked permission/depth. This host owns only effects:
-//! bounded overlap, cancellation propagation, durable parent jobs, stable result
-//! ordering, and restart reconciliation without replay.
+//! bounded work-conserving overlap, cancellation propagation, durable parent
+//! jobs, stable result ordering, and restart reconciliation without replay.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -813,58 +813,73 @@ impl NativeWorkflowHost {
         let mut pending = (0..request.nodes.len()).collect::<BTreeSet<_>>();
         let mut completed_ids = BTreeSet::new();
         let mut results = vec![None; request.nodes.len()];
+        let max_parallel = request.max_parallel.max(1);
+        let run_cancellation = cancellation.child_token();
+        let mut tasks = JoinSet::new();
 
-        while !pending.is_empty() {
+        loop {
             if cancellation.is_cancelled() {
-                return WorkflowOutcome::Cancelled {
-                    message: "cancelled before the next workflow node was admitted".to_owned(),
+                run_cancellation.cancel();
+                if drain_cancelled(&mut tasks).await {
+                    return WorkflowOutcome::Cancelled {
+                        message: "cancelled by the parent turn".to_owned(),
+                        completed: ordered_results(&results),
+                    };
+                }
+                return WorkflowOutcome::Uncertain {
+                    message:
+                        "node tasks did not acknowledge cancellation before the safety timeout"
+                            .to_owned(),
                     completed: ordered_results(&results),
                 };
             }
-            let ready = pending
-                .iter()
-                .copied()
-                .filter(|index| {
+
+            while tasks.len() < max_parallel {
+                let next = pending.iter().copied().find(|index| {
                     request.nodes[*index]
                         .depends_on
                         .iter()
                         .all(|dependency| completed_ids.contains(dependency))
-                })
-                .take(request.max_parallel.max(1))
-                .collect::<Vec<_>>();
-            if ready.is_empty() {
-                return WorkflowOutcome::Failed {
-                    message: "no runnable node remains; dependencies did not reach a successful terminal state"
-                        .to_owned(),
-                    completed: ordered_results(&results),
+                });
+                let Some(index) = next else {
+                    break;
                 };
-            }
-            for index in &ready {
-                pending.remove(index);
+                pending.remove(&index);
                 if let Err(error) = self.transition_item(
                     &request.parent_session_id,
-                    &mut items.nodes[*index],
+                    &mut items.nodes[index],
                     WorkItemStatus::InProgress,
                     None,
                     None,
                 ) {
+                    run_cancellation.cancel();
+                    if !drain_cancelled(&mut tasks).await {
+                        return WorkflowOutcome::Uncertain {
+                            message: format!(
+                                "workflow node `{}` could not enter running state ({error}) and active sibling cancellation could not be confirmed",
+                                request.nodes[index].id
+                            ),
+                            completed: ordered_results(&results),
+                        };
+                    }
+                    if cancellation.is_cancelled() {
+                        return WorkflowOutcome::Cancelled {
+                            message: "cancelled by the parent turn".to_owned(),
+                            completed: ordered_results(&results),
+                        };
+                    }
                     return WorkflowOutcome::Failed {
                         message: format!(
                             "workflow node `{}` could not enter running state: {error}",
-                            request.nodes[*index].id
+                            request.nodes[index].id
                         ),
                         completed: ordered_results(&results),
                     };
                 }
-                items.nodes[*index].started = Some(Instant::now());
-            }
-
-            let batch_cancellation = cancellation.child_token();
-            let mut tasks = JoinSet::new();
-            for index in ready {
+                items.nodes[index].started = Some(Instant::now());
                 let node = request.nodes[index].clone();
                 let runner = Arc::clone(&self.runner);
-                let node_cancellation = batch_cancellation.child_token();
+                let node_cancellation = run_cancellation.child_token();
                 tasks.spawn(async move {
                     let id = node.id;
                     let agent = node.turn.agent.clone();
@@ -874,99 +889,117 @@ impl NativeWorkflowHost {
                 });
             }
 
-            while !tasks.is_empty() {
-                let joined = tokio::select! {
-                    () = cancellation.cancelled() => {
-                        batch_cancellation.cancel();
-                        if drain_cancelled(&mut tasks).await {
-                            return WorkflowOutcome::Cancelled {
-                                message: "cancelled by the parent turn".to_owned(),
-                                completed: ordered_results(&results),
-                            };
-                        }
-                        return WorkflowOutcome::Uncertain {
-                            message: "node tasks did not acknowledge cancellation before the safety timeout"
-                                .to_owned(),
+            if tasks.is_empty() {
+                if pending.is_empty() {
+                    if cancellation.is_cancelled() {
+                        return WorkflowOutcome::Cancelled {
+                            message: "cancelled by the parent turn".to_owned(),
                             completed: ordered_results(&results),
                         };
                     }
-                    joined = tasks.join_next() => joined,
+                    return WorkflowOutcome::Completed(ordered_results(&results));
+                }
+                return WorkflowOutcome::Failed {
+                    message: "no runnable node remains; dependencies did not reach a successful terminal state"
+                        .to_owned(),
+                    completed: ordered_results(&results),
                 };
-                let Some(joined) = joined else {
-                    break;
-                };
-                match joined {
-                    Ok((index, id, agent, elapsed_ms, Ok(turn))) => {
-                        completed_ids.insert(id.clone());
-                        let session_id = turn.session_id;
-                        results[index] = Some(NodeResult {
-                            index,
-                            id,
-                            agent,
-                            session_id: session_id.clone(),
-                            output: turn.output,
-                        });
-                        let tokens = match self.child_tokens(&session_id) {
-                            Ok(tokens) => tokens,
-                            Err(error) => {
-                                return WorkflowOutcome::Uncertain {
-                                    message: format!(
-                                        "workflow node usage could not be reconciled after completion: {error}"
-                                    ),
-                                    completed: ordered_results(&results),
-                                };
-                            }
+            }
+
+            let joined = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    run_cancellation.cancel();
+                    if drain_cancelled(&mut tasks).await {
+                        return WorkflowOutcome::Cancelled {
+                            message: "cancelled by the parent turn".to_owned(),
+                            completed: ordered_results(&results),
                         };
-                        if let Err(error) = self.transition_item(
-                            &request.parent_session_id,
-                            &mut items.nodes[index],
-                            WorkItemStatus::Completed,
-                            Some(elapsed_ms),
-                            tokens,
-                        ) {
+                    }
+                    return WorkflowOutcome::Uncertain {
+                        message: "node tasks did not acknowledge cancellation before the safety timeout"
+                            .to_owned(),
+                        completed: ordered_results(&results),
+                    };
+                }
+                joined = tasks.join_next() => joined,
+            };
+            let Some(joined) = joined else {
+                continue;
+            };
+            match joined {
+                Ok((index, id, agent, elapsed_ms, Ok(turn))) => {
+                    completed_ids.insert(id.clone());
+                    let session_id = turn.session_id;
+                    results[index] = Some(NodeResult {
+                        index,
+                        id,
+                        agent,
+                        session_id: session_id.clone(),
+                        output: turn.output,
+                    });
+                    let tokens = match self.child_tokens(&session_id) {
+                        Ok(tokens) => tokens,
+                        Err(error) => {
+                            run_cancellation.cancel();
+                            let _drained = drain_cancelled(&mut tasks).await;
                             return WorkflowOutcome::Uncertain {
                                 message: format!(
-                                    "workflow node `{}` completed but its WorkItem could not be settled: {error}",
-                                    request.nodes[index].id
+                                    "workflow node usage could not be reconciled after completion: {error}"
                                 ),
                                 completed: ordered_results(&results),
                             };
                         }
-                    }
-                    Ok((_index, id, _agent, _elapsed_ms, Err(error))) => {
-                        batch_cancellation.cancel();
-                        if !drain_cancelled(&mut tasks).await {
-                            return WorkflowOutcome::Uncertain {
-                                message: format!(
-                                    "node `{id}` failed ({error}) and sibling cancellation could not be confirmed"
-                                ),
-                                completed: ordered_results(&results),
-                            };
-                        }
-                        if cancellation.is_cancelled() {
-                            return WorkflowOutcome::Cancelled {
-                                message: "cancelled by the parent turn".to_owned(),
-                                completed: ordered_results(&results),
-                            };
-                        }
-                        return WorkflowOutcome::Failed {
-                            message: format!("node `{id}` failed: {error}"),
-                            completed: ordered_results(&results),
-                        };
-                    }
-                    Err(error) => {
-                        batch_cancellation.cancel();
+                    };
+                    if let Err(error) = self.transition_item(
+                        &request.parent_session_id,
+                        &mut items.nodes[index],
+                        WorkItemStatus::Completed,
+                        Some(elapsed_ms),
+                        tokens,
+                    ) {
+                        run_cancellation.cancel();
                         let _drained = drain_cancelled(&mut tasks).await;
                         return WorkflowOutcome::Uncertain {
-                            message: format!("a workflow node task was lost: {error}"),
+                            message: format!(
+                                "workflow node `{}` completed but its WorkItem could not be settled: {error}",
+                                request.nodes[index].id
+                            ),
                             completed: ordered_results(&results),
                         };
                     }
                 }
+                Ok((_index, id, _agent, _elapsed_ms, Err(error))) => {
+                    run_cancellation.cancel();
+                    if !drain_cancelled(&mut tasks).await {
+                        return WorkflowOutcome::Uncertain {
+                            message: format!(
+                                "node `{id}` failed ({error}) and sibling cancellation could not be confirmed"
+                            ),
+                            completed: ordered_results(&results),
+                        };
+                    }
+                    if cancellation.is_cancelled() {
+                        return WorkflowOutcome::Cancelled {
+                            message: "cancelled by the parent turn".to_owned(),
+                            completed: ordered_results(&results),
+                        };
+                    }
+                    return WorkflowOutcome::Failed {
+                        message: format!("node `{id}` failed: {error}"),
+                        completed: ordered_results(&results),
+                    };
+                }
+                Err(error) => {
+                    run_cancellation.cancel();
+                    let _drained = drain_cancelled(&mut tasks).await;
+                    return WorkflowOutcome::Uncertain {
+                        message: format!("a workflow node task was lost: {error}"),
+                        completed: ordered_results(&results),
+                    };
+                }
             }
         }
-
-        WorkflowOutcome::Completed(ordered_results(&results))
     }
 
     async fn execute_council_managed(

@@ -99,7 +99,10 @@ Independent runtime work has four bounded controls:
   Codex/Claude Code product agents all consume it. Background work from an
   earlier turn continues to consume capacity. Waiting delegations are admitted
   in fair FIFO order, and a workflow's `maxParallel` remains an additional,
-  narrower bound. Independent Zuno processes do not yet coordinate this quota.
+  narrower bound. A workflow immediately refills a free slot with the next ready
+  node in template order; it does not wait for the slowest node in an earlier
+  wave. Parent cancellation takes priority over same-tick final completion.
+  Independent Zuno processes do not yet coordinate this quota.
 - `mcp_connections` limits simultaneous lifecycle operations across different
   MCP servers. One server's operations remain serialized.
 - `lsp_requests` is the shared cap for language-server startup and request fan-out

@@ -497,7 +497,12 @@ adjusts the bound without cancelling active work: a lower bound waits for enough
 active delegations to finish, while a higher bound admits queued work. The queue
 is explicit and fair FIFO; later calls cannot barge ahead of existing waiters.
 Workflow `maxParallel` remains an additional per-workflow ceiling. Separate Zuno
-processes do not yet share a durable quota lease.
+processes do not yet share a durable quota lease. Within that ceiling, the
+workflow scheduler is work-conserving: whenever one node settles, the next ready
+node is admitted in template order without waiting for slower siblings from the
+same wave. Durable/model-facing results remain in template order. If parent
+cancellation and final node completion become ready in the same scheduler tick,
+cancellation wins and the workflow cannot publish a false `completed` outcome.
 
 Background native and product-agent jobs commit `queued` before waiting for a
 permit, then atomically transition to `running` immediately before invoking the

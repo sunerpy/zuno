@@ -109,6 +109,14 @@ started and marks already-running work `Uncertain`, preserving the non-replay
 contract. Cross-process leases and per-parent/provider/model quotas remain later
 work; the unchanged DSH baseline does not move.
 
+Workflow scheduling hardening was classified `adapt`. Zuno keeps immutable DAG
+templates and stable declaration-order results, but replaces wave/batch waiting
+with a work-conserving scheduler that immediately fills a free `maxParallel`
+slot from the next ready node. Parent cancellation is explicitly biased ahead of
+same-tick completion and checked again before a workflow can publish
+`Completed`. This strengthens native Rust execution semantics without adopting a
+DSH runtime API; the unchanged DSH baseline does not move.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

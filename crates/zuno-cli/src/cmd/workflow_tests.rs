@@ -130,6 +130,48 @@ struct RecordingRunner {
     events: Mutex<Vec<String>>,
     entered: tokio::sync::Notify,
     attempts: Mutex<BTreeMap<String, usize>>,
+    gates: Mutex<BTreeMap<String, Arc<tokio::sync::Semaphore>>>,
+    cancel_before_success: Mutex<Option<CancellationToken>>,
+}
+
+impl RecordingRunner {
+    fn gate(&self, label: &str) -> Arc<tokio::sync::Semaphore> {
+        let mut gates = self
+            .gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            gates
+                .entry(label.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(0))),
+        )
+    }
+
+    fn cancel_parent_before_success(&self, cancellation: CancellationToken) {
+        *self
+            .cancel_before_success
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cancellation);
+    }
+
+    async fn wait_for_event(&self, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if self
+                    .events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .any(|event| event == expected)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("runner event `{expected}` was not observed"));
+    }
 }
 
 #[async_trait]
@@ -172,6 +214,19 @@ impl WorkflowNodeRunner for RecordingRunner {
             return Err("seat failed".to_owned());
         }
 
+        if request.prompt == "gate" {
+            let gate = self.gate(&label);
+            tokio::select! {
+                permit = gate.acquire_owned() => {
+                    permit.expect("test gate remains open").forget();
+                }
+                () = cancellation.cancelled() => {
+                    self.active.fetch_sub(1, Ordering::SeqCst);
+                    return Err("cancelled".to_owned());
+                }
+            }
+        }
+
         let delay = if request.prompt.starts_with("slow") {
             60
         } else {
@@ -189,6 +244,15 @@ impl WorkflowNodeRunner for RecordingRunner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(format!("end:{label}"));
         self.active.fetch_sub(1, Ordering::SeqCst);
+        if request.prompt == "cancel-before-success"
+            && let Some(parent) = self
+                .cancel_before_success
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        {
+            parent.cancel();
+        }
         let output = match request.prompt.as_str() {
             "agree" | "slow-agree" => json!({
                 "verdict":"approve",
@@ -366,6 +430,77 @@ async fn independent_nodes_overlap_and_dependents_wait_with_stable_results() {
         .find(|item| item.subject == "implement")
         .expect("implement item");
     assert_eq!(implement.dependencies.len(), 2);
+}
+
+#[tokio::test]
+async fn workflow_refills_a_free_slot_without_waiting_for_the_slowest_running_node() {
+    let fixture = Fixture::new();
+    let scan_gate = fixture.runner.gate("scan");
+    let review_gate = fixture.runner.gate("review");
+    let request = fixture.request(
+        false,
+        vec![
+            node("scan", &[], "gate"),
+            node("review", &[], "gate"),
+            node("package", &[], "fast"),
+        ],
+    );
+    let host = fixture.host.clone();
+    let task = tokio::spawn(async move {
+        WorkflowHost::dispatch(&host, request, CancellationToken::new()).await
+    });
+
+    fixture.runner.wait_for_event("start:scan").await;
+    fixture.runner.wait_for_event("start:review").await;
+    review_gate.add_permits(1);
+    fixture.runner.wait_for_event("start:package").await;
+
+    {
+        let events = fixture
+            .runner
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !events.iter().any(|event| event == "end:scan"),
+            "package must be admitted while scan still occupies the other slot"
+        );
+    }
+
+    scan_gate.add_permits(1);
+    let turn = task
+        .await
+        .expect("workflow task remains attached")
+        .expect("workflow completes");
+    assert_eq!(fixture.runner.max_active.load(Ordering::SeqCst), 2);
+    assert!(
+        turn.output.find("### scan").expect("scan output")
+            < turn.output.find("### review").expect("review output")
+    );
+    assert!(
+        turn.output.find("### review").expect("review output")
+            < turn.output.find("### package").expect("package output")
+    );
+}
+
+#[tokio::test]
+async fn parent_cancellation_wins_when_the_final_node_completes_in_the_same_tick() {
+    let fixture = Fixture::new();
+    for attempt in 0..16 {
+        let cancellation = CancellationToken::new();
+        fixture
+            .runner
+            .cancel_parent_before_success(cancellation.clone());
+        let id = format!("finish-{attempt}");
+        let result = WorkflowHost::dispatch(
+            &fixture.host,
+            fixture.request(false, vec![node(&id, &[], "cancel-before-success")]),
+            cancellation,
+        )
+        .await;
+        let error = result.expect_err("a cancelled workflow must never report completion");
+        assert!(error.contains("cancelled"), "unexpected outcome: {error}");
+    }
 }
 
 #[tokio::test]
