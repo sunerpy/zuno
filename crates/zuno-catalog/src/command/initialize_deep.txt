@@ -1,0 +1,39 @@
+Initialize durable repository guidance for future Zuno sessions across the repository rooted at `${path}`.
+
+User-provided focus, constraints, and flags (honor these):
+$ARGUMENTS
+
+## Option semantics
+
+- `--create-new`: leave all existing `AGENTS.md` files unchanged and create only missing files that satisfy the placement rules below. Without this flag, improve accurate existing files in place and create missing ones where justified.
+- `--max-depth=N`: Treat the repository root as depth 0. Do not inspect candidate directories or create scoped files below depth `N`. The root `AGENTS.md` remains in scope.
+- Treat any remaining user arguments as priorities for investigation and writing. They supplement these rules; they do not weaken them.
+
+## Investigate before writing
+
+Use CodeGraph first to confirm the index is current and map the repository's entrypoints, call paths, package ownership, and build boundaries. Follow structural relationships before broad text searches. If a relevant non-source file is outside the index, read that file directly.
+
+Then inspect the highest-value executable sources of truth:
+- root and workspace manifests, lockfiles, task runners, and generated-code declarations
+- build, test, lint, format, typecheck, migration, release, and deployment configuration
+- CI workflows and environment setup
+- existing `AGENTS.md` files and other repository-owned instruction sources
+- a small number of representative entrypoints when the graph and configuration do not fully explain a boundary
+
+Prefer verified commands and wiring over prose. Do not infer rules from directory names alone.
+
+## Decide the instruction hierarchy
+
+Generate or update the root `AGENTS.md` with concise repository-wide guidance that future Zuno sessions would otherwise miss.
+
+Create a scoped `AGENTS.md` only when its directory is a real responsibility, build, language, or deployment boundary with durable rules that differ from the parent scope. Package count alone is not a boundary. Do not create files for generated output, vendored dependencies, fixtures, caches, or every leaf directory.
+
+A scoped file inherits every ancestor instruction file. Write only rules that are new relative to its parent `AGENTS.md`. Do not repeat parent rules, repository-wide commands, or generic engineering advice. If a boundary has no additional durable guidance, do not create a file there.
+
+## Preserve and improve
+
+Preserve accurate existing content, user-authored constraints, and useful local detail. Update stale claims only when the repository provides evidence. Keep unrelated wording stable where practical, and never erase a narrower rule merely to make files look uniform.
+
+Each file should be compact and operational. Prefer exact commands, non-obvious architecture facts, ownership boundaries, generated-code or migration constraints, test prerequisites, deployment hazards, and local conventions that differ from defaults. Omit tutorials, exhaustive trees, speculation, and facts obvious from filenames.
+
+Before finishing, review the complete hierarchy from root to leaves. Remove duplicated guidance, verify each scoped file has a real boundary, and summarize which files were created or updated and why.

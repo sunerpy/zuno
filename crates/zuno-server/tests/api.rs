@@ -2468,6 +2468,52 @@ async fn api_init_command_is_written_for_future_zuno_sessions() {
 }
 
 #[tokio::test]
+async fn api_init_deep_command_is_native_project_scoped_and_hierarchical() {
+    let (root, directory) = fs_fixture();
+    let state = ApiState::memory(directory.clone())
+        .expect("API state")
+        .with_env(isolated_env(root.path()));
+    let (status, body) = fs_body(state, "/api/command").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).expect("command body is JSON");
+    let init_deep = json["data"]
+        .as_array()
+        .expect("commands are an array")
+        .iter()
+        .find(|entry| entry["name"] == "init-deep")
+        .expect("init-deep command is present");
+    let template = init_deep["template"]
+        .as_str()
+        .expect("init-deep template is text");
+
+    assert!(template.contains("future Zuno sessions"), "{template}");
+    assert!(
+        !template.contains("OpenCode") && !template.contains("oh-my") && !template.contains("OMO"),
+        "{template}"
+    );
+    assert!(!template.contains("${path}"), "{template}");
+    let project_directory = json["location"]["project"]["directory"]
+        .as_str()
+        .expect("location carries the project directory");
+    assert!(
+        template.contains(&format!("repository rooted at `{project_directory}`")),
+        "{template}"
+    );
+    for required in [
+        "Use CodeGraph first",
+        "Generate or update the root `AGENTS.md`",
+        "real responsibility, build, language, or deployment boundary",
+        "only rules that are new relative to its parent `AGENTS.md`",
+        "Do not repeat parent rules",
+    ] {
+        assert!(
+            template.contains(required),
+            "missing {required:?}: {template}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn api_agent_roster_is_the_resolved_native_set() {
     let (root, directory) = fs_fixture();
     let state = ApiState::memory(directory)

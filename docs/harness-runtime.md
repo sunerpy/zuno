@@ -210,6 +210,27 @@ Supplying arguments loads the Skill first and then admits the exact canonical
 slash text as user input. Real commands always win; ambiguous names remain
 available through `/skills` and source-qualified `skill` operations.
 
+### Repository instruction initialization
+
+The command registry always seeds two Zuno instruction workflows before
+`/review`:
+
+- `/init [focus...]` creates or improves the repository-root `AGENTS.md`. It is
+  the compact choice for a repository whose guidance does not need scoped
+  overrides.
+- `/init-deep [--create-new] [--max-depth=N] [focus...]` maps the repository with
+  CodeGraph first, then creates or updates the root file and adds scoped
+  `AGENTS.md` files only at real responsibility, build, language, or deployment
+  boundaries. A scoped file contains only rules that differ from its parent; it
+  must not duplicate inherited guidance.
+
+Both workflows preserve accurate existing content and treat remaining arguments
+as user priorities. By default `/init-deep` may improve existing files and create
+missing ones. `--create-new` leaves every existing `AGENTS.md` unchanged and only
+creates missing files. `--max-depth=N` counts the repository root as depth zero
+and prevents inspection or scoped-file creation below `N`; the root file remains
+in scope.
+
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 
 ## Auditable memory and reflection

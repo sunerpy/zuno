@@ -74,8 +74,8 @@ fn builtins_seed_the_registry() {
 
     assert_eq!(
         registry.names().collect::<Vec<_>>(),
-        vec!["init", "review"],
-        "only init and review are built in"
+        vec!["init", "init-deep", "review"],
+        "the native initialization commands precede review"
     );
 }
 
@@ -102,6 +102,84 @@ fn builtin_init_names_zuno_as_the_future_agent() {
 
     assert!(template.contains("future Zuno sessions"));
     assert!(!template.contains("future OpenCode sessions"));
+}
+
+#[test]
+fn builtin_init_deep_has_a_native_catalog_shape() {
+    let registry = Registry::build(&Sources::new(WORKTREE));
+    let init_deep = registry.get("init-deep").expect("init-deep is built in");
+
+    assert_eq!(
+        init_deep.description.as_deref(),
+        Some("deep AGENTS.md setup [--create-new] [--max-depth=N]")
+    );
+    assert_eq!(init_deep.source, Source::Command);
+    assert_eq!(init_deep.subtask, None);
+    assert_eq!(init_deep.hints, vec!["$ARGUMENTS".to_owned()]);
+    assert_eq!(
+        init_deep.agent, None,
+        "the built-in uses the current session agent"
+    );
+    assert_eq!(init_deep.model, None);
+}
+
+#[test]
+fn builtin_init_deep_encodes_hierarchical_instruction_rules() {
+    let registry = Registry::build(&Sources::new(WORKTREE));
+    let template = text_of(registry.get("init-deep").expect("init-deep is built in"));
+
+    for required in [
+        "future Zuno sessions",
+        "Use CodeGraph first",
+        "Generate or update the root `AGENTS.md`",
+        "real responsibility, build, language, or deployment boundary",
+        "only rules that are new relative to its parent `AGENTS.md`",
+        "Do not repeat parent rules",
+        "Preserve accurate existing content",
+        "`--create-new`",
+        "leave all existing `AGENTS.md` files unchanged",
+        "`--max-depth=N`",
+        "Treat the repository root as depth 0",
+        "Treat any remaining user arguments as priorities",
+    ] {
+        assert!(
+            template.contains(required),
+            "init-deep template must explain {required:?}"
+        );
+    }
+    assert!(
+        !template.contains("OpenCode") && !template.contains("oh-my"),
+        "the template is Zuno-native rather than copied from another harness"
+    );
+}
+
+#[test]
+fn builtin_init_deep_interpolates_worktree_and_user_arguments() {
+    let registry = Registry::build(&Sources::new(WORKTREE));
+    let template = text_of(registry.get("init-deep").expect("init-deep is built in"));
+
+    assert_eq!(
+        template.matches(WORKTREE).count(),
+        1,
+        "the project root is named exactly once"
+    );
+    assert!(!template.contains("${path}"));
+
+    let Resolution::Ready(resolved) = registry
+        .resolve(
+            "init-deep",
+            "--create-new --max-depth=2 prioritize deployment boundaries",
+        )
+        .expect("init-deep resolves")
+    else {
+        panic!("a built-in template resolves without an MCP round trip");
+    };
+    assert!(
+        resolved
+            .prompt
+            .contains("--create-new --max-depth=2 prioritize deployment boundaries")
+    );
+    assert!(!resolved.prompt.contains("$ARGUMENTS"));
 }
 
 #[test]
@@ -187,8 +265,8 @@ fn overriding_a_builtin_keeps_its_listing_position() {
 
     assert_eq!(
         registry.names().collect::<Vec<_>>(),
-        vec!["init", "review", "zzz", "aaa"],
-        "review stays in slot 1 where the built-in put it; observed on the real binary"
+        vec!["init", "init-deep", "review", "zzz", "aaa"],
+        "review stays in slot 2 where the built-in put it"
     );
 }
 
@@ -257,7 +335,7 @@ fn mcp_prompt_overrides_a_config_command() {
     assert!(matches!(resolved.template, Template::Mcp(_)));
     assert_eq!(
         registry.len(),
-        3,
+        4,
         "the collision replaces rather than duplicating"
     );
 }
@@ -358,7 +436,7 @@ fn skill_never_overrides_a_config_command() {
     );
     assert_eq!(
         registry.len(),
-        3,
+        4,
         "the skill is dropped entirely, not listed twice"
     );
 }
@@ -367,6 +445,7 @@ fn skill_never_overrides_a_config_command() {
 fn skill_never_overrides_a_builtin() {
     let skills = [
         skill("init", "SKILL BODY init"),
+        skill("init-deep", "SKILL BODY init-deep"),
         skill("review", "SKILL BODY review"),
     ];
     let registry = Registry::build(&Sources::new(WORKTREE).with_skills(&skills));
@@ -376,10 +455,17 @@ fn skill_never_overrides_a_builtin() {
         Source::Command
     );
     assert_eq!(
+        registry
+            .get("init-deep")
+            .expect("init-deep resolves")
+            .source,
+        Source::Command
+    );
+    assert_eq!(
         registry.get("review").expect("review resolves").source,
         Source::Command
     );
-    assert_eq!(registry.len(), 2, "both skills are dropped");
+    assert_eq!(registry.len(), 3, "all colliding skills are dropped");
 }
 
 #[test]
@@ -398,7 +484,7 @@ fn skill_never_overrides_an_mcp_prompt() {
         Source::Mcp,
         "observed on the real binary: a skill named srv:noargs vanished"
     );
-    assert_eq!(registry.len(), 3);
+    assert_eq!(registry.len(), 4);
 }
 
 #[test]
@@ -487,6 +573,7 @@ fn the_full_chain_resolves_in_ascending_precedence() {
     let prompts = [prompt("srv", "hello", &["a"])];
     let skills = [
         skill("init", "skill init"),
+        skill("init-deep", "skill init-deep"),
         skill("review", "skill review"),
         skill("configonly", "skill configonly"),
         skill("srv:hello", "skill srv hello"),
@@ -507,12 +594,13 @@ fn the_full_chain_resolves_in_ascending_precedence() {
         winners,
         vec![
             ("init", Source::Command),
+            ("init-deep", Source::Command),
             ("review", Source::Command),
             ("srv:hello", Source::Mcp),
             ("configonly", Source::Command),
             ("skillonly", Source::Skill),
         ],
-        "four skills lost, one claimed a free name"
+        "five skills lost, one claimed a free name"
     );
     assert_eq!(
         text_of(registry.get("review").expect("review resolves")),
@@ -573,11 +661,10 @@ fn resolving_an_unknown_name_names_the_alternatives() {
         .expect_err("an unknown command fails");
     let CommandError::NotFound { name, available } = &error;
     assert_eq!(name, "missing");
-    assert_eq!(available, &["init", "review", "known"]);
+    assert_eq!(available, &["init", "init-deep", "review", "known"]);
     assert_eq!(
         error.to_string(),
-        "Command not found: \"missing\". Available commands: init, review, known",
-        "matching the oracle's message at session/prompt.ts:1364-1366"
+        "Command not found: \"missing\". Available commands: init, init-deep, review, known"
     );
 }
 
@@ -925,5 +1012,5 @@ fn js_replace_all_leaves_capture_references_alone() {
 fn a_registry_is_never_empty() {
     let registry = Registry::build(&Sources::new(WORKTREE));
     assert!(!registry.is_empty());
-    assert_eq!(registry.len(), 2);
+    assert_eq!(registry.len(), 3);
 }

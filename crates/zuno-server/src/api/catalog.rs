@@ -600,7 +600,7 @@ fn model_ref(value: &str, variant: Option<String>) -> ModelRef {
     }
 }
 
-/// `GET /api/command` — the two built-ins plus the user's config commands.
+/// `GET /api/command` — the three built-ins plus the user's config commands.
 ///
 /// # V2 has three levels, not four
 ///
@@ -670,7 +670,7 @@ async fn load_skills(options: SkillOptions) -> Result<zuno_catalog::skill::Skill
     .map_err(|error| ApiError::CatalogUnavailable(error.to_string()))?
 }
 
-/// The V2 template for a built-in command, with the project directory substituted.
+/// A V2 template override for the two upstream-shaped built-ins.
 ///
 /// `plugin/command.ts:14-21` replaces the literal `${path}` with
 /// `location.project.directory` — the **project** root, which is `/` outside a

@@ -13,10 +13,14 @@
 //!
 //! | # | level | oracle | overwrite |
 //! |---|---|---|---|
-//! | 1 | built-in `init` and `review` | `:70-88` | seeds the map |
+//! | 1 | built-in `init`, `init-deep`, and `review` | `init`/`review`: `:70-88`; `init-deep`: Zuno native | seeds the map |
 //! | 2 | `cfg.command` entries | `:90-103` | unconditional |
 //! | 3 | MCP prompts | `:105-132` | unconditional |
 //! | 4 | skills | `:134-152` | **only when the name is still free** (`:135`) |
+//!
+//! `init-deep` is a Zuno-native Level 1 command inserted between `init` and
+//! `review`. It uses the same registry, precedence, expansion, and client surfaces;
+//! only its repository-instruction template is new.
 //!
 //! Level 4's guard is the single line `if (commands[item.name]) continue`. A
 //! skill therefore never shadows a built-in, a configured command, or an MCP
@@ -79,6 +83,9 @@ use zuno_paths::{Env, Layout};
 /// The built-in `init` command's name (`command/index.ts:47`).
 pub const BUILTIN_INIT: &str = "init";
 
+/// The Zuno-native deep repository-instruction command's name.
+pub const BUILTIN_INIT_DEEP: &str = "init-deep";
+
 /// The built-in `review` command's name (`command/index.ts:48`).
 pub const BUILTIN_REVIEW: &str = "review";
 
@@ -87,6 +94,9 @@ pub const COMMAND_DIRECTORY_PREFIXES: [&str; 2] = ["command/", "commands/"];
 
 /// The built-in repository-instruction prompt.
 const TEMPLATE_INITIALIZE: &str = include_str!("command/initialize.txt");
+
+/// The Zuno-native hierarchical repository-instruction prompt.
+const TEMPLATE_INITIALIZE_DEEP: &str = include_str!("command/initialize_deep.txt");
 
 /// `command/template/review.txt`, byte-identical to the oracle's copy.
 const TEMPLATE_REVIEW: &str = include_str!("command/review.txt");
@@ -473,8 +483,9 @@ impl<'a> Sources<'a> {
 ///
 /// Insertion order matches the oracle's, including the detail that overwriting a
 /// name keeps the position the name first appeared at — a JavaScript object
-/// property that [`OrderedMap::insert`] reproduces. Observed on the real binary:
-/// a `review` config entry stays in slot 1 where the built-in put it.
+/// property that [`OrderedMap::insert`] reproduces. Zuno inserts `init-deep`
+/// between `init` and `review`, so a `review` config entry stays in slot 2 where
+/// the built-in put it.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     commands: OrderedMap<Info>,
@@ -486,8 +497,10 @@ impl Registry {
     pub fn build(sources: &Sources<'_>) -> Self {
         let mut commands: OrderedMap<Info> = OrderedMap::new();
 
-        // Level 1 — built-ins (`command/index.ts:70-88`).
+        // Level 1 — built-ins. Zuno's native `init-deep` sits between the
+        // upstream-shaped `init` and `review` entries.
         commands.insert(BUILTIN_INIT, builtin_init(sources.worktree));
+        commands.insert(BUILTIN_INIT_DEEP, builtin_init_deep(sources.worktree));
         commands.insert(BUILTIN_REVIEW, builtin_review(sources.worktree));
 
         // Level 2 — config commands, unconditional (`:90-103`).
@@ -709,6 +722,19 @@ fn builtin_init(worktree: &str) -> Info {
     }
 }
 
+fn builtin_init_deep(worktree: &str) -> Info {
+    Info {
+        name: BUILTIN_INIT_DEEP.to_owned(),
+        description: Some("deep AGENTS.md setup [--create-new] [--max-depth=N]".to_owned()),
+        agent: None,
+        model: None,
+        source: Source::Command,
+        template: Template::Text(interpolate_worktree(TEMPLATE_INITIALIZE_DEEP, worktree)),
+        subtask: None,
+        hints: hints(TEMPLATE_INITIALIZE_DEEP),
+    }
+}
+
 fn builtin_review(worktree: &str) -> Info {
     Info {
         name: BUILTIN_REVIEW.to_owned(),
@@ -726,8 +752,8 @@ fn builtin_review(worktree: &str) -> Info {
 ///
 /// The oracle uses `String.prototype.replace` with a *string* pattern
 /// (`command/index.ts:75,84`), which replaces only the first occurrence.
-/// `initialize.txt` has exactly one; `review.txt` has none, making its
-/// substitution a no-op.
+/// Both initialization templates have exactly one; `review.txt` has none,
+/// making its substitution a no-op.
 fn interpolate_worktree(template: &str, worktree: &str) -> String {
     template.replacen(WORKTREE_PLACEHOLDER, worktree, 1)
 }
