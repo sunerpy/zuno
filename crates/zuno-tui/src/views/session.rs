@@ -712,6 +712,8 @@ pub enum Selection {
     Model(String),
     /// A different agent for subsequent turns.
     Agent(String),
+    /// A different model-team preset for subsequent turns and delegations.
+    Preset(String),
     /// A different session to continue in.
     Session(String),
     /// A fresh lazily materialized session in the current directory.
@@ -811,6 +813,10 @@ pub struct SessionCatalog {
     pub model: Option<String>,
     /// The agent currently in use.
     pub agent: Option<String>,
+    /// Every configured model-team preset.
+    pub presets: Vec<String>,
+    /// The preset currently in use.
+    pub preset: Option<String>,
     /// Whether the model in use accepts a reasoning level at all.
     ///
     /// Stated by the host from the resolved catalog, because the view cannot know it: a
@@ -1459,6 +1465,12 @@ impl SessionScreen {
                     .with_labels("Restore", "Keep"),
                 ));
             }
+            SlashSubmission::Host(HostCommand::Preset(None)) => {
+                self.request_preset_picker();
+            }
+            SlashSubmission::Host(HostCommand::Preset(Some(preset))) => {
+                self.select_preset(&preset);
+            }
             SlashSubmission::Host(HostCommand::Plan) => {
                 if self.plan_mode_active() {
                     self.request_start_work();
@@ -1500,6 +1512,42 @@ impl SessionScreen {
 
     fn plan_mode_active(&self) -> bool {
         self.catalog.agent.as_deref() == Some("plan")
+    }
+
+    fn request_preset_picker(&mut self) {
+        if self.catalog.presets.is_empty() {
+            self.toasts.push(Toast::warning(
+                "no presets configured; add `presets` to the Zuno configuration",
+            ));
+            return;
+        }
+        self.requested
+            .push(Box::new(crate::views::picker::preset_picker(
+                self.context.clone(),
+                self.catalog.presets.clone(),
+                self.catalog.preset.as_deref(),
+            )));
+    }
+
+    fn select_preset(&mut self, preset: &str) -> EventResult {
+        if !self.catalog.presets.iter().any(|name| name == preset) {
+            self.toasts.push(Toast::warning(format!(
+                "preset `{preset}` is not configured; available presets: {}",
+                self.catalog.presets.join(", ")
+            )));
+            return EventResult::REDRAW;
+        }
+        if self.catalog.preset.as_deref() == Some(preset) {
+            self.toasts
+                .push(Toast::info(format!("preset `{preset}` is already active")));
+            return EventResult::REDRAW;
+        }
+        let (notice, level) = self.commit_selection(Selection::Preset(preset.to_owned()));
+        if level == ToastLevel::Success {
+            self.catalog.preset = Some(preset.to_owned());
+        }
+        self.toasts.push(Toast::new(level, notice));
+        EventResult::REDRAW
     }
 
     fn select_collaboration_agent(&mut self, agent: &str) {
@@ -3387,6 +3435,7 @@ impl SessionScreen {
                 self.welcome.facts_mut().agent = Some(value.to_owned());
                 Selection::Agent(value.to_owned())
             }
+            crate::views::picker::PRESET_DIALOG_ID => return self.select_preset(value),
             crate::views::picker::SESSION_DIALOG_ID => {
                 if self.catalog.session.as_deref() == Some(value) {
                     self.toasts.push(Toast::new(
@@ -3452,6 +3501,9 @@ impl SessionScreen {
         let notice = match &selection {
             Selection::Model(model) => format!("model set to {model} for the next turn"),
             Selection::Agent(agent) => format!("agent set to {agent} for the next turn"),
+            Selection::Preset(preset) => {
+                format!("preset set to {preset} for the next turn and future delegations")
+            }
             Selection::Session(id) => format!("switching to session {id}"),
             Selection::NewSession => String::from("starting a new session"),
             Selection::SessionRename { id, title } => {

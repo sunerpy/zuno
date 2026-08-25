@@ -167,6 +167,15 @@ falling through; Zuno never ships hidden model-id defaults. The selected preset
 is frozen with the turn plan, so editing configuration cannot mutate an
 in-flight attempt.
 
+In the TUI, `/preset` opens the configured preset picker and
+`/preset <name>` selects one directly. The replacement is prepared and applied
+inside the current TUI; it does not restart the interface or interrupt an
+in-flight turn. A preset switch clears prior manual model and reasoning
+overrides so the selected team's routes take effect. A later explicit model or
+reasoning choice overrides that team route for the top-level Agent while the
+preset continues to route delegations. The choice is session-local runtime
+state; set the top-level `preset` key to make a team the startup default.
+
 ## Context compaction
 
 Zuno can compact older conversation history before the model window is exhausted:

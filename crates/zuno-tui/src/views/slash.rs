@@ -110,6 +110,8 @@ pub enum HostCommand {
     Redo,
     /// Inspect or mutate the durable top-level goal for this session.
     Goal(String),
+    /// Select a configured model-team preset, or open the picker when omitted.
+    Preset(Option<String>),
     /// Interactively enter or leave Plan mode.
     Plan,
     /// Enter Plan mode without another prompt.
@@ -260,6 +262,9 @@ impl SlashRouter {
             SlashCommandKind::Host(HostCommand::Goal(_)) => {
                 SlashSubmission::Host(HostCommand::Goal(arguments))
             }
+            SlashCommandKind::Host(HostCommand::Preset(_)) => SlashSubmission::Host(
+                HostCommand::Preset((!arguments.is_empty()).then_some(arguments)),
+            ),
             SlashCommandKind::Host(command) => SlashSubmission::Host(command.clone()),
         }
     }
@@ -416,6 +421,12 @@ fn ui_commands() -> Vec<SlashCommand> {
                 aliases: Vec::new(),
                 description: "View or manage the durable session goal".to_owned(),
                 kind: SlashCommandKind::Host(HostCommand::Goal(String::new())),
+            },
+            SlashCommand {
+                name: "preset".to_owned(),
+                aliases: Vec::new(),
+                description: "Switch the configured model team, or choose one".to_owned(),
+                kind: SlashCommandKind::Host(HostCommand::Preset(None)),
             },
             SlashCommand {
                 name: "plan".to_owned(),

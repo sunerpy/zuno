@@ -42,6 +42,8 @@ pub const SESSION_DIALOG_ID: &str = "session_list";
 pub const MODEL_DIALOG_ID: &str = "model_list";
 /// The dialog id for the agent picker.
 pub const AGENT_DIALOG_ID: &str = "agent_list";
+/// The dialog id for the model-team preset picker.
+pub const PRESET_DIALOG_ID: &str = "preset_list";
 /// The dialog id for the theme picker.
 pub const THEME_DIALOG_ID: &str = "theme_list";
 /// The dialog id for the MCP server list.
@@ -1607,6 +1609,26 @@ pub fn agent_picker(context: ViewContext, agents: Vec<AgentEntry>) -> SelectDial
         .map(|agent| Item::new(agent.name).described(agent.description))
         .collect();
     SelectDialog::new(AGENT_DIALOG_ID, "Agents", context, items)
+}
+
+/// The configured model-team preset picker.
+#[must_use]
+pub fn preset_picker(
+    context: ViewContext,
+    mut presets: Vec<String>,
+    selected: Option<&str>,
+) -> SelectDialog {
+    presets.sort();
+    presets.dedup();
+    let items = presets
+        .into_iter()
+        .map(|preset| Item::new(preset.clone()).valued(preset))
+        .collect();
+    let dialog = SelectDialog::new(PRESET_DIALOG_ID, "Presets", context, items);
+    match selected {
+        Some(selected) => dialog.selecting(selected),
+        None => dialog,
+    }
 }
 
 /// The discovered skills, as a filterable list.

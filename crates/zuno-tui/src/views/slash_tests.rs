@@ -81,6 +81,25 @@ fn goal_is_a_host_command_and_preserves_its_argument_tail() {
 }
 
 #[test]
+fn preset_is_a_host_command_and_preserves_an_optional_name() {
+    assert_eq!(
+        route("/preset"),
+        SlashSubmission::Host(HostCommand::Preset(None))
+    );
+    assert_eq!(
+        route("/preset deliberate"),
+        SlashSubmission::Host(HostCommand::Preset(Some("deliberate".to_owned())))
+    );
+    let router = SlashRouter::default();
+    let command = router
+        .commands()
+        .iter()
+        .find(|command| command.name == "preset")
+        .expect("/preset is absent from autocomplete");
+    assert!(matches!(command.kind, SlashCommandKind::Host(_)));
+}
+
+#[test]
 fn plan_controls_are_host_commands_and_never_model_text() {
     assert_eq!(route("/plan"), SlashSubmission::Host(HostCommand::Plan));
     assert_eq!(

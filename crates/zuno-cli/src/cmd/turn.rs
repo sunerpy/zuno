@@ -250,6 +250,8 @@ pub(crate) struct TurnOptions {
     pub(crate) model: Option<String>,
     /// The agent name, defaulting through config and then [`DEFAULT_AGENT`].
     pub(crate) agent: Option<String>,
+    /// A session-local model-team preset override.
+    pub(crate) preset: Option<String>,
     /// Which session to talk in.
     pub(crate) session: SessionChoice,
     /// The title a newly created session gets.
@@ -301,6 +303,8 @@ pub(crate) struct TurnPlan {
     extension_prepared: Option<zuno_extension::PreparedTransition>,
     provider_id: String,
     model_id: String,
+    /// An explicit surface-level model choice, distinct from a model routed by a preset.
+    model_override: Option<String>,
     auth_store: AuthStore,
     credential: Option<Credential>,
     resolver: Resolver,
@@ -359,6 +363,8 @@ pub(crate) struct TurnPlan {
     reasoning_supported: bool,
     /// The reasoning level this plan resolved with, echoed back for display.
     effort: Option<zuno_llm::effort::ReasoningEffort>,
+    /// An explicit surface-level reasoning choice, distinct from a preset variant.
+    effort_override: Option<zuno_llm::effort::ReasoningEffort>,
     /// Fully validated automatic recovery policy for active goals.
     goal_retry_policy: GoalRetryPolicy,
 }
@@ -500,7 +506,7 @@ impl TurnPlan {
             .find(|entry| entry.name == agent_name)
             .cloned()
             .ok_or_else(|| format!("Agent not found: {agent_name}"))?;
-        let presets = PresetLibrary::from_config(&config);
+        let presets = turn_presets(&config, options.preset.as_deref());
         let mut notes = Vec::new();
         let mut primary_policy = ModelPolicy::new().with_library(&presets);
         if let Some(session_model) = &config.model {
@@ -717,6 +723,7 @@ impl TurnPlan {
             ),
             provider_id,
             model_id,
+            model_override: options.model.clone(),
             resolver,
             session: options.session.clone(),
             title: options.title.clone(),
@@ -733,6 +740,7 @@ impl TurnPlan {
             vision_available,
             reasoning_supported,
             effort,
+            effort_override: options.effort,
             goal_retry_policy,
         })
     }
@@ -800,6 +808,20 @@ impl TurnPlan {
     /// Every resolved agent, including active static and process extensions.
     pub(crate) fn agents(&self) -> &[zuno_catalog::agent::Agent] {
         &self.agents
+    }
+
+    /// Configured preset names in stable order.
+    pub(crate) fn preset_names(&self) -> Vec<String> {
+        self.presets
+            .names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The preset selected for this plan, including a stale configured name.
+    pub(crate) fn preset_name(&self) -> Option<&str> {
+        self.presets.selected()
     }
 
     /// The exact skill set shared by prompt assembly and the `skill` tool.
@@ -1210,12 +1232,12 @@ pub(crate) struct TurnHost {
     extension_scope: zuno_extension::Scope,
     extension_revision: u64,
     extension_ownership: Option<ExtensionOwnership>,
-    /// The reasoning level this host resolved with.
-    ///
-    /// Held here because the host is the source of truth every rebuild path already
-    /// reads its model and agent back from (`refresh_mcp_host`). A level kept only in
-    /// the launch options would be dropped by the next rebuild that did not carry it.
-    effort: Option<zuno_llm::effort::ReasoningEffort>,
+    /// The explicit model choice a surface supplied, if any.
+    model_override: Option<String>,
+    /// The preset selected for this host.
+    preset: Option<String>,
+    /// The explicit reasoning choice a surface supplied, if any.
+    effort_override: Option<zuno_llm::effort::ReasoningEffort>,
     internals: Internals,
     compaction_config: zuno_config::schema::CompactionConfig,
     compaction_state: CompactionState,
@@ -2223,10 +2245,12 @@ impl TurnHost {
                 agent: plan.agent.name().to_owned(),
                 provider_id: plan.provider_id,
                 model_id: plan.model_id,
+                model_override: plan.model_override,
+                preset: plan.presets.selected().map(str::to_owned),
                 extension_scope: plan.extension_scope,
                 extension_revision: plan.extension_revision,
                 extension_ownership: extension_ownership.take(),
-                effort: plan.effort,
+                effort_override: plan.effort_override,
                 internals: plan.internals,
                 compaction_config: plan.config.compaction.clone().unwrap_or_default(),
                 compaction_state: CompactionState::default(),
@@ -2894,6 +2918,16 @@ impl TurnHost {
         format!("{}/{}", self.provider_id, self.model_id)
     }
 
+    /// Explicit model choice that must survive unrelated host rebuilds.
+    pub(crate) fn model_override(&self) -> Option<&str> {
+        self.model_override.as_deref()
+    }
+
+    /// Selected model-team preset that must survive unrelated host rebuilds.
+    pub(crate) fn preset_name(&self) -> Option<&str> {
+        self.preset.as_deref()
+    }
+
     /// Extension revision this host was assembled against.
     pub(crate) const fn extension_revision(&self) -> u64 {
         self.extension_revision
@@ -2928,9 +2962,9 @@ impl TurnHost {
         }
     }
 
-    /// The reasoning level this host resolved with.
-    pub(crate) const fn effort(&self) -> Option<zuno_llm::effort::ReasoningEffort> {
-        self.effort
+    /// Explicit reasoning choice that must survive unrelated host rebuilds.
+    pub(crate) const fn effort_override(&self) -> Option<zuno_llm::effort::ReasoningEffort> {
+        self.effort_override
     }
 
     /// Commands available to interactive discovery, in catalog listing order.
@@ -5763,6 +5797,14 @@ fn preset_descriptors(presets: &PresetLibrary) -> Vec<PresetDescriptor> {
             })
         })
         .collect()
+}
+
+fn turn_presets(config: &zuno_config::schema::Config, selected: Option<&str>) -> PresetLibrary {
+    let library = PresetLibrary::from_config(config);
+    match selected {
+        Some(selected) => library.select(selected),
+        None => library,
+    }
 }
 
 fn selected_preset(presets: &PresetLibrary) -> Result<Option<PresetSelection>, String> {

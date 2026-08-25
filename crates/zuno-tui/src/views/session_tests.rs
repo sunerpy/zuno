@@ -1844,6 +1844,8 @@ fn catalog() -> SessionCatalog {
         session: None,
         model: Some(String::from("prov/haiku")),
         agent: Some(String::from("build")),
+        presets: Vec::new(),
+        preset: None,
         reasoning: false,
         reasoning_efforts: Default::default(),
         effort: None,
@@ -1865,6 +1867,51 @@ fn session_screen_asks_the_host_to_open_the_model_picker() {
     assert!(
         screen.drain_dialogs().is_empty(),
         "a drained request was offered twice"
+    );
+}
+
+#[test]
+fn session_screen_preset_command_opens_the_picker_and_applies_its_choice() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(4);
+    let mut catalog = catalog();
+    catalog.presets = vec![String::from("deliberate"), String::from("fast")];
+    catalog.preset = Some(String::from("fast"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(catalog)
+        .with_selection_sink(selections);
+
+    screen.submit_prompt("/preset");
+
+    let requested = screen.drain_dialogs();
+    assert_eq!(requested.len(), 1, "the preset picker was not requested");
+    assert_eq!(requested[0].id(), crate::views::picker::PRESET_DIALOG_ID);
+
+    screen.adopt(crate::views::picker::PRESET_DIALOG_ID, "deliberate");
+    assert_eq!(screen.catalog.preset.as_deref(), Some("deliberate"));
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Preset(String::from("deliberate")))
+    );
+}
+
+#[test]
+fn session_screen_named_preset_switches_without_opening_a_picker() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (selections, mut chosen) = mpsc::channel(4);
+    let mut catalog = catalog();
+    catalog.presets = vec![String::from("deliberate"), String::from("fast")];
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(catalog)
+        .with_selection_sink(selections);
+
+    screen.submit_prompt("/preset fast");
+
+    assert!(screen.drain_dialogs().is_empty());
+    assert_eq!(screen.catalog.preset.as_deref(), Some("fast"));
+    assert_eq!(
+        chosen.try_recv(),
+        Ok(Selection::Preset(String::from("fast")))
     );
 }
 

@@ -231,6 +231,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
             .agent
             .clone()
             .or_else(|| persisted_session_agent(&session)),
+        preset: None,
         session,
         title: None,
         effort: None,
@@ -1573,6 +1574,8 @@ async fn session_catalog(
         session: None,
         model: Some(plan.qualified_model()),
         agent: Some(plan.agent_name().to_owned()),
+        presets: plan.preset_names(),
+        preset: plan.preset_name().map(str::to_owned),
         reasoning: plan.reasoning_supported(),
         reasoning_efforts,
         effort: plan.effort(),
@@ -1670,13 +1673,19 @@ async fn apply_selection(
     // `refresh_mcp_host` does the same: the host is what the previous selection actually
     // produced. Reading the launch options alone made each pick discard the one before
     // it — choose a model, then an agent, and the model reverted to the launched one.
-    next.model = Some(host.qualified_model());
+    next.model = host.model_override().map(str::to_owned);
     next.agent = Some(host.agent_name().to_owned());
-    next.effort = host.effort();
+    next.preset = host.preset_name().map(str::to_owned);
+    next.effort = host.effort_override();
     next.extension_composition = super::turn::ExtensionComposition::Active;
     match selection {
         zuno_tui::views::session::Selection::Model(model) => next.model = Some(model),
         zuno_tui::views::session::Selection::Agent(agent) => next.agent = Some(agent),
+        zuno_tui::views::session::Selection::Preset(preset) => {
+            next.preset = Some(preset);
+            next.model = None;
+            next.effort = None;
+        }
         // Through the same rebuild as a model change, rather than mutating the live host:
         // the level is resolved against the model's declared variants and capability, so
         // it has to be re-resolved by `TurnPlan::resolve` to become the right provider
@@ -2141,6 +2150,8 @@ fn queued_submission_display(submission: &PromptSubmission) -> (String, bool) {
                 HostCommand::Undo => "/undo".to_owned(),
                 HostCommand::Redo => "/redo".to_owned(),
                 HostCommand::Goal(arguments) => format!("/goal {arguments}"),
+                HostCommand::Preset(Some(preset)) => format!("/preset {preset}"),
+                HostCommand::Preset(None) => "/preset".to_owned(),
                 HostCommand::Plan => "/plan".to_owned(),
                 HostCommand::StartPlan => "/start-plan".to_owned(),
                 HostCommand::StartWork => "/start-work".to_owned(),
@@ -2491,9 +2502,10 @@ async fn drive_turns(
         {
             let mut next = driver.options.clone();
             next.session = driver.host.rebuild_session_choice();
-            next.model = Some(driver.host.qualified_model());
+            next.model = driver.host.model_override().map(str::to_owned);
             next.agent = Some(driver.host.agent_name().to_owned());
-            next.effort = driver.host.effort();
+            next.preset = driver.host.preset_name().map(str::to_owned);
+            next.effort = driver.host.effort_override();
             next.extension_composition = super::turn::ExtensionComposition::Desired;
             driver.remount.request(RemountRequest::plain(next));
             let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
@@ -3196,6 +3208,9 @@ async fn restore_snapshot(
         HostCommand::Goal(_) => {
             return Err("goal commands must be handled by the turn host".to_owned());
         }
+        HostCommand::Preset(_) => {
+            return Err("preset controls must be handled by the TUI selection layer".to_owned());
+        }
         HostCommand::Plan | HostCommand::StartPlan | HostCommand::StartWork => {
             return Err("plan mode controls must be handled by the TUI selection layer".to_owned());
         }
@@ -3255,6 +3270,9 @@ async fn execute_host_command(
         }
         HostCommand::Plan | HostCommand::StartPlan | HostCommand::StartWork => {
             return Err("plan mode controls must be handled by the TUI selection layer".to_owned());
+        }
+        HostCommand::Preset(_) => {
+            return Err("preset controls must be handled by the TUI selection layer".to_owned());
         }
         HostCommand::Stop(_) => {
             return Err("background stop must be handled by the TUI background service".to_owned());

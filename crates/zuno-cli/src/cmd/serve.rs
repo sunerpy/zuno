@@ -151,6 +151,7 @@ impl ServerHostSpec {
                 .as_ref()
                 .map(|model| format!("{}/{}", model.provider_id, model.model_id)),
             agent: self.agent.clone(),
+            preset: None,
             session: SessionChoice::Existing(self.session_id.clone()),
             title: None,
             effort: None,

@@ -263,6 +263,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         vision_available: false,
         reasoning_supported: false,
         effort: None,
+        effort_override: None,
         goal_retry_policy: GoalRetryPolicy::default(),
         directory,
         project,
@@ -270,6 +271,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         agent: profile,
         provider_id: "provider".to_owned(),
         model_id: "model".to_owned(),
+        model_override: None,
         auth_store,
         credential: None,
         session,
@@ -2102,6 +2104,31 @@ fn session_choice_resolves_the_two_flags_into_one_answer() {
     assert_eq!(
         SessionChoice::resolve(Some("ses_1"), true),
         SessionChoice::Existing("ses_1".to_owned())
+    );
+}
+
+#[test]
+fn a_turn_option_preset_overrides_the_configuration_default() {
+    let config: zuno_config::schema::Config = serde_json::from_str(
+        r#"{
+          "preset": "fast",
+          "presets": {
+            "deliberate": {"agents": {"build": "test/big"}},
+            "fast": {"agents": {"build": "test/small"}}
+          }
+        }"#,
+    )
+    .expect("preset fixture");
+
+    let library = turn_presets(&config, Some("deliberate"));
+
+    assert_eq!(library.selected(), Some("deliberate"));
+    assert_eq!(
+        library
+            .active()
+            .and_then(|preset| preset.agent("build"))
+            .map(|choice| choice.model.as_str()),
+        Some("test/big")
     );
 }
 

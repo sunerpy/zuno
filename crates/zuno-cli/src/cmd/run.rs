@@ -34,6 +34,7 @@ pub(super) fn execute(args: &RunArgs, environment: &StartupEnvironment) -> Resul
             .agent
             .clone()
             .or_else(|| persisted_session_agent(&session)),
+        preset: None,
         session,
         title: args.title.clone(),
         effort: None,
