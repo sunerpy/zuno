@@ -468,7 +468,10 @@ implementation failures remain error outcomes.
 Hard turn interruption is observed during tool hooks, permission waiting, and
 execution. Cancelling before permission resolves drops the pending approval
 future and guarantees that the tool body never starts; cancelling a running
-tool joins its cancelled task or process tree before the dispatch returns.
+tool joins its cancelled task or process tree before the dispatch returns. A
+foreground `task` delegation carries the same interrupt through
+`ChildTurnHost`, converts it to the child runner's cancellation token, aborts the
+live child turn, and waits for event drain plus host shutdown before returning.
 
 Tool execution is at-most-once by default. `ToolReplayPolicy::Never` is inherited by every tool unless the implementation explicitly declares `Safe`; current safe tools are read-only or idempotent inspection operations such as file reads, glob, grep, skill lookup, session search, job status, LSP inspection, goal status, and web search/fetch.
 
@@ -482,6 +485,12 @@ order. It then executes consecutive non-exclusive calls under the configured
 bound and persists results in original call order, regardless of physical
 completion order. Shell, writes, unknown extension tools, and MCP tools without an
 explicit safety declaration remain exclusive.
+
+The configured `tool_calls` bound is applied even when one parallel-safe group
+contains more calls than the limit. `Exclusive` is a two-sided barrier: every
+earlier `ParallelSafe` or `IsolatedBackground` call settles before it starts,
+and no later call starts until it settles. Physical overlap is bounded while
+durable results and client events remain in model order.
 
 MCP lifecycle operations use the same bounded pattern across different servers,
 while operations for one server remain generation-serialized. LSP startup and
@@ -603,7 +612,11 @@ scrollable output view.
 
 ## Background subagents and product agents
 
-`task` creates a distinct `job_*` identifier for each background run while retaining a separate child session identifier for conversational continuation.
+Foreground `task` runs remain attached to the parent turn's hard interrupt. A
+cancelled parent waits until the child runner has acknowledged cancellation and
+shut down; it cannot return a successful child result from the same cancellation
+tick. `task` creates a distinct `job_*` identifier for each background run while
+retaining a separate child session identifier for conversational continuation.
 
 Enabled `productAgent` instances register independent static tools backed by a host-installed Codex or Claude Code process. A product invocation has a one-shot `run_*` id and, in background mode, a separate `job_*` id. It does not create a Zuno child session and cannot be resumed as one.
 

@@ -953,7 +953,11 @@ async fn a_host_failure_is_reported_as_a_tool_failure() {
             Ok(0)
         }
 
-        async fn dispatch(&self, _request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError> {
+        async fn dispatch(
+            &self,
+            _request: ChildTurnRequest,
+            _interrupt: Arc<dyn zuno_tool::InterruptHandle>,
+        ) -> Result<ChildTurn, ChildTurnError> {
             Err(ChildTurnError::UnknownSession("ses_gone".to_owned()))
         }
     }

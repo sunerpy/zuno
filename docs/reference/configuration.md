@@ -93,7 +93,10 @@ Independent runtime work has four bounded controls:
 ```
 
 - `tool_calls` limits model-issued calls that explicitly declare themselves safe
-  to overlap. Permission prompts and argument preparation remain ordered.
+  to overlap. Permission prompts and argument preparation remain ordered. The
+  bound also applies when a single safe group is larger than the limit;
+  `Exclusive` calls drain all earlier safe/background calls and prevent later
+  calls from starting until the barrier settles.
 - `delegations` is the per-process cap shared by every turn host for the same
   workspace process: native child sessions, workflow nodes, Council seats, and
   Codex/Claude Code product agents all consume it. Background work from an
@@ -115,6 +118,10 @@ Background native and product-agent jobs are persisted as `queued` before they
 wait for delegation capacity and become `running` only after admission. If the
 process restarts, a still-queued job is safely cancelled because its runner never
 started; a running job becomes `uncertain` and is never replayed.
+
+Foreground native `task` delegation is not detached: it inherits the parent
+turn interrupt, aborts the live child turn when fired, and waits for child drain
+and runtime shutdown before the tool call settles.
 
 ## Agent model presets
 

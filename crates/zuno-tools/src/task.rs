@@ -67,7 +67,8 @@ use zuno_error::ToolError;
 use zuno_llm::effort::{EffortCapabilities, ProviderFamily, ReasoningEffort};
 use zuno_orchestration::AttemptSnapshot;
 use zuno_tool::{
-    PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolUiIntent, TypedTool,
+    InterruptHandle, PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolUiIntent,
+    TypedTool,
 };
 
 /// The id the model calls, and the registry slot it fills
@@ -307,8 +308,13 @@ pub trait ChildTurnHost: Send + Sync + 'static {
     /// relationship exists.
     async fn delegation_depth(&self, session_id: &str) -> Result<u32, ChildTurnError>;
 
-    /// Create or resume the child session and drive its turn.
-    async fn dispatch(&self, request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError>;
+    /// Create or resume the child session and drive its turn under the parent's
+    /// cancellation signal.
+    async fn dispatch(
+        &self,
+        request: ChildTurnRequest,
+        interrupt: Arc<dyn InterruptHandle>,
+    ) -> Result<ChildTurn, ChildTurnError>;
 }
 
 /// A refusal, phrased so the caller can act on it without a recovery hook.
@@ -812,21 +818,24 @@ impl TypedTool for TaskTool {
         let plan = self.plan(&agent, category.as_deref(), &params);
         let turn = self
             .host
-            .dispatch(ChildTurnRequest {
-                parent_session_id: ctx.session_id.clone(),
-                parent_attempt: ctx.orchestration_snapshot().cloned(),
-                workflow: None,
-                workflow_node: None,
-                resume_session_id: params.task_id.clone(),
-                agent,
-                description: params.description.clone(),
-                prompt: params.prompt.clone(),
-                model: plan.model.clone(),
-                effort: plan.effort,
-                provider_options: plan.provider_options.clone(),
-                background,
-                report_delivery,
-            })
+            .dispatch(
+                ChildTurnRequest {
+                    parent_session_id: ctx.session_id.clone(),
+                    parent_attempt: ctx.orchestration_snapshot().cloned(),
+                    workflow: None,
+                    workflow_node: None,
+                    resume_session_id: params.task_id.clone(),
+                    agent,
+                    description: params.description.clone(),
+                    prompt: params.prompt.clone(),
+                    model: plan.model.clone(),
+                    effort: plan.effort,
+                    provider_options: plan.provider_options.clone(),
+                    background,
+                    report_delivery,
+                },
+                Arc::clone(&ctx.interrupt),
+            )
             .await
             .map_err(host_failure)?;
 
@@ -1044,7 +1053,11 @@ impl ChildTurnHost for RecordingHost {
         Ok(self.ancestry)
     }
 
-    async fn dispatch(&self, request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError> {
+    async fn dispatch(
+        &self,
+        request: ChildTurnRequest,
+        _interrupt: Arc<dyn InterruptHandle>,
+    ) -> Result<ChildTurn, ChildTurnError> {
         let background = request.background;
         let session_id = request
             .resume_session_id

@@ -14,8 +14,14 @@ use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use zuno_engine::interrupt::InterruptSignal;
 use zuno_paths::{DbLocation, Env};
+use zuno_tool::{InterruptHandle, NeverInterrupted};
 use zuno_tools::task::ReportDelivery;
+
+fn no_interrupt() -> Arc<dyn InterruptHandle> {
+    Arc::new(NeverInterrupted)
+}
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -329,6 +335,28 @@ fn resuming_this_parents_own_child_reuses_it_rather_than_forking() {
 }
 
 #[tokio::test]
+async fn foreground_dispatch_propagates_parent_interrupt_and_waits_for_runner_exit() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let interrupt = Arc::new(InterruptSignal::new());
+    let fire = Arc::clone(&interrupt);
+    let host = fixture.host.clone();
+    let request = fixture.request("ses_owner");
+    let task =
+        tokio::spawn(async move { ChildTurnHost::dispatch(&host, request, interrupt).await });
+
+    fixture.runner.wait_for_starts(1).await;
+    fire.fire();
+
+    let error = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("foreground cancellation must settle")
+        .expect("dispatch task remains attached")
+        .expect_err("an interrupted child cannot report completion");
+    assert!(format!("{error}").contains("cancelled"), "{error}");
+}
+
+#[tokio::test]
 async fn background_supervisor_reports_a_live_writer_until_it_finishes() {
     let jobs = BackgroundJobSupervisor::default();
     let (release, waiting) = tokio::sync::oneshot::channel();
@@ -411,7 +439,7 @@ async fn background_dispatch_returns_a_durable_active_job_before_the_child_finis
 
     let turn = fixture
         .host
-        .dispatch(request)
+        .dispatch(request, no_interrupt())
         .await
         .expect("background delegation is admitted");
     let job_id = turn.job_id.expect("background job id");
@@ -480,10 +508,14 @@ async fn background_children_share_the_workspace_delegation_bound() {
     second.background = true;
     second.report_delivery = ReportDelivery::Quiet;
 
-    let first = fixture.host.dispatch(first).await.expect("first dispatch");
+    let first = fixture
+        .host
+        .dispatch(first, no_interrupt())
+        .await
+        .expect("first dispatch");
     let second = fixture
         .host
-        .dispatch(second)
+        .dispatch(second, no_interrupt())
         .await
         .expect("second dispatch");
     fixture.runner.wait_for_starts(1).await;
@@ -537,10 +569,14 @@ async fn a_queued_background_child_can_be_cancelled_without_starting() {
     let mut queued = fixture.request("ses_owner");
     queued.background = true;
 
-    let first = fixture.host.dispatch(first).await.expect("first dispatch");
+    let first = fixture
+        .host
+        .dispatch(first, no_interrupt())
+        .await
+        .expect("first dispatch");
     let queued = fixture
         .host
-        .dispatch(queued)
+        .dispatch(queued, no_interrupt())
         .await
         .expect("queued dispatch");
     fixture.runner.wait_for_starts(1).await;
@@ -592,7 +628,11 @@ async fn quiet_background_dispatch_persists_the_result_without_waking_the_parent
     request.background = true;
     request.report_delivery = ReportDelivery::Quiet;
 
-    let turn = fixture.host.dispatch(request).await.expect("dispatch");
+    let turn = fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect("dispatch");
     fixture.runner.complete_with(Ok("quiet answer"));
     fixture.jobs.wait_all().await;
 
@@ -628,7 +668,11 @@ async fn cancelling_a_native_background_job_keeps_the_host_alive_and_settles_can
     let mut request = fixture.request("ses_owner");
     request.background = true;
 
-    let turn = fixture.host.dispatch(request).await.expect("dispatch");
+    let turn = fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect("dispatch");
     let job_id = turn.job_id.expect("job id");
     assert!(fixture.jobs.cancel("ses_owner", &job_id));
     fixture.jobs.wait_all().await;
@@ -648,7 +692,11 @@ async fn a_failed_background_child_is_persisted_and_reported() {
     let mut request = fixture.request("ses_owner");
     request.background = true;
 
-    let turn = fixture.host.dispatch(request).await.expect("dispatch");
+    let turn = fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect("dispatch");
     fixture.runner.complete_with(Err("provider failed"));
     fixture.jobs.wait_all().await;
 
@@ -672,7 +720,11 @@ async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reop
     let mut request = fixture.request("ses_owner");
     request.background = true;
 
-    let turn = fixture.host.dispatch(request).await.expect("dispatch");
+    let turn = fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect("dispatch");
     fixture.runner.complete_with(Ok("survives restart"));
     fixture.jobs.wait_all().await;
     let job = fixture

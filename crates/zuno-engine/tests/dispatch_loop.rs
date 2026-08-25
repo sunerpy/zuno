@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -174,6 +174,78 @@ impl Tool for ParallelTool {
     }
 }
 
+#[derive(Default)]
+struct PolicyState {
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    exclusive: AtomicBool,
+    events: Mutex<Vec<String>>,
+}
+
+struct PolicyTool {
+    id: &'static str,
+    policy: ToolConcurrencyPolicy,
+    state: Arc<PolicyState>,
+}
+
+#[async_trait]
+impl Tool for PolicyTool {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn description(&self) -> &str {
+        "Record mixed tool concurrency barriers."
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        self.policy
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        let active = self.state.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.state.max_active.fetch_max(active, Ordering::SeqCst);
+        if self.policy == ToolConcurrencyPolicy::Exclusive {
+            assert_eq!(active, 1, "an exclusive call overlapped an earlier call");
+            assert!(
+                !self.state.exclusive.swap(true, Ordering::SeqCst),
+                "two exclusive calls overlapped"
+            );
+        } else {
+            assert!(
+                !self.state.exclusive.load(Ordering::SeqCst),
+                "a non-exclusive call started while the barrier was active"
+            );
+        }
+        let command = args["command"].as_str().expect("command string");
+        self.state
+            .events
+            .lock()
+            .expect("policy events lock")
+            .push(format!("start:{command}"));
+        let delay = if command.contains("parallel") { 30 } else { 20 };
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        self.state
+            .events
+            .lock()
+            .expect("policy events lock")
+            .push(format!("end:{command}"));
+        if self.policy == ToolConcurrencyPolicy::Exclusive {
+            self.state.exclusive.store(false, Ordering::SeqCst);
+        }
+        self.state.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolOutput::text(self.id, format!("completed {command}")))
+    }
+}
+
 struct TimeoutTool {
     calls: Arc<AtomicUsize>,
 }
@@ -290,6 +362,35 @@ fn named_provider_events(tool: &str, calls: &[(&str, &str)]) -> Vec<Vec<StreamEv
         first.push(StreamEvent::ToolUseStart {
             id: (*id).to_owned(),
             name: tool.to_owned(),
+        });
+        first.push(StreamEvent::ToolInputDelta {
+            id: (*id).to_owned(),
+            delta: json!({ "command": command, "intent": "qa" }).to_string(),
+        });
+        first.push(StreamEvent::ToolUseEnd {
+            id: (*id).to_owned(),
+        });
+    }
+    first.push(StreamEvent::MessageEnd {
+        stop_reason: Some(FinishReason::ToolCalls),
+    });
+    vec![
+        first,
+        vec![
+            StreamEvent::TextDelta("tools completed".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ],
+    ]
+}
+
+fn mixed_provider_events(calls: &[(&str, &str, &str)]) -> Vec<Vec<StreamEvent>> {
+    let mut first = Vec::new();
+    for (id, tool, command) in calls {
+        first.push(StreamEvent::ToolUseStart {
+            id: (*id).to_owned(),
+            name: (*tool).to_owned(),
         });
         first.push(StreamEvent::ToolInputDelta {
             id: (*id).to_owned(),
@@ -552,6 +653,160 @@ async fn parallel_safe_calls_overlap_but_persist_and_emit_in_model_order() {
     assert_eq!(
         outputs,
         ["completed first", "completed second", "completed third"]
+    );
+}
+
+#[tokio::test]
+async fn parallel_safe_calls_never_exceed_the_configured_execution_bound() {
+    let mut connection = seeded();
+    let calls = [
+        ("call-one", "first"),
+        ("call-two", "second"),
+        ("call-three", "third"),
+        ("call-four", "fourth"),
+        ("call-five", "fifth"),
+    ];
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "parallel", &calls,
+    )));
+    let providers = registry(provider);
+    let state = Arc::new(ParallelState::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(ParallelTool {
+            state: Arc::clone(&state),
+        })],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-parallel-bound", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_tool_concurrency(ToolConcurrencyLimit::new(2).expect("valid limit")),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(outcome, Ok(TurnOutcome::Completed { .. })));
+    assert_eq!(state.max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(state.completed.lock().expect("completed lock").len(), 5);
+    assert_eq!(
+        lifecycle(&events)
+            .iter()
+            .filter(|event| event.ends_with(":result:ok"))
+            .count(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn exclusive_calls_barrier_parallel_safe_and_isolated_background_groups() {
+    let mut connection = seeded();
+    let calls = [
+        ("call-one", "parallel", "before-parallel"),
+        ("call-two", "background", "before-background"),
+        ("call-three", "exclusive", "barrier"),
+        ("call-four", "background", "after-background"),
+        ("call-five", "parallel", "after-parallel"),
+    ];
+    let provider = Arc::new(ScriptedProvider::new(mixed_provider_events(&calls)));
+    let providers = registry(provider);
+    let state = Arc::new(PolicyState::default());
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![
+            Arc::new(PolicyTool {
+                id: "parallel",
+                policy: ToolConcurrencyPolicy::ParallelSafe,
+                state: Arc::clone(&state),
+            }),
+            Arc::new(PolicyTool {
+                id: "background",
+                policy: ToolConcurrencyPolicy::IsolatedBackground,
+                state: Arc::clone(&state),
+            }),
+            Arc::new(PolicyTool {
+                id: "exclusive",
+                policy: ToolConcurrencyPolicy::Exclusive,
+                state: Arc::clone(&state),
+            }),
+        ],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, "turn-mixed-barrier", DynamicContext::default()),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_tool_concurrency(ToolConcurrencyLimit::new(4).expect("valid limit")),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(outcome, Ok(TurnOutcome::Completed { .. })));
+    assert_eq!(state.max_active.load(Ordering::SeqCst), 2);
+    let physical = state.events.lock().expect("policy events lock");
+    let position = |expected: &str| {
+        physical
+            .iter()
+            .position(|event| event == expected)
+            .unwrap_or_else(|| panic!("missing event `{expected}` in {physical:?}"))
+    };
+    assert!(position("end:before-parallel") < position("start:barrier"));
+    assert!(position("end:before-background") < position("start:barrier"));
+    assert!(position("end:barrier") < position("start:after-background"));
+    assert!(position("end:barrier") < position("start:after-parallel"));
+    assert!(position("start:before-parallel") < position("end:before-background"));
+    assert!(position("start:before-background") < position("end:before-parallel"));
+    assert!(position("start:after-parallel") < position("end:after-background"));
+    assert!(position("start:after-background") < position("end:after-parallel"));
+    drop(physical);
+    assert_eq!(
+        lifecycle(&events),
+        [
+            "call-one:running",
+            "call-two:running",
+            "call-one:completed",
+            "call-one:result:ok",
+            "call-two:completed",
+            "call-two:result:ok",
+            "call-three:running",
+            "call-three:completed",
+            "call-three:result:ok",
+            "call-four:running",
+            "call-five:running",
+            "call-four:completed",
+            "call-four:result:ok",
+            "call-five:completed",
+            "call-five:result:ok",
+        ]
     );
 }
 

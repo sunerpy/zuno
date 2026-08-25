@@ -117,6 +117,15 @@ same-tick completion and checked again before a workflow can publish
 `Completed`. This strengthens native Rust execution semantics without adopting a
 DSH runtime API; the unchanged DSH baseline does not move.
 
+Cancellation and tool-boundary hardening were classified `adapt`. Foreground
+native `task` delegation now receives the parent turn interrupt explicitly,
+bridges it to the child cancellation token, aborts the live child control, and
+waits for drain plus host shutdown before settling. The engine test suite now
+proves configured parallel-call ceilings above the bound and two-sided
+`Exclusive` barriers around both `ParallelSafe` and `IsolatedBackground` calls,
+while keeping durable results in model order. No DSH API was copied and the
+unchanged baseline does not move.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

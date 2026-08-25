@@ -222,9 +222,12 @@ cancels queued jobs and marks running jobs `Uncertain`. Workflow DAG execution i
 work-conserving under `maxParallel`: a newly free slot admits the next ready node
 in declaration order immediately, while durable results retain declaration
 order. Parent cancellation is biased ahead of same-tick node completion and is
-rechecked before publishing `Completed`. Durable cross-process leases,
-restart-preserved FIFO admission, and per-parent/provider/model quotas remain
-roadmap work.
+rechecked before publishing `Completed`. Foreground native `task` calls now pass
+the parent interrupt through `ChildTurnHost`, abort the child control, and wait
+for drain/shutdown. Tool concurrency tests prove an over-cap parallel group never
+exceeds `tool_calls` and that `Exclusive` barriers both `ParallelSafe` and
+`IsolatedBackground` calls. Durable cross-process leases, restart-preserved FIFO
+admission, and per-parent/provider/model quotas remain roadmap work.
 
 ### Result ordering
 

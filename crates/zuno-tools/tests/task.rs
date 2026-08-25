@@ -251,7 +251,11 @@ async fn a_child_session_cannot_delegate_again_at_the_default_bound() {
             Ok(1)
         }
 
-        async fn dispatch(&self, _request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError> {
+        async fn dispatch(
+            &self,
+            _request: ChildTurnRequest,
+            _interrupt: Arc<dyn zuno_tool::InterruptHandle>,
+        ) -> Result<ChildTurn, ChildTurnError> {
             panic!("a delegation past the bound must never reach the host");
         }
     }

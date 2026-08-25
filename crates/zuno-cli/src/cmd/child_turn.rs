@@ -1,10 +1,12 @@
 //! Production child-session delegation and durable background delivery.
 //!
-//! Foreground and background calls use the same child runner. A background call first
-//! creates a durable running job, returns its independent job id, and only then starts
-//! execution. Terminal state and the optional parent report commit in one SQLite
-//! transaction. Parent wake-up happens after that commit, so a process loss can delay
-//! delivery but cannot erase the report.
+//! Foreground and background calls use the same child runner. A foreground call
+//! carries the parent turn's interrupt into the runner and drains shutdown before
+//! returning cancellation. A background call first creates a durable queued job,
+//! returns its independent job id, and starts only after fair delegation admission.
+//! Terminal state and the optional parent report commit in one SQLite transaction.
+//! Parent wake-up happens after that commit, so a process loss can delay delivery but
+//! cannot erase the report.
 
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -27,7 +29,7 @@ use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::event_channel;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_engine::wake::{PendingInputDriver, SessionWakeCoordinator};
-use zuno_tool::PermissionAsker;
+use zuno_tool::{InterruptHandle, PermissionAsker};
 use zuno_tools::question::QuestionAsker;
 use zuno_tools::task::{
     ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest,
@@ -597,12 +599,13 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             let drive = drive_and_drain(&mut host, &request.prompt, None, Some(guard));
             tokio::pin!(drive);
             tokio::select! {
-                outcome = &mut drive => outcome,
+                biased;
                 () = cancellation.cancelled() => {
                     let _aborted = control.abort();
                     let _drained = drive.await;
                     Err("child turn was cancelled".to_owned())
                 }
+                outcome = &mut drive => outcome,
             }
         };
         let shutdown = host.shutdown().await;
@@ -787,11 +790,31 @@ impl ChildTurnHost for ChildSessionHost {
         )))
     }
 
-    async fn dispatch(&self, request: ChildTurnRequest) -> Result<ChildTurn, ChildTurnError> {
+    async fn dispatch(
+        &self,
+        request: ChildTurnRequest,
+        interrupt: Arc<dyn InterruptHandle>,
+    ) -> Result<ChildTurn, ChildTurnError> {
         if !request.background {
-            return self
-                .dispatch_foreground(request, CancellationToken::new())
-                .await;
+            let cancellation = CancellationToken::new();
+            let dispatch = self.dispatch_foreground(request, cancellation.clone());
+            tokio::pin!(dispatch);
+            return tokio::select! {
+                biased;
+                () = interrupt.notified() => {
+                    cancellation.cancel();
+                    match dispatch.await {
+                        Ok(_) => Err(ChildTurnError::Host("child turn was cancelled".to_owned())),
+                        Err(error) => Err(error),
+                    }
+                }
+                result = &mut dispatch => result,
+            };
+        }
+        if interrupt.is_set() {
+            return Err(ChildTurnError::Host(
+                "background child was cancelled before admission".to_owned(),
+            ));
         }
         let session_id = self.session_for(&request)?;
 
