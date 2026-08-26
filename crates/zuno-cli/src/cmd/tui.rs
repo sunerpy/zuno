@@ -72,10 +72,15 @@ use zuno_tui::views::picker::{
     McpProjection, McpServer, McpState, McpToggleRequest, QueuedInputDelivery, QueuedInputEntry,
     QueuedInputNotice, QueuedInputNoticeKind, QueuedInputProjection,
 };
-use zuno_tui::views::session::{PromptSubmission, QueuedInputMutation, SessionScreen, scopes};
+use zuno_tui::views::session::{
+    PromptSubmission, PromptTarget, QueuedInputMutation, SessionScreen, TargetedPromptSubmission,
+    scopes,
+};
 use zuno_tui::views::slash::{CatalogCommand, HostCommand};
 
-use super::child_turn::{ChildSessionOpened, ChildTurnObserver};
+use super::child_turn::{
+    ChildSessionOpened, ChildTurnObserver, InteractiveChildInput, InteractiveChildInputContext,
+};
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
 use super::tui_question::{QuestionBridge, QuestionBroker};
 use super::turn::{
@@ -505,6 +510,17 @@ fn execute_once(
     });
     host.set_title_sink(Arc::clone(&title_sink));
     let continuity = TuiHostContinuity::new(runs, title_sink, Some(child_observer));
+    let interactive_children = InteractiveChildInput::new(InteractiveChildInputContext {
+        database: host.database_pool(),
+        environment: driver_environment.clone(),
+        directory: reference_root.clone(),
+        approval: Arc::clone(&driver_approval),
+        question: Some(Arc::clone(&question)),
+        runs: continuity.runs(),
+        mcp: Some(mcp_catalog.clone()),
+        observer: continuity.child_observer(),
+        supervisor: environment.background_jobs(&reference_root),
+    });
     let work_state = WorkState::new(host.work_state()?);
     let queued_inputs = QueuedInputProjection::new(project_queued_inputs(
         &host.session_inbox(),
@@ -722,6 +738,7 @@ fn execute_once(
                 queued_inputs,
                 queue_wake,
                 continuity,
+                interactive_children,
                 remount: driver_remount,
                 shutdown: session_shutdown,
             },
@@ -2095,6 +2112,7 @@ struct TurnDriver {
     queued_inputs: QueuedInputProjection,
     queue_wake: mpsc::Sender<TerminalEvent>,
     continuity: TuiHostContinuity,
+    interactive_children: InteractiveChildInput,
     remount: CompositionRemount,
     shutdown: mpsc::Sender<TerminalEvent>,
 }
@@ -2160,6 +2178,62 @@ impl DriverPrompt {
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum PersistedTuiInput {
     TuiPrompt { submission: PromptSubmission },
+}
+
+fn dispatch_child_prompt(
+    children: &InteractiveChildInput,
+    session_id: &str,
+    submission: PromptSubmission,
+) -> Result<(), String> {
+    let text = match &submission {
+        PromptSubmission::Text(text) => text.clone(),
+        PromptSubmission::Steer(inner) => match inner.as_ref() {
+            PromptSubmission::Text(text) => text.clone(),
+            _ => {
+                return Err("an attached child session accepts plain text input only".to_owned());
+            }
+        },
+        _ => {
+            return Err("an attached child session accepts plain text input only".to_owned());
+        }
+    };
+    let prompt =
+        serde_json::to_value(PersistedTuiInput::TuiPrompt { submission }).map_err(to_string)?;
+    children.submit_text(session_id, prompt, text)?;
+    Ok(())
+}
+
+fn report_child_prompt_failure(
+    observer: Option<Arc<dyn ChildTurnObserver>>,
+    session_id: &str,
+    message: String,
+) {
+    if let Some(observer) = observer {
+        observer.event(
+            session_id,
+            &TurnEvent::TurnFailed {
+                assistant_message_id: None,
+                steps: 0,
+                message: format!("input was not admitted: {message}"),
+            },
+        );
+    }
+}
+
+fn route_targeted_prompt(
+    children: &InteractiveChildInput,
+    observer: Option<Arc<dyn ChildTurnObserver>>,
+    prompt: TargetedPromptSubmission,
+    root: &mut VecDeque<PromptSubmission>,
+) {
+    match prompt.target {
+        PromptTarget::Root => root.push_back(prompt.submission),
+        PromptTarget::Session(session_id) => {
+            if let Err(error) = dispatch_child_prompt(children, &session_id, prompt.submission) {
+                report_child_prompt_failure(observer, &session_id, error);
+            }
+        }
+    }
 }
 
 fn project_queued_inputs(
@@ -2344,7 +2418,7 @@ async fn apply_queued_input_mutation(
 
 async fn drive_turns(
     mut driver: TurnDriver,
-    mut prompts: mpsc::Receiver<PromptSubmission>,
+    mut prompts: mpsc::Receiver<TargetedPromptSubmission>,
     mut selections: mpsc::Receiver<zuno_tui::views::session::Selection>,
     mut queue_mutations: mpsc::Receiver<QueuedInputMutation>,
     environment: StartupEnvironment,
@@ -2353,7 +2427,16 @@ async fn drive_turns(
 ) -> Result<(), String> {
     let mut work_changes = driver.host.work_state_changes();
     let mut queue_mutations_open = true;
+    let mut root_prompts = VecDeque::new();
     'driver: loop {
+        while let Ok(prompt) = prompts.try_recv() {
+            route_targeted_prompt(
+                &driver.interactive_children,
+                driver.continuity.child_observer(),
+                prompt,
+                &mut root_prompts,
+            );
+        }
         loop {
             match queue_mutations.try_recv() {
                 Ok(mutation) => {
@@ -2375,7 +2458,7 @@ async fn drive_turns(
                 }
             }
         }
-        let queued = if prompts.is_empty() && selections.is_empty() {
+        let queued = if root_prompts.is_empty() && selections.is_empty() {
             zuno_goal::QueuedUserInput::Absent
         } else {
             zuno_goal::QueuedUserInput::Present
@@ -2419,10 +2502,18 @@ async fn drive_turns(
         // mid-turn would drop the stream the loop is still reading.
         let prompt = match pending {
             Some(pending) => pending,
+            None if !root_prompts.is_empty() => DriverPrompt::direct(
+                root_prompts
+                    .pop_front()
+                    .expect("the non-empty root prompt queue has a front"),
+            ),
             None => tokio::select! {
                 biased;
                 prompt = prompts.recv() => match prompt {
-                    Some(prompt @ PromptSubmission::Queue(_)) => {
+                    Some(TargetedPromptSubmission {
+                        target: PromptTarget::Root,
+                        submission: prompt @ PromptSubmission::Queue(_),
+                    }) => {
                         if let Err(message) = admit_followup(
                             driver.host.session_inbox(),
                             driver.host.control(),
@@ -2435,7 +2526,27 @@ async fn drive_turns(
                         }
                         continue 'driver;
                     }
-                    Some(prompt) => DriverPrompt::direct(prompt),
+                    Some(TargetedPromptSubmission {
+                        target: PromptTarget::Root,
+                        submission,
+                    }) => DriverPrompt::direct(submission),
+                    Some(TargetedPromptSubmission {
+                        target: PromptTarget::Session(session_id),
+                        submission,
+                    }) => {
+                        if let Err(error) = dispatch_child_prompt(
+                            &driver.interactive_children,
+                            &session_id,
+                            submission,
+                        ) {
+                            report_child_prompt_failure(
+                                driver.continuity.child_observer(),
+                                &session_id,
+                                error,
+                            );
+                        }
+                        continue 'driver;
+                    }
                     None => break 'driver,
                 },
                 mutation = queue_mutations.recv(), if queue_mutations_open => {
@@ -2547,6 +2658,7 @@ async fn drive_turns(
             &mut driver,
             prompt,
             &mut prompts,
+            &mut root_prompts,
             &mut queue_mutations,
             &mut queue_mutations_open,
             &events,
@@ -2820,11 +2932,14 @@ async fn drive_mcp_lifecycle(worker: McpLifecycleWorker) {
 async fn drive_one(
     driver: &mut TurnDriver,
     prompt: DriverPrompt,
-    prompts: &mut mpsc::Receiver<PromptSubmission>,
+    prompts: &mut mpsc::Receiver<TargetedPromptSubmission>,
+    root_prompts: &mut VecDeque<PromptSubmission>,
     queue_mutations: &mut mpsc::Receiver<QueuedInputMutation>,
     queue_mutations_open: &mut bool,
     events: &TurnEventSender,
 ) {
+    let interactive_children = driver.interactive_children.clone();
+    let child_observer = driver.continuity.child_observer();
     let TurnDriver {
         host,
         reference_root,
@@ -2859,6 +2974,16 @@ async fn drive_one(
             let admission_events = events.clone();
             let mut admissions: FuturesUnordered<BoxFuture<'static, Result<(), String>>> =
                 FuturesUnordered::new();
+            while let Some(followup) = root_prompts.pop_front() {
+                admissions.push(Box::pin(admit_followup(
+                    inbox.clone(),
+                    control.clone(),
+                    admission_root.clone(),
+                    queued_inputs.clone(),
+                    queue_wake.clone(),
+                    followup,
+                )));
+            }
             let mut prompts_open = true;
             let mut turn = Box::pin(drive_submission(
                 host,
@@ -2891,14 +3016,33 @@ async fn drive_one(
                     }
                     followup = prompts.recv(), if prompts_open => {
                         match followup {
-                            Some(followup) => admissions.push(Box::pin(admit_followup(
-                                inbox.clone(),
-                                control.clone(),
-                                admission_root.clone(),
-                                queued_inputs.clone(),
-                                queue_wake.clone(),
-                                followup,
-                            ))),
+                            Some(TargetedPromptSubmission {
+                                target: PromptTarget::Root,
+                                submission,
+                            }) => admissions.push(Box::pin(admit_followup(
+                                    inbox.clone(),
+                                    control.clone(),
+                                    admission_root.clone(),
+                                    queued_inputs.clone(),
+                                    queue_wake.clone(),
+                                    submission,
+                                ))),
+                            Some(TargetedPromptSubmission {
+                                target: PromptTarget::Session(session_id),
+                                submission,
+                            }) => {
+                                if let Err(error) = dispatch_child_prompt(
+                                    &interactive_children,
+                                    &session_id,
+                                    submission,
+                                ) {
+                                    report_child_prompt_failure(
+                                        child_observer.as_ref().map(Arc::clone),
+                                        &session_id,
+                                        error,
+                                    );
+                                }
+                            }
                             None => prompts_open = false,
                         }
                     }
@@ -2906,14 +3050,29 @@ async fn drive_one(
             };
             drop(turn);
             while let Ok(followup) = prompts.try_recv() {
-                admissions.push(Box::pin(admit_followup(
-                    inbox.clone(),
-                    control.clone(),
-                    admission_root.clone(),
-                    queued_inputs.clone(),
-                    queue_wake.clone(),
-                    followup,
-                )));
+                match followup.target {
+                    PromptTarget::Root => admissions.push(Box::pin(admit_followup(
+                        inbox.clone(),
+                        control.clone(),
+                        admission_root.clone(),
+                        queued_inputs.clone(),
+                        queue_wake.clone(),
+                        followup.submission,
+                    ))),
+                    PromptTarget::Session(session_id) => {
+                        if let Err(error) = dispatch_child_prompt(
+                            &interactive_children,
+                            &session_id,
+                            followup.submission,
+                        ) {
+                            report_child_prompt_failure(
+                                child_observer.as_ref().map(Arc::clone),
+                                &session_id,
+                                error,
+                            );
+                        }
+                    }
+                }
             }
             while let Some(outcome) = admissions.next().await {
                 if let Err(message) = outcome {

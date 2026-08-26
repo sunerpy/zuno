@@ -270,7 +270,7 @@ const CHANNELS: &[ChannelGate] = &[
         "PROMPT_CHANNEL_CAPACITY=1",
         Policy::RefuseNewest,
         "zuno-tui/src/views/session.rs",
-        "match prompts.try_send(submission) {",
+        "match prompts.try_send(TargetedPromptSubmission::root(submission)) {",
     ),
     gate(
         "tui-queue-mutations",

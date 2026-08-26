@@ -94,6 +94,8 @@ const FIRST_CHILD_DESCRIPTION: &str = "inspect current tree";
 const SECOND_CHILD_DESCRIPTION: &str = "inspect temp tree";
 const FIRST_CHILD_PROMPT: &str = "FirstChildProviderMarker inspect the current directory.";
 const SECOND_CHILD_PROMPT: &str = "SecondChildProviderMarker inspect the temporary directory.";
+const CHILD_STEER_PROMPT: &str = "ChildSteerPromptMarker inspect the changed priority.";
+const CHILD_STEER_RESPONSE: &str = "ChildSteerReplyMarker";
 const CHILD_RESPONSE_DELAY: Duration = Duration::from_secs(10);
 const PARALLEL_BUDGET: Duration = Duration::from_secs(15);
 
@@ -113,6 +115,7 @@ impl Respond for FlagResponder {
 #[derive(Debug, Default)]
 struct ParallelProviderState {
     child_requests: AtomicUsize,
+    child_steers: AtomicUsize,
     first_child_request_at: Mutex<Option<Instant>>,
 }
 
@@ -128,6 +131,14 @@ impl ParallelProviderState {
 
     fn children_started(&self) -> usize {
         self.child_requests.load(Ordering::Acquire)
+    }
+
+    fn record_child_steer(&self) {
+        self.child_steers.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn child_steers(&self) -> usize {
+        self.child_steers.load(Ordering::Acquire)
     }
 
     fn children_cannot_have_completed(&self) -> bool {
@@ -170,6 +181,10 @@ impl Respond for ParallelDelegationResponder {
             } else {
                 compatible_parallel_task_response()
             };
+        }
+        if serialized_messages.contains(CHILD_STEER_PROMPT) {
+            self.state.record_child_steer();
+            return compatible_text_response(CHILD_STEER_RESPONSE);
         }
         if serialized_messages.contains(FIRST_CHILD_PROMPT) {
             self.state.record_child_request();
@@ -510,6 +525,9 @@ struct ParallelDelegationTranscript {
     text: String,
     saw_two_running_agents: bool,
     entered_child_surface: bool,
+    submitted_child_message: bool,
+    provider_received_child_message: bool,
+    child_reply_visible: bool,
     returned_to_parent: bool,
     all_observed_before_child_completion: bool,
 }
@@ -558,12 +576,15 @@ fn run_parallel_delegation_under_pty(
     let started = Instant::now();
     let mut text = String::new();
     let mut enter_sent = false;
+    let mut child_message_sent = false;
     let mut return_sent = false;
     let mut first_description_count = 0;
     let mut second_description_count = 0;
     let mut parent_prompt_count = 0;
     let mut saw_two_running_agents = false;
     let mut entered_child_surface = false;
+    let mut provider_received_child_message = false;
+    let mut child_reply_visible = false;
     let mut returned_to_parent = false;
     let mut all_observed_before_child_completion = true;
 
@@ -596,12 +617,27 @@ fn run_parallel_delegation_under_pty(
             stdin.flush()?;
             enter_sent = true;
         } else if enter_sent
-            && !return_sent
+            && !child_message_sent
             && text.contains("running · session ")
             && (text.matches(FIRST_CHILD_DESCRIPTION).count() > first_description_count
                 || text.matches(SECOND_CHILD_DESCRIPTION).count() > second_description_count)
         {
             entered_child_surface = true;
+            all_observed_before_child_completion &= provider.children_cannot_have_completed();
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("parallel delegation stdin was not piped"))?;
+            stdin.write_all(format!("{CHILD_STEER_PROMPT}\r").as_bytes())?;
+            stdin.flush()?;
+            child_message_sent = true;
+        } else if child_message_sent
+            && !return_sent
+            && provider.child_steers() >= 1
+            && text.contains(CHILD_STEER_RESPONSE)
+        {
+            provider_received_child_message = true;
+            child_reply_visible = true;
             all_observed_before_child_completion &= provider.children_cannot_have_completed();
             parent_prompt_count = text.matches(PARALLEL_PARENT_PROMPT).count();
             let stdin = child
@@ -611,9 +647,7 @@ fn run_parallel_delegation_under_pty(
             stdin.write_all(b"\x18\x1bOA")?;
             stdin.flush()?;
             return_sent = true;
-        } else if return_sent
-            && text.matches(PARALLEL_PARENT_PROMPT).count() > parent_prompt_count
-            && text.matches("2 running").count() >= 2
+        } else if return_sent && text.matches(PARALLEL_PARENT_PROMPT).count() > parent_prompt_count
         {
             returned_to_parent = true;
             all_observed_before_child_completion &= provider.children_cannot_have_completed();
@@ -627,6 +661,9 @@ fn run_parallel_delegation_under_pty(
         text,
         saw_two_running_agents,
         entered_child_surface,
+        submitted_child_message: child_message_sent,
+        provider_received_child_message,
+        child_reply_visible,
         returned_to_parent,
         all_observed_before_child_completion,
     })
@@ -1515,6 +1552,23 @@ async fn parallel_foreground_children_remain_live_and_navigable_in_the_real_tui(
         transcript.entered_child_surface,
         "Ctrl+X Down did not replace the parent main pane with a full running child-session \
          surface\ntranscript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.submitted_child_message,
+        "the running child composer did not accept a direct user message\ntranscript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.provider_received_child_message,
+        "the direct child message did not interrupt and restart the real child provider request\n\
+         transcript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.child_reply_visible,
+        "the steered child's provider reply did not reach the attached child transcript\n\
+         transcript:\n{}",
         transcript.text
     );
     assert!(

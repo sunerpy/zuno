@@ -44,6 +44,15 @@ Capability negotiation must not alter agent semantics. An unsupported renderer f
 
 Every submitted input receives an admission identifier before execution. A client may optimistically render a pending row keyed by that identifier, then replace it when the committed event arrives. Reconnecting with the same identifier must not create a duplicate input.
 
+Input also names its session target. A root composer uses the mounted root target;
+an attached child composer sends the durable child session id and never tunnels the
+message through the parent transcript. The runtime validates that target, writes the
+message to that child's inbox, and supervises delivery independently of the render
+loop. A completed child acquires an idle run lease and reopens its `TurnHost`; a
+running child receives the same admitted input as a soft steer. The wake coordinator
+closes the active-to-idle race, so a message that misses the running turn remains
+pending and becomes the next child turn instead of being lost.
+
 During an active turn, ordinary text and rich content target the nearest safe
 step as steering. Commands and explicit next-turn work remain queued. A steer
 interrupts a provider wait or provider-retry delay, checkpoints partial assistant
@@ -155,7 +164,12 @@ The TUI favors dense, keyboard-first operation:
   full main-pane session projection: `Ctrl+X Down` enters the first direct child,
   `Ctrl+X Up` returns to its parent, and `Ctrl+X Left`/`Right` cycle siblings. The
   parent host remains mounted and running while the child transcript receives live
-  events, so child progress is visible before the foreground `task` call completes;
+  events, so child progress is visible before the foreground `task` call completes.
+  Every attached child owns its own `InputEditor` draft. Enter steers a running child
+  and continues a completed child; the text is admitted to the child inbox before
+  execution. Child input is literal text, so `/help` and other slash-looking strings
+  are not dispatched as root or host commands. Switching siblings or returning to the
+  parent preserves each child draft;
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
   row `✓ skill-name · loaded`. Expanded skills are grouped with loaded skills

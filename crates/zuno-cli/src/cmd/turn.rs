@@ -3144,6 +3144,11 @@ impl TurnHost {
         self.inbox.clone()
     }
 
+    /// Database pool shared with independently driven child-session input.
+    pub(crate) fn database_pool(&self) -> Arc<zuno_db::pool::Pool> {
+        Arc::clone(&self.database)
+    }
+
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
         let session = self.runtime.shutdown().await.map_err(to_string);
         let profile = self.profile_runtime.shutdown().await.map_err(to_string);

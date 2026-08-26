@@ -7,7 +7,9 @@
 
 use crate::app::{AppEvent, Component, EventResult};
 use crate::keybind::Definition;
+use crate::views::editor::{EditorSignal, InputEditor, PromptGutter};
 use crate::views::message::{ActivityDisplay, Message, StatusView, Transcript, TranscriptView};
+use crate::views::session::{PROMPT_MARKER, prompt_frame, prompt_rows};
 use crate::views::{ViewContext, fill, padded, pressable_label};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -17,6 +19,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use zuno_engine::r#loop::TurnEvent;
 use zuno_types::UsageSnapshot;
+
+const CHILD_PROMPT_PLACEHOLDER: &str = "message this child";
 
 /// Initial durable state published before a child starts producing live events.
 #[derive(Debug, Clone)]
@@ -165,6 +169,7 @@ pub struct LiveSessionView {
     generation: u64,
     transcript: TranscriptView,
     status: StatusView,
+    composer: InputEditor,
 }
 
 impl LiveSessionView {
@@ -186,6 +191,7 @@ impl LiveSessionView {
         if snapshot.transcript.is_running() {
             status.mark_running();
         }
+        let composer = InputEditor::new(context.clone()).with_placeholder(CHILD_PROMPT_PLACEHOLDER);
         Some(Self {
             context,
             sessions,
@@ -195,6 +201,7 @@ impl LiveSessionView {
             generation: snapshot.generation,
             transcript,
             status,
+            composer,
         })
     }
 
@@ -216,6 +223,37 @@ impl LiveSessionView {
     #[must_use]
     pub fn transcript(&self) -> &Transcript {
         self.transcript.transcript()
+    }
+
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.transcript.transcript().is_running()
+    }
+
+    pub fn insert_char(&mut self, character: char) -> EventResult {
+        self.composer.insert_char(character);
+        EventResult::REDRAW
+    }
+
+    pub fn insert_text(&mut self, text: &str) -> EventResult {
+        self.composer.insert_text(text);
+        EventResult::REDRAW
+    }
+
+    pub fn handle_composer_action(&mut self, action: &'static Definition) -> EditorSignal {
+        self.composer.handle_action(action)
+    }
+
+    pub fn push_user_submission(&mut self, text: impl Into<String>) {
+        self.transcript
+            .transcript_mut()
+            .push(Message::user(text.into()));
+        self.transcript.follow();
+    }
+
+    pub fn mark_turn_accepted(&mut self) {
+        self.transcript.transcript_mut().mark_running();
+        self.status.mark_running();
     }
 
     /// Adopt a newer projection without replacing view-local scroll/disclosure state.
@@ -294,13 +332,22 @@ impl LiveSessionView {
     }
 
     fn footer(&self, width: u16) -> Line<'static> {
+        let submit = if self.is_running() {
+            "enter steer"
+        } else {
+            "enter continue"
+        };
         let parent = pressable_label("session_parent", &self.context)
             .map_or_else(|| String::from("parent"), |key| format!("{key} parent"));
         let next = pressable_label("session_child_cycle", &self.context).map_or_else(
             || String::from("next sibling"),
             |key| format!("{key} next sibling"),
         );
-        padded(&format!(" {parent} · {next}"), width, self.context.muted())
+        padded(
+            &format!(" {submit} · {parent} · {next}"),
+            width,
+            self.context.muted(),
+        )
     }
 }
 
@@ -308,10 +355,12 @@ impl Component for LiveSessionView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.sync();
         fill(frame.buffer_mut(), area, self.context.surface());
-        let [header, body, identity, footer] = Layout::vertical([
+        let composer_rows = prompt_rows(self.composer.height(), area.height);
+        let [header, body, identity, composer, footer] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(u16::from(self.status.has_identity())),
+            Constraint::Length(composer_rows),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -320,6 +369,12 @@ impl Component for LiveSessionView {
             .render(header, frame.buffer_mut());
         self.transcript.render(frame, body);
         self.status.render(frame, identity);
+        fill(frame.buffer_mut(), composer, self.context.element());
+        let (gutter, buffer) = prompt_frame(composer);
+        if let Some(gutter) = gutter {
+            PromptGutter::new(self.context.clone(), PROMPT_MARKER.to_owned()).render(frame, gutter);
+        }
+        self.composer.render(frame, buffer);
         Paragraph::new(vec![self.footer(footer.width)])
             .style(self.context.surface())
             .render(footer, frame.buffer_mut());

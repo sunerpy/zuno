@@ -38,6 +38,20 @@ fn press_none() -> KeyEvent {
     crate::views::testkit::press(crossterm::event::KeyCode::Null)
 }
 
+fn type_into_screen(screen: &mut SessionScreen, text: &str) {
+    for character in text.chars() {
+        screen.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(crate::views::testkit::press(
+                crossterm::event::KeyCode::Char(character),
+            )),
+        )));
+    }
+}
+
+fn root_prompt(submission: PromptSubmission) -> TargetedPromptSubmission {
+    TargetedPromptSubmission::root(submission)
+}
+
 #[test]
 fn session_screen_renders_the_transcript_reply_identity_and_prompt() {
     let (mut screen, _shutdown) = screen();
@@ -179,8 +193,8 @@ fn session_screen_a_submission_during_work_is_queued_for_the_next_turn() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Queue(Box::new(PromptSubmission::Text(
-            String::from("change direction")
+        Ok(root_prompt(PromptSubmission::Queue(Box::new(
+            PromptSubmission::Text(String::from("change direction"))
         )))),
         "the active turn caused the follow-up to be refused instead of admitted"
     );
@@ -234,8 +248,8 @@ fn session_screen_ctrl_enter_marks_a_busy_submission_as_an_explicit_steer() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Steer(Box::new(PromptSubmission::Text(
-            String::from("change direction now")
+        Ok(root_prompt(PromptSubmission::Steer(Box::new(
+            PromptSubmission::Text(String::from("change direction now"))
         ))))
     );
     assert!(
@@ -333,7 +347,7 @@ fn session_screen_a_large_paste_shows_a_summary_but_submits_the_whole_text() {
     screen.handle_action(action("input_submit"), &press_none());
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Text(pasted.clone())),
+        Ok(root_prompt(PromptSubmission::Text(pasted.clone()))),
         "the summary was sent to the model instead of the pasted text"
     );
     assert_eq!(
@@ -356,7 +370,9 @@ fn session_screen_a_pasted_path_is_not_taken_for_a_slash_command() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Text(String::from("/etc/hosts"))),
+        Ok(root_prompt(PromptSubmission::Text(String::from(
+            "/etc/hosts"
+        )))),
         "a pasted absolute path did not reach the model as literal text"
     );
     let joined = rows(&render_offscreen(&mut screen, 60, 10).expect("infallible")).join("\n");
@@ -460,10 +476,10 @@ fn session_screen_catalog_slash_stays_typed_for_the_host() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Command {
+        Ok(root_prompt(PromptSubmission::Command {
             name: "review".to_owned(),
             arguments: "src/lib.rs carefully".to_owned(),
-        })
+        }))
     );
     assert_eq!(screen.submissions(), ["/review src/lib.rs carefully"]);
 }
@@ -487,11 +503,11 @@ fn session_screen_direct_skill_stays_typed_with_its_source() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Skill {
+        Ok(root_prompt(PromptSubmission::Skill {
             name: "github-project-scaffold".to_owned(),
             source: "/skills/github-project-scaffold/SKILL.md".to_owned(),
             arguments: "audit this repository".to_owned(),
-        })
+        }))
     );
 }
 
@@ -642,7 +658,7 @@ fn session_screen_redo_stays_typed_for_the_runtime_host_and_asks_nothing() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Host(HostCommand::Redo))
+        Ok(root_prompt(PromptSubmission::Host(HostCommand::Redo)))
     );
     assert_eq!(screen.submissions(), ["/redo"]);
     assert!(
@@ -673,7 +689,7 @@ fn type_and_submit(host: &mut DialogHost, text: &str) {
 /// (`drain_dialogs`), so a test that inspected the request would prove the confirmation
 /// was built and never that it can be answered — the "built, tested, impossible to open"
 /// failure this project has removed four times.
-fn hosted_screen() -> (DialogHost, mpsc::Receiver<PromptSubmission>) {
+fn hosted_screen() -> (DialogHost, mpsc::Receiver<TargetedPromptSubmission>) {
     let (sender, shutdown) = terminal_event_channel();
     // Leaked deliberately: dropping the receiver closes the shutdown channel, and the
     // screen reports a closed channel rather than the behaviour under test.
@@ -707,7 +723,7 @@ fn session_screen_undo_asks_before_it_restores_the_worktree() {
     host.handle_action(action("dialog.select.submit"), &press_none());
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Host(HostCommand::Undo)),
+        Ok(root_prompt(PromptSubmission::Host(HostCommand::Undo))),
         "confirming the undo did not restore anything"
     );
     assert!(
@@ -1025,7 +1041,9 @@ fn session_screen_doubled_slash_submits_one_literal_slash() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Text("/review this literally".to_owned()))
+        Ok(root_prompt(PromptSubmission::Text(
+            "/review this literally".to_owned()
+        )))
     );
     assert_eq!(screen.submissions(), ["/review this literally"]);
 }
@@ -1629,7 +1647,7 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
     screen.submit_prompt("first");
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Text(String::from("first")))
+        Ok(root_prompt(PromptSubmission::Text(String::from("first"))))
     );
     screen.handle_action(action("app_exit"), &press_none());
     assert_eq!(cancelled.try_recv(), Ok(()));
@@ -1641,7 +1659,7 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
     screen.submit_prompt("second");
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Text(String::from("second")))
+        Ok(root_prompt(PromptSubmission::Text(String::from("second"))))
     );
     screen.handle_action(action("app_exit"), &press_none());
 
@@ -1954,11 +1972,11 @@ fn session_screen_complete_council_command_keeps_the_user_text_and_typed_request
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Council {
+        Ok(root_prompt(PromptSubmission::Council {
             text: input.to_owned(),
             preset: String::from("balanced-review"),
             question: String::from("Should we ship this design?"),
-        })
+        }))
     );
     assert_eq!(screen.submissions(), [input]);
 }
@@ -1982,13 +2000,13 @@ fn session_screen_running_council_is_queued_even_when_force_send_is_requested() 
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(PromptSubmission::Queue(Box::new(
+        Ok(root_prompt(PromptSubmission::Queue(Box::new(
             PromptSubmission::Council {
                 text: input.to_owned(),
                 preset: String::from("balanced-review"),
                 question: String::from("Should we ship this design?"),
             }
-        )))
+        ))))
     );
 }
 
@@ -7845,7 +7863,7 @@ fn a_press_on_the_prompt_opens_a_menu_that_copies_and_reverts() {
         );
         assert_eq!(
             submitted.try_recv(),
-            Ok(PromptSubmission::Host(HostCommand::Undo)),
+            Ok(root_prompt(PromptSubmission::Host(HostCommand::Undo))),
             "at {width} columns clicking Restore did not reach the undo handler"
         );
         assert!(
@@ -8252,6 +8270,156 @@ fn leader_down_and_up_switch_between_parent_and_live_child_without_a_dialog() {
     assert!(
         !parent.contains("working before completion"),
         "returning to the parent left the child transcript attached:\n{parent}"
+    );
+}
+
+#[test]
+fn live_running_child_enter_submits_plain_text_as_a_targeted_steer() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(2);
+    let sessions = crate::views::live_session::LiveSessions::default();
+    sessions.open(crate::views::live_session::LiveSessionOpen {
+        session_id: String::from("ses_child"),
+        parent_session_id: String::from("ses_parent"),
+        title: String::from("inspect auth"),
+        agent: String::from("explorer"),
+        model: String::from("test/model"),
+        effort: None,
+        messages: vec![Message::user("inspect the auth flow")],
+        usage: None,
+    });
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions)
+        .with_prompt_sink(prompts);
+    screen.attach_live_session("ses_child");
+
+    type_into_screen(&mut screen, "/help must stay text");
+    let composing = rows(&render_offscreen(&mut screen, 90, 18).expect("infallible")).join("\n");
+    assert!(
+        composing.contains("/help must stay text"),
+        "the child composer did not render the typed draft:\n{composing}"
+    );
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(TargetedPromptSubmission {
+            target: PromptTarget::Session(String::from("ses_child")),
+            submission: PromptSubmission::Steer(Box::new(PromptSubmission::Text(String::from(
+                "/help must stay text"
+            )))),
+        }),
+        "ordinary Enter on a running child must steer that child without slash dispatch"
+    );
+}
+
+#[test]
+fn live_completed_child_enter_submits_a_targeted_continuation() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(2);
+    let sessions = crate::views::live_session::LiveSessions::default();
+    sessions.open(crate::views::live_session::LiveSessionOpen {
+        session_id: String::from("ses_child"),
+        parent_session_id: String::from("ses_parent"),
+        title: String::from("inspect auth"),
+        agent: String::from("explorer"),
+        model: String::from("test/model"),
+        effort: None,
+        messages: vec![Message::user("inspect the auth flow")],
+        usage: None,
+    });
+    sessions.observe(
+        "ses_child",
+        &TurnEvent::AssistantMessageCreated {
+            step: 1,
+            message_id: String::from("msg_child"),
+        },
+    );
+    sessions.observe(
+        "ses_child",
+        &TurnEvent::TurnCompleted {
+            assistant_message_id: String::from("msg_child"),
+            steps: 1,
+        },
+    );
+    assert!(
+        !sessions
+            .snapshot("ses_child")
+            .expect("child remains projected")
+            .transcript
+            .is_running()
+    );
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions)
+        .with_prompt_sink(prompts);
+    screen.attach_live_session("ses_child");
+
+    type_into_screen(&mut screen, "continue with refresh handling");
+    screen.handle_action(action("input_submit"), &press_none());
+
+    assert_eq!(
+        submitted.try_recv(),
+        Ok(TargetedPromptSubmission {
+            target: PromptTarget::Session(String::from("ses_child")),
+            submission: PromptSubmission::Text(String::from("continue with refresh handling")),
+        }),
+        "a completed child needs ordinary continuation input rather than a steer wrapper"
+    );
+    let rendered = rows(&render_offscreen(&mut screen, 90, 18).expect("infallible")).join("\n");
+    assert!(
+        rendered.contains("continue with refresh handling"),
+        "the accepted child input was not reflected in its transcript:\n{rendered}"
+    );
+}
+
+#[test]
+fn live_child_composers_keep_one_draft_per_attached_sibling() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let sessions = crate::views::live_session::LiveSessions::default();
+    for (session_id, title) in [
+        ("ses_child_one", "first child"),
+        ("ses_child_two", "second child"),
+    ] {
+        sessions.open(crate::views::live_session::LiveSessionOpen {
+            session_id: session_id.to_owned(),
+            parent_session_id: String::from("ses_parent"),
+            title: title.to_owned(),
+            agent: String::from("explorer"),
+            model: String::from("test/model"),
+            effort: None,
+            messages: Vec::new(),
+            usage: None,
+        });
+    }
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions);
+    screen.attach_live_session("ses_child_one");
+    type_into_screen(&mut screen, "draft for first");
+
+    screen.handle_action(action("session_child_cycle"), &press_none());
+    type_into_screen(&mut screen, "draft for second");
+    screen.handle_action(action("session_child_cycle_reverse"), &press_none());
+
+    let first = rows(&render_offscreen(&mut screen, 90, 18).expect("infallible")).join("\n");
+    assert!(
+        first.contains("draft for first") && !first.contains("draft for second"),
+        "returning to the first child did not restore only its draft:\n{first}"
+    );
+
+    screen.handle_action(action("session_child_cycle"), &press_none());
+    let second = rows(&render_offscreen(&mut screen, 90, 18).expect("infallible")).join("\n");
+    assert!(
+        second.contains("draft for second") && !second.contains("draft for first"),
+        "returning to the second child did not restore only its draft:\n{second}"
     );
 }
 

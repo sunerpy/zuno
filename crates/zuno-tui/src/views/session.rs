@@ -253,7 +253,7 @@ const PROMPT_SPACER_ROWS: u16 = 1;
 const PROMPT_MIN_CONTENT_COLS: u16 = 12;
 
 /// The marker drawn in the prompt's gutter.
-const PROMPT_MARKER: &str = "›";
+pub(crate) const PROMPT_MARKER: &str = "›";
 
 /// What the empty prompt says about itself.
 ///
@@ -463,7 +463,7 @@ const fn composer_region(bounds: Rect, welcome: bool) -> Rect {
 /// The consequence is that the preferred floor is *earned*: it arrives at twelve rows and
 /// above, three rows at nine to eleven, and two below that. A prompt is never more than a
 /// third of the screen, whatever it would prefer.
-fn prompt_rows(content_lines: usize, height: u16) -> u16 {
+pub(crate) fn prompt_rows(content_lines: usize, height: u16) -> u16 {
     let wanted = u16::try_from(content_lines)
         .unwrap_or(u16::MAX)
         .saturating_add(1);
@@ -480,7 +480,7 @@ fn prompt_rows(content_lines: usize, height: u16) -> u16 {
 /// gutter is `None` — chrome dropped rather than text squeezed — whenever the pane cannot
 /// spare [`PROMPT_MIN_CONTENT_COLS`] after it, and the spacer is dropped whenever the band
 /// is a single row, because a spacer that takes the only row leaves nowhere to type.
-fn prompt_frame(band: Rect) -> (Option<Rect>, Rect) {
+pub(crate) fn prompt_frame(band: Rect) -> (Option<Rect>, Rect) {
     // Clamped to the band rather than floored at one: a `max(1)` here fabricates a row the
     // band does not own, and writing into it panics inside ratatui's buffer. The three-band
     // split really does hand out a zero-row prompt — on a one-row viewport the footer takes
@@ -557,7 +557,7 @@ pub struct SessionScreen {
     welcome_enabled: bool,
     sidebar: crate::views::ambient::SidebarView,
     shutdown: mpsc::Sender<TerminalEvent>,
-    prompts: Option<mpsc::Sender<PromptSubmission>>,
+    prompts: Option<mpsc::Sender<TargetedPromptSubmission>>,
     mcp_toggles: Option<mpsc::Sender<crate::views::picker::McpToggleRequest>>,
     title: crate::views::ambient::SessionTitle,
     /// The session-name generation this screen last painted.
@@ -592,6 +592,13 @@ pub struct SessionScreen {
     /// This is a view attachment, not a host replacement. The parent and sibling hosts
     /// continue running while this field is present.
     live_session: Option<crate::views::live_session::LiveSessionView>,
+    /// Detached child surfaces keyed by durable session id.
+    ///
+    /// A view owns its composer, so retaining the whole view retains exactly that child's
+    /// draft while the user inspects a sibling or returns to the parent. Projection sync on
+    /// the next render keeps cached transcripts current without moving draft state into the
+    /// process-level [`crate::views::live_session::LiveSessions`] read model.
+    live_session_cache: BTreeMap<String, crate::views::live_session::LiveSessionView>,
     /// The non-MCP halves of `§8.7`'s status census, resolved once by the host.
     ///
     /// MCP is deliberately *not* stored here: it is live, and `status_panel` reads it from
@@ -807,6 +814,43 @@ pub enum PromptSubmission {
     Steer(Box<PromptSubmission>),
 }
 
+/// The durable session a prompt-channel message belongs to.
+///
+/// `Root` remains id-free because a new root conversation is materialized lazily by its first
+/// accepted model input. Child sessions already have durable ids when their surfaces become
+/// attachable, so the view can target them without importing database or runtime types.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", content = "session_id", rename_all = "snake_case")]
+pub enum PromptTarget {
+    Root,
+    Session(String),
+}
+
+/// One typed prompt plus the session surface that submitted it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TargetedPromptSubmission {
+    pub target: PromptTarget,
+    pub submission: PromptSubmission,
+}
+
+impl TargetedPromptSubmission {
+    #[must_use]
+    pub const fn root(submission: PromptSubmission) -> Self {
+        Self {
+            target: PromptTarget::Root,
+            submission,
+        }
+    }
+
+    #[must_use]
+    pub fn session(session_id: impl Into<String>, submission: PromptSubmission) -> Self {
+        Self {
+            target: PromptTarget::Session(session_id.into()),
+            submission,
+        }
+    }
+}
+
 /// What the pickers can offer, as the host resolved it.
 ///
 /// Plain lists rather than a live query: a picker redraws on every keystroke, and a
@@ -890,6 +934,7 @@ impl SessionScreen {
             work_generation: 0,
             live_sessions: crate::views::live_session::LiveSessions::default(),
             live_session: None,
+            live_session_cache: BTreeMap::new(),
             census: Vec::new(),
             debug: crate::views::diagnostics::DebugFacts::default(),
             cancels: None,
@@ -999,7 +1044,7 @@ impl SessionScreen {
     /// Optional because a screen with no driver is still a legitimate screen — every
     /// view test builds one — and a `Sender` it could not answer would be worse.
     #[must_use]
-    pub fn with_prompt_sink(mut self, prompts: mpsc::Sender<PromptSubmission>) -> Self {
+    pub fn with_prompt_sink(mut self, prompts: mpsc::Sender<TargetedPromptSubmission>) -> Self {
         self.prompts = Some(prompts);
         self
     }
@@ -1743,7 +1788,7 @@ impl SessionScreen {
                     | PromptSubmission::Queue(_)
                     | PromptSubmission::Steer(_)
             );
-            match prompts.try_send(submission) {
+            match prompts.try_send(TargetedPromptSubmission::root(submission)) {
                 Ok(()) => {
                     if tracks_model_turn {
                         self.mark_turn_accepted();
@@ -1761,6 +1806,64 @@ impl SessionScreen {
             }
         }
         self.submissions.push(shown);
+    }
+
+    fn submit_live_to_driver(&mut self, shown: String) -> EventResult {
+        let Some(live) = self.live_session.as_mut() else {
+            return EventResult::IGNORED;
+        };
+        let session_id = live.session_id().to_owned();
+        let submission = PromptSubmission::Text(shown.clone());
+        let submission = if live.is_running() {
+            PromptSubmission::Steer(Box::new(submission))
+        } else {
+            submission
+        };
+        live.push_user_submission(shown.clone());
+
+        if let Some(prompts) = self.prompts.as_ref() {
+            match prompts.try_send(TargetedPromptSubmission::session(session_id, submission)) {
+                Ok(()) => live.mark_turn_accepted(),
+                Err(error) => {
+                    let reason = match error {
+                        mpsc::error::TrySendError::Full(_) => "the durable input queue is full",
+                        mpsc::error::TrySendError::Closed(_) => "the turn driver has stopped",
+                    };
+                    live.push_user_submission(format!("not sent: {reason}"));
+                }
+            }
+        }
+        self.submissions.push(shown);
+        EventResult::REDRAW
+    }
+
+    fn paste_into_live_from_clipboard(&mut self) -> EventResult {
+        let (level, notice) = match self.clipboard.read() {
+            Ok(Some(content)) if content.is_image() => (
+                ToastLevel::Warning,
+                String::from(
+                    "the clipboard holds an image; pasting an attachment is not supported yet",
+                ),
+            ),
+            Ok(Some(content)) => {
+                return self
+                    .live_session
+                    .as_mut()
+                    .map_or(EventResult::IGNORED, |live| {
+                        // Child input is always literal text. `InputEditor::insert_paste` escapes a
+                        // leading slash for the root slash router, so this path intentionally uses
+                        // `insert_text` and never introduces command syntax.
+                        live.insert_text(&content.data)
+                    });
+            }
+            Ok(None) => (
+                ToastLevel::Warning,
+                String::from("nothing to paste: the clipboard is empty"),
+            ),
+            Err(error) => (ToastLevel::Error, format!("paste failed: {error}")),
+        };
+        self.toasts.push(Toast::new(level, notice));
+        EventResult::REDRAW
     }
 
     fn refresh_autocomplete(&mut self) {
@@ -2180,10 +2283,15 @@ impl Component for SessionScreen {
         // to the editor and resolves to no action at all. That is the point: before
         // bracketed paste was enabled the same paste arrived as individual keys, and
         // every newline among them resolved to `input_submit`.
-        if self.live_session.is_none()
-            && !self.transcript_full
+        if !self.transcript_full
             && let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Paste(text))) = event
         {
+            if let Some(live) = self.live_session.as_mut() {
+                // Unlike the root composer, a child has no slash router. Keep the terminal
+                // payload literal rather than applying `InputEditor::insert_paste`'s leading
+                // slash escape for root commands.
+                return live.insert_text(text);
+            }
             return self.paste(text);
         }
         // A printable key resolves to no action, so the dispatcher forwards it here
@@ -2192,10 +2300,12 @@ impl Component for SessionScreen {
         // same seam the reject box uses.
         if let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(key))) = event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-            && self.live_session.is_none()
             && !self.transcript_full
             && let Some(character) = typed_character(key)
         {
+            if let Some(live) = self.live_session.as_mut() {
+                return live.insert_char(character);
+            }
             self.editor.insert_char(character);
             self.refresh_autocomplete();
             return EventResult::REDRAW;
@@ -2282,11 +2392,21 @@ impl SessionScreen {
     }
 
     fn attach_live_session(&mut self, session_id: &str) -> EventResult {
-        let Some(view) = crate::views::live_session::LiveSessionView::attach(
-            self.context.clone(),
-            self.live_sessions.clone(),
-            session_id.to_owned(),
-        ) else {
+        if self
+            .live_session
+            .as_ref()
+            .is_some_and(|live| live.session_id() == session_id)
+        {
+            return EventResult::REDRAW;
+        }
+        let view = self.live_session_cache.remove(session_id).or_else(|| {
+            crate::views::live_session::LiveSessionView::attach(
+                self.context.clone(),
+                self.live_sessions.clone(),
+                session_id.to_owned(),
+            )
+        });
+        let Some(view) = view else {
             self.toasts.push(Toast::info(format!(
                 "child session {session_id} is not live yet"
             )));
@@ -2294,7 +2414,10 @@ impl SessionScreen {
         };
         self.autocomplete.hide();
         self.sidebar.clear_selection();
-        self.live_session = Some(view);
+        if let Some(previous) = self.live_session.replace(view) {
+            self.live_session_cache
+                .insert(previous.session_id().to_owned(), previous);
+        }
         EventResult::REDRAW
     }
 
@@ -2331,7 +2454,10 @@ impl SessionScreen {
         if self.live_sessions.snapshot(&parent).is_some() {
             return self.attach_live_session(&parent);
         }
-        self.live_session = None;
+        if let Some(previous) = self.live_session.take() {
+            self.live_session_cache
+                .insert(previous.session_id().to_owned(), previous);
+        }
         self.sidebar.clear_selection();
         EventResult::REDRAW
     }
@@ -4332,10 +4458,32 @@ impl ActionComponent for SessionScreen {
             if navigation.handled {
                 return navigation;
             }
-            return self
+            let transcript = self
                 .live_session
                 .as_mut()
                 .map_or(EventResult::IGNORED, |live| live.handle_action(action));
+            if transcript.handled {
+                return transcript;
+            }
+            let signal = self
+                .live_session
+                .as_mut()
+                .map_or(EditorSignal::None, |live| {
+                    live.handle_composer_action(action)
+                });
+            return match signal {
+                EditorSignal::None => EventResult::IGNORED,
+                EditorSignal::Submit(text) => self.submit_live_to_driver(text),
+                EditorSignal::Copy(text) => self.copy(text),
+                EditorSignal::OpenExternalEditor => {
+                    self.toasts.push(Toast::warning(
+                        "the external editor is not available for an attached child draft",
+                    ));
+                    EventResult::REDRAW
+                }
+                EditorSignal::Changed => EventResult::REDRAW,
+                EditorSignal::Paste => self.paste_into_live_from_clipboard(),
+            };
         }
         if self.transcript_full {
             if matches!(action.name, "messages_transcript" | "session_interrupt") {

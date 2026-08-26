@@ -192,6 +192,16 @@ identity, then every live `TurnEvent`. The TUI folds those records into a per-se
 model and attaches views to that model. Switching the visible session never remounts or
 aborts the parent or a sibling host.
 
+An attached native child is also an independent input target. The TUI sends its durable
+session id with the submission instead of routing the text through the parent transcript.
+The child inbox commits the text before delivery. A running child receives a soft steer;
+an idle or completed child acquires a run lease and reopens a `TurnHost` with the resolved
+Agent, model, effort, and inherited orchestration identity captured for that child. The
+`SessionWakeCoordinator` closes the active-to-idle race, so input that misses the running
+turn remains pending and starts the next child turn. Delivery belongs to the workspace
+supervisor and is cancelled with that lifecycle. A direct child continuation updates only
+the child session; it does not fabricate a report or another input for the parent.
+
 Permission attribution comes from immutable coordinates captured by `ToolContext`, not
 from a broker-wide current-session slot. A root or child request therefore carries the
 session, assistant message, and provider call that raised it through every rule and human

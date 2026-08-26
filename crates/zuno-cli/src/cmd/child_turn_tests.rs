@@ -238,6 +238,165 @@ struct RecordingWake {
     failure: Mutex<Option<String>>,
 }
 
+#[derive(Default)]
+struct PromotingInputDriver {
+    inbox: Option<zuno_db::inbox::SessionInbox>,
+    seen: Mutex<Vec<zuno_db::inbox::SessionInput>>,
+}
+
+impl PromotingInputDriver {
+    fn new(inbox: zuno_db::inbox::SessionInbox) -> Self {
+        Self {
+            inbox: Some(inbox),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl zuno_engine::wake::PendingInputDriver for PromotingInputDriver {
+    async fn drive(
+        &self,
+        input: zuno_db::inbox::SessionInput,
+        _guard: zuno_engine::status::SessionRunGuard,
+    ) -> Result<(), String> {
+        self.seen
+            .lock()
+            .expect("seen input lock")
+            .push(input.clone());
+        self.inbox
+            .as_ref()
+            .expect("fixture inbox")
+            .promote_id(&input.session_id, &input.id)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+fn interactive_input_fixture() -> (
+    Arc<zuno_db::pool::Pool>,
+    zuno_db::inbox::SessionInbox,
+    BackgroundJobSupervisor,
+) {
+    let pool = Arc::new(
+        zuno_db::pool::Pool::open(&DbLocation::Memory).expect("open interactive input database"),
+    );
+    {
+        let mut connection = pool.get().expect("interactive input connection");
+        zuno_db::migration::apply(&mut connection).expect("migrate interactive input database");
+        connection
+            .execute_batch(
+                "INSERT INTO project \
+                   (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-interactive-child', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, \
+                    time_created, time_updated) \
+                 VALUES ('ses_parent', 'project-interactive-child', 'parent', \
+                         '/workspace', 'parent', '1', 1, 1);
+                 INSERT INTO session \
+                   (id, project_id, parent_id, slug, directory, title, version, \
+                    time_created, time_updated) \
+                 VALUES ('ses_child', 'project-interactive-child', 'ses_parent', 'child', \
+                         '/workspace', 'child', '1', 1, 1);",
+            )
+            .expect("seed interactive child sessions");
+    }
+    let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&pool));
+    (pool, inbox, BackgroundJobSupervisor::default())
+}
+
+#[tokio::test]
+async fn interactive_child_input_targets_only_the_child_and_steers_an_active_turn() {
+    let (pool, inbox, jobs) = interactive_input_fixture();
+    let runs = zuno_engine::status::SessionRunRegistry::new();
+    let guard = runs
+        .begin_turn("ses_child")
+        .expect("the child turn is active");
+    let driver = Arc::new(PromotingInputDriver::new(inbox.clone()));
+    let input = InteractiveChildInput::with_driver(pool, runs, jobs.clone(), driver);
+
+    let input_id = input
+        .submit_text(
+            "ses_child",
+            serde_json::json!({
+                "kind": "tuiPrompt",
+                "submission": {
+                    "kind": "steer",
+                    "data": {"kind": "text", "data": "change direction"}
+                }
+            }),
+            "change direction".to_owned(),
+        )
+        .expect("admit interactive child input");
+
+    assert!(
+        inbox
+            .pending("ses_parent")
+            .expect("parent inbox")
+            .is_empty(),
+        "the child composer leaked its message into the parent inbox"
+    );
+    let pending = inbox.pending("ses_child").expect("child inbox");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, input_id);
+    assert_eq!(pending[0].delivery, zuno_db::inbox::InputDelivery::Steer);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !guard.soft_interrupt_signal().is_set() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the supervised delivery task must steer the active child");
+    let delivered = guard.take_soft_interrupts_at_safe_point();
+    assert_eq!(delivered.messages.len(), 1);
+    assert_eq!(delivered.messages[0].content, "change direction");
+    assert_eq!(
+        delivered.messages[0].source,
+        zuno_engine::interrupt::SoftInterruptSource::User
+    );
+    drop(guard);
+    jobs.wait_all().await;
+}
+
+#[tokio::test]
+async fn interactive_child_input_reopens_an_idle_child_through_the_pending_driver() {
+    let (pool, inbox, jobs) = interactive_input_fixture();
+    let runs = zuno_engine::status::SessionRunRegistry::new();
+    let driver = Arc::new(PromotingInputDriver::new(inbox.clone()));
+    let input = InteractiveChildInput::with_driver(pool, runs, jobs.clone(), driver.clone());
+
+    let input_id = input
+        .submit_text(
+            "ses_child",
+            serde_json::json!({
+                "kind": "tuiPrompt",
+                "submission": {
+                    "kind": "steer",
+                    "data": {"kind": "text", "data": "continue from here"}
+                }
+            }),
+            "continue from here".to_owned(),
+        )
+        .expect("admit idle child input");
+    jobs.wait_all().await;
+
+    let seen = driver.seen.lock().expect("seen input lock");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].id, input_id);
+    assert_eq!(seen[0].session_id, "ses_child");
+    drop(seen);
+    assert!(inbox.pending("ses_child").expect("child inbox").is_empty());
+    assert_eq!(
+        inbox
+            .get("ses_child", &input_id)
+            .expect("stored input")
+            .expect("input exists")
+            .state,
+        zuno_db::inbox::SubmissionState::Promoted
+    );
+}
+
 impl RecordingWake {
     fn fail_with(&self, error: &str) {
         *self.failure.lock().expect("wake failure lock") = Some(error.to_owned());

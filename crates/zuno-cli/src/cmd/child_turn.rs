@@ -8,6 +8,7 @@
 //! Parent wake-up happens after that commit, so a process loss can delay delivery but
 //! cannot erase the report.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -85,6 +86,7 @@ pub(crate) struct BackgroundJobSupervisor {
     waiter: Arc<tokio::sync::Mutex<()>>,
     changed: ChangeNotifier,
     delegations: DelegationLimiter,
+    children: ChildSessionSpecs,
 }
 
 impl Default for BackgroundJobSupervisor {
@@ -100,7 +102,51 @@ impl Default for BackgroundJobSupervisor {
                 NonZeroUsize::new(usize::from(default_delegations))
                     .expect("the config default delegation limit is non-zero"),
             ),
+            children: ChildSessionSpecs::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ChildSessionSpec {
+    request: ChildTurnRequest,
+    agent: String,
+    model: String,
+    effort: Option<zuno_llm::effort::ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChildSessionSpecs(Arc<Mutex<BTreeMap<String, ChildSessionSpec>>>);
+
+impl ChildSessionSpecs {
+    fn remember(
+        &self,
+        session_id: &str,
+        request: &ChildTurnRequest,
+        agent: &str,
+        model: &str,
+        effort: Option<zuno_llm::effort::ReasoningEffort>,
+    ) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                session_id.to_owned(),
+                ChildSessionSpec {
+                    request: request.clone(),
+                    agent: agent.to_owned(),
+                    model: model.to_owned(),
+                    effort,
+                },
+            );
+    }
+
+    fn get(&self, session_id: &str) -> Option<ChildSessionSpec> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .cloned()
     }
 }
 
@@ -321,6 +367,19 @@ pub(crate) struct ChildSessionContext {
     pub(crate) supervisor: BackgroundJobSupervisor,
 }
 
+/// Dependencies for user-authored input sent directly to an observed child session.
+pub(crate) struct InteractiveChildInputContext {
+    pub(crate) database: Arc<zuno_db::pool::Pool>,
+    pub(crate) environment: StartupEnvironment,
+    pub(crate) directory: PathBuf,
+    pub(crate) approval: Arc<dyn PermissionAsker>,
+    pub(crate) question: Option<Arc<dyn QuestionAsker>>,
+    pub(crate) runs: SessionRunRegistry,
+    pub(crate) mcp: Option<zuno_mcp::Catalog>,
+    pub(crate) observer: Option<Arc<dyn ChildTurnObserver>>,
+    pub(crate) supervisor: BackgroundJobSupervisor,
+}
+
 /// Delegation backed by a real child session and a real turn.
 #[derive(Clone)]
 pub(crate) struct ChildSessionHost {
@@ -346,6 +405,7 @@ impl ChildSessionHost {
             runs: context.runs.clone(),
             mcp: context.mcp.clone(),
             observer: context.observer.clone(),
+            children: context.supervisor.children.clone(),
         });
         let parent_driver: Arc<dyn PendingInputDriver> = Arc::new(ParentReportDriver {
             database: Arc::clone(&pool),
@@ -575,6 +635,7 @@ struct ProductionDelegatedTurnRunner {
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
     observer: Option<Arc<dyn ChildTurnObserver>>,
+    children: ChildSessionSpecs,
 }
 
 #[async_trait]
@@ -599,6 +660,13 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
+        self.children.remember(
+            session_id,
+            request,
+            plan.agent_name(),
+            &plan.qualified_model(),
+            plan.effort(),
+        );
         let parent_attempt = request.parent_attempt.as_deref().ok_or_else(|| {
             "delegated child turn is missing the immutable parent Attempt snapshot".to_owned()
         })?;
@@ -630,6 +698,9 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
                     if let Some(notice) = omission {
                         messages.push(notice);
                     }
+                    messages.push(zuno_tui::views::message::Message::user(
+                        request.prompt.clone(),
+                    ));
                     messages
                 }
                 Err(error) => vec![super::tui_replay::failure_notice(session_id, &error)],
@@ -677,6 +748,275 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
         let shutdown = host.shutdown().await;
         super::turn::finish_with_shutdown(outcome, shutdown)?;
         child_answer(&self.database, session_id)
+    }
+}
+
+/// Durable direct-input path for a child session shown by the TUI.
+#[derive(Clone)]
+pub(crate) struct InteractiveChildInput {
+    database: Arc<zuno_db::pool::Pool>,
+    inbox: SessionInbox,
+    runs: SessionRunRegistry,
+    coordinator: SessionWakeCoordinator,
+    supervisor: BackgroundJobSupervisor,
+    observer: Option<Arc<dyn ChildTurnObserver>>,
+}
+
+impl InteractiveChildInput {
+    pub(crate) fn new(context: InteractiveChildInputContext) -> Self {
+        let inbox = SessionInbox::new(Arc::clone(&context.database));
+        let driver: Arc<dyn PendingInputDriver> = Arc::new(InteractiveChildInputDriver {
+            database: Arc::clone(&context.database),
+            environment: context.environment,
+            directory: context.directory,
+            approval: context.approval,
+            question: context.question,
+            runs: context.runs.clone(),
+            mcp: context.mcp,
+            observer: context.observer.clone(),
+            inbox: inbox.clone(),
+            children: context.supervisor.children.clone(),
+        });
+        let coordinator = SessionWakeCoordinator::new(inbox.clone(), context.runs.clone(), driver);
+        Self {
+            database: context.database,
+            inbox,
+            runs: context.runs,
+            coordinator,
+            supervisor: context.supervisor,
+            observer: context.observer,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_driver(
+        database: Arc<zuno_db::pool::Pool>,
+        runs: SessionRunRegistry,
+        supervisor: BackgroundJobSupervisor,
+        driver: Arc<dyn PendingInputDriver>,
+    ) -> Self {
+        let inbox = SessionInbox::new(Arc::clone(&database));
+        let coordinator = SessionWakeCoordinator::new(inbox.clone(), runs.clone(), driver);
+        Self {
+            database,
+            inbox,
+            runs,
+            coordinator,
+            supervisor,
+            observer: None,
+        }
+    }
+
+    /// Admit one plain-text user message and arrange active steering or idle continuation.
+    pub(crate) fn submit_text(
+        &self,
+        session_id: &str,
+        mut prompt: Value,
+        text: String,
+    ) -> Result<String, String> {
+        if text.trim().is_empty() {
+            return Err("interactive child input cannot be empty".to_owned());
+        }
+        let connection = self.database.open_connection().map_err(to_string)?;
+        let session = zuno_db::session::get(&connection, session_id).map_err(to_string)?;
+        if session.parent_id.is_none() {
+            return Err(format!(
+                "session `{session_id}` is not a child session and cannot receive child input"
+            ));
+        }
+        let object = prompt.as_object_mut().ok_or_else(|| {
+            "interactive child input must persist a structured prompt object".to_owned()
+        })?;
+        object.insert("text".to_owned(), Value::String(text.clone()));
+        let input_id = format!("msg_{}", Uuid::new_v4().simple());
+        let input = self
+            .inbox
+            .admit(NewSessionInput::new(
+                input_id.clone(),
+                session_id,
+                prompt,
+                InputDelivery::Steer,
+                zuno_db::message::now_millis(),
+            ))
+            .map_err(to_string)?;
+
+        let coordinator = self.coordinator.clone();
+        let inbox = self.inbox.clone();
+        let control = self.runs.control(session_id.to_owned());
+        let observer = self.observer.as_ref().map(Arc::clone);
+        let task_session_id = session_id.to_owned();
+        let task_input_id = input_id.clone();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        self.supervisor.spawn(
+            format!("interactive-{input_id}"),
+            session_id.to_owned(),
+            cancellation,
+            async move {
+                let delivery = coordinator.deliver(
+                    &task_session_id,
+                    &task_input_id,
+                    SoftInterruptMessage {
+                        input_id: Some(task_input_id.clone()),
+                        content: text,
+                        images: Vec::new(),
+                        urgent: false,
+                        source: SoftInterruptSource::User,
+                    },
+                );
+                tokio::pin!(delivery);
+                let outcome = tokio::select! {
+                    biased;
+                    () = task_cancellation.cancelled() => {
+                        let _aborted = control.abort();
+                        delivery.await
+                    }
+                    outcome = &mut delivery => outcome,
+                };
+                if let Err(error) = outcome {
+                    let _failed =
+                        inbox.mark_failed(&task_session_id, &task_input_id, error.clone());
+                    if let Some(observer) = observer.as_ref() {
+                        observer.event(
+                            &task_session_id,
+                            &TurnEvent::Provider {
+                                step: 0,
+                                event: zuno_llm::event::StreamEvent::Error {
+                                    message: format!(
+                                        "interactive child input `{task_input_id}` failed: {error}"
+                                    ),
+                                    retry_after: None,
+                                },
+                            },
+                        );
+                    }
+                    tracing::error!(
+                        session_id = %task_session_id,
+                        input_id = %task_input_id,
+                        %error,
+                        "interactive child input failed"
+                    );
+                }
+            },
+        );
+        Ok(input.id)
+    }
+}
+
+struct InteractiveChildInputDriver {
+    database: Arc<zuno_db::pool::Pool>,
+    environment: StartupEnvironment,
+    directory: PathBuf,
+    approval: Arc<dyn PermissionAsker>,
+    question: Option<Arc<dyn QuestionAsker>>,
+    runs: SessionRunRegistry,
+    mcp: Option<zuno_mcp::Catalog>,
+    observer: Option<Arc<dyn ChildTurnObserver>>,
+    inbox: SessionInbox,
+    children: ChildSessionSpecs,
+}
+
+#[async_trait]
+impl PendingInputDriver for InteractiveChildInputDriver {
+    async fn drive(&self, input: SessionInput, guard: SessionRunGuard) -> Result<(), String> {
+        let text = input
+            .prompt
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "interactive child input `{}` has no string `text` field",
+                    input.id
+                )
+            })?
+            .to_owned();
+        let spec = self.children.get(&input.session_id).ok_or_else(|| {
+            format!(
+                "child session `{}` has no process-owned continuation identity",
+                input.session_id
+            )
+        })?;
+        let options = TurnOptions {
+            directory: Some(self.directory.clone()),
+            model: Some(spec.model.clone()),
+            agent: Some(spec.agent.clone()),
+            preset: None,
+            session: SessionChoice::Existing(input.session_id.clone()),
+            title: spec.request.description.clone(),
+            effort: spec.effort,
+            extension_composition: super::turn::ExtensionComposition::Active,
+        };
+        let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
+        if let Some(parent_attempt) = spec.request.parent_attempt.as_deref() {
+            plan.inherit_orchestration(
+                parent_attempt,
+                spec.request.workflow.as_deref(),
+                spec.request.workflow_node.as_deref(),
+            )?;
+        }
+        let mut host = TurnHost::open_with_dependencies(
+            plan,
+            &self.environment,
+            TurnHostDependencies {
+                approval: Arc::clone(&self.approval),
+                question: self.question.clone(),
+                runs: self.runs.clone(),
+                mcp: self.mcp.clone(),
+                database: Arc::clone(&self.database),
+                child_observer: self.observer.clone(),
+            },
+        )
+        .await?;
+        host.activate_extension_composition()?;
+        if let Some(observer) = self.observer.as_ref() {
+            let messages = match host.resumed_history() {
+                Ok(history) => {
+                    let replay = super::tui_replay::project(history);
+                    let omission = replay.omission_notice();
+                    let mut messages = replay.messages;
+                    if let Some(notice) = omission {
+                        messages.push(notice);
+                    }
+                    messages.push(zuno_tui::views::message::Message::user(text.clone()));
+                    messages
+                }
+                Err(error) => {
+                    vec![super::tui_replay::failure_notice(&input.session_id, &error)]
+                }
+            };
+            observer.opened(ChildSessionOpened {
+                session_id: input.session_id.clone(),
+                parent_session_id: spec.request.parent_session_id.clone(),
+                title: host
+                    .session_title()
+                    .map(str::to_owned)
+                    .or_else(|| spec.request.description.clone())
+                    .unwrap_or_else(|| input.session_id.clone()),
+                agent: host.agent_name().to_owned(),
+                model: host.qualified_model(),
+                effort: host.effort_override(),
+                messages,
+                usage: Some(host.session_usage().snapshot()),
+            });
+        }
+        let promoted = self
+            .inbox
+            .promote_id(&input.session_id, &input.id)
+            .map_err(to_string)?;
+        if promoted.is_none() {
+            return host.shutdown().await;
+        }
+        let outcome = drive_and_drain(
+            &mut host,
+            &text,
+            Some(input.id.as_str()),
+            Some(guard),
+            input.session_id.as_str(),
+            self.observer.clone(),
+        )
+        .await;
+        let shutdown = host.shutdown().await;
+        super::turn::finish_with_shutdown(outcome, shutdown)
     }
 }
 

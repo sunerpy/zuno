@@ -319,6 +319,21 @@ Use background delegation for independent research or long-running work. Keep a
 dependency on the critical path in the foreground unless the parent has other
 useful work and can reliably consume a later report.
 
+## Interacting with an attached child
+
+The TUI treats each observed native child as a complete session surface rather than a
+details popup. Use `Ctrl+X Down` to enter the first direct child, `Ctrl+X Left` or
+`Ctrl+X Right` to cycle siblings, and `Ctrl+X Up` to return to the parent. Each child keeps
+its own composer draft while navigation changes the visible session.
+
+Pressing Enter in a running child admits the text to that child's durable inbox and steers
+its active turn. Pressing Enter after the child settles admits a continuation and wakes the
+same child identity with its resolved Agent, model, effort, permissions, and orchestration
+lineage. Child text is literal: slash-looking input such as `/help` is sent to the child and
+is not executed as a root TUI command. This direct conversation path is available only for
+native child sessions attached to the current Zuno process; product-agent invocations and
+workflow projections are not presented as resumable child conversations.
+
 ## Depth, permissions, and capacity
 
 Top-level `subagent_depth` defaults to `1`. It is a hop ceiling, not a grant.
