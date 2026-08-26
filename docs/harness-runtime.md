@@ -240,10 +240,19 @@ Supplying arguments loads the Skill first and then admits the exact canonical
 slash text as user input. Real commands always win; ambiguous names remain
 available through `/skills` and source-qualified `skill` operations.
 
+Reusable workflows belong in Skills by default. A Markdown command remains useful
+for a literal prompt template or a short argument-expansion macro, but it has no
+resource bundle, implicit trigger, or authority of its own. The first-party
+`ui-design` workflow is a Skill and therefore receives a direct slash entry while
+its name remains unambiguous. Named organization-specific review and release policy
+is user owned: users may define `dual-review`, `auto-release`, or other named Skills
+in global or project Skill roots, but Zuno does not compile those policy bodies into
+the binary. The generic `balanced-review` council remains a reusable synthesis
+primitive and does not prescribe either workflow.
+
 ### Repository instruction initialization
 
-The command registry always seeds two Zuno instruction workflows before
-`/review`:
+The command registry seeds two Zuno instruction workflows:
 
 - `/init [focus...]` creates or improves the repository-root `AGENTS.md`. It is
   the compact choice for a repository whose guidance does not need scoped

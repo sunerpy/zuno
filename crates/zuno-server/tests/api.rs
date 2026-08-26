@@ -2535,6 +2535,60 @@ async fn api_init_deep_command_is_native_project_scoped_and_hierarchical() {
 }
 
 #[tokio::test]
+async fn api_user_review_command_keeps_the_users_template() {
+    let (root, directory) = fs_fixture();
+    let command_directory = std::path::Path::new(&directory).join(".zuno/command");
+    std::fs::create_dir_all(&command_directory).expect("create project command directory");
+    std::fs::write(
+        command_directory.join("review.md"),
+        "USER-OWNED REVIEW $ARGUMENTS\n",
+    )
+    .expect("write user-owned review command");
+    let state = ApiState::memory(directory)
+        .expect("API state")
+        .with_env(isolated_env(root.path()));
+
+    let (status, body) = fs_body(state, "/api/command").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).expect("command body is JSON");
+    let review = json["data"]
+        .as_array()
+        .expect("commands are an array")
+        .iter()
+        .find(|entry| entry["name"] == "review")
+        .expect("the user-owned review command is present");
+
+    assert_eq!(review["template"], "USER-OWNED REVIEW $ARGUMENTS");
+}
+
+#[tokio::test]
+async fn api_user_init_command_can_override_the_builtin_template() {
+    let (root, directory) = fs_fixture();
+    let command_directory = std::path::Path::new(&directory).join(".zuno/command");
+    std::fs::create_dir_all(&command_directory).expect("create project command directory");
+    std::fs::write(
+        command_directory.join("init.md"),
+        "USER-OWNED INIT $ARGUMENTS\n",
+    )
+    .expect("write user-owned init command");
+    let state = ApiState::memory(directory)
+        .expect("API state")
+        .with_env(isolated_env(root.path()));
+
+    let (status, body) = fs_body(state, "/api/command").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).expect("command body is JSON");
+    let init = json["data"]
+        .as_array()
+        .expect("commands are an array")
+        .iter()
+        .find(|entry| entry["name"] == "init")
+        .expect("the user-owned init command is present");
+
+    assert_eq!(init["template"], "USER-OWNED INIT $ARGUMENTS");
+}
+
+#[tokio::test]
 async fn api_agent_roster_is_the_resolved_native_set() {
     let (root, directory) = fs_fixture();
     let state = ApiState::memory(directory)

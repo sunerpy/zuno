@@ -74,8 +74,8 @@ fn builtins_seed_the_registry() {
 
     assert_eq!(
         registry.names().collect::<Vec<_>>(),
-        vec!["init", "init-deep", "review"],
-        "the native initialization commands precede review"
+        vec!["init", "init-deep"],
+        "only commands with concrete generic-host execution are registered"
     );
 }
 
@@ -183,23 +183,6 @@ fn builtin_init_deep_interpolates_worktree_and_user_arguments() {
 }
 
 #[test]
-fn builtin_review_runs_as_a_subtask() {
-    let registry = Registry::build(&Sources::new(WORKTREE));
-    let review = registry.get("review").expect("review is built in");
-
-    assert_eq!(
-        review.description.as_deref(),
-        Some("review changes [commit|branch|pr], defaults to uncommitted")
-    );
-    assert_eq!(
-        review.subtask,
-        Some(true),
-        "command/index.ts:86, and observed as subtask=True on the real binary"
-    );
-    assert_eq!(review.hints, vec!["$ARGUMENTS".to_owned()]);
-}
-
-#[test]
 fn builtin_init_interpolates_the_worktree_exactly_once() {
     let registry = Registry::build(&Sources::new(WORKTREE));
     let template = text_of(registry.get("init").expect("init is built in"));
@@ -220,53 +203,34 @@ fn builtin_init_interpolates_the_worktree_exactly_once() {
     );
 }
 
-#[test]
-fn builtin_review_has_no_worktree_placeholder() {
-    let registry = Registry::build(&Sources::new(WORKTREE));
-    let template = text_of(registry.get("review").expect("review is built in"));
-
-    assert_eq!(
-        template, TEMPLATE_REVIEW,
-        "review.txt has no ${{path}}, so its substitution is a no-op"
-    );
-    // Observed on the real binary: 4704 characters.
-    assert_eq!(template.chars().count(), 4704);
-}
-
 // ---------------------------------------------------------------------------
 // Level 2 — config commands
 // ---------------------------------------------------------------------------
 
 #[test]
 fn config_command_overrides_a_builtin() {
-    let cfg = config(&[(
-        "review",
-        described("CONFIG REVIEW $ARGUMENTS", "CONFIG DESC"),
-    )]);
+    let cfg = config(&[("init", described("CONFIG INIT $ARGUMENTS", "CONFIG DESC"))]);
     let registry = Registry::build(&Sources::new(WORKTREE).with_config(Some(&cfg)));
-    let review = registry.get("review").expect("review resolves");
+    let init = registry.get("init").expect("init resolves");
 
-    assert_eq!(text_of(review), "CONFIG REVIEW $ARGUMENTS");
-    assert_eq!(review.description.as_deref(), Some("CONFIG DESC"));
-    assert_eq!(
-        review.subtask, None,
-        "the config entry replaces the built-in wholesale, losing subtask=true"
-    );
+    assert_eq!(text_of(init), "CONFIG INIT $ARGUMENTS");
+    assert_eq!(init.description.as_deref(), Some("CONFIG DESC"));
+    assert_eq!(init.subtask, None);
 }
 
 #[test]
 fn overriding_a_builtin_keeps_its_listing_position() {
     let cfg = config(&[
         ("zzz", entry("LAST")),
-        ("review", entry("OVERRIDE")),
+        ("init", entry("OVERRIDE")),
         ("aaa", entry("MIDDLE")),
     ]);
     let registry = Registry::build(&Sources::new(WORKTREE).with_config(Some(&cfg)));
 
     assert_eq!(
         registry.names().collect::<Vec<_>>(),
-        vec!["init", "init-deep", "review", "zzz", "aaa"],
-        "review stays in slot 2 where the built-in put it"
+        vec!["init", "init-deep", "zzz", "aaa"],
+        "overriding init preserves the built-in listing position"
     );
 }
 
@@ -335,7 +299,7 @@ fn mcp_prompt_overrides_a_config_command() {
     assert!(matches!(resolved.template, Template::Mcp(_)));
     assert_eq!(
         registry.len(),
-        4,
+        3,
         "the collision replaces rather than duplicating"
     );
 }
@@ -436,13 +400,13 @@ fn skill_never_overrides_a_config_command() {
     );
     assert_eq!(
         registry.len(),
-        4,
+        3,
         "the skill is dropped entirely, not listed twice"
     );
 }
 
 #[test]
-fn skill_never_overrides_a_builtin() {
+fn skills_never_override_builtins_and_review_remains_user_owned() {
     let skills = [
         skill("init", "SKILL BODY init"),
         skill("init-deep", "SKILL BODY init-deep"),
@@ -462,10 +426,17 @@ fn skill_never_overrides_a_builtin() {
         Source::Command
     );
     assert_eq!(
-        registry.get("review").expect("review resolves").source,
-        Source::Command
+        registry
+            .get("review")
+            .expect("user review skill resolves")
+            .source,
+        Source::Skill
     );
-    assert_eq!(registry.len(), 3, "all colliding skills are dropped");
+    assert_eq!(
+        registry.len(),
+        3,
+        "only the two built-in collisions are dropped"
+    );
 }
 
 #[test]
@@ -484,7 +455,7 @@ fn skill_never_overrides_an_mcp_prompt() {
         Source::Mcp,
         "observed on the real binary: a skill named srv:noargs vanished"
     );
-    assert_eq!(registry.len(), 4);
+    assert_eq!(registry.len(), 3);
 }
 
 #[test]
@@ -661,10 +632,10 @@ fn resolving_an_unknown_name_names_the_alternatives() {
         .expect_err("an unknown command fails");
     let CommandError::NotFound { name, available } = &error;
     assert_eq!(name, "missing");
-    assert_eq!(available, &["init", "init-deep", "review", "known"]);
+    assert_eq!(available, &["init", "init-deep", "known"]);
     assert_eq!(
         error.to_string(),
-        "Command not found: \"missing\". Available commands: init, init-deep, review, known"
+        "Command not found: \"missing\". Available commands: init, init-deep, known"
     );
 }
 
@@ -1012,5 +983,5 @@ fn js_replace_all_leaves_capture_references_alone() {
 fn a_registry_is_never_empty() {
     let registry = Registry::build(&Sources::new(WORKTREE));
     assert!(!registry.is_empty());
-    assert_eq!(registry.len(), 3);
+    assert_eq!(registry.len(), 2);
 }

@@ -522,6 +522,32 @@ picker or the typed `skill` tool with an exact source instead. The current
 `worktree` Skill performs preflight guidance only. Worktree creation, leases,
 cleanup, and quota enforcement remain runtime services planned separately.
 
+## Reusable workflows: Skills and Markdown commands
+
+Use a Skill for reusable guidance, implicit trigger matching, scripts, references,
+assets, or a workflow that must be fully loaded before action. A unique Skill is
+already available explicitly as `/<skill-name>`, so a second command file is not
+needed merely to add a slash entry.
+
+Product- and organization-specific workflows remain user owned. For example,
+define `dual-review` or `auto-release` under a global
+`~/.config/zuno/skills/<name>/SKILL.md` or project `.zuno/skills/<name>/SKILL.md`
+when that policy is wanted. Zuno supplies the discovery, source identity,
+permission filtering, resource loading, and direct slash entry; it does not ship
+either policy body or assume a reviewer, release process, remote authority, gate
+set, or publication target. The generic built-in `balanced-review` council is only
+a reusable multi-seat synthesis primitive; it is not either named workflow.
+
+Use a Markdown command only for a literal prompt template or argument macro. Zuno
+loads `command/**/*.md` and `commands/**/*.md` recursively from its global config
+directory and every project `.zuno` config directory. Frontmatter supplies command
+metadata; the body supports `$ARGUMENTS` and positional parameters. Commands never
+grant tools or bypass Agent permissions, and a real command wins a same-name Skill
+collision. Built-in `/init` and `/init-deep` remain native commands because the
+generic command host can execute their templates. Zuno does not register a
+built-in `/review`; a user may provide a `review` Skill or command with the exact
+semantics their project needs.
+
 ## Memory learning
 
 Resident memory is enabled by default, but model and reflection writes enter an

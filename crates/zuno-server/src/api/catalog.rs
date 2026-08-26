@@ -34,7 +34,7 @@ use zuno_permission::rules_from_config;
 use super::error::ApiError;
 use super::state::ApiState;
 
-/// The HTTP system prompts and built-in command templates.
+/// The HTTP system prompts.
 ///
 /// # Why these bytes live here rather than in `zuno-catalog`
 ///
@@ -49,10 +49,6 @@ mod v2 {
     pub const PROMPT_TITLE: &str = include_str!("v2/agent-title.txt");
     /// Summary-agent prompt.
     pub const PROMPT_SUMMARY: &str = include_str!("v2/agent-summary.txt");
-    /// Repository-initialization command.
-    pub const COMMAND_INITIALIZE: &str = include_str!("v2/command-initialize.txt");
-    /// Review command.
-    pub const COMMAND_REVIEW: &str = include_str!("v2/command-review.txt");
 }
 
 /// The V2 system prompt for a native agent, when V2 declares one.
@@ -620,24 +616,26 @@ pub async fn commands(
 ) -> Result<LocationEnvelope<Vec<CommandInfo>>, ApiError> {
     let resolved = Resolution::open(&state)?;
     let project_directory = state.project_directory().to_owned();
-    let sources =
-        command::Sources::new(&project_directory).with_config(resolved.config.command.as_ref());
+    let configured = command::load_map(
+        &resolved.directory,
+        resolved.worktree.as_deref(),
+        state.env(),
+    )
+    .map_err(|error| ApiError::ConfigInvalid(error.report()))?;
+    let sources = command::Sources::new(&project_directory).with_config(Some(&configured));
     let registry = command::Registry::build(&sources);
     let data = registry
         .list()
         .map(|info| CommandInfo {
             name: info.name.clone(),
-            template: match v2_command_template(&info.name, &project_directory) {
-                Some(template) => template,
-                None => match &info.template {
-                    command::Template::Text(text) => text.clone(),
-                    // An MCP template is one round trip away from being text and
-                    // this operation is read-only, so it is reported by reference
-                    // rather than fetched inside a GET.
-                    command::Template::Mcp(template) => {
-                        format!("{}/{}", template.client, template.prompt)
-                    }
-                },
+            template: match &info.template {
+                command::Template::Text(text) => text.clone(),
+                // An MCP template is one round trip away from being text and
+                // this operation is read-only, so it is reported by reference
+                // rather than fetched inside a GET.
+                command::Template::Mcp(template) => {
+                    format!("{}/{}", template.client, template.prompt)
+                }
             },
             description: info.description.clone(),
             agent: info.agent.clone(),
@@ -670,21 +668,6 @@ async fn load_skills(options: SkillOptions) -> Result<zuno_catalog::skill::Skill
     .map_err(|error| ApiError::CatalogUnavailable(error.to_string()))?
 }
 
-/// A V2 template override for the two upstream-shaped built-ins.
-///
-/// `plugin/command.ts:14-21` replaces the literal `${path}` with
-/// `location.project.directory` — the **project** root, which is `/` outside a
-/// repository, not the session directory. Substituting the session directory would
-/// put a path in the prompt that the model would then treat as the repository root.
-fn v2_command_template(name: &str, project_directory: &str) -> Option<String> {
-    let template = match name {
-        "init" => v2::COMMAND_INITIALIZE,
-        "review" => v2::COMMAND_REVIEW,
-        _ => return None,
-    };
-    Some(template.replacen("${path}", project_directory, 1))
-}
-
 /// `GET /api/skill` — discovered skill metadata.
 ///
 /// # Errors
@@ -701,8 +684,13 @@ pub async fn skills(
     );
     let loaded = load_skills(options).await?;
     let project_directory = state.project_directory().to_owned();
-    let command_sources =
-        command::Sources::new(&project_directory).with_config(resolved.config.command.as_ref());
+    let configured = command::load_map(
+        &resolved.directory,
+        resolved.worktree.as_deref(),
+        state.env(),
+    )
+    .map_err(|error| ApiError::ConfigInvalid(error.report()))?;
+    let command_sources = command::Sources::new(&project_directory).with_config(Some(&configured));
     let command_registry = command::Registry::build(&command_sources);
     let slash_sources = loaded
         .slash_invokable(command_registry.list().map(|command| command.name.as_str()))
