@@ -515,14 +515,20 @@ locations visible to a session. A generic prompt such
 as "follow skill guidance" does not select every skill; a skill is loaded only
 when its name is explicit or its description clearly matches the request.
 
-Zuno also compiles eight original first-party Skills into the
-`zuno-orchestration` pack: `customize-zuno`, `deepwork`, `codemap`,
+Zuno also compiles nine original first-party Skills into the
+`zuno-orchestration` pack: `customize-zuno`, `develop-zuno`, `deepwork`, `codemap`,
 `verification-planning`, `reflect`, `worktree`, `git-workflow`, and `ui-design`.
 Each has a stable
 `builtin://zuno-orchestration/...` source, content hash, provenance, allowed
 Agent profiles, and required-tool declaration. The active profile and its
 declared tool visibility filter the advertised set; selecting a Skill can never
 widen the runtime capability snapshot.
+
+These resources are compiled into the executable and published into the Skill
+catalog when the first-party profile mounts; Zuno does not copy them into the
+user configuration directory. `develop-zuno` helps choose among configuration,
+Agent Markdown, a user-owned Skill or command, an `extension.json` package, and
+a native Rust extension point. It grants no tools or authority.
 
 An unambiguous Skill that does not collide with a real command is directly
 invokable as `/<skill-name>`. Zuno resolves that exact advertised source and

@@ -5,8 +5,9 @@ use zuno_orchestration::{
     COUNCILS, PACK_ID, PACK_VERSION, SKILLS, council, councils, pack, skill, skills,
 };
 
-const EXPECTED_NAMES: [&str; 8] = [
+const EXPECTED_NAMES: [&str; 9] = [
     "customize-zuno",
+    "develop-zuno",
     "deepwork",
     "codemap",
     "verification-planning",
@@ -216,5 +217,29 @@ fn reusable_design_method_is_a_skill_but_product_workflows_remain_user_owned() {
     assert!(
         design.content.contains("visual evidence"),
         "the design workflow must require runtime evidence rather than source-only confidence"
+    );
+}
+
+#[test]
+fn develop_zuno_is_embedded_guidance_not_a_product_workflow_or_cli_command() {
+    let development = skill("develop-zuno").expect("develop-zuno descriptor");
+    assert!(development.content.contains("extension.json"));
+    assert!(development.content.contains("SKILL.md"));
+    assert!(development.content.contains("agent/"));
+    assert!(development.content.contains("docs/plugins.md"));
+    assert!(development.content.contains("github.com/sunerpy/zuno"));
+    assert!(development.content.contains("not a CLI command"));
+    assert!(development.content.contains("user-owned"));
+    assert!(development.content.contains("static tools"));
+    assert!(development.content.contains("Provider transports"));
+    assert!(
+        development
+            .content
+            .contains("remain native Rust extension points")
+    );
+    assert!(
+        !development
+            .content
+            .contains("register tools, hooks, providers")
     );
 }

@@ -9,6 +9,11 @@ Use this runtime only when the tool needs a normal host executable or an API
 that a bounded WASI component cannot expose. A process plugin is a trusted
 tool adapter, not a general replacement for native Zuno components.
 
+Start with the built-in `/develop-zuno` Skill when authoring from an interactive
+session. It selects among configuration, Agent Markdown, Skills, declarative
+packages, WASI, trusted process tools, and native Rust, then points back to this
+guide. The Skill does not grant any runtime capability.
+
 ## Choose the correct extension tier
 
 Before writing a process host, decide who must own the behavior:

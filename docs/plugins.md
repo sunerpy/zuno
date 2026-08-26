@@ -15,6 +15,10 @@ Compiled first-party or deployment-owned Rust behavior remains a native
 load Rust dynamic libraries: Rust has no stable plugin ABI, and unloading a
 library cannot prove that its threads, callbacks, or borrowed values are gone.
 
+The built-in `/develop-zuno` Skill helps choose this extension tier and links
+the current authoring references. It is guidance only: loading it does not grant
+plugin capabilities, tools, filesystem access, or permission bypasses.
+
 ## Install and inspect packages
 
 Project packages live below `.zuno/extensions`; global packages live below the

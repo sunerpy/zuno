@@ -533,6 +533,28 @@ question. Use a workflow DAG when seats have different prompts or dependencies.
 Use direct `task` calls when the orchestrator should adaptively decide whether
 delegation is useful.
 
+## First-party Skills and slash entry points
+
+The resources in `crates/zuno-orchestration/src/skills` are embedded Skill
+descriptors and Markdown bodies. They are not CLI subcommands and are not copied
+into the user's config directory during installation. Mounting the first-party
+profile publishes them into the same immutable catalog as user and extension
+Skills, with source identity, digest, profile visibility, and required-tool
+metadata.
+
+When one advertised Skill name is unambiguous and does not collide with a real
+command, the TUI exposes it directly as `/<skill-name>`. The slash entry loads
+the selected Skill before the next model request; it does not create a second
+host-side command handler. Ambiguous names remain selectable through the Skill
+picker or typed `skill` tool.
+
+`/develop-zuno` is the first-party authoring guide for deciding whether a change
+belongs in configuration, Agent Markdown, a user-owned Skill or command, an
+`extension.json` package, or native Rust. It links the repository's current
+configuration, plugin, process-plugin, orchestration, and runtime contracts.
+User-specific policies such as `dual-review` and `auto-release` remain external
+Skills or commands; Zuno does not compile those workflows into the product.
+
 ## TUI and CLI controls
 
 In the TUI:

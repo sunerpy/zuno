@@ -923,6 +923,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "customize-zuno",
+                "develop-zuno",
                 "deepwork",
                 "codemap",
                 "verification-planning",

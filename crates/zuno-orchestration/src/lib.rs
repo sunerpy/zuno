@@ -168,7 +168,7 @@ const NATIVE_PROVENANCE: SkillProvenance = SkillProvenance {
 };
 
 /// Every Skill shipped by the first-party pack, in stable presentation order.
-pub const SKILLS: [BuiltinSkillDescriptor; 8] = [
+pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
     BuiltinSkillDescriptor {
         name: "customize-zuno",
         description: "Inspect or change Zuno configuration, providers, authentication, permissions, Agents, workflows, Skills, MCP servers, or extensions.",
@@ -178,6 +178,17 @@ pub const SKILLS: [BuiltinSkillDescriptor; 8] = [
         allowed_profiles: USER_FACING_PROFILES,
         required_tools: &["read", "glob", "grep"],
         content_sha256: "b20e2eb8c99ea75982de36ad0b49181099dff467420de83aef0cbd86342b554d",
+        provenance: NATIVE_PROVENANCE,
+    },
+    BuiltinSkillDescriptor {
+        name: "develop-zuno",
+        description: "Design or implement native Zuno configuration, Agents, Skills, providers, MCP integrations, extension plugins, or runtime extension points.",
+        content: include_str!("skills/develop-zuno.md"),
+        source_id: "zuno-orchestration:skill/develop-zuno@0.1.0",
+        location: "builtin://zuno-orchestration/0.1.0/develop-zuno",
+        allowed_profiles: USER_FACING_PROFILES,
+        required_tools: &["read", "glob", "grep"],
+        content_sha256: "f1c142dcefd8bdeae79d3d8755d7be3c45a226ab5d4408d542aa4d3805d9ae12",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
