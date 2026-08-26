@@ -93,6 +93,18 @@ impl Definition {
     pub fn is_leader(&self) -> bool {
         self.name == LEADER
     }
+
+    /// Whether this action earns its own row in the pending-prefix help overlay.
+    ///
+    /// Numeric session slots remain real bindings, but nine copies of the same
+    /// "switch to slot" sentence crowd out the distinct actions a user opens
+    /// which-key to discover. The digits are already self-describing once a user
+    /// knows quick slots exist, so keep them executable without advertising each
+    /// slot as a separate command.
+    #[must_use]
+    pub fn show_in_which_key(&self) -> bool {
+        !self.name.starts_with("session_quick_switch_")
+    }
 }
 
 /// The keys this build gives to actions upstream ships with no key at all.
@@ -892,14 +904,9 @@ impl Keymap {
     /// than listed twice. Empty while nothing is pending — the question it answers is
     /// "I pressed the leader, what now?".
     ///
-    /// # The order is load-bearing, and it is not alphabetical
-    ///
     /// Rows come back in scope-precedence order and, within a scope, in [`DEFINITIONS`]
-    /// order. Sorting by spelling was tried and reverted: it puts `1`-`9` first, and the
-    /// leader's nine `session_quick_switch_*` rows then fill a narrow panel with nine lines of
-    /// `Switch to session in quick slot N` while `List all sessions` and
-    /// `Create a new session` fall past the cut. A caller that re-sorts this reintroduces
-    /// that, so [`crate::views::autocomplete`] has a test holding the order.
+    /// order. Actions whose definitions opt out of which-key remain resolvable but do
+    /// not consume overlay rows.
     #[must_use]
     pub fn continuations(&self, scopes: &[&str]) -> Vec<Continuation> {
         let prefix = self.pending();
@@ -912,6 +919,9 @@ impl Keymap {
         for scope in scopes {
             for binding in self.scopes.get(scope).into_iter().flatten() {
                 if !starts_with(&binding.sequence, prefix) {
+                    continue;
+                }
+                if !binding.definition.show_in_which_key() {
                     continue;
                 }
                 // A sequence already claimed by an earlier scope resolves there, so
@@ -1655,7 +1665,7 @@ pub const DEFINITIONS: &[Definition] = &[
     Definition {
         name: "session_child_cycle",
         scope: "session",
-        keys: "right",
+        keys: "<leader>right",
         command: "session.child.next",
         prevent_default: None,
         description: "Go to next child session",
@@ -1663,7 +1673,7 @@ pub const DEFINITIONS: &[Definition] = &[
     Definition {
         name: "session_child_cycle_reverse",
         scope: "session",
-        keys: "left",
+        keys: "<leader>left",
         command: "session.child.previous",
         prevent_default: None,
         description: "Go to previous child session",
@@ -1671,7 +1681,7 @@ pub const DEFINITIONS: &[Definition] = &[
     Definition {
         name: "session_parent",
         scope: "session",
-        keys: "up",
+        keys: "<leader>up",
         command: "session.parent",
         prevent_default: None,
         description: "Go to parent session",

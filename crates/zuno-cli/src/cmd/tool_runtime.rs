@@ -50,7 +50,7 @@ use zuno_orchestration::CapabilitySnapshot;
 use zuno_paths::Env;
 use zuno_permission::Rule;
 use zuno_permission::visibility::permission_key;
-use zuno_tool::{PermissionAsk, PermissionAsker, Tool, ToolUiIntent, erase};
+use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase};
 use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::question::{QuestionAsker, QuestionTool};
@@ -395,7 +395,12 @@ pub(crate) struct HeadlessApproval;
 
 #[async_trait]
 impl PermissionAsker for HeadlessApproval {
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         let patterns = ask.patterns.join(", ");
         if ask.manual {
             eprintln!(

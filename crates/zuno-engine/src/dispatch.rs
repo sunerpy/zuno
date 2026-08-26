@@ -17,7 +17,7 @@ use zuno_observability::tool::ToolLifecycle;
 use zuno_permission::visibility::{is_tool_visible, permission_key};
 use zuno_permission::{PermissionAction, Rule, evaluate};
 use zuno_tool::{
-    ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, PermissionAsk, PermissionAsker, Tool,
+    ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY, PermissionAsk, PermissionAsker, PermissionOrigin, Tool,
     ToolConcurrencyPolicy, ToolContext, ToolDefinition, ToolOutput, ToolReplayPolicy,
 };
 
@@ -222,14 +222,26 @@ impl ToolDispatcher for ToolRegistryDispatcher {
 
         let ask = permission_ask(resolved_name, &request.call.input)
             .with_tool_effect(tool.effect(&request.call.input));
-        let permission_request = ask.clone().into_request(
-            format!("per_{}", request.call.id),
-            &request.session_id,
-            Some(zuno_permission::ToolCall {
-                message_id: request.message_id.clone(),
-                call_id: request.call.id.clone(),
-            }),
+        let permission = Arc::new(RulePermissionAsker::new(
+            Arc::clone(&self.rules),
+            Arc::clone(&self.approval),
+            self.authorization,
+        ));
+        let permission_for_context: Arc<dyn PermissionAsker> = permission.clone();
+        let mut context = ToolContext::new(
+            request.session_id.clone(),
+            request.message_id.clone(),
+            request.call.id.clone(),
+            request.agent.clone(),
+            permission_for_context,
+            Arc::new(interrupt.clone()),
         );
+        if let Some(snapshot) = request.orchestration_snapshot.as_ref() {
+            context = context.with_orchestration_snapshot(Arc::clone(snapshot));
+        }
+        let permission_request = context
+            .permission_origin()
+            .into_request(format!("per_{}", request.call.id), ask.clone());
         let plugin_permission = match tokio::select! {
             biased;
             () = interrupt.notified() => {
@@ -258,11 +270,6 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                 ),
             );
         }
-        let permission = Arc::new(RulePermissionAsker::new(
-            Arc::clone(&self.rules),
-            Arc::clone(&self.approval),
-            self.authorization,
-        ));
         let gate = tokio::select! {
             biased;
             () = interrupt.notified() => {
@@ -274,7 +281,12 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                     ),
                 );
             }
-            result = permission.gate(resolved_name, ask, plugin_permission) => result,
+            result = permission.gate(
+                context.permission_origin(),
+                resolved_name,
+                ask,
+                plugin_permission,
+            ) => result,
         };
         if let Err(error) = gate {
             return observed_ready(
@@ -283,18 +295,6 @@ impl ToolDispatcher for ToolRegistryDispatcher {
             );
         }
 
-        let permission: Arc<dyn PermissionAsker> = permission;
-        let mut context = ToolContext::new(
-            request.session_id.clone(),
-            request.message_id,
-            request.call.id.clone(),
-            request.agent,
-            permission,
-            Arc::new(interrupt.clone()),
-        );
-        if let Some(snapshot) = request.orchestration_snapshot.as_ref() {
-            context = context.with_orchestration_snapshot(Arc::clone(snapshot));
-        }
         let args = request.call.input.clone();
         let tool_name = resolved_name.to_owned();
         let session_id = request.session_id;
@@ -451,6 +451,7 @@ impl RulePermissionAsker {
     /// user's written prohibition.
     async fn gate(
         &self,
+        origin: PermissionOrigin<'_>,
         tool: &str,
         mut ask: PermissionAsk,
         plugin: PermissionHookDecision,
@@ -461,11 +462,11 @@ impl RulePermissionAsker {
             RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
                 tool: tool.to_owned(),
             }),
-            _ if self.requires_manual(&ask) => self.prompt_manual(tool, ask).await,
+            _ if self.requires_manual(&ask) => self.prompt_manual(origin, tool, ask).await,
             _ if self.authorization.is_allow_all() => Ok(()),
             RuleOutcome::Permitted => Ok(()),
             RuleOutcome::Pending(_) if plugin == PermissionHookDecision::Allow => Ok(()),
-            RuleOutcome::Pending(pending) => self.prompt(tool, ask, pending).await,
+            RuleOutcome::Pending(pending) => self.prompt(origin, tool, ask, pending).await,
         }
     }
 
@@ -479,11 +480,14 @@ impl RulePermissionAsker {
 
     async fn prompt_manual(
         &self,
+        origin: PermissionOrigin<'_>,
         tool: &str,
         ask: PermissionAsk,
     ) -> Result<(), zuno_error::ToolError> {
         let permission = ask.permission.clone();
-        self.approval.ask(tool, ask.require_manual()).await?;
+        self.approval
+            .ask(origin, tool, ask.require_manual())
+            .await?;
         self.approved_permissions
             .lock()
             .expect("approved permission lock")
@@ -493,13 +497,14 @@ impl RulePermissionAsker {
 
     async fn prompt(
         &self,
+        origin: PermissionOrigin<'_>,
         tool: &str,
         mut ask: PermissionAsk,
         pending: Vec<String>,
     ) -> Result<(), zuno_error::ToolError> {
         let approved_patterns = pending.clone();
         ask.patterns = pending;
-        self.approval.ask(tool, ask.clone()).await?;
+        self.approval.ask(origin, tool, ask.clone()).await?;
         let mut approved_once = self.approved_once.lock().expect("approved permission lock");
         approved_once.extend(
             approved_patterns
@@ -518,17 +523,22 @@ fn normalize_patterns(ask: &mut PermissionAsk) {
 
 #[async_trait]
 impl PermissionAsker for RulePermissionAsker {
-    async fn ask(&self, tool: &str, mut ask: PermissionAsk) -> Result<(), zuno_error::ToolError> {
+    async fn ask(
+        &self,
+        origin: PermissionOrigin<'_>,
+        tool: &str,
+        mut ask: PermissionAsk,
+    ) -> Result<(), zuno_error::ToolError> {
         normalize_patterns(&mut ask);
         let outcome = self.evaluate_patterns(&ask);
         match outcome {
             RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
                 tool: tool.to_owned(),
             }),
-            _ if self.requires_manual(&ask) => self.prompt_manual(tool, ask).await,
+            _ if self.requires_manual(&ask) => self.prompt_manual(origin, tool, ask).await,
             _ if self.authorization.is_allow_all() => Ok(()),
             RuleOutcome::Permitted => Ok(()),
-            RuleOutcome::Pending(pending) => self.prompt(tool, ask, pending).await,
+            RuleOutcome::Pending(pending) => self.prompt(origin, tool, ask, pending).await,
         }
     }
 }

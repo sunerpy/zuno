@@ -59,6 +59,8 @@ pub const COLLAPSED_MAX_ROWS: u16 = 15;
 pub struct PermissionDecision {
     /// The request being answered.
     pub request_id: String,
+    /// Session that owns the request.
+    pub session_id: String,
     /// The reply, in the engine's own vocabulary.
     pub reply: ReplyKind,
     /// The rejection message, when the user wrote one.
@@ -460,6 +462,7 @@ impl PermissionPrompt {
     fn decide(&self, reply: ReplyKind, message: Option<String>) -> DialogStep {
         DialogStep::Resolved(DialogOutcome::Permission(PermissionDecision {
             request_id: self.request.id.clone(),
+            session_id: self.request.session_id.clone(),
             reply,
             message,
         }))
@@ -504,6 +507,7 @@ impl PermissionPrompt {
                 Span::styled(self.subject.title.clone(), self.context.text()),
             ]),
         ];
+        lines.extend(self.source_lines(width));
         for row in &self.subject.detail {
             lines.push(padded(&format!("  {row}"), width, self.context.muted()));
         }
@@ -531,6 +535,7 @@ impl PermissionPrompt {
             Span::styled(String::from("△ "), self.context.warning()),
             Span::styled(String::from("Always allow"), self.context.title()),
         ])];
+        lines.extend(self.source_lines(width));
         // `permission.tsx:129-131`: a lone `*` is a blanket grant, and saying so is
         // clearer than printing an asterisk and hoping.
         if self.request.always.len() == 1 && self.request.always[0] == "*" {
@@ -576,7 +581,7 @@ impl PermissionPrompt {
     }
 
     fn reject_lines(&self, width: u16) -> Vec<Line<'static>> {
-        vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled(String::from("△ "), self.context.error()),
                 Span::styled(String::from("Reject permission"), self.context.title()),
@@ -592,7 +597,31 @@ impl PermissionPrompt {
                 width,
                 self.context.element(),
             ),
-        ]
+        ];
+        let source = self.source_lines(width);
+        lines.splice(1..1, source);
+        lines
+    }
+
+    fn source_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = vec![padded(
+            &format!("  Source session: {}", self.request.session_id),
+            width,
+            self.context.muted(),
+        )];
+        if let Some(tool) = &self.request.tool {
+            lines.push(padded(
+                &format!("  Message: {}", tool.message_id),
+                width,
+                self.context.muted(),
+            ));
+            lines.push(padded(
+                &format!("  Tool call: {}", tool.call_id),
+                width,
+                self.context.muted(),
+            ));
+        }
+        lines
     }
 }
 

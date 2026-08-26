@@ -481,12 +481,21 @@ fn tool_status_style_paints_from_the_palette_and_separates_the_terminal_states()
     );
     assert_eq!(
         completed.fg,
+        context.text().fg,
+        "ordinary tool prose should use the terminal's neutral foreground, not a purple accent"
+    );
+    assert_ne!(
+        completed.fg,
         Some(ratatui::style::Color::from(context.palette().accent)),
-        "ordinary completed tools must use the semantic tool accent, not border grey or success green"
+        "ordinary completed tools still inherit the theme accent"
     );
     assert_eq!(
         delegated.fg,
-        Some(ratatui::style::Color::from(context.palette().secondary)),
+        context.muted().fg,
+        "completed delegated work should recede as neutral metadata rather than purple text"
+    );
+    assert_ne!(
+        delegated.fg, completed.fg,
         "delegated work must remain visually distinct from ordinary tools"
     );
 }

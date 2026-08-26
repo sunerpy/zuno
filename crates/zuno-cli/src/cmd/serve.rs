@@ -14,7 +14,7 @@ use zuno_server::{
     ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
     SessionMutationFuture, SessionPromptExecution, events_router,
 };
-use zuno_tool::{PermissionAsk, PermissionAsker};
+use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
 use zuno_tools::question::{QuestionAsker, QuestionOutcome};
 
 use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
@@ -65,13 +65,12 @@ impl ServerSessionMutationExecutor {
             &self.environment,
         )
         .await?;
-        self.open_plan(plan, spec).await
+        self.open_plan(plan).await
     }
 
-    async fn open_plan(&self, plan: TurnPlan, spec: &ServerHostSpec) -> Result<TurnHost, String> {
+    async fn open_plan(&self, plan: TurnPlan) -> Result<TurnHost, String> {
         let approval: Arc<dyn PermissionAsker> = Arc::new(ServerPermissionAsker {
             requests: self.requests.clone(),
-            session_id: spec.session_id.clone(),
         });
         let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker {
             requests: self.requests.clone(),
@@ -129,7 +128,7 @@ impl ServerSessionMutationExecutor {
             }
         };
         plan.use_prepared_extension_transition(prepared)?;
-        let mut candidate = self.open_plan(plan, spec).await?;
+        let mut candidate = self.open_plan(plan).await?;
         candidate.shutdown().await
     }
 }
@@ -191,15 +190,19 @@ fn reserve_pending_extension_transition(
 #[derive(Debug)]
 struct ServerPermissionAsker {
     requests: RequestBroker,
-    session_id: String,
 }
 
 #[async_trait]
 impl PermissionAsker for ServerPermissionAsker {
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        origin: PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         let request = PermissionRequest {
             id: format!("per_{}", Uuid::new_v4().simple()),
-            session_id: self.session_id.clone(),
+            session_id: origin.session_id().to_owned(),
             action: ask.permission,
             resources: ask.patterns,
             save: ask.always,

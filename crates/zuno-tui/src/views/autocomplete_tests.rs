@@ -629,6 +629,33 @@ fn views_which_key_renders_a_key_beside_its_description() {
     );
 }
 
+#[test]
+fn views_which_key_is_a_compact_centered_framed_overlay() {
+    let mut view = which_key(usize::MAX);
+    let buffer = render_offscreen(&mut view, 100, 24).expect("infallible");
+    let rendered = rows(&buffer).join("\n");
+    assert!(
+        rendered.contains("Next key"),
+        "the leader help has no title, so it is visually indistinguishable from transcript          content:\n{rendered}"
+    );
+
+    let corner = (0..buffer.area.height).find_map(|row| {
+        (0..buffer.area.width)
+            .find(|column| buffer[(*column, row)].symbol() == "╭")
+            .map(|column| (column, row))
+    });
+    let (left, top) =
+        corner.unwrap_or_else(|| panic!("the leader help has no visible frame:\n{rendered}"));
+    assert!(
+        left > 0 && top > 0,
+        "the leader help is pinned to the terminal edge instead of floating: {left},{top}"
+    );
+    assert!(
+        view.desired_height(24) < 12,
+        "a wide terminal still receives a half-screen-tall key map instead of packing columns"
+    );
+}
+
 /// The continuation whose description is shortest, so it survives any cell width.
 fn shortest() -> crate::keybind::Continuation {
     let mut all = prefix(usize::MAX).continuations;
@@ -639,37 +666,30 @@ fn shortest() -> crate::keybind::Continuation {
 }
 
 #[test]
-fn views_which_key_shows_distinct_actions_before_interchangeable_ones() {
-    // `continuations` returns table order, and a narrow panel keeps its head. Sorting by
-    // spelling instead puts `1`-`9` first, and a 20-column panel then shows four lines of
-    // `Switch to session in quick slot N` and hides every action a user pressing the
-    // leader is actually looking for. This holds the order that fix depends on.
+fn views_which_key_hides_numeric_quick_slots_without_disabling_them() {
     let entries = prefix(usize::MAX).continuations;
-    let slots = entries
-        .iter()
-        .filter(|entry| entry.definition.name.starts_with("session_quick_switch"))
-        .count();
     assert!(
-        slots >= 9,
-        "the nine quick-slot rows are what make this hazard real; found {slots}"
-    );
-    let first_slot = entries
-        .iter()
-        .position(|entry| entry.definition.name.starts_with("session_quick_switch"))
-        .expect("a quick slot is reachable");
-    assert!(
-        first_slot >= entries.len() - slots,
-        "a quick-slot row appears at index {first_slot} of {}, so the interchangeable \
-         rows are no longer last and a narrow panel will hide the distinct ones",
-        entries.len()
+        entries
+            .iter()
+            .all(|entry| !entry.definition.name.starts_with("session_quick_switch")),
+        "the leader overlay repeated the same quick-slot action once per digit: {entries:#?}"
     );
 
-    let mut view = which_key(usize::MAX);
-    let rendered = rows(&render_offscreen(&mut view, 20, 10).expect("infallible")).join("\n");
-    assert!(
-        !rendered.contains("quick slot"),
-        "the narrowest panel spent all its rows on interchangeable slots:\n{rendered}"
+    let mut keymap = crate::keybind::Keymap::defaults().expect("the shipped table builds");
+    let now = Instant::now();
+    assert_eq!(
+        keymap.resolve(&["session"], keymap.leader(), now),
+        crate::keybind::Resolution::Pending
     );
+    assert!(matches!(
+        keymap.resolve(
+            &["session"],
+            crate::keybind::Chord::parse("1").expect("digit chord"),
+            now
+        ),
+        crate::keybind::Resolution::Action { definition, .. }
+            if definition.name == "session_quick_switch_1"
+    ));
 }
 
 #[test]
@@ -742,6 +762,20 @@ fn views_which_key_counts_what_the_grid_could_not_hold() {
 }
 
 #[test]
+fn views_which_key_keeps_an_action_before_overflow_on_a_short_frame() {
+    let mut view = which_key(32);
+    let rendered = rows(&render_offscreen(&mut view, 40, 6).expect("infallible")).join("\n");
+    assert!(
+        rendered.contains("Export"),
+        "the frame spent its only content row on the overflow count and exposed no action:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("more"),
+        "overflow became silent:\n{rendered}"
+    );
+}
+
+#[test]
 fn views_which_key_pads_by_columns_not_characters() {
     // The bug this view shipped with, and why it survived: `chars().count()` plus
     // `{:<12}` both undercount a CJK glyph by one column each, and the one test that
@@ -788,9 +822,7 @@ fn views_which_key_visual_probe() {
         let mut view = which_key(usize::MAX);
         let rows_wanted = view.desired_height(height);
         println!("(panel takes {rows_wanted} of {height} rows)");
-        for row in
-            rows(&render_offscreen(&mut view, width, rows_wanted.max(1)).expect("infallible"))
-        {
+        for row in rows(&render_offscreen(&mut view, width, height).expect("infallible")) {
             println!("|{}|", row.trim_end());
         }
     }

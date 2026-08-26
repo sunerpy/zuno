@@ -391,6 +391,35 @@ fn theme_system_without_terminal_capabilities_does_not_panic() {
 }
 
 #[test]
+fn theme_system_uses_a_muted_neutral_unordered_list_marker() {
+    let mut registry = ThemeRegistry::new();
+    assert_eq!(
+        registry.refresh_system_theme(&FakePalette(None), None, Mode::Dark),
+        SystemThemeOutcome::Unavailable
+    );
+
+    let palette = registry.resolve(SYSTEM_THEME, Mode::Dark).palette;
+    assert_eq!(
+        palette.markdown_list_item, palette.text_muted,
+        "the system theme's unordered-list marker should support the text instead of          competing with links and actions"
+    );
+    assert_ne!(
+        palette.markdown_list_item, palette.accent,
+        "an unordered bullet should not use the interactive accent colour"
+    );
+
+    assert_eq!(
+        registry.refresh_system_theme(&FakePalette(Some(dark_terminal())), None, Mode::Dark),
+        SystemThemeOutcome::Derived(Mode::Dark)
+    );
+    let derived = registry.resolve(SYSTEM_THEME, Mode::Dark).palette;
+    assert_eq!(
+        derived.markdown_list_item, derived.text_muted,
+        "a terminal-derived system theme must keep the same neutral bullet contract"
+    );
+}
+
+#[test]
 fn theme_system_without_terminal_capabilities_keeps_a_readable_surface_hierarchy() {
     let mut registry = ThemeRegistry::new();
     assert_eq!(

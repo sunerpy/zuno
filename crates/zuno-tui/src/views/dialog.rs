@@ -513,31 +513,15 @@ impl DialogHost {
         &self.pending
     }
 
-    /// Draw the which-key panel across the bottom of `area`, if one is due.
+    /// Draw the centred which-key overlay, if one is due.
     ///
-    /// Above the dialog and below the toast. Above, because a user who pressed the
-    /// leader while a modal was open asked this question most recently and the modal is
-    /// still answering the previous one; below, because `§11.4` puts a toast on top of
-    /// everything and a notice that a copy failed must not be the thing that gets hidden.
+    /// Above the dialog and below the toast. The view owns its content-derived frame so it
+    /// can leave transcript context visible and cannot be clipped against the bottom edge.
     fn render_which_key(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        // Pruned here, before the height is asked for, and that ordering is the whole
-        // correctness of the timeout. `WhichKeyView::render` prunes too, but it is only
-        // reached when `desired_height` returns non-zero — and `desired_height` reports on
-        // an unpruned prefix. So an expired panel kept answering "still active", kept being
-        // drawn, and never pruned: on a real terminal it sat on screen indefinitely after
-        // its 2000 ms wake, which no offscreen test saw because they call `prune` directly.
-        // `ToastLayer` avoids this by being rendered unconditionally every frame.
-        let height = self.which_key.desired_height(area.height);
-        if height == 0 {
-            return;
-        }
-        let region = Rect {
-            x: area.x,
-            y: area.y + area.height.saturating_sub(height),
-            width: area.width,
-            height,
-        };
-        self.which_key.render(frame, region);
+        // Render unconditionally: the view prunes its own deadline before deciding whether
+        // it has a frame. This preserves the wake-driven timeout even when the prefix expired
+        // between two otherwise idle frames.
+        self.which_key.render(frame, area);
     }
 
     fn render_dialog(&mut self, frame: &mut Frame<'_>, area: Rect) {

@@ -531,14 +531,17 @@ async fn prepared_extension_aborts_cleanly_when_session_preparation_fails() {
     let database =
         Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
 
-    let opened = TurnHost::open_with_runtime_mcp_and_database(
+    let opened = TurnHost::open_with_dependencies(
         candidate,
         &environment,
-        Arc::new(zuno_tool::AllowAll),
-        None,
-        SessionRunRegistry::new(),
-        None,
-        database,
+        TurnHostDependencies {
+            approval: Arc::new(zuno_tool::AllowAll),
+            question: None,
+            runs: SessionRunRegistry::new(),
+            mcp: None,
+            database,
+            child_observer: None,
+        },
     )
     .await;
     assert!(opened.is_err(), "missing session prevents host preparation");

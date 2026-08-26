@@ -4,7 +4,7 @@ expression: "theme_sample(&registry, name, Mode::Dark)"
 ---
 "system                    " fg=#e6e6e6 bg=#242830 mod=BOLD
 "primary                   " fg=#00ffff bg=#242830 mod=NONE
-"secondary                 " fg=#ff00ff bg=#242830 mod=NONE
+"secondary                 " fg=#9a9a9a bg=#242830 mod=NONE
 "accent                    " fg=#00ffff bg=#242830 mod=NONE
 "error                     " fg=#ff0000 bg=#242830 mod=NONE
 "warning                   " fg=#ffff00 bg=#242830 mod=NONE
@@ -34,12 +34,12 @@ expression: "theme_sample(&registry, name, Mode::Dark)"
 "markdownHeading           " fg=#e6e6e6 bg=#242830 mod=NONE
 "markdownLink              " fg=#00ffff bg=#242830 mod=NONE
 "markdownLinkText          " fg=#00ffff bg=#242830 mod=NONE
-"markdownCode              " fg=#00ff00 bg=#242830 mod=NONE
+"markdownCode              " fg=#e6e6e6 bg=#242830 mod=NONE
 "markdownBlockQuote        " fg=#ffff00 bg=#242830 mod=NONE
 "markdownEmph              " fg=#ffff00 bg=#242830 mod=NONE
 "markdownStrong            " fg=#e6e6e6 bg=#242830 mod=NONE
 "markdownHorizontalRule    " fg=#4d4d4d bg=#242830 mod=NONE
-"markdownListItem          " fg=#00ffff bg=#242830 mod=NONE
+"markdownListItem          " fg=#9a9a9a bg=#242830 mod=NONE
 "markdownListEnumeration   " fg=#00ffff bg=#242830 mod=NONE
 "markdownImage             " fg=#00ffff bg=#242830 mod=NONE
 "markdownImageText         " fg=#00ffff bg=#242830 mod=NONE

@@ -131,23 +131,58 @@ impl PermissionAsk {
         self.always.clear();
         self
     }
+}
 
-    /// Completes the ask into the request the permission engine evaluates.
+#[derive(Debug, Clone)]
+struct PermissionCoordinates {
+    session_id: String,
+    message_id: String,
+    call_id: String,
+}
+
+/// Trusted coordinates for the tool call that raised a permission request.
+///
+/// The fields and constructor are private: callers can inspect an origin received
+/// from [`PermissionAsker`], but only [`ToolContext`] can create one. This prevents
+/// a tool from attributing its request to another session or provider call.
+#[derive(Debug, Clone, Copy)]
+pub struct PermissionOrigin<'a> {
+    coordinates: &'a PermissionCoordinates,
+}
+
+impl<'a> PermissionOrigin<'a> {
+    /// Session that owns the call.
     #[must_use]
-    pub fn into_request(
-        self,
-        id: impl Into<String>,
-        session_id: impl Into<String>,
-        tool: Option<ToolCall>,
-    ) -> PermissionRequest {
+    pub fn session_id(self) -> &'a str {
+        &self.coordinates.session_id
+    }
+
+    /// Assistant message that requested the call.
+    #[must_use]
+    pub fn message_id(self) -> &'a str {
+        &self.coordinates.message_id
+    }
+
+    /// Provider call identifier.
+    #[must_use]
+    pub fn call_id(self) -> &'a str {
+        &self.coordinates.call_id
+    }
+
+    /// Completes a tool-facing ask using these trusted coordinates.
+    #[must_use]
+    pub fn into_request(self, id: impl Into<String>, ask: PermissionAsk) -> PermissionRequest {
         PermissionRequest {
             id: id.into(),
-            session_id: session_id.into(),
-            permission: self.permission,
-            patterns: self.patterns,
-            metadata: self.metadata,
-            always: self.always,
-            tool,
+            session_id: self.session_id().to_owned(),
+            permission: ask.permission,
+            patterns: ask.patterns,
+            metadata: ask.metadata,
+            always: ask.always,
+            tool: Some(ToolCall {
+                message_id: self.message_id().to_owned(),
+                call_id: self.call_id().to_owned(),
+            }),
         }
     }
 }
@@ -161,7 +196,12 @@ impl PermissionAsk {
 #[async_trait]
 pub trait PermissionAsker: Send + Sync {
     /// Asks for authorization, blocking until it resolves.
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError>;
+    async fn ask(
+        &self,
+        origin: PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError>;
 }
 
 /// An asker that authorizes everything. For tests and for explicitly ungated paths.
@@ -170,7 +210,12 @@ pub struct AllowAll;
 
 #[async_trait]
 impl PermissionAsker for AllowAll {
-    async fn ask(&self, _tool: &str, _ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: PermissionOrigin<'_>,
+        _tool: &str,
+        _ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         Ok(())
     }
 }
@@ -181,7 +226,12 @@ pub struct DenyAll;
 
 #[async_trait]
 impl PermissionAsker for DenyAll {
-    async fn ask(&self, tool: &str, _ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: PermissionOrigin<'_>,
+        tool: &str,
+        _ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         Err(ToolError::Denied {
             tool: tool.to_owned(),
         })
@@ -215,6 +265,7 @@ pub struct ToolContext {
     pub permission: Arc<dyn PermissionAsker>,
     /// The cancellation signal to poll at every safe point.
     pub interrupt: Arc<dyn InterruptHandle>,
+    permission_coordinates: PermissionCoordinates,
     /// Immutable identity of the provider Attempt that admitted this call.
     ///
     /// Direct tool tests and non-turn administrative invocation may leave this
@@ -233,10 +284,18 @@ impl ToolContext {
         permission: Arc<dyn PermissionAsker>,
         interrupt: Arc<dyn InterruptHandle>,
     ) -> Self {
+        let session_id = session_id.into();
+        let message_id = message_id.into();
+        let call_id = call_id.into();
         Self {
-            session_id: session_id.into(),
-            message_id: message_id.into(),
-            call_id: call_id.into(),
+            permission_coordinates: PermissionCoordinates {
+                session_id: session_id.clone(),
+                message_id: message_id.clone(),
+                call_id: call_id.clone(),
+            },
+            session_id,
+            message_id,
+            call_id,
             agent: agent.into(),
             depth: 0,
             permission,
@@ -269,14 +328,20 @@ impl ToolContext {
     /// `jcode`, plus the depth.
     #[must_use]
     pub fn for_subcall(&self, call_id: impl Into<String>) -> Self {
+        let call_id = call_id.into();
         Self {
-            session_id: self.session_id.clone(),
-            message_id: self.message_id.clone(),
-            call_id: call_id.into(),
+            session_id: self.permission_coordinates.session_id.clone(),
+            message_id: self.permission_coordinates.message_id.clone(),
+            call_id: call_id.clone(),
             agent: self.agent.clone(),
             depth: self.depth.saturating_add(1),
             permission: Arc::clone(&self.permission),
             interrupt: Arc::clone(&self.interrupt),
+            permission_coordinates: PermissionCoordinates {
+                session_id: self.permission_coordinates.session_id.clone(),
+                message_id: self.permission_coordinates.message_id.clone(),
+                call_id,
+            },
             orchestration_snapshot: self.orchestration_snapshot.as_ref().map(Arc::clone),
         }
     }
@@ -289,15 +354,25 @@ impl ToolContext {
 
     /// Asks for authorization for this call.
     pub async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
-        self.permission.ask(tool, ask).await
+        self.permission
+            .ask(self.permission_origin(), tool, ask)
+            .await
+    }
+
+    /// Trusted permission coordinates for this context.
+    #[must_use]
+    pub const fn permission_origin(&self) -> PermissionOrigin<'_> {
+        PermissionOrigin {
+            coordinates: &self.permission_coordinates,
+        }
     }
 
     /// The tool-call coordinates the permission engine records a request against.
     #[must_use]
     pub fn tool_call(&self) -> ToolCall {
         ToolCall {
-            message_id: self.message_id.clone(),
-            call_id: self.call_id.clone(),
+            message_id: self.permission_coordinates.message_id.clone(),
+            call_id: self.permission_coordinates.call_id.clone(),
         }
     }
 }
@@ -325,7 +400,28 @@ impl std::fmt::Debug for ToolContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct RecordingOrigins(Mutex<Vec<(String, String, String)>>);
+
+    #[async_trait]
+    impl PermissionAsker for RecordingOrigins {
+        async fn ask(
+            &self,
+            origin: PermissionOrigin<'_>,
+            _tool: &str,
+            _ask: PermissionAsk,
+        ) -> Result<(), ToolError> {
+            self.0.lock().expect("origin lock").push((
+                origin.session_id().to_owned(),
+                origin.message_id().to_owned(),
+                origin.call_id().to_owned(),
+            ));
+            Ok(())
+        }
+    }
 
     /// Shaped exactly like `zuno_engine::InterruptSignal`: a sync `is_set` over shared
     /// state plus an async `notified`. Standing in for it proves the forwarding impl
@@ -457,6 +553,63 @@ mod tests {
         assert!(!error.is_model_correctable());
     }
 
+    #[tokio::test]
+    async fn permission_origin_is_captured_by_the_context_and_cannot_be_forged_by_a_tool() {
+        let recorded = Arc::new(RecordingOrigins::default());
+        let mut ctx = ToolContext::new(
+            "ses_trusted",
+            "msg_trusted",
+            "call_trusted",
+            "build",
+            Arc::clone(&recorded) as Arc<dyn PermissionAsker>,
+            Arc::new(NeverInterrupted),
+        );
+        ctx.session_id = String::from("ses_forged");
+        ctx.message_id = String::from("msg_forged");
+        ctx.call_id = String::from("call_forged");
+
+        ctx.ask("bash", PermissionAsk::new("bash", "pwd"))
+            .await
+            .expect("the recording asker allows");
+
+        assert_eq!(
+            *recorded.0.lock().expect("origin lock"),
+            [(
+                String::from("ses_trusted"),
+                String::from("msg_trusted"),
+                String::from("call_trusted"),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn subcall_permission_origin_keeps_session_and_message_but_uses_the_subcall_id() {
+        let recorded = Arc::new(RecordingOrigins::default());
+        let parent = ToolContext::new(
+            "ses_parent",
+            "msg_parent",
+            "call_parent",
+            "build",
+            Arc::clone(&recorded) as Arc<dyn PermissionAsker>,
+            Arc::new(NeverInterrupted),
+        );
+        let child = parent.for_subcall("call_child");
+
+        child
+            .ask("read", PermissionAsk::new("read", "src/lib.rs"))
+            .await
+            .expect("the recording asker allows");
+
+        assert_eq!(
+            *recorded.0.lock().expect("origin lock"),
+            [(
+                String::from("ses_parent"),
+                String::from("msg_parent"),
+                String::from("call_child"),
+            )]
+        );
+    }
+
     #[test]
     fn ask_completes_into_the_engines_request_shape() {
         let ctx = context();
@@ -465,7 +618,7 @@ mod tests {
         ask.metadata
             .insert("reason".to_owned(), Value::String("rename".to_owned()));
 
-        let request = ask.into_request("per_1", &ctx.session_id, Some(ctx.tool_call()));
+        let request = ctx.permission_origin().into_request("per_1", ask);
 
         assert_eq!(request.id, "per_1");
         assert_eq!(request.session_id, "ses_1");

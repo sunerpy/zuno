@@ -23,6 +23,69 @@ fn no_interrupt() -> Arc<dyn InterruptHandle> {
     Arc::new(NeverInterrupted)
 }
 
+#[derive(Default)]
+struct RecordingChildObserver {
+    events: Mutex<Vec<(String, zuno_engine::r#loop::TurnEvent)>>,
+}
+
+impl ChildTurnObserver for RecordingChildObserver {
+    fn opened(&self, _opened: ChildSessionOpened) {}
+
+    fn event(&self, session_id: &str, event: &zuno_engine::r#loop::TurnEvent) {
+        self.events
+            .lock()
+            .expect("observer event lock")
+            .push((session_id.to_owned(), event.clone()));
+    }
+}
+
+#[tokio::test]
+async fn child_events_are_forwarded_before_the_child_channel_closes() {
+    let observer = Arc::new(RecordingChildObserver::default());
+    let erased: Arc<dyn ChildTurnObserver> = observer.clone();
+    let (sender, receiver) = zuno_engine::r#loop::event_channel();
+    let forwarding = tokio::spawn(forward_child_events(
+        String::from("ses_child"),
+        receiver,
+        Some(erased),
+    ));
+
+    sender
+        .publish(zuno_engine::r#loop::TurnEvent::TurnStarted {
+            session_id: String::from("ses_child"),
+        })
+        .await
+        .expect("publish the live event");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !observer
+                .events
+                .lock()
+                .expect("observer event lock")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the observer must see the event before completion");
+    {
+        let events = observer.events.lock().expect("observer event lock");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "ses_child");
+        assert!(matches!(
+            events[0].1,
+            zuno_engine::r#loop::TurnEvent::TurnStarted { .. }
+        ));
+    }
+
+    drop(sender);
+    forwarding.await.expect("forwarder task exits cleanly");
+}
+
 struct Fixture {
     _root: tempfile::TempDir,
     host: ChildSessionHost,

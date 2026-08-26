@@ -8,7 +8,7 @@ use zuno_engine::dispatch::ToolRegistryDispatcher;
 use zuno_engine::interrupt::InterruptSignal;
 use zuno_engine::r#loop::{DispatchRequest, ToolCall, ToolDispatcher};
 use zuno_llm::cache::McpToolStatus;
-use zuno_tool::{Tool, ToolContext, ToolOutput};
+use zuno_tool::{NeverInterrupted, Tool, ToolContext, ToolOutput};
 use zuno_tui::app::render_offscreen;
 use zuno_tui::keybind::{KeyDispatcher, Keymap};
 use zuno_tui::views::dialog::ObservedBase;
@@ -33,6 +33,35 @@ fn reusable_ask(permission: &str, pattern: &str) -> PermissionAsk {
     let mut ask = PermissionAsk::new(permission, pattern);
     ask.always = vec![pattern.to_owned()];
     ask
+}
+
+fn permission_context(
+    broker: &Arc<PermissionBroker>,
+    session_id: &str,
+    message_id: &str,
+    call_id: &str,
+) -> ToolContext {
+    ToolContext::new(
+        session_id,
+        message_id,
+        call_id,
+        "build",
+        Arc::clone(broker) as Arc<dyn PermissionAsker>,
+        Arc::new(NeverInterrupted),
+    )
+}
+
+async fn next_request(broker: &PermissionBroker) -> PermissionRequest {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = broker.next_request() {
+                return request;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("permission request must be parked")
 }
 
 fn resize() -> AppEvent {
@@ -142,16 +171,15 @@ async fn answer_through_production_keys(
     keys: Vec<zuno_tui::crossterm::event::KeyEvent>,
 ) -> (Arc<PermissionBroker>, Result<(), ToolError>) {
     let (broker, mut wake) = broker();
-    let asking = {
-        let broker = Arc::clone(&broker);
-        tokio::spawn(async move { broker.ask("bash", reusable_ask("bash", "ls")).await })
-    };
+    let mut bridge = bridge(&broker);
+    let context = permission_context(&broker, "ses_keys", "msg_keys", "call_keys");
+    let asking =
+        { tokio::spawn(async move { context.ask("bash", reusable_ask("bash", "ls")).await }) };
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), wake.recv()).await,
         Ok(Some(TerminalEvent::Wake))
     ));
 
-    let mut bridge = bridge(&broker);
     bridge.handle_event(&resize());
     let mut dispatcher = KeyDispatcher::new(
         Keymap::defaults().expect("the shipped keymap builds"),
@@ -223,15 +251,15 @@ fn production_wrappers_preserve_the_screens_focused_scope() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ask_becomes_a_prompt_and_the_decision_answers_it() {
     let (broker, mut wake) = broker();
-    broker.bind_session("ses_bridge");
+    let mut bridge = bridge(&broker);
     let mut ask = PermissionAsk::new("bash", "git status");
     ask.metadata.insert(
         String::from("arguments"),
         serde_json::json!({"command": "git status"}),
     );
     let asking = {
-        let broker = Arc::clone(&broker);
-        tokio::spawn(async move { broker.ask("bash", ask).await })
+        let context = permission_context(&broker, "ses_bridge", "msg_bridge", "call_bash");
+        tokio::spawn(async move { context.ask("bash", ask).await })
     };
 
     assert!(
@@ -242,7 +270,6 @@ async fn an_ask_becomes_a_prompt_and_the_decision_answers_it() {
         "the broker did not nudge the render loop, so an idle TUI would never ask"
     );
 
-    let mut bridge = bridge(&broker);
     let opened = bridge.handle_event(&resize());
     assert!(
         opened.redraw,
@@ -283,8 +310,8 @@ async fn an_ask_becomes_a_prompt_and_the_decision_answers_it() {
         serde_json::json!({"url": "https://example.com/docs"}),
     );
     let asking = {
-        let broker = Arc::clone(&broker);
-        tokio::spawn(async move { broker.ask("webfetch", webfetch).await })
+        let context = permission_context(&broker, "ses_bridge", "msg_bridge", "call_webfetch");
+        tokio::spawn(async move { context.ask("webfetch", webfetch).await })
     };
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), wake.recv()).await,
@@ -317,7 +344,7 @@ async fn an_ask_becomes_a_prompt_and_the_decision_answers_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
     let (broker, mut wake) = broker();
-    broker.bind_session("ses_dispatch_bridge");
+    let mut bridge = bridge(&broker);
     let dispatcher = Arc::new(ToolRegistryDispatcher::new(
         vec![Arc::new(DispatchBash)],
         Vec::new(),
@@ -364,7 +391,6 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
     .await
     .expect("production dispatch never reached the permission broker");
 
-    let mut bridge = bridge(&broker);
     bridge.handle_event(&resize());
     let rendered = render_offscreen(&mut bridge, 70, 12).expect("infallible");
     let joined = (0..rendered.area.height)
@@ -391,7 +417,7 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscreen() {
     let (broker, mut wake) = broker();
-    broker.bind_session("ses_edit_dispatch_bridge");
+    let mut bridge = bridge(&broker);
     let dispatcher = Arc::new(ToolRegistryDispatcher::new(
         vec![Arc::new(DispatchEdit)],
         Vec::new(),
@@ -440,7 +466,6 @@ async fn production_edit_dispatch_renders_path_and_diff_in_collapsed_and_fullscr
     .await
     .expect("production edit dispatch never reached the permission broker");
 
-    let mut bridge = bridge(&broker);
     bridge.handle_event(&resize());
     let collapsed = rendered_text(&mut bridge, 80, 20);
     assert!(
@@ -503,15 +528,7 @@ async fn production_keys_answer_every_permission_choice() {
         always.is_ok(),
         "Down and Enter did not allow always: {always:?}"
     );
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(250),
-            always_broker.ask("bash", reusable_ask("bash", "ls")),
-        )
-        .await
-        .expect("the always grant must answer a matching ask immediately")
-        .is_ok()
-    );
+    assert!(always_broker.next_request().is_none());
 
     let (_reject_broker, reject) =
         answer_through_production_keys(vec![key(KeyCode::Esc, KeyModifiers::NONE)]).await;
@@ -538,21 +555,23 @@ async fn a_tui_that_goes_away_denies_an_outstanding_ask() {
     // not run, and the only way to say so is the error the dispatcher already
     // understands.
     let (broker, _wake) = broker();
+    let surface = bridge(&broker);
+    let context = permission_context(&broker, "ses_gone", "msg_gone", "call_gone");
     let asking = {
-        let broker = Arc::clone(&broker);
         tokio::spawn(async move {
-            broker
+            context
                 .ask("bash", PermissionAsk::new("bash", "rm -rf /"))
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    // Dropping every parked answer is what the render loop's exit does to them.
-    locked(&broker.parked).pending.clear();
+    let _request = next_request(&broker).await;
+    // This is the component tree `execute_once` now drops immediately after
+    // `App::run` returns, before it waits for the turn driver.
+    drop(surface);
 
-    let answer = tokio::time::timeout(Duration::from_secs(5), asking)
+    let answer = tokio::time::timeout(Duration::from_millis(250), asking)
         .await
-        .expect("a dropped answer must not hang the turn")
+        .expect("dropping the TUI bridge must not leave the turn worker waiting")
         .expect("the asking task");
     assert!(
         matches!(answer, Err(ToolError::Denied { .. })),
@@ -561,12 +580,164 @@ async fn a_tui_that_goes_away_denies_an_outstanding_ask() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parent_and_child_requests_keep_distinct_trusted_origins_and_cannot_cross_resolve() {
+    let (broker, _wake) = broker();
+    let _surface = broker.surface_lease();
+    let parent = permission_context(&broker, "ses_parent", "msg_parent", "call_parent");
+    let child = permission_context(&broker, "ses_child", "msg_child", "call_child");
+    let parent_wait = tokio::spawn(async move {
+        parent
+            .ask("bash", PermissionAsk::new("bash", "parent command"))
+            .await
+    });
+    let parent_request = next_request(&broker).await;
+    let child_wait = tokio::spawn(async move {
+        child
+            .ask("bash", PermissionAsk::new("bash", "child command"))
+            .await
+    });
+    let child_request = next_request(&broker).await;
+
+    assert_eq!(parent_request.session_id, "ses_parent");
+    assert_eq!(child_request.session_id, "ses_child");
+    let parent_call = parent_request.tool.as_ref().expect("parent tool origin");
+    assert_eq!(parent_call.message_id, "msg_parent");
+    assert_eq!(parent_call.call_id, "call_parent");
+    let child_call = child_request.tool.as_ref().expect("child tool origin");
+    assert_eq!(child_call.message_id, "msg_child");
+    assert_eq!(child_call.call_id, "call_child");
+
+    assert!(
+        !broker.resolve("ses_parent", &child_request.id, ReplyKind::Once),
+        "a parent session must not resolve a child request"
+    );
+    assert!(
+        !child_wait.is_finished(),
+        "cross-session resolution unexpectedly authorized the child"
+    );
+    assert!(broker.resolve("ses_child", &child_request.id, ReplyKind::Once));
+    assert!(broker.resolve("ses_parent", &parent_request.id, ReplyKind::Once));
+    assert!(child_wait.await.expect("child task").is_ok());
+    assert!(parent_wait.await.expect("parent task").is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn always_grants_are_isolated_per_session() {
+    let (broker, _wake) = broker();
+    let _surface = broker.surface_lease();
+    let parent = permission_context(&broker, "ses_parent", "msg_parent", "call_parent");
+    let parent_wait =
+        tokio::spawn(async move { parent.ask("bash", reusable_ask("bash", "git status")).await });
+    let parent_request = next_request(&broker).await;
+    assert!(broker.resolve("ses_parent", &parent_request.id, ReplyKind::Always));
+    assert!(parent_wait.await.expect("parent task").is_ok());
+
+    let child = permission_context(&broker, "ses_child", "msg_child", "call_child");
+    let child_wait =
+        tokio::spawn(async move { child.ask("bash", reusable_ask("bash", "git status")).await });
+    let child_request = next_request(&broker).await;
+    assert_eq!(child_request.session_id, "ses_child");
+    assert!(broker.resolve("ses_child", &child_request.id, ReplyKind::Once));
+    assert!(child_wait.await.expect("child task").is_ok());
+}
+
+#[tokio::test]
+async fn a_closed_wake_channel_fails_closed_without_parking_forever() {
+    let (broker, wake) = broker();
+    let _surface = broker.surface_lease();
+    drop(wake);
+    let context = permission_context(&broker, "ses_closed", "msg_closed", "call_closed");
+
+    let answer = tokio::time::timeout(
+        Duration::from_millis(250),
+        context.ask("bash", PermissionAsk::new("bash", "pwd")),
+    )
+    .await
+    .expect("a closed wake channel must not leave the ask waiting");
+
+    assert!(matches!(answer, Err(ToolError::Denied { .. })));
+    assert!(broker.next_request().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicitly_closing_the_surface_denies_every_pending_request() {
+    let (broker, _wake) = broker();
+    let surface = broker.surface_lease();
+    let context = permission_context(&broker, "ses_surface", "msg_surface", "call_surface");
+    let waiting = tokio::spawn(async move {
+        context
+            .ask("bash", PermissionAsk::new("bash", "cargo publish"))
+            .await
+    });
+    let _request = next_request(&broker).await;
+
+    surface.close();
+
+    let answer = tokio::time::timeout(Duration::from_millis(250), waiting)
+        .await
+        .expect("closing the surface must wake pending asks")
+        .expect("asking task");
+    assert!(matches!(answer, Err(ToolError::Denied { .. })));
+    assert!(broker.next_request().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn losing_a_pending_sender_fails_closed() {
+    let (broker, _wake) = broker();
+    let _surface = broker.surface_lease();
+    let context = permission_context(&broker, "ses_lost", "msg_lost", "call_lost");
+    let waiting = tokio::spawn(async move {
+        context
+            .ask("bash", PermissionAsk::new("bash", "cargo publish"))
+            .await
+    });
+    let request = next_request(&broker).await;
+    locked(&broker.parked)
+        .pending
+        .remove(&(request.session_id.clone(), request.id.clone()));
+
+    let answer = tokio::time::timeout(Duration::from_millis(250), waiting)
+        .await
+        .expect("a lost pending sender must wake the asker")
+        .expect("asking task");
+    assert!(matches!(answer, Err(ToolError::Denied { .. })));
+    assert!(
+        broker.next_request().is_none(),
+        "a request without a pending sender must not open a stale prompt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_asker_cannot_install_a_standing_grant() {
+    let (broker, _wake) = broker();
+    let _surface = broker.surface_lease();
+    let context = permission_context(&broker, "ses_abandoned", "msg_abandoned", "call_abandoned");
+    let waiting = tokio::spawn(async move {
+        context
+            .ask("bash", reusable_ask("bash", "cargo publish"))
+            .await
+    });
+    let request = next_request(&broker).await;
+    waiting.abort();
+    let _cancelled = waiting.await;
+
+    assert!(
+        !broker.resolve("ses_abandoned", &request.id, ReplyKind::Always),
+        "a reply with no receiver must report delivery failure"
+    );
+    assert!(
+        locked(&broker.parked).standing.is_empty(),
+        "an undelivered Always reply must not authorize a later call"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn always_answers_the_next_matching_ask_without_prompting() {
     let (broker, _wake) = broker();
     let mut bridge = bridge(&broker);
     let first = {
-        let broker = Arc::clone(&broker);
-        tokio::spawn(async move { broker.ask("bash", reusable_ask("bash", "ls")).await })
+        let context = permission_context(&broker, "ses_always", "msg_always", "call_first");
+        tokio::spawn(async move { context.ask("bash", reusable_ask("bash", "ls")).await })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
     bridge.handle_event(&resize());
@@ -588,7 +759,8 @@ async fn always_answers_the_next_matching_ask_without_prompting() {
 
     let repeated = tokio::time::timeout(
         Duration::from_secs(5),
-        broker.ask("bash", reusable_ask("bash", "ls")),
+        permission_context(&broker, "ses_always", "msg_always", "call_repeat")
+            .ask("bash", reusable_ask("bash", "ls")),
     )
     .await
     .expect("a standing grant must answer without a prompt");
@@ -602,8 +774,16 @@ async fn always_answers_the_next_matching_ask_without_prompting() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_approval_never_parks_anything() {
+    let context = ToolContext::new(
+        "ses_auto",
+        "msg_auto",
+        "call_auto",
+        "build",
+        Arc::new(AutoApproval),
+        Arc::new(NeverInterrupted),
+    );
     assert!(
-        AutoApproval
+        context
             .ask("bash", PermissionAsk::new("bash", "anything"))
             .await
             .is_ok()
@@ -612,7 +792,15 @@ async fn auto_approval_never_parks_anything() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_approval_bypasses_neither_auto_mode_nor_standing_grants() {
-    let denied = AutoApproval
+    let auto = ToolContext::new(
+        "ses_auto",
+        "msg_auto",
+        "call_auto_manual",
+        "build",
+        Arc::new(AutoApproval),
+        Arc::new(NeverInterrupted),
+    );
+    let denied = auto
         .ask(
             "bash",
             PermissionAsk::new("bash", "git push").require_manual(),
@@ -621,13 +809,16 @@ async fn manual_approval_bypasses_neither_auto_mode_nor_standing_grants() {
     assert!(matches!(denied, Err(ToolError::Denied { .. })));
 
     let (broker, _wake) = broker();
-    locked(&broker.parked)
-        .standing
-        .push((String::from("bash"), vec![String::from("git push")]));
+    let _surface = broker.surface_lease();
+    locked(&broker.parked).standing.push((
+        String::from("ses_manual"),
+        String::from("bash"),
+        vec![String::from("git push")],
+    ));
     let waiting = {
-        let broker = Arc::clone(&broker);
+        let context = permission_context(&broker, "ses_manual", "msg_manual", "call_manual");
         tokio::spawn(async move {
-            broker
+            context
                 .ask(
                     "bash",
                     PermissionAsk::new("bash", "git push").require_manual(),
@@ -741,9 +932,9 @@ async fn cmd_tui_permission_prompt_replaces_the_live_pulse() {
     );
 
     let asked = tokio::spawn({
-        let broker = Arc::clone(&broker);
+        let context = permission_context(&broker, "s", "m", "call_permission");
         async move {
-            broker
+            context
                 .ask(
                     "bash",
                     PermissionAsk {

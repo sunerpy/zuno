@@ -1241,6 +1241,19 @@ struct DriveInputOptions<'a> {
     routing: Option<PromptRouting>,
 }
 
+/// Process-local services inherited by every host opened from one composition.
+///
+/// Keeping these dependencies named prevents optional client projections from
+/// turning the host constructor into an order-dependent argument list.
+pub(super) struct TurnHostDependencies {
+    pub(super) approval: Arc<dyn PermissionAsker>,
+    pub(super) question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
+    pub(super) runs: SessionRunRegistry,
+    pub(super) mcp: Option<zuno_mcp::Catalog>,
+    pub(super) database: Arc<zuno_db::pool::Pool>,
+    pub(super) child_observer: Option<Arc<dyn super::child_turn::ChildTurnObserver>>,
+}
+
 /// An open database, an assembled tool set, and the session a turn runs in.
 pub(crate) struct TurnHost {
     profile_runtime: HarnessRuntime,
@@ -1946,12 +1959,34 @@ impl TurnHost {
     /// configuration, with no error on either path. A surface that genuinely wants no
     /// MCP passes `None` here and says so at its own call site.
     pub(crate) async fn open_with_runtime_and_mcp(
+        plan: TurnPlan,
+        environment: &StartupEnvironment,
+        approval: Arc<dyn PermissionAsker>,
+        question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
+        runs: SessionRunRegistry,
+        mcp: Option<zuno_mcp::Catalog>,
+    ) -> Result<Self, String> {
+        Self::open_with_runtime_mcp_and_observer(
+            plan,
+            environment,
+            approval,
+            question,
+            runs,
+            mcp,
+            None,
+        )
+        .await
+    }
+
+    /// Interactive constructor with an optional process-local child-session observer.
+    pub(crate) async fn open_with_runtime_mcp_and_observer(
         mut plan: TurnPlan,
         environment: &StartupEnvironment,
         approval: Arc<dyn PermissionAsker>,
         question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
         runs: SessionRunRegistry,
         mcp: Option<zuno_mcp::Catalog>,
+        child_observer: Option<Arc<dyn super::child_turn::ChildTurnObserver>>,
     ) -> Result<Self, String> {
         let database = match zuno_db::pool::Pool::open_default() {
             Ok(database) => Arc::new(database),
@@ -1965,27 +2000,34 @@ impl TurnHost {
                 };
             }
         };
-        Self::open_with_runtime_mcp_and_database(
+        Self::open_with_dependencies(
             plan,
             environment,
+            TurnHostDependencies {
+                approval,
+                question,
+                runs,
+                mcp,
+                database,
+                child_observer,
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn open_with_dependencies(
+        mut plan: TurnPlan,
+        environment: &StartupEnvironment,
+        dependencies: TurnHostDependencies,
+    ) -> Result<Self, String> {
+        let TurnHostDependencies {
             approval,
             question,
             runs,
             mcp,
             database,
-        )
-        .await
-    }
-
-    pub(super) async fn open_with_runtime_mcp_and_database(
-        mut plan: TurnPlan,
-        environment: &StartupEnvironment,
-        approval: Arc<dyn PermissionAsker>,
-        question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
-        runs: SessionRunRegistry,
-        mcp: Option<zuno_mcp::Catalog>,
-        database: Arc<zuno_db::pool::Pool>,
-    ) -> Result<Self, String> {
+            child_observer,
+        } = dependencies;
         let mut extension_ownership = Some(match plan.extension_prepared.take() {
             Some(prepared) => ExtensionOwnership::Prepared(prepared),
             None => match plan.extension_transaction.take() {
@@ -2228,6 +2270,7 @@ impl TurnHost {
                     question: question.clone(),
                     runs: runs.clone(),
                     mcp: mcp.clone(),
+                    observer: child_observer.clone(),
                     parent_agent: plan.agent.name().to_owned(),
                     parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
                     parent_effort: plan.effort,

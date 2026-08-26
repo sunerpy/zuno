@@ -131,12 +131,12 @@ impl ToastLevel {
         }
     }
 
-    /// This level's style, on the inset-element background every footer uses.
+    /// This level's compact marker style, on the inset-element background.
     ///
     /// `background_element` rather than `background_panel`: a toast floats over whatever
     /// is behind it, and `§11.5` gives the inset shade to exactly that.
     #[must_use]
-    fn style(self, context: &ViewContext) -> Style {
+    fn marker_style(self, context: &ViewContext) -> Style {
         let palette = context.palette();
         let foreground = match self {
             Self::Info => palette.text_muted,
@@ -147,6 +147,17 @@ impl ToastLevel {
         Style::new()
             .fg(foreground.into())
             .bg(palette.background_element.into())
+    }
+
+    /// The prose beside the marker.
+    ///
+    /// Success is ordinary foreground: the check already carries the state, and a whole
+    /// green sentence turns routine confirmations into the loudest text on the screen.
+    fn body_style(self, context: &ViewContext) -> Style {
+        match self {
+            Self::Success => context.on_element(context.text()),
+            _ => self.marker_style(context),
+        }
     }
 }
 
@@ -348,7 +359,7 @@ impl ToastLayer {
         let height = u16::try_from(rows.len())
             .unwrap_or(u16::MAX)
             .min(area.height);
-        let style = toast.level.style(&self.context);
+        let style = toast.level.body_style(&self.context);
         let lines = rows
             .into_iter()
             .take(usize::from(height))
@@ -361,6 +372,9 @@ impl ToastLayer {
             height,
         };
         Paragraph::new(lines).style(style).render(region, buffer);
+        if width > 1 {
+            buffer[(region.x + 1, region.y)].set_style(toast.level.marker_style(&self.context));
+        }
     }
 
     /// Schedule the single wake that removes the current toast.

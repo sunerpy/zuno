@@ -72,7 +72,13 @@ The TUI favors dense, keyboard-first operation:
 - multiline question input with bounded growth that replaces the composer area
   while the tool waits; `Esc` cancels it as a refusal rather than returning a
   synthetic answer;
-- visible permission, retry, diagnostics, and background-job states;
+- visible permission, retry, diagnostics, and background-job states. TUI presentation
+  settings live in `tui.json`; authorization remains a runtime concern in the main
+  `zuno.json` `permission` block. `mode: allow_all` skips non-manual human-in-the-loop
+  asks, while explicit denies and tool-declared manual gates remain authoritative.
+  Root and child asks share one foreground queue, but every request retains its trusted
+  session, assistant-message, and tool-call origin. Closing the attached TUI refuses
+  outstanding asks, and an `Always` grant is scoped to the originating session;
 - explicit `working`, `awaiting approval`, and `awaiting answer` states. During a
   running turn the first `Esc` arms interruption and shows the confirmation
   immediately above the composer; the second within the confirmation window
@@ -88,7 +94,11 @@ The TUI favors dense, keyboard-first operation:
   at the completed or interrupted turn boundary;
 - generic rendering for unknown future events;
 - a `system` theme that reads non-invasive terminal color hints when available
-  and otherwise preserves the terminal's foreground and background defaults;
+  and otherwise preserves the terminal's foreground and background defaults. Its
+  unordered-list marker uses muted text without bold emphasis, while ordered
+  enumerations retain their own emphasized token. Ordinary content, reasoning, service
+  names, and sidebar metadata use neutral foreground hierarchy; semantic green is
+  reserved for compact success or health glyphs rather than complete sentences or rows;
 - a full-height ambient sidebar outside the transcript, prompt, status, and info
   column, so no left-hand band renders underneath it;
 - a visible transcript scrollbar with wheel and thumb dragging, plus
@@ -98,7 +108,11 @@ The TUI favors dense, keyboard-first operation:
   `mouse: false` opts back into terminal-native selection and alternate-scroll
   translation;
 - ordinary modal overlays are centred in both axes; composer-owned questions
-  remain anchored to the composer region. An open modal captures pointer input
+  remain anchored to the composer region. Leader continuation help is a compact,
+  centred, titled, bordered overlay: it preserves readable cell widths and reports
+  `+N more` instead of filling the frame with clipped descriptions. Numeric quick-session
+  bindings remain active but are omitted from this help surface so nine repeated
+  `Switch to session in quick slot` rows do not obscure higher-value commands. An open modal captures pointer input
   so clicks cannot activate covered transcript or sidebar content. Picker rows
   and confirmation buttons accept left-click selection as well as keyboard
   actions. Slash autocomplete, structured questions, permissions, sessions,
@@ -127,15 +141,21 @@ The TUI favors dense, keyboard-first operation:
   durable source text;
 - per-call tool disclosure in the complete transcript, with subagent rendering
   selected by persisted `ToolUiIntent::Subagent` rather than hard-coded tool
-  names. A call refused before execution is projected as `blocked` with warning
+  names. The collapsed row stays summary-only; expanding a call renders a
+  pretty-printed `Arguments` section and a distinct `Result` section, with explicit
+  bounded-overflow notices for pathological inputs. A call refused before execution is projected as `blocked` with warning
   styling and a durable block kind; only a call that actually ran and failed is
   projected as an error;
-- one subagent view for native child sessions and configured Codex or Claude Code
+- one subagent overview for native child sessions and configured Codex or Claude Code
   product agents. It shows product/target, objective, status, elapsed time,
   session/run, job, report delivery, result, and safety diagnostics without
   exposing product-internal reasoning or tool streams. Enter toggles details;
   pressing `x` twice requests cancellation of a running job and keeps the list
-  mounted for consecutive cancellations;
+  mounted for consecutive cancellations. Native child hosts additionally publish a
+  full main-pane session projection: `Ctrl+X Down` enters the first direct child,
+  `Ctrl+X Up` returns to its parent, and `Ctrl+X Left`/`Right` cycle siblings. The
+  parent host remains mounted and running while the child transcript receives live
+  events, so child progress is visible before the foreground `task` call completes;
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
   row `✓ skill-name · loaded`. Expanded skills are grouped with loaded skills
@@ -144,8 +164,11 @@ The TUI favors dense, keyboard-first operation:
   exact source selected by the tool call;
 - an independently scrollable and selectable sidebar whose current-session title
   is a fixed header and whose location/version footer stays fixed. Only the
-  projection body scrolls. It projects goal, todos, jobs, pending memory, token
-  usage, LSP, MCP, and skills from shared state rather than polling;
+  projection body scrolls. Foreground transcript-backed delegations appear
+  immediately under `Agents`; once a call acquires a matching durable job it yields
+  to the richer `Jobs` projection rather than appearing twice. The sidebar also
+  projects goal, todos, pending memory, token usage, LSP, MCP, and skills from
+  shared state rather than polling;
 - `/ps` for process-owned background terminals and `/memory` for auditable
   candidate review. Both keep their list mounted after an action so several
   entries can be handled consecutively;

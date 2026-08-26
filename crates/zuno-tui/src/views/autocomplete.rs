@@ -36,8 +36,9 @@ use crate::views::slash::SlashRouter;
 use crate::views::{ViewContext, display_width, fill, hint, padded, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -773,6 +774,15 @@ const WHICH_KEY_MAX_CELL: u16 = 34;
 /// The narrowest cell worth drawing: a key, a space, and something of a description.
 const WHICH_KEY_MIN_CELL: u16 = 14;
 
+/// The width at which a key and a useful description can normally coexist.
+const WHICH_KEY_COMFORT_CELL: u16 = 24;
+
+/// The largest leader-help overlay, leaving transcript context visible on wide terminals.
+const WHICH_KEY_MAX_WIDTH: u16 = 96;
+
+/// The title that distinguishes leader help from transcript or tool output.
+const WHICH_KEY_TITLE: &str = " Next key ";
+
 /// A which-key surface: the actions reachable from the pending leader sequence.
 ///
 /// Autocomplete's neighbour rather than its own module because it is the same
@@ -855,31 +865,136 @@ impl WhichKeyView {
     /// and one that covers the transcript it is explaining has taken more than it gave.
     #[must_use]
     pub fn desired_height(&self, available: u16) -> u16 {
-        if !self.is_active() {
+        self.desired_height_for(WHICH_KEY_MAX_WIDTH, available)
+    }
+
+    fn desired_height_for(&self, width: u16, available: u16) -> u16 {
+        if !self.is_active() || available == 0 {
             return 0;
         }
-        let ceiling = (available / 2).max(1);
-        let wanted = u16::try_from(self.prefix.continuations.len()).unwrap_or(u16::MAX);
-        wanted.min(ceiling)
+        let ceiling = (available / 2).max(1).min(available);
+        if ceiling < 3 {
+            return ceiling;
+        }
+        let content_width = width.saturating_sub(2).max(1);
+        let max_content_rows = ceiling.saturating_sub(2).max(1);
+        let entries = self.prefix.continuations.len();
+        let content_rows = (1..=max_content_rows)
+            .find(|rows| {
+                let (columns, _) = Self::plan_columns(content_width, *rows, entries);
+                usize::from(*rows) * usize::from(columns) >= entries
+            })
+            .unwrap_or(max_content_rows);
+        content_rows.saturating_add(2).min(ceiling)
     }
 
     /// The grid: how many columns of what width to use for `entries` over `rows`.
     ///
-    /// Takes the entry count, and that is the whole point. Packing the width full of
-    /// minimum-width columns instead produced seven 14-column cells on a 100-column
-    /// frame, which cut every description to eleven characters — nine rows reading
-    /// `Switch to s`, a panel that names keys and explains nothing. So: use the fewest
-    /// columns that hold the entries, then spend the leftover width on making them
-    /// legible. Same rule as `§7.1`'s degradation order — content before decoration.
+    /// Readability wins over silent completeness. A 100-column frame can technically fit
+    /// six 14-column cells, but each would reduce `List all sessions` to `List all ses`.
+    /// Limit the column count to cells with useful descriptive width and let the final cell
+    /// state `+N more` when the available rows cannot carry every continuation.
     fn plan_columns(width: u16, rows: u16, entries: usize) -> (u16, u16) {
         if width < WHICH_KEY_MIN_CELL || rows == 0 {
             return (1, width);
         }
         let fits = (width / WHICH_KEY_MIN_CELL).max(1);
+        let roomy = (width / WHICH_KEY_COMFORT_CELL).max(1);
         let needed = entries.div_ceil(usize::from(rows).max(1));
-        let columns = u16::try_from(needed).unwrap_or(u16::MAX).clamp(1, fits);
+        let columns = u16::try_from(needed)
+            .unwrap_or(u16::MAX)
+            .clamp(1, fits)
+            .min(roomy);
         let cell = (width / columns).min(WHICH_KEY_MAX_CELL);
         (columns, cell)
+    }
+
+    fn overlay_frame(&self, area: Rect) -> Option<Rect> {
+        if !self.is_active() || area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let horizontal_gutter: u16 = if area.width >= WHICH_KEY_MIN_CELL.saturating_add(4) {
+            2
+        } else {
+            0
+        };
+        let width = area
+            .width
+            .saturating_sub(horizontal_gutter.saturating_mul(2))
+            .clamp(1, WHICH_KEY_MAX_WIDTH);
+        let height = self.desired_height_for(width, area.height).max(1);
+        Some(Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        })
+    }
+
+    fn render_grid(&self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        fill(frame.buffer_mut(), area, self.context.element());
+        let rows = area.height;
+        let total = self.prefix.continuations.len();
+        let (columns, cell) = Self::plan_columns(area.width, rows, total);
+        let capacity = usize::from(rows) * usize::from(columns);
+        let shown = if total > capacity {
+            capacity.saturating_sub(1)
+        } else {
+            total
+        };
+        let key_style = self
+            .context
+            .on_element(self.context.accent())
+            .add_modifier(Modifier::BOLD);
+        let description_style = self.context.on_element(self.context.text());
+        let muted_style = self.context.on_element(self.context.muted());
+
+        for row in 0..rows {
+            let mut spans = Vec::new();
+            for column in 0..columns {
+                let index = usize::from(row) + usize::from(column) * usize::from(rows);
+                if index < shown {
+                    let entry = &self.prefix.continuations[index];
+                    let keys = truncate(&entry.keys, usize::from(cell).saturating_sub(3));
+                    let key = format!(" {keys}");
+                    let key_width = display_width(&key);
+                    let description_room = usize::from(cell).saturating_sub(key_width + 1);
+                    let description = truncate(entry.definition.description, description_room);
+                    let description = if description.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {description}")
+                    };
+                    let used = key_width + display_width(&description);
+                    spans.push(Span::styled(key, key_style));
+                    spans.push(Span::styled(description, description_style));
+                    spans.push(Span::styled(
+                        " ".repeat(usize::from(cell).saturating_sub(used)),
+                        self.context.element(),
+                    ));
+                } else if index == shown && total > capacity {
+                    spans.extend(
+                        padded(&format!(" +{} more", total - shown), cell, muted_style).spans,
+                    );
+                } else {
+                    spans.extend(padded("", cell, self.context.element()).spans);
+                }
+            }
+            Paragraph::new(vec![Line::from(spans)])
+                .style(self.context.element())
+                .render(
+                    Rect {
+                        x: area.x,
+                        y: area.y + row,
+                        width: area.width,
+                        height: 1,
+                    },
+                    frame.buffer_mut(),
+                );
+        }
     }
 
     fn arm(&self) {
@@ -900,55 +1015,25 @@ impl WhichKeyView {
 impl Component for WhichKeyView {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         self.prune(Instant::now());
-        if !self.is_active() || area.width == 0 || area.height == 0 {
+        let Some(panel) = self.overlay_frame(area) else {
+            return;
+        };
+        if panel.width < 4 || panel.height < 4 {
+            self.render_grid(frame, panel);
             return;
         }
-        fill(frame.buffer_mut(), area, self.context.element());
 
-        let rows = area.height;
-        let total = self.prefix.continuations.len();
-        let (columns, cell) = Self::plan_columns(area.width, rows, total);
-        let capacity = usize::from(rows) * usize::from(columns);
-        // The last cell becomes a count when the grid cannot hold everything, so the
-        // panel never implies the leader has fewer continuations than it does.
-        let shown = if total > capacity {
-            capacity.saturating_sub(1)
-        } else {
-            total
-        };
-
-        for row in 0..rows {
-            let mut spans = Vec::new();
-            for column in 0..columns {
-                let index = usize::from(row) + usize::from(column) * usize::from(rows);
-                let text = if index < shown {
-                    let entry = &self.prefix.continuations[index];
-                    let keys = truncate(&entry.keys, usize::from(cell).saturating_sub(2));
-                    let used = display_width(&keys);
-                    let room = usize::from(cell).saturating_sub(used + 2);
-                    format!(" {keys} {}", truncate(entry.definition.description, room))
-                } else if index == shown && total > capacity {
-                    format!(" +{} more", total - shown)
-                } else {
-                    String::new()
-                };
-                let style = if index < shown {
-                    self.context.accent()
-                } else {
-                    self.context.muted()
-                };
-                spans.extend(padded(&text, cell, style).spans);
-            }
-            let region = Rect {
-                x: area.x,
-                y: area.y + row,
-                width: area.width,
-                height: 1,
-            };
-            Paragraph::new(vec![Line::from(spans)])
-                .style(self.context.element())
-                .render(region, frame.buffer_mut());
-        }
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(self.context.on_element(self.context.accent()))
+            .title(Line::from(Span::styled(
+                WHICH_KEY_TITLE,
+                self.context.on_element(self.context.title()),
+            )))
+            .style(self.context.element());
+        let inner = block.inner(panel);
+        block.render(panel, frame.buffer_mut());
+        self.render_grid(frame, inner);
     }
 
     fn handle_event(&mut self, _event: &AppEvent) -> EventResult {

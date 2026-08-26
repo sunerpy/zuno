@@ -31,14 +31,14 @@
 //! second spelling of it.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use zuno_error::ToolError;
 use zuno_permission::{PermissionRequest, ReplyKind};
-use zuno_tool::{PermissionAsk, PermissionAsker};
+use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
 use zuno_tui::app::{AppEvent, Component, EventResult, TerminalEvent};
 use zuno_tui::keybind::{ActionComponent, Definition, PendingPrefix};
 use zuno_tui::ratatui::Frame;
@@ -53,8 +53,9 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A `(permission, patterns)` pair, which is what a rule matches on.
-type Grant = (String, Vec<String>);
+/// A session-scoped `(permission, patterns)` grant.
+type Grant = (String, String, Vec<String>);
+type PendingKey = (String, String);
 
 struct Pending {
     answer: oneshot::Sender<ReplyKind>,
@@ -64,15 +65,36 @@ struct Pending {
 #[derive(Default)]
 struct Parked {
     waiting: VecDeque<PermissionRequest>,
-    pending: HashMap<String, Pending>,
+    pending: HashMap<PendingKey, Pending>,
     standing: Vec<Grant>,
+    surfaces: usize,
 }
 
 /// The asker a surface with a human attached hands to the dispatcher.
 pub(crate) struct PermissionBroker {
     parked: Mutex<Parked>,
     wake: mpsc::Sender<TerminalEvent>,
-    session_id: OnceLock<String>,
+}
+
+pub(crate) struct PermissionSurfaceLease {
+    broker: Option<Arc<PermissionBroker>>,
+}
+
+impl PermissionSurfaceLease {
+    #[cfg(test)]
+    pub(crate) fn close(mut self) {
+        if let Some(broker) = self.broker.take() {
+            broker.release_surface();
+        }
+    }
+}
+
+impl Drop for PermissionSurfaceLease {
+    fn drop(&mut self) {
+        if let Some(broker) = self.broker.take() {
+            broker.release_surface();
+        }
+    }
 }
 
 impl PermissionBroker {
@@ -81,70 +103,138 @@ impl PermissionBroker {
         Self {
             parked: Mutex::new(Parked::default()),
             wake,
-            session_id: OnceLock::new(),
         }
     }
 
-    /// Record the session every request belongs to, once it is known.
-    ///
-    /// Separate from construction because the session is resolved by the same call
-    /// that needs the broker: the dispatcher is built with the asker already in hand.
-    pub(crate) fn bind_session(&self, session_id: &str) {
-        let _first = self.session_id.set(session_id.to_owned());
+    /// Lease the single attached TUI surface. Dropping it refuses every pending ask.
+    pub(crate) fn surface_lease(self: &Arc<Self>) -> PermissionSurfaceLease {
+        let mut parked = locked(&self.parked);
+        parked.surfaces = parked.surfaces.saturating_add(1);
+        drop(parked);
+        PermissionSurfaceLease {
+            broker: Some(Arc::clone(self)),
+        }
+    }
+
+    fn release_surface(&self) {
+        let answers = {
+            let mut parked = locked(&self.parked);
+            if parked.surfaces == 0 {
+                return;
+            }
+            parked.surfaces -= 1;
+            if parked.surfaces != 0 {
+                return;
+            }
+            parked.waiting.clear();
+            parked
+                .pending
+                .drain()
+                .map(|(_, pending)| pending.answer)
+                .collect::<Vec<_>>()
+        };
+        for answer in answers {
+            let _delivered = answer.send(ReplyKind::Reject);
+        }
+    }
+
+    fn close_surfaces(&self) {
+        let answers = {
+            let mut parked = locked(&self.parked);
+            parked.surfaces = 0;
+            parked.waiting.clear();
+            parked
+                .pending
+                .drain()
+                .map(|(_, pending)| pending.answer)
+                .collect::<Vec<_>>()
+        };
+        for answer in answers {
+            let _delivered = answer.send(ReplyKind::Reject);
+        }
     }
 
     /// Take the next request that has not been shown yet.
     fn next_request(&self) -> Option<PermissionRequest> {
-        locked(&self.parked).waiting.pop_front()
+        let mut parked = locked(&self.parked);
+        while let Some(request) = parked.waiting.pop_front() {
+            let key = (request.session_id.clone(), request.id.clone());
+            if parked.pending.contains_key(&key) {
+                return Some(request);
+            }
+        }
+        None
     }
 
-    /// Answer a resolved request, and remember an `always` for the process.
-    fn resolve(&self, request_id: &str, reply: ReplyKind) {
-        let answer = {
+    /// Answer a resolved request, and remember an `always` for this session.
+    fn resolve(&self, session_id: &str, request_id: &str, reply: ReplyKind) -> bool {
+        let pending = {
             let mut parked = locked(&self.parked);
-            let Some(pending) = parked.pending.remove(request_id) else {
-                return;
+            let key = (session_id.to_owned(), request_id.to_owned());
+            let Some(pending) = parked.pending.remove(&key) else {
+                return false;
             };
-            if reply == ReplyKind::Always
-                && let Some(grant) = pending.grant
-            {
-                parked.standing.push(grant);
-            }
-            pending.answer
+            pending
         };
-        let _delivered = answer.send(reply);
+        if pending.answer.send(reply).is_err() {
+            return false;
+        }
+        if reply == ReplyKind::Always
+            && let Some(grant) = pending.grant
+        {
+            locked(&self.parked).standing.push(grant);
+        }
+        true
     }
 }
 
 #[async_trait]
 impl PermissionAsker for PermissionBroker {
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        origin: PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         let request_id = format!("per_{}", Uuid::new_v4().simple());
         let (sender, receiver) = oneshot::channel();
         {
-            let grant: Grant = (ask.permission.clone(), ask.patterns.clone());
+            let session_id = origin.session_id().to_owned();
+            let grant: Grant = (
+                session_id.clone(),
+                ask.permission.clone(),
+                ask.patterns.clone(),
+            );
             let reusable = !ask.manual && !ask.always.is_empty();
             let mut parked = locked(&self.parked);
+            if parked.surfaces == 0 {
+                return Err(ToolError::Denied {
+                    tool: tool.to_owned(),
+                });
+            }
             if reusable && parked.standing.contains(&grant) {
                 return Ok(());
             }
             parked.pending.insert(
-                request_id.clone(),
+                (session_id, request_id.clone()),
                 Pending {
                     answer: sender,
                     grant: reusable.then_some(grant),
                 },
             );
-            parked.waiting.push_back(ask.into_request(
-                request_id,
-                self.session_id.get().cloned().unwrap_or_default(),
-                None,
-            ));
+            parked
+                .waiting
+                .push_back(origin.into_request(request_id, ask));
         }
         // A full terminal channel means at least 64 events are already queued, so the
         // bridge is about to run anyway and will find the request; the nudge only
         // matters when nothing else would wake the loop.
-        let _nudged = self.wake.try_send(TerminalEvent::Wake);
+        if matches!(
+            self.wake.try_send(TerminalEvent::Wake),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ) {
+            self.close_surfaces();
+        }
         match receiver.await {
             Ok(ReplyKind::Once | ReplyKind::Always) => Ok(()),
             Ok(ReplyKind::Reject) | Err(_) => Err(ToolError::Denied {
@@ -165,7 +255,12 @@ pub(crate) struct AutoApproval;
 
 #[async_trait]
 impl PermissionAsker for AutoApproval {
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         if ask.manual {
             Err(ToolError::Denied {
                 tool: tool.to_owned(),
@@ -182,6 +277,7 @@ pub(crate) struct PermissionBridge {
     broker: Arc<PermissionBroker>,
     host: DialogHost,
     question: Option<QuestionBridge>,
+    _surface: PermissionSurfaceLease,
 }
 
 impl PermissionBridge {
@@ -191,11 +287,13 @@ impl PermissionBridge {
         broker: Arc<PermissionBroker>,
         host: DialogHost,
     ) -> Self {
+        let surface = broker.surface_lease();
         Self {
             context,
             broker,
             host,
             question: None,
+            _surface: surface,
         }
     }
 
@@ -223,7 +321,8 @@ impl PermissionBridge {
         for (dialog, outcome) in self.host.drain_outcomes() {
             match outcome {
                 DialogOutcome::Permission(decision) => {
-                    self.broker.resolve(&decision.request_id, decision.reply);
+                    self.broker
+                        .resolve(&decision.session_id, &decision.request_id, decision.reply);
                     result = EventResult::REDRAW;
                 }
                 DialogOutcome::Question(answers) => {

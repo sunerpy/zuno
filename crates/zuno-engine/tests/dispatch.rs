@@ -12,22 +12,39 @@ use zuno_engine::r#loop::{DispatchRequest, ToolCall, ToolDispatcher};
 use zuno_error::ToolError;
 use zuno_llm::cache::McpToolStatus;
 use zuno_permission::{PermissionAction, Rule};
-use zuno_tool::{PermissionAsk, PermissionAsker, Tool, ToolContext, ToolEffect, ToolOutput};
+use zuno_tool::{
+    PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolContext, ToolEffect, ToolOutput,
+};
 
 #[derive(Default)]
 struct RecordingApprover {
     asks: Mutex<Vec<PermissionAsk>>,
+    origins: Mutex<Vec<(String, String, String)>>,
 }
 
 impl RecordingApprover {
     fn asks(&self) -> Vec<PermissionAsk> {
         self.asks.lock().expect("ask lock").clone()
     }
+
+    fn origins(&self) -> Vec<(String, String, String)> {
+        self.origins.lock().expect("origin lock").clone()
+    }
 }
 
 #[async_trait]
 impl PermissionAsker for RecordingApprover {
-    async fn ask(&self, _tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        origin: PermissionOrigin<'_>,
+        _tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
+        self.origins.lock().expect("origin lock").push((
+            origin.session_id().to_owned(),
+            origin.message_id().to_owned(),
+            origin.call_id().to_owned(),
+        ));
         self.asks.lock().expect("ask lock").push(ask);
         Ok(())
     }
@@ -51,7 +68,12 @@ impl BlockingApprover {
 
 #[async_trait]
 impl PermissionAsker for BlockingApprover {
-    async fn ask(&self, _tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: PermissionOrigin<'_>,
+        _tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         self.events
             .lock()
             .expect("event lock")
@@ -1134,6 +1156,15 @@ async fn dispatch_passes_argument_pattern_to_permission_approver() {
     assert_eq!(asks.len(), 1);
     assert_eq!(asks[0].permission, "bash");
     assert_eq!(asks[0].patterns, ["git push origin main"]);
+    assert_eq!(
+        approver.origins(),
+        [(
+            String::from("ses_dispatch"),
+            String::from("msg_dispatch"),
+            String::from("call_pattern"),
+        )],
+        "the rule asker must forward the ToolContext origin unchanged"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

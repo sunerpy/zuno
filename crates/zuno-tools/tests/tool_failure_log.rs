@@ -229,7 +229,12 @@ struct Allow;
 
 #[async_trait]
 impl PermissionAsker for Allow {
-    async fn ask(&self, _tool: &str, _ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: zuno_tool::PermissionOrigin<'_>,
+        _tool: &str,
+        _ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         Ok(())
     }
 }

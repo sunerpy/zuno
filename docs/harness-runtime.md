@@ -172,12 +172,32 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 
 `compaction`, `title`, and `summary` are hidden engine agents. A user-defined agent may be declared under `agents.<name>` or as Markdown under `.zuno/agent/**/*.md`; it enters the same resolution, permission, prompt, and provenance pipeline as a native agent.
 
+See [agent orchestration and model routing](orchestration.md) for the exact
+delegate roster, per-Agent and preset model routes, reasoning precedence,
+background report delivery, configured workflow DAGs, and Council.
+
 User-facing agents answer in natural Markdown. Zuno does not require XML-like
 reply envelopes unless a typed runtime consumer exists for that exact structure.
 The built-in prompts emphasize intent matching, deliberate tool use, scoped
 changes, proportional verification, and concise outcome-first reporting. In
 particular, self-contained reasoning or writing does not justify a shell call or
 a throwaway file.
+
+### Delegated session projection and approval routing
+
+A native delegation runs in its own child `TurnHost`; the parent tool waits for the
+foreground result but does not own the child's event channel. Interactive composition
+installs a `ChildTurnObserver` that first receives the child's durable replay and resolved
+identity, then every live `TurnEvent`. The TUI folds those records into a per-session read
+model and attaches views to that model. Switching the visible session never remounts or
+aborts the parent or a sibling host.
+
+Permission attribution comes from immutable coordinates captured by `ToolContext`, not
+from a broker-wide current-session slot. A root or child request therefore carries the
+session, assistant message, and provider call that raised it through every rule and human
+approval layer. The foreground TUI broker serializes all such asks, scopes standing grants
+to one session, and fails closed by rejecting pending requests when its last surface or
+wake channel closes.
 
 ## Prompt provenance
 

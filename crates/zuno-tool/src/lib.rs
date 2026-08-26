@@ -77,7 +77,7 @@ pub mod store;
 
 pub use crate::context::{
     AllowAll, DenyAll, InterruptHandle, NeverInterrupted, PermissionAsk, PermissionAsker,
-    ToolContext,
+    PermissionOrigin, ToolContext,
 };
 pub use crate::output::{
     Attachment, LimitExceeded, OutputLimits, SizeMeasurement, SizeVerdict, ToolOutput,

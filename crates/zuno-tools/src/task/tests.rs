@@ -57,7 +57,12 @@ struct RecordingDenier(Mutex<Vec<PermissionAsk>>);
 
 #[async_trait]
 impl PermissionAsker for RecordingDenier {
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: zuno_tool::PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -73,7 +78,12 @@ struct RecordingAllower(Mutex<Vec<PermissionAsk>>);
 
 #[async_trait]
 impl PermissionAsker for RecordingAllower {
-    async fn ask(&self, _tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: zuno_tool::PermissionOrigin<'_>,
+        _tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -28,7 +28,8 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -87,6 +88,14 @@ const PICKER_FIRST_TITLE: &str = "PickerFirstMarker";
 const PICKER_SECOND_TITLE: &str = "PickerSecondMarker";
 const PICKER_THIRD_TITLE: &str = "PickerThirdMarker";
 const PICKER_RENAMED_TITLE: &str = "PickerRenamedMarker";
+const PARALLEL_PARENT_PROMPT: &str = "ParentSurfaceMarker delegate two foreground children.";
+const PARALLEL_PARENT_TITLE: &str = "ParallelParentMarker";
+const FIRST_CHILD_DESCRIPTION: &str = "inspect current tree";
+const SECOND_CHILD_DESCRIPTION: &str = "inspect temp tree";
+const FIRST_CHILD_PROMPT: &str = "FirstChildProviderMarker inspect the current directory.";
+const SECOND_CHILD_PROMPT: &str = "SecondChildProviderMarker inspect the temporary directory.";
+const CHILD_RESPONSE_DELAY: Duration = Duration::from_secs(10);
+const PARALLEL_BUDGET: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 struct FlagResponder {
@@ -99,6 +108,152 @@ impl Respond for FlagResponder {
         self.seen.store(true, Ordering::Release);
         self.response.clone()
     }
+}
+
+#[derive(Debug, Default)]
+struct ParallelProviderState {
+    child_requests: AtomicUsize,
+    first_child_request_at: Mutex<Option<Instant>>,
+}
+
+impl ParallelProviderState {
+    fn record_child_request(&self) {
+        self.child_requests.fetch_add(1, Ordering::AcqRel);
+        let mut first = self
+            .first_child_request_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        first.get_or_insert_with(Instant::now);
+    }
+
+    fn children_started(&self) -> usize {
+        self.child_requests.load(Ordering::Acquire)
+    }
+
+    fn children_cannot_have_completed(&self) -> bool {
+        self.first_child_request_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|started| started.elapsed() < CHILD_RESPONSE_DELAY)
+    }
+}
+
+#[derive(Clone)]
+struct ParallelDelegationResponder {
+    state: Arc<ParallelProviderState>,
+}
+
+impl Respond for ParallelDelegationResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("provider request is JSON");
+        let messages = body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let serialized_messages = serde_json::Value::Array(messages.clone()).to_string();
+        let has_tools = body
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+
+        if !has_tools {
+            return compatible_text_response(PARALLEL_PARENT_TITLE);
+        }
+        if serialized_messages.contains(PARALLEL_PARENT_PROMPT) {
+            let has_tool_result = messages.iter().any(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+            });
+            return if has_tool_result {
+                compatible_text_response("parent completed")
+            } else {
+                compatible_parallel_task_response()
+            };
+        }
+        if serialized_messages.contains(FIRST_CHILD_PROMPT) {
+            self.state.record_child_request();
+            return compatible_text_response("first child completed")
+                .set_delay(CHILD_RESPONSE_DELAY);
+        }
+        if serialized_messages.contains(SECOND_CHILD_PROMPT) {
+            self.state.record_child_request();
+            return compatible_text_response("second child completed")
+                .set_delay(CHILD_RESPONSE_DELAY);
+        }
+
+        ResponseTemplate::new(500).set_body_json(serde_json::json!({
+            "error": {
+                "message": "unexpected deterministic PTY fixture request",
+                "request": body,
+            }
+        }))
+    }
+}
+
+fn compatible_text_response(text: &str) -> ResponseTemplate {
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": text},
+            "finish_reason": null
+        }]
+    });
+    let finish = serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
+    ResponseTemplate::new(200).set_body_raw(
+        format!("data: {chunk}\n\ndata: {finish}\n\ndata: [DONE]\n\n"),
+        "text/event-stream",
+    )
+}
+
+fn compatible_parallel_task_response() -> ResponseTemplate {
+    let first_arguments = serde_json::json!({
+        "description": FIRST_CHILD_DESCRIPTION,
+        "prompt": FIRST_CHILD_PROMPT,
+        "subagent_type": "explorer",
+    })
+    .to_string();
+    let second_arguments = serde_json::json!({
+        "description": SECOND_CHILD_DESCRIPTION,
+        "prompt": SECOND_CHILD_PROMPT,
+        "subagent_type": "explorer",
+    })
+    .to_string();
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_first_child",
+                        "function": {
+                            "name": "task",
+                            "arguments": first_arguments,
+                        }
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_second_child",
+                        "function": {
+                            "name": "task",
+                            "arguments": second_arguments,
+                        }
+                    }
+                ]
+            },
+            "finish_reason": null
+        }]
+    });
+    let finish = serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    });
+    ResponseTemplate::new(200).set_body_raw(
+        format!("data: {chunk}\n\ndata: {finish}\n\ndata: [DONE]\n\n"),
+        "text/event-stream",
+    )
 }
 
 fn binary() -> PathBuf {
@@ -174,6 +329,15 @@ fn variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
         ("ZUNO_DISABLE_MODELS_FETCH".to_owned(), "true".to_owned()),
         ("ZUNO_CONFIG_CONTENT".to_owned(), provider_config(base_url)),
     ]);
+    variables
+}
+
+fn parallel_delegation_variables(env: &ScriptedEnv, base_url: &str) -> BTreeMap<String, String> {
+    let mut variables = variables(env, base_url);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&provider_config(base_url)).expect("provider fixture config is JSON");
+    config["permission"] = serde_json::json!({"mode": "allow_all"});
+    variables.insert("ZUNO_CONFIG_CONTENT".to_owned(), config.to_string());
     variables
 }
 
@@ -339,6 +503,133 @@ fn run_under_pty(
     let _ = child.kill();
     let _ = child.wait();
     Ok(Transcript { text, saw_wanted })
+}
+
+#[derive(Debug)]
+struct ParallelDelegationTranscript {
+    text: String,
+    saw_two_running_agents: bool,
+    entered_child_surface: bool,
+    returned_to_parent: bool,
+    all_observed_before_child_completion: bool,
+}
+
+fn run_parallel_delegation_under_pty(
+    env: &ScriptedEnv,
+    base_url: &str,
+    provider: Arc<ParallelProviderState>,
+) -> Result<ParallelDelegationTranscript, std::io::Error> {
+    let script = which::which("script").map_err(|_| {
+        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
+    })?;
+    let command = format!(
+        "stty rows 48 cols 180; {} --model {MODEL} --auto --prompt {}",
+        shell_quote(&binary().to_string_lossy()),
+        shell_quote(PARALLEL_PARENT_PROMPT),
+    );
+    let mut child = Command::new(&script)
+        .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(parallel_delegation_variables(env, base_url))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("parallel delegation stdout was not piped"))?;
+    let (chunks, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if chunks.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut enter_sent = false;
+    let mut return_sent = false;
+    let mut first_description_count = 0;
+    let mut second_description_count = 0;
+    let mut parent_prompt_count = 0;
+    let mut saw_two_running_agents = false;
+    let mut entered_child_surface = false;
+    let mut returned_to_parent = false;
+    let mut all_observed_before_child_completion = true;
+
+    while started.elapsed() < PARALLEL_BUDGET {
+        match received.recv_timeout(Duration::from_millis(50)) {
+            Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if !enter_sent
+            && provider.children_started() == 2
+            // Ratatui's diff renderer may insert cursor-positioning CSI sequences
+            // between the summary's later spans. `2 running` is one span and remains
+            // contiguous in the real PTY byte stream; the two provider requests and
+            // the two distinct descriptions prove which two rows it summarizes.
+            && text.contains("2 running")
+            && text.contains(FIRST_CHILD_DESCRIPTION)
+            && text.contains(SECOND_CHILD_DESCRIPTION)
+        {
+            saw_two_running_agents = true;
+            all_observed_before_child_completion &= provider.children_cannot_have_completed();
+            first_description_count = text.matches(FIRST_CHILD_DESCRIPTION).count();
+            second_description_count = text.matches(SECOND_CHILD_DESCRIPTION).count();
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("parallel delegation stdin was not piped"))?;
+            stdin.write_all(b"\x18\x1bOB")?;
+            stdin.flush()?;
+            enter_sent = true;
+        } else if enter_sent
+            && !return_sent
+            && text.contains("running · session ")
+            && (text.matches(FIRST_CHILD_DESCRIPTION).count() > first_description_count
+                || text.matches(SECOND_CHILD_DESCRIPTION).count() > second_description_count)
+        {
+            entered_child_surface = true;
+            all_observed_before_child_completion &= provider.children_cannot_have_completed();
+            parent_prompt_count = text.matches(PARALLEL_PARENT_PROMPT).count();
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("parallel delegation stdin was not piped"))?;
+            stdin.write_all(b"\x18\x1bOA")?;
+            stdin.flush()?;
+            return_sent = true;
+        } else if return_sent
+            && text.matches(PARALLEL_PARENT_PROMPT).count() > parent_prompt_count
+            && text.matches("2 running").count() >= 2
+        {
+            returned_to_parent = true;
+            all_observed_before_child_completion &= provider.children_cannot_have_completed();
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(ParallelDelegationTranscript {
+        text,
+        saw_two_running_agents,
+        entered_child_surface,
+        returned_to_parent,
+        all_observed_before_child_completion,
+    })
 }
 
 /// Open and leave the real welcome screen without submitting model input.
@@ -1182,6 +1473,62 @@ async fn a_submitted_prompt_drives_a_provider_request_and_renders_the_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_prompt_typed_into_the_pty_drives_the_same_turn_as_the_flag() {
     one_turn_through(Submission::Typed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_foreground_children_remain_live_and_navigable_in_the_real_tui() {
+    let server = MockServer::start().await;
+    let provider = Arc::new(ParallelProviderState::default());
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ParallelDelegationResponder {
+            state: Arc::clone(&provider),
+        })
+        .mount(&server)
+        .await;
+
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+    let base_url = server.uri();
+    let observed = Arc::clone(&provider);
+    let transcript = tokio::task::spawn_blocking(move || {
+        run_parallel_delegation_under_pty(&env, &base_url, observed)
+    })
+    .await
+    .expect("parallel delegation PTY task")
+    .expect("parallel delegation TUI starts");
+
+    assert_eq!(
+        provider.children_started(),
+        2,
+        "the parent did not dispatch two real child provider turns\ntranscript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.saw_two_running_agents,
+        "the real TUI did not refresh its Agents sidebar with two running foreground children\n\
+         transcript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.entered_child_surface,
+        "Ctrl+X Down did not replace the parent main pane with a full running child-session \
+         surface\ntranscript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.returned_to_parent,
+        "Ctrl+X Up did not return from the child-session surface to the still-running parent\n\
+         transcript:\n{}",
+        transcript.text
+    );
+    assert!(
+        transcript.all_observed_before_child_completion,
+        "one of the asserted UI states appeared only after the delayed child provider response; \
+         this would not prove the TUI remains live while foreground children run\ntranscript:\n{}",
+        transcript.text
+    );
 }
 
 #[test]

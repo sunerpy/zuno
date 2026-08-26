@@ -55,9 +55,9 @@ session_toggle_timestamps	none	session.toggle.timestamps		Toggle message timesta
 session_toggle_generic_tool_output	none	session.toggle.generic_tool_output		Toggle generic tool output
 session_queued_prompts	<leader>q	session.queued_prompts		Manage queued prompts
 session_child_first	<leader>down	session.child.first		Go to first child session
-session_child_cycle	right	session.child.next		Go to next child session
-session_child_cycle_reverse	left	session.child.previous		Go to previous child session
-session_parent	up	session.parent		Go to parent session
+session_child_cycle	<leader>right	session.child.next		Go to next child session
+session_child_cycle_reverse	<leader>left	session.child.previous		Go to previous child session
+session_parent	<leader>up	session.parent		Go to parent session
 session_pin_toggle	ctrl+f	session.pin.toggle		Pin or unpin session in the session list
 session_quick_switch_1	<leader>1	session.quick_switch.1		Switch to session in quick slot 1
 session_quick_switch_2	<leader>2	session.quick_switch.2		Switch to session in quick slot 2

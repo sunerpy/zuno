@@ -11,6 +11,7 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 use serde_json::json;
+use zuno_permission::ToolCall;
 
 fn request(permission: &str) -> PermissionRequest {
     PermissionRequest {
@@ -60,6 +61,7 @@ fn views_permission_prompt_resolves_to_once() {
         decision,
         PermissionDecision {
             request_id: String::from("req_1"),
+            session_id: String::from("ses_1"),
             reply: ReplyKind::Once,
             message: None,
         }
@@ -87,7 +89,7 @@ fn views_permission_prompt_can_be_decided_with_the_mouse() {
         &MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Left),
             column: 10,
-            row: 8,
+            row: 9,
             modifiers: KeyModifiers::NONE,
         },
         body,
@@ -214,12 +216,39 @@ fn views_permission_empty_reject_message_is_none_not_an_empty_string() {
 fn views_permission_decision_converts_to_the_engine_reply() {
     let reply = PermissionDecision {
         request_id: String::from("req_9"),
+        session_id: String::from("ses_1"),
         reply: ReplyKind::Always,
         message: None,
     }
     .into_reply();
     assert_eq!(reply.request_id, "req_9");
     assert_eq!(reply.reply, ReplyKind::Always);
+}
+
+#[test]
+fn views_permission_prompt_shows_trusted_source_ids_without_rendering_unrelated_metadata() {
+    let mut inner = request("mystery_tool");
+    inner.session_id = String::from("ses_child_42");
+    inner.tool = Some(ToolCall {
+        message_id: String::from("msg_child_7"),
+        call_id: String::from("call_child_9"),
+    });
+    inner.metadata.insert(
+        String::from("credential"),
+        json!("secret-that-must-not-render"),
+    );
+
+    let joined = render(
+        PermissionPrompt::new(ViewContext::defaults(), inner, &json!({})),
+        80,
+        16,
+    )
+    .join("\n");
+
+    assert!(joined.contains("Source session: ses_child_42"), "{joined}");
+    assert!(joined.contains("Tool call: call_child_9"), "{joined}");
+    assert!(joined.contains("Message: msg_child_7"), "{joined}");
+    assert!(!joined.contains("secret-that-must-not-render"), "{joined}");
 }
 
 // ---------------------------------------------------------------------------

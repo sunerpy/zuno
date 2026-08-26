@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -26,7 +26,7 @@ use zuno_db::job::{
     ReportDelivery as DbReportDelivery,
 };
 use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
-use zuno_engine::r#loop::event_channel;
+use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_engine::wake::{PendingInputDriver, SessionWakeCoordinator};
 use zuno_tool::{InterruptHandle, PermissionAsker};
@@ -37,7 +37,7 @@ use zuno_tools::task::{
 };
 
 use super::delegation::DelegationLimiter;
-use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
+use super::turn::{SessionChoice, TurnHost, TurnHostDependencies, TurnOptions, TurnPlan};
 use crate::environment::StartupEnvironment;
 
 /// How deep a delegation chain may be walked before the walk is called cyclic.
@@ -276,6 +276,29 @@ trait DelegatedTurnRunner: Send + Sync + 'static {
     ) -> Result<String, String>;
 }
 
+/// Durable replay and identity published before a child emits its first live event.
+#[derive(Debug, Clone)]
+pub(crate) struct ChildSessionOpened {
+    pub(crate) session_id: String,
+    pub(crate) parent_session_id: String,
+    pub(crate) title: String,
+    pub(crate) agent: String,
+    pub(crate) model: String,
+    pub(crate) effort: Option<zuno_llm::effort::ReasoningEffort>,
+    pub(crate) messages: Vec<zuno_tui::views::message::Message>,
+    pub(crate) usage: Option<zuno_types::UsageSnapshot>,
+}
+
+/// Optional process surface that observes independently running child sessions.
+///
+/// The observer is synchronous by design: implementations update a short in-memory
+/// projection and nudge their own event loop. A child turn never waits on terminal
+/// rendering, and a non-interactive surface simply supplies no observer.
+pub(crate) trait ChildTurnObserver: Send + Sync + 'static {
+    fn opened(&self, opened: ChildSessionOpened);
+    fn event(&self, session_id: &str, event: &TurnEvent);
+}
+
 #[async_trait]
 pub(crate) trait ParentReportWake: Send + Sync + 'static {
     async fn wake(&self, report: SessionInput) -> Result<(), String>;
@@ -290,6 +313,7 @@ pub(crate) struct ChildSessionContext {
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
     pub(crate) runs: SessionRunRegistry,
     pub(crate) mcp: Option<zuno_mcp::Catalog>,
+    pub(crate) observer: Option<Arc<dyn ChildTurnObserver>>,
     pub(crate) parent_agent: String,
     pub(crate) parent_model: String,
     pub(crate) parent_effort: Option<zuno_llm::effort::ReasoningEffort>,
@@ -321,6 +345,7 @@ impl ChildSessionHost {
             question: context.question.clone(),
             runs: context.runs.clone(),
             mcp: context.mcp.clone(),
+            observer: context.observer.clone(),
         });
         let parent_driver: Arc<dyn PendingInputDriver> = Arc::new(ParentReportDriver {
             database: Arc::clone(&pool),
@@ -330,6 +355,7 @@ impl ChildSessionHost {
             question: context.question,
             runs: context.runs.clone(),
             mcp: context.mcp,
+            observer: context.observer,
             inbox: inbox.clone(),
             agent: context.parent_agent,
             model: context.parent_model,
@@ -548,6 +574,7 @@ struct ProductionDelegatedTurnRunner {
     question: Option<Arc<dyn QuestionAsker>>,
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
+    observer: Option<Arc<dyn ChildTurnObserver>>,
 }
 
 #[async_trait]
@@ -580,24 +607,62 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             request.workflow.as_deref(),
             request.workflow_node.as_deref(),
         )?;
-        let mut host = TurnHost::open_with_runtime_mcp_and_database(
+        let mut host = TurnHost::open_with_dependencies(
             plan,
             &self.environment,
-            Arc::clone(&self.approval),
-            self.question.clone(),
-            self.runs.clone(),
-            self.mcp.clone(),
-            Arc::clone(&self.database),
+            TurnHostDependencies {
+                approval: Arc::clone(&self.approval),
+                question: self.question.clone(),
+                runs: self.runs.clone(),
+                mcp: self.mcp.clone(),
+                database: Arc::clone(&self.database),
+                child_observer: self.observer.clone(),
+            },
         )
         .await?;
         host.activate_extension_composition()?;
+        if let Some(observer) = self.observer.as_ref() {
+            let messages = match host.resumed_history() {
+                Ok(history) => {
+                    let replay = super::tui_replay::project(history);
+                    let omission = replay.omission_notice();
+                    let mut messages = replay.messages;
+                    if let Some(notice) = omission {
+                        messages.push(notice);
+                    }
+                    messages
+                }
+                Err(error) => vec![super::tui_replay::failure_notice(session_id, &error)],
+            };
+            observer.opened(ChildSessionOpened {
+                session_id: session_id.to_owned(),
+                parent_session_id: request.parent_session_id.clone(),
+                title: host
+                    .session_title()
+                    .map(str::to_owned)
+                    .or_else(|| request.description.clone())
+                    .unwrap_or_else(|| session_id.to_owned()),
+                agent: host.agent_name().to_owned(),
+                model: host.qualified_model(),
+                effort: host.effort_override(),
+                messages,
+                usage: Some(host.session_usage().snapshot()),
+            });
+        }
         let guard = self
             .runs
             .begin_turn(session_id.to_owned())
             .map_err(to_string)?;
         let control = self.runs.control(session_id.to_owned());
         let outcome = {
-            let drive = drive_and_drain(&mut host, &request.prompt, None, Some(guard));
+            let drive = drive_and_drain(
+                &mut host,
+                &request.prompt,
+                None,
+                Some(guard),
+                session_id,
+                self.observer.clone(),
+            );
             tokio::pin!(drive);
             tokio::select! {
                 biased;
@@ -623,6 +688,7 @@ struct ParentReportDriver {
     question: Option<Arc<dyn QuestionAsker>>,
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
+    observer: Option<Arc<dyn ChildTurnObserver>>,
     inbox: SessionInbox,
     agent: String,
     model: String,
@@ -654,14 +720,17 @@ impl PendingInputDriver for ParentReportDriver {
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let plan = TurnPlan::resolve(&options, &self.environment).await?;
-        let mut host = TurnHost::open_with_runtime_mcp_and_database(
+        let mut host = TurnHost::open_with_dependencies(
             plan,
             &self.environment,
-            Arc::clone(&self.approval),
-            self.question.clone(),
-            self.runs.clone(),
-            self.mcp.clone(),
-            Arc::clone(&self.database),
+            TurnHostDependencies {
+                approval: Arc::clone(&self.approval),
+                question: self.question.clone(),
+                runs: self.runs.clone(),
+                mcp: self.mcp.clone(),
+                database: Arc::clone(&self.database),
+                child_observer: self.observer.clone(),
+            },
         )
         .await?;
         host.activate_extension_composition()?;
@@ -672,7 +741,15 @@ impl PendingInputDriver for ParentReportDriver {
         if promoted.is_none() {
             return host.shutdown().await;
         }
-        let outcome = drive_and_drain(&mut host, &text, Some(input.id.as_str()), Some(guard)).await;
+        let outcome = drive_and_drain(
+            &mut host,
+            &text,
+            Some(input.id.as_str()),
+            Some(guard),
+            input.session_id.as_str(),
+            self.observer.clone(),
+        )
+        .await;
         let shutdown = host.shutdown().await;
         super::turn::finish_with_shutdown(outcome, shutdown)
     }
@@ -718,8 +795,10 @@ async fn drive_and_drain(
     prompt: &str,
     message_id: Option<&str>,
     guard: Option<SessionRunGuard>,
+    session_id: &str,
+    observer: Option<Arc<dyn ChildTurnObserver>>,
 ) -> Result<(), String> {
-    let (sender, mut receiver) = event_channel();
+    let (sender, receiver) = event_channel();
     let drive = async {
         let outcome = match guard {
             Some(guard) => {
@@ -734,9 +813,21 @@ async fn drive_and_drain(
         drop(sender);
         outcome
     };
-    let drain = async { while receiver.recv().await.is_some() {} };
+    let drain = forward_child_events(session_id.to_owned(), receiver, observer);
     let (outcome, ()) = tokio::join!(drive, drain);
     outcome
+}
+
+async fn forward_child_events(
+    session_id: String,
+    mut receiver: mpsc::Receiver<TurnEvent>,
+    observer: Option<Arc<dyn ChildTurnObserver>>,
+) {
+    while let Some(event) = receiver.recv().await {
+        if let Some(observer) = observer.as_ref() {
+            observer.event(&session_id, &event);
+        }
+    }
 }
 
 fn child_answer(database: &zuno_db::pool::Pool, session_id: &str) -> Result<String, String> {

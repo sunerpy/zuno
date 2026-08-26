@@ -76,6 +76,27 @@ fn lsp_an_unchecked_file_never_reads_as_a_clean_one() {
 }
 
 #[test]
+fn lsp_clean_summary_uses_neutral_text_instead_of_a_green_sentence() {
+    let context = ViewContext::defaults();
+    let report = Report::checked("src/main.rs", "rust", Vec::new());
+    let line = report
+        .lines(80, 5, &context)
+        .into_iter()
+        .next()
+        .expect("the clean summary row");
+    let summary = line
+        .spans
+        .iter()
+        .find(|span| span.content.contains("no problems"))
+        .expect("the clean summary text");
+    assert_eq!(
+        summary.style.fg,
+        context.text().fg,
+        "the complete no-problems sentence was painted green"
+    );
+}
+
+#[test]
 fn lsp_summary_counts_each_severity_and_names_the_server() {
     let report = Report::checked(
         "src/lib.rs",

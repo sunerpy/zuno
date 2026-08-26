@@ -66,6 +66,7 @@ use zuno_tui::views::external::{
     EditorCancellation, EditorProcess, EditorProcessLauncher, EditorRequest, ExternalEditor,
     ExternalError, SystemEditor,
 };
+use zuno_tui::views::live_session::{LiveSessionOpen, LiveSessions};
 use zuno_tui::views::message::Message;
 use zuno_tui::views::picker::{
     McpProjection, McpServer, McpState, McpToggleRequest, QueuedInputDelivery, QueuedInputEntry,
@@ -74,6 +75,7 @@ use zuno_tui::views::picker::{
 use zuno_tui::views::session::{PromptSubmission, QueuedInputMutation, SessionScreen, scopes};
 use zuno_tui::views::slash::{CatalogCommand, HostCommand};
 
+use super::child_turn::{ChildSessionOpened, ChildTurnObserver};
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
 use super::tui_question::{QuestionBridge, QuestionBroker};
 use super::turn::{
@@ -465,13 +467,19 @@ fn execute_once(
     let mut driver_options = options.clone();
     let driver_environment = environment.clone();
     let runs = SessionRunRegistry::new();
-    let mut host = runtime.block_on(TurnHost::open_with_runtime_and_mcp(
+    let live_sessions = LiveSessions::default();
+    let child_observer: Arc<dyn ChildTurnObserver> = Arc::new(TuiChildObserver {
+        sessions: live_sessions.clone(),
+        wake: terminal_sender.clone(),
+    });
+    let mut host = runtime.block_on(TurnHost::open_with_runtime_mcp_and_observer(
         plan,
         environment,
         approval,
         Some(Arc::clone(&question)),
         runs.clone(),
         Some(mcp_catalog.clone()),
+        Some(Arc::clone(&child_observer)),
     ))?;
     if let Err(error) = host.activate_extension_composition() {
         let shutdown = runtime.block_on(host.shutdown());
@@ -496,7 +504,7 @@ fn execute_once(
         wake: terminal_sender.clone(),
     });
     host.set_title_sink(Arc::clone(&title_sink));
-    let continuity = TuiHostContinuity::new(runs, title_sink);
+    let continuity = TuiHostContinuity::new(runs, title_sink, Some(child_observer));
     let work_state = WorkState::new(host.work_state()?);
     let queued_inputs = QueuedInputProjection::new(project_queued_inputs(
         &host.session_inbox(),
@@ -515,8 +523,6 @@ fn execute_once(
             .into_iter()
             .map(|skill| CatalogCommand::skill(skill.name, skill.description, skill.location)),
     );
-    broker.bind_session(host.session_id());
-
     let (cancel_sender, cancel_receiver) = mpsc::channel(CANCEL_CHANNEL_CAPACITY);
     let (selection_sender, selection_receiver) = mpsc::channel(SELECTION_CHANNEL_CAPACITY);
     let (queue_mutation_sender, queue_mutation_receiver) =
@@ -553,6 +559,7 @@ fn execute_once(
         .with_queued_inputs(queued_inputs.clone(), queue_mutation_sender)
         .with_session_title(session_title)
         .with_work_state(work_state.clone())
+        .with_live_sessions(live_sessions)
         .with_catalog(catalog)
         .with_diagnostics_source(report_receiver)
         .with_edit_sink(pending_edits)
@@ -771,6 +778,12 @@ fn execute_once(
             editor_shutdown_source,
         ));
         let outcome = app.run().await.map_err(to_string);
+        // `App::run` returning is the logical end of the human-attached surface, even
+        // though worker shutdown still follows. Drop the component tree now so the
+        // permission bridge rejects root or child asks before the turn driver is joined;
+        // retaining it until the async block ended would make an unseen approval wait for
+        // the worker-shutdown timeout.
+        drop(app);
         let _stopping = worker_shutdown.send(true);
         let _aborted = shutdown_control.abort();
         let _stopping = editor_shutdown.send(true);
@@ -910,6 +923,34 @@ struct TitleProjectionSink {
     wake: mpsc::Sender<TerminalEvent>,
 }
 
+/// Projects independently running child hosts into the mounted session screen.
+struct TuiChildObserver {
+    sessions: LiveSessions,
+    wake: mpsc::Sender<TerminalEvent>,
+}
+
+impl ChildTurnObserver for TuiChildObserver {
+    fn opened(&self, opened: ChildSessionOpened) {
+        self.sessions.open(LiveSessionOpen {
+            session_id: opened.session_id,
+            parent_session_id: opened.parent_session_id,
+            title: opened.title,
+            agent: opened.agent,
+            model: opened.model,
+            effort: opened.effort,
+            messages: opened.messages,
+            usage: opened.usage,
+        });
+        let _nudged = self.wake.try_send(TerminalEvent::Wake);
+    }
+
+    fn event(&self, session_id: &str, event: &TurnEvent) {
+        if self.sessions.observe(session_id, event) {
+            let _nudged = self.wake.try_send(TerminalEvent::Wake);
+        }
+    }
+}
+
 impl super::turn::SessionTitleSink for TitleProjectionSink {
     fn publish(&self, title: &str) {
         self.projection.replace(Some(title.to_owned()));
@@ -928,11 +969,20 @@ impl super::turn::SessionTitleSink for TitleProjectionSink {
 struct TuiHostContinuity {
     runs: SessionRunRegistry,
     title_sink: Arc<dyn SessionTitleSink>,
+    child_observer: Option<Arc<dyn ChildTurnObserver>>,
 }
 
 impl TuiHostContinuity {
-    fn new(runs: SessionRunRegistry, title_sink: Arc<dyn SessionTitleSink>) -> Self {
-        Self { runs, title_sink }
+    fn new(
+        runs: SessionRunRegistry,
+        title_sink: Arc<dyn SessionTitleSink>,
+        child_observer: Option<Arc<dyn ChildTurnObserver>>,
+    ) -> Self {
+        Self {
+            runs,
+            title_sink,
+            child_observer,
+        }
     }
 
     fn control(&self, session_id: &str) -> zuno_engine::status::SessionControl {
@@ -947,6 +997,10 @@ impl TuiHostContinuity {
         Arc::clone(&self.title_sink)
     }
 
+    fn child_observer(&self) -> Option<Arc<dyn ChildTurnObserver>> {
+        self.child_observer.as_ref().map(Arc::clone)
+    }
+
     async fn open_host(
         &self,
         plan: TurnPlan,
@@ -955,13 +1009,14 @@ impl TuiHostContinuity {
         question: Arc<dyn QuestionAsker>,
         mcp: zuno_mcp::Catalog,
     ) -> Result<TurnHost, String> {
-        let mut host = TurnHost::open_with_runtime_and_mcp(
+        let mut host = TurnHost::open_with_runtime_mcp_and_observer(
             plan,
             environment,
             approval,
             Some(question),
             self.runs(),
             Some(mcp),
+            self.child_observer(),
         )
         .await?;
         host.set_title_sink(self.title_sink());
@@ -3440,6 +3495,7 @@ mod tests {
         let continuity = TuiHostContinuity::new(
             SessionRunRegistry::new(),
             Arc::new(RecordingTitleSink::default()),
+            None,
         );
         let control = continuity.control("ses_rebuilt");
         let replacement_runs = continuity.runs();
@@ -3473,6 +3529,7 @@ mod tests {
         let continuity = TuiHostContinuity::new(
             SessionRunRegistry::new(),
             Arc::clone(&titles) as Arc<dyn SessionTitleSink>,
+            None,
         );
 
         continuity.title_sink().publish("Replacement title");

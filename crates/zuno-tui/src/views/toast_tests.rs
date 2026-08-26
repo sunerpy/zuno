@@ -104,6 +104,17 @@ fn views_toast_carries_its_level_as_a_glyph_and_a_palette_colour() {
             ratatui::style::Color::from(context.palette().background_element),
             "{level:?} did not sit on the inset-element background"
         );
+        if level == ToastLevel::Success {
+            let text = (0..40)
+                .find(|x| buffer[(*x, 0)].symbol() == "m")
+                .map(|x| buffer[(x, 0)].clone())
+                .expect("the success toast body");
+            assert_eq!(
+                Some(text.fg),
+                context.text().fg,
+                "a success toast painted its whole sentence green instead of only the marker"
+            );
+        }
     }
 }
 

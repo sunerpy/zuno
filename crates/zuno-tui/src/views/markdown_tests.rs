@@ -474,6 +474,28 @@ fn markdown_ordered_and_unordered_markers_read_from_different_tokens() {
 }
 
 #[test]
+fn markdown_unordered_marker_is_quiet_but_ordered_enumeration_stays_emphasized() {
+    let palette = palette();
+    let bullet = span_with(&render("- a\n", 20, &palette), "•");
+    let ordinal = span_with(&render("1. a\n", 20, &palette), "1.");
+
+    assert!(
+        !bullet
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "the unordered bullet is decorative punctuation, not a second heading"
+    );
+    assert!(
+        ordinal
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "ordered markers still need enough emphasis to make sequence scannable"
+    );
+}
+
+#[test]
 fn markdown_task_list_markers_replace_the_bullet() {
     let rendered = draw("- [x] done\n- [ ] pending\n", 40);
     let out = text(&rendered);

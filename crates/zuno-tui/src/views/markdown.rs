@@ -510,10 +510,13 @@ impl<'palette> Builder<'palette> {
                 } else {
                     self.palette.markdown_list_item
                 };
-                spans.push(Span::styled(
-                    marker.to_owned(),
-                    self.tinted(color).add_modifier(Modifier::BOLD),
-                ));
+                let style = self.tinted(color);
+                let style = if ordered {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                };
+                spans.push(Span::styled(marker.to_owned(), style));
             }
             (_, Some(marker)) => {
                 spans.push(Span::styled(" ".repeat(display_width(marker)), self.base()));

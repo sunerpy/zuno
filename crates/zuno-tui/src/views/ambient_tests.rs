@@ -52,6 +52,7 @@ fn ambient() -> Ambient {
                 loaded: false,
             },
         ],
+        agents: Vec::new(),
         work: zuno_types::WorkStateProjection::default(),
         version: Some(String::from("0.1.0")),
     }
@@ -460,6 +461,33 @@ fn views_sidebar_warns_once_the_context_window_is_nearly_full() {
     assert!(
         coloured,
         "a nearly-full context window is not visually distinguished"
+    );
+}
+
+#[test]
+fn views_sidebar_colours_only_a_ready_services_status_glyph_green() {
+    let view = view();
+    let row = view
+        .lines(SIDEBAR_WIDTH)
+        .into_iter()
+        .find(|line| line.to_string().contains("rust-analyzer"))
+        .expect("the ready service row");
+    let text = view.context.text().fg;
+    let success = view.context.success().fg;
+    let name = row
+        .spans
+        .iter()
+        .find(|span| span.content.contains("rust-analyzer"))
+        .expect("service name span");
+    assert_eq!(
+        name.style.fg, text,
+        "a ready service painted its whole name green instead of only its status glyph"
+    );
+    assert!(
+        row.spans.iter().any(|span| {
+            span.content.contains(Health::Ready.glyph()) && span.style.fg == success
+        }),
+        "the ready state lost its compact success marker"
     );
 }
 

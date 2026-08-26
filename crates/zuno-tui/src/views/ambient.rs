@@ -27,6 +27,7 @@
 
 use crate::app::{AppEvent, Component, EventResult};
 use crate::views::selection::{TextPoint, TextSelection, slice_columns};
+use crate::views::subagent::Delegation;
 use crate::views::{ViewContext, display_width, fill, padded, truncate};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -167,6 +168,8 @@ pub struct Ambient {
     pub mcp: Vec<Service>,
     /// Discovered skills.
     pub skills: Vec<SkillSummary>,
+    /// Foreground subagent calls projected from the durable transcript.
+    pub agents: Vec<Delegation>,
     /// Durable goal, todo, job, and resident-memory state.
     pub work: zuno_types::WorkStateProjection,
     /// The build's version.
@@ -474,6 +477,8 @@ pub struct Expanded {
     pub todos: bool,
     /// Whether the background terminal list is open.
     pub background: bool,
+    /// Whether foreground delegated-agent calls are open.
+    pub agents: bool,
     /// Whether the durable agent/workflow job list is open.
     pub jobs: bool,
     /// Whether memory candidates and entries are open.
@@ -498,6 +503,7 @@ impl Default for Expanded {
             plan: true,
             todos: true,
             background: true,
+            agents: true,
             jobs: true,
             memory: false,
             lsp: true,
@@ -522,6 +528,8 @@ pub enum Section {
     Todos,
     /// Background terminal processes.
     Background,
+    /// Foreground delegated-agent calls.
+    Agents,
     /// Background agent and workflow jobs.
     Jobs,
     /// Resident-memory candidates and entries.
@@ -620,6 +628,7 @@ impl SidebarView {
             Section::Plan => self.expanded.plan = !self.expanded.plan,
             Section::Todos => self.expanded.todos = !self.expanded.todos,
             Section::Background => self.expanded.background = !self.expanded.background,
+            Section::Agents => self.expanded.agents = !self.expanded.agents,
             Section::Jobs => self.expanded.jobs = !self.expanded.jobs,
             Section::Memory => self.expanded.memory = !self.expanded.memory,
             Section::Lsp => self.toggle_lsp(),
@@ -790,6 +799,17 @@ impl SidebarView {
         }
     }
 
+    fn agent_style(&self, state: &str) -> Style {
+        match state {
+            "running" | "cancelling" => self.context.accent(),
+            "failed" => self.context.error(),
+            "blocked" | "uncertain" => self.context.warning(),
+            "cancelled" => self.context.muted(),
+            "completed" => self.context.text(),
+            _ => self.context.secondary(),
+        }
+    }
+
     fn heading(&self, label: &str, summary: &str, open: Option<bool>, width: u16) -> Line<'static> {
         let glyph = match open {
             Some(true) => OPEN_GLYPH,
@@ -809,15 +829,22 @@ impl SidebarView {
 
     fn service_row(&self, service: &Service, width: u16) -> Line<'static> {
         let columns = usize::from(width);
-        // Truncated here rather than left to the frame: a name wider than the panel gets
-        // cut either way, and cutting it in columns is what keeps the cut off the middle
-        // of a wide glyph.
-        let head = truncate(
-            &format!("  {} {}", service.health.glyph(), service.name),
-            columns,
-        );
-        let head_columns = display_width(&head);
-        let mut spans = vec![Span::styled(head, self.health_style(service.health))];
+        let marker = format!("  {} ", service.health.glyph());
+        let marker_columns = display_width(&marker);
+        if columns <= marker_columns {
+            return Line::from(Span::styled(
+                truncate(&marker, columns),
+                self.health_style(service.health),
+            ));
+        }
+        // State colour belongs to the compact glyph. The name is ordinary content, as
+        // in Codex's agent overview, so a healthy sidebar does not become a green wall.
+        let name = truncate(&service.name, columns - marker_columns);
+        let head_columns = marker_columns + display_width(&name);
+        let mut spans = vec![
+            Span::styled(marker, self.health_style(service.health)),
+            Span::styled(name, self.context.text()),
+        ];
         // The detail is dropped, never abbreviated to a stub. A long server name leaves
         // two or three columns, and `…d` is not a shorter way of saying `configured` —
         // it is a fragment a reader has to decode, while the health glyph already
@@ -1187,6 +1214,73 @@ impl SidebarView {
                 }
                 lines.push(padded(
                     "  /ps to inspect output",
+                    width,
+                    self.context.secondary(),
+                ));
+            }
+        }
+
+        if !self.ambient.agents.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Agents));
+            let running = self
+                .ambient
+                .agents
+                .iter()
+                .filter(|agent| matches!(agent.state.as_str(), "running" | "cancelling"))
+                .count();
+            let pending = self
+                .ambient
+                .agents
+                .iter()
+                .filter(|agent| agent.state == "pending")
+                .count();
+            let subagent_shortcut =
+                crate::views::pressable_label("session_child_first", &self.context)
+                    .unwrap_or_else(|| "/subagent".to_owned());
+            let summary = if pending == 0 {
+                format!(
+                    "{running} running · {} total · {subagent_shortcut}",
+                    self.ambient.agents.len()
+                )
+            } else {
+                format!(
+                    "{pending} pending · {running} running · {} total · {subagent_shortcut}",
+                    self.ambient.agents.len()
+                )
+            };
+            lines.push(self.heading(
+                "Agents",
+                &summary,
+                self.disclosure(self.expanded.agents),
+                width,
+            ));
+            if self.expanded.agents {
+                for agent in &self.ambient.agents {
+                    lines.push(padded(
+                        &format!("  {}", agent.headline(usize::from(width).saturating_sub(2))),
+                        width,
+                        self.agent_style(&agent.state),
+                    ));
+                    let location = agent
+                        .job_id
+                        .as_deref()
+                        .map(|id| format!("job {id}"))
+                        .or_else(|| {
+                            agent
+                                .session_id
+                                .as_deref()
+                                .map(|id| format!("session {id}"))
+                        })
+                        .unwrap_or_else(|| "foreground".to_owned());
+                    lines.push(padded(
+                        &format!("    {} · {location}", agent.state),
+                        width,
+                        self.context.secondary(),
+                    ));
+                }
+                lines.push(padded(
+                    &format!("  {subagent_shortcut} to inspect details"),
                     width,
                     self.context.secondary(),
                 ));
@@ -1587,11 +1681,20 @@ impl SidebarView {
             ));
         }
         if let Some(version) = &self.ambient.version {
-            lines.push(padded(
-                &format!("● zuno {version}"),
-                width,
-                self.context.success(),
-            ));
+            let marker = "● ";
+            let label = truncate(
+                &format!("zuno {version}"),
+                usize::from(width).saturating_sub(display_width(marker)),
+            );
+            let used = display_width(marker) + display_width(&label);
+            lines.push(Line::from(vec![
+                Span::styled(marker, self.context.success()),
+                Span::styled(label, self.context.muted()),
+                Span::styled(
+                    " ".repeat(usize::from(width).saturating_sub(used)),
+                    self.context.surface(),
+                ),
+            ]));
         }
         lines
     }

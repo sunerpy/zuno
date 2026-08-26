@@ -309,7 +309,12 @@ struct RecordingDenial {
 
 #[async_trait::async_trait]
 impl PermissionAsker for RecordingDenial {
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: zuno_tool::PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         self.asks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

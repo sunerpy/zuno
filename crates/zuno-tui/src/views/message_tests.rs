@@ -584,22 +584,33 @@ fn views_user_messages_render_commonmark_tables_instead_of_literal_pipes() {
 }
 
 #[test]
-fn views_thinking_style_uses_a_readable_secondary_accent_without_dim() {
+fn views_thinking_style_matches_codex_neutral_dim_italic_text() {
     let context = ViewContext::defaults();
-    let palette = context.palette();
     let style = context.thinking();
     let thinking = style.fg.expect("a foreground");
     assert_eq!(
         thinking,
-        ratatui::style::Color::from(palette.secondary),
-        "reasoning does not use the semantic secondary accent"
+        context.text().fg.expect("ordinary text foreground"),
+        "reasoning should use the terminal's normal foreground rather than purple"
     );
-    assert_ne!(
-        thinking,
-        ratatui::style::Color::from(palette.text_muted),
-        "reasoning fell back to the low-contrast muted colour"
+    assert!(
+        style.add_modifier.contains(Modifier::DIM),
+        "reasoning should be visually secondary without changing hue"
     );
-    assert!(!style.add_modifier.contains(Modifier::DIM));
+    assert!(
+        style.add_modifier.contains(Modifier::ITALIC),
+        "reasoning should retain Codex's italic treatment"
+    );
+}
+
+#[test]
+fn views_secondary_ui_text_uses_muted_neutral_foreground() {
+    let context = ViewContext::defaults();
+    assert_eq!(
+        context.secondary().fg,
+        context.muted().fg,
+        "secondary TUI and sidebar copy should not inherit the theme's purple accent"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2361,6 +2372,37 @@ fn views_expanding_tool_output_lifts_the_cap_and_removes_the_notice() {
 }
 
 #[test]
+fn views_expanded_tool_call_reveals_structured_arguments_and_result_sections() {
+    let arguments = r#"{"query":"Zuno agent delegation","urls":["https://example.com/a","https://example.com/b"]}"#;
+    let collapsed = tool_call("google_search", arguments, "two relevant sources", None).join("\n");
+    assert!(
+        !collapsed.contains("Arguments"),
+        "the compact transcript should stay compact:\n{collapsed}"
+    );
+
+    let expanded = tool_call_shown(
+        "google_search",
+        arguments,
+        "two relevant sources",
+        None,
+        ToolDisplay::Expanded,
+    )
+    .join("\n");
+    for expected in [
+        "Arguments",
+        r#""query": "Zuno agent delegation""#,
+        r#""urls": ["#,
+        "Result",
+        "two relevant sources",
+    ] {
+        assert!(
+            expanded.contains(expected),
+            "expanded tool details are missing {expected:?}:\n{expanded}"
+        );
+    }
+}
+
+#[test]
 fn views_a_single_enormous_line_is_reported_as_cut_rather_than_silently_clipped() {
     // The other way output hides: one row to the row cap, a megabyte to the wrap. Without
     // the character cap the wrap pays for the whole thing; without the *notice* the reader
@@ -2552,9 +2594,8 @@ fn views_reasoning_is_inset_past_the_answer_in_both_display_states() {
 
 #[test]
 fn views_reasoning_body_is_dimmer_than_the_answer_and_the_answer_is_not_italic() {
-    // Colour and weight carry the same hierarchy the indent does, so a terminal that drops
-    // one still shows it. Asserted on the produced spans, because a rendered cell cannot
-    // report a modifier.
+    // Weight and posture carry the hierarchy without assigning reasoning a competing hue.
+    // Asserted on the produced spans, because a rendered cell cannot report a modifier.
     let mut view = view();
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDelta(
@@ -2584,12 +2625,20 @@ fn views_reasoning_body_is_dimmer_than_the_answer_and_the_answer_is_not_italic()
         "the reasoning body is not italic, so one of the two hierarchy signals is missing"
     );
     assert!(
+        reasoning.style.add_modifier.contains(Modifier::DIM),
+        "the reasoning body is not dim, so it competes with the answer"
+    );
+    assert!(
         !answer.style.add_modifier.contains(Modifier::ITALIC),
         "the answer is italic too, which erases the distinction"
     );
-    assert_ne!(
+    assert!(
+        !answer.style.add_modifier.contains(Modifier::DIM),
+        "the answer is dim too, which erases the distinction"
+    );
+    assert_eq!(
         reasoning.style.fg, answer.style.fg,
-        "reasoning and the answer are the same colour, so the transcript buries the reply"
+        "reasoning should use neutral text hierarchy rather than a purple accent"
     );
 }
 

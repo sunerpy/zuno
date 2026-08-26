@@ -1,30 +1,21 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use zuno_error::ToolError;
-use zuno_tool::{PermissionAsk, PermissionAsker};
+use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
 
 use crate::ClientConnection;
 
 #[derive(Debug, Clone)]
 pub struct AcpPermissionAsker {
     client: ClientConnection,
-    session_id: String,
-    call_id: String,
     title: String,
 }
 
 impl AcpPermissionAsker {
     #[must_use]
-    pub fn new(
-        client: ClientConnection,
-        session_id: impl Into<String>,
-        call_id: impl Into<String>,
-        title: impl Into<String>,
-    ) -> Self {
+    pub fn new(client: ClientConnection, title: impl Into<String>) -> Self {
         Self {
             client,
-            session_id: session_id.into(),
-            call_id: call_id.into(),
             title: title.into(),
         }
     }
@@ -32,13 +23,18 @@ impl AcpPermissionAsker {
 
 #[async_trait]
 impl PermissionAsker for AcpPermissionAsker {
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        origin: PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         let response = self
             .client
             .request_permission(json!({
-                "sessionId": self.session_id,
+                "sessionId": origin.session_id(),
                 "toolCall": {
-                    "toolCallId": self.call_id,
+                    "toolCallId": origin.call_id(),
                     "title": self.title,
                     "kind": tool_kind(tool),
                     "status": "pending",

@@ -144,7 +144,7 @@ impl StatusPanel {
 /// left and is truncated too, because a detail that overflows is redrawn by the terminal
 /// on the next line without its gutter glyph and reads as a row of its own.
 fn service_row(context: &ViewContext, service: &Service, width: u16) -> Line<'static> {
-    let style = match service.health {
+    let health_style = match service.health {
         Health::Ready => context.success(),
         Health::Pending => context.warning(),
         Health::Faulted => context.error(),
@@ -156,7 +156,7 @@ fn service_row(context: &ViewContext, service: &Service, width: u16) -> Line<'st
     if total <= gutter_width {
         // The glyph still carries the health, which is the one fact that survives at this
         // width. Dropping the row instead would remove the member from the census.
-        return Line::from(Span::styled(truncate(&gutter, total), style));
+        return Line::from(Span::styled(truncate(&gutter, total), health_style));
     }
 
     // The name column yields to the frame rather than holding [`NAME_COLUMN`] into a
@@ -181,9 +181,12 @@ fn service_row(context: &ViewContext, service: &Service, width: u16) -> Line<'st
     // Padding is therefore measured in terminal columns.
     let pad = column.saturating_sub(display_width(&name));
 
-    let head = format!("{gutter}{name}{}", " ".repeat(pad));
-    let used = display_width(&head);
-    let mut spans = vec![Span::styled(head, style)];
+    let name = format!("{name}{}", " ".repeat(pad));
+    let used = gutter_width + display_width(&name);
+    let mut spans = vec![
+        Span::styled(gutter, health_style),
+        Span::styled(name, context.text()),
+    ];
     // Two columns separate the name from its detail. Below that there is no detail
     // column at all, and the remainder is padding rather than a one-character sliver of a
     // failure reason.
@@ -201,7 +204,7 @@ fn service_row(context: &ViewContext, service: &Service, width: u16) -> Line<'st
             spans.push(Span::styled(" ".repeat(total - filled), context.muted()));
         }
     } else if room > 0 {
-        spans.push(Span::styled(" ".repeat(room), style));
+        spans.push(Span::styled(" ".repeat(room), context.text()));
     }
     Line::from(spans)
 }

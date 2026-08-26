@@ -1012,18 +1012,17 @@ pub fn work_state_tools(pool: Arc<Pool>) -> Vec<Arc<dyn Tool>> {
 }
 
 async fn authorize(ctx: &ToolContext, tool: &str) -> Result<(), ToolError> {
-    ctx.permission
-        .ask(
-            tool,
-            PermissionAsk {
-                permission: tool.to_owned(),
-                patterns: vec!["*".to_owned()],
-                metadata: Map::new(),
-                always: vec!["*".to_owned()],
-                ..PermissionAsk::default()
-            },
-        )
-        .await
+    ctx.ask(
+        tool,
+        PermissionAsk {
+            permission: tool.to_owned(),
+            patterns: vec!["*".to_owned()],
+            metadata: Map::new(),
+            always: vec!["*".to_owned()],
+            ..PermissionAsk::default()
+        },
+    )
+    .await
 }
 
 fn output<T: Serialize>(

@@ -585,6 +585,13 @@ pub struct SessionScreen {
     queue_mutations: Option<mpsc::Sender<QueuedInputMutation>>,
     work: crate::views::ambient::WorkState,
     work_generation: u64,
+    /// Every delegated child host currently observed by this TUI composition.
+    live_sessions: crate::views::live_session::LiveSessions,
+    /// The full session surface currently attached in place of the root composer.
+    ///
+    /// This is a view attachment, not a host replacement. The parent and sibling hosts
+    /// continue running while this field is present.
+    live_session: Option<crate::views::live_session::LiveSessionView>,
     /// The non-MCP halves of `§8.7`'s status census, resolved once by the host.
     ///
     /// MCP is deliberately *not* stored here: it is live, and `status_panel` reads it from
@@ -881,6 +888,8 @@ impl SessionScreen {
             queue_mutations: None,
             work: crate::views::ambient::WorkState::default(),
             work_generation: 0,
+            live_sessions: crate::views::live_session::LiveSessions::default(),
+            live_session: None,
             census: Vec::new(),
             debug: crate::views::diagnostics::DebugFacts::default(),
             cancels: None,
@@ -1034,6 +1043,16 @@ impl SessionScreen {
     pub fn with_work_state(mut self, work: crate::views::ambient::WorkState) -> Self {
         self.work_generation = work.generation();
         self.work = work;
+        self
+    }
+
+    /// Install the process-local child-session projection used for live navigation.
+    #[must_use]
+    pub fn with_live_sessions(
+        mut self,
+        sessions: crate::views::live_session::LiveSessions,
+    ) -> Self {
+        self.live_sessions = sessions;
         self
     }
 
@@ -1892,7 +1911,21 @@ impl Component for SessionScreen {
             .collect();
         let (work_generation, work) = self.work.observe();
         self.work_generation = work_generation;
-        self.sidebar.ambient_mut().work = work;
+        let mut agents =
+            crate::views::subagent::delegations(self.transcript.transcript().messages());
+        agents.retain(|agent| {
+            agent
+                .job_id
+                .as_ref()
+                .is_none_or(|job_id| !work.jobs.iter().any(|job| job.id == *job_id))
+        });
+        let ambient = self.sidebar.ambient_mut();
+        ambient.work = work;
+        ambient.agents = agents;
+        if self.live_session.is_some() {
+            self.render_live_session(frame, area);
+            return;
+        }
         if self.transcript_full {
             self.sidebar.forget_hit_targets();
             crate::views::fill(frame.buffer_mut(), area, self.context.surface());
@@ -2147,7 +2180,8 @@ impl Component for SessionScreen {
         // to the editor and resolves to no action at all. That is the point: before
         // bracketed paste was enabled the same paste arrived as individual keys, and
         // every newline among them resolved to `input_submit`.
-        if !self.transcript_full
+        if self.live_session.is_none()
+            && !self.transcript_full
             && let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Paste(text))) = event
         {
             return self.paste(text);
@@ -2158,6 +2192,7 @@ impl Component for SessionScreen {
         // same seam the reject box uses.
         if let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Key(key))) = event
             && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && self.live_session.is_none()
             && !self.transcript_full
             && let Some(character) = typed_character(key)
         {
@@ -2169,6 +2204,7 @@ impl Component for SessionScreen {
         // than returned early, so the drain below still runs on a scroll — see its
         // comment: an event that skips it can be the last event the loop ever sees.
         let wheel = match event {
+            _ if self.live_session.is_some() => EventResult::IGNORED,
             AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse))) => {
                 self.handle_mouse(mouse, self.now_ms())
             }
@@ -2191,13 +2227,136 @@ impl Component for SessionScreen {
         if self.suppress_live_event_while_cancelling(event) {
             return projections;
         }
+        let live = self
+            .live_session
+            .as_mut()
+            .map_or(EventResult::IGNORED, |live| live.handle_event(event));
         projections
             .merge(self.transcript.handle_event(event))
             .merge(self.status.handle_event(event))
+            .merge(live)
     }
 }
 
 impl SessionScreen {
+    fn render_live_session(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(live) = self.live_session.as_mut() else {
+            return;
+        };
+        self.autocomplete_area = None;
+        self.transcript.forget_hit_targets();
+        let sidebar_drawn = sidebar_drawn(self.sidebar_visible, false, area.width);
+        let (content, gap, aside) = if sidebar_drawn {
+            let content = content_bounds(area, true);
+            let gap = Rect {
+                x: content.x.saturating_add(content.width),
+                width: SIDEBAR_GAP_COLS,
+                ..area
+            };
+            let aside = Rect {
+                x: gap.x.saturating_add(gap.width),
+                width: crate::views::ambient::SIDEBAR_WIDTH,
+                ..area
+            };
+            (content, Some(gap), Some(aside))
+        } else {
+            (area, None, None)
+        };
+        if let Some(gap) = gap {
+            crate::views::fill(frame.buffer_mut(), gap, self.context.surface());
+        }
+        live.render(frame, content);
+        let transcript = live.transcript();
+        let ambient = self.sidebar.ambient_mut();
+        ambient.title = Some(live.title().to_owned());
+        ambient.tokens = transcript.tokens();
+        ambient.usage_state = transcript.usage_state();
+        ambient.failed_turns = transcript.failed_turns();
+        ambient.context = transcript.context_window();
+        ambient.agents = crate::views::subagent::delegations(transcript.messages());
+        if let Some(aside) = aside {
+            self.sidebar.render(frame, aside);
+        } else {
+            self.sidebar.forget_hit_targets();
+        }
+    }
+
+    fn attach_live_session(&mut self, session_id: &str) -> EventResult {
+        let Some(view) = crate::views::live_session::LiveSessionView::attach(
+            self.context.clone(),
+            self.live_sessions.clone(),
+            session_id.to_owned(),
+        ) else {
+            self.toasts.push(Toast::info(format!(
+                "child session {session_id} is not live yet"
+            )));
+            return EventResult::REDRAW;
+        };
+        self.autocomplete.hide();
+        self.sidebar.clear_selection();
+        self.live_session = Some(view);
+        EventResult::REDRAW
+    }
+
+    fn enter_first_child(&mut self) -> EventResult {
+        let parent = self
+            .live_session
+            .as_ref()
+            .map(|live| live.session_id().to_owned())
+            .or_else(|| self.catalog.session.clone());
+        let Some(parent) = parent else {
+            self.toasts
+                .push(Toast::info("this session has no delegated child yet"));
+            return EventResult::REDRAW;
+        };
+        let Some(child) = self.live_sessions.children(&parent).into_iter().next() else {
+            self.toasts
+                .push(Toast::info("this session has no delegated child yet"));
+            return EventResult::REDRAW;
+        };
+        self.attach_live_session(&child)
+    }
+
+    fn return_to_parent_session(&mut self) -> EventResult {
+        let Some(parent) = self
+            .live_session
+            .as_ref()
+            .map(|live| live.parent_session_id().to_owned())
+        else {
+            // The root has no parent, but this is still a real routed action. Treating it as
+            // unhandled makes the binding look dead to both the reachability guard and users
+            // with key-dispatch diagnostics enabled.
+            return EventResult::REDRAW;
+        };
+        if self.live_sessions.snapshot(&parent).is_some() {
+            return self.attach_live_session(&parent);
+        }
+        self.live_session = None;
+        self.sidebar.clear_selection();
+        EventResult::REDRAW
+    }
+
+    fn cycle_live_sibling(&mut self, step: isize) -> EventResult {
+        let Some(live) = self.live_session.as_ref() else {
+            return self.enter_first_child();
+        };
+        let siblings = self.live_sessions.children(live.parent_session_id());
+        if siblings.len() < 2 {
+            return EventResult::REDRAW;
+        }
+        let current = siblings
+            .iter()
+            .position(|session| session == live.session_id())
+            .unwrap_or(0);
+        let length = isize::try_from(siblings.len()).unwrap_or(isize::MAX);
+        let next = isize::try_from(current)
+            .unwrap_or(0)
+            .saturating_add(step)
+            .rem_euclid(length);
+        let next = usize::try_from(next).unwrap_or(0);
+        self.attach_live_session(&siblings[next])
+    }
+
     /// The prompt band's height and the tail below it, for a `width` by `height` frame.
     ///
     /// One function rather than two calls at each site, because the tail depends on the band
@@ -3136,7 +3295,10 @@ impl SessionScreen {
                 let dialog = self.theme_picker();
                 self.request(dialog)
             }
-            "session_child_first" => self.request(self.subagent_view()),
+            "session_child_first" => self.enter_first_child(),
+            "session_parent" => self.return_to_parent_session(),
+            "session_child_cycle" => self.cycle_live_sibling(1),
+            "session_child_cycle_reverse" => self.cycle_live_sibling(-1),
             "ps_view" => self.request(self.background_view()),
             "memory_view" => self.request(self.memory_view()),
             "mcp_list" => self.request(self.mcp_list()),
@@ -3265,22 +3427,6 @@ impl SessionScreen {
             self.context.clone(),
             self.mcp.clone(),
         )))
-    }
-
-    /// The delegated-task view, over the delegations this conversation actually made.
-    ///
-    /// Always present, for the reason the census below is: "this session has delegated
-    /// nothing" is itself the answer a user opening it wants, and returning `None` would
-    /// replace that answer with `request`'s generic "nothing to choose from here yet",
-    /// which reads as a surface that failed rather than as a session with no subagents.
-    fn subagent_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
-        Some(Box::new(
-            crate::views::subagent::SubagentView::new(
-                self.context.clone(),
-                crate::views::subagent::delegations(self.transcript.transcript().messages()),
-            )
-            .with_work_state(self.work.clone()),
-        ))
     }
 
     fn background_view(&self) -> Option<Box<dyn crate::views::dialog::Dialog>> {
@@ -4167,6 +4313,29 @@ impl ActionComponent for SessionScreen {
     fn handle_action(&mut self, action: &'static Definition, event: &KeyEvent) -> EventResult {
         if action.name == "session_interrupt" && self.modal.is_some() {
             return self.request_interrupt_at(self.now_ms());
+        }
+        if self.live_session.is_some() {
+            if action.name == APP_EXIT || is_exit_request(event) {
+                return self.request_exit();
+            }
+            let navigation = match action.name {
+                "session_parent" => self.return_to_parent_session(),
+                "session_child_first" => self.enter_first_child(),
+                "session_child_cycle" => self.cycle_live_sibling(1),
+                "session_child_cycle_reverse" => self.cycle_live_sibling(-1),
+                "sidebar_toggle" => {
+                    self.sidebar_visible = !self.sidebar_visible;
+                    EventResult::REDRAW
+                }
+                _ => EventResult::IGNORED,
+            };
+            if navigation.handled {
+                return navigation;
+            }
+            return self
+                .live_session
+                .as_mut()
+                .map_or(EventResult::IGNORED, |live| live.handle_action(action));
         }
         if self.transcript_full {
             if matches!(action.name, "messages_transcript" | "session_interrupt") {

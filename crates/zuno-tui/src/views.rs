@@ -55,6 +55,7 @@ pub mod editor;
 pub mod external;
 pub mod help;
 mod highlight;
+pub mod live_session;
 pub mod lsp;
 pub mod markdown;
 pub mod memory;
@@ -250,22 +251,24 @@ impl ViewContext {
             .bg(palette.background_panel.into())
     }
 
-    /// Secondary accent used to distinguish delegated work from ordinary tools.
+    /// Secondary copy, following Codex's default-foreground-plus-dim hierarchy.
+    ///
+    /// A second hue made metadata and the whole sidebar compete with primary content,
+    /// and terminal magenta/blue variants were especially hard to read. Semantic state
+    /// keeps its own short glyph colour; explanatory copy stays neutral.
     #[must_use]
     pub fn secondary(&self) -> Style {
-        let palette = self.palette();
-        Style::new()
-            .fg(palette.secondary.into())
-            .bg(palette.background_panel.into())
+        self.muted()
     }
 
-    /// Ordinary tool activity: a cool accent that remains distinct from success.
+    /// Ordinary tool activity: neutral foreground like Codex's transcript rows.
+    ///
+    /// The icon and typography already identify a tool call. Painting the complete row
+    /// with the theme accent made routine activity purple on the system theme and competed
+    /// with the assistant answer.
     #[must_use]
     pub fn tool(&self) -> Style {
-        let palette = self.palette();
-        Style::new()
-            .fg(palette.accent.into())
-            .bg(palette.background_panel.into())
+        self.text()
     }
 
     /// Delegated agent or workflow activity.
@@ -274,7 +277,7 @@ impl ViewContext {
         self.secondary()
     }
 
-    /// Work that is actively progressing. The spinner is not left in muted text.
+    /// Work that is actively progressing: neutral foreground with stronger typography.
     #[must_use]
     pub fn running(&self) -> Style {
         self.tool().add_modifier(Modifier::BOLD)
@@ -327,13 +330,13 @@ impl ViewContext {
             .bg(palette.background_panel.into())
     }
 
-    /// Reasoning text: secondary accent, never a whole-block DIM treatment.
+    /// Reasoning text: ordinary foreground, dim and italic like Codex.
     ///
-    /// Indentation, italics and default collapse preserve hierarchy while this
-    /// readable foreground remains visible on terminal-derived system themes.
+    /// The hierarchy comes from typography rather than a purple hue, keeping it
+    /// readable on terminal-derived themes while clearly subordinate to the answer.
     #[must_use]
     pub fn thinking(&self) -> Style {
-        self.secondary()
+        self.text().add_modifier(Modifier::DIM | Modifier::ITALIC)
     }
 
     /// The fill used behind a whole surface.

@@ -662,7 +662,7 @@ fn an_invalid_spelling_names_the_action_and_the_spelling() {
 }
 
 #[test]
-fn unbinding_the_leader_is_refused_rather_than_silently_dropping_28_bindings() {
+fn unbinding_the_leader_is_refused_rather_than_silently_dropping_31_bindings() {
     let mut config = ResolvedTuiConfig::default();
     config
         .keybinds
@@ -670,10 +670,10 @@ fn unbinding_the_leader_is_refused_rather_than_silently_dropping_28_bindings() {
     let error = Keymap::from_config(&config).expect_err("an unbound leader must not build");
     assert_eq!(
         error,
-        KeybindError::LeaderDisabled { count: 28 },
-        "28 default spellings contain `<leader>`"
+        KeybindError::LeaderDisabled { count: 31 },
+        "31 default spellings contain `<leader>`"
     );
-    assert!(error.to_string().contains("28 bindings use `<leader>`"));
+    assert!(error.to_string().contains("31 bindings use `<leader>`"));
 }
 
 #[test]
@@ -688,9 +688,10 @@ fn rebinding_the_leader_moves_every_leader_sequence() {
 
 #[test]
 fn scope_precedence_is_ordered_rather_than_arbitrary() {
-    // `right` is `diff_expand` in the diff viewer and `session_child_cycle` in a
-    // session. Whichever scope the caller lists first is the one that answers.
-    let mut keymap = Keymap::defaults().expect("defaults build");
+    // A user can deliberately put the same physical chord in two scopes. Whichever scope
+    // the caller lists first is the one that answers; the default child-session binding is
+    // leader-qualified so it does not steal the prompt's ordinary arrow key.
+    let mut keymap = keymap_with(&[("session_child_cycle", BindingValue::parse("right"))]);
     let start = Instant::now();
     let right = Chord::parse("right").expect("parses");
 

@@ -361,7 +361,7 @@ impl Report {
             } else if self.count(Severity::Warning) > 0 {
                 context.warning()
             } else if self.is_checked() {
-                context.success()
+                context.text()
             } else {
                 context.muted()
             },

@@ -59,7 +59,12 @@ struct RecordingPermission(Mutex<Vec<PermissionAsk>>);
 
 #[async_trait]
 impl PermissionAsker for RecordingPermission {
-    async fn ask(&self, _tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: zuno_tool::PermissionOrigin<'_>,
+        _tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

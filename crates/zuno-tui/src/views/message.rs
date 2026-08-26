@@ -361,7 +361,7 @@ fn notice_style(level: crate::views::toast::ToastLevel, context: &ViewContext) -
     use crate::views::toast::ToastLevel;
     match level {
         ToastLevel::Info => context.muted(),
-        ToastLevel::Success => context.success(),
+        ToastLevel::Success => context.text(),
         ToastLevel::Warning => context.warning(),
         ToastLevel::Error => context.error(),
     }
@@ -2438,6 +2438,13 @@ impl TranscriptView {
                     crate::views::tool::status_style(*status, *ui_intent, &self.context),
                     out,
                 );
+                let frame = RowFrame { role, rule, width };
+                if display == ToolDisplay::Expanded {
+                    self.tool_argument_lines(frame, arguments, out);
+                    if diff.is_some() || output.is_some() {
+                        self.tool_section_label(frame, "Result", out);
+                    }
+                }
                 // A patch travels beside the output rather than inside it, so a result that
                 // has one is rendered from it — and before this it was rendered from neither.
                 // `tool_output_lines` only ever diff-sniffed `output`, and every mutating
@@ -2445,7 +2452,6 @@ impl TranscriptView {
                 // `TurnEvent::ToolDispatchCompleted` had faithfully carried all the way here
                 // was dropped on the floor at the last step. The diff viewer could open it;
                 // the transcript could not show it.
-                let frame = RowFrame { role, rule, width };
                 match (diff, output) {
                     (Some(patch), _) => {
                         self.tool_result_lines(frame, name, patch, *status, display, out);
@@ -2532,6 +2538,89 @@ impl TranscriptView {
     /// five-column continuation indent, and the alignment under the icon is what makes a
     /// long result read as belonging to the call above it instead of floating between two.
     const RESULT_INSET: &'static str = "   ";
+
+    /// The inset for structured tool-call details beneath a section label.
+    const DETAIL_INSET: &'static str = "     ";
+
+    /// Expanded input stays inspectable without allowing one malformed call to allocate an
+    /// unbounded frame. A visible overflow row makes either limit explicit.
+    const TOOL_ARGUMENT_ROWS: usize = 120;
+    const TOOL_ARGUMENT_CHARS: usize = 16_000;
+
+    fn tool_section_label(&self, frame: RowFrame, label: &str, out: &mut Vec<Line<'static>>) {
+        out.push(self.ruled(
+            frame.role,
+            frame.rule,
+            &format!("{}{label}", Self::RESULT_INSET),
+            self.context.secondary().add_modifier(Modifier::BOLD),
+            frame.width,
+        ));
+    }
+
+    fn tool_argument_lines(&self, frame: RowFrame, arguments: &str, out: &mut Vec<Line<'static>>) {
+        if arguments.trim().is_empty() {
+            return;
+        }
+        self.tool_section_label(frame, "Arguments", out);
+        let formatted = serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .unwrap_or_else(|| arguments.to_owned());
+        let (formatted, capped) = match formatted.char_indices().nth(Self::TOOL_ARGUMENT_CHARS) {
+            Some((cut, _)) => (&formatted[..cut], true),
+            None => (formatted.as_str(), false),
+        };
+        let body_width = frame.width.saturating_sub(frame.gutter(Self::DETAIL_INSET));
+        let rows = Self::indented_detail_rows(formatted, body_width);
+        let total = rows.len();
+        for row in rows.iter().take(Self::TOOL_ARGUMENT_ROWS) {
+            out.push(self.ruled(
+                frame.role,
+                frame.rule,
+                &format!("{}{row}", Self::DETAIL_INSET),
+                self.context.tool_output(),
+                frame.width,
+            ));
+        }
+        if total > Self::TOOL_ARGUMENT_ROWS || capped {
+            let mut notice = format!("{}{ELIDED}", Self::DETAIL_INSET);
+            if total > Self::TOOL_ARGUMENT_ROWS {
+                notice.push_str(&format!(
+                    " {} more argument lines",
+                    total - Self::TOOL_ARGUMENT_ROWS
+                ));
+            }
+            if capped {
+                if total > Self::TOOL_ARGUMENT_ROWS {
+                    notice.push(',');
+                }
+                notice.push_str(&format!(" cut at {} chars", Self::TOOL_ARGUMENT_CHARS));
+            }
+            out.push(self.ruled(
+                frame.role,
+                frame.rule,
+                &notice,
+                self.context.warning(),
+                frame.width,
+            ));
+        }
+    }
+
+    fn indented_detail_rows(text: &str, width: u16) -> Vec<String> {
+        let width = width.max(1);
+        let mut rows = Vec::new();
+        for line in text.split('\n') {
+            let content = line.trim_start_matches(char::is_whitespace);
+            let leading = &line[..line.len() - content.len()];
+            let indent = truncate(leading, usize::from(width.saturating_sub(1)));
+            let indent_width = u16::try_from(display_width(&indent)).unwrap_or(u16::MAX);
+            let content_width = width.saturating_sub(indent_width).max(1);
+            for row in wrap(content, content_width) {
+                rows.push(format!("{indent}{row}"));
+            }
+        }
+        rows
+    }
 
     /// A tool's result, as a diff when it is one and as budgeted prose otherwise.
     ///

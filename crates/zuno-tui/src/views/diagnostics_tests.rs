@@ -151,6 +151,16 @@ fn views_status_panel_health_colour_comes_from_the_palette() {
         context.success().fg,
         "a ready member is not drawn in the palette's success colour"
     );
+    let name = ready
+        .spans
+        .iter()
+        .find(|span| span.content.contains("filesystem"))
+        .expect("the ready service name is rendered separately");
+    assert_eq!(
+        name.style.fg,
+        context.text().fg,
+        "a ready diagnostics row painted its whole service name green"
+    );
 }
 
 #[test]

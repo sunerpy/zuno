@@ -1026,7 +1026,7 @@ pub fn derive_system_theme(colors: &TerminalColors, mode: Mode) -> Option<ThemeJ
 
     Some(ThemeJson::from_literals(vec![
         ("primary", cyan),
-        ("secondary", magenta),
+        ("secondary", text_muted),
         ("accent", cyan),
         ("error", red),
         ("warning", yellow),
@@ -1064,12 +1064,12 @@ pub fn derive_system_theme(colors: &TerminalColors, mode: Mode) -> Option<ThemeJ
         ("markdownHeading", fg),
         ("markdownLink", blue),
         ("markdownLinkText", cyan),
-        ("markdownCode", green),
+        ("markdownCode", fg),
         ("markdownBlockQuote", yellow),
         ("markdownEmph", yellow),
         ("markdownStrong", fg),
         ("markdownHorizontalRule", gray(7)),
-        ("markdownListItem", blue),
+        ("markdownListItem", text_muted),
         ("markdownListEnumeration", cyan),
         ("markdownImage", blue),
         ("markdownImageText", cyan),

@@ -5588,15 +5588,6 @@ fn session_ignores_a_mouse_event_that_is_not_a_vertical_wheel() {
 /// capability this screen has not grown yet, recorded so the next author sees the backlog
 /// instead of rediscovering one row of it.
 const PRESSABLE_BUT_DEAD: &[&str] = &[
-    // Deliberate: the bare arrows the delegated-task view owns. They reach
-    // `crate::views::subagent::SubagentView` through `DialogHost`, which owns the keyboard
-    // and promotes the `session` scope while that view is open — the same arrangement the
-    // `diff_*` rows below describe. An arm on this screen would take `left`, `right` and
-    // `up` away from the prompt cursor, which the `input` scope wins ahead of `session`
-    // precisely so that it keeps them.
-    "session_child_cycle",
-    "session_child_cycle_reverse",
-    "session_parent",
     // Deliberate: bare characters the diff viewer owns; an arm here would make them untypeable.
     "diff_close",
     "diff_collapse",
@@ -5712,11 +5703,12 @@ fn every_bound_action_in_a_registered_scope_either_reaches_something_or_is_a_nam
     );
     // The census is a number as well as a set, so shrinking it is a visible event in a diff
     // and growing it silently is impossible. `agent_cycle` and `agent_cycle_reverse` were the
-    // two an earlier change took off the list; `session_child_first` gained the delegated-task
-    // view, and `session_queued_prompts` gained the durable queue picker.
+    // two an earlier change took off the list; `session_child_first` gained live child
+    // attachment, its three parent/sibling navigation actions now route on that surface, and
+    // `session_queued_prompts` gained the durable queue picker.
     assert_eq!(
         PRESSABLE_BUT_DEAD.len(),
-        45,
+        42,
         "the pressable-but-dead census changed size; that is a real event either way and the \
          count is pinned so it cannot pass unremarked"
     );
@@ -8168,20 +8160,46 @@ fn choosing_a_reasoning_model_clears_an_unsupported_level() {
     assert_eq!(screen.welcome_mut().facts().reasoning, None);
 }
 
-/// `ctrl+x` then `down` opens the delegated-task view.
-///
-/// Driven through the dispatcher and the dialog host rather than by calling the handler,
-/// because the thing under test is that the *chord* reaches a surface: `session_child_first`
-/// was a row in the shipped table with no handler anywhere in the crate.
+/// `ctrl+x` then `down` attaches the full screen to a running child immediately, and
+/// `ctrl+x` then `up` returns to the still-mounted parent.
 #[test]
-fn the_leader_down_chord_opens_the_delegated_task_view() {
+fn leader_down_and_up_switch_between_parent_and_live_child_without_a_dialog() {
     let keymap = Keymap::defaults().expect("the shipped table builds");
     let (sender, _receiver) = terminal_event_channel();
-    let mut screen = SessionScreen::new(ViewContext::defaults(), sender);
+    let sessions = crate::views::live_session::LiveSessions::default();
+    sessions.open(crate::views::live_session::LiveSessionOpen {
+        session_id: String::from("ses_child"),
+        parent_session_id: String::from("ses_parent"),
+        title: String::from("survey the auth code"),
+        agent: String::from("explorer"),
+        model: String::from("test/model"),
+        effort: None,
+        messages: vec![Message::user("child transcript is live")],
+        usage: None,
+    });
+    sessions.observe(
+        "ses_child",
+        &TurnEvent::AssistantMessageCreated {
+            step: 1,
+            message_id: String::from("msg_child"),
+        },
+    );
+    sessions.observe(
+        "ses_child",
+        &TurnEvent::Provider {
+            step: 1,
+            event: StreamEvent::TextDelta(String::from("working before completion")),
+        },
+    );
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions);
     screen
         .transcript_mut()
         .transcript_mut()
-        .push(delegating_message());
+        .push(Message::user("parent transcript remains mounted"));
     let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
     let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
 
@@ -8199,42 +8217,74 @@ fn the_leader_down_chord_opens_the_delegated_task_view() {
         )));
     }
 
-    let joined = rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
+    let child = rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
     assert!(
-        joined.contains("Subagents"),
-        "ctrl+x down did not open the delegated-task view:\n{joined}"
+        child.contains("survey the auth code"),
+        "ctrl+x down did not attach the full screen to the child:\n{child}"
     );
     assert!(
-        joined.contains("survey the auth code"),
-        "the view opened without the delegation this session made:\n{joined}"
+        child.contains("working before completion"),
+        "the child stayed invisible until completion:\n{child}"
+    );
+    assert!(
+        !child.contains("Subagents"),
+        "ctrl+x down still opened the old details dialog:\n{child}"
+    );
+
+    for event in [
+        KeyEvent {
+            code: crossterm::event::KeyCode::Char('x'),
+            modifiers: crossterm::event::KeyModifiers::CONTROL,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        },
+        press(crossterm::event::KeyCode::Up),
+    ] {
+        dispatcher.handle_event(&crate::app::AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(event),
+        )));
+    }
+    let parent = rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
+    assert!(
+        parent.contains("parent transcript remains mounted"),
+        "ctrl+x up did not return to the original parent screen:\n{parent}"
+    );
+    assert!(
+        !parent.contains("working before completion"),
+        "returning to the parent left the child transcript attached:\n{parent}"
     );
 }
 
-/// One assistant message carrying two `task` calls, as a delegating turn records them.
-fn delegating_message() -> Message {
-    let call = |id: &str, agent: &str, description: &str, session: &str| {
-        crate::views::message::MessagePart::Tool {
-            call_id: String::from(id),
-            name: String::from("task"),
-            ui_intent: zuno_tool::ToolUiIntent::Subagent,
-            arguments: format!(
-                r#"{{"description":"{description}","prompt":"go","subagent_type":"{agent}"}}"#
-            ),
-            title: None,
-            status: crate::views::message::ToolStatus::Completed,
-            output: Some(format!(
-                "<task id=\"{session}\" state=\"completed\">\nok\n</task>"
-            )),
-            diff: None,
-        }
+#[test]
+fn the_sidebar_projects_foreground_running_delegations_from_the_transcript() {
+    let (mut screen, _shutdown) = screen();
+    let call = |id: &str, description: &str| crate::views::message::MessagePart::Tool {
+        call_id: id.to_owned(),
+        name: String::from("task"),
+        ui_intent: zuno_tool::ToolUiIntent::Subagent,
+        arguments: format!(
+            r#"{{"description":"{description}","prompt":"inspect","subagent_type":"explorer"}}"#
+        ),
+        title: None,
+        status: crate::views::message::ToolStatus::Running,
+        output: None,
+        diff: None,
     };
-    Message {
+    screen.transcript_mut().transcript_mut().push(Message {
         role: Role::Assistant,
-        id: Some(String::from("msg_delegating")),
+        id: Some(String::from("msg_parallel_delegation")),
         parts: vec![
-            call("c1", "explore", "survey the auth code", "ses_child_a"),
-            call("c2", "librarian", "find the RFC", "ses_child_b"),
+            call("call_current", "inspect current directory"),
+            call("call_tmp", "inspect /tmp directory"),
         ],
+    });
+
+    let rendered = rows(&render_offscreen(&mut screen, 120, 40).expect("infallible")).join("\n");
+    for expected in ["Agents", "2 running", "inspect current", "inspect /tmp"] {
+        assert!(
+            rendered.contains(expected),
+            "the sidebar is missing {expected:?} for foreground task calls:\n{rendered}"
+        );
     }
 }
 

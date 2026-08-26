@@ -140,7 +140,12 @@ struct DenyNamed(&'static str);
 
 #[async_trait]
 impl PermissionAsker for DenyNamed {
-    async fn ask(&self, tool: &str, _ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: zuno_tool::PermissionOrigin<'_>,
+        tool: &str,
+        _ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         if tool == self.0 {
             Err(ToolError::Denied {
                 tool: tool.to_owned(),
@@ -158,7 +163,12 @@ struct RecordingPermissions {
 
 #[async_trait]
 impl PermissionAsker for RecordingPermissions {
-    async fn ask(&self, tool: &str, ask: PermissionAsk) -> Result<(), ToolError> {
+    async fn ask(
+        &self,
+        _origin: zuno_tool::PermissionOrigin<'_>,
+        tool: &str,
+        ask: PermissionAsk,
+    ) -> Result<(), ToolError> {
         self.asks
             .lock()
             .expect("permission lock")
