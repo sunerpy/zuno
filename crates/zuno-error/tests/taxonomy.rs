@@ -178,22 +178,22 @@ fn tool_failures_identify_their_tool_and_their_next_step() {
         source: Box::new(std::io::Error::other("missing field `oldString`")),
     };
     let timed_out = ToolError::Timeout {
-        tool: "bash".to_owned(),
+        tool: "shell".to_owned(),
         elapsed: Duration::from_secs(120),
     };
     let missing = ToolError::NotFound {
         tool: "frobnicate".to_owned(),
     };
     let failed = ToolError::Failed {
-        tool: "bash".to_owned(),
+        tool: "shell".to_owned(),
         source: Box::new(std::io::Error::other("exit status 1")),
     };
 
     assert_eq!(denied.tool(), "write");
     assert_eq!(invalid.tool(), "edit");
-    assert_eq!(timed_out.tool(), "bash");
+    assert_eq!(timed_out.tool(), "shell");
     assert_eq!(missing.tool(), "frobnicate");
-    assert_eq!(failed.tool(), "bash");
+    assert_eq!(failed.tool(), "shell");
 
     assert!(timed_out.is_retryable());
     assert!(!denied.is_retryable());
@@ -326,7 +326,7 @@ fn one_generic_helper_serves_every_domain() {
     }));
     assert!(should_retry(&DbError::Busy { retry_after: None }));
     assert!(should_retry(&ToolError::Timeout {
-        tool: "bash".to_owned(),
+        tool: "shell".to_owned(),
         elapsed: Duration::from_secs(1)
     }));
     assert!(should_retry(&McpError::Timeout {
@@ -358,11 +358,11 @@ fn one_generic_helper_serves_every_domain() {
 #[test]
 fn errors_render_a_full_cause_chain_for_humans() {
     let error = Error::from(ToolError::Failed {
-        tool: "bash".to_owned(),
+        tool: "shell".to_owned(),
         source: Box::new(std::io::Error::other("exit status 1")),
     });
 
-    assert_eq!(error.to_string(), "tool bash failed");
+    assert_eq!(error.to_string(), "tool shell failed");
 
     let mut chain = vec![error.to_string()];
     let mut current: Option<&(dyn std::error::Error + 'static)> = error.source();
@@ -370,5 +370,5 @@ fn errors_render_a_full_cause_chain_for_humans() {
         chain.push(cause.to_string());
         current = cause.source();
     }
-    assert_eq!(chain, ["tool bash failed", "exit status 1"]);
+    assert_eq!(chain, ["tool shell failed", "exit status 1"]);
 }

@@ -111,7 +111,7 @@ fn fts_keeps_tool_output_in_main_but_out_of_trigram() {
         json!({
             "type": "tool",
             "callID": "call_1",
-            "tool": "bash",
+            "tool": "shell",
             "state": {
                 "status": "completed",
                 "input": { "command": "diagnose" },

@@ -36,9 +36,34 @@ fn engine_stream_events_project_to_protocol_updates() {
     assert_eq!(text["content"]["type"], "text");
     assert_eq!(text["content"]["text"], "hello");
 
+    let pending = turn_event_update(&TurnEvent::ToolCallStarted {
+        step: 1,
+        call_id: "call-1".to_owned(),
+        display_name: "zsh".to_owned(),
+        name: "shell".to_owned(),
+        ui_intent: ToolUiIntent::Generic,
+    })
+    .expect("pending tool call is client-visible");
+    assert_eq!(pending["sessionUpdate"], "tool_call");
+    assert_eq!(pending["toolCallId"], "call-1");
+    assert_eq!(pending["title"], "zsh");
+    assert_eq!(pending["status"], "pending");
+    assert!(
+        turn_event_update(&TurnEvent::Provider {
+            step: 1,
+            event: StreamEvent::ToolUseStart {
+                id: "call-1".to_owned(),
+                name: "shell".to_owned(),
+            },
+        })
+        .is_none(),
+        "the raw provider event must not publish a second wire-name tool row"
+    );
+
     let started = turn_event_update(&TurnEvent::ToolDispatchStarted {
         step: 1,
         call_id: "call-1".to_owned(),
+        display_name: "write".to_owned(),
         name: "write".to_owned(),
         ui_intent: ToolUiIntent::Generic,
     })
@@ -50,6 +75,7 @@ fn engine_stream_events_project_to_protocol_updates() {
     let completed = turn_event_update(&TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: "call-1".to_owned(),
+        display_name: "write".to_owned(),
         name: "write".to_owned(),
         title: "Wrote file".to_owned(),
         output: "ok".to_owned(),

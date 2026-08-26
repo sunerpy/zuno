@@ -66,12 +66,14 @@ fn views_chat_transcript_renders_every_part_kind_offscreen() {
         TurnEvent::ToolDispatchStarted {
             step: 1,
             call_id: String::from("call_1"),
+            display_name: String::from("read"),
             name: String::from("read"),
             ui_intent: zuno_tool::ToolUiIntent::Generic,
         },
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("call_1"),
+            display_name: String::from("read"),
             name: String::from("read"),
             title: String::from("Read src/main.rs"),
             output: String::from("fn main() {}"),
@@ -332,37 +334,72 @@ fn views_retry_notice_states_its_count_at_the_narrowest_width() {
 fn views_tool_call_walks_pending_running_and_terminal_states() {
     let mut transcript = Transcript::new();
     transcript.observe(&started());
+    transcript.observe(&TurnEvent::ToolCallStarted {
+        step: 1,
+        call_id: String::from("c1"),
+        display_name: String::from("zsh"),
+        name: String::from("shell"),
+        ui_intent: zuno_tool::ToolUiIntent::Generic,
+    });
     transcript.observe(&provider(StreamEvent::ToolUseStart {
         id: String::from("c1"),
-        name: String::from("bash"),
+        name: String::from("shell"),
     }));
-    let status = |transcript: &Transcript| match &transcript.messages()[0].parts[0] {
-        MessagePart::Tool { status, .. } => *status,
+    let state = |transcript: &Transcript| match &transcript.messages()[0].parts[0] {
+        MessagePart::Tool {
+            name,
+            display_name,
+            status,
+            ..
+        } => (name.clone(), display_name.clone(), *status),
         other => panic!("expected a tool part, found {other:?}"),
     };
-    assert_eq!(status(&transcript), ToolStatus::Pending);
+    assert_eq!(
+        state(&transcript),
+        (
+            String::from("shell"),
+            String::from("zsh"),
+            ToolStatus::Pending
+        )
+    );
 
     transcript.observe(&TurnEvent::ToolDispatchStarted {
         step: 1,
         call_id: String::from("c1"),
-        name: String::from("bash"),
+        display_name: String::from("zsh"),
+        name: String::from("shell"),
         ui_intent: zuno_tool::ToolUiIntent::Generic,
     });
-    assert_eq!(status(&transcript), ToolStatus::Running);
-    assert!(status(&transcript).is_active());
+    assert_eq!(
+        state(&transcript),
+        (
+            String::from("shell"),
+            String::from("zsh"),
+            ToolStatus::Running
+        )
+    );
+    assert!(state(&transcript).2.is_active());
 
     transcript.observe(&TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
-        name: String::from("bash"),
-        title: String::from("ls"),
+        display_name: String::from("zsh"),
+        name: String::from("shell"),
+        title: String::from("false"),
         output: String::from("a\nb"),
         diff: None,
         written_paths: Vec::new(),
         is_error: true,
     });
-    assert_eq!(status(&transcript), ToolStatus::Error);
-    assert!(!status(&transcript).is_active());
+    assert_eq!(
+        state(&transcript),
+        (
+            String::from("shell"),
+            String::from("zsh"),
+            ToolStatus::Error
+        )
+    );
+    assert!(!state(&transcript).2.is_active());
 }
 
 #[test]
@@ -374,6 +411,7 @@ fn views_tool_dispatch_without_a_provider_stream_still_appears() {
     transcript.observe(&TurnEvent::ToolDispatchStarted {
         step: 1,
         call_id: String::from("orphan"),
+        display_name: String::from("grep"),
         name: String::from("grep"),
         ui_intent: zuno_tool::ToolUiIntent::Generic,
     });
@@ -383,7 +421,7 @@ fn views_tool_dispatch_without_a_provider_stream_still_appears() {
 #[test]
 fn views_tool_affordance_matches_the_oracle_icons() {
     for (name, icon) in [
-        ("bash", "$"),
+        ("shell", "$"),
         ("glob", "✱"),
         ("grep", "✱"),
         ("read", "→"),
@@ -403,12 +441,12 @@ fn views_pending_tool_renders_its_placeholder_until_arguments_arrive() {
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
         id: String::from("c"),
-        name: String::from("bash"),
+        name: String::from("shell"),
     })));
     let joined = draw(&mut view, 40, 6).join("\n");
     assert!(
         joined.contains("~ Tool · $ Writing command..."),
-        "a pending bash call did not render the oracle's placeholder:\n{joined}"
+        "a pending shell call did not render the oracle's placeholder:\n{joined}"
     );
 }
 
@@ -452,7 +490,7 @@ fn views_reasoning_and_tool_rows_name_their_different_content_types() {
         provider(StreamEvent::ReasoningDone { duration_secs: 1.5 }),
         provider(StreamEvent::ToolUseStart {
             id: String::from("call_1"),
-            name: String::from("bash"),
+            name: String::from("shell"),
         }),
         provider(StreamEvent::ToolInputDelta {
             id: String::from("call_1"),
@@ -468,7 +506,7 @@ fn views_reasoning_and_tool_rows_name_their_different_content_types() {
         "reasoning has no explicit category label:\n{joined}"
     );
     assert!(
-        joined.contains("Tool · $ bash"),
+        joined.contains("Tool · $ shell"),
         "the tool row is visually indistinguishable from reasoning:\n{joined}"
     );
 }
@@ -480,7 +518,7 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
     for event in [
         provider(StreamEvent::ToolUseStart {
             id: String::from("blocked"),
-            name: String::from("bash"),
+            name: String::from("shell"),
         }),
         TurnEvent::ToolDispatchBlocked {
             step: 1,
@@ -490,8 +528,9 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("blocked"),
-            name: String::from("bash"),
-            title: String::from("bash blocked"),
+            display_name: String::from("shell"),
+            name: String::from("shell"),
+            title: String::from("shell blocked"),
             output: String::from("redirection outside the worktree was refused; nothing ran"),
             diff: None,
             written_paths: Vec::new(),
@@ -499,13 +538,14 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
         },
         provider(StreamEvent::ToolUseStart {
             id: String::from("failed"),
-            name: String::from("bash"),
+            name: String::from("shell"),
         }),
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("failed"),
-            name: String::from("bash"),
-            title: String::from("bash failed"),
+            display_name: String::from("shell"),
+            name: String::from("shell"),
+            title: String::from("shell failed"),
             output: String::from("process exited with status 1"),
             diff: None,
             written_paths: Vec::new(),
@@ -523,7 +563,7 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
-                .contains("! Tool · $ bash blocked")
+                .contains("! Tool · $ shell blocked")
         })
         .expect("blocked tool header");
     let failed = lines
@@ -533,7 +573,7 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
-                .contains("✗ Tool · $ bash failed")
+                .contains("✗ Tool · $ shell failed")
         })
         .expect("failed tool header");
     let blocked_glyph = blocked
@@ -549,12 +589,12 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
     let blocked_title = blocked
         .spans
         .iter()
-        .find(|span| span.content.as_ref() == "bash blocked")
+        .find(|span| span.content.as_ref() == "shell blocked")
         .expect("blocked title");
     let failed_title = failed
         .spans
         .iter()
-        .find(|span| span.content.as_ref() == "bash failed")
+        .find(|span| span.content.as_ref() == "shell failed")
         .expect("failed title");
     assert_eq!(
         blocked_glyph.style.fg,
@@ -573,11 +613,11 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
 
     let joined = draw(&mut view, 96, 18).join("\n");
     assert!(
-        joined.contains("! Tool · $ bash blocked"),
+        joined.contains("! Tool · $ shell blocked"),
         "the refusal still looks like an execution failure:\n{joined}"
     );
     assert!(
-        joined.contains("✗ Tool · $ bash failed"),
+        joined.contains("✗ Tool · $ shell failed"),
         "a process failure lost its error state:\n{joined}"
     );
 }
@@ -986,6 +1026,7 @@ fn views_transcript_follows_the_newest_row_for_every_overflowing_shape() {
     tool.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("call_1"),
+        display_name: String::from("read"),
         name: String::from("read"),
         title: String::from("Read src/main.rs"),
         output: (0..6)
@@ -1579,6 +1620,7 @@ fn views_transcript_renders_a_tool_patch_as_a_diff() {
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
+        display_name: String::from("edit"),
         name: String::from("edit"),
         title: String::from("Edit src/main.rs"),
         output: String::from("@@ -1,3 +1,3 @@\n fn main() {\n-    old();\n+    new();\n }\n"),
@@ -1617,6 +1659,7 @@ fn views_transcript_finds_the_patch_of_a_mutation_whose_output_is_a_sentence() {
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
+        display_name: String::from("edit"),
         name: String::from("edit"),
         title: String::from("src/main.rs"),
         // Exactly what `edit` really returns, and deliberately not a patch.
@@ -1645,13 +1688,14 @@ fn views_transcript_still_finds_a_patch_that_arrived_as_output() {
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
         id: String::from("c1"),
-        name: String::from("bash"),
+        name: String::from("shell"),
     })));
     let patch = "@@ -1,2 +1,2 @@\n-old\n+new\n";
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
-        name: String::from("bash"),
+        display_name: String::from("shell"),
+        name: String::from("shell"),
         title: String::from("git diff"),
         output: String::from(patch),
         diff: None,
@@ -1674,6 +1718,7 @@ fn views_transcript_reports_no_patch_when_no_tool_produced_one() {
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
+        display_name: String::from("read"),
         name: String::from("read"),
         title: String::from("src/main.rs"),
         output: String::from("fn main() {}"),
@@ -1694,7 +1739,7 @@ fn views_transcript_collapses_long_tool_output_and_says_how_much_it_hid() {
     }));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
         id: String::from("c1"),
-        name: String::from("bash"),
+        name: String::from("shell"),
     })));
     let body = (1..=12)
         .map(|n| format!("line {n}"))
@@ -1703,7 +1748,8 @@ fn views_transcript_collapses_long_tool_output_and_says_how_much_it_hid() {
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
-        name: String::from("bash"),
+        display_name: String::from("shell"),
+        name: String::from("shell"),
         title: String::from("ls"),
         output: body,
         diff: None,
@@ -1753,12 +1799,14 @@ fn views_task_results_render_as_a_child_session_instead_of_raw_envelope_markup()
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchStarted {
         step: 1,
         call_id: String::from("task_1"),
+        display_name: String::from("renamed_delegate"),
         name: String::from("renamed_delegate"),
         ui_intent: zuno_tool::ToolUiIntent::Subagent,
     }));
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("task_1"),
+        display_name: String::from("renamed_delegate"),
         name: String::from("renamed_delegate"),
         title: String::from("Delegated runtime trace"),
         output: String::from(
@@ -2098,12 +2146,13 @@ fn views_tool_output_overflow_is_marked_as_a_cut_not_as_a_header() {
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
         id: String::from("c1"),
-        name: String::from("bash"),
+        name: String::from("shell"),
     })));
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
-        name: String::from("bash"),
+        display_name: String::from("shell"),
+        name: String::from("shell"),
         title: String::from("ls"),
         output: (1..=9)
             .map(|n| format!("line {n}"))
@@ -2157,6 +2206,7 @@ fn views_transcript_renders_at_every_width_without_overrunning_or_panicking() {
             TurnEvent::ToolDispatchCompleted {
                 step: 1,
                 call_id: String::from("c1"),
+                display_name: String::from("read"),
                 name: String::from("read"),
                 title: String::from("读取 crates/zuno-tui/src/views/message.rs"),
                 output: String::from("一行\n二行\n三行\n四行\n五行"),
@@ -2261,6 +2311,7 @@ fn tool_call_shown(
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
+        display_name: name.to_owned(),
         name: name.to_owned(),
         // Deliberately a title that names the *kind* of work and drops the argument, which
         // is what a real provider sends and what used to be all the row said.
@@ -2288,6 +2339,7 @@ fn complete_tool(view: &mut TranscriptView, id: &str, name: &str, arguments: &st
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: id.to_owned(),
+        display_name: name.to_owned(),
         name: name.to_owned(),
         title: String::from("Ran a tool"),
         output: output.to_owned(),
@@ -2384,7 +2436,7 @@ fn views_compacted_activity_lists_each_command_read_and_search_summary() {
 fn views_tool_row_names_the_argument_and_not_only_the_kind_of_work() {
     // The P2-4 defect, stated as an assertion: `title` alone said `Read src/main.rs` for
     // one call and `Read src/lib.rs` for the next only because the provider chose to put
-    // the path in its sentence — and for `glob`, `grep` and `bash` it did not. The
+    // the path in its sentence — and for `glob`, `grep` and `shell` it did not. The
     // arguments are the only reliable source, so the row is built from them.
     let rendered = tool_call(
         "read",
@@ -2404,6 +2456,41 @@ fn views_tool_row_names_the_argument_and_not_only_the_kind_of_work() {
 }
 
 #[test]
+fn views_shell_row_uses_the_real_interpreter_instead_of_the_wire_id() {
+    let mut view = view();
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: String::from("c1"),
+        name: String::from("shell"),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
+        id: String::from("c1"),
+        delta: String::from(r#"{"command":"cargo test"}"#),
+    })));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: String::from("c1"),
+        display_name: String::from("zsh"),
+        name: String::from("shell"),
+        title: String::from("Ran cargo test"),
+        output: String::from("ok"),
+        diff: None,
+        written_paths: Vec::new(),
+        is_error: false,
+    }));
+
+    let joined = draw(&mut view, 80, 12).join("\n");
+    assert!(
+        joined.contains("Tool · $ zsh cargo test"),
+        "the completed shell call did not use its actual interpreter:\n{joined}"
+    );
+    assert!(
+        !joined.contains("Tool · $ shell"),
+        "the provider-facing wire id leaked into the user-facing shell label:\n{joined}"
+    );
+}
+
+#[test]
 fn views_tool_row_falls_back_to_the_title_when_the_arguments_never_parsed() {
     // A completed call whose argument JSON never arrived still has the provider's sentence,
     // and a sentence beats the bare wire name.
@@ -2416,6 +2503,7 @@ fn views_tool_row_falls_back_to_the_title_when_the_arguments_never_parsed() {
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
+        display_name: String::from("read"),
         name: String::from("read"),
         title: String::from("Read something"),
         output: String::from("x"),
@@ -2440,7 +2528,7 @@ fn views_tool_arguments_accumulate_across_the_deltas_that_carry_them() {
     transcript.observe(&started());
     transcript.observe(&provider(StreamEvent::ToolUseStart {
         id: String::from("c1"),
-        name: String::from("bash"),
+        name: String::from("shell"),
     }));
     for fragment in [r#"{"comm"#, r#"and":"cargo "#, r#"test"}"#] {
         assert!(
@@ -2468,7 +2556,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
     for (index, (name, arguments)) in [
         ("read", r#"{"filePath":"src/a.rs"}"#),
         ("grep", r#"{"pattern":"fn main"}"#),
-        ("bash", r#"{"command":"cargo build"}"#),
+        ("shell", r#"{"command":"cargo build"}"#),
         ("web_search", r#"{"queries":["ratatui spans"]}"#),
         (
             "todo_update",
@@ -2494,6 +2582,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
         view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: id,
+            display_name: name.to_owned(),
             name: name.to_owned(),
             title: String::from("Ran a tool"),
             output: String::new(),
@@ -2506,7 +2595,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
     for expected in [
         "read src/a.rs",
         "grep \"fn main\"",
-        "bash cargo build",
+        "shell cargo build",
         "web_search ratatui spans",
         "todo_update 1 changes · ship it",
         "memory_propose add project: run cargo fmt",
@@ -2564,7 +2653,7 @@ fn views_collapsed_tool_output_names_the_key_that_expands_it() {
     // this build binds it through `SHIPPED_DEFAULTS` and the key worked the whole time. A
     // cap the user cannot discover how to lift is a cap that hides content permanently.
     let rendered = tool_call(
-        "bash",
+        "shell",
         r#"{"command":"ls"}"#,
         &(1..=9)
             .map(|n| format!("line {n}"))
@@ -2599,7 +2688,7 @@ fn views_collapse_threshold_is_the_preview_row_count_and_the_notice_counts_the_r
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        tool_call("bash", r#"{"command":"ls"}"#, &output, None).join("\n")
+        tool_call("shell", r#"{"command":"ls"}"#, &output, None).join("\n")
     };
     let under = rows(TOOL_OUTPUT_PREVIEW_ROWS);
     assert!(
@@ -2624,12 +2713,13 @@ fn views_expanding_tool_output_lifts_the_cap_and_removes_the_notice() {
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
         id: String::from("c1"),
-        name: String::from("bash"),
+        name: String::from("shell"),
     })));
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
-        name: String::from("bash"),
+        display_name: String::from("shell"),
+        name: String::from("shell"),
         title: String::from("ls"),
         output: (1..=9)
             .map(|n| format!("line {n}"))
@@ -2692,7 +2782,7 @@ fn views_a_single_enormous_line_is_reported_as_cut_rather_than_silently_clipped(
     // the character cap the wrap pays for the whole thing; without the *notice* the reader
     // trusts a truncated line as complete.
     let huge = "x".repeat(crate::views::tool::COLLAPSED_CHARS + 500);
-    let rendered = tool_call("bash", r#"{"command":"cat big"}"#, &huge, None).join("\n");
+    let rendered = tool_call("shell", r#"{"command":"cat big"}"#, &huge, None).join("\n");
     assert!(
         rendered.contains("cut at"),
         "an over-long single line was clipped with no notice, so the reader cannot tell \
@@ -2753,6 +2843,7 @@ fn views_a_diff_bearing_result_uses_the_diff_palette_not_the_muted_output_style(
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
+        display_name: String::from("edit"),
         name: String::from("edit"),
         title: String::from("Edit"),
         output: String::from("applied 1 change"),
@@ -2782,7 +2873,7 @@ fn views_a_failed_tool_marks_the_call_as_error_but_keeps_its_output_readable() {
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
         id: String::from("c1"),
-        name: String::from("bash"),
+        name: String::from("shell"),
     })));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
         id: String::from("c1"),
@@ -2791,7 +2882,8 @@ fn views_a_failed_tool_marks_the_call_as_error_but_keeps_its_output_readable() {
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
-        name: String::from("bash"),
+        display_name: String::from("shell"),
+        name: String::from("shell"),
         title: String::from("false"),
         output: String::from("exit status 1"),
         diff: None,
@@ -2801,7 +2893,7 @@ fn views_a_failed_tool_marks_the_call_as_error_but_keeps_its_output_readable() {
     let rendered = draw(&mut view, 60, 12);
     let joined = rendered.join("\n");
     assert!(
-        joined.contains("bash false"),
+        joined.contains("shell false"),
         "the failing call stopped naming itself, so the error replaced the row instead of \
          hanging below it:\n{joined}"
     );
@@ -2812,7 +2904,7 @@ fn views_a_failed_tool_marks_the_call_as_error_but_keeps_its_output_readable() {
     assert!(
         lines.iter().any(|line| line.spans.iter().any(|span| {
             span.style.fg == Some(error)
-                && (span.content.contains('✗') || span.content.contains("bash"))
+                && (span.content.contains('✗') || span.content.contains("shell"))
         })),
         "the failed call row did not carry the semantic error colour"
     );
@@ -2951,6 +3043,7 @@ fn views_a_cjk_tool_argument_stays_inside_the_frame_at_every_width() {
         view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c1"),
+            display_name: String::from("read"),
             name: String::from("read"),
             title: String::from("Read"),
             output: String::from("说明\n読み\n混合 mixed 内容\nfourth"),
@@ -2992,6 +3085,7 @@ fn views_a_tool_call_survives_the_smallest_supported_frame() {
     view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c1"),
+        display_name: String::from("edit"),
         name: String::from("edit"),
         title: String::from("Edit"),
         output: String::from("applied"),
@@ -3056,6 +3150,7 @@ fn realistic() -> TranscriptView {
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c1"),
+            display_name: String::from("read"),
             name: String::from("read"),
             title: String::from("Read diff.rs"),
             output: String::from("pub fn parse(patch: &str) -> Vec<DiffLine> {"),
@@ -3077,6 +3172,7 @@ fn realistic() -> TranscriptView {
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c2"),
+            display_name: String::from("glob"),
             name: String::from("glob"),
             title: String::from("Find files"),
             output: long,
@@ -3100,6 +3196,7 @@ fn realistic() -> TranscriptView {
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c3"),
+            display_name: String::from("edit"),
             name: String::from("edit"),
             title: String::from("Edit session.rs"),
             output: String::from("applied 1 change"),
@@ -3177,12 +3274,13 @@ fn cache_subjects() -> Vec<(&'static str, TranscriptView)> {
         started(),
         provider(StreamEvent::ToolUseStart {
             id: String::from("r1"),
-            name: String::from("bash"),
+            name: String::from("shell"),
         }),
         TurnEvent::ToolDispatchStarted {
             step: 1,
             call_id: String::from("r1"),
-            name: String::from("bash"),
+            display_name: String::from("shell"),
+            name: String::from("shell"),
             ui_intent: zuno_tool::ToolUiIntent::Generic,
         },
     ] {
@@ -3470,12 +3568,13 @@ fn views_transcript_cache_never_recalls_a_row_carrying_the_spinner() {
         started(),
         provider(StreamEvent::ToolUseStart {
             id: String::from("c"),
-            name: String::from("bash"),
+            name: String::from("shell"),
         }),
         TurnEvent::ToolDispatchStarted {
             step: 1,
             call_id: String::from("c"),
-            name: String::from("bash"),
+            display_name: String::from("shell"),
+            name: String::from("shell"),
             ui_intent: zuno_tool::ToolUiIntent::Generic,
         },
     ] {
@@ -3722,7 +3821,8 @@ fn views_transcript_fingerprint_separates_every_part_shape() {
                 id: None,
                 parts: vec![MessagePart::Tool {
                     call_id: String::from("c"),
-                    name: String::from("bash"),
+                    display_name: String::from("shell"),
+                    name: String::from("shell"),
                     ui_intent: zuno_tool::ToolUiIntent::Generic,
                     arguments: String::new(),
                     title: None,
@@ -3739,7 +3839,8 @@ fn views_transcript_fingerprint_separates_every_part_shape() {
                 id: None,
                 parts: vec![MessagePart::Tool {
                     call_id: String::from("c"),
-                    name: String::from("bash"),
+                    display_name: String::from("shell"),
+                    name: String::from("shell"),
                     ui_intent: zuno_tool::ToolUiIntent::Generic,
                     arguments: String::new(),
                     title: None,
@@ -3756,7 +3857,8 @@ fn views_transcript_fingerprint_separates_every_part_shape() {
                 id: None,
                 parts: vec![MessagePart::Tool {
                     call_id: String::from("c"),
-                    name: String::from("bash"),
+                    display_name: String::from("shell"),
+                    name: String::from("shell"),
                     ui_intent: zuno_tool::ToolUiIntent::Generic,
                     arguments: String::new(),
                     title: None,

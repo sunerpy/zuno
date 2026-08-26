@@ -392,7 +392,7 @@ the shell and its external-path escalation:
   "permission": {
     "mode": "standard",
     "rules": {
-      "bash": "allow",
+      "shell": "allow",
       "external_directory": "allow"
     }
   }
@@ -433,9 +433,24 @@ requires approval. Shell, file writes, durable state changes, delegation,
 product agents, extension lifecycle mutations, and unknown harness or MCP tools
 are side-effecting by default.
 
-`bash` always requires strict approval, even for a command such as `rg`, because
+`shell` always requires strict approval, even for a command such as `rg`, because
 the shell is not an operating-system sandbox. Use the native `grep` or `glob`
 tool when the intended operation is read-only.
+
+The top-level `shell` field chooses the actual interpreter for both terminal and
+model-issued command execution. The command tool resolves an explicit value first,
+then the operating-system account shell, inherited `SHELL`, and finally the platform
+fallback. An invalid, non-executable, or command-syntax-unsupported explicit value
+fails tool assembly; interactive PTYs may still use another executable login shell.
+TUI and durable background state show the resolved command interpreter (`zsh`,
+`pwsh`, and so on), not a fixed tool-id label.
+
+Interactive PTYs accept any executable login shell. Model-issued commands are narrower:
+Zuno currently has invocation and risk-analysis semantics for POSIX shells and PowerShell
+only. `fish`, `nu`, unknown interpreters, and native Windows `cmd.exe` are rejected rather
+than being analyzed as Bash. On Windows the command resolver tries `pwsh`, PowerShell,
+and Git Bash; a host with only `cmd.exe` has no model command shell until a native `cmd`
+parser and risk gate exist.
 
 Independently of strict mode, the shell risk gate requires fresh approval before
 bounded destructive operations or replacing an existing redirect target. New

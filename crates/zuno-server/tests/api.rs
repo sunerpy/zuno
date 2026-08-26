@@ -874,7 +874,7 @@ async fn api_reply_routes_validate_bodies_before_rejecting_cross_session_request
                 .ask_permission(PermissionRequest {
                     id: "per_owner".to_owned(),
                     session_id: "ses_owner".to_owned(),
-                    action: "bash".to_owned(),
+                    action: "shell".to_owned(),
                     resources: vec!["pwd".to_owned()],
                     save: Vec::new(),
                     metadata: serde_json::Map::new(),
@@ -1089,7 +1089,7 @@ async fn permission_without_an_observer_is_rejected_by_the_deadline() {
                 .ask_permission(PermissionRequest {
                     id: "per_unobserved".to_owned(),
                     session_id: "ses_unobserved".to_owned(),
-                    action: "bash".to_owned(),
+                    action: "shell".to_owned(),
                     resources: vec!["touch must-not-run".to_owned()],
                     save: Vec::new(),
                     metadata: serde_json::Map::new(),
@@ -1944,6 +1944,27 @@ async fn api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_
             .to_string()
             .contains(&expired.ticket)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn api_state_wires_the_configured_terminal_shell() {
+    let directory = TempDir::new().expect("temporary terminal workspace");
+    let state = ApiState::memory(directory.path().to_string_lossy())
+        .expect("in-memory API state initializes")
+        .with_configured_shell(Some("/bin/sh".to_owned()));
+
+    let info = state
+        .pty()
+        .create(CreateInput::default())
+        .expect("configured terminal starts");
+
+    assert!(
+        info.command.ends_with("/sh"),
+        "configured terminal used {}",
+        info.command
+    );
+    state.pty().remove(&info.id).expect("terminal removed");
 }
 
 #[tokio::test]

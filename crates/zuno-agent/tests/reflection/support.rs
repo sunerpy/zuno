@@ -131,12 +131,12 @@ impl ReflectionRunner for DeniedToolRunner {
     ) -> Result<(), ReflectionError> {
         let error = tools
             .dispatch(ReflectionToolCall::new(
-                "reflection-bash-call",
-                "bash",
+                "reflection-shell-call",
+                "shell",
                 json!({ "command": "pwd" }),
             ))
             .await
-            .expect_err("bash must be outside the reflection whitelist");
+            .expect_err("shell must be outside the reflection whitelist");
         *self.denial.lock().expect("denial lock") = Some(error.to_string());
         Ok(())
     }

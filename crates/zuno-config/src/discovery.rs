@@ -17,6 +17,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use zuno_error::ConfigError;
+use zuno_paths::project::ResolvedProject;
 use zuno_paths::{CONFIG_FILE_STEM, Env, Layout};
 
 const ZUNO_CONFIG: &str = "ZUNO_CONFIG";
@@ -80,6 +81,28 @@ pub struct DiscoveryOptions {
 }
 
 impl DiscoveryOptions {
+    /// Resolve project-aware discovery inputs for an arbitrary directory.
+    ///
+    /// A Git worktree bounds ancestor traversal at its repository root. Outside
+    /// version control the bound is `None`, so parent `.zuno` directories remain
+    /// visible instead of treating the current directory as a synthetic root.
+    #[must_use]
+    pub fn for_directory(directory: impl Into<PathBuf>, env: Env) -> Self {
+        let directory = directory.into();
+        let project = zuno_paths::project::resolve_project(&directory);
+        Self::for_project(directory, &project, env)
+    }
+
+    /// Build discovery inputs from an already resolved project identity.
+    #[must_use]
+    pub fn for_project(directory: impl Into<PathBuf>, project: &ResolvedProject, env: Env) -> Self {
+        Self::new(
+            directory,
+            project.vcs.as_ref().map(|_| project.directory.as_path()),
+            env,
+        )
+    }
+
     /// Resolve all path inputs from an explicit environment snapshot.
     #[must_use]
     pub fn new(

@@ -32,7 +32,7 @@
 //! happen — the path being edited, the command being run, the URL being fetched —
 //! rather than showing the permission's internal name. That is ported, driven by
 //! the request's `metadata` and the tool input, because "Permission required:
-//! bash" tells a user nothing they can decide on.
+//! shell" tells a user nothing they can decide on.
 
 use crate::keybind::Definition;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogPlacement, DialogStep};
@@ -189,7 +189,7 @@ pub fn describe(request: &PermissionRequest, input: &Value) -> Subject {
                 detail: detail("Path", &path),
             }
         }
-        "bash" => {
+        "shell" => {
             let command = arg("command");
             Subject {
                 icon: "#",

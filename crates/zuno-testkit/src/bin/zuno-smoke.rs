@@ -54,7 +54,7 @@ const RECORDED_TOOL: &str = "get_weather";
 /// The same four `tool_turn.rs` pins, and for the same reason: `edit`/`write` are
 /// model-conditional and `websearch` is provider-conditional, so a longer list
 /// would fail for reasons unrelated to whether the registry reached the wire.
-const REQUIRED_TOOLS: [&str; 4] = ["bash", "read", "glob", "grep"];
+const REQUIRED_TOOLS: [&str; 4] = ["shell", "read", "glob", "grep"];
 
 /// Wall-clock budget per subprocess. Everything the subject talks to is loopback
 /// or the local filesystem, so exceeding this is a hang, not slowness.

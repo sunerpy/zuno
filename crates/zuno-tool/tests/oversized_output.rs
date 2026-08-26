@@ -33,7 +33,7 @@ fn oversized_output_is_detected_and_the_full_text_is_retrievable_afterwards() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = ToolOutputStore::new(dir.path());
     let text: String = (0..500).map(|n| format!("line {n}\n")).collect();
-    let mut output = ToolOutput::text("bash", &text);
+    let mut output = ToolOutput::text("shell", &text);
 
     // 1. Detection reports the verdict and the limits it applied. 500 lines averaging
     //    nine bytes crosses both the ten-line and the 4096-byte budget, so the verdict
@@ -52,7 +52,7 @@ fn oversized_output_is_detected_and_the_full_text_is_retrievable_afterwards() {
 
     // 2. Storage keeps the whole thing and records where it went.
     let stored = store
-        .persist("bash", "ses_detect", &output.output)
+        .persist("shell", "ses_detect", &output.output)
         .expect("persist");
     output.record_output_path(&stored.path);
 
@@ -63,7 +63,7 @@ fn oversized_output_is_detected_and_the_full_text_is_retrievable_afterwards() {
         .map(std::path::PathBuf::from)
         .expect("a recorded output path");
     assert_eq!(
-        store.read("bash", &path).expect("read back"),
+        store.read("shell", &path).expect("read back"),
         text,
         "the full text has to survive whatever the policy layer decides to show"
     );
@@ -107,17 +107,17 @@ fn detection_and_storage_leave_the_text_exactly_as_produced() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = ToolOutputStore::new(dir.path());
     let text = "a\n".repeat(1_000);
-    let output = ToolOutput::text("bash", &text);
+    let output = ToolOutput::text("shell", &text);
 
     let measurement = output.measure(tiny());
     let stored = store
-        .persist("bash", "ses_x", &output.output)
+        .persist("shell", "ses_x", &output.output)
         .expect("persist");
 
     assert!(measurement.is_oversized());
     assert_eq!(output.output, text, "measuring must not truncate");
     assert_eq!(
-        store.read("bash", &stored.path).expect("read"),
+        store.read("shell", &stored.path).expect("read"),
         text,
         "persisting must not truncate"
     );
@@ -158,10 +158,10 @@ fn the_thresholds_come_from_configuration_and_default_to_the_oracles() {
 fn several_spills_in_one_result_are_all_retrievable() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = ToolOutputStore::new(dir.path());
-    let mut output = ToolOutput::text("bash", "");
+    let mut output = ToolOutput::text("shell", "");
 
     for chunk in ["first spill", "second spill"] {
-        let stored = store.persist("bash", "ses_multi", chunk).expect("persist");
+        let stored = store.persist("shell", "ses_multi", chunk).expect("persist");
         output.record_output_path(&stored.path);
     }
 
@@ -170,7 +170,7 @@ fn several_spills_in_one_result_are_all_retrievable() {
         .into_iter()
         .map(|path| {
             store
-                .read("bash", std::path::Path::new(path))
+                .read("shell", std::path::Path::new(path))
                 .expect("read back")
         })
         .collect();

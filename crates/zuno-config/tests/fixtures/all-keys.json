@@ -85,7 +85,7 @@
         "mode": "standard",
         "rules": {
           "edit": "allow",
-          "bash": { "git push": "ask", "*": "allow" }
+          "shell": { "git push": "ask", "*": "allow" }
         }
       }
     },
@@ -249,7 +249,7 @@
       "glob": "allow",
       "grep": "allow",
       "list": "allow",
-      "bash": { "git status": "allow", "*": "ask" },
+      "shell": { "git status": "allow", "*": "ask" },
       "task": "allow",
       "external_directory": "ask",
       "plan_get": "allow",
@@ -265,7 +265,7 @@
     }
   },
   "tools": {
-    "bash": true,
+    "shell": true,
     "webfetch": false
   },
   "attachment": {

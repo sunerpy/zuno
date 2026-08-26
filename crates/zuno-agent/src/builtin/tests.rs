@@ -372,7 +372,7 @@ fn deep_owns_cross_cutting_implementation_without_children() {
     assert_eq!(DEEP.research, Research::Allowed);
     assert_eq!(DEEP.delegation, Delegation::NoChildren);
     assert!(is_tool_hidden("task", &DEEP.rules()));
-    for capability in ["edit", "bash", "web_search", "plan_update", "todo_update"] {
+    for capability in ["edit", "shell", "web_search", "plan_update", "todo_update"] {
         assert!(
             !is_tool_hidden(capability, &DEEP.rules()),
             "deep needs `{capability}`"
@@ -387,7 +387,7 @@ fn fixer_is_a_focused_writer_and_general_is_the_bounded_fallback() {
     assert_eq!(FIXER.delegation, Delegation::NoChildren);
 
     let fixer = FIXER.rules();
-    for allowed in ["read", "grep", "glob", "lsp", "edit", "bash"] {
+    for allowed in ["read", "grep", "glob", "lsp", "edit", "shell"] {
         assert!(
             !is_tool_hidden(allowed, &fixer),
             "the fixer needs `{allowed}` to inspect, edit, and verify"
@@ -404,7 +404,7 @@ fn fixer_is_a_focused_writer_and_general_is_the_bounded_fallback() {
     assert_eq!(GENERAL.research, Research::Allowed);
     assert_eq!(GENERAL.delegation, Delegation::NoChildren);
     let general = GENERAL.rules();
-    for allowed in ["read", "edit", "bash", "web_search", "skill", "execute"] {
+    for allowed in ["read", "edit", "shell", "web_search", "skill", "execute"] {
         assert!(
             !is_tool_hidden(allowed, &general),
             "general needs bounded access to `{allowed}`"
@@ -427,7 +427,7 @@ fn read_only_agents_cannot_reach_a_writing_or_delegating_tool() {
             continue;
         }
         let rules = agent.rules();
-        for forbidden in ["edit", "write", "apply_patch", "bash", "task", "execute"] {
+        for forbidden in ["edit", "write", "apply_patch", "shell", "task", "execute"] {
             assert!(
                 is_tool_hidden(forbidden, &rules),
                 "{}: read-only agents must not see `{forbidden}`",

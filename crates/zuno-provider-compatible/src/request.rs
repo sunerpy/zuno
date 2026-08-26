@@ -1100,7 +1100,7 @@ mod tests {
                 },
                 RequestContentBlock::ToolUse {
                     id: id.to_owned(),
-                    name: "bash".to_owned(),
+                    name: "shell".to_owned(),
                     input: json!({"command": "command -v go"}),
                     thought_signature: None,
                 },
@@ -1151,7 +1151,7 @@ mod tests {
         );
         assert_eq!(
             messages[1]["tool_calls"][0]["function"]["name"],
-            json!("bash")
+            json!("shell")
         );
     }
 
@@ -1172,7 +1172,7 @@ mod tests {
                 },
                 RequestContentBlock::ToolUse {
                     id: "call_1".to_owned(),
-                    name: "bash".to_owned(),
+                    name: "shell".to_owned(),
                     input: json!({"command": "command -v go"}),
                     thought_signature: None,
                 },

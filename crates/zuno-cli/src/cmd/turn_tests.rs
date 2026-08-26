@@ -610,7 +610,7 @@ fn unresolved_tool_failures_choose_safe_or_uncertain_goal_recovery() {
     );
 
     let uncertain = ToolFailureRecovery {
-        tool: "bash".to_owned(),
+        tool: "shell".to_owned(),
         replay_policy: zuno_tool::ToolReplayPolicy::Never,
         retry_after: Some(Duration::from_secs(7)),
     };
@@ -3148,6 +3148,74 @@ fn production_registry_exposes_all_three_goal_tools() {
             "production registry is missing `{goal_tool}`; visible tools: {ids:?}"
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn production_registry_wires_configured_shell_into_the_shell_tool() {
+    use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config = zuno_config::schema::Config {
+        shell: Some("/bin/sh".to_owned()),
+        ..Default::default()
+    };
+    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+    let runtime = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &config,
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            question: None,
+            background_executions: test_background_executions(directory.path()),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+        },
+    )
+    .expect("production registry assembles");
+    let shell = runtime
+        .tools
+        .iter()
+        .find(|tool| tool.id() == "shell")
+        .expect("the build profile exposes the shell tool");
+
+    let output = shell
+        .invoke(
+            serde_json::json!({"command": "printf configured-shell"}),
+            ToolContext::new(
+                "ses_shell_config",
+                "msg_shell_config",
+                "call_shell_config",
+                "build",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            ),
+        )
+        .await
+        .expect("the configured shell executes");
+
+    assert_eq!(output.title, "sh printf configured-shell");
+    assert_eq!(output.metadata["shell"], "sh");
 }
 
 #[test]
@@ -6090,7 +6158,7 @@ mod reflection_runtime {
                 "malformed tool arguments",
             ),
             (
-                tool_events("bash", r#"{"command":"echo forbidden"}"#, true),
+                tool_events("shell", r#"{"command":"echo forbidden"}"#, true),
                 "denied non-whitelisted tool",
             ),
             (
@@ -6192,7 +6260,7 @@ mod reflection_runtime {
                 "messageID": assistant.id,
                 "type": "tool",
                 "callID": "call_failed",
-                "tool": "bash",
+                "tool": "shell",
                 "state": {
                     "status": "error",
                     "input": {"command": "cargo test"},
@@ -6205,7 +6273,7 @@ mod reflection_runtime {
                 "messageID": assistant.id,
                 "type": "tool",
                 "callID": "call_succeeded",
-                "tool": "bash",
+                "tool": "shell",
                 "state": {
                     "status": "completed",
                     "input": {"command": "cargo test"},

@@ -147,14 +147,16 @@ SQLite 中的 deadline 恢复，人工输入优先。工具失败作为 tool res
 description: Review a change for security and authorization defects
 mode: subagent
 permission:
-  "*": deny
-  read: allow
-  glob: allow
-  grep: allow
-  lsp: allow
-  webfetch: allow
-  web_search: allow
-  bash: ask
+  mode: standard
+  rules:
+    "*": deny
+    read: allow
+    glob: allow
+    grep: allow
+    lsp: allow
+    webfetch: allow
+    web_search: allow
+    shell: ask
 ---
 
 Inspect repository files, relevant environment facts, current external evidence,
@@ -173,7 +175,7 @@ Workflow 和 Skill。`extension_define` 只在当前进程内记录不可变定�
 `~/.config/zuno/extensions/<id>/extension.json`）并重启。两种加载方式共用验证与冲突检查；
 扩展中 `mode: subagent | all` 的 Agent 会进入 `task` 的真实目标列表，并在子会话中使用自身
 模型、Prompt 与原生工具权限。文件由 `read/glob/grep/lsp/edit` 提供，网络由
-`webfetch/web_search` 提供，环境与普通进程能力由受权限控制的 `bash` 提供；Strict 模式仍会
+`webfetch/web_search` 提供，环境与普通进程能力由受权限控制的 `shell` 提供；Strict 模式仍会
 对所有副作用调用逐次 HITL。
 
 静态包还可以注册可执行工具：首选进程内、按 workspace/network/env 最小授权并带 fuel、内存和

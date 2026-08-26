@@ -48,6 +48,7 @@ use zuno_llm::event::{
     ConnectionPhase, FinishReason, Message, RequestContentBlock, StreamEvent, ThoughtSignature,
 };
 use zuno_testkit::perf::{W_REAL_SUBJECT, verify_pinned_database};
+use zuno_tool::ToolUiIntent;
 
 /// Repetitions every measured quantity is reported over.
 ///
@@ -179,8 +180,15 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
         payload("ToolSnapshotLocked", size_of::<(u32, Vec<String>, bool)>()),
         payload("ProviderRequestStarted", size_of::<(u32, usize, u64)>()),
         payload("Provider", size_of::<(u32, StreamEvent)>()),
+        payload(
+            "ToolCallStarted",
+            size_of::<(u32, String, String, String, ToolUiIntent)>(),
+        ),
         payload("AssistantCheckpointed", size_of::<(u32, String, bool)>()),
-        payload("ToolDispatchStarted", size_of::<(u32, String, String)>()),
+        payload(
+            "ToolDispatchStarted",
+            size_of::<(u32, String, String, String, ToolUiIntent)>(),
+        ),
         payload(
             "ToolDispatchBlocked",
             size_of::<(u32, String, ToolBlockKind)>(),
@@ -189,6 +197,7 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
             "ToolDispatchCompleted",
             size_of::<(
                 u32,
+                String,
                 String,
                 String,
                 String,
@@ -219,6 +228,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::ToolSnapshotLocked { .. } => "ToolSnapshotLocked",
         TurnEvent::ProviderRequestStarted { .. } => "ProviderRequestStarted",
         TurnEvent::Provider { .. } => "Provider",
+        TurnEvent::ToolCallStarted { .. } => "ToolCallStarted",
         TurnEvent::AssistantCheckpointed { .. } => "AssistantCheckpointed",
         TurnEvent::ToolDispatchStarted { .. } => "ToolDispatchStarted",
         TurnEvent::ToolDispatchBlocked { .. } => "ToolDispatchBlocked",

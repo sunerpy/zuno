@@ -1303,7 +1303,7 @@ fn permission_prompt() -> Box<dyn crate::views::dialog::Dialog> {
         zuno_permission::PermissionRequest {
             id: String::from("req_exit"),
             session_id: String::from("ses_exit"),
-            permission: String::from("bash"),
+            permission: String::from("shell"),
             patterns: vec![String::from("*")],
             metadata: serde_json::Map::new(),
             always: vec![String::from("*")],
@@ -2509,7 +2509,8 @@ fn session_screen_suppresses_late_provider_and_tool_events_after_cancellation_is
     screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchStarted {
         step: 2,
         call_id: String::from("late-tool"),
-        name: String::from("bash"),
+        display_name: String::from("shell"),
+        name: String::from("shell"),
         ui_intent: zuno_tool::ToolUiIntent::Generic,
     }));
 
@@ -2554,6 +2555,7 @@ fn session_reports_the_files_a_finished_turn_wrote_and_no_others() {
         AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c"),
+            display_name: name.to_owned(),
             name: name.to_owned(),
             // Prose, as `apply_patch`'s really is: nothing may read a path out of it.
             title: String::from("Success. Updated the following files:"),
@@ -2602,6 +2604,7 @@ fn session_reports_every_file_one_multi_file_patch_wrote() {
     screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c"),
+        display_name: String::from("apply_patch"),
         name: String::from("apply_patch"),
         title: String::from("Success. Updated the following files:\nM a.rs\nA b.rs"),
         output: String::from("Success. Updated the following files:\nM a.rs\nA b.rs"),
@@ -2643,6 +2646,7 @@ fn session_reports_an_interrupted_turns_writes_too() {
     screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c"),
+        display_name: String::from("edit"),
         name: String::from("edit"),
         title: String::from("src/lib.rs"),
         output: String::new(),
@@ -2671,6 +2675,7 @@ fn a_full_nudge_channel_never_loses_a_files_place_in_the_set() {
         AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("c"),
+            display_name: String::from("apply_patch"),
             name: String::from("apply_patch"),
             title: String::from("Success. Updated the following files:"),
             output: String::new(),
@@ -2720,6 +2725,7 @@ fn the_pending_edit_set_stops_growing_at_its_bound_and_counts_what_it_refused() 
     screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: String::from("c"),
+        display_name: String::from("apply_patch"),
         name: String::from("apply_patch"),
         title: String::from("Success. Updated the following files:"),
         output: String::new(),
@@ -3041,6 +3047,7 @@ fn furnished_screen() -> SessionScreen {
         .observe(&TurnEvent::ToolDispatchStarted {
             step: 1,
             call_id: String::from("call_1"),
+            display_name: String::from("edit"),
             name: String::from("edit"),
             ui_intent: zuno_tool::ToolUiIntent::Generic,
         });
@@ -3050,6 +3057,7 @@ fn furnished_screen() -> SessionScreen {
         .observe(&TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("call_1"),
+            display_name: String::from("edit"),
             name: String::from("edit"),
             title: String::from("src/lib.rs"),
             output: String::from(
@@ -4679,7 +4687,7 @@ fn session_a_click_on_one_tool_header_expands_only_that_call() {
         for event in [
             provider(StreamEvent::ToolUseStart {
                 id: call_id.to_owned(),
-                name: String::from("bash"),
+                name: String::from("shell"),
             }),
             provider(StreamEvent::ToolInputDelta {
                 id: call_id.to_owned(),
@@ -4691,7 +4699,8 @@ fn session_a_click_on_one_tool_header_expands_only_that_call() {
             TurnEvent::ToolDispatchCompleted {
                 step: 1,
                 call_id: call_id.to_owned(),
-                name: String::from("bash"),
+                display_name: String::from("shell"),
+                name: String::from("shell"),
                 title: command.to_owned(),
                 output: (1..=6)
                     .map(|line| format!("{prefix}-{line}"))
@@ -4986,6 +4995,7 @@ fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skil
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("skill_resource_1"),
+            display_name: String::from("skill"),
             name: String::from("skill"),
             title: String::from("Skill resource: codegraph/references/index.md"),
             output: String::from("reference body"),
@@ -5023,6 +5033,7 @@ fn session_sidebar_distinguishes_discovered_skills_from_successfully_loaded_skil
         TurnEvent::ToolDispatchCompleted {
             step: 2,
             call_id: String::from("skill_1"),
+            display_name: String::from("skill"),
             name: String::from("skill"),
             title: String::from("Loaded codegraph"),
             output: String::from("complete skill body"),
@@ -5080,6 +5091,7 @@ fn session_sidebar_tracks_same_named_skills_by_source() {
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: String::from("skill_review"),
+            display_name: String::from("skill"),
             name: String::from("skill"),
             title: String::from("Loaded review"),
             output: String::from("complete skill body"),
@@ -8818,6 +8830,7 @@ fn the_sidebar_projects_foreground_running_delegations_from_the_transcript() {
     let (mut screen, _shutdown) = screen();
     let call = |id: &str, description: &str| crate::views::message::MessagePart::Tool {
         call_id: id.to_owned(),
+        display_name: String::from("task"),
         name: String::from("task"),
         ui_intent: zuno_tool::ToolUiIntent::Subagent,
         arguments: format!(

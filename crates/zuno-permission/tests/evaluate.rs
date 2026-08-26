@@ -12,11 +12,11 @@ fn rule(permission: &str, pattern: &str, action: PermissionAction) -> Rule {
 #[test]
 fn later_ask_overrides_earlier_allow_for_the_same_command() {
     let rules = [
-        rule("bash", "git *", PermissionAction::Allow),
-        rule("bash", "*", PermissionAction::Ask),
+        rule("shell", "git *", PermissionAction::Allow),
+        rule("shell", "*", PermissionAction::Ask),
     ];
 
-    let action = evaluate("bash", "git push", &rules);
+    let action = evaluate("shell", "git push", &rules);
 
     assert_eq!(action, PermissionAction::Ask);
 }
@@ -24,11 +24,11 @@ fn later_ask_overrides_earlier_allow_for_the_same_command() {
 #[test]
 fn later_allow_overrides_earlier_ask_for_the_same_command() {
     let rules = [
-        rule("bash", "*", PermissionAction::Ask),
-        rule("bash", "git *", PermissionAction::Allow),
+        rule("shell", "*", PermissionAction::Ask),
+        rule("shell", "git *", PermissionAction::Allow),
     ];
 
-    let action = evaluate("bash", "git push", &rules);
+    let action = evaluate("shell", "git push", &rules);
 
     assert_eq!(action, PermissionAction::Allow);
 }
@@ -37,16 +37,16 @@ fn later_allow_overrides_earlier_ask_for_the_same_command() {
 fn no_matching_rule_defaults_to_ask() {
     let rules = [rule("edit", "*", PermissionAction::Allow)];
 
-    let action = evaluate("bash", "git push", &rules);
+    let action = evaluate("shell", "git push", &rules);
 
     assert_eq!(action, PermissionAction::Ask);
 }
 
 #[test]
 fn permission_keys_and_patterns_both_support_wildcards() {
-    let rules = [rule("b?sh", "git *", PermissionAction::Allow)];
+    let rules = [rule("sh?ll", "git *", PermissionAction::Allow)];
 
-    let action = evaluate("bash", "git status", &rules);
+    let action = evaluate("shell", "git status", &rules);
 
     assert_eq!(action, PermissionAction::Allow);
 }
@@ -67,7 +67,7 @@ fn config_conversion_preserves_outer_and_nested_source_order() {
             "mode": "standard",
             "rules": {
                 "*": "deny",
-                "bash": {
+                "shell": {
                     "git *": "allow",
                     "*": "ask"
                 },
@@ -83,8 +83,8 @@ fn config_conversion_preserves_outer_and_nested_source_order() {
         rules,
         vec![
             rule("*", "*", PermissionAction::Deny),
-            rule("bash", "git *", PermissionAction::Allow),
-            rule("bash", "*", PermissionAction::Ask),
+            rule("shell", "git *", PermissionAction::Allow),
+            rule("shell", "*", PermissionAction::Ask),
             rule("deploy_production", "*", PermissionAction::Allow),
         ]
     );
@@ -92,11 +92,11 @@ fn config_conversion_preserves_outer_and_nested_source_order() {
 
 #[test]
 fn outer_config_key_order_controls_overlapping_permission_keys() {
-    let config = serde_json::from_str(r#"{"mode":"standard","rules":{"bash":"allow","*":"ask"}}"#)
+    let config = serde_json::from_str(r#"{"mode":"standard","rules":{"shell":"allow","*":"ask"}}"#)
         .expect("fixture is valid permission config");
     let rules = rules_from_config(&config);
 
-    let action = evaluate("bash", "git push", &rules);
+    let action = evaluate("shell", "git push", &rules);
 
     assert_eq!(action, PermissionAction::Ask);
 }
@@ -119,7 +119,7 @@ proptest! {
             .enumerate()
             .map(|(index, (matches, action))| {
                 if *matches {
-                    let permission = if index % 2 == 0 { "bash" } else { "b*" };
+                    let permission = if index % 2 == 0 { "shell" } else { "s*" };
                     let pattern = if index % 3 == 0 { "git push" } else { "git *" };
                     rule(permission, pattern, *action)
                 } else {
@@ -133,7 +133,7 @@ proptest! {
             .find(|(matches, _)| *matches)
             .map_or(PermissionAction::Ask, |(_, action)| *action);
 
-        prop_assert_eq!(evaluate("bash", "git push", &rules), expected);
-        prop_assert_eq!(evaluate("bash", "git push", &[]), PermissionAction::Ask);
+        prop_assert_eq!(evaluate("shell", "git push", &rules), expected);
+        prop_assert_eq!(evaluate("shell", "git push", &[]), PermissionAction::Ask);
     }
 }

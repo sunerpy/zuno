@@ -6,7 +6,7 @@ use zuno_db::session::Store;
 use zuno_error::DbError;
 use zuno_llm::catalog::models_dev::CatalogDocument;
 use zuno_paths::{DbLocation, Env, GLOBAL_PROJECT_ID};
-use zuno_pty::PtyService;
+use zuno_pty::{PtyService, PtyServiceConfig};
 
 use super::catalog::{LocationBody, LocationEnvelope, OptionalEnvelope, ProjectBody};
 use super::error::ApiError;
@@ -117,6 +117,15 @@ impl ApiState {
     #[must_use]
     pub fn with_events(mut self, events: EventService) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Rebuilds the process-owned PTY service with the resolved `shell` config.
+    #[must_use]
+    pub fn with_configured_shell(mut self, shell: Option<String>) -> Self {
+        self.pty = PtyService::with_config(
+            PtyServiceConfig::new(self.directory.as_ref()).with_configured_shell(shell),
+        );
         self
     }
 

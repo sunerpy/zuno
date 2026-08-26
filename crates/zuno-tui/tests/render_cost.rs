@@ -105,6 +105,7 @@ fn assistant_reply(index: usize) -> Message {
             MessagePart::Text { text },
             MessagePart::Tool {
                 call_id: format!("call-{index}"),
+                display_name: String::from("read"),
                 name: String::from("read"),
                 ui_intent: zuno_tool::ToolUiIntent::Generic,
                 arguments: format!(

@@ -245,6 +245,11 @@ fn tool(data: &serde_json::Map<String, Value>) -> Option<MessagePart> {
         .map(str::to_owned);
     Some(MessagePart::Tool {
         call_id,
+        display_name: data
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(&name)
+            .to_owned(),
         name,
         ui_intent: data
             .get("uiIntent")

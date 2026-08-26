@@ -1885,13 +1885,13 @@ fn reflection_tool_event(data: &serde_json::Map<String, Value>) -> Option<Transc
         .unwrap_or_default()
         .to_owned();
     let input = state.get("input");
-    let command = if tool == "bash" {
+    let command = if tool == "shell" {
         input
             .and_then(Value::as_object)
             .and_then(|input| input.get("command"))
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .unwrap_or_else(|| "bash".to_owned())
+            .unwrap_or_else(|| "shell".to_owned())
     } else {
         input.map_or_else(|| tool.to_owned(), |input| format!("{tool} {}", input))
     };

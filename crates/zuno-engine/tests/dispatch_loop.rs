@@ -89,7 +89,11 @@ struct SequentialTool {
 #[async_trait]
 impl Tool for SequentialTool {
     fn id(&self) -> &str {
-        "bash"
+        "shell"
+    }
+
+    fn display_name(&self) -> &str {
+        "zsh"
     }
 
     fn description(&self) -> &str {
@@ -117,7 +121,7 @@ impl Tool for SequentialTool {
             .push(command.to_owned());
         tokio::time::sleep(Duration::from_millis(10)).await;
         self.active.fetch_sub(1, Ordering::SeqCst);
-        Ok(ToolOutput::text("bash", format!("ran {command}")))
+        Ok(ToolOutput::text("shell", format!("ran {command}")))
     }
 }
 
@@ -353,7 +357,7 @@ fn seeded() -> Connection {
 }
 
 fn provider_events(calls: &[(&str, &str)]) -> Vec<Vec<StreamEvent>> {
-    named_provider_events("bash", calls)
+    named_provider_events("shell", calls)
 }
 
 fn named_provider_events(tool: &str, calls: &[(&str, &str)]) -> Vec<Vec<StreamEvent>> {
@@ -462,7 +466,13 @@ async fn run_scenario(
     turn_id: &str,
     calls: &[(&str, &str)],
     rules: Vec<Rule>,
-) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+) -> (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<(String, String, String)>,
+) {
     let mut connection = seeded();
     let provider = Arc::new(ScriptedProvider::new(provider_events(calls)));
     let providers = registry(provider);
@@ -532,7 +542,25 @@ async fn run_scenario(
         })
         .collect();
     let execution_order = order.lock().expect("order lock").clone();
-    (lifecycle(&events), statuses, outcomes, execution_order)
+    let pending = events
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::ToolCallStarted {
+                call_id,
+                display_name,
+                name,
+                ..
+            } => Some((call_id.clone(), name.clone(), display_name.clone())),
+            _ => None,
+        })
+        .collect();
+    (
+        lifecycle(&events),
+        statuses,
+        outcomes,
+        execution_order,
+        pending,
+    )
 }
 
 #[tokio::test]
@@ -542,7 +570,7 @@ async fn dispatch_loop_runs_three_calls_sequentially_with_complete_transitions()
         ("call-two", "second"),
         ("call-three", "third"),
     ];
-    let (transcript, statuses, outcomes, order) = run_scenario(
+    let (transcript, statuses, outcomes, order, pending) = run_scenario(
         "turn-dispatch-happy",
         &calls,
         vec![Rule {
@@ -570,6 +598,19 @@ async fn dispatch_loop_runs_three_calls_sequentially_with_complete_transitions()
     assert_eq!(statuses, ["completed", "completed", "completed"]);
     assert_eq!(outcomes, ["completed", "completed", "completed"]);
     assert_eq!(order, ["first", "second", "third"]);
+    assert_eq!(
+        pending,
+        [
+            ("call-one".to_owned(), "shell".to_owned(), "zsh".to_owned()),
+            ("call-two".to_owned(), "shell".to_owned(), "zsh".to_owned()),
+            (
+                "call-three".to_owned(),
+                "shell".to_owned(),
+                "zsh".to_owned()
+            ),
+        ],
+        "the pending event must resolve the display identity before dispatch"
+    );
     eprintln!("HAPPY_QA transcript={transcript:?} persisted={statuses:?} order={order:?}");
 }
 
@@ -813,7 +854,7 @@ async fn exclusive_calls_barrier_parallel_safe_and_isolated_background_groups() 
 #[tokio::test]
 async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
     let calls = [("call-denied", "rm -rf /"), ("call-safe", "git status")];
-    let (transcript, statuses, outcomes, order) = run_scenario(
+    let (transcript, statuses, outcomes, order, _pending) = run_scenario(
         "turn-dispatch-denied",
         &calls,
         vec![
@@ -823,7 +864,7 @@ async fn dispatch_loop_appends_denial_and_continues_to_the_next_call() {
                 action: PermissionAction::Allow,
             },
             Rule {
-                permission: "bash".to_owned(),
+                permission: "shell".to_owned(),
                 pattern: "rm -rf /".to_owned(),
                 action: PermissionAction::Deny,
             },

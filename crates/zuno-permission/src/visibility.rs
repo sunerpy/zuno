@@ -6,7 +6,7 @@
 //!
 //! Hiding and refusing are separate code paths. This module only hides tools
 //! whose *last* matching permission rule is an unconditional deny; a narrower
-//! deny (`{"bash": {"rm *": "deny"}}`) leaves the tool visible and is enforced
+//! deny (`{"shell": {"rm *": "deny"}}`) leaves the tool visible and is enforced
 //! at call time by [`crate::PermissionEngine::authorize`].
 //!
 //! Oracle: `packages/opencode/src/permission/index.ts:204-219`

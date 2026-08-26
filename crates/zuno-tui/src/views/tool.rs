@@ -152,7 +152,7 @@ pub const SUMMARISED: [&str; 26] = [
     // The 18 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
-    "bash",
+    "shell",
     "bg",
     "read",
     "glob",
@@ -200,9 +200,9 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
     let first_text = |keys: &[&str]| keys.iter().find_map(|key| field(&value, key));
     match name {
         // `$ cmd`, the oracle's own shell form. The prompt character is carried in the
-        // summary rather than in the icon because `bash`'s icon is already `$`: printing
+        // summary rather than in the icon because `shell`'s icon is already `$`: printing
         // it twice would read as a nested shell.
-        "bash" | "shell" | "exec" | "exec_command" => {
+        "shell" | "exec" | "exec_command" => {
             first_text(&["command", "cmd"]).map(|command| {
                 let mut out = command.replace('\n', " ");
                 if value.get("background").and_then(Value::as_bool) == Some(true) {

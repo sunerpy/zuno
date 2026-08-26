@@ -561,7 +561,7 @@ fn permission_ask(tool: &str, args: &Value) -> PermissionAsk {
 #[must_use]
 pub fn permission_patterns(tool: &str, args: &Value) -> Vec<String> {
     let patterns = match tool {
-        "bash" => strings_at(args, &["command"]),
+        "shell" => strings_at(args, &["command"]),
         "read" | "write" | "edit" => strings_at(args, &["filePath", "file_path", "path"]),
         "apply_patch" => patch_paths(args),
         "glob" | "grep" => strings_at(args, &["pattern", "query"]),
@@ -855,7 +855,7 @@ mod tests {
     #[test]
     fn argument_patterns_cover_builtin_resource_shapes() {
         assert_eq!(
-            permission_patterns("bash", &serde_json::json!({"command": "git push"})),
+            permission_patterns("shell", &serde_json::json!({"command": "git push"})),
             ["git push"]
         );
         assert_eq!(
@@ -900,9 +900,9 @@ mod tests {
     #[test]
     fn suggester_copies_reference_ranking_and_cutoff() {
         let suggestions =
-            closest_tool_names("ToolSerch", &["bash", "tool_search", "web_search", "todo"]);
+            closest_tool_names("ToolSerch", &["shell", "tool_search", "web_search", "todo"]);
         assert_eq!(suggestions.first().map(String::as_str), Some("tool_search"));
-        assert!(!suggestions.contains(&"bash".to_owned()));
+        assert!(!suggestions.contains(&"shell".to_owned()));
         assert!(suggestions.len() <= 3);
     }
 
@@ -931,11 +931,11 @@ mod tests {
     #[test]
     fn retryable_mutations_require_state_verification_before_replay() {
         let error = zuno_error::ToolError::Timeout {
-            tool: "bash".to_owned(),
+            tool: "shell".to_owned(),
             elapsed: Duration::from_secs(120),
         };
 
-        let result = tool_error_result("bash", ToolReplayPolicy::Never, &error);
+        let result = tool_error_result("shell", ToolReplayPolicy::Never, &error);
 
         assert_eq!(
             result

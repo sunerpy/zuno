@@ -301,12 +301,14 @@ fn status_urgent_soft_interrupt_skips_remaining_tools_in_event_sequence() {
             TurnEvent::ToolDispatchStarted {
                 step: 1,
                 call_id: "call-1".to_owned(),
+                display_name: "first".to_owned(),
                 name: "first".to_owned(),
                 ui_intent: ToolUiIntent::Generic,
             },
             TurnEvent::ToolDispatchCompleted {
                 step: 1,
                 call_id: "call-1".to_owned(),
+                display_name: "first".to_owned(),
                 name: "first".to_owned(),
                 title: "first complete".to_owned(),
                 output: "first output".to_owned(),
@@ -331,12 +333,14 @@ fn emit_tool_events(events: &mut Vec<TurnEvent>, call_id: &str, name: &str) {
     events.push(TurnEvent::ToolDispatchStarted {
         step: 1,
         call_id: call_id.to_owned(),
+        display_name: name.to_owned(),
         name: name.to_owned(),
         ui_intent: ToolUiIntent::Generic,
     });
     events.push(TurnEvent::ToolDispatchCompleted {
         step: 1,
         call_id: call_id.to_owned(),
+        display_name: name.to_owned(),
         name: name.to_owned(),
         title: format!("{name} complete"),
         output: format!("{name} output"),

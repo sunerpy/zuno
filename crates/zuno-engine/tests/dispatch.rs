@@ -169,7 +169,7 @@ struct InternallyGatedTool {
 #[async_trait]
 impl Tool for InternallyGatedTool {
     fn id(&self) -> &str {
-        "bash"
+        "shell"
     }
 
     fn description(&self) -> &str {
@@ -186,15 +186,15 @@ impl Tool for InternallyGatedTool {
     }
 
     async fn execute(&self, _args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let ask = PermissionAsk::new("bash", "nested command");
+        let ask = PermissionAsk::new("shell", "nested command");
         let ask = if self.manual {
             ask.require_manual()
         } else {
             ask
         };
-        ctx.ask("bash", ask).await?;
+        ctx.ask("shell", ask).await?;
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ToolOutput::text("bash", "done"))
+        Ok(ToolOutput::text("shell", "done"))
     }
 }
 
@@ -205,7 +205,7 @@ struct ArgumentCapturingTool {
 #[async_trait]
 impl Tool for ArgumentCapturingTool {
     fn id(&self) -> &str {
-        "bash"
+        "shell"
     }
 
     fn description(&self) -> &str {
@@ -223,7 +223,7 @@ impl Tool for ArgumentCapturingTool {
 
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         *self.received.lock().expect("received lock") = Some(args.clone());
-        Ok(ToolOutput::text("bash", "captured"))
+        Ok(ToolOutput::text("shell", "captured"))
     }
 }
 
@@ -252,7 +252,7 @@ impl Drop for BlockingDropGuard {
 #[async_trait]
 impl Tool for BlockingDropTool {
     fn id(&self) -> &str {
-        "bash"
+        "shell"
     }
 
     fn description(&self) -> &str {
@@ -391,7 +391,7 @@ async fn strict_authorization_forces_fresh_manual_approval_despite_allows() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
         vec![allow_all_rule()],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::Strict,
@@ -404,7 +404,7 @@ async fn strict_authorization_forces_fresh_manual_approval_despite_allows() {
             .dispatch(request(
                 &dispatcher,
                 &format!("call-strict-{index}"),
-                "bash",
+                "shell",
                 json!({"command": "git status", "intent": "inspect"}),
             ))
             .await;
@@ -456,7 +456,7 @@ async fn allow_all_skips_hitl_for_side_effecting_tools() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
         Vec::new(),
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::AllowAll,
@@ -467,7 +467,7 @@ async fn allow_all_skips_hitl_for_side_effecting_tools() {
         .dispatch(request(
             &dispatcher,
             "call-allow-all",
-            "bash",
+            "shell",
             json!({"command": "chmod +x scripts/install.sh", "intent": "prepare installer"}),
         ))
         .await;
@@ -496,7 +496,7 @@ async fn allow_all_skips_tool_owned_non_manual_gate() {
         .dispatch(request(
             &dispatcher,
             "call-allow-all-internal",
-            "bash",
+            "shell",
             json!({"command": "printf ok", "intent": "run one command"}),
         ))
         .await;
@@ -528,7 +528,7 @@ async fn allow_all_keeps_tool_owned_manual_gate_interactive() {
         .dispatch(request(
             &dispatcher,
             "call-allow-all-manual",
-            "bash",
+            "shell",
             json!({"command": "rm -f /tmp/existing", "intent": "clean up"}),
         ))
         .await;
@@ -545,8 +545,8 @@ async fn allow_all_keeps_explicit_denies_terminal() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
-        vec![deny_rule("bash", "rm -rf /")],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
+        vec![deny_rule("shell", "rm -rf /")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::AllowAll,
         McpToolStatus::Ready,
@@ -556,7 +556,7 @@ async fn allow_all_keeps_explicit_denies_terminal() {
         .dispatch(request(
             &dispatcher,
             "call-allow-all-deny",
-            "bash",
+            "shell",
             json!({"command": "rm -rf /", "intent": "must remain denied"}),
         ))
         .await;
@@ -575,8 +575,8 @@ async fn strict_authorization_keeps_explicit_denies_terminal() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
-        vec![allow_all_rule(), deny_rule("bash", "rm -rf /")],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
+        vec![allow_all_rule(), deny_rule("shell", "rm -rf /")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::Strict,
         McpToolStatus::Ready,
@@ -587,7 +587,7 @@ async fn strict_authorization_keeps_explicit_denies_terminal() {
         .dispatch(request(
             &dispatcher,
             "call-strict-deny",
-            "bash",
+            "shell",
             json!({"command": "rm -rf /", "intent": "must remain denied"}),
         ))
         .await;
@@ -621,7 +621,7 @@ async fn strict_dispatch_approval_covers_the_same_tools_internal_gate_once() {
         .dispatch(request(
             &dispatcher,
             "call-strict-internal",
-            "bash",
+            "shell",
             json!({"command": "printf ok", "intent": "run one command"}),
         ))
         .await;
@@ -640,7 +640,7 @@ async fn strict_dispatch_approval_does_not_hide_a_later_explicit_resource_deny()
             calls: Arc::clone(&calls),
             manual: false,
         })],
-        vec![deny_rule("bash", "nested command")],
+        vec![deny_rule("shell", "nested command")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::Strict,
         McpToolStatus::Ready,
@@ -650,7 +650,7 @@ async fn strict_dispatch_approval_does_not_hide_a_later_explicit_resource_deny()
         .dispatch(request(
             &dispatcher,
             "call-strict-internal-deny",
-            "bash",
+            "shell",
             json!({"command": "printf ok", "intent": "run one command"}),
         ))
         .await;
@@ -688,7 +688,7 @@ async fn manual_tool_gate_requires_fresh_approval_despite_standard_allow() {
             .dispatch(request(
                 &dispatcher,
                 &format!("call-manual-{index}"),
-                "bash",
+                "shell",
                 json!({"command": "rm -f /tmp/existing", "intent": "clean up"}),
             ))
             .await;
@@ -711,8 +711,8 @@ async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
-        vec![allow_all_rule(), deny_rule("bash", "rm -rf /")],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
+        vec![allow_all_rule(), deny_rule("shell", "rm -rf /")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
@@ -723,7 +723,7 @@ async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
         .dispatch(request(
             &dispatcher,
             "call-plugin-allow-versus-deny-rule",
-            "bash",
+            "shell",
             json!({"command": "rm -rf /", "intent": "prove the deny rule still holds"}),
         ))
         .await;
@@ -754,7 +754,7 @@ async fn a_plugin_allow_cannot_cross_an_explicit_deny_rule() {
     );
 }
 
-/// The `deny_rule("bash", "original")` here is not testing denial.
+/// The `deny_rule("shell", "original")` here is not testing denial.
 ///
 /// `MutatingHooks::before` rewrites `command` from `original` to `hooked`, and the
 /// permission patterns are derived from the arguments *after* that rewrite, so the
@@ -768,8 +768,8 @@ async fn production_dispatch_rewrites_arguments_before_permission_and_execution(
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
-        vec![deny_rule("bash", "original")],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
+        vec![deny_rule("shell", "original")],
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::Standard,
         McpToolStatus::Ready,
@@ -780,7 +780,7 @@ async fn production_dispatch_rewrites_arguments_before_permission_and_execution(
         .dispatch(request(
             &dispatcher,
             "call-hooked",
-            "bash",
+            "shell",
             json!({"command": "original", "intent": "verify plugin hooks"}),
         ))
         .await;
@@ -796,7 +796,7 @@ async fn a_plugin_allow_resolves_an_ask_without_prompting() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
         Vec::new(),
         Arc::clone(&approver) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::Standard,
@@ -808,7 +808,7 @@ async fn a_plugin_allow_resolves_an_ask_without_prompting() {
         .dispatch(request(
             &dispatcher,
             "call-plugin-allow-resolves-ask",
-            "bash",
+            "shell",
             json!({"command": "git status", "intent": "inspect"}),
         ))
         .await;
@@ -841,7 +841,7 @@ async fn the_intent_reaches_the_permission_layer_but_not_the_tool() {
         .dispatch(request(
             &dispatcher,
             "call-intent-hand-off",
-            "bash",
+            "shell",
             json!({
                 "command": "git status",
                 "intent": "read the working tree state",
@@ -871,7 +871,7 @@ async fn the_intent_reaches_the_permission_layer_but_not_the_tool() {
 async fn dispatch_rejects_unregistered_tool_aliases_without_running_the_native_tool() {
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatcher = dispatcher(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
         vec![allow_all_rule()],
         Arc::new(RecordingApprover::default()),
     );
@@ -907,7 +907,7 @@ async fn dispatch_rejects_unregistered_tool_aliases_without_running_the_native_t
 async fn dispatch_unknown_tool_returns_ranked_suggestion_and_available_list() {
     let dispatcher = dispatcher(
         vec![
-            Arc::new(RecordingTool::new("bash", Arc::new(AtomicUsize::new(0)))),
+            Arc::new(RecordingTool::new("shell", Arc::new(AtomicUsize::new(0)))),
             Arc::new(RecordingTool::new(
                 "tool_search",
                 Arc::new(AtomicUsize::new(0)),
@@ -941,7 +941,7 @@ async fn dispatch_unknown_tool_returns_ranked_suggestion_and_available_list() {
         result
             .output
             .output
-            .contains("Available tools: bash, tool_search."),
+            .contains("Available tools: shell, tool_search."),
         "{}",
         result.output.output
     );
@@ -951,14 +951,14 @@ async fn dispatch_unknown_tool_returns_ranked_suggestion_and_available_list() {
 async fn dispatch_malformed_json_synthesizes_error_without_running_tool() {
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatcher = dispatcher(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
         vec![allow_all_rule()],
         Arc::new(RecordingApprover::default()),
     );
     let mut malformed = request(
         &dispatcher,
         "call_bad_json",
-        "bash",
+        "shell",
         Value::String("{\"command\":".to_owned()),
     );
     malformed.call.raw_input = "{\"command\":".to_owned();
@@ -976,7 +976,7 @@ async fn dispatch_malformed_json_synthesizes_error_without_running_tool() {
         result
             .output
             .output
-            .contains("Malformed arguments for tool `bash`")
+            .contains("Malformed arguments for tool `shell`")
     );
     assert!(result.output.output.contains("EOF while parsing a value"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -990,7 +990,7 @@ async fn dispatch_malformed_json_synthesizes_error_without_running_tool() {
 async fn dispatch_schema_error_is_a_result_and_does_not_run_tool() {
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatcher = dispatcher(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
         vec![allow_all_rule()],
         Arc::new(RecordingApprover::default()),
     );
@@ -999,7 +999,7 @@ async fn dispatch_schema_error_is_a_result_and_does_not_run_tool() {
         .dispatch(request(
             &dispatcher,
             "call_bad_args",
-            "bash",
+            "shell",
             json!({ "intent": "missing command" }),
         ))
         .await;
@@ -1014,7 +1014,7 @@ async fn dispatch_schema_error_is_a_result_and_does_not_run_tool() {
         result
             .output
             .output
-            .contains("Invalid arguments for tool `bash`")
+            .contains("Invalid arguments for tool `shell`")
     );
     assert!(result.output.output.contains("command"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1024,8 +1024,8 @@ async fn dispatch_schema_error_is_a_result_and_does_not_run_tool() {
 async fn dispatch_denial_is_an_error_result_and_a_later_call_still_runs() {
     let calls = Arc::new(AtomicUsize::new(0));
     let dispatcher = dispatcher(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
-        vec![allow_all_rule(), deny_rule("bash", "rm -rf /")],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
+        vec![allow_all_rule(), deny_rule("shell", "rm -rf /")],
         Arc::new(RecordingApprover::default()),
     );
 
@@ -1033,7 +1033,7 @@ async fn dispatch_denial_is_an_error_result_and_a_later_call_still_runs() {
         .dispatch(request(
             &dispatcher,
             "call_denied",
-            "bash",
+            "shell",
             json!({ "command": "rm -rf /", "intent": "unsafe" }),
         ))
         .await;
@@ -1041,7 +1041,7 @@ async fn dispatch_denial_is_an_error_result_and_a_later_call_still_runs() {
         .dispatch(request(
             &dispatcher,
             "call_continued",
-            "bash",
+            "shell",
             json!({ "command": "git status", "intent": "inspect" }),
         ))
         .await;
@@ -1063,7 +1063,7 @@ async fn dispatch_waits_for_argument_derived_permission_before_execution() {
     let approver = Arc::new(BlockingApprover::new(Arc::clone(&events)));
     let dispatcher = Arc::new(dispatcher(
         vec![Arc::new(RecordingTool::with_events(
-            "bash",
+            "shell",
             Arc::clone(&calls),
             Arc::clone(&events),
         ))],
@@ -1077,7 +1077,7 @@ async fn dispatch_waits_for_argument_derived_permission_before_execution() {
                 .dispatch(request(
                     &dispatcher,
                     "call_permission",
-                    "bash",
+                    "shell",
                     json!({ "command": "git push origin main", "intent": "publish" }),
                 ))
                 .await
@@ -1102,14 +1102,14 @@ async fn dispatch_interrupt_cancels_a_pending_permission_before_execution() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let approver = Arc::new(BlockingApprover::new(events));
     let dispatcher = Arc::new(dispatcher(
-        vec![Arc::new(RecordingTool::new("bash", Arc::clone(&calls)))],
+        vec![Arc::new(RecordingTool::new("shell", Arc::clone(&calls)))],
         Vec::new(),
         approver.clone(),
     ));
     let call = request(
         &dispatcher,
         "call_cancel_permission",
-        "bash",
+        "shell",
         json!({ "command": "git push origin main", "intent": "publish" }),
     );
     let interrupt = call.interrupt.clone();
@@ -1135,7 +1135,7 @@ async fn dispatch_passes_argument_pattern_to_permission_approver() {
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = dispatcher(
         vec![Arc::new(RecordingTool::new(
-            "bash",
+            "shell",
             Arc::new(AtomicUsize::new(0)),
         ))],
         Vec::new(),
@@ -1146,7 +1146,7 @@ async fn dispatch_passes_argument_pattern_to_permission_approver() {
         .dispatch(request(
             &dispatcher,
             "call_pattern",
-            "bash",
+            "shell",
             json!({ "command": "git push origin main", "intent": "publish" }),
         ))
         .await;
@@ -1154,7 +1154,7 @@ async fn dispatch_passes_argument_pattern_to_permission_approver() {
     assert!(!result.is_error, "{}", result.output.output);
     let asks = approver.asks();
     assert_eq!(asks.len(), 1);
-    assert_eq!(asks[0].permission, "bash");
+    assert_eq!(asks[0].permission, "shell");
     assert_eq!(asks[0].patterns, ["git push origin main"]);
     assert_eq!(
         approver.origins(),
@@ -1184,7 +1184,7 @@ async fn dispatch_interrupt_joins_the_cancelled_tool_before_returning() {
     let call = request(
         &dispatcher,
         "call_interrupt",
-        "bash",
+        "shell",
         json!({ "command": "wait", "intent": "wait" }),
     );
     let interrupt = call.interrupt.clone();
@@ -1222,13 +1222,13 @@ async fn dispatch_interrupt_joins_the_cancelled_tool_before_returning() {
 fn available_tools_omits_unconditionally_denied_entries() {
     let dispatcher = dispatcher(
         vec![
-            Arc::new(RecordingTool::new("bash", Arc::new(AtomicUsize::new(0)))),
+            Arc::new(RecordingTool::new("shell", Arc::new(AtomicUsize::new(0)))),
             Arc::new(RecordingTool::new(
                 "tool_search",
                 Arc::new(AtomicUsize::new(0)),
             )),
         ],
-        vec![deny_rule("bash", "*")],
+        vec![deny_rule("shell", "*")],
         Arc::new(RecordingApprover::default()),
     );
 

@@ -97,12 +97,12 @@ fn key(
     }
 }
 
-struct DispatchBash;
+struct DispatchShell;
 
 #[async_trait]
-impl Tool for DispatchBash {
+impl Tool for DispatchShell {
     fn id(&self) -> &str {
-        "bash"
+        "shell"
     }
 
     fn description(&self) -> &str {
@@ -121,7 +121,7 @@ impl Tool for DispatchBash {
     }
 
     async fn execute(&self, args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        Ok(ToolOutput::text("bash", args["command"].to_string()))
+        Ok(ToolOutput::text("shell", args["command"].to_string()))
     }
 }
 
@@ -174,7 +174,7 @@ async fn answer_through_production_keys(
     let mut bridge = bridge(&broker);
     let context = permission_context(&broker, "ses_keys", "msg_keys", "call_keys");
     let asking =
-        { tokio::spawn(async move { context.ask("bash", reusable_ask("bash", "ls")).await }) };
+        { tokio::spawn(async move { context.ask("shell", reusable_ask("shell", "ls")).await }) };
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), wake.recv()).await,
         Ok(Some(TerminalEvent::Wake))
@@ -252,14 +252,14 @@ fn production_wrappers_preserve_the_screens_focused_scope() {
 async fn an_ask_becomes_a_prompt_and_the_decision_answers_it() {
     let (broker, mut wake) = broker();
     let mut bridge = bridge(&broker);
-    let mut ask = PermissionAsk::new("bash", "git status");
+    let mut ask = PermissionAsk::new("shell", "git status");
     ask.metadata.insert(
         String::from("arguments"),
         serde_json::json!({"command": "git status"}),
     );
     let asking = {
-        let context = permission_context(&broker, "ses_bridge", "msg_bridge", "call_bash");
-        tokio::spawn(async move { context.ask("bash", ask).await })
+        let context = permission_context(&broker, "ses_bridge", "msg_bridge", "call_shell");
+        tokio::spawn(async move { context.ask("shell", ask).await })
     };
 
     assert!(
@@ -346,7 +346,7 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
     let (broker, mut wake) = broker();
     let mut bridge = bridge(&broker);
     let dispatcher = Arc::new(ToolRegistryDispatcher::new(
-        vec![Arc::new(DispatchBash)],
+        vec![Arc::new(DispatchShell)],
         Vec::new(),
         Arc::clone(&broker) as Arc<dyn PermissionAsker>,
         zuno_engine::dispatch::AuthorizationPolicy::Standard,
@@ -360,7 +360,7 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
                 .dispatch(DispatchRequest {
                     call: ToolCall {
                         id: "call_dispatch_bridge".to_owned(),
-                        name: "bash".to_owned(),
+                        name: "shell".to_owned(),
                         input: json!({
                             "command": "printf seam-20",
                             "intent": "prove permission argument plumbing"
@@ -403,7 +403,7 @@ async fn production_dispatch_arguments_reach_the_rendered_permission_dialog() {
         .join("\n");
     assert!(
         joined.contains("$ printf seam-20"),
-        "the production dispatcher did not carry its bash arguments to the dialog:\n{joined}"
+        "the production dispatcher did not carry its shell arguments to the dialog:\n{joined}"
     );
 
     bridge.handle_action(submit(), &press());
@@ -560,7 +560,7 @@ async fn a_tui_that_goes_away_denies_an_outstanding_ask() {
     let asking = {
         tokio::spawn(async move {
             context
-                .ask("bash", PermissionAsk::new("bash", "rm -rf /"))
+                .ask("shell", PermissionAsk::new("shell", "rm -rf /"))
                 .await
         })
     };
@@ -587,13 +587,13 @@ async fn parent_and_child_requests_keep_distinct_trusted_origins_and_cannot_cros
     let child = permission_context(&broker, "ses_child", "msg_child", "call_child");
     let parent_wait = tokio::spawn(async move {
         parent
-            .ask("bash", PermissionAsk::new("bash", "parent command"))
+            .ask("shell", PermissionAsk::new("shell", "parent command"))
             .await
     });
     let parent_request = next_request(&broker).await;
     let child_wait = tokio::spawn(async move {
         child
-            .ask("bash", PermissionAsk::new("bash", "child command"))
+            .ask("shell", PermissionAsk::new("shell", "child command"))
             .await
     });
     let child_request = next_request(&broker).await;
@@ -626,15 +626,21 @@ async fn always_grants_are_isolated_per_session() {
     let (broker, _wake) = broker();
     let _surface = broker.surface_lease();
     let parent = permission_context(&broker, "ses_parent", "msg_parent", "call_parent");
-    let parent_wait =
-        tokio::spawn(async move { parent.ask("bash", reusable_ask("bash", "git status")).await });
+    let parent_wait = tokio::spawn(async move {
+        parent
+            .ask("shell", reusable_ask("shell", "git status"))
+            .await
+    });
     let parent_request = next_request(&broker).await;
     assert!(broker.resolve("ses_parent", &parent_request.id, ReplyKind::Always));
     assert!(parent_wait.await.expect("parent task").is_ok());
 
     let child = permission_context(&broker, "ses_child", "msg_child", "call_child");
-    let child_wait =
-        tokio::spawn(async move { child.ask("bash", reusable_ask("bash", "git status")).await });
+    let child_wait = tokio::spawn(async move {
+        child
+            .ask("shell", reusable_ask("shell", "git status"))
+            .await
+    });
     let child_request = next_request(&broker).await;
     assert_eq!(child_request.session_id, "ses_child");
     assert!(broker.resolve("ses_child", &child_request.id, ReplyKind::Once));
@@ -650,7 +656,7 @@ async fn a_closed_wake_channel_fails_closed_without_parking_forever() {
 
     let answer = tokio::time::timeout(
         Duration::from_millis(250),
-        context.ask("bash", PermissionAsk::new("bash", "pwd")),
+        context.ask("shell", PermissionAsk::new("shell", "pwd")),
     )
     .await
     .expect("a closed wake channel must not leave the ask waiting");
@@ -666,7 +672,7 @@ async fn explicitly_closing_the_surface_denies_every_pending_request() {
     let context = permission_context(&broker, "ses_surface", "msg_surface", "call_surface");
     let waiting = tokio::spawn(async move {
         context
-            .ask("bash", PermissionAsk::new("bash", "cargo publish"))
+            .ask("shell", PermissionAsk::new("shell", "cargo publish"))
             .await
     });
     let _request = next_request(&broker).await;
@@ -688,7 +694,7 @@ async fn losing_a_pending_sender_fails_closed() {
     let context = permission_context(&broker, "ses_lost", "msg_lost", "call_lost");
     let waiting = tokio::spawn(async move {
         context
-            .ask("bash", PermissionAsk::new("bash", "cargo publish"))
+            .ask("shell", PermissionAsk::new("shell", "cargo publish"))
             .await
     });
     let request = next_request(&broker).await;
@@ -714,7 +720,7 @@ async fn an_abandoned_asker_cannot_install_a_standing_grant() {
     let context = permission_context(&broker, "ses_abandoned", "msg_abandoned", "call_abandoned");
     let waiting = tokio::spawn(async move {
         context
-            .ask("bash", reusable_ask("bash", "cargo publish"))
+            .ask("shell", reusable_ask("shell", "cargo publish"))
             .await
     });
     let request = next_request(&broker).await;
@@ -737,7 +743,7 @@ async fn always_answers_the_next_matching_ask_without_prompting() {
     let mut bridge = bridge(&broker);
     let first = {
         let context = permission_context(&broker, "ses_always", "msg_always", "call_first");
-        tokio::spawn(async move { context.ask("bash", reusable_ask("bash", "ls")).await })
+        tokio::spawn(async move { context.ask("shell", reusable_ask("shell", "ls")).await })
     };
     tokio::time::sleep(Duration::from_millis(50)).await;
     bridge.handle_event(&resize());
@@ -760,7 +766,7 @@ async fn always_answers_the_next_matching_ask_without_prompting() {
     let repeated = tokio::time::timeout(
         Duration::from_secs(5),
         permission_context(&broker, "ses_always", "msg_always", "call_repeat")
-            .ask("bash", reusable_ask("bash", "ls")),
+            .ask("shell", reusable_ask("shell", "ls")),
     )
     .await
     .expect("a standing grant must answer without a prompt");
@@ -784,7 +790,7 @@ async fn auto_approval_never_parks_anything() {
     );
     assert!(
         context
-            .ask("bash", PermissionAsk::new("bash", "anything"))
+            .ask("shell", PermissionAsk::new("shell", "anything"))
             .await
             .is_ok()
     );
@@ -802,8 +808,8 @@ async fn manual_approval_bypasses_neither_auto_mode_nor_standing_grants() {
     );
     let denied = auto
         .ask(
-            "bash",
-            PermissionAsk::new("bash", "git push").require_manual(),
+            "shell",
+            PermissionAsk::new("shell", "git push").require_manual(),
         )
         .await;
     assert!(matches!(denied, Err(ToolError::Denied { .. })));
@@ -812,7 +818,7 @@ async fn manual_approval_bypasses_neither_auto_mode_nor_standing_grants() {
     let _surface = broker.surface_lease();
     locked(&broker.parked).standing.push((
         String::from("ses_manual"),
-        String::from("bash"),
+        String::from("shell"),
         vec![String::from("git push")],
     ));
     let waiting = {
@@ -820,8 +826,8 @@ async fn manual_approval_bypasses_neither_auto_mode_nor_standing_grants() {
         tokio::spawn(async move {
             context
                 .ask(
-                    "bash",
-                    PermissionAsk::new("bash", "git push").require_manual(),
+                    "shell",
+                    PermissionAsk::new("shell", "git push").require_manual(),
                 )
                 .await
         })
@@ -936,9 +942,9 @@ async fn cmd_tui_permission_prompt_replaces_the_live_pulse() {
         async move {
             context
                 .ask(
-                    "bash",
+                    "shell",
                     PermissionAsk {
-                        permission: String::from("bash"),
+                        permission: String::from("shell"),
                         patterns: vec![String::from("rm -rf /")],
                         metadata: serde_json::Map::new(),
                         always: vec![String::from("*")],

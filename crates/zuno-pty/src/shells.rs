@@ -18,10 +18,13 @@
 //! runs `Shell.acceptable`, because it injects POSIX script that fish and nushell
 //! cannot parse. Collapsing them would either break fish users' terminals or feed
 //! POSIX script to a shell that rejects it. Both are exported here for that
-//! reason; see the project's engineering notes for how this interacts with
-//! todo 40's single-selector `zuno_tools::shell::discover_shell`.
+//! reason. Model-issued commands use [`command`], the shared strict resolver
+//! that also records the actual interpreter name for durable clients.
 
+use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(all(unix, not(target_os = "redox")))]
+use std::sync::OnceLock;
 
 /// One entry of `GET /pty/shells`, from `packages/core/src/shell.ts:25-29`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,6 +49,41 @@ pub struct ShellMeta {
     pub posix: bool,
     /// Takes PowerShell arguments rather than `-c`.
     pub powershell: bool,
+}
+
+/// Invocation syntax for one non-interactive command shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandShellKind {
+    Posix,
+    PowerShell,
+}
+
+/// One resolved shell executable used for model-issued commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandShell {
+    path: PathBuf,
+    kind: CommandShellKind,
+    name: String,
+}
+
+impl CommandShell {
+    /// Resolved executable path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Argument and parsing family used to invoke the executable.
+    #[must_use]
+    pub const fn kind(&self) -> CommandShellKind {
+        self.kind
+    }
+
+    /// Stable user-facing interpreter name, such as `zsh` or `pwsh`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 const META: &[(&str, ShellMeta)] = &[
@@ -213,11 +251,51 @@ pub fn list() -> Vec<ShellItem> {
 /// The shell to open a terminal in (`shell.ts:205-209`).
 ///
 /// Does not apply the deny list — see the module docs. `configured` is the
-/// `shell` config key; when it is absent the process `SHELL` is consulted, and
-/// when neither resolves the platform default wins.
-#[must_use]
-pub fn preferred(configured: Option<&str>) -> PathBuf {
-    select(configured, environment_shell().as_deref(), false)
+/// `shell` config key; when it is absent the operating-system account shell,
+/// process `SHELL`, and platform default are consulted in that order.
+pub fn preferred(configured: Option<&str>) -> io::Result<PathBuf> {
+    preferred_with_sources(
+        configured,
+        account_shell().as_deref(),
+        environment_shell().as_deref(),
+    )
+}
+
+/// [`preferred`] with host identity sources supplied explicitly.
+///
+/// An explicit configuration is authoritative: a missing or non-executable path is
+/// an error rather than a request to fall back silently. Account and environment
+/// values are discovery hints, so an unavailable value advances to the next source.
+pub fn preferred_with_sources(
+    configured: Option<&str>,
+    account: Option<&str>,
+    environment: Option<&str>,
+) -> io::Result<PathBuf> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        return resolve(Path::new(configured)).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("configured shell {configured} was not found or is not executable"),
+            )
+        });
+    }
+
+    for candidate in [account, environment].into_iter().flatten() {
+        if let Some(shell) = resolve(Path::new(candidate)) {
+            return Ok(shell);
+        }
+    }
+
+    let candidate = fallback();
+    resolve(&candidate).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "fallback shell {} was not found or is not executable",
+                candidate.display()
+            ),
+        )
+    })
 }
 
 /// The shell to run generated POSIX script in (`shell.ts:214-218`).
@@ -226,7 +304,50 @@ pub fn preferred(configured: Option<&str>) -> PathBuf {
 /// passed over in favour of the platform default.
 #[must_use]
 pub fn acceptable(configured: Option<&str>) -> PathBuf {
-    select(configured, environment_shell().as_deref(), true)
+    select_with_account(
+        configured,
+        account_shell().as_deref(),
+        environment_shell().as_deref(),
+        true,
+    )
+}
+
+/// Resolve the shell used for non-interactive model-issued commands.
+///
+/// An explicit configuration error is terminal. Without one, the operating-system
+/// account shell wins over the inherited `SHELL`, matching the login identity rather
+/// than whichever parent process happened to launch Zuno.
+pub fn command(configured: Option<&str>) -> io::Result<CommandShell> {
+    command_with_sources(
+        configured,
+        account_shell().as_deref(),
+        environment_shell().as_deref(),
+    )
+}
+
+/// Pure selection seam for tests and embedders that already resolved host identity.
+pub fn command_with_sources(
+    configured: Option<&str>,
+    account: Option<&str>,
+    environment: Option<&str>,
+) -> io::Result<CommandShell> {
+    if let Some(configured) = configured.filter(|value| !value.is_empty()) {
+        return resolve_command(Path::new(configured)).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("configured shell {configured} was not found or is not supported"),
+            )
+        });
+    }
+
+    for candidate in [account, environment].into_iter().flatten() {
+        if let Some(shell) = resolve_command(Path::new(candidate)) {
+            return Ok(shell);
+        }
+    }
+
+    resolve_command(&fallback())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no supported shell was found"))
 }
 
 /// [`preferred`] and [`acceptable`] with the environment supplied explicitly.
@@ -242,7 +363,20 @@ pub fn select(
     environment: Option<&str>,
     require_acceptable: bool,
 ) -> PathBuf {
-    for candidate in [configured, environment].into_iter().flatten() {
+    select_with_account(configured, None, environment, require_acceptable)
+}
+
+fn select_with_account(
+    configured: Option<&str>,
+    account: Option<&str>,
+    environment: Option<&str>,
+    require_acceptable: bool,
+) -> PathBuf {
+    for (source, candidate) in [configured, account, environment]
+        .into_iter()
+        .enumerate()
+        .filter_map(|(source, candidate)| candidate.map(|candidate| (source, candidate)))
+    {
         if candidate.is_empty() {
             continue;
         }
@@ -252,9 +386,12 @@ pub fn select(
         if let Some(resolved) = resolve(Path::new(candidate)) {
             return resolved;
         }
-        // The oracle falls through to the platform default after the *first*
-        // supplied value fails, rather than trying the next (`shell.ts:114-120`).
-        break;
+        if source == 0 {
+            // An explicit but missing executable is not silently replaced by a
+            // lower-precedence identity source. The command resolver reports this
+            // as an error; this infallible PTY helper reaches the platform default.
+            return fallback();
+        }
     }
     fallback()
 }
@@ -283,7 +420,7 @@ pub fn git_bash() -> Option<PathBuf> {
         return None;
     }
     if let Some(explicit) = std::env::var_os(GIT_BASH_PATH_ENV).filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(explicit));
+        return resolve(Path::new(&explicit));
     }
     let git = which::which("git").ok()?;
     // `<git>/../../bin/bash.exe`: `git` lives in `<root>/cmd` or `<root>/bin`.
@@ -361,16 +498,67 @@ fn resolve(candidate: &Path) -> Option<PathBuf> {
     if candidate.is_absolute() {
         return std::fs::metadata(candidate)
             .ok()
-            .filter(std::fs::Metadata::is_file)
+            .filter(is_executable_file)
             .map(|_| candidate.to_owned());
     }
     which::which(candidate).ok()
+}
+
+#[cfg(unix)]
+fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
 }
 
 fn environment_shell() -> Option<String> {
     std::env::var("SHELL")
         .ok()
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+static ACCOUNT_SHELL: OnceLock<Option<String>> = OnceLock::new();
+
+#[cfg(all(unix, not(target_os = "redox")))]
+fn account_shell() -> Option<String> {
+    ACCOUNT_SHELL.get_or_init(resolve_account_shell).clone()
+}
+
+#[cfg(all(unix, not(target_os = "redox")))]
+fn resolve_account_shell() -> Option<String> {
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .ok()
+        .flatten()?;
+    let shell = user.shell.to_string_lossy().into_owned();
+    (!shell.is_empty()).then_some(shell)
+}
+
+#[cfg(any(not(unix), target_os = "redox"))]
+fn account_shell() -> Option<String> {
+    None
+}
+
+fn resolve_command(candidate: &Path) -> Option<CommandShell> {
+    let path = resolve(candidate)?;
+    let metadata = meta(&path)?;
+    if metadata.deny {
+        return None;
+    }
+    let name = shell_name(&path);
+    let kind = if metadata.powershell {
+        CommandShellKind::PowerShell
+    } else if metadata.posix {
+        CommandShellKind::Posix
+    } else {
+        return None;
+    };
+    Some(CommandShell { path, kind, name })
 }
 
 fn dedupe(values: impl Iterator<Item = String>) -> Vec<String> {
@@ -470,10 +658,78 @@ mod tests {
         assert_eq!(posix_candidates("\n# only comments\n"), POSIX_FALLBACK);
     }
 
+    #[cfg(unix)]
     #[test]
     fn selection_prefers_the_configured_shell_over_the_environment() {
         let selected = select(Some("/bin/sh"), Some("/bin/bash"), false);
         assert_eq!(selected, PathBuf::from("/bin/sh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_selection_prefers_config_then_account_then_environment() {
+        assert_eq!(
+            command_with_sources(Some("/bin/sh"), Some("/bin/bash"), Some("/bin/zsh"))
+                .expect("configured shell")
+                .name(),
+            "sh"
+        );
+        assert_eq!(
+            command_with_sources(None, Some("/bin/sh"), Some("/bin/bash"))
+                .expect("account shell")
+                .name(),
+            "sh"
+        );
+        assert_eq!(
+            command_with_sources(None, Some("/missing/account-shell"), Some("/bin/sh"))
+                .expect("environment shell")
+                .name(),
+            "sh"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preferred_rejects_an_invalid_explicit_shell() {
+        let error = preferred_with_sources(
+            Some("/missing/configured-shell"),
+            Some("/bin/sh"),
+            Some("/bin/sh"),
+        )
+        .expect_err("explicit configuration must not fall back");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("configured shell"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_rejects_unknown_and_non_executable_interpreters() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let unknown = directory.path().join("elvish");
+        std::fs::write(&unknown, "#!/bin/sh\n").expect("write unknown shell");
+        std::fs::set_permissions(&unknown, std::fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+        let error = command_with_sources(Some(unknown.to_str().expect("utf8 path")), None, None)
+            .expect_err("unknown syntax must be rejected");
+        assert!(error.to_string().contains("not supported"));
+
+        let non_executable = directory.path().join("zsh");
+        std::fs::write(&non_executable, "#!/bin/sh\n").expect("write non-executable shell");
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o644))
+            .expect("remove execute bit");
+        assert!(resolve(&non_executable).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_selection_continues_from_a_missing_account_shell_to_environment() {
+        assert_eq!(
+            preferred_with_sources(None, Some("/missing/account-shell"), Some("/bin/sh"))
+                .expect("environment shell"),
+            PathBuf::from("/bin/sh")
+        );
     }
 
     #[test]
@@ -499,6 +755,7 @@ mod tests {
         assert!(is_acceptable(Path::new("zsh")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_empty_configured_value_is_ignored_rather_than_resolved() {
         assert_eq!(
@@ -507,6 +764,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_fallback_is_a_real_executable_on_this_host() {
         let shell = fallback();

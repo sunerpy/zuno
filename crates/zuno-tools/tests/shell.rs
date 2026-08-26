@@ -77,7 +77,7 @@ fn shell_description_bounds_git_apply_and_defines_non_destructive_recovery() {
     ] {
         assert!(
             description.contains(clause),
-            "bash description is missing `{clause}`:\n{description}"
+            "shell description is missing `{clause}`:\n{description}"
         );
     }
 }
@@ -97,23 +97,23 @@ fn shell_compound_command_extracts_each_permission_resource_and_matches_real_rul
 
     let rules = [
         Rule {
-            permission: "bash".to_owned(),
+            permission: "shell".to_owned(),
             pattern: "*".to_owned(),
             action: PermissionAction::Deny,
         },
         Rule {
-            permission: "bash".to_owned(),
+            permission: "shell".to_owned(),
             pattern: "git push*".to_owned(),
             action: PermissionAction::Ask,
         },
     ];
     assert_eq!(
-        evaluate("bash", &analysis.commands[1].source, &rules),
+        evaluate("shell", &analysis.commands[1].source, &rules),
         PermissionAction::Ask,
         "the extracted constituent, not the opaque compound string, must reach zuno-permission"
     );
     assert_eq!(
-        evaluate("bash", &analysis.commands[0].source, &rules),
+        evaluate("shell", &analysis.commands[0].source, &rules),
         PermissionAction::Deny,
         "the rule must distinguish cd from git push"
     );
@@ -233,6 +233,29 @@ async fn shell_env_hook_injects_call_scoped_environment() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn configured_shell_is_named_in_the_durable_output() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let tool = ShellTool::with_configured_shell(dir.path(), Some("/bin/sh"))
+        .expect("configured shell tool");
+    let definition = tool.definition();
+    assert_eq!(definition.id, "shell", "wire id is platform-neutral");
+    assert_eq!(definition.display_name, "sh");
+
+    let output = tool
+        .run(
+            params("printf configured-shell"),
+            context(Arc::new(zuno_tool::NeverInterrupted)),
+        )
+        .await
+        .expect("command succeeds");
+
+    assert_eq!(output.title, "sh printf configured-shell");
+    assert_eq!(output.metadata["shell"], "sh");
+    assert_eq!(output.output, "configured-shell");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn shell_background_mode_returns_before_the_command_finishes() {
     let dir = tempfile::tempdir().expect("temp dir");
     let marker = dir.path().join("background-finished");
@@ -282,7 +305,7 @@ async fn shell_oversized_output_is_detected_and_persisted_in_the_shared_store() 
     let path = paths.first().expect("stored output path");
     assert_eq!(
         store
-            .read("bash", std::path::Path::new(path))
+            .read("shell", std::path::Path::new(path))
             .expect("stored full output"),
         output.output
     );

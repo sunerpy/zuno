@@ -151,7 +151,7 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
     // the row: this is the whole of §7.5, and the failure it guards against is six tool
     // rows in a turn that a reader cannot tell apart.
     let cases: &[(&str, &str, &str)] = &[
-        ("bash", r#"{"command":"cargo test"}"#, "cargo test"),
+        ("shell", r#"{"command":"cargo test"}"#, "cargo test"),
         ("read", r#"{"filePath":"src/main.rs"}"#, "src/main.rs"),
         (
             "write",
@@ -309,7 +309,7 @@ fn tool_summary_treats_a_half_streamed_argument_as_not_yet_rather_than_as_an_err
 fn tool_summary_ignores_an_empty_argument_the_way_the_strip_ignores_an_empty_branch() {
     // A blank where an argument should be is indistinguishable from one that never
     // arrived, and it still costs the separator's columns.
-    assert_eq!(summary("bash", r#"{"command":""}"#), None);
+    assert_eq!(summary("shell", r#"{"command":""}"#), None);
     assert_eq!(summary("read", r#"{"filePath":""}"#), None);
 }
 
@@ -375,7 +375,7 @@ fn tool_summary_cuts_a_path_from_the_left_and_a_command_from_the_right() {
     assert!(cut.starts_with('…'), "the cut was not marked: {cut:?}");
 
     let command =
-        summary("bash", r#"{"command":"cargo test --workspace --offline"}"#).expect("a summary");
+        summary("shell", r#"{"command":"cargo test --workspace --offline"}"#).expect("a summary");
     assert_eq!(command.elide, Elide::Tail);
     let cut = command.fit(20);
     assert!(cut.starts_with("cargo"), "the verb was cut off: {cut:?}");
@@ -420,9 +420,9 @@ fn tool_summary_states_the_first_patched_file_and_counts_the_rest() {
 
 #[test]
 fn tool_summary_marks_a_background_command_because_its_result_means_something_else() {
-    let foreground = summary("bash", r#"{"command":"ls","background":false}"#).expect("a summary");
+    let foreground = summary("shell", r#"{"command":"ls","background":false}"#).expect("a summary");
     assert_eq!(foreground.fit(200), "ls");
-    let background = summary("bash", r#"{"command":"ls","background":true}"#).expect("a summary");
+    let background = summary("shell", r#"{"command":"ls","background":true}"#).expect("a summary");
     assert_eq!(background.fit(200), "ls &");
 }
 
@@ -437,7 +437,7 @@ fn tool_output_budget_gives_read_a_higher_ceiling_than_every_other_tool() {
     let read = output_budget("read", ToolDisplay::Expanded);
     assert_eq!(read.rows, READ_EXPANDED_ROWS);
     assert_eq!(read.chars, READ_EXPANDED_CHARS);
-    let other = output_budget("bash", ToolDisplay::Expanded);
+    let other = output_budget("shell", ToolDisplay::Expanded);
     assert_eq!(other.rows, EXPANDED_ROWS);
     assert_eq!(other.chars, EXPANDED_CHARS);
     assert!(
@@ -450,7 +450,7 @@ fn tool_output_budget_gives_read_a_higher_ceiling_than_every_other_tool() {
 fn tool_output_budget_collapses_to_the_same_small_preview_for_every_tool() {
     // Collapsed is a preview, and a preview whose size depended on the tool would make the
     // transcript's row arithmetic vary with its content.
-    for name in ["read", "bash", "grep", "some_mcp_tool"] {
+    for name in ["read", "shell", "grep", "some_mcp_tool"] {
         let budget = output_budget(name, ToolDisplay::Collapsed);
         assert_eq!(
             budget.rows,

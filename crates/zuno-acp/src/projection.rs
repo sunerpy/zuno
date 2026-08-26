@@ -13,25 +13,37 @@ pub fn turn_event_update(event: &TurnEvent) -> Option<Value> {
             event: StreamEvent::ReasoningDelta(text),
             ..
         } => Some(content_update("agent_thought_chunk", text)),
-        TurnEvent::Provider {
-            event: StreamEvent::ToolUseStart { id, name },
+        TurnEvent::ToolCallStarted {
+            call_id,
+            display_name,
+            name,
             ..
         } => Some(json!({
             "sessionUpdate": "tool_call",
-            "toolCallId": id,
-            "title": name,
+            "toolCallId": call_id,
+            "title": display_name,
             "kind": tool_kind(name),
             "status": "pending",
         })),
-        TurnEvent::ToolDispatchStarted { call_id, name, .. } => Some(json!({
+        TurnEvent::Provider {
+            event: StreamEvent::ToolUseStart { .. },
+            ..
+        } => None,
+        TurnEvent::ToolDispatchStarted {
+            call_id,
+            display_name,
+            name,
+            ..
+        } => Some(json!({
             "sessionUpdate": "tool_call",
             "toolCallId": call_id,
-            "title": name,
+            "title": display_name,
             "kind": tool_kind(name),
             "status": "in_progress",
         })),
         TurnEvent::ToolDispatchCompleted {
             call_id,
+            display_name,
             title,
             output,
             is_error,
@@ -39,7 +51,7 @@ pub fn turn_event_update(event: &TurnEvent) -> Option<Value> {
         } => Some(json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": call_id,
-            "title": title,
+            "title": if title.is_empty() { display_name } else { title },
             "status": if *is_error { "failed" } else { "completed" },
             "rawOutput": output,
             "content": [{
@@ -93,7 +105,7 @@ fn tool_kind(name: &str) -> &'static str {
         "delete" => "delete",
         "move" => "move",
         "grep" | "search" => "search",
-        "bash" | "execute" => "execute",
+        "shell" | "execute" => "execute",
         "fetch" | "webfetch" => "fetch",
         _ => "other",
     }

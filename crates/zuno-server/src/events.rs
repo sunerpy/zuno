@@ -225,6 +225,22 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "provider",
             object(json!({"step": step, "event": provider_event(event)})),
         ),
+        TurnEvent::ToolCallStarted {
+            step,
+            call_id,
+            display_name,
+            name,
+            ui_intent,
+        } => (
+            "tool.call.started",
+            object(json!({
+                "step": step,
+                "callID": call_id,
+                "name": name,
+                "displayName": display_name,
+                "uiIntent": ui_intent,
+            })),
+        ),
         TurnEvent::AssistantCheckpointed {
             step,
             message_id,
@@ -240,11 +256,17 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
         TurnEvent::ToolDispatchStarted {
             step,
             call_id,
+            display_name,
             name,
             ..
         } => (
             "tool.dispatch.started",
-            object(json!({"step": step, "callID": call_id, "name": name})),
+            object(json!({
+                "step": step,
+                "callID": call_id,
+                "name": name,
+                "displayName": display_name,
+            })),
         ),
         TurnEvent::ToolDispatchBlocked {
             step,
@@ -261,6 +283,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
         TurnEvent::ToolDispatchCompleted {
             step,
             call_id,
+            display_name,
             name,
             title,
             output,
@@ -273,6 +296,7 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
                 "step": step,
                 "callID": call_id,
                 "name": name,
+                "displayName": display_name,
                 "title": title,
                 "output": output,
                 "diff": diff,

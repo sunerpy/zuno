@@ -155,6 +155,7 @@ fn a_completed_tool_call_replays_with_its_arguments_output_title_and_diff() {
             "type": "tool",
             "callID": "call_1",
             "tool": "edit",
+            "displayName": "workspace-edit",
             "state": {
                 "status": "completed",
                 "input": { "filePath": "src/lib.rs" },
@@ -171,6 +172,7 @@ fn a_completed_tool_call_replays_with_its_arguments_output_title_and_diff() {
         MessagePart::Tool {
             call_id,
             name,
+            display_name,
             arguments,
             title,
             status,
@@ -184,6 +186,7 @@ fn a_completed_tool_call_replays_with_its_arguments_output_title_and_diff() {
     };
     assert_eq!(call_id, "call_1");
     assert_eq!(name, "edit");
+    assert_eq!(display_name, "workspace-edit");
     assert_eq!(arguments, r#"{"filePath":"src/lib.rs"}"#);
     assert_eq!(title.as_deref(), Some("Edit lib.rs"));
     assert_eq!(*status, ToolStatus::Completed);
@@ -203,7 +206,7 @@ fn a_failed_tool_call_replays_its_error_as_the_output_it_showed_live() {
         json!({
             "type": "tool",
             "callID": "call_1",
-            "tool": "bash",
+            "tool": "shell",
             "state": {
                 "status": "error",
                 "input": {},
@@ -233,7 +236,7 @@ fn a_tool_call_that_never_resolved_replays_as_pending_rather_than_vanishing() {
         json!({
             "type": "tool",
             "callID": "call_1",
-            "tool": "bash",
+            "tool": "shell",
             "state": { "status": "pending", "input": { "command": "sleep 600" } }
         }),
     );
@@ -248,7 +251,7 @@ fn a_tool_call_that_never_resolved_replays_as_pending_rather_than_vanishing() {
         ToolStatus::Pending,
         "an unresolved call is what a user resuming after an interruption is looking for",
     );
-    assert_eq!(name, "bash");
+    assert_eq!(name, "shell");
 }
 
 #[test]
@@ -267,7 +270,7 @@ fn a_tool_part_with_no_call_id_is_dropped_exactly_as_the_provider_projection_dro
         "msg_a",
         "prt_tool",
         101,
-        json!({ "type": "tool", "tool": "bash", "state": { "status": "completed" } }),
+        json!({ "type": "tool", "tool": "shell", "state": { "status": "completed" } }),
     );
 
     let replay = project(history(&connection));

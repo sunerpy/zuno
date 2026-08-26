@@ -375,7 +375,7 @@ fn plugin_add_update_list_and_remove_use_project_extension_storage() {
           "glob": "allow",
           "grep": "allow",
           "web_search": "allow",
-          "bash": "ask"
+          "shell": "ask"
         }
       }
     }

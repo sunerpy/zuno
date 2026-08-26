@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn aggregation_is_transparent_in_display_and_source() {
         let inner = ToolError::Failed {
-            tool: "bash".to_owned(),
+            tool: "shell".to_owned(),
             source: Box::new(std::io::Error::other("exit status 1")),
         };
         let inner_text = inner.to_string();
@@ -257,7 +257,7 @@ mod tests {
             .into(),
             ProviderError::RateLimited { retry_after: None }.into(),
             ToolError::NotFound {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
             }
             .into(),
             DbError::Busy { retry_after: None }.into(),

@@ -49,7 +49,7 @@ const GOLDEN: &str = "crates/zuno-cli/tests/prompts/tool-descriptions.txt";
 /// lives, and the text the binary compiled in.
 struct Description {
     /// The id the model sees on the wire. Not always the module name — the module
-    /// is `shell`, the wire id is `bash`.
+    /// is `shell`, and the wire id is also `shell`.
     wire_id: &'static str,
     /// The description file, relative to the workspace root.
     file: &'static str,
@@ -77,8 +77,8 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::apply_patch::DESCRIPTION,
         },
         Description {
-            wire_id: "bash",
-            file: "crates/zuno-tools/src/description/bash.txt",
+            wire_id: "shell",
+            file: "crates/zuno-tools/src/description/shell.txt",
             text: zuno_tools::shell::DESCRIPTION,
         },
         Description {

@@ -371,7 +371,7 @@ impl Builtin {
                 ("grep", allow()),
                 ("lsp", allow()),
                 ("edit", allow()),
-                ("bash", allow()),
+                ("shell", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
                 ("plan_get", allow()),
@@ -388,7 +388,7 @@ impl Builtin {
                 ("grep", allow()),
                 ("lsp", allow()),
                 ("edit", allow()),
-                ("bash", allow()),
+                ("shell", allow()),
                 ("plan_get", allow()),
                 ("todo_get", allow()),
             ],
@@ -585,7 +585,7 @@ mod tests {
                 "Plan mode must expose `{allowed}`"
             );
         }
-        for denied in ["bash", "write", "edit", "patch", "task", "execute"] {
+        for denied in ["shell", "write", "edit", "patch", "task", "execute"] {
             assert_ne!(
                 overlay.get(denied),
                 Some(&PermissionRule::Action(PermissionAction::Allow)),

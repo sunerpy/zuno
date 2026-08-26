@@ -154,30 +154,30 @@ mod tests {
     fn every_variant() -> Vec<ToolError> {
         vec![
             ToolError::Denied {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
             },
             ToolError::InvalidArgs {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
                 source: Box::new(std::io::Error::other("missing field `command`")),
             },
             ToolError::Timeout {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
                 elapsed: Duration::from_secs(120),
             },
             ToolError::Transient {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
                 retry_after: Some(Duration::from_secs(3)),
                 source: Box::new(std::io::Error::other("connection reset")),
             },
             ToolError::NotFound {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
             },
             ToolError::Failed {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
                 source: Box::new(std::io::Error::other("exit status 1")),
             },
             ToolError::Uncertain {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
                 applied_paths: vec!["/workspace/output.txt".to_owned()],
                 source: Box::new(std::io::Error::other("response lost")),
             },
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn every_variant_names_its_tool() {
         for e in every_variant() {
-            assert_eq!(e.tool(), "bash", "{e}");
+            assert_eq!(e.tool(), "shell", "{e}");
         }
     }
 
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn timeout_carries_the_budget_it_actually_spent() {
         let e = ToolError::Timeout {
-            tool: "bash".to_owned(),
+            tool: "shell".to_owned(),
             elapsed: Duration::from_secs(120),
         };
         let ToolError::Timeout { elapsed, .. } = e else {
@@ -254,10 +254,10 @@ mod tests {
         use std::error::Error as _;
 
         let e = ToolError::Failed {
-            tool: "bash".to_owned(),
+            tool: "shell".to_owned(),
             source: Box::new(std::io::Error::other("exit status 1")),
         };
-        assert_eq!(e.to_string(), "tool bash failed");
+        assert_eq!(e.to_string(), "tool shell failed");
         assert_eq!(
             e.source().map(ToString::to_string).as_deref(),
             Some("exit status 1")

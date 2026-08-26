@@ -72,7 +72,7 @@ fn register_non_file_builtins(builder: &mut ToolRegistryBuilder) {
     for (slot, id) in [
         (BuiltinSlot::Invalid, "invalid"),
         (BuiltinSlot::Question, "question"),
-        (BuiltinSlot::Shell, "bash"),
+        (BuiltinSlot::Shell, "shell"),
         (BuiltinSlot::Background, "bg"),
         (BuiltinSlot::Glob, "glob"),
         (BuiltinSlot::Grep, "grep"),
@@ -120,7 +120,7 @@ fn registry_builtin_order_is_stable_before_turn_filters() {
         vec![
             "invalid",
             "question",
-            "bash",
+            "shell",
             "bg",
             "read",
             "glob",
@@ -170,16 +170,16 @@ fn registry_full_deny_hides_a_tool_but_a_narrow_deny_keeps_it_visible() {
     let fully_denied = registry.resolved_ids(ResolveInput::new(
         "claude-sonnet-4-5",
         "anthropic",
-        &[deny("bash", "*")],
+        &[deny("shell", "*")],
     ));
-    assert!(!fully_denied.contains(&"bash".to_owned()));
+    assert!(!fully_denied.contains(&"shell".to_owned()));
 
     let narrowly_denied = registry.resolved_ids(ResolveInput::new(
         "claude-sonnet-4-5",
         "anthropic",
-        &[deny("bash", "git push*")],
+        &[deny("shell", "git push*")],
     ));
-    assert!(narrowly_denied.contains(&"bash".to_owned()));
+    assert!(narrowly_denied.contains(&"shell".to_owned()));
 }
 
 #[test]
@@ -290,21 +290,21 @@ fn registry_rejects_wrong_ids_and_duplicate_slots() {
 
     assert_eq!(
         builder
-            .register_builtin(BuiltinSlot::Shell, stub("shell"))
+            .register_builtin(BuiltinSlot::Shell, stub("bash"))
             .err()
-            .expect("shell's wire id is bash"),
+            .expect("the historical bash id is rejected"),
         RegistryError::WrongBuiltinId {
             slot: BuiltinSlot::Shell,
-            expected: "bash",
-            actual: "shell".to_owned(),
+            expected: "shell",
+            actual: "bash".to_owned(),
         }
     );
     builder
-        .register_builtin(BuiltinSlot::Shell, stub("bash"))
+        .register_builtin(BuiltinSlot::Shell, stub("shell"))
         .expect("first shell");
     assert_eq!(
         builder
-            .register_builtin(BuiltinSlot::Shell, stub("bash"))
+            .register_builtin(BuiltinSlot::Shell, stub("shell"))
             .err()
             .expect("the slot is already occupied"),
         RegistryError::DuplicateBuiltin {
@@ -328,7 +328,7 @@ struct DifferentialCase {
 #[derive(Clone, Copy)]
 enum PermissionCase {
     Default,
-    DenyAllBash,
+    DenyAllShell,
     DenyGitPush,
 }
 
@@ -344,7 +344,7 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
         expected: &[
             "invalid",
             "question",
-            "bash",
+            "shell",
             "bg",
             "read",
             "glob",
@@ -358,7 +358,7 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
         ],
     },
     DifferentialCase {
-        label: "non-gpt with narrow bash deny",
+        label: "non-gpt with narrow shell deny",
         provider_id: "anthropic",
         model_id: "claude-sonnet-4-5",
         permission: PermissionCase::DenyGitPush,
@@ -368,7 +368,7 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
         expected: &[
             "invalid",
             "question",
-            "bash",
+            "shell",
             "bg",
             "read",
             "glob",
@@ -382,10 +382,10 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
         ],
     },
     DifferentialCase {
-        label: "gpt-4 carve-out with full bash deny",
+        label: "gpt-4 carve-out with full shell deny",
         provider_id: "openai",
         model_id: "gpt-4.1",
-        permission: PermissionCase::DenyAllBash,
+        permission: PermissionCase::DenyAllShell,
         enable_exa: false,
         enable_lsp: false,
         enable_plan: false,
@@ -415,7 +415,7 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
         expected: &[
             "invalid",
             "question",
-            "bash",
+            "shell",
             "bg",
             "read",
             "glob",
@@ -441,7 +441,7 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
         expected: &[
             "invalid",
             "question",
-            "bash",
+            "shell",
             "bg",
             "read",
             "glob",
@@ -461,8 +461,8 @@ const DIFFERENTIAL_CASES: [DifferentialCase; 5] = [
 fn rules(case: PermissionCase) -> Vec<Rule> {
     match case {
         PermissionCase::Default => Vec::new(),
-        PermissionCase::DenyAllBash => vec![deny("bash", "*")],
-        PermissionCase::DenyGitPush => vec![deny("bash", "git push*")],
+        PermissionCase::DenyAllShell => vec![deny("shell", "*")],
+        PermissionCase::DenyGitPush => vec![deny("shell", "git push*")],
     }
 }
 

@@ -360,7 +360,7 @@ async fn risk_existing_redirect_target_requires_fresh_human_approval() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(asks.len(), 1, "{asks:#?}");
     assert!(asks[0].manual, "the overwrite accepted an automatic grant");
-    assert_eq!(asks[0].permission, "bash");
+    assert_eq!(asks[0].permission, "shell");
     let target_text = target.to_string_lossy().into_owned();
     assert_eq!(
         asks[0]

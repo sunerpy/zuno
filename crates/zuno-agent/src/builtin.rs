@@ -68,7 +68,7 @@ use zuno_permission::Rule;
 /// assertion that these ids still match the registry belongs in `zuno-tools`, where
 /// todo 65's `task` tool already sees both crates.
 pub const GOVERNED_TOOL_IDS: [&str; 17] = [
-    "bash",
+    "shell",
     "read",
     "glob",
     "grep",
@@ -407,7 +407,7 @@ pub const INTERNAL_NAMES: [&str; 4] = ["compaction", "title", "summary", "counci
 /// per-call `load_skills` — skill access is a per-agent permission, so a lane that
 /// needs no skills says so.
 const READ_ONLY_DENIED: &[&str] = &[
-    "bash",
+    "shell",
     "edit",
     "task",
     "question",
@@ -448,7 +448,7 @@ pub const ORCHESTRATOR: Agent = Agent {
             "grep",
             "lsp",
             "edit",
-            "bash",
+            "shell",
             "task",
             "webfetch",
             "web_search",
@@ -491,7 +491,7 @@ pub const BUILD: Agent = Agent {
             "grep",
             "lsp",
             "edit",
-            "bash",
+            "shell",
             "webfetch",
             "web_search",
             "plan_get",
@@ -534,7 +534,7 @@ pub const DEEP: Agent = Agent {
             "grep",
             "lsp",
             "edit",
-            "bash",
+            "shell",
             "webfetch",
             "web_search",
             "plan_get",
@@ -597,7 +597,7 @@ pub const LIBRARIAN: Agent = Agent {
     output: OutputContract::Natural,
     permissions: Permissions {
         denied: &[
-            "bash",
+            "shell",
             "edit",
             "task",
             "question",
@@ -683,7 +683,7 @@ pub const FIXER: Agent = Agent {
             "plan_exit",
         ],
         allowed: &[
-            "read", "glob", "grep", "lsp", "edit", "bash", "plan_get", "todo_get",
+            "read", "glob", "grep", "lsp", "edit", "shell", "plan_get", "todo_get",
         ],
         extension_tools: ExtensionTools::Excluded,
     },
@@ -717,7 +717,7 @@ pub const GENERAL: Agent = Agent {
             "grep",
             "lsp",
             "edit",
-            "bash",
+            "shell",
             "webfetch",
             "web_search",
             "plan_get",

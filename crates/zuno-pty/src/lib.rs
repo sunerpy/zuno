@@ -57,7 +57,7 @@ pub use crate::session::{
     AttachOptions, Attachment, CreateInput, DEFAULT_SUBSCRIBER_CAPACITY, DRAIN_GRACE, PtyId,
     PtyInfo, PtyOutput, PtyStatus, RetainedOutput, SessionOptions, TerminalSize, UpdateInput,
 };
-pub use crate::shells::ShellItem;
+pub use crate::shells::{CommandShell, CommandShellKind, ShellItem};
 pub use crate::ticket::{ConnectToken, TicketScope, TicketStore};
 
 use crate::retention::ExitRetention;
@@ -110,6 +110,13 @@ pub enum PtyEvent {
 /// are silently going nowhere has no way to learn that.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyError {
+    /// The configured default shell could not be resolved to an executable.
+    #[error("invalid terminal shell configuration")]
+    Shell {
+        /// The resolver's concrete path or lookup failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// No session with this identifier, or it was evicted by the retention cap.
     #[error("pty session `{id}` does not exist")]
     NotFound {
@@ -241,6 +248,7 @@ pub struct PtyServiceConfig {
     /// How many exited sessions stay observable.
     pub exited_limit: usize,
     /// The `shell` config value, used when a create request names no command.
+    /// Invalid explicit values fail when the service opens a default terminal.
     pub configured_shell: Option<String>,
 }
 

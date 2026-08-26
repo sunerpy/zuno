@@ -57,7 +57,7 @@ impl CapabilityPolicy {
     }
 
     fn can_shell(&self) -> bool {
-        !is_tool_hidden("bash", &self.rules)
+        !is_tool_hidden("shell", &self.rules)
     }
 
     fn can_research_externally(&self) -> bool {

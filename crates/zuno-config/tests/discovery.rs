@@ -54,6 +54,32 @@ fn instructions(config: &Config) -> Vec<&str> {
 }
 
 #[test]
+fn project_aware_options_keep_ancestor_config_visible_outside_git() {
+    let root = tempfile::tempdir().expect("temporary discovery root");
+    let parent = root.path().join("plain-project");
+    let nested = parent.join("nested");
+    fs::create_dir_all(&nested).expect("create non-git nested directory");
+    write(&parent.join(".zuno/zuno.json"), r#"{"shell":"/bin/sh"}"#);
+    let home = root.path().join("home");
+    let xdg_config = root.path().join("xdg-config");
+    fs::create_dir_all(&home).expect("create isolated home");
+    fs::create_dir_all(&xdg_config).expect("create isolated config home");
+    let options = DiscoveryOptions::for_directory(
+        &nested,
+        Env::from_pairs([
+            ("HOME", home.to_string_lossy().as_ref()),
+            ("ZUNO_TEST_HOME", home.to_string_lossy().as_ref()),
+            ("XDG_CONFIG_HOME", xdg_config.to_string_lossy().as_ref()),
+        ]),
+    )
+    .with_default_username("unknown");
+
+    assert!(options.worktree().is_none());
+    let config = discover_with(&options).expect("ancestor project config is discovered");
+    assert_eq!(config.shell.as_deref(), Some("/bin/sh"));
+}
+
+#[test]
 fn an_empty_zuno_root_gets_an_empty_native_file() {
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("project");
@@ -359,12 +385,12 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
         [
             (
                 "ZUNO_CONFIG_CONTENT".to_owned(),
-                r#"{"tools":{"bash":false,"write":true},"permission":{"rules":{"read":"ask"}}}"#
+                r#"{"tools":{"shell":false,"write":true},"permission":{"rules":{"read":"ask"}}}"#
                     .to_owned(),
             ),
             (
                 "ZUNO_PERMISSION".to_owned(),
-                r#"{"bash":"allow","edit":"deny"}"#.to_owned(),
+                r#"{"shell":"allow","edit":"deny"}"#.to_owned(),
             ),
         ],
     )
@@ -376,7 +402,7 @@ fn discovery_applies_permission_after_managed_preferences_and_tools_defaults_fir
     let config = discover_with(&options).expect("discover permissions");
     let permission = config.permission.expect("permission policy").rules;
     let expected = [
-        ("bash", PermissionAction::Allow),
+        ("shell", PermissionAction::Allow),
         ("edit", PermissionAction::Deny),
         ("read", PermissionAction::Deny),
         ("glob", PermissionAction::Ask),

@@ -52,7 +52,7 @@ plugin runtime capability list, controls which model-visible tools it can use:
 - `read`, `glob`, `grep`, and read-only `lsp` provide file inspection;
 - `edit` provides native file mutation;
 - `webfetch` and `web_search` provide network research;
-- `bash` runs a host process in the workspace and inherits Zuno's process
+- `shell` runs a host process in the workspace and inherits Zuno's process
   environment, filesystem visibility, network, proxy variables, and credentials;
 - `skill` loads reusable instructions;
 - `task` delegates again, subject to the configured depth bound.
@@ -86,7 +86,7 @@ research and asks before shell/environment access:
           "lsp": "allow",
           "webfetch": "allow",
           "web_search": "allow",
-          "bash": "ask"
+          "shell": "ask"
         }
       }
     }

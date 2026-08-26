@@ -4,7 +4,7 @@
 //!
 //! A tool call has several observable moments — it was requested, it started, and
 //! then completed, was blocked, or failed — and each one can be written by
-//! different code in a different crate. Left to ad-hoc `info!("running bash")`
+//! different code in a different crate. Left to ad-hoc `info!("running shell")`
 //! calls, those moments arrive as unrelated sentences that nothing can join,
 //! count, or time.
 //!
@@ -12,9 +12,9 @@
 //! group by [`FIELD_CALL_ID`] and get the whole life of one call:
 //!
 //! ```text
-//! event=TOOL_LIFECYCLE phase=pending   tool=bash call_id=toolu_01A
-//! event=TOOL_LIFECYCLE phase=running   tool=bash call_id=toolu_01A
-//! event=TOOL_LIFECYCLE phase=completed tool=bash call_id=toolu_01A elapsed_ms=412
+//! event=TOOL_LIFECYCLE phase=pending   tool=shell call_id=toolu_01A
+//! event=TOOL_LIFECYCLE phase=running   tool=shell call_id=toolu_01A
+//! event=TOOL_LIFECYCLE phase=completed tool=shell call_id=toolu_01A elapsed_ms=412
 //! ```
 //!
 //! # The abandoned phase
@@ -122,7 +122,7 @@ pub fn error_kind(error: &ToolError) -> &'static str {
 /// ```
 /// use zuno_observability::tool::ToolLifecycle;
 ///
-/// let mut call = ToolLifecycle::pending("bash", "toolu_01A");
+/// let mut call = ToolLifecycle::pending("shell", "toolu_01A");
 /// call.running();
 /// call.completed();
 /// ```
@@ -313,14 +313,14 @@ mod tests {
     fn every_tool_error_variant_has_a_distinct_discriminant() {
         let errors = [
             ToolError::Denied {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
             },
             ToolError::InvalidArgs {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
                 source: Box::new(std::io::Error::other("bad")),
             },
             ToolError::Timeout {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
                 elapsed: std::time::Duration::from_secs(1),
             },
             ToolError::Transient {
@@ -332,7 +332,7 @@ mod tests {
                 tool: "nope".to_owned(),
             },
             ToolError::Failed {
-                tool: "bash".to_owned(),
+                tool: "shell".to_owned(),
                 source: Box::new(std::io::Error::other("exit 1")),
             },
             ToolError::Uncertain {
@@ -363,9 +363,9 @@ mod tests {
 
     #[test]
     fn the_phase_advances_through_the_lifecycle() {
-        let mut call = ToolLifecycle::pending("bash", "toolu_01A");
+        let mut call = ToolLifecycle::pending("shell", "toolu_01A");
         assert_eq!(call.phase(), ToolPhase::Pending);
-        assert_eq!(call.tool(), "bash");
+        assert_eq!(call.tool(), "shell");
         assert_eq!(call.call_id(), "toolu_01A");
 
         call.running();
@@ -378,15 +378,15 @@ mod tests {
     /// code cannot know whether the process initialized logging.
     #[test]
     fn a_failure_is_recordable_without_a_subscriber() {
-        let call = ToolLifecycle::pending("bash", "toolu_01B");
+        let call = ToolLifecycle::pending("shell", "toolu_01B");
         call.failed(&ToolError::NotFound {
-            tool: "bash".to_owned(),
+            tool: "shell".to_owned(),
         });
     }
 
     #[test]
     fn an_abandoned_call_does_not_panic_on_drop() {
-        let call = ToolLifecycle::pending("bash", "toolu_01C");
+        let call = ToolLifecycle::pending("shell", "toolu_01C");
         drop(call);
     }
 }

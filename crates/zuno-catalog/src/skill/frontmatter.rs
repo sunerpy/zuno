@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn unknown_keys_are_ignored_not_rejected() {
         let parsed = doc(
-            "---\nname: extra\ndescription: d\nlicense: MIT\nallowed-tools: [bash]\nversion: 2\n---\nB\n",
+            "---\nname: extra\ndescription: d\nlicense: MIT\nallowed-tools: [shell]\nversion: 2\n---\nB\n",
         );
         assert_eq!(parsed.name.text(), Some("extra"));
         assert_eq!(parsed.description.text(), Some("d"));

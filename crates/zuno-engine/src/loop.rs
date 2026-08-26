@@ -172,6 +172,15 @@ pub enum TurnEvent {
         step: u32,
         event: StreamEvent,
     },
+    /// A provider started a tool call and the locked tool snapshot resolved its
+    /// client-facing identity before any arguments or dispatch result existed.
+    ToolCallStarted {
+        step: u32,
+        call_id: String,
+        display_name: String,
+        name: String,
+        ui_intent: ToolUiIntent,
+    },
     AssistantCheckpointed {
         step: u32,
         message_id: String,
@@ -180,6 +189,8 @@ pub enum TurnEvent {
     ToolDispatchStarted {
         step: u32,
         call_id: String,
+        /// Stable client-facing identity resolved from the locked tool snapshot.
+        display_name: String,
         name: String,
         ui_intent: ToolUiIntent,
     },
@@ -197,6 +208,8 @@ pub enum TurnEvent {
     ToolDispatchCompleted {
         step: u32,
         call_id: String,
+        /// Stable client-facing identity resolved from the locked tool snapshot.
+        display_name: String,
         name: String,
         title: String,
         output: String,
@@ -1464,6 +1477,7 @@ async fn run_turn_in_span(
                 let soft_interrupt = soft_interrupt.clone();
                 let events = events.clone();
                 let accumulator = Arc::clone(&accumulator);
+                let locked_tools = Arc::clone(&locked_tools);
                 let request_span = span::provider_request_for_session(
                     &request.session_id,
                     &model.catalog_provider_id,
@@ -1519,6 +1533,19 @@ async fn run_turn_in_span(
                                 .expect("step accumulator lock")
                                 .apply(step, &event);
                             if let Err(error) = apply {
+                                return Ok(Err(error));
+                            }
+                            if let StreamEvent::ToolUseStart { id, name } = &event
+                                && let Err(error) = events
+                                    .send(TurnEvent::ToolCallStarted {
+                                        step,
+                                        call_id: id.clone(),
+                                        display_name: tool_display_name(&locked_tools, name),
+                                        name: name.clone(),
+                                        ui_intent: tool_ui_intent(&locked_tools, name),
+                                    })
+                                    .await
+                            {
                                 return Ok(Err(error));
                             }
                             if let Err(error) =
@@ -1898,10 +1925,12 @@ async fn run_turn_in_span(
                     .skip(next_call)
                 {
                     let ui_intent = tool_ui_intent(&locked_tools, &call.name);
+                    let display_name = tool_display_name(&locked_tools, &call.name);
                     events
                         .send(TurnEvent::ToolDispatchStarted {
                             step,
                             call_id: call.id.clone(),
+                            display_name: display_name.clone(),
                             name: call.name.clone(),
                             ui_intent,
                         })
@@ -1918,17 +1947,29 @@ async fn run_turn_in_span(
                             &orchestration_snapshot,
                         ))
                         .await;
-                    prepared.push((call_index, call, ui_intent, dispatch));
+                    prepared.push((call_index, call, display_name, ui_intent, dispatch));
                 }
 
                 let completed = if first_policy == ToolConcurrencyPolicy::Exclusive {
-                    let (call_index, call, ui_intent, dispatch) =
+                    let (call_index, call, display_name, ui_intent, dispatch) =
                         prepared.pop().expect("exclusive group contains one call");
-                    vec![(call_index, call, ui_intent, dispatch.execute().await)]
+                    vec![(
+                        call_index,
+                        call,
+                        display_name,
+                        ui_intent,
+                        dispatch.execute().await,
+                    )]
                 } else {
                     stream::iter(prepared.into_iter().map(
-                        |(call_index, call, ui_intent, dispatch)| async move {
-                            (call_index, call, ui_intent, dispatch.execute().await)
+                        |(call_index, call, display_name, ui_intent, dispatch)| async move {
+                            (
+                                call_index,
+                                call,
+                                display_name,
+                                ui_intent,
+                                dispatch.execute().await,
+                            )
                         },
                     ))
                     .buffered(context.tool_concurrency.get())
@@ -1939,7 +1980,7 @@ async fn run_turn_in_span(
                 // A completed parallel group is an indivisible durable unit: every
                 // execution result is appended in model order before an urgent inbox
                 // item may prevent the next group from starting.
-                for (call_index, call, ui_intent, dispatch) in completed {
+                for (call_index, call, display_name, ui_intent, dispatch) in completed {
                     if let Some(recovery) = dispatch.recovery.clone() {
                         unresolved_tool_failures.insert(recovery.tool.clone(), recovery);
                     } else {
@@ -1948,11 +1989,12 @@ async fn run_turn_in_span(
                     persist_tool_result(
                         context.connection,
                         &request,
-                        ToolResultIdentity {
+                        ToolPartIdentity {
                             step,
                             call_index,
                             message_id: &assistant_id,
                             call: &call,
+                            display_name: &display_name,
                             ui_intent,
                         },
                         &dispatch,
@@ -1970,6 +2012,7 @@ async fn run_turn_in_span(
                         .send(TurnEvent::ToolDispatchCompleted {
                             step,
                             call_id: call.id.clone(),
+                            display_name,
                             name: call.name,
                             title: dispatch.output.title.clone(),
                             output: dispatch.output.output.clone(),
@@ -3179,6 +3222,13 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
         .map(|tool| {
             ToolDefinition {
                 id: tool.name.clone(),
+                display_name: locked_tools
+                    .iter()
+                    .find(|definition| definition.id == tool.name)
+                    .map_or_else(
+                        || tool.name.clone(),
+                        |definition| definition.display_name.clone(),
+                    ),
                 description: tool.description.clone(),
                 parameters: tool.parameters.clone(),
                 ui_intent: locked_tools
@@ -3450,13 +3500,17 @@ fn checkpoint_assistant(
         }
     };
     for (call_index, call) in accumulator.checkpoint_calls().iter().enumerate() {
+        let display_name = tool_display_name(locked_tools, &call.name);
         let tool = checkpoint_tool_part(
             request,
-            step,
-            call_index,
-            &assistant.id,
-            call,
-            tool_ui_intent(locked_tools, &call.name),
+            ToolPartIdentity {
+                step,
+                call_index,
+                message_id: &assistant.id,
+                call,
+                display_name: &display_name,
+                ui_intent: tool_ui_intent(locked_tools, &call.name),
+            },
             tool_failure,
         )?;
         store.put_part_at(&tool, completed)?;
@@ -3541,13 +3595,17 @@ fn provider_reasoning_part(
 
 fn checkpoint_tool_part(
     request: &RunTurnRequest,
-    step: u32,
-    call_index: usize,
-    message_id: &str,
-    call: &ToolCall,
-    ui_intent: ToolUiIntent,
+    identity: ToolPartIdentity<'_>,
     failure: Option<&str>,
 ) -> Result<PartRecord, TurnError> {
+    let ToolPartIdentity {
+        step,
+        call_index,
+        message_id,
+        call,
+        display_name,
+        ui_intent,
+    } = identity;
     let mut state = if let Some(error) = failure {
         json!({
             "status": "error",
@@ -3574,6 +3632,7 @@ fn checkpoint_tool_part(
         "type": "tool",
         "callID": call.id,
         "tool": call.name,
+        "displayName": display_name,
         "uiIntent": ui_intent,
         "state": state
     });
@@ -3583,18 +3642,19 @@ fn checkpoint_tool_part(
     PartRecord::from_json(payload, now_millis()).map_err(TurnError::from)
 }
 
-struct ToolResultIdentity<'a> {
+struct ToolPartIdentity<'a> {
     step: u32,
     call_index: usize,
     message_id: &'a str,
     call: &'a ToolCall,
+    display_name: &'a str,
     ui_intent: ToolUiIntent,
 }
 
 fn persist_tool_result(
     connection: &Connection,
     request: &RunTurnRequest,
-    identity: ToolResultIdentity<'_>,
+    identity: ToolPartIdentity<'_>,
     dispatch: &ToolDispatchResult,
 ) -> Result<(), TurnError> {
     let status = if dispatch.is_error {
@@ -3627,6 +3687,7 @@ fn persist_tool_result(
         "type": "tool",
         "callID": identity.call.id,
         "tool": identity.call.name,
+        "displayName": identity.display_name,
         "uiIntent": identity.ui_intent,
         "state": state
     });
@@ -3644,6 +3705,16 @@ fn tool_ui_intent(definitions: &[ToolDefinition], name: &str) -> ToolUiIntent {
         .iter()
         .find(|definition| definition.id == name)
         .map_or(ToolUiIntent::Generic, |definition| definition.ui_intent)
+}
+
+fn tool_display_name(definitions: &[ToolDefinition], name: &str) -> String {
+    definitions
+        .iter()
+        .find(|definition| definition.id == name)
+        .map_or_else(
+            || name.to_owned(),
+            |definition| definition.display_name.clone(),
+        )
 }
 
 fn assistant_message_id(turn_id: &str, step: u32) -> String {

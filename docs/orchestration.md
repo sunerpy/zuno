@@ -69,9 +69,9 @@ typed runtime decisions.
 | `looker` | Visual artifact inspection | No recursive delegation |
 
 `explorer` is deliberately native-read-only, not shell-read-only. Its default tool
-surface contains `read`, `glob`, `grep`, and read-only `lsp`, and denies `bash`, edits,
+surface contains `read`, `glob`, `grep`, and read-only `lsp`, and denies `shell`, edits,
 delegation, and network research. Commands such as `du`, `stat`, and `file` therefore do
-not belong to `explorer`: they are executables reached through `bash`, not native read
+not belong to `explorer`: they are executables reached through `shell`, not native read
 operations. Delegate command-based inspection to `deep`, `general`, or another
 shell-capable Agent, or execute the bounded command in the parent session. Global
 `permission.mode: "allow_all"` skips ordinary confirmation but does not erase this

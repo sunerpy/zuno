@@ -102,6 +102,8 @@ use zuno_orchestration::{ToolSchemaIdentity, sha256_json, sha256_text};
 pub struct ToolDefinition {
     /// The name the model calls.
     pub id: String,
+    /// Stable client-facing name, independent from the provider wire id.
+    pub display_name: String,
     /// The description the model reads.
     pub description: String,
     /// The augmented JSON Schema for the arguments.
@@ -208,6 +210,15 @@ pub trait Tool: Send + Sync {
     /// The name the model calls, and the key the registry stores.
     fn id(&self) -> &str;
 
+    /// Stable name clients render for this exact runtime implementation.
+    ///
+    /// Most tools expose their wire id. Tools whose wire id is deliberately
+    /// cross-platform, such as the shell tool, override this with the interpreter
+    /// that will actually execute the call.
+    fn display_name(&self) -> &str {
+        self.id()
+    }
+
     /// The description the model reads.
     fn description(&self) -> &str;
 
@@ -296,6 +307,7 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             id: self.id().to_owned(),
+            display_name: self.display_name().to_owned(),
             description: self.description().to_owned(),
             parameters: schema::augment(self.raw_parameters_schema()),
             ui_intent: self.ui_intent(),
@@ -577,6 +589,7 @@ mod tests {
     fn tool_definition_schema_identity_captures_the_exact_provider_surface() {
         let definition = ToolDefinition {
             id: "subagent_research".to_owned(),
+            display_name: "subagent_research".to_owned(),
             description: "Delegate a bounded research task.".to_owned(),
             parameters: json!({
                 "type": "object",

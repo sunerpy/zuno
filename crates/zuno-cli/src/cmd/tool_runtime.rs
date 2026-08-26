@@ -167,9 +167,10 @@ pub(crate) fn assemble(
         worktree: worktree.map_or_else(|| directory.to_path_buf(), Path::to_path_buf),
     };
     let tooling = SearchTooling::discover(scope).map_err(to_string)?;
-    let shell = zuno_tools::shell::ShellTool::new(directory)
-        .map_err(to_string)?
-        .with_background_executions(Arc::clone(&selection.background_executions));
+    let shell =
+        zuno_tools::shell::ShellTool::with_configured_shell(directory, config.shell.as_deref())
+            .map_err(to_string)?
+            .with_background_executions(Arc::clone(&selection.background_executions));
     if selection.manifest.contains(BuiltinSlot::Question)
         && let Some(asker) = selection.question
     {

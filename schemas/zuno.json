@@ -2867,7 +2867,7 @@
       "description": "Session sharing behaviour."
     },
     "shell": {
-      "description": "Default shell for the terminal and the bash tool.",
+      "description": "Default shell for terminals and the model-facing Shell tool.",
       "type": [
         "string",
         "null"

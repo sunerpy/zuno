@@ -104,7 +104,7 @@ pub struct Config {
     /// JSON schema reference for editor validation.
     #[serde(rename = "$schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
-    /// Default shell for the terminal and the bash tool.
+    /// Default shell for terminals and the model-facing Shell tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     /// Log level.

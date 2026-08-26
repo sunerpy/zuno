@@ -117,7 +117,7 @@ pub fn record_turn_identity(span: &Span, agent: &str, provider: &str, model: &st
 /// Opens the span covering one tool invocation.
 ///
 /// ```
-/// let span = zuno_observability::span::tool_call("bash", "toolu_01A");
+/// let span = zuno_observability::span::tool_call("shell", "toolu_01A");
 /// let _entered = span.enter();
 /// tracing::debug!("this record carries tool and call_id");
 /// ```
@@ -270,7 +270,7 @@ mod tests {
         record_turn_identity(&turn_span, "build", "anthropic", "claude-sonnet-4-5");
         let _turn_entered = turn_span.enter();
 
-        let tool_span = tool_call("bash", "toolu_01A");
+        let tool_span = tool_call("shell", "toolu_01A");
         {
             let _tool_entered = tool_span.enter();
         }

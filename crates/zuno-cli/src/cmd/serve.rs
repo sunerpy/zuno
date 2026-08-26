@@ -401,17 +401,20 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
     runtime.block_on(async {
         let env = environment.resolved();
         let project = zuno_paths::project::resolve_project(&directory_path);
-        let worktree = project
+        let mcp_workspace = project
             .vcs
             .as_ref()
             .map_or(directory_path.as_path(), |_| project.directory.as_path());
-        let harness_config =
-            zuno_config::discovery::discover_with(&zuno_config::discovery::DiscoveryOptions::new(
+        let harness_config = zuno_config::discovery::discover_with(
+            &zuno_config::discovery::DiscoveryOptions::for_project(
                 &directory_path,
-                Some(worktree),
+                &project,
                 env.clone(),
-            ))
-            .map_err(|error| error.report())?;
+            ),
+        )
+        .map_err(|error| error.report())?;
+        zuno_pty::shells::preferred(harness_config.shell.as_deref())
+            .map_err(|error| format!("invalid shell configuration: {error}"))?;
         let pool = Arc::new(zuno_db::Pool::open_default().map_err(|error| error.to_string())?);
         let events = EventService::new(Arc::clone(&pool), DEFAULT_EVENT_SUBSCRIBER_CAPACITY);
         let server_config = ServerConfig::default()
@@ -421,13 +424,14 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .with_default_directory(&directory);
         let state = ApiState::open_default(&directory)
             .map_err(|error| error.to_string())?
+            .with_configured_shell(harness_config.shell.clone())
             .with_events(events.clone());
         let requests = RequestBroker::with_events(events.clone());
         let services =
             ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY).with_requests(requests.clone());
         // Connected once for the server's lifetime, not per request: every host this
         // executor builds reads the same merged catalog. See `super::mcp_runtime`.
-        let mcp = super::mcp_runtime::McpRuntime::from_config(&harness_config, worktree);
+        let mcp = super::mcp_runtime::McpRuntime::from_config(&harness_config, mcp_workspace);
         if let Some(mcp) = mcp.as_ref() {
             for note in mcp.connect().await {
                 println!("{note}");

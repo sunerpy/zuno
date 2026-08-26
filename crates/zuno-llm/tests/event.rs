@@ -200,7 +200,7 @@ fn retry_rollback_event_clears_text_and_tool_call_accumulators() {
     accumulator
         .apply(&StreamEvent::ToolUseStart {
             id: "call-1".to_owned(),
-            name: "bash".to_owned(),
+            name: "shell".to_owned(),
         })
         .expect("tool start remains within stream limits");
     accumulator

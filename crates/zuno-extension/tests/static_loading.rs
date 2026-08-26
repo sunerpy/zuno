@@ -125,7 +125,7 @@ fn extension_agents_keep_native_file_network_and_environment_tool_permissions() 
                     "rules": {
                         "read": "allow",
                         "web_search": "allow",
-                        "bash": "ask"
+                        "shell": "ask"
                     }
                 }
             }
@@ -153,7 +153,7 @@ fn extension_agents_keep_native_file_network_and_environment_tool_permissions() 
     for (tool, expected) in [
         ("read", PermissionAction::Allow),
         ("web_search", PermissionAction::Allow),
-        ("bash", PermissionAction::Ask),
+        ("shell", PermissionAction::Ask),
     ] {
         assert_eq!(
             permission.get(tool),

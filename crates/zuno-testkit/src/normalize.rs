@@ -564,7 +564,7 @@ mod tests {
             "xses_0197d5f0a1b2cdefghijKLMNop"
         );
         // A model or tool name is untouched.
-        assert_eq!(norm("tool bash"), "tool bash");
+        assert_eq!(norm("tool shell"), "tool shell");
         assert_eq!(
             norm("claude-haiku-4-5-20251001"),
             "claude-haiku-4-5-20251001"

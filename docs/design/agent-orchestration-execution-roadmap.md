@@ -391,7 +391,7 @@ Required prompt improvements:
   and tool-schema hashes alongside the existing receipt.
 
 Prompt tests must prove that the declared role and actual runtime capabilities
-agree. A read-only profile that can see `bash`, `edit`, `write`, or
+agree. A read-only profile that can see `shell`, `edit`, `write`, or
 `apply_patch` is a test failure.
 
 ## 5. Patch and file-editing reliability
@@ -405,7 +405,7 @@ raw Git unified diff. Zuno already implements the same high-level
 The prompt should teach:
 
 - use `apply_patch` for focused source edits and coherent multi-file changes;
-- call the dedicated tool directly rather than routing it through `bash` or a
+- call the dedicated tool directly rather than routing it through `shell` or a
   heredoc;
 - use `write` only for a new file best expressed as complete content or an
   intentional full replacement;

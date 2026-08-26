@@ -50,7 +50,7 @@
 //!
 //! # Why a formatter does not go through the risk gate
 //!
-//! [`crate::risk`] exists because `bash` executes a string the **model** composed.
+//! [`crate::risk`] exists because `shell` executes a string the **model** composed.
 //! A formatter command comes from either this module's compile-time table or the
 //! operator's config, so there is no model-authored text anywhere in it and the
 //! gate has no audience. It is also spawned as argv with no shell, so there is no

@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn output_paths_accumulate_in_order() {
-        let mut output = ToolOutput::text("bash", "hello");
+        let mut output = ToolOutput::text("shell", "hello");
         assert!(output.output_paths().is_empty());
 
         output.record_output_path(Path::new("/data/tool-output/tool_a"));
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn output_paths_replaces_a_key_no_reader_could_use() {
         let mut output =
-            ToolOutput::text("bash", "hello").with_metadata(METADATA_OUTPUT_PATHS_KEY, "oops");
+            ToolOutput::text("shell", "hello").with_metadata(METADATA_OUTPUT_PATHS_KEY, "oops");
 
         output.record_output_path(Path::new("/data/tool_a"));
 
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn measure_never_alters_the_text_it_measures() {
-        let output = ToolOutput::text("bash", "a\nb\nc\nd");
+        let output = ToolOutput::text("shell", "a\nb\nc\nd");
         let before = output.output.clone();
 
         let measurement = output.measure(limits(1, 1));

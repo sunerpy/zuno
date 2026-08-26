@@ -125,7 +125,7 @@ impl ToolStatus {
 
 /// The per-tool icon and the placeholder shown before the arguments arrive.
 ///
-/// The first eight rows are verbatim from the oracle's `InlineTool` call sites: bash
+/// The first eight rows are verbatim from the oracle's `InlineTool` call sites: shell
 /// `$`/"Writing command...", glob `✱`/"Finding files...", grep `✱`/"Searching
 /// content...", read `→`/"Reading file...", write `→`/"Preparing write...", webfetch
 /// `%`/"Fetching from the web...", websearch `◈`/"Searching web...", task
@@ -152,7 +152,7 @@ impl ToolStatus {
 #[must_use]
 pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
     match name {
-        "bash" | "shell" | "exec" | "exec_command" => ("$", "Writing command..."),
+        "shell" | "exec" | "exec_command" => ("$", "Writing command..."),
         "glob" => ("✱", "Finding files..."),
         "grep" => ("✱", "Searching content..."),
         "read" => ("→", "Reading file..."),
@@ -425,6 +425,8 @@ pub enum MessagePart {
         call_id: String,
         /// The tool's wire name.
         name: String,
+        /// Stable client-facing identity resolved by the runtime.
+        display_name: String,
         /// Durable client presentation intent supplied by the tool implementation.
         ui_intent: zuno_tool::ToolUiIntent,
         /// The raw JSON arguments, accumulated from the provider's input deltas.
@@ -509,7 +511,7 @@ fn compact_activity(part: &MessagePart) -> Option<zuno_types::ActivityKind> {
             diff: None,
             ..
         } => match name.as_str() {
-            "bash" | "shell" | "exec" | "exec_command" => Some(ActivityKind::Command),
+            "shell" | "exec" | "exec_command" => Some(ActivityKind::Command),
             "read" | "glob" | "grep" | "list" | "ls" => Some(ActivityKind::Read),
             "web_search" | "google_search" | "webfetch" | "web_fetch" => Some(ActivityKind::Search),
             "view_image" | "image" | "imagegen" => Some(ActivityKind::Image),
@@ -982,8 +984,41 @@ impl Transcript {
                 true
             }
             TurnEvent::Provider { event, .. } => self.observe_stream(event),
+            TurnEvent::ToolCallStarted {
+                call_id,
+                display_name,
+                name,
+                ui_intent,
+                ..
+            } => {
+                self.update_tool(call_id, |part| {
+                    if let MessagePart::Tool {
+                        display_name: rendered_name,
+                        ui_intent: intent,
+                        ..
+                    } = part
+                    {
+                        *rendered_name = display_name.clone();
+                        *intent = *ui_intent;
+                    }
+                }) || {
+                    self.append(MessagePart::Tool {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        display_name: display_name.clone(),
+                        ui_intent: *ui_intent,
+                        arguments: String::new(),
+                        title: None,
+                        status: ToolStatus::Pending,
+                        output: None,
+                        diff: None,
+                    });
+                    true
+                }
+            }
             TurnEvent::ToolDispatchStarted {
                 call_id,
+                display_name,
                 name,
                 ui_intent,
                 ..
@@ -991,11 +1026,13 @@ impl Transcript {
                 self.update_tool(call_id, |part| {
                     if let MessagePart::Tool {
                         status,
+                        display_name: rendered_name,
                         ui_intent: intent,
                         ..
                     } = part
                     {
                         *status = ToolStatus::Running;
+                        *rendered_name = display_name.clone();
                         *intent = *ui_intent;
                     }
                 }) || {
@@ -1005,6 +1042,7 @@ impl Transcript {
                     self.append(MessagePart::Tool {
                         call_id: call_id.clone(),
                         name: name.clone(),
+                        display_name: display_name.clone(),
                         ui_intent: *ui_intent,
                         arguments: String::new(),
                         title: None,
@@ -1022,6 +1060,7 @@ impl Transcript {
             }),
             TurnEvent::ToolDispatchCompleted {
                 call_id,
+                display_name,
                 title,
                 output,
                 diff,
@@ -1030,6 +1069,7 @@ impl Transcript {
             } => self.update_tool(call_id, |part| {
                 if let MessagePart::Tool {
                     status,
+                    display_name: rendered_name,
                     title: slot,
                     output: body,
                     diff: patch,
@@ -1043,6 +1083,7 @@ impl Transcript {
                     } else {
                         ToolStatus::Completed
                     };
+                    *rendered_name = display_name.clone();
                     *slot = Some(title.clone());
                     *body = Some(output.clone());
                     *patch = diff.clone();
@@ -1149,9 +1190,13 @@ impl Transcript {
                 true
             }
             StreamEvent::ToolUseStart { id, name } => {
+                if self.update_tool(id, |_| {}) {
+                    return false;
+                }
                 self.append(MessagePart::Tool {
                     call_id: id.clone(),
                     name: name.clone(),
+                    display_name: name.clone(),
                     ui_intent: zuno_tool::ToolUiIntent::Generic,
                     arguments: String::new(),
                     title: None,
@@ -1920,12 +1965,14 @@ impl TranscriptView {
         match part {
             MessagePart::Tool {
                 name,
+                display_name,
                 arguments,
                 title,
                 ..
             } => {
                 let (icon, _) = tool_affordance(name);
-                let (label, separator) = match compact_activity(part)? {
+                let activity = compact_activity(part)?;
+                let (label, separator) = match activity {
                     zuno_types::ActivityKind::Command => (None, " "),
                     zuno_types::ActivityKind::Read => (Some("read"), " · "),
                     zuno_types::ActivityKind::Search => (Some("search"), " · "),
@@ -1941,7 +1988,16 @@ impl TranscriptView {
                     .saturating_sub(display_width(&prefix))
                     .saturating_sub(display_width(separator));
                 let detail = crate::views::tool::summary(name, arguments)
-                    .map(|summary| summary.fit(detail_room))
+                    .map(|summary| {
+                        if activity == zuno_types::ActivityKind::Command && display_name != name {
+                            let command_room = detail_room
+                                .saturating_sub(display_width(display_name))
+                                .saturating_sub(1);
+                            format!("{display_name} {}", summary.fit(command_room))
+                        } else {
+                            summary.fit(detail_room)
+                        }
+                    })
                     .or_else(|| {
                         title
                             .as_deref()
@@ -2499,6 +2555,7 @@ impl TranscriptView {
             MessagePart::Tool {
                 call_id,
                 name,
+                display_name,
                 arguments,
                 title,
                 status,
@@ -2521,7 +2578,7 @@ impl TranscriptView {
                 // The disclosure is part of the header rather than an overflow notice:
                 // clicking this exact row changes this exact call and leaves every sibling
                 // alone.
-                let head = format!(" {} {glyph} Tool · {icon} {name}", display.glyph());
+                let head = format!(" {} {glyph} Tool · {icon} {display_name}", display.glyph());
                 // The tool's wire name plus the argument that matters, which is the whole of
                 // §7.5. `title` is no longer preferred over the arguments: a completed
                 // `read` reported `Read diff.rs`, which names the kind of work and drops the
@@ -2545,7 +2602,7 @@ impl TranscriptView {
                     .map(|summary| summary.fit(room))
                     .filter(|summary| !summary.is_empty());
                 let identity = if has_summary {
-                    name.as_str()
+                    display_name
                 } else if let Some(title) = title.as_deref() {
                     title
                 } else if *status == ToolStatus::Pending {
@@ -3097,6 +3154,7 @@ fn fingerprint(message: &Message) -> u64 {
             MessagePart::Tool {
                 call_id,
                 name,
+                display_name,
                 arguments,
                 title,
                 status,
@@ -3107,6 +3165,7 @@ fn fingerprint(message: &Message) -> u64 {
                 2_u8.hash(&mut hasher);
                 call_id.hash(&mut hasher);
                 name.hash(&mut hasher);
+                display_name.hash(&mut hasher);
                 arguments.hash(&mut hasher);
                 title.hash(&mut hasher);
                 match status {

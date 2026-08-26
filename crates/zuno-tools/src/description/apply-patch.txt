@@ -1,4 +1,4 @@
-Use `apply_patch` for localized source edits and related multi-file changes. Put the exact patch envelope in `patchText`. Call this tool directly; never invoke `apply_patch` through `bash` or wrap it in a shell heredoc.
+Use `apply_patch` for localized source edits and related multi-file changes. Put the exact patch envelope in `patchText`. Call this tool directly; never invoke `apply_patch` through `shell` or wrap it in a shell heredoc.
 
 Selection:
 - Prefer this tool over a full-file rewrite for existing hand-edited files.

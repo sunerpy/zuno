@@ -54,7 +54,7 @@ fn decision(outcome: DialogOutcome) -> PermissionDecision {
 
 #[test]
 fn views_permission_prompt_resolves_to_once() {
-    let mut prompt = prompt("bash", json!({"command": "ls -la"}));
+    let mut prompt = prompt("shell", json!({"command": "ls -la"}));
     assert_eq!(prompt.highlighted(), ReplyKind::Once);
     let decision = decision(resolve(&mut prompt, &["dialog.select.submit"]));
     assert_eq!(
@@ -70,7 +70,7 @@ fn views_permission_prompt_resolves_to_once() {
 
 #[test]
 fn views_permission_prompt_uses_the_composer_unless_explicitly_expanded() {
-    let mut prompt = prompt("bash", json!({"command": "git status"}));
+    let mut prompt = prompt("shell", json!({"command": "git status"}));
     assert_eq!(prompt.placement(), DialogPlacement::Composer);
     assert_eq!(prompt.focused_scopes(), ["dialog.permission"]);
 
@@ -83,7 +83,7 @@ fn views_permission_prompt_uses_the_composer_unless_explicitly_expanded() {
 
 #[test]
 fn views_permission_prompt_can_be_decided_with_the_mouse() {
-    let mut prompt = prompt("bash", json!({"command": "ls -la"}));
+    let mut prompt = prompt("shell", json!({"command": "ls -la"}));
     let body = Rect::new(8, 4, 60, 12);
     let outcome = prompt.handle_mouse(
         &MouseEvent {
@@ -120,7 +120,7 @@ fn views_permission_prompt_resolves_to_always_after_confirming() {
 
 #[test]
 fn views_permission_manual_prompt_omits_always() {
-    let mut request = request("bash");
+    let mut request = request("shell");
     request.always.clear();
     let input = json!({"command": "git push"});
     let joined = render(
@@ -152,7 +152,7 @@ fn views_permission_prompt_resolves_to_reject() {
 fn views_permission_escape_rejects_rather_than_allowing() {
     // The highlighted option is `once`, and escape must not take it: a prompt
     // dismissed by accident cannot have granted anything.
-    let mut prompt = prompt("bash", json!({}));
+    let mut prompt = prompt("shell", json!({}));
     assert_eq!(prompt.highlighted(), ReplyKind::Once);
     let decision = decision(resolve(&mut prompt, &["app_exit"]));
     assert_eq!(decision.reply, ReplyKind::Reject);
@@ -175,14 +175,14 @@ fn views_permission_cancelling_the_always_confirmation_decides_nothing() {
 
 #[test]
 fn views_permission_reject_message_is_only_offered_in_a_child_session() {
-    let mut top_level = prompt("bash", json!({}));
+    let mut top_level = prompt("shell", json!({}));
     top_level.handle_action(action("dialog.select.end"), &key(KeyCode::End));
     assert!(matches!(
         top_level.handle_action(action("dialog.select.submit"), &key(KeyCode::Enter)),
         DialogStep::Resolved(_)
     ));
 
-    let mut child = prompt("bash", json!({})).with_reject_message(true);
+    let mut child = prompt("shell", json!({})).with_reject_message(true);
     child.handle_action(action("dialog.select.end"), &key(KeyCode::End));
     let step = child.handle_action(action("dialog.select.submit"), &key(KeyCode::Enter));
     assert_eq!(step, DialogStep::Redraw);
@@ -191,7 +191,7 @@ fn views_permission_reject_message_is_only_offered_in_a_child_session() {
 
 #[test]
 fn views_permission_reject_message_is_typed_and_carried() {
-    let mut prompt = prompt("bash", json!({})).with_reject_message(true);
+    let mut prompt = prompt("shell", json!({})).with_reject_message(true);
     prompt.handle_action(action("dialog.select.end"), &key(KeyCode::End));
     prompt.handle_action(action("dialog.select.submit"), &key(KeyCode::Enter));
     for character in "use read".chars() {
@@ -205,7 +205,7 @@ fn views_permission_reject_message_is_typed_and_carried() {
 
 #[test]
 fn views_permission_empty_reject_message_is_none_not_an_empty_string() {
-    let mut prompt = prompt("bash", json!({})).with_reject_message(true);
+    let mut prompt = prompt("shell", json!({})).with_reject_message(true);
     prompt.handle_action(action("dialog.select.end"), &key(KeyCode::End));
     prompt.handle_action(action("dialog.select.submit"), &key(KeyCode::Enter));
     let decision = decision(resolve(&mut prompt, &["dialog.prompt.submit"]));
@@ -267,7 +267,7 @@ fn render(prompt: PermissionPrompt, width: u16, height: u16) -> Vec<String> {
 
 #[test]
 fn views_permission_prompt_renders_offscreen() {
-    let rows = render(prompt("bash", json!({"command": "rm -rf build"})), 60, 20);
+    let rows = render(prompt("shell", json!({"command": "rm -rf build"})), 60, 20);
     let joined = rows.join("\n");
     assert!(
         joined.contains("Permission required"),
@@ -298,7 +298,7 @@ fn views_permission_prompt_highlights_the_cursor_from_the_palette() {
     let context = ViewContext::defaults();
     let base = ObservedBase::new(TranscriptView::new(context.clone()));
     let mut host = DialogHost::new(context.clone(), Box::new(base));
-    host.open(Box::new(prompt("bash", json!({}))));
+    host.open(Box::new(prompt("shell", json!({}))));
     let buffer = render_offscreen(&mut host, 60, 20).expect("infallible");
     let expected = ratatui::style::Color::from(context.palette().primary);
     let highlighted = (0..buffer.area.height)
@@ -328,14 +328,14 @@ fn views_permission_always_stage_lists_the_patterns_offscreen() {
 
 #[test]
 fn views_permission_always_stage_says_so_for_a_blanket_grant() {
-    let mut inner = request("bash");
+    let mut inner = request("shell");
     inner.always = vec![String::from("*")];
     let mut prompt = PermissionPrompt::new(ViewContext::defaults(), inner, &json!({}));
     prompt.handle_action(action("dialog.select.next"), &key(KeyCode::Down));
     prompt.handle_action(action("dialog.select.submit"), &key(KeyCode::Enter));
     let joined = render(prompt, 70, 12).join("\n");
     assert!(
-        joined.contains("This will allow bash until Zuno is restarted"),
+        joined.contains("This will allow shell until Zuno is restarted"),
         "a `*` grant rendered as a pattern list instead of as a blanket grant:\n{joined}"
     );
 }
@@ -363,7 +363,7 @@ fn views_permission_edit_renders_the_diff_it_is_approving() {
 
 #[test]
 fn views_permission_fullscreen_toggle_changes_the_requested_height() {
-    let mut prompt = prompt("bash", json!({}));
+    let mut prompt = prompt("shell", json!({}));
     assert!(!prompt.is_expanded());
     assert_eq!(
         prompt.desired_height(30, 40),
@@ -450,7 +450,7 @@ fn views_permission_describe_covers_every_oracle_branch() {
         ),
         ("grep", json!({"pattern": "TODO"}), "✱", "Grep \"TODO\""),
         ("list", json!({"path": "src"}), "→", "List src"),
-        ("bash", json!({"command": "ls"}), "#", "Shell command"),
+        ("shell", json!({"command": "ls"}), "#", "Shell command"),
         (
             "task",
             json!({"subagent_type": "explore", "description": "find it"}),
@@ -520,7 +520,7 @@ fn views_permission_external_directory_renders_a_non_empty_subject() {
 
 #[test]
 fn views_permission_footer_advertises_horizontal_selection_and_keeps_vertical_aliases() {
-    let mut prompt = prompt("bash", json!({"command": "true"}));
+    let mut prompt = prompt("shell", json!({"command": "true"}));
     assert!(
         prompt.hints().contains(&("←→", "select")),
         "the horizontal choice row must advertise Left/Right"

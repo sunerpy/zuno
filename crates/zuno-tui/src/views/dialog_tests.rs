@@ -990,7 +990,7 @@ fn views_dialog_a_reject_box_can_still_be_typed_into() {
             zuno_permission::PermissionRequest {
                 id: String::from("r"),
                 session_id: String::from("s"),
-                permission: String::from("bash"),
+                permission: String::from("shell"),
                 patterns: Vec::new(),
                 metadata: serde_json::Map::new(),
                 always: Vec::new(),
@@ -1197,7 +1197,7 @@ fn views_dialog_the_default_tier_is_large_and_the_two_reference_panels_are_xlarg
             zuno_permission::PermissionRequest {
                 id: String::from("r"),
                 session_id: String::from("s"),
-                permission: String::from("bash"),
+                permission: String::from("shell"),
                 patterns: Vec::new(),
                 metadata: serde_json::Map::new(),
                 always: Vec::new(),

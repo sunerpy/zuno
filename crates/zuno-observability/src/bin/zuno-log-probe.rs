@@ -100,21 +100,21 @@ fn main() -> ExitCode {
     }
 
     {
-        let tool_span = span::tool_call("bash", "toolu_probe");
+        let tool_span = span::tool_call("shell", "toolu_probe");
         let _tool_entered = tool_span.enter();
-        let mut call = ToolLifecycle::pending("bash", "toolu_probe");
+        let mut call = ToolLifecycle::pending("shell", "toolu_probe");
         call.running();
         call.completed();
 
-        let failing = ToolLifecycle::pending("bash", "toolu_probe_err");
+        let failing = ToolLifecycle::pending("shell", "toolu_probe_err");
         failing.failed(&ToolError::NotFound {
-            tool: "bash".to_owned(),
+            tool: "shell".to_owned(),
         });
 
-        let blocked = ToolLifecycle::pending("bash", "toolu_probe_blocked");
+        let blocked = ToolLifecycle::pending("shell", "toolu_probe_blocked");
         blocked.blocked("denied");
 
-        let _abandoned = ToolLifecycle::pending("bash", "toolu_probe_abandoned");
+        let _abandoned = ToolLifecycle::pending("shell", "toolu_probe_abandoned");
     }
 
     frame(r#"{"jsonrpc":"2.0","method":"probe/emitted","params":{"levels":5}}"#);

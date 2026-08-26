@@ -212,6 +212,7 @@ impl ToolDispatcher for FakeDispatcher {
         AvailableTools::new(
             vec![ToolDefinition {
                 id: "echo".to_owned(),
+                display_name: "echo-runtime".to_owned(),
                 description: "Echo text.".to_owned(),
                 parameters: json!({
                     "type": "object",
@@ -1398,6 +1399,13 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
             step: 1,
             event: StreamEvent::TextDelta("I will use echo.".to_owned()),
         },
+        TurnEvent::ToolCallStarted {
+            step: 1,
+            call_id: "call-1".to_owned(),
+            display_name: "echo-runtime".to_owned(),
+            name: "echo".to_owned(),
+            ui_intent: ToolUiIntent::Generic,
+        },
         TurnEvent::Provider {
             step: 1,
             event: StreamEvent::ToolUseStart {
@@ -1432,12 +1440,14 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
         TurnEvent::ToolDispatchStarted {
             step: 1,
             call_id: "call-1".to_owned(),
+            display_name: "echo-runtime".to_owned(),
             name: "echo".to_owned(),
             ui_intent: ToolUiIntent::Generic,
         },
         TurnEvent::ToolDispatchCompleted {
             step: 1,
             call_id: "call-1".to_owned(),
+            display_name: "echo-runtime".to_owned(),
             name: "echo".to_owned(),
             title: "echo".to_owned(),
             output: "hello".to_owned(),
@@ -2696,6 +2706,13 @@ async fn loop_reply_sorts_after_a_prompt_stamped_ahead_of_the_clock() {
         "each record must carry a strictly later stamp than the one before it, so the \
          order does not depend on which random id sorts first"
     );
+    let tool = hydrated[1]
+        .parts
+        .iter()
+        .find(|part| part.kind == PartKind::Tool)
+        .expect("first assistant tool part");
+    assert_eq!(tool.data["tool"], "echo");
+    assert_eq!(tool.data["displayName"], "echo-runtime");
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);

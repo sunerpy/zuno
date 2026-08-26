@@ -166,7 +166,7 @@ permission:
   lsp: allow
   webfetch: allow
   web_search: allow
-  bash: ask
+  shell: ask
 ---
 
 Inspect repository files, relevant environment facts, current external evidence,
@@ -187,7 +187,7 @@ collision checker. Extension agents with mode `subagent` or `all` join the real
 `task` target roster and retain their model, prompt, and native tool permissions
 inside the child session. File access comes from `read`/`glob`/`grep`/`lsp`/`edit`,
 network access from `webfetch`/`web_search`, and environment or ordinary process
-access from permission-governed `bash`. Strict authorization still applies fresh
+access from permission-governed `shell`. Strict authorization still applies fresh
 HITL to every side effect.
 
 Static packages may also register executable tools. Prefer an in-process WASI

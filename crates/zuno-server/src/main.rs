@@ -53,7 +53,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 zuno_paths::log(),
             ))
             .map_err(|error| format!("failed to initialize logging: {error}"))?;
-            let directory = std::env::current_dir()?.to_string_lossy().into_owned();
+            let directory_path = std::env::current_dir()?;
+            let directory = directory_path.to_string_lossy().into_owned();
+            let env = zuno_paths::Env::from_process();
+            let project = zuno_paths::project::resolve_project(&directory_path);
+            let harness_config = zuno_config::discovery::discover_with(
+                &zuno_config::discovery::DiscoveryOptions::for_project(
+                    &directory_path,
+                    &project,
+                    env,
+                ),
+            )?;
+            zuno_pty::shells::preferred(harness_config.shell.as_deref())?;
             // One pool backs both surfaces: the `/api` handlers and the event
             // stream's durable sequence must see the same database, or a cursor
             // would resume against rows the API never wrote.
@@ -64,7 +75,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .with_port(port)
                 .with_auth(AuthConfig::from_env())
                 .with_default_directory(&directory);
-            let state = ApiState::open_default(directory)?.with_events(events.clone());
+            let state = ApiState::open_default(directory)?
+                .with_configured_shell(harness_config.shell.clone())
+                .with_events(events.clone());
             let server = ServerBuilder::new(config)
                 .with_routes(api::router(state.clone()).merge(events_router(events)))
                 .bind()

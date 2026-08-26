@@ -292,7 +292,7 @@ filesystem for a named skill. The first completed tool call was:
 }
 ```
 
-Only after it completed did the model invoke `bash`. The model used the source
+Only after it completed did the model invoke `shell`. The model used the source
 advertised in `skills.index` directly.
 
 ## Historical source-reconstructed Responses request

@@ -242,15 +242,16 @@ fn permission_mode_defaults_to_standard_and_legacy_authorization_is_rejected() {
 
 #[test]
 fn canonical_permission_modes_keep_ordered_rules_and_allow_all() {
-    let config = parse(r#"{"permission":{"mode":"strict","rules":{"bash":"ask","read":"allow"}}}"#)
-        .expect("canonical permission policy parses");
+    let config =
+        parse(r#"{"permission":{"mode":"strict","rules":{"shell":"ask","read":"allow"}}}"#)
+            .expect("canonical permission policy parses");
     assert_eq!(config.permission_mode(), PermissionMode::Strict);
     let policy = config
         .permission
         .expect("canonical permission policy was not retained");
     assert_eq!(
         policy.rules.iter().map(|(key, _)| key).collect::<Vec<_>>(),
-        vec!["bash", "read"]
+        vec!["shell", "read"]
     );
 
     let allow_all = parse(r#"{"permission":{"mode":"allow_all"}}"#)
@@ -651,7 +652,7 @@ fn agent_orchestration_fields_are_structured_and_validated() {
             "implementer": {
                 "model": "myopenai/gpt-5.6-sol",
                 "reasoning": "max",
-                "tools": ["read", "edit", "bash"],
+                "tools": ["read", "edit", "shell"],
                 "delegates": ["researcher"]
             }
         },
@@ -889,12 +890,12 @@ fn unknown_provider_options_are_kept_for_the_sdk() {
 fn permission_keeps_the_authors_key_order() {
     // Rule precedence follows the order authored inside `permission.rules`.
     let config = parse(
-        r#"{"permission":{"rules":{"zebra":"deny","bash":"ask","alpha":"allow","read":"allow"}}}"#,
+        r#"{"permission":{"rules":{"zebra":"deny","shell":"ask","alpha":"allow","read":"allow"}}}"#,
     )
     .expect("deserializes");
     let rules = &config.permission.as_ref().expect("permission").rules;
     let keys: Vec<&str> = rules.iter().map(|(key, _)| key).collect();
-    assert_eq!(keys, vec!["zebra", "bash", "alpha", "read"]);
+    assert_eq!(keys, vec!["zebra", "shell", "alpha", "read"]);
 }
 
 #[test]
@@ -939,9 +940,9 @@ fn action_only_permissions_reject_per_pattern_rules() {
     assert_eq!(issue_path(&error), "permission.rules.webfetch");
     assert!(issue_detail(&error).contains("webfetch"));
     parse_value(json!({
-        "permission": { "rules": { "bash": { "git push": "ask" } } }
+        "permission": { "rules": { "shell": { "git push": "ask" } } }
     }))
-    .expect("bash does take per-pattern rules");
+    .expect("shell does take per-pattern rules");
 }
 
 #[test]

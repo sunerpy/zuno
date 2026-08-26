@@ -100,7 +100,7 @@ The real runtime, not only test fixtures, opens:
 Provider diagnostics record typed outcome/status metadata, not request or
 response bodies. The destructive-command risk gate records verdict, shell
 syntax, and command byte length, never the command itself. Its verdicts are
-`run`, `confirm`, and `deny`; `confirm` means the existing `bash` permission
+`run`, `confirm`, and `deny`; `confirm` means the existing `shell` permission
 request was upgraded to a fresh attached-user decision, not that the model
 should retry with different arguments. A TUI interruption request records the
 session id and whether it fired a live turn; it never records prompt, model

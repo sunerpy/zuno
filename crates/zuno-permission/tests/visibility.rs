@@ -17,7 +17,7 @@ use zuno_permission::{
 
 /// Every builtin tool name the model can be offered, plus the MCP resource trio.
 const TOOL_LIST: [&str; 18] = [
-    "bash",
+    "shell",
     "edit",
     "write",
     "apply_patch",
@@ -74,11 +74,11 @@ fn request(permission: &str, patterns: &[&str]) -> PermissionRequest {
 
 #[test]
 fn visibility_a_denied_tool_is_absent_from_the_resolved_tool_list() {
-    let visible = resolved_tools(r#"{"bash": "deny"}"#);
+    let visible = resolved_tools(r#"{"shell": "deny"}"#);
 
     assert!(
-        !visible.contains(&"bash"),
-        "bash must not be advertised: {visible:?}"
+        !visible.contains(&"shell"),
+        "shell must not be advertised: {visible:?}"
     );
     assert!(visible.contains(&"read"), "unrelated tools stay visible");
     assert_eq!(visible.len(), TOOL_LIST.len() - 1);
@@ -133,8 +133,8 @@ fn visibility_alias_keys_cover_exactly_the_oracle_groups() {
         assert_eq!(permission_key(tool), "read");
     }
     assert_eq!(
-        permission_key("bash"),
-        "bash",
+        permission_key("shell"),
+        "shell",
         "unaliased tools own their key"
     );
     assert_eq!(
@@ -149,61 +149,61 @@ fn visibility_alias_keys_cover_exactly_the_oracle_groups() {
 
 #[test]
 fn visibility_a_narrower_deny_pattern_keeps_the_tool_visible_and_refuses_only_matches() {
-    let ruleset = rules(r#"{"bash": {"rm *": "deny"}}"#);
+    let ruleset = rules(r#"{"shell": {"rm *": "deny"}}"#);
     let visible = visible_tools(TOOL_LIST, &ruleset, |tool| *tool);
 
     assert!(
-        visible.contains(&"bash"),
+        visible.contains(&"shell"),
         "a pattern-scoped deny is not a hide: {visible:?}"
     );
 
     let mut engine = PermissionEngine::new();
     let error = engine
-        .authorize(request("bash", &["rm -rf /tmp/build"]), &ruleset)
+        .authorize(request("shell", &["rm -rf /tmp/build"]), &ruleset)
         .expect_err("a matching invocation is refused at call time");
-    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "bash"));
+    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
 
     let authorization = engine
-        .authorize(request("bash", &["git status"]), &ruleset)
+        .authorize(request("shell", &["git status"]), &ruleset)
         .expect("a non-matching invocation is not refused");
     assert_eq!(authorization, Authorization::Pending);
 }
 
 #[test]
 fn visibility_an_ask_rule_never_hides_a_tool() {
-    let visible = resolved_tools(r#"{"bash": "ask", "edit": "ask"}"#);
+    let visible = resolved_tools(r#"{"shell": "ask", "edit": "ask"}"#);
 
-    assert!(visible.contains(&"bash"));
+    assert!(visible.contains(&"shell"));
     assert!(visible.contains(&"edit"));
     assert_eq!(visible.len(), TOOL_LIST.len());
 }
 
 #[test]
 fn visibility_a_specific_allow_after_a_wildcard_deny_keeps_the_tool_visible() {
-    let ruleset = rules(r#"{"bash": {"*": "deny", "echo *": "allow"}}"#);
+    let ruleset = rules(r#"{"shell": {"*": "deny", "echo *": "allow"}}"#);
 
     assert!(
-        is_tool_visible("bash", &ruleset),
-        "echo is still reachable, so bash must be advertised"
+        is_tool_visible("shell", &ruleset),
+        "echo is still reachable, so shell must be advertised"
     );
     assert_eq!(
-        evaluate("bash", "rm -rf /", &ruleset),
+        evaluate("shell", "rm -rf /", &ruleset),
         PermissionAction::Deny,
         "the wildcard deny still refuses other commands"
     );
     assert_eq!(
-        evaluate("bash", "echo hi", &ruleset),
+        evaluate("shell", "echo hi", &ruleset),
         PermissionAction::Allow
     );
 }
 
 #[test]
 fn visibility_a_wildcard_allow_after_a_narrow_deny_keeps_the_tool_visible() {
-    let ruleset = rules(r#"{"bash": {"rm *": "deny", "*": "allow"}}"#);
+    let ruleset = rules(r#"{"shell": {"rm *": "deny", "*": "allow"}}"#);
 
-    assert!(is_tool_visible("bash", &ruleset));
+    assert!(is_tool_visible("shell", &ruleset));
     assert_eq!(
-        evaluate("bash", "rm -rf /", &ruleset),
+        evaluate("shell", "rm -rf /", &ruleset),
         PermissionAction::Allow
     );
 }
@@ -228,14 +228,14 @@ fn visibility_a_wildcard_key_deny_hides_every_tool() {
 
 #[test]
 fn visibility_a_later_specific_allow_survives_an_earlier_wildcard_key_deny() {
-    let visible = resolved_tools(r#"{"*": "deny", "bash": "allow"}"#);
+    let visible = resolved_tools(r#"{"*": "deny", "shell": "allow"}"#);
 
-    assert_eq!(visible, vec!["bash"]);
+    assert_eq!(visible, vec!["shell"]);
 }
 
 #[test]
 fn visibility_an_earlier_specific_allow_loses_to_a_later_wildcard_key_deny() {
-    let visible = resolved_tools(r#"{"bash": "allow", "*": "deny"}"#);
+    let visible = resolved_tools(r#"{"shell": "allow", "*": "deny"}"#);
 
     assert!(
         visible.is_empty(),
@@ -299,18 +299,18 @@ fn visibility_an_agent_deny_still_hides_when_the_session_says_nothing() {
 
 #[test]
 fn visibility_a_session_deny_hides_a_tool_the_agent_allowed() {
-    let agent = rules(r#"{"bash": "allow"}"#);
-    let session = rules(r#"{"bash": "deny"}"#);
+    let agent = rules(r#"{"shell": "allow"}"#);
+    let session = rules(r#"{"shell": "deny"}"#);
 
     let merged = merge_agent_session(&agent, &session);
 
-    assert!(is_tool_hidden("bash", &merged));
+    assert!(is_tool_hidden("shell", &merged));
 }
 
 #[test]
 fn visibility_merge_rulesets_concatenates_in_argument_order() {
-    let first = [rule("bash", "*", PermissionAction::Allow)];
-    let second = [rule("bash", "rm *", PermissionAction::Deny)];
+    let first = [rule("shell", "*", PermissionAction::Allow)];
+    let second = [rule("shell", "rm *", PermissionAction::Deny)];
     let third = [rule("edit", "*", PermissionAction::Ask)];
 
     let merged = merge_rulesets(&[&first, &second, &third]);
@@ -329,7 +329,7 @@ fn visibility_merge_rulesets_concatenates_in_argument_order() {
 #[test]
 fn visibility_a_plan_style_agent_exposes_no_write_capable_tools() {
     let agent = rules(
-        r#"{"edit":"deny","plan_update":"deny","todo_update":"deny","bash":{"*":"deny","git status":"allow"}}"#,
+        r#"{"edit":"deny","plan_update":"deny","todo_update":"deny","shell":{"*":"deny","git status":"allow"}}"#,
     );
 
     let visible = visible_tools(TOOL_LIST, &agent, |tool| *tool);
@@ -337,7 +337,7 @@ fn visibility_a_plan_style_agent_exposes_no_write_capable_tools() {
     assert_eq!(
         visible,
         vec![
-            "bash",
+            "shell",
             "read",
             "grep",
             "glob",
@@ -357,9 +357,9 @@ fn visibility_a_plan_style_agent_exposes_no_write_capable_tools() {
         assert!(!visible.contains(&tool), "{tool} must be hidden");
     }
     assert_eq!(
-        evaluate("bash", "rm -rf /", &agent),
+        evaluate("shell", "rm -rf /", &agent),
         PermissionAction::Deny,
-        "bash stays visible because `git status` is reachable, and is still refused otherwise"
+        "shell stays visible because `git status` is reachable, and is still refused otherwise"
     );
 }
 
@@ -377,7 +377,7 @@ struct ToolDef {
 fn visibility_visible_tools_filters_records_and_preserves_order() {
     let defs = vec![
         ToolDef {
-            id: "bash".to_owned(),
+            id: "shell".to_owned(),
             description: "run a command".to_owned(),
         },
         ToolDef {
@@ -398,7 +398,7 @@ fn visibility_visible_tools_filters_records_and_preserves_order() {
             .iter()
             .map(|def| def.id.as_str())
             .collect::<Vec<_>>(),
-        ["bash", "read"]
+        ["shell", "read"]
     );
 }
 
@@ -420,11 +420,11 @@ fn visibility_an_empty_ruleset_hides_nothing() {
 
 #[test]
 fn visibility_disabled_tools_reports_every_hidden_name() {
-    let hidden = disabled_tools(TOOL_LIST, &rules(r#"{"edit": "deny", "bash": "deny"}"#));
+    let hidden = disabled_tools(TOOL_LIST, &rules(r#"{"edit": "deny", "shell": "deny"}"#));
 
     assert_eq!(
         hidden.iter().map(String::as_str).collect::<Vec<_>>(),
-        ["apply_patch", "bash", "edit", "write"]
+        ["apply_patch", "edit", "shell", "write"]
     );
 }
 
@@ -456,15 +456,15 @@ proptest! {
         let ruleset: Vec<_> = specs
             .iter()
             .map(|(permission, pattern, action)| {
-                let permission = ["bash", "b*", "*", "edit"][*permission];
+                let permission = ["shell", "s*", "*", "edit"][*permission];
                 let pattern = ["*", "rm *", "git status"][*pattern];
                 rule(permission, pattern, *action)
             })
             .collect();
 
-        if is_tool_hidden("bash", &ruleset) {
+        if is_tool_hidden("shell", &ruleset) {
             prop_assert_eq!(
-                evaluate("bash", &input, &ruleset),
+                evaluate("shell", &input, &ruleset),
                 PermissionAction::Deny,
                 "a hidden tool must be unreachable for input {:?}",
                 input

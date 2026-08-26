@@ -202,8 +202,8 @@ mod tests {
         let store = ToolOutputStore::new(dir.path());
         let text = "line\n".repeat(5_000);
 
-        let stored = store.persist("bash", "ses_abc", &text).expect("persist");
-        let back = store.read("bash", &stored.path).expect("read");
+        let stored = store.persist("shell", "ses_abc", &text).expect("persist");
+        let back = store.read("shell", &stored.path).expect("read");
 
         assert_eq!(back, text, "the full text must survive byte for byte");
         assert_eq!(stored.bytes, text.len());
@@ -216,7 +216,7 @@ mod tests {
         let root = dir.path().join("nested").join("tool-output");
         let store = ToolOutputStore::new(&root);
 
-        let stored = store.persist("bash", "ses_abc", "hi").expect("persist");
+        let stored = store.persist("shell", "ses_abc", "hi").expect("persist");
 
         assert!(stored.path.starts_with(&root));
         assert!(root.is_dir());
@@ -237,7 +237,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = ToolOutputStore::new(dir.path());
 
-        let stored = store.persist("bash", "ses_abc123", "hi").expect("persist");
+        let stored = store.persist("shell", "ses_abc123", "hi").expect("persist");
 
         assert_eq!(
             session_of(&stored.path),
@@ -267,7 +267,7 @@ mod tests {
         let store = ToolOutputStore::new(dir.path());
 
         let stored = store
-            .persist("bash", "../../etc/ses_x", "hi")
+            .persist("shell", "../../etc/ses_x", "hi")
             .expect("persist");
 
         assert_eq!(
@@ -283,12 +283,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = ToolOutputStore::new(dir.path());
 
-        let first = store.persist("bash", "ses_abc", "one").expect("first");
-        let second = store.persist("bash", "ses_abc", "two").expect("second");
+        let first = store.persist("shell", "ses_abc", "one").expect("first");
+        let second = store.persist("shell", "ses_abc", "two").expect("second");
 
         assert_ne!(first.path, second.path);
-        assert_eq!(store.read("bash", &first.path).expect("read"), "one");
-        assert_eq!(store.read("bash", &second.path).expect("read"), "two");
+        assert_eq!(store.read("shell", &first.path).expect("read"), "one");
+        assert_eq!(store.read("shell", &second.path).expect("read"), "two");
     }
 
     #[test]
@@ -297,11 +297,11 @@ mod tests {
         let store = ToolOutputStore::new(dir.path());
         std::fs::write(dir.path().join("unrelated.txt"), "x").expect("write");
 
-        let first = store.persist("bash", "ses_a", "one").expect("first");
-        let second = store.persist("bash", "ses_a", "two").expect("second");
+        let first = store.persist("shell", "ses_a", "one").expect("first");
+        let second = store.persist("shell", "ses_a", "two").expect("second");
 
         assert_eq!(
-            store.entries("bash").expect("entries"),
+            store.entries("shell").expect("entries"),
             vec![first.path, second.path]
         );
     }
@@ -311,7 +311,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = ToolOutputStore::new(dir.path().join("absent"));
 
-        assert!(store.entries("bash").expect("entries").is_empty());
+        assert!(store.entries("shell").expect("entries").is_empty());
     }
 
     #[test]
@@ -320,10 +320,10 @@ mod tests {
         let store = ToolOutputStore::new(dir.path());
 
         let error = store
-            .read("bash", &dir.path().join("tool_missing_0"))
+            .read("shell", &dir.path().join("tool_missing_0"))
             .expect_err("absent file");
 
-        assert_eq!(error.tool(), "bash");
+        assert_eq!(error.tool(), "shell");
         assert!(matches!(error, ToolError::Failed { .. }));
     }
 }

@@ -17,7 +17,7 @@
 //! |---|---|
 //! | plain scalar (`mode: subagent`) | `agent/dq.md` family |
 //! | double- and single-quoted scalars | `mode: "subagent"`, `mode: 'subagent'` |
-//! | nested block map (`permission.rules:` then indented keys) | emitted `edit`/`bash` rules |
+//! | nested block map (`permission.rules:` then indented keys) | emitted `edit`/`shell` rules |
 //! | flow map (`permission: { mode: standard, rules: {...} }`) | emitted the same policy |
 //! | block scalar (`description: \|`) | agent loaded, `mode` after it still read |
 //! | comments and blank lines inside the head | agent loaded |
@@ -997,14 +997,14 @@ mod tests {
 
     #[test]
     fn a_nested_block_map_becomes_a_nested_object() {
-        let text = "---\nmode: subagent\npermission:\n  mode: standard\n  rules:\n    edit: deny\n    bash:\n      \"git push\": ask\n---\nbody\n";
+        let text = "---\nmode: subagent\npermission:\n  mode: standard\n  rules:\n    edit: deny\n    shell:\n      \"git push\": ask\n---\nbody\n";
         assert_eq!(
             data(text),
             json!({
                 "mode": "subagent",
                 "permission": {
                     "mode": "standard",
-                    "rules": { "edit": "deny", "bash": { "git push": "ask" } },
+                    "rules": { "edit": "deny", "shell": { "git push": "ask" } },
                 },
             })
         );

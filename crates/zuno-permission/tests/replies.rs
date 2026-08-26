@@ -16,7 +16,7 @@ fn request(id: &str, session_id: &str) -> PermissionRequest {
     PermissionRequest {
         id: id.to_owned(),
         session_id: session_id.to_owned(),
-        permission: "bash".to_owned(),
+        permission: "shell".to_owned(),
         patterns: vec!["git push".to_owned()],
         metadata: serde_json::Map::new(),
         always: vec!["git *".to_owned()],
@@ -27,13 +27,13 @@ fn request(id: &str, session_id: &str) -> PermissionRequest {
 #[test]
 fn deny_returns_a_typed_error_without_creating_a_pending() {
     let mut engine = PermissionEngine::new();
-    let rules = [rule("bash", "*", PermissionAction::Deny)];
+    let rules = [rule("shell", "*", PermissionAction::Deny)];
 
     let error = engine
         .authorize(request("per_deny", "ses_a"), &rules)
         .expect_err("deny must stop authorization");
 
-    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "bash"));
+    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
     assert!(engine.pending().is_empty());
 }
 
@@ -43,22 +43,22 @@ fn later_denied_pattern_prevents_an_earlier_ask_from_becoming_pending() {
     let mut input = request("per_deny_after_ask", "ses_a");
     input.patterns.push("rm -rf /tmp/build".to_owned());
     let rules = [
-        rule("bash", "git *", PermissionAction::Ask),
-        rule("bash", "rm *", PermissionAction::Deny),
+        rule("shell", "git *", PermissionAction::Ask),
+        rule("shell", "rm *", PermissionAction::Deny),
     ];
 
     let error = engine
         .authorize(input, &rules)
         .expect_err("a deny on any pattern must stop authorization");
 
-    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "bash"));
+    assert!(matches!(error, ToolError::Denied { ref tool } if tool == "shell"));
     assert!(engine.pending().is_empty());
 }
 
 #[test]
 fn all_allowed_patterns_authorize_without_creating_a_pending() {
     let mut engine = PermissionEngine::new();
-    let rules = [rule("bash", "*", PermissionAction::Allow)];
+    let rules = [rule("shell", "*", PermissionAction::Allow)];
 
     let outcome = engine
         .authorize(request("per_allow", "ses_a"), &rules)
@@ -74,8 +74,8 @@ fn any_ask_pattern_creates_one_pending_request() {
     let mut input = request("per_ask", "ses_a");
     input.patterns.push("cargo test".to_owned());
     let rules = [
-        rule("bash", "git *", PermissionAction::Allow),
-        rule("bash", "*", PermissionAction::Ask),
+        rule("shell", "git *", PermissionAction::Allow),
+        rule("shell", "*", PermissionAction::Ask),
     ];
 
     let outcome = engine
@@ -201,7 +201,7 @@ fn always_clears_exactly_covered_same_session_pendings() {
     );
     assert_eq!(
         outcome.installed_rules,
-        [rule("bash", "git *", PermissionAction::Allow)]
+        [rule("shell", "git *", PermissionAction::Allow)]
     );
     assert_eq!(engine.approved_rules(), outcome.installed_rules);
 }
@@ -209,7 +209,7 @@ fn always_clears_exactly_covered_same_session_pendings() {
 #[test]
 fn always_rules_override_supplied_rules_for_subsequent_requests() {
     let mut engine = PermissionEngine::new();
-    let ask = [rule("bash", "*", PermissionAction::Ask)];
+    let ask = [rule("shell", "*", PermissionAction::Ask)];
     engine
         .authorize(request("per_target", "ses_a"), &ask)
         .expect("ask creates a pending");

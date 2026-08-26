@@ -543,12 +543,12 @@ mod tests {
         ctx.permission = Arc::new(DenyAll);
 
         let error = ctx
-            .ask("bash", PermissionAsk::new("bash", "rm -rf /"))
+            .ask("shell", PermissionAsk::new("shell", "rm -rf /"))
             .await
             .expect_err("DenyAll must refuse");
 
         assert!(matches!(error, ToolError::Denied { .. }));
-        assert_eq!(error.tool(), "bash");
+        assert_eq!(error.tool(), "shell");
         assert!(!error.is_retryable());
         assert!(!error.is_model_correctable());
     }
@@ -568,7 +568,7 @@ mod tests {
         ctx.message_id = String::from("msg_forged");
         ctx.call_id = String::from("call_forged");
 
-        ctx.ask("bash", PermissionAsk::new("bash", "pwd"))
+        ctx.ask("shell", PermissionAsk::new("shell", "pwd"))
             .await
             .expect("the recording asker allows");
 

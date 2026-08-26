@@ -95,7 +95,7 @@ impl BuiltinSlot {
         match self {
             Self::Invalid => "invalid",
             Self::Question => "question",
-            Self::Shell => "bash",
+            Self::Shell => "shell",
             Self::Background => "bg",
             Self::Read => "read",
             Self::Glob => "glob",
@@ -623,7 +623,6 @@ pub(crate) fn canonical_tool_name(name: &str) -> &str {
     match name {
         "communicate" | "task_runner" | "subagent" | "Agent" | "Task" => "task",
         "launch" => "open",
-        "shell" | "shell_exec" | "Bash" => "bash",
         "read_file" | "file_read" | "Read" => "read",
         "write_file" | "file_write" | "Write" => "write",
         "edit_file" | "file_edit" | "Edit" => "edit",

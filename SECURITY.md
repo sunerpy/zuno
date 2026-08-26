@@ -54,7 +54,7 @@ credentials. That makes the following interesting, and all of it in scope:
 ## What is not in scope
 
 - A tool doing exactly what an explicitly granted permission allows. Granting
-  `bash: allow` permits arbitrary commands by design; that is a configuration
+  `shell: allow` permits arbitrary commands by design; that is a configuration
   choice, not a vulnerability.
 - Behaviour that requires an attacker who already has local code execution as the
   same user, or write access to the user's Zuno configuration.

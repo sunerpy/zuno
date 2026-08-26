@@ -143,7 +143,7 @@ is `subagent` or `all` join the exact `task` target roster and retain their
 configured model, variant, prompt, and permissions in the child turn. File,
 network, and environment access comes through the same native tools and
 permission rules as built-in agents: `read`/`glob`/`grep`/`lsp`, `edit`,
-`webfetch`/`web_search`, and `bash`. `bash` inherits the Zuno process
+`webfetch`/`web_search`, and `shell`. `shell` inherits the Zuno process
 environment and host visibility and therefore remains a side-effecting,
 approval-governed capability. A workflow that requires one custom agent
 explicitly calls `task` with that `subagent_type`.
@@ -506,7 +506,7 @@ resource deny still wins.
 
 The shell's destructive-command gate is independent of strict mode. A protected
 target is denied, while a bounded deletion, a dynamic destructive target, or a
-redirect that would replace an existing path marks the ordinary `bash`
+redirect that would replace an existing path marks the ordinary `shell`
 permission request as human-only. Permission rules still evaluate first, so an
 explicit deny remains terminal; a model-authored argument cannot approve its own
 operation. A new static redirect target inside the working directory or the OS
@@ -514,7 +514,7 @@ temporary directory is creation rather than overwrite and does not receive this
 extra risk prompt. An exact, non-recursive forced removal of a statically named
 path that is currently absent below the OS temporary directory is likewise a
 no-op cleanup; existing targets, recursive removal, and dynamic targets remain
-human-only. The filesystem probe is advisory and does not turn `bash` into a
+human-only. The filesystem probe is advisory and does not turn `shell` into a
 sandbox.
 
 Refusal is a typed lifecycle outcome rather than an execution failure.
@@ -610,7 +610,7 @@ ripgrep-compatible walker. `rg` major version 14 or newer must be available on
 `PATH` (or packaged beside Zuno by a distributor). Missing or unsupported
 ripgrep is a startup error for the tool runtime, never a silent fallback.
 
-The `bash` tool is not an OS sandbox. Its tree-sitter command analysis,
+The Shell tool is not an OS sandbox. Its tree-sitter command analysis,
 deterministic destructive-command gate, permission checks, process-tree
 containment, working directory, and time limits reduce accidental execution
 risk, but the child still inherits the Zuno process's filesystem, network, and
@@ -619,6 +619,25 @@ operations require a fresh attached-user decision; static creation under the
 working directory or OS temporary directory and exact non-recursive `rm -f`
 cleanup of an absent OS-temporary path do not. Strict authorization adds HITL to
 every side-effecting shell call; neither mechanism adds confinement.
+
+`config.shell` is passed into the same resolver used by non-interactive command
+execution. Selection is explicit configuration, then the operating-system account
+shell, then inherited `SHELL`, then the platform fallback. An invalid explicit value
+is a configuration error rather than a silent fallback. Durable tool output records
+the resolved interpreter name, so clients render `zsh cargo test` or `pwsh ...`
+instead of presenting the provider-facing `shell` wire id as the executable.
+
+Terminal selection and model-command admission intentionally diverge after path
+resolution. A PTY may start any executable login shell. A model command may start only
+a POSIX shell or PowerShell because those are the syntax families the permission and
+risk gates understand. Fish, Nushell, unknown interpreters, and `cmd.exe` fail closed;
+they are not treated as Bash-compatible aliases.
+
+Read-only Agents still do not receive this tool. A complete OS sandbox requires a
+typed authority snapshot, backend capability validation, policy compilation, and
+platform enforcement; a bwrap command prefix alone is insufficient. The
+fail-closed design and registration gate are recorded in
+[Shell sandbox roadmap](design/shell-sandbox-roadmap.md).
 
 ## Resident process containment
 
@@ -641,7 +660,7 @@ Codex comparison and the split ownership decision are recorded in
 
 ## Background command execution
 
-`bash` registers a command with the process-owned
+`shell` registers a command with the process-owned
 `BackgroundExecutionService` before spawning it. Explicit background mode and a
 foreground attention timeout therefore retain one execution identity and one
 process tree; neither path adopts a detached task or starts a second command.
@@ -656,7 +675,7 @@ Durable commands keep a bounded 2 MiB live tail, persist complete output
 separately, and record status under `.zuno/background`. The service retains at
 most 32 terminal commands per workspace and removes the oldest row together with
 its `.status.json` and `.output` files. Running commands are never evicted.
-Consequently ordinary `bash` calls no longer accumulate files, while `/ps`,
+Consequently ordinary `shell` calls no longer accumulate files, while `/ps`,
 `bg`, and restart reconciliation keep the state they actually require. Other
 tools such as `read`, `grep`, `glob`, and web search never use this directory.
 Because the product is still pre-release, terminal rows written by the old

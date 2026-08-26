@@ -32,6 +32,12 @@ which = { workspace = true }
 # `crypto.randomUUID()` (`core/src/pty/ticket.ts:41`).
 uuid = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# `User::from_uid` wraps the thread-safe `getpwuid_r` account lookup without
+# introducing first-party `unsafe` code. This sees NSS-backed users that are not
+# necessarily materialized in `/etc/passwd`.
+nix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

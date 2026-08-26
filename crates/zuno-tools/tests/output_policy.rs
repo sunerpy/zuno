@@ -34,7 +34,7 @@ fn output_policy_refuses_oversized_output_after_persisting_every_byte() {
 
     let error = policy
         .apply(
-            "bash",
+            "shell",
             "ses_output_policy",
             ToolOutput::text("large", full),
             false,
@@ -48,7 +48,7 @@ fn output_policy_refuses_oversized_output_after_persisting_every_byte() {
     assert_eq!(refusal.measurement.lines, 3);
     assert_eq!(
         store
-            .read("bash", &refusal.output_path)
+            .read("shell", &refusal.output_path)
             .expect("persisted full output"),
         full
     );
@@ -72,7 +72,7 @@ fn output_policy_explicit_acceptance_returns_the_complete_output() {
 
     let output = policy
         .apply(
-            "bash",
+            "shell",
             "ses_output_policy",
             ToolOutput::text("large", full),
             true,
@@ -86,7 +86,7 @@ fn output_policy_explicit_acceptance_returns_the_complete_output() {
     let path = paths.first().expect("retrieval path");
     assert_eq!(
         store
-            .read("bash", std::path::Path::new(path))
+            .read("shell", std::path::Path::new(path))
             .expect("persisted full output"),
         full
     );
@@ -100,7 +100,7 @@ fn output_policy_leaves_output_within_limits_unstored_and_unchanged() {
 
     let output = policy
         .apply(
-            "bash",
+            "shell",
             "ses_output_policy",
             ToolOutput::text("small", "four"),
             false,
@@ -109,7 +109,7 @@ fn output_policy_leaves_output_within_limits_unstored_and_unchanged() {
 
     assert_eq!(output.output, "four");
     assert!(output.output_paths().is_empty());
-    assert!(store.entries("bash").expect("store entries").is_empty());
+    assert!(store.entries("shell").expect("store entries").is_empty());
 }
 
 #[cfg(unix)]

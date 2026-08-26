@@ -209,7 +209,7 @@ fn views_every_action_a_view_names_exists_in_the_shipped_table() {
     //
     // Only match arms *inside* an action handler are inspected. A tool name and an
     // action name are both snake_case strings in a match arm, so a whole-file scan
-    // would report `"bash" =>` in the tool-icon table as an unknown action.
+    // would report `"shell" =>` in the tool-icon table as an unknown action.
     let files = source_files();
     let mut checked = 0;
     let mut unknown = Vec::new();
@@ -409,7 +409,7 @@ fn views_a_permission_prompt_over_a_live_session_resolves_without_disturbing_it(
         zuno_permission::PermissionRequest {
             id: String::from("r"),
             session_id: String::from("s"),
-            permission: String::from("bash"),
+            permission: String::from("shell"),
             patterns: Vec::new(),
             metadata: serde_json::Map::new(),
             always: Vec::new(),

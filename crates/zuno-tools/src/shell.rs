@@ -17,14 +17,14 @@ use tree_sitter::{Node, Parser};
 use zuno_error::ToolError;
 use zuno_pty::{
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionRetention,
-    BackgroundExecutionService, BackgroundExecutionStatus,
+    BackgroundExecutionService, BackgroundExecutionStatus, CommandShell, CommandShellKind,
 };
 use zuno_tool::{OutputLimits, PermissionAsk, Tool, ToolContext, ToolOutput, ToolOutputStore};
 
-const TOOL_ID: &str = "bash";
+const TOOL_ID: &str = "shell";
 const BACKGROUND_DIRECTORY: &str = "background";
 /// The description the model reads.
-pub const DESCRIPTION: &str = include_str!("description/bash.txt");
+pub const DESCRIPTION: &str = include_str!("description/shell.txt");
 
 const CWD_COMMANDS: &[&str] = &[
     "cd",
@@ -117,22 +117,9 @@ impl ShellEnvHook for NoopShellEnv {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShellKind {
-    Posix,
-    PowerShell,
-    Cmd,
-}
-
-#[derive(Debug, Clone)]
-struct SelectedShell {
-    path: PathBuf,
-    kind: ShellKind,
-}
-
 pub struct ShellTool {
     workspace: PathBuf,
-    shell: SelectedShell,
+    shell: CommandShell,
     env_hook: Arc<dyn ShellEnvHook>,
     output_store: ToolOutputStore,
     output_limits: OutputLimits,
@@ -145,9 +132,9 @@ impl ShellTool {
         Self::with_configured_shell(workspace, None)
     }
 
-    pub fn with_configured_shell(workspace: &Path, configured: Option<&Path>) -> io::Result<Self> {
+    pub fn with_configured_shell(workspace: &Path, configured: Option<&str>) -> io::Result<Self> {
         let workspace = workspace.canonicalize()?;
-        let shell = discover_shell(configured)?;
+        let shell = zuno_pty::shells::command(configured)?;
         let output_store = ToolOutputStore::new(
             workspace
                 .join(zuno_paths::PROJECT_DIRECTORY)
@@ -265,7 +252,10 @@ impl ShellTool {
             .map_err(failed)?;
 
         if params.background {
-            return Ok(background_started_output(command, &execution));
+            return Ok(background_started_output(
+                self.display_command(&command),
+                &execution,
+            ));
         }
 
         let foreground_timeout = Duration::from_millis(foreground_timeout_ms);
@@ -293,7 +283,7 @@ impl ShellTool {
                 .promote(&execution.id)
                 .map_err(failed)?;
             return Ok(timeout_promoted_output(
-                command,
+                self.display_command(&command),
                 foreground_timeout_ms,
                 &promoted,
             ));
@@ -313,10 +303,14 @@ impl ShellTool {
     }
 
     fn syntax(&self) -> ShellSyntax {
-        match self.shell.kind {
-            ShellKind::PowerShell => ShellSyntax::PowerShell,
-            ShellKind::Posix | ShellKind::Cmd => ShellSyntax::Bash,
+        match self.shell.kind() {
+            CommandShellKind::PowerShell => ShellSyntax::PowerShell,
+            CommandShellKind::Posix => ShellSyntax::Bash,
         }
+    }
+
+    fn display_command(&self, command: &str) -> String {
+        format!("{} {command}", self.shell.name())
     }
 
     fn resolve_workdir(&self, requested: Option<&str>) -> Result<PathBuf, ToolError> {
@@ -442,19 +436,18 @@ impl ShellTool {
         ctx: &ToolContext,
         retention: BackgroundExecutionRetention,
     ) -> BackgroundExecutionInput {
-        let arguments = match self.shell.kind {
-            ShellKind::PowerShell => vec![
+        let arguments = match self.shell.kind() {
+            CommandShellKind::PowerShell => vec![
                 OsString::from("-NoLogo"),
                 OsString::from("-NoProfile"),
                 OsString::from("-NonInteractive"),
                 OsString::from("-Command"),
                 OsString::from(command),
             ],
-            ShellKind::Cmd => vec![OsString::from("/c"), OsString::from(command)],
-            ShellKind::Posix => vec![OsString::from("-lc"), OsString::from(command)],
+            CommandShellKind::Posix => vec![OsString::from("-lc"), OsString::from(command)],
         };
         BackgroundExecutionInput {
-            program: self.shell.path.as_os_str().to_owned(),
+            program: self.shell.path().as_os_str().to_owned(),
             arguments,
             cwd: cwd.to_owned(),
             environment: env
@@ -462,7 +455,7 @@ impl ShellTool {
                 .map(|(key, value)| (key.into(), value.into()))
                 .collect(),
             session_id: ctx.session_id.clone(),
-            title: command.to_owned(),
+            title: self.display_command(command),
             command: command.to_owned(),
             hard_ceiling: self.hard_ceiling,
             retention,
@@ -510,11 +503,12 @@ impl ShellTool {
         if full.is_empty() {
             full = "(no output)".to_owned();
         }
-        let output = ToolOutput::text(command, full)
+        let output = ToolOutput::text(self.display_command(command), full)
             .with_metadata("exit", json!(execution.exit_code))
             .with_metadata("truncated", false)
             .with_metadata("background", false)
             .with_metadata("task_id", execution.id.as_str())
+            .with_metadata("shell", self.shell.name())
             .with_metadata("timeout", json!(foreground_timeout_ms));
         OutputPolicy::new(self.output_store.clone(), self.output_limits)
             .apply(TOOL_ID, session_id, output, accept_large_output)
@@ -529,6 +523,10 @@ impl ShellTool {
 impl Tool for ShellTool {
     fn id(&self) -> &str {
         TOOL_ID
+    }
+
+    fn display_name(&self) -> &str {
+        self.shell.name()
     }
 
     fn description(&self) -> &str {
@@ -877,64 +875,6 @@ fn is_dynamic_path(path: &str) -> bool {
         || path.contains('*')
         || path.contains('?')
         || path.contains('[')
-}
-
-fn discover_shell(configured: Option<&Path>) -> io::Result<SelectedShell> {
-    if let Some(configured) = configured {
-        return resolve_shell(configured).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("configured shell {} was not found", configured.display()),
-            )
-        });
-    }
-
-    if let Some(shell) = std::env::var_os("SHELL")
-        .map(PathBuf::from)
-        .as_deref()
-        .and_then(resolve_shell)
-        .filter(acceptable)
-    {
-        return Ok(shell);
-    }
-
-    #[cfg(windows)]
-    let candidates = ["pwsh.exe", "powershell.exe", "bash.exe", "cmd.exe"];
-    #[cfg(target_os = "macos")]
-    let candidates = ["/bin/zsh", "/bin/bash", "/bin/sh"];
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let candidates = ["bash", "/bin/bash", "/bin/sh"];
-
-    candidates
-        .iter()
-        .find_map(|candidate| resolve_shell(Path::new(candidate)))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no acceptable shell was found"))
-}
-
-fn resolve_shell(candidate: &Path) -> Option<SelectedShell> {
-    let path = if candidate.components().count() > 1 || candidate.is_absolute() {
-        candidate.is_file().then(|| candidate.to_owned())?
-    } else {
-        which::which(candidate).ok()?
-    };
-    let name = path
-        .file_stem()
-        .and_then(|name| name.to_str())?
-        .to_ascii_lowercase();
-    let kind = match name.as_str() {
-        "pwsh" | "powershell" => ShellKind::PowerShell,
-        "cmd" => ShellKind::Cmd,
-        _ => ShellKind::Posix,
-    };
-    Some(SelectedShell { path, kind })
-}
-
-fn acceptable(shell: &SelectedShell) -> bool {
-    shell
-        .path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .is_none_or(|name| !matches!(name.to_ascii_lowercase().as_str(), "fish" | "nu"))
 }
 
 fn invalid(message: &'static str) -> ToolError {

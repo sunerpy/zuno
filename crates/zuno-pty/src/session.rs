@@ -670,6 +670,7 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
+    /// [`PtyError::Shell`] when the configured default shell is invalid,
     /// [`PtyError::Open`] when the platform refuses a new pty (typically the
     /// per-user pty limit), and [`PtyError::Spawn`] when the command cannot be
     /// executed in it.
@@ -679,13 +680,11 @@ impl SessionHandle {
         on_exit: Arc<dyn ExitObserver>,
     ) -> Result<Arc<Self>, PtyError> {
         let id = PtyId::mint();
-        let command = input
-            .command
-            .filter(|command| !command.is_empty())
-            .map_or_else(
-                || shells::preferred(options.configured_shell.as_deref()),
-                PathBuf::from,
-            );
+        let command = match input.command.filter(|command| !command.is_empty()) {
+            Some(command) => PathBuf::from(command),
+            None => shells::preferred(options.configured_shell.as_deref())
+                .map_err(|source| PtyError::Shell { source })?,
+        };
         let command_display = command.to_string_lossy().into_owned();
 
         let mut args = input.args.unwrap_or_default();

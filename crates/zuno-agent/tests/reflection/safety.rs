@@ -22,7 +22,7 @@ async fn non_memory_tool_call_is_denied_at_reflection_dispatch() {
     // Then
     assert_eq!(
         runner.denial(),
-        "Background review denied non-whitelisted tool: bash. Only memory proposals are allowed."
+        "Background review denied non-whitelisted tool: shell. Only memory proposals are allowed."
     );
     assert_eq!(memory.call_count(), 0);
 }

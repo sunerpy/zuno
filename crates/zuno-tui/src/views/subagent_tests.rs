@@ -16,6 +16,7 @@ fn native(state: &str, job: Option<&str>) -> MessagePart {
     let job = job.map_or_else(String::new, |job| format!(" job=\"{job}\""));
     MessagePart::Tool {
         call_id: "call_native".to_owned(),
+        display_name: "renamed_native_delegate".to_owned(),
         name: "renamed_native_delegate".to_owned(),
         ui_intent: ToolUiIntent::Subagent,
         arguments: r#"{"description":"survey auth","prompt":"inspect","subagent_type":"deep","background":true}"#
@@ -34,6 +35,7 @@ fn product(state: &str, job: Option<&str>) -> MessagePart {
     let job = job.map_or_else(String::new, |job| format!(" job=\"{job}\""));
     MessagePart::Tool {
         call_id: "call_product".to_owned(),
+        display_name: "company_codex".to_owned(),
         name: "company_codex".to_owned(),
         ui_intent: ToolUiIntent::Subagent,
         arguments: r#"{"description":"review patch","prompt":"review","background":true,"reportDelivery":"quiet"}"#
@@ -52,6 +54,7 @@ fn product(state: &str, job: Option<&str>) -> MessagePart {
 fn job_observation(job: &str, status: &str) -> MessagePart {
     MessagePart::Tool {
         call_id: format!("inspect_{job}"),
+        display_name: "job".to_owned(),
         name: "job".to_owned(),
         ui_intent: ToolUiIntent::Generic,
         arguments: format!(r#"{{"jobID":"{job}"}}"#),
@@ -186,6 +189,7 @@ fn intent_not_wire_name_selects_native_and_product_subagents() {
         product("completed", None),
         MessagePart::Tool {
             call_id: "generic".to_owned(),
+            display_name: "task".to_owned(),
             name: "task".to_owned(),
             ui_intent: ToolUiIntent::Generic,
             arguments: "{}".to_owned(),

@@ -92,7 +92,7 @@ fn tool_kind(tool: &str) -> &'static str {
         "delete" => "delete",
         "move" => "move",
         "grep" | "search" => "search",
-        "bash" | "execute" => "execute",
+        "shell" | "execute" => "execute",
         "fetch" | "webfetch" => "fetch",
         _ => "other",
     }

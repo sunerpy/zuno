@@ -664,6 +664,7 @@ impl ToolDispatcher for LargeOutputDispatcher {
         AvailableTools::new(
             vec![ToolDefinition {
                 id: "get_weather".to_owned(),
+                display_name: "get_weather".to_owned(),
                 description: "Return deterministic cassette-backed weather data.".to_owned(),
                 parameters: json!({
                     "type": "object",

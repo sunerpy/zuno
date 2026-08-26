@@ -54,7 +54,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "glob",
     "grep",
     "list",
-    "bash",
+    "shell",
     "task",
     "external_directory",
     "plan_get",

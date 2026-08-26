@@ -227,17 +227,17 @@ where
                     event: StreamEvent::StatusDetail { detail },
                     ..
                 } => writeln!(stderr, "{detail}").map_err(to_string)?,
-                TurnEvent::ToolDispatchStarted { name, .. } => {
-                    writeln!(stderr, "[{name}] started").map_err(to_string)?;
+                TurnEvent::ToolDispatchStarted { display_name, .. } => {
+                    writeln!(stderr, "[{display_name}] started").map_err(to_string)?;
                 }
                 TurnEvent::ToolDispatchCompleted {
-                    name,
+                    display_name,
                     title,
                     is_error,
                     ..
                 } => writeln!(
                     stderr,
-                    "[{name}] {}: {title}",
+                    "[{display_name}] {}: {title}",
                     if is_error { "failed" } else { "completed" }
                 )
                 .map_err(to_string)?,
@@ -317,6 +317,20 @@ fn event_json(event: TurnEvent) -> Value {
             "estimatedPromptTokens":estimated_prompt_tokens
         }),
         TurnEvent::Provider { step, event } => stream_event_json(step, event),
+        TurnEvent::ToolCallStarted {
+            step,
+            call_id,
+            display_name,
+            name,
+            ui_intent,
+        } => json!({
+            "type":"tool_call_started",
+            "step":step,
+            "callID":call_id,
+            "name":name,
+            "displayName":display_name,
+            "uiIntent":ui_intent
+        }),
         TurnEvent::AssistantCheckpointed {
             step,
             message_id,
@@ -327,9 +341,12 @@ fn event_json(event: TurnEvent) -> Value {
         TurnEvent::ToolDispatchStarted {
             step,
             call_id,
+            display_name,
             name,
             ..
-        } => json!({"type":"tool_dispatch_started","step":step,"callID":call_id,"name":name}),
+        } => {
+            json!({"type":"tool_dispatch_started","step":step,"callID":call_id,"name":name,"displayName":display_name})
+        }
         TurnEvent::ToolDispatchBlocked {
             step,
             call_id,
@@ -340,6 +357,7 @@ fn event_json(event: TurnEvent) -> Value {
         TurnEvent::ToolDispatchCompleted {
             step,
             call_id,
+            display_name,
             name,
             title,
             output,
@@ -347,7 +365,7 @@ fn event_json(event: TurnEvent) -> Value {
             written_paths,
             is_error,
         } => {
-            json!({"type":"tool_dispatch_completed","step":step,"callID":call_id,"name":name,"title":title,"output":output,"diff":diff,"writtenPaths":written_paths,"isError":is_error})
+            json!({"type":"tool_dispatch_completed","step":step,"callID":call_id,"name":name,"displayName":display_name,"title":title,"output":output,"diff":diff,"writtenPaths":written_paths,"isError":is_error})
         }
         TurnEvent::ToolResultAppended {
             step,
@@ -684,6 +702,27 @@ mod tests {
         assert_eq!(
             stream_event_json(7, StreamEvent::RetryRollback { attempt: 2, max: 3 }),
             json!({"type":"retry_rollback","step":7,"attempt":2,"max":3})
+        );
+    }
+
+    #[test]
+    fn run_pending_tool_json_carries_the_resolved_display_identity() {
+        assert_eq!(
+            event_json(TurnEvent::ToolCallStarted {
+                step: 2,
+                call_id: "call-1".to_owned(),
+                display_name: "zsh".to_owned(),
+                name: "shell".to_owned(),
+                ui_intent: zuno_tool::ToolUiIntent::Generic,
+            }),
+            json!({
+                "type":"tool_call_started",
+                "step":2,
+                "callID":"call-1",
+                "name":"shell",
+                "displayName":"zsh",
+                "uiIntent":"generic"
+            })
         );
     }
 }
