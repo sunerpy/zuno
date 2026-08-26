@@ -369,6 +369,53 @@ fn two_concurrent_writers_both_succeed_within_the_busy_timeout() {
     );
 }
 
+#[test]
+fn an_immediate_transaction_from_a_shared_reference_reserves_the_writer() {
+    let dir = temp_dir();
+    let path = dir.path().join("zuno.db");
+    let first_connection = open::open_at(&path).expect("open first writer");
+    first_connection
+        .execute_batch("CREATE TABLE writes (id integer primary key, who text not null)")
+        .expect("create the table");
+    let second_connection = open::open_at(&path).expect("open second writer");
+    second_connection
+        .busy_timeout(Duration::ZERO)
+        .expect("disable waiting for the deterministic contention probe");
+
+    let first = open::immediate_transaction(&first_connection)
+        .expect("begin first immediate transaction through a shared reference");
+    first
+        .query_row("SELECT count(*) FROM writes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("read after reserving the writer");
+
+    let busy = match open::immediate_transaction(&second_connection) {
+        Ok(_) => panic!("a second writer started while the first reservation was active"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(busy, zuno_error::DbError::Busy { .. }),
+        "a contending writer returned the wrong error: {busy}"
+    );
+
+    first
+        .execute("INSERT INTO writes (who) VALUES ('first')", [])
+        .expect("write after reading");
+    first.commit().expect("commit first writer");
+
+    let second = open::immediate_transaction(&second_connection)
+        .expect("second writer starts after the reservation is released");
+    let visible_rows: i64 = second
+        .query_row("SELECT count(*) FROM writes", [], |row| row.get(0))
+        .expect("read the first committed row");
+    assert_eq!(visible_rows, 1);
+    second
+        .execute("INSERT INTO writes (who) VALUES ('second')", [])
+        .expect("write from the second transaction");
+    second.commit().expect("commit second writer");
+}
+
 /// A reader must not be blocked by an open writer. That is the whole reason the
 /// Zuno uses WAL rather than the default rollback journal.
 #[test]

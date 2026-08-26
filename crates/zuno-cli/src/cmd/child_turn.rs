@@ -669,8 +669,8 @@ impl ChildSessionHost {
     /// confusing transcript and a way to write into a session the caller was never
     /// given.
     fn session_for(&self, request: &ChildTurnRequest) -> Result<String, ChildTurnError> {
-        let mut connection = self.connect()?;
         if let Some(resume) = &request.resume_session_id {
+            let connection = self.connect()?;
             let existing = zuno_db::session::get(&connection, resume)
                 .map_err(|_error| ChildTurnError::UnknownSession(resume.clone()))?;
             if existing.parent_id.as_deref() != Some(request.parent_session_id.as_str()) {
@@ -679,34 +679,31 @@ impl ChildSessionHost {
             return Ok(existing.id);
         }
 
-        let parent = zuno_db::session::get(&connection, &request.parent_session_id)
-            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
         let child_id = crate::cmd::turn::prefixed_id("ses");
         let title = request
             .description
             .clone()
             .unwrap_or_else(|| format!("Delegated to {}", request.agent));
-        let mut input = zuno_db::session::SessionCreate::new(
-            &child_id,
-            Uuid::new_v4().simple().to_string(),
-            &parent.project_id,
-            parent.directory.clone(),
-            parent.directory.clone(),
-            title,
-            crate::RUST_PACKAGE_VERSION,
-        )
-        .with_parent(&request.parent_session_id);
-        input.agent = Some(request.agent.clone());
-        if let Some(workspace) = parent.workspace_id.clone() {
-            input = input.with_workspace(workspace);
-        }
-        let transaction = connection
-            .transaction()
-            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
-        zuno_db::session::create(&transaction, &input)
-            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
-        transaction
-            .commit()
+        self.database
+            .transaction(|transaction| {
+                let parent = zuno_db::session::get(transaction, &request.parent_session_id)?;
+                let mut input = zuno_db::session::SessionCreate::new(
+                    &child_id,
+                    Uuid::new_v4().simple().to_string(),
+                    &parent.project_id,
+                    parent.directory.clone(),
+                    parent.directory.clone(),
+                    title,
+                    crate::RUST_PACKAGE_VERSION,
+                )
+                .with_parent(&request.parent_session_id);
+                input.agent = Some(request.agent.clone());
+                if let Some(workspace) = parent.workspace_id {
+                    input = input.with_workspace(workspace);
+                }
+                zuno_db::session::create(transaction, &input)?;
+                Ok(())
+            })
             .map_err(|error| ChildTurnError::Host(error.to_string()))?;
         Ok(child_id)
     }

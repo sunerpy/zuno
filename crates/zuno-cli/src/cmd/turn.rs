@@ -2054,7 +2054,10 @@ impl TurnHost {
             let mut connection = database.open_connection().map_err(to_string)?;
             zuno_db::migration::apply(&mut connection).map_err(to_string)?;
             let now = zuno_db::message::now_millis();
-            ensure_project(&connection, &plan.project, now)?;
+            let transaction =
+                zuno_db::open::immediate_transaction(&connection).map_err(to_string)?;
+            ensure_project(&transaction, &plan.project, now)?;
+            transaction.commit().map_err(to_string)?;
             let prepared = prepare_turn_host(&connection, &plan, now)?;
             Ok((connection, prepared))
         })();
@@ -2498,7 +2501,8 @@ impl TurnHost {
         };
         let mut input = input.clone();
         input.time = Some(zuno_db::message::now_millis());
-        let transaction = self.connection.transaction().map_err(to_string)?;
+        let transaction =
+            zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
         zuno_db::session::create(&transaction, &input).map_err(to_string)?;
         transaction.commit().map_err(to_string)?;
         self.session_materializer = SessionMaterializer::Existing;
@@ -3742,7 +3746,8 @@ impl TurnHost {
         let durable_input_id = durable_input.id.clone();
         match &self.session_materializer {
             SessionMaterializer::Existing => {
-                let transaction = self.connection.unchecked_transaction().map_err(to_string)?;
+                let transaction =
+                    zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
@@ -3753,7 +3758,8 @@ impl TurnHost {
             SessionMaterializer::Pending(input) => {
                 let mut input = input.clone();
                 input.time = Some(message.time_created);
-                let transaction = self.connection.transaction().map_err(to_string)?;
+                let transaction =
+                    zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
                 zuno_db::session::create(&transaction, &input).map_err(to_string)?;
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
@@ -3778,7 +3784,8 @@ impl TurnHost {
                 message.id
             ));
         }
-        let transaction = self.connection.unchecked_transaction().map_err(to_string)?;
+        let transaction =
+            zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
         persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
         consume_promoted_input(&transaction, &self.session_id, &message.id)?;
         transaction.commit().map_err(to_string)
@@ -6314,7 +6321,8 @@ fn resolve_session(
         }
         SessionMaterializer::Pending(mut input) => {
             input.time = Some(now);
-            let transaction = connection.transaction().map_err(to_string)?;
+            let transaction =
+                zuno_db::open::immediate_transaction(connection).map_err(to_string)?;
             let creation = zuno_db::session::create(&transaction, &input).map_err(to_string)?;
             transaction.commit().map_err(to_string)?;
             Ok(creation.into_session())

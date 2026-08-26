@@ -2237,7 +2237,7 @@ fn persist_live_input(
 }
 
 fn touch_session(connection: &mut Connection, session_id: &str) -> Result<(), TurnError> {
-    let transaction = connection.transaction().map_err(open::map_error)?;
+    let transaction = open::immediate_transaction(connection)?;
     session::touch(&transaction, session_id)?;
     transaction.commit().map_err(open::map_error)?;
     Ok(())
@@ -3386,9 +3386,7 @@ fn checkpoint_assistant(
     }
     update_usage(&mut assistant.data, accumulator);
 
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(open::map_error)?;
+    let transaction = open::immediate_transaction(connection)?;
     let store = MessageStore::new(&transaction);
     let previous = store
         .find_message(&assistant.id)?

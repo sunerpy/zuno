@@ -277,10 +277,8 @@ pub async fn generate_title(
             "the title model returned no usable line".to_owned(),
         ));
     };
-    let transaction = context
-        .connection
-        .transaction()
-        .map_err(|error| TitleSkipped::Database(open::map_error(error)))?;
+    let transaction =
+        open::immediate_transaction(context.connection).map_err(TitleSkipped::Database)?;
     session::set_title(&transaction, session_id, &title).map_err(TitleSkipped::Database)?;
     transaction
         .commit()

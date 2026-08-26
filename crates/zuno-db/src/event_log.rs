@@ -140,7 +140,7 @@ pub fn append_with_connection(
     session_id: &str,
     event: NewSessionEvent,
 ) -> Result<SessionEvent, DbError> {
-    let transaction = connection.transaction().map_err(open::map_error)?;
+    let transaction = open::immediate_transaction(connection)?;
     let appended = append_in(&transaction, session_id, event)?;
     transaction.commit().map_err(open::map_error)?;
     Ok(appended)

@@ -3,7 +3,7 @@
 //! The connection target comes from [`zuno_paths::db_path`]; this module never
 //! re-parses `ZUNO_DB`.
 
-use rusqlite::{Connection, ErrorCode};
+use rusqlite::{Connection, ErrorCode, Transaction, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use zuno_error::DbError;
 use zuno_paths::DbLocation;
@@ -159,6 +159,26 @@ pub fn open_target(target: &str, location: &DbLocation) -> Result<Connection, Db
     })?;
     apply_pragmas(&connection, location)?;
     Ok(connection)
+}
+
+/// Begin an `IMMEDIATE` transaction through a shared connection reference.
+///
+/// Turn projection owns one connection for its whole lifetime and therefore
+/// cannot always borrow it mutably at every helper boundary. Rusqlite's
+/// `unchecked_transaction` solves that borrow-shape problem but starts a
+/// `DEFERRED` transaction. A read followed by a write can then fail with
+/// `SQLITE_BUSY_SNAPSHOT` after another writer commits, and SQLite deliberately
+/// does not invoke the busy handler for that stale snapshot. Reserving the write
+/// lock up front lets the configured busy timeout serialize writers instead.
+///
+/// Callers must still ensure they do not nest transactions on `connection`.
+///
+/// # Errors
+///
+/// [`DbError::Busy`] when another writer outlives the busy timeout, or
+/// [`DbError::Query`] when SQLite cannot begin the transaction.
+pub fn immediate_transaction(connection: &Connection) -> Result<Transaction<'_>, DbError> {
+    Transaction::new_unchecked(connection, TransactionBehavior::Immediate).map_err(map_error)
 }
 
 /// Apply [`PRAGMA_SEQUENCE`] and prove each setting actually took effect.

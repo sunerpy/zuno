@@ -959,10 +959,7 @@ where
         reason: FinishReason,
         now: i64,
     ) -> Result<(), ProjectionError> {
-        let transaction = self
-            .connection
-            .unchecked_transaction()
-            .map_err(open::map_error)?;
+        let transaction = open::immediate_transaction(self.connection)?;
         let store = MessageStore::new(&transaction);
         let mut message = store.message(&self.context.message_id)?;
         let previous = session::MessageUsage::from_data(&message.data);

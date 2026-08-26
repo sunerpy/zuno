@@ -315,6 +315,12 @@ See [auditable memory and reflection](design/memory-learning.md).
 
 Every model-visible external input is admitted to the session event log and durable inbox in one SQLite transaction before execution is attempted. The inbox is the source of truth across active turns, idle sessions, process restarts, and competing drivers.
 
+Every multi-statement write transaction reserves SQLite's writer with `BEGIN IMMEDIATE`,
+including transactions opened through a caller-owned turn connection. This lets the configured
+busy timeout serialize concurrent parent and child writers before any read snapshot is taken;
+Zuno does not use a deferred read-then-write upgrade that can fail with
+`SQLITE_BUSY_SNAPSHOT` without invoking SQLite's busy handler.
+
 An interactive `SessionChoice::New` is prepared without inserting a `session` row. The
 process-local identity is stable across model, agent, MCP, and theme changes, but opening,
 browsing, or leaving the welcome screen creates no durable session. The first model-bound
