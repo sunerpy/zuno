@@ -183,6 +183,17 @@ or authorize delegation.
 Use presets when the same Agent roster should switch between teams such as
 `balanced`, `fast`, and `thorough`.
 
+A preset may route different Agents through different providers. This is the
+preferred way to combine, for example, a long-context Claude model for
+orchestration and planning, a GPT model for implementation and architecture
+review, and a smaller multimodal model for exploration or visual inspection.
+The providers remain independently configured in the shared catalog; the
+preset contains only qualified model routes and canonical reasoning levels.
+See the checked
+[`zuno-multi-provider.json`](../examples/config/zuno-multi-provider.json) for
+`myopenai`, `kiro-local`, and mixed `hybrid` teams covering the complete native
+user-Agent roster.
+
 ### Per-task overrides
 
 The `task` tool accepts `model` and `effort` for one child only. This is useful

@@ -292,6 +292,112 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
 }
 
 #[test]
+fn multi_provider_example_routes_only_zuno_agents() {
+    let relative = "examples/config/zuno-multi-provider.json";
+    let value: serde_json::Value =
+        serde_json::from_str(&read(relative)).expect("multi-provider example is valid JSON");
+
+    let providers = value["provider"]
+        .as_object()
+        .expect("multi-provider example declares providers");
+    assert_eq!(
+        providers.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["kiro-local", "myopenai"],
+        "the checked example should keep both providers in one config"
+    );
+    assert!(
+        providers["myopenai"]["models"]
+            .get("us.anthropic.claude-fable-5")
+            .is_some(),
+        "the myopenai catalog must include Claude Fable 5"
+    );
+    for model in [
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+    ] {
+        assert!(
+            providers["kiro-local"]["models"].get(model).is_some(),
+            "the Kiro catalog must include {model}"
+        );
+    }
+    assert!(
+        providers["kiro-local"]["models"]
+            .get("claude-opus-5")
+            .is_none(),
+        "the example must not advertise a model absent from the referenced Kiro gateway"
+    );
+
+    let expected_agents = [
+        "build",
+        "deep",
+        "explorer",
+        "fixer",
+        "general",
+        "librarian",
+        "looker",
+        "oracle",
+        "orchestrator",
+        "plan",
+    ];
+    let presets = value["presets"]
+        .as_object()
+        .expect("multi-provider example declares presets");
+    assert_eq!(
+        presets.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["hybrid", "kiro-local", "myopenai"]
+    );
+    for (name, preset) in presets {
+        let agents = preset["agents"]
+            .as_object()
+            .unwrap_or_else(|| panic!("preset {name} declares Agent routes"));
+        let mut actual = agents.keys().map(String::as_str).collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected_agents,
+            "preset {name} must route the complete Zuno user-Agent roster"
+        );
+        assert!(
+            preset.get("categories").is_none(),
+            "OMO categories must not be copied into Zuno presets"
+        );
+    }
+
+    let text = read(relative);
+    for foreign in [
+        "sisyphus",
+        "hephaestus",
+        "prometheus",
+        "metis",
+        "momus",
+        "atlas",
+        "ultrabrain",
+        "visual-engineering",
+        "unspecified-low",
+    ] {
+        assert!(
+            !text.contains(foreign),
+            "multi-provider example copied foreign OMO identity {foreign:?}"
+        );
+    }
+
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "examples/config/zuno-multi-provider.json",
+            "`myopenai`",
+            "`kiro-local`",
+            "`hybrid`",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "ZUNO_CONFIG_DIR",
+            "/preset",
+        ],
+    );
+}
+
+#[test]
 fn self_update_documentation_pins_the_verified_release_contract() {
     contains_all(
         "docs/reference/self-update.md",

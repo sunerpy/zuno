@@ -27,61 +27,71 @@ Agents routed to its original provider. Do not use `"preset": null` as a tombsto
 optional typed fields currently treat JSON null as no higher-layer value, so the inherited
 preset remains selected. Select an explicit overlay preset instead.
 
-For a loopback [kiro-provider](https://github.com/sunerpy/kiro-provider) Responses
-gateway, a complete overlay at
-`$HOME/.config/zuno/profiles/kiro/zuno.json` can be:
+One `zuno.json` can declare several providers. Provider ids are catalog
+namespaces, while presets choose which qualified `provider/model` route each
+Agent uses. The checked
+[`examples/config/zuno-multi-provider.json`](../../examples/config/zuno-multi-provider.json)
+keeps both `myopenai` and `kiro-local` in one catalog and defines three teams:
+
+- `myopenai` preserves an all-`myopenai` team;
+- `kiro-local` uses the loopback gateway for the whole team;
+- `hybrid` combines Kiro coding/reasoning models with
+  `myopenai/us.anthropic.claude-fable-5` for long-context orchestration,
+  planning, general work, and research.
+
+Each team routes only Zuno's current user-facing roster: `orchestrator`,
+`build`, `plan`, `deep`, `fixer`, `general`, `explorer`, `librarian`, `oracle`,
+and `looker`. OMO Agent names and OMO categories are not copied. A category in
+Zuno is an optional user-defined semantic route, so an unused category should
+not be present merely because another harness defines one.
+
+Use `/preset` in the TUI to inspect the teams, or switch directly:
+
+```text
+/preset myopenai
+/preset kiro-local
+/preset hybrid
+```
+
+The selection is session-local. To choose a startup team through the
+environment, keep the providers and presets in the global file and make the
+overlay only select the top-level defaults. For example,
+`$HOME/.config/zuno/profiles/kiro/zuno.json` can contain:
 
 ```json
 {
-  "model": "kiro-local/gpt-5.6-sol",
-  "small_model": "kiro-local/gpt-5.6-sol",
-  "preset": "kiro-local",
-  "presets": {
-    "kiro-local": {
-      "agents": {
-        "orchestrator": "kiro-local/gpt-5.6-sol",
-        "build": "kiro-local/gpt-5.6-sol",
-        "plan": "kiro-local/gpt-5.6-sol",
-        "deep": "kiro-local/gpt-5.6-sol",
-        "fixer": "kiro-local/gpt-5.6-sol",
-        "general": "kiro-local/gpt-5.6-sol",
-        "explorer": "kiro-local/gpt-5.6-sol",
-        "librarian": "kiro-local/gpt-5.6-sol",
-        "oracle": "kiro-local/gpt-5.6-sol",
-        "looker": "kiro-local/gpt-5.6-sol"
-      }
-    }
-  },
-  "provider": {
-    "kiro-local": {
-      "name": "Kiro local gateway",
-      "env": ["ZUNO_KIRO_LOCAL_API_KEY"],
-      "transport": "openai",
-      "surface": "responses",
-      "options": {
-        "baseURL": "http://127.0.0.1:8787/v1"
-      },
-      "models": {
-        "gpt-5.6-sol": {
-          "name": "GPT 5.6 Sol via Kiro",
-          "reasoning": true,
-          "tool_call": true,
-          "limit": {
-            "context": 272000,
-            "output": 64000
-          }
-        }
-      }
-    }
-  }
+  "model": "kiro-local/claude-opus-4-8",
+  "small_model": "kiro-local/gpt-5.6-luna",
+  "preset": "kiro-local"
 }
 ```
 
-Use a unique provider id such as `kiro-local`: Zuno checks configured and stored
-credentials before the provider's environment-variable list, so reusing an unrelated
-provider id can select an old credential. The gateway and Zuno need the same private
-loopback key, but that key should remain in the environment or a secret manager rather
-than in either JSON file:
+Then launch it with:
+
+```sh
+ZUNO_CONFIG_DIR="$HOME/.config/zuno/profiles/kiro" zuno
+```
+
+The same pattern can select `hybrid` or return explicitly to `myopenai`; the
+overlay need not duplicate either provider definition. Checked selector files
+for all three teams live under
+[`examples/config/profiles`](../../examples/config/profiles).
+
+Model names belong to a provider implementation, not to an account. On
+2026-08-26 the locally checked `opencode-kiro-auth` catalog advertises
+`claude-opus-5`, but the separately checked loopback `kiro-provider` catalog
+does not yet expose that id. Its current long-context Claude routes are
+`claude-opus-4-8` and `claude-sonnet-5`. Do not copy `kiro-auth` model ids into
+`kiro-local` until the running gateway's `/v1/models` response and its source
+both expose them. This distinction is why the checked example uses Claude Opus
+5 only under `myopenai`, and Claude Opus 4.8 under `kiro-local`.
+
+For a loopback [kiro-provider](https://github.com/sunerpy/kiro-provider)
+Responses gateway, use a unique provider id such as `kiro-local`: Zuno checks
+configured and stored credentials before the provider's environment-variable
+list, so reusing an unrelated provider id can select an old credential. The
+gateway and Zuno need the same private loopback key, but that key should remain
+in the environment or a secret manager rather than in either JSON file:
 
 ```sh
 KIRO_PROVIDER_API_KEYS="$ZUNO_KIRO_LOCAL_API_KEY" \

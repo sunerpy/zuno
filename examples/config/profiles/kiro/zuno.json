@@ -1,0 +1,5 @@
+{
+  "model": "kiro-local/claude-opus-4-8",
+  "small_model": "kiro-local/gpt-5.6-luna",
+  "preset": "kiro-local"
+}

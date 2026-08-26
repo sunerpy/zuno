@@ -1157,6 +1157,43 @@ fn checked_native_provider_starter_deserializes() {
     );
 }
 
+#[test]
+fn checked_multi_provider_starter_deserializes() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/config/zuno-multi-provider.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let config = parse(&text).expect("the checked multi-provider starter must load");
+    let value = serde_json::to_value(config).expect("starter serializes");
+
+    assert_eq!(value["preset"], "myopenai");
+    assert_eq!(value["provider"]["kiro-local"]["transport"], "openai");
+    assert_eq!(value["provider"]["myopenai"]["transport"], "openai");
+    assert_eq!(
+        value["presets"]["hybrid"]["agents"]["orchestrator"]["model"],
+        "myopenai/us.anthropic.claude-fable-5"
+    );
+    assert_eq!(
+        value["presets"]["hybrid"]["agents"]["build"]["model"],
+        "kiro-local/gpt-5.6-sol"
+    );
+
+    for (directory, expected) in [
+        ("hybrid", "hybrid"),
+        ("kiro", "kiro-local"),
+        ("myopenai", "myopenai"),
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../examples/config/profiles/{directory}/zuno.json"
+        ));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let overlay =
+            parse(&text).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        assert_eq!(overlay.preset.as_deref(), Some(expected));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The order-preserving map itself.
 // ---------------------------------------------------------------------------
