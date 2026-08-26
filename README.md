@@ -7,7 +7,7 @@
 [![CI](https://github.com/sunerpy/zuno/actions/workflows/ci.yml/badge.svg)](https://github.com/sunerpy/zuno/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/sunerpy/zuno)](https://github.com/sunerpy/zuno/releases)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.96%2B-orange)](./rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange)](./rust-toolchain.toml)
 
 [Install](#install) · [Quick start](#quick-start) · [Harness runtime](#harness-runtime) · [Documentation](#documentation) · [Development](#development)
 

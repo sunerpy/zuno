@@ -5,7 +5,7 @@
 set -uo pipefail
 
 MIN_DISK_GB=${MIN_DISK_GB:-20}
-MIN_RUSTC=${MIN_RUSTC:-1.96.0}
+MIN_RUSTC=${MIN_RUSTC:-1.98.0}
 
 failures=0
 warnings=0
