@@ -75,7 +75,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "ExportCommand",
         command: "export",
         disposition: Disposition::Implemented,
-        reason: "prints one session's whole transcript as JSON, byte-compared against the released binary's own export, with `--sanitize` redacting the same fields",
+        reason: "writes a cross-platform `.zuno-bundle` containing Zuno-owned configuration, Skills, extensions, Agents, commands, profiles, and optional credentials; sessions, databases, logs, and caches are excluded",
     },
     CommandDisposition {
         upstream_symbol: "GenerateCommand",
@@ -93,7 +93,7 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
         upstream_symbol: "ImportCommand",
         command: "import",
         disposition: Disposition::Implemented,
-        reason: "reads a local `export` document into Zuno's database; share-URL imports are not accepted because Zuno does not integrate with the hosted share service",
+        reason: "validates and transactionally installs a local `.zuno-bundle` into the current platform's Zuno layout without restoring session databases",
     },
     CommandDisposition {
         upstream_symbol: "McpCommand",

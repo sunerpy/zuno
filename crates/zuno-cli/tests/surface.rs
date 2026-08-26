@@ -229,12 +229,12 @@ const IMPLEMENTED_PROBES: &[Probe] = &[
     Probe {
         command: "export",
         argv: &["export", "ses_probe000000000000000000000a"],
-        evidence: "Session not found: ses_probe000000000000000000000a",
+        evidence: "Exported Zuno bundle:",
     },
     Probe {
         command: "import",
         argv: &["import", "probe.json"],
-        evidence: "File not found: probe.json",
+        evidence: "Bundle not found: probe.json",
     },
     Probe {
         command: "mcp",
@@ -348,6 +348,7 @@ fn surface_no_registered_command_is_only_a_display_entry() {
 fn probe_binary(argv: &[&str], root: &std::path::Path) -> std::process::Output {
     binary()
         .args(argv)
+        .current_dir(root)
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .env("HOME", root.join("home"))
@@ -413,12 +414,14 @@ fn surface_every_implemented_command_reaches_its_handler_through_the_production_
 /// todo 56" and exited 1.
 #[test]
 fn surface_export_no_longer_reports_a_pending_handler() {
+    let root = tempfile::tempdir().expect("probe root");
     let output = binary()
-        .args(["export", "ses_738026eec17c4c33ba2fe3bfc90d8b01"])
-        .env(
-            "ZUNO_DB",
-            std::env::temp_dir().join("zuno-surface-export.db"),
-        )
+        .arg("export")
+        .arg(root.path().join("probe.zuno-bundle"))
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("ZUNO_DB", root.path().join("zuno-surface-export.db"))
         .output()
         .expect("run export");
     let stderr = String::from_utf8_lossy(&output.stderr);

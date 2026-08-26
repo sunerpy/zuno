@@ -84,8 +84,12 @@ impl CommandDispatcher for HeadlessCommandDispatcher<'_> {
             DispatchArguments::Tui(args) => {
                 tui::execute(args, &request.environment).map_err(to_error)
             }
-            DispatchArguments::Export(args) => export::export(args).map_err(to_error),
-            DispatchArguments::Import(args) => export::import(args).map_err(to_error),
+            DispatchArguments::Export(args) => {
+                export::export(args, &request.environment).map_err(to_error)
+            }
+            DispatchArguments::Import(args) => {
+                export::import(args, &request.environment).map_err(to_error)
+            }
         }
     }
 }

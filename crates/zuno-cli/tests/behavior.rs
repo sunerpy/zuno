@@ -546,144 +546,195 @@ fn debug_config_includes_runtime_markdown_agents_and_commands() {
     );
 }
 
-const EXPORT_SESSION: &str = "ses_behaviorexport000000000000ab";
-const EXPORT_MESSAGE: &str = "msg_behaviorexport000000000000us";
-const EXPORT_PART: &str = "prt_behaviorexport00000000000001";
-
-fn seed_export_database(path: &Path) {
-    use zuno_db::message::{MessageRecord, MessageStore, PartRecord};
-
-    std::fs::create_dir_all(path.parent().expect("database parent")).expect("database directory");
-    let mut connection = zuno_db::open::open_at(path).expect("create export database");
-    zuno_db::migration::apply(&mut connection).expect("apply schema");
-    connection
-        .execute_batch(&format!(
-            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
-             VALUES ('prj_behavior_export', '/srv/export', 1, 1, '[]');
-             INSERT INTO session \
-               (id, project_id, slug, directory, path, title, version, cost, tokens_input, \
-                tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, agent, \
-                time_created, time_updated) \
-             VALUES ('{EXPORT_SESSION}', 'prj_behavior_export', 'export', '/srv/export', '', \
-                     'CLI export round trip', '1.18.13', 0, 0, 0, 0, 0, 0, 'build', 2, 3);"
-        ))
-        .expect("seed project and session");
-    let store = MessageStore::new(&connection);
-    let message = MessageRecord::from_json(serde_json::json!({
-        "id": EXPORT_MESSAGE,
-        "sessionID": EXPORT_SESSION,
-        "role": "user",
-        "time": { "created": 4_i64 },
-        "agent": "build",
-        "model": { "providerID": "test", "modelID": "test-model" }
-    }))
-    .expect("split message");
-    store.put_message_at(&message, 4).expect("write message");
-    let part = PartRecord::from_json(
-        serde_json::json!({
-            "id": EXPORT_PART,
-            "sessionID": EXPORT_SESSION,
-            "messageID": EXPORT_MESSAGE,
-            "type": "text",
-            "text": "round-trip me"
-        }),
-        5,
-    )
-    .expect("split part");
-    store.put_part_at(&part, 5).expect("write part");
-}
-
-fn export_document(root: &Path, database: &Path) -> serde_json::Value {
-    let mut command = zuno();
-    command
-        .args(["export", EXPORT_SESSION])
-        .current_dir(root)
-        .env("ZUNO_DB", database);
-    isolated(&mut command, root);
-    let output = command.output().expect("run export");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).expect("export JSON")
-}
-
-#[test]
-fn export_then_import_restores_the_transcript_in_another_database() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let source = root.path().join("source.db");
-    seed_export_database(&source);
-    let exported = export_document(root.path(), &source);
-    let file = root.path().join("exported.json");
+fn seed_portable_configuration(root: &Path) {
+    let config = root.join("config/zuno");
+    let home = root.join("home/.zuno");
+    let data = root.join("data/zuno");
+    let cache = root.join("cache/zuno");
+    for directory in [
+        config.join("skill/release-helper/references"),
+        config.join("extensions/example"),
+        config.join("agent"),
+        config.join("command"),
+        config.join("profiles/kiro"),
+        home.join("skill/home-helper"),
+        data.clone(),
+        cache.clone(),
+    ] {
+        std::fs::create_dir_all(directory).expect("portable fixture directory");
+    }
+    std::fs::write(config.join("AGENTS.md"), "# Global Zuno rules\n").expect("global AGENTS");
+    std::fs::write(config.join("zuno.json"), r#"{"provider":{"local":{}}}"#)
+        .expect("global config");
     std::fs::write(
-        &file,
-        serde_json::to_vec_pretty(&exported).expect("render export"),
+        config.join("skill/release-helper/SKILL.md"),
+        "# Release helper\n",
     )
-    .expect("write export");
+    .expect("skill");
+    std::fs::write(
+        config.join("skill/release-helper/references/checklist.md"),
+        "# Checklist\n",
+    )
+    .expect("skill reference");
+    std::fs::write(
+        config.join("extensions/example/extension.json"),
+        r#"{"id":"example","runtime":{"kind":"process","command":["example"]}}"#,
+    )
+    .expect("extension");
+    std::fs::write(config.join("agent/reviewer.md"), "# Reviewer\n").expect("agent");
+    std::fs::write(config.join("command/check.md"), "# Check\n").expect("command");
+    std::fs::write(
+        config.join("profiles/kiro/zuno.json"),
+        r#"{"provider":{"kiro":{}}}"#,
+    )
+    .expect("profile");
+    std::fs::write(home.join("skill/home-helper/SKILL.md"), "# Home helper\n").expect("home skill");
+    std::fs::write(data.join("auth.json"), r#"{"local":{"key":"secret"}}"#).expect("credentials");
+    std::fs::write(data.join("zuno-local.db"), b"session database").expect("database");
+    std::fs::write(cache.join("models.json"), b"cache").expect("cache");
+}
 
-    let target = root.path().join("target.db");
+fn export_bundle(root: &Path, bundle: &Path, include_credentials: bool) -> Output {
     let mut command = zuno();
-    command
-        .args(["import", &file.to_string_lossy()])
-        .current_dir(root.path())
-        .env("ZUNO_DB", &target);
-    isolated(&mut command, root.path());
-    let output = command.output().expect("run import");
+    command.arg("export").arg(bundle).current_dir(root);
+    if include_credentials {
+        command.arg("--include-credentials");
+    }
+    isolated(&mut command, root);
+    command.output().expect("run portable export")
+}
+
+#[test]
+fn export_then_import_restores_portable_configuration_without_runtime_state() {
+    let source = tempfile::tempdir().expect("source");
+    seed_portable_configuration(source.path());
+    let bundle = source.path().join("portable.zuno-bundle");
+    let output = export_bundle(source.path(), &bundle, false);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains(EXPORT_SESSION));
+    assert!(bundle.is_file());
 
-    let restored = export_document(root.path(), &target);
-    assert_eq!(restored["info"]["id"], EXPORT_SESSION);
-    assert_eq!(restored["info"]["title"], "CLI export round trip");
-    assert_eq!(restored["messages"][0]["info"]["id"], EXPORT_MESSAGE);
-    assert_eq!(restored["messages"][0]["parts"][0]["id"], EXPORT_PART);
-    assert_eq!(restored["messages"][0]["parts"][0]["text"], "round-trip me");
-}
-
-#[test]
-fn export_without_a_session_id_explains_the_required_selection() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let output = run(root.path(), &["export"]);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("session id"), "{stderr}");
-    assert!(stderr.contains("session list"), "{stderr}");
-    assert!(!stderr.contains("pending"), "{stderr}");
-}
-
-#[test]
-fn export_reports_an_unknown_session() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let database = root.path().join("export.db");
-    seed_export_database(&database);
-    let missing = "ses_behaviorexport000000000000zz";
+    let target = tempfile::tempdir().expect("target");
     let mut command = zuno();
     command
-        .args(["export", missing])
-        .current_dir(root.path())
-        .env("ZUNO_DB", database);
-    isolated(&mut command, root.path());
-    let output = command.output().expect("run export");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        .arg("import")
+        .arg(&bundle)
+        .current_dir(target.path());
+    isolated(&mut command, target.path());
+    let output = command.output().expect("run portable import");
     assert!(
-        stderr.contains(&format!("Session not found: {missing}")),
-        "{stderr}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        std::fs::read_to_string(target.path().join("config/zuno/AGENTS.md"))
+            .expect("imported AGENTS"),
+        "# Global Zuno rules\n"
+    );
+    assert!(target.path().join("config/zuno/zuno.json").is_file());
+    assert!(
+        target
+            .path()
+            .join("config/zuno/skill/release-helper/references/checklist.md")
+            .is_file()
+    );
+    assert!(
+        target
+            .path()
+            .join("config/zuno/extensions/example/extension.json")
+            .is_file()
+    );
+    assert!(
+        target
+            .path()
+            .join("home/.zuno/skill/home-helper/SKILL.md")
+            .is_file()
+    );
+    assert!(!target.path().join("data/zuno/auth.json").exists());
+    assert!(!target.path().join("data/zuno/zuno-local.db").exists());
+    assert!(!target.path().join("cache/zuno/models.json").exists());
 }
 
 #[test]
-fn import_reports_a_missing_file() {
+fn export_without_a_path_creates_a_named_portable_bundle() {
     let root = tempfile::tempdir().expect("tempdir");
-    let output = run(root.path(), &["import", "/definitely/absent/export.json"]);
+    seed_portable_configuration(root.path());
+    let output = run(root.path(), &["export"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bundles = std::fs::read_dir(root.path())
+        .expect("export directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("zuno-export-") && name.ends_with(".zuno-bundle"))
+        .collect::<Vec<_>>();
+    assert_eq!(bundles.len(), 1, "{bundles:?}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("session"));
+}
+
+#[test]
+fn import_requires_explicit_replace_and_credentials_are_opt_in() {
+    let source = tempfile::tempdir().expect("source");
+    seed_portable_configuration(source.path());
+    let bundle = source.path().join("portable-with-credentials.zuno-bundle");
+    let output = export_bundle(source.path(), &bundle, true);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unencrypted credentials"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let target = tempfile::tempdir().expect("target");
+    let existing = target.path().join("config/zuno");
+    std::fs::create_dir_all(&existing).expect("target config");
+    std::fs::write(existing.join("zuno.json"), r#"{"keep":true}"#).expect("target marker");
+
+    let mut command = zuno();
+    command
+        .arg("import")
+        .arg(&bundle)
+        .current_dir(target.path());
+    isolated(&mut command, target.path());
+    let output = command.output().expect("import without replace");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("File not found"), "{stderr}");
+    assert!(stderr.contains("--replace"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(existing.join("zuno.json")).expect("unchanged target"),
+        r#"{"keep":true}"#
+    );
+
+    let mut command = zuno();
+    command
+        .arg("import")
+        .arg(&bundle)
+        .arg("--replace")
+        .current_dir(target.path());
+    isolated(&mut command, target.path());
+    let output = command.output().expect("import with replace");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.path().join("data/zuno/auth.json"))
+            .expect("imported credentials"),
+        r#"{"local":{"key":"secret"}}"#
+    );
+    assert!(!target.path().join("data/zuno/zuno-local.db").exists());
 }
 
 #[test]

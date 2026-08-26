@@ -535,29 +535,32 @@ pub struct DbArgs {
     pub format: DbFormat,
 }
 
-/// `export [sessionID] [--sanitize]` (`cli/cmd/export.ts:222-234`).
-///
-/// The id stays optional so the argument shape matches upstream's, but omitting
-/// it upstream opens a `@clack/prompts` picker (`export.ts:259-270`). This port
-/// has no picker, so the absent case fails with the same kind of message
-/// `providers login` already uses for its interactive selection rather than
-/// silently choosing a session for the caller.
+/// Export the portable Zuno user environment.
 #[derive(Debug, Clone, Args)]
 pub struct ExportArgs {
-    /// Session id to export.
-    #[arg(value_name = "sessionID")]
-    pub session_id: Option<String>,
-    /// Redact sensitive transcript and file data.
+    /// Bundle path; defaults to `zuno-export-<UTC timestamp>.zuno-bundle`.
+    #[arg(value_name = "bundle")]
+    pub output: Option<PathBuf>,
+    /// Include provider and MCP credential stores in the unencrypted bundle.
     #[arg(long)]
-    pub sanitize: bool,
+    pub include_credentials: bool,
+    /// Replace an existing output file.
+    #[arg(long)]
+    pub force: bool,
 }
 
-/// `import <file>` (`cli/cmd/import.ts:94-107`).
+/// Import a portable Zuno user environment.
 #[derive(Debug, Clone, Args)]
 pub struct ImportArgs {
-    /// Path to a JSON file produced by `export`.
-    #[arg(value_name = "file")]
-    pub file: String,
+    /// Path to a `.zuno-bundle` produced by `zuno export`.
+    #[arg(value_name = "bundle")]
+    pub file: PathBuf,
+    /// Transactionally replace non-empty target roots.
+    #[arg(long)]
+    pub replace: bool,
+    /// Validate and report the import without changing files.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -714,9 +717,9 @@ pub enum Command {
     Completion(CompletionArgs),
     /// Update Zuno in place from a checksum-verified GitHub release.
     SelfUpdate(SelfUpdateArgs),
-    /// Export session data as JSON.
+    /// Export Zuno configuration, Skills, extensions, Agents, and other user assets.
     Export(ExportArgs),
-    /// Import session data from a JSON file.
+    /// Import a portable Zuno user-environment bundle.
     Import(ImportArgs),
 
     /// Explain why the hosted Console is excluded.
@@ -1060,11 +1063,7 @@ mod tests {
             &["completion", "bash"],
             &["self-update", "--check"],
             &["export"],
-            // `<file>` is required, as upstream's `demandOption: true`
-            // (`cli/cmd/import.ts:98-102`) makes it; a bare `import` exits 1 on
-            // the released binary too, so this names a valid invocation rather
-            // than relaxing the requirement.
-            &["import", "exported.json"],
+            &["import", "environment.zuno-bundle"],
         ] {
             let cli = Cli::try_parse_from(std::iter::once("zuno").chain(args.iter().copied()))
                 .expect("registered command");
