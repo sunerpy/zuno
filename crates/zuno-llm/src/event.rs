@@ -92,7 +92,13 @@ pub enum ContentBlock {
         is_error: Option<bool>,
     },
     /// Inline binary input represented in a provider-neutral form.
-    Image { media_type: String, data: String },
+    Image {
+        /// Original display name when the image came from a local attachment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        media_type: String,
+        data: String,
+    },
 }
 
 impl ContentBlock {
@@ -145,7 +151,12 @@ impl ContentBlock {
                 content: content.clone(),
                 is_error: *is_error,
             }),
-            Self::Image { media_type, data } => Some(RequestContentBlock::Image {
+            Self::Image {
+                filename,
+                media_type,
+                data,
+            } => Some(RequestContentBlock::Image {
+                filename: filename.clone(),
                 media_type: media_type.clone(),
                 data: data.clone(),
             }),
@@ -188,7 +199,13 @@ pub enum RequestContentBlock {
         is_error: Option<bool>,
     },
     /// Inline binary input represented in a provider-neutral form.
-    Image { media_type: String, data: String },
+    Image {
+        /// Original display name when the image came from a local attachment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        media_type: String,
+        data: String,
+    },
 }
 
 /// A stored message whose content has not yet been filtered for replay.

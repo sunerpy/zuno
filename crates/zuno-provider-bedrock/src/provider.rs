@@ -508,7 +508,9 @@ fn converse_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provid
                     }
                 }))
             }
-            RequestContentBlock::Image { media_type, data } => Ok(json!({
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } => Ok(json!({
                 "image": {
                     "format": media_type.rsplit('/').next().unwrap_or(media_type),
                     "source": {"bytes": data}
@@ -650,7 +652,9 @@ fn anthropic_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provi
                 "content": content,
                 "is_error": is_error.unwrap_or(false)
             })),
-            RequestContentBlock::Image { media_type, data } => Ok(json!({
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } => Ok(json!({
                 "type": "image",
                 "source": {"type": "base64", "media_type": media_type, "data": data}
             })),

@@ -13,13 +13,16 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
-use zuno_llm::event::{ConnectionPhase, StreamEvent};
+use zuno_llm::event::{ConnectionPhase, RequestContentBlock, StreamEvent};
 
 use crate::cmd::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan, persisted_session_agent};
 use crate::command::{RunArgs, RunFormat};
 use crate::environment::StartupEnvironment;
 
 type ProgressPulse<'a> = Option<&'a dyn Fn()>;
+
+const TEXT_ATTACHMENT_MAX_BYTES: usize = 50 * 1_024;
+const TEXT_ATTACHMENT_MAX_LINES: usize = 2_000;
 
 pub(super) fn execute(
     args: &RunArgs,
@@ -32,6 +35,7 @@ pub(super) fn execute(
     } else {
         prompt(args)?
     };
+    let file_content = file_attachment_content(&message, &args.file)?;
     let session = SessionChoice::resolve(args.session.as_deref(), args.r#continue);
     let options = TurnOptions {
         directory: args.dir.as_deref().map(PathBuf::from),
@@ -82,7 +86,13 @@ pub(super) fn execute(
                         host.drive_command(command, &message, sender.clone())
                             .await?
                     }
-                    None => host.drive(&message, sender.clone()).await?,
+                    None => match file_content.as_deref() {
+                        Some(content) => {
+                            host.drive_content(&message, content, sender.clone())
+                                .await?
+                        }
+                        None => host.drive(&message, sender.clone()).await?,
+                    },
                 }
                 while host
                     .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, sender.clone())
@@ -117,8 +127,8 @@ fn validate_flags(args: &RunArgs) -> Result<(), String> {
     if args.share {
         return Err("--share is not available in the local Rust runtime".to_owned());
     }
-    if !args.file.is_empty() {
-        return Err("--file attachment projection is not available yet".to_owned());
+    if args.command.is_some() && !args.file.is_empty() {
+        return Err("--command and --file cannot be used together".to_owned());
     }
     if args.attach.is_some()
         || args.port.is_some()
@@ -164,6 +174,81 @@ fn prompt(args: &RunArgs) -> Result<String, String> {
         return Err("a message is required".to_owned());
     }
     Ok(message)
+}
+
+fn file_attachment_content(
+    prompt: &str,
+    files: &[String],
+) -> Result<Option<Vec<RequestContentBlock>>, String> {
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let mut content = vec![RequestContentBlock::Text {
+        text: prompt.to_owned(),
+    }];
+    for value in files {
+        let path = PathBuf::from(value);
+        let metadata = std::fs::metadata(&path)
+            .map_err(|error| format!("cannot inspect attachment `{}`: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "attachment `{}` is not a regular file",
+                path.display()
+            ));
+        }
+        if let Some(image) = zuno_tui::views::attachment::load_image_file(&path)? {
+            content.push(RequestContentBlock::Text {
+                text: format!("Attached image: {}", path.display()),
+            });
+            content.push(RequestContentBlock::Image {
+                filename: Some(image.filename),
+                media_type: image.media_type,
+                data: image.data,
+            });
+            continue;
+        }
+        if metadata.len() > u64::try_from(TEXT_ATTACHMENT_MAX_BYTES).unwrap_or(u64::MAX) {
+            return Err(format!(
+                "text attachment `{}` exceeds the {}-byte limit",
+                path.display(),
+                TEXT_ATTACHMENT_MAX_BYTES
+            ));
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        std::fs::File::open(&path)
+            .map_err(|error| format!("cannot read attachment `{}`: {error}", path.display()))?
+            .take(u64::try_from(TEXT_ATTACHMENT_MAX_BYTES).unwrap_or(u64::MAX) + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("cannot read attachment `{}`: {error}", path.display()))?;
+        if bytes.len() > TEXT_ATTACHMENT_MAX_BYTES {
+            return Err(format!(
+                "text attachment `{}` exceeds the {}-byte limit",
+                path.display(),
+                TEXT_ATTACHMENT_MAX_BYTES
+            ));
+        }
+        let body = String::from_utf8(bytes).map_err(|_| {
+            format!(
+                "attachment `{}` is neither UTF-8 text nor a supported PNG, JPEG, GIF, or WebP image",
+                path.display()
+            )
+        })?;
+        let lines = body.lines().count();
+        if lines > TEXT_ATTACHMENT_MAX_LINES {
+            return Err(format!(
+                "text attachment `{}` has {lines} lines, exceeding the {TEXT_ATTACHMENT_MAX_LINES}-line limit",
+                path.display()
+            ));
+        }
+        content.push(RequestContentBlock::Text {
+            text: format!(
+                "--- BEGIN ATTACHED FILE: {} ---\n{body}\n--- END ATTACHED FILE: {} ---",
+                path.display(),
+                path.display()
+            ),
+        });
+    }
+    Ok(Some(content))
 }
 
 async fn render_events(
@@ -527,6 +612,7 @@ fn to_string(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zuno_llm::event::RequestContentBlock;
 
     #[derive(Clone, Default)]
     struct StallCounter {
@@ -573,6 +659,49 @@ mod tests {
         args.r#continue = true;
         args.session = Some("ses_x".to_owned());
         assert!(validate_flags(&args).is_err());
+    }
+
+    #[test]
+    fn file_attachments_build_typed_text_and_image_content() {
+        let root = tempfile::tempdir().expect("attachment fixture");
+        let text = root.path().join("notes.txt");
+        let image = root.path().join("diagram.png");
+        std::fs::write(&text, "portable note\n").expect("text fixture");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nfixture").expect("image fixture");
+
+        let content = file_attachment_content(
+            "inspect these",
+            &[
+                text.to_string_lossy().into_owned(),
+                image.to_string_lossy().into_owned(),
+            ],
+        )
+        .expect("load explicit file attachments")
+        .expect("attachments produce rich content");
+
+        assert!(content.iter().any(|block| matches!(
+            block,
+            RequestContentBlock::Text { text }
+                if text.contains("notes.txt") && text.contains("portable note")
+        )));
+        assert!(content.iter().any(|block| matches!(
+            block,
+            RequestContentBlock::Image { filename, media_type, data }
+                if filename.as_deref() == Some("diagram.png")
+                    && media_type == "image/png"
+                    && !data.is_empty()
+        )));
+    }
+
+    #[test]
+    fn file_attachments_cannot_be_silently_dropped_by_a_custom_command() {
+        let mut args = run_args();
+        args.command = Some("review".to_owned());
+        args.file.push("diagram.png".to_owned());
+
+        let error = validate_flags(&args).expect_err("command attachments are not wired");
+        assert!(error.contains("--command"), "{error}");
+        assert!(error.contains("--file"), "{error}");
     }
 
     #[tokio::test]

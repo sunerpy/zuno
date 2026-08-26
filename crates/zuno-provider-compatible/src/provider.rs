@@ -265,7 +265,16 @@ impl Provider for CompatibleProvider {
     }
 
     fn stream(&self, request: CompletionRequest) -> ProviderStream<'_> {
-        let surface = self.quirks_for(&request.model_id, request.surface).surface;
+        let quirks = self.quirks_for(&request.model_id, request.surface);
+        if !quirks.accepts_attachments() && request_contains_attachment(&request) {
+            let error = ProviderError::UnsupportedCapability {
+                provider: self.spec.provider.clone(),
+                model: request.model_id,
+                capability: "attachments",
+            };
+            return Box::pin(futures::stream::once(async move { Err(error) }));
+        }
+        let surface = quirks.surface;
         let http = self.http_request(&request);
         let provider = self.spec.provider.clone();
         let model = request.model_id.clone();
@@ -282,6 +291,15 @@ impl Provider for CompatibleProvider {
             .flatten(),
         )
     }
+}
+
+fn request_contains_attachment(request: &CompletionRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, zuno_llm::event::RequestContentBlock::Image { .. }))
+    })
 }
 
 /// Drive one response body to completion, emitting shared events.
@@ -485,6 +503,7 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
 
     #[derive(Debug)]
     struct NeverCalled;
@@ -502,6 +521,32 @@ mod tests {
             >,
         > {
             unreachable!("these tests never open a stream")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingTransport {
+        requests: Mutex<Vec<HttpRequest>>,
+    }
+
+    impl Transport for RecordingTransport {
+        fn send(
+            &self,
+            request: HttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::transport::ChunkStream, ProviderError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.requests.lock().expect("request lock").push(request);
+            Box::pin(async {
+                let stream: crate::transport::ChunkStream =
+                    Box::pin(futures::stream::empty::<Result<Vec<u8>, ProviderError>>());
+                Ok(stream)
+            })
         }
     }
 
@@ -549,6 +594,77 @@ mod tests {
         assert!(provider.capabilities().sampling_params);
         assert!(!provider.capabilities_for("o3").sampling_params);
         assert!(provider.capabilities_for("llama-3.3-70b").sampling_params);
+    }
+
+    #[tokio::test]
+    async fn a_text_only_model_rejects_an_image_before_the_transport_is_called() {
+        let provider = groq();
+        let request = CompletionRequest::new(
+            "llama-3.3-70b",
+            vec![zuno_llm::event::Message::from_content(
+                zuno_llm::event::Role::User,
+                vec![zuno_llm::event::RequestContentBlock::Image {
+                    filename: Some("diagram.png".to_owned()),
+                    media_type: "image/png".to_owned(),
+                    data: "AAAA".to_owned(),
+                }],
+            )],
+        );
+
+        let error = provider
+            .stream(request)
+            .next()
+            .await
+            .expect("one local failure event")
+            .expect_err("the image must not be silently dropped");
+        let ProviderError::UnsupportedCapability {
+            provider,
+            model,
+            capability,
+        } = error
+        else {
+            panic!("unsupported attachments must be a typed permanent failure");
+        };
+        assert_eq!(provider, "groq");
+        assert_eq!(model, "llama-3.3-70b");
+        assert_eq!(capability, "attachments");
+    }
+
+    #[tokio::test]
+    async fn an_image_capable_model_serializes_the_image_and_calls_transport() {
+        let transport = Arc::new(RecordingTransport::default());
+        let spec = Spec::new("groq")
+            .with_base_url("https://api.groq.com/openai/v1")
+            .with_option(
+                MODEL_CAPABILITIES_OPTION,
+                json!({"vision-model": {"attachments": true}}),
+            );
+        let provider = CompatibleProvider::new(spec, transport.clone(), Some("k".to_owned()))
+            .expect("image-capable provider");
+        let request = CompletionRequest::new(
+            "vision-model",
+            vec![zuno_llm::event::Message::from_content(
+                zuno_llm::event::Role::User,
+                vec![zuno_llm::event::RequestContentBlock::Image {
+                    filename: Some("synthetic.png".to_owned()),
+                    media_type: "image/png".to_owned(),
+                    data: "AAAA".to_owned(),
+                }],
+            )],
+        );
+
+        let _events = provider.stream(request).collect::<Vec<_>>().await;
+
+        let requests = transport.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 1, "the image request must reach transport");
+        assert!(
+            requests[0]
+                .body
+                .to_string()
+                .contains("data:image/png;base64,AAAA"),
+            "the serialized request must retain the typed image: {}",
+            requests[0].body
+        );
     }
 
     /// A spec's `extraBody` is copied onto the body verbatim.

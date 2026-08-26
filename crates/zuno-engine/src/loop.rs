@@ -444,6 +444,11 @@ impl TurnError {
             Self::Provider(ProviderError::Transient { .. }) => {
                 "The provider connection failed before the turn completed.".to_owned()
             }
+            Self::Provider(ProviderError::UnsupportedCapability {
+                provider,
+                model,
+                capability,
+            }) => format!("Model `{provider}/{model}` does not support `{capability}` input."),
             Self::Provider(ProviderError::Refused { .. } | ProviderError::Fatal { .. }) => {
                 "The provider rejected or malformed the response before the turn completed."
                     .to_owned()
@@ -493,7 +498,11 @@ impl TurnError {
             Self::Provider(ProviderError::Auth { .. }) | Self::EventConsumerClosed => {
                 TurnRecovery::Pause
             }
-            Self::Provider(ProviderError::Refused { .. } | ProviderError::Fatal { .. })
+            Self::Provider(
+                ProviderError::Refused { .. }
+                | ProviderError::UnsupportedCapability { .. }
+                | ProviderError::Fatal { .. },
+            )
             | Self::NoUserMessage { .. }
             | Self::MissingUserField { .. }
             | Self::AgentNotFound { .. }
@@ -2140,6 +2149,7 @@ fn provider_error_metadata(error: &ProviderError) -> (&'static str, Option<u16>)
         ProviderError::Transient { status, .. } => ("transient", *status),
         ProviderError::Auth { .. } => ("authentication", None),
         ProviderError::Refused { .. } => ("refused", None),
+        ProviderError::UnsupportedCapability { .. } => ("unsupported_capability", None),
         ProviderError::Fatal { status, .. } => ("fatal", *status),
     }
 }
@@ -2668,10 +2678,16 @@ fn append_user_message(messages: &mut Vec<Message>, message: &MessageWithParts) 
                 }
             }
             PartKind::File => {
+                let filename = part
+                    .data
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let media_type = part.data.get("mime").and_then(Value::as_str);
                 let data = part.data.get("data").and_then(Value::as_str);
                 if let (Some(media_type), Some(data)) = (media_type, data) {
                     content.push(RequestContentBlock::Image {
+                        filename,
                         media_type: media_type.to_owned(),
                         data: data.to_owned(),
                     });
@@ -2711,10 +2727,15 @@ fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>
                 }
             }
             PartKind::File => {
+                let filename = take_string(&mut part.data, "filename");
                 let media_type = take_string(&mut part.data, "mime");
                 let data = take_string(&mut part.data, "data");
                 if let (Some(media_type), Some(data)) = (media_type, data) {
-                    content.push(RequestContentBlock::Image { media_type, data });
+                    content.push(RequestContentBlock::Image {
+                        filename,
+                        media_type,
+                        data,
+                    });
                 }
             }
             PartKind::Subtask

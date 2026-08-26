@@ -438,7 +438,9 @@ fn translate_response_tool_results(message: &Message, quirks: &Quirks) -> Vec<Va
             .content
             .iter()
             .filter_map(|block| match block {
-                RequestContentBlock::Image { media_type, data } => Some(json!({
+                RequestContentBlock::Image {
+                    media_type, data, ..
+                } => Some(json!({
                     "type": "input_image",
                     "image_url": format!("data:{media_type};base64,{data}"),
                 })),
@@ -481,12 +483,12 @@ fn response_content(message: &Message, quirks: &Quirks) -> Vec<Value> {
         .iter()
         .filter_map(|block| match block {
             RequestContentBlock::Text { text } => Some(json!({"type": "input_text", "text": text})),
-            RequestContentBlock::Image { media_type, data } if quirks.accepts_attachments() => {
-                Some(json!({
-                    "type": "input_image",
-                    "image_url": format!("data:{media_type};base64,{data}"),
-                }))
-            }
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } if quirks.accepts_attachments() => Some(json!({
+                "type": "input_image",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            })),
             _ => None,
         })
         .collect()
@@ -520,7 +522,9 @@ fn translate_plain(message: &Message, quirks: &Quirks) -> Vec<Value> {
                 text.push_str(value);
                 parts.push(json!({"type": "text", "text": value}));
             }
-            RequestContentBlock::Image { media_type, data } if quirks.accepts_attachments() => {
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } if quirks.accepts_attachments() => {
                 has_attachment = true;
                 parts.push(json!({
                     "type": "image_url",
@@ -1234,6 +1238,7 @@ mod tests {
                     text: "what is this".to_owned(),
                 },
                 RequestContentBlock::Image {
+                    filename: None,
                     media_type: "image/png".to_owned(),
                     data: "AAAA".to_owned(),
                 },

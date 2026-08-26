@@ -689,6 +689,7 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
             text: "--- BEGIN REFERENCED FILE: note.txt ---\nreal body\n--- END REFERENCED FILE: note.txt ---".to_owned(),
         },
         RequestContentBlock::Image {
+            filename: Some("diagram.png".to_owned()),
             media_type: "image/png".to_owned(),
             data: "aW1hZ2U=".to_owned(),
         },
@@ -709,6 +710,7 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
         .find(|part| part.kind == zuno_db::message::PartKind::File)
         .expect("the image became a stored file part");
     assert_eq!(image.data["mime"], "image/png");
+    assert_eq!(image.data["filename"], "diagram.png");
     assert_eq!(image.data["data"], "aW1hZ2U=");
 }
 
@@ -2786,6 +2788,57 @@ fn the_endpoint_keys_do_not_also_travel_in_the_option_bag() {
         !format!("{:?}", spec.options).contains("sk-"),
         "key material reached the option bag: {:?}",
         spec.options
+    );
+}
+
+#[test]
+fn a_configured_image_modality_reaches_the_compatible_provider_capability_map() {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "vision-gateway": {
+                "transport": "openai",
+                "surface": "responses",
+                "options": {"baseURL": "http://127.0.0.1:8787/v1"},
+                "models": {
+                    "vision-model": {
+                        "attachment": true,
+                        "reasoning": true,
+                        "tool_call": true,
+                        "modalities": {
+                            "input": ["text", "image"],
+                            "output": ["text"]
+                        },
+                        "limit": {"context": 1000, "output": 100}
+                    }
+                }
+            }
+        }
+    }))
+    .expect("vision provider config");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let model = catalog
+        .model("vision-gateway", "vision-model")
+        .expect("configured model resolves");
+    assert!(
+        model.capabilities.input.image,
+        "fixture must be image-capable"
+    );
+
+    let spec = model_spec(&catalog, model, &Env::empty()).expect("compatible spec resolves");
+    let capabilities = spec
+        .options
+        .get(zuno_provider_compatible::provider::MODEL_CAPABILITIES_OPTION)
+        .and_then(serde_json::Value::as_object)
+        .and_then(|models| models.get(&model.api.id))
+        .and_then(serde_json::Value::as_object)
+        .expect("resolved per-model capability map");
+    assert_eq!(
+        capabilities.get("attachments"),
+        Some(&serde_json::json!(true)),
+        "an image-capable model must not be rejected as text-only before transport"
     );
 }
 

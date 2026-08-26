@@ -15,6 +15,7 @@ publish.workspace = true
 # and this workspace treats warnings as failures.
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 crossterm = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-llm = { workspace = true }
@@ -50,6 +51,7 @@ tree-sitter-typescript = { workspace = true }
 tree-sitter-yaml = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

@@ -2280,15 +2280,17 @@ fn dispatch_child_prompt(
     submission: PromptSubmission,
 ) -> Result<(), String> {
     let text = match &submission {
-        PromptSubmission::Text(text) => text.clone(),
+        PromptSubmission::Text(text) | PromptSubmission::Content { text, .. } => text.clone(),
         PromptSubmission::Steer(inner) => match inner.as_ref() {
-            PromptSubmission::Text(text) => text.clone(),
+            PromptSubmission::Text(text) | PromptSubmission::Content { text, .. } => text.clone(),
             _ => {
-                return Err("an attached child session accepts plain text input only".to_owned());
+                return Err(
+                    "an attached child session accepts text and image input only".to_owned(),
+                );
             }
         },
         _ => {
-            return Err("an attached child session accepts plain text input only".to_owned());
+            return Err("an attached child session accepts text and image input only".to_owned());
         }
     };
     let prompt =
@@ -3327,7 +3329,9 @@ fn soft_interrupt(
                     zuno_llm::event::RequestContentBlock::Text { text: block } => {
                         text.push(block.clone());
                     }
-                    zuno_llm::event::RequestContentBlock::Image { media_type, data } => {
+                    zuno_llm::event::RequestContentBlock::Image {
+                        media_type, data, ..
+                    } => {
                         images.push((media_type.clone(), data.clone()));
                     }
                     _ => return None,
@@ -3995,6 +3999,7 @@ mod tests {
                     text: String::from("Referenced image: diagram.png"),
                 },
                 zuno_llm::event::RequestContentBlock::Image {
+                    filename: Some(String::from("diagram.png")),
                     media_type: String::from("image/png"),
                     data: String::from("AAAA"),
                 },
@@ -4023,6 +4028,7 @@ mod tests {
             PromptSubmission::Content {
                 text: String::from("inspect @diagram.png"),
                 content: vec![zuno_llm::event::RequestContentBlock::Image {
+                    filename: Some(String::from("diagram.png")),
                     media_type: String::from("image/png"),
                     data: String::from("AAAA"),
                 }],

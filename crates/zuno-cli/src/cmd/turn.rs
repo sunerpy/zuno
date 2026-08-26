@@ -5556,6 +5556,46 @@ fn expand_variables(url: &str, env: &zuno_paths::Env) -> String {
     expanded
 }
 
+/// Publish the selected catalog model's typed capabilities to a compatible provider.
+///
+/// A compatible provider instance is constructed from one selected model, while its
+/// request quirk table still keys overrides by the wire model id. The resolved catalog
+/// is the authority here: model configuration has already been merged and normalized
+/// into booleans, so forwarding only the free-form option bags would drop facts such as
+/// `modalities.input: ["image"]` before the provider can validate a rich request.
+fn with_compatible_model_capabilities(
+    mut spec: Spec,
+    model: &zuno_llm::catalog::ResolvedModel,
+) -> Spec {
+    let option = zuno_provider_compatible::provider::MODEL_CAPABILITIES_OPTION;
+    let mut models = spec
+        .options
+        .get(option)
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut capabilities = models
+        .remove(&model.api.id)
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    capabilities.insert("reasoning".to_owned(), json!(model.capabilities.reasoning));
+    capabilities.insert("tool_calls".to_owned(), json!(model.capabilities.toolcall));
+    capabilities.insert(
+        "attachments".to_owned(),
+        json!(model.capabilities.input.image),
+    );
+    capabilities.insert(
+        "sampling_params".to_owned(),
+        json!(model.capabilities.temperature),
+    );
+    models.insert(
+        model.api.id.clone(),
+        serde_json::Value::Object(capabilities),
+    );
+    spec = spec.with_option(option, serde_json::Value::Object(models));
+    spec
+}
+
 /// The transport spec for one model: endpoint, headers and forwarded options.
 ///
 /// The option bag comes from [`forwarded_options`], which seeds it from the provider
@@ -5664,6 +5704,7 @@ fn model_spec(
         spec = spec.with_option(generation::MAX_TOKENS, json!(output_ceiling(model)));
     }
     if factory_key == COMPATIBLE_PROVIDER {
+        spec = with_compatible_model_capabilities(spec, model);
         // `family::resolve` accepts an unlisted identity only when its resolved model
         // explicitly selects the generic compatible transport. Carry that typed
         // decision across this boundary rather than making the family guess.
@@ -6484,11 +6525,16 @@ fn request_content_parts(
                     "type": "text",
                     "text": text,
                 }),
-                RequestContentBlock::Image { media_type, data } => json!({
+                RequestContentBlock::Image {
+                    filename,
+                    media_type,
+                    data,
+                } => json!({
                     "id": prefixed_id("prt"),
                     "sessionID": input.session_id,
                     "messageID": message_id,
                     "type": "file",
+                    "filename": filename,
                     "mime": media_type,
                     "data": data,
                     "url": format!("data:{media_type};base64,{data}"),

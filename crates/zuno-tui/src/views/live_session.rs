@@ -184,6 +184,7 @@ pub struct LiveSessionView {
     scroller: Scroller,
     status: StatusView,
     composer: InputEditor,
+    attachments: crate::views::attachment::AttachmentDraft,
 }
 
 impl LiveSessionView {
@@ -218,6 +219,7 @@ impl LiveSessionView {
             scroller,
             status,
             composer,
+            attachments: crate::views::attachment::AttachmentDraft::default(),
         })
     }
 
@@ -271,8 +273,39 @@ impl LiveSessionView {
         EventResult::REDRAW
     }
 
+    pub fn attach_pasted_image(&mut self, text: &str) -> Result<bool, String> {
+        let Some(placeholder) = self.attachments.attach_pasted_path(text)? else {
+            return Ok(false);
+        };
+        self.composer.insert_text(&placeholder);
+        Ok(true)
+    }
+
+    pub fn attach_clipboard_image(&mut self, media_type: &str, data: &str) -> Result<(), String> {
+        let placeholder = self.attachments.attach_clipboard_image(media_type, data)?;
+        self.composer.insert_text(&placeholder);
+        Ok(())
+    }
+
+    pub(crate) fn take_attached_prompt(
+        &mut self,
+        text: &str,
+    ) -> Option<crate::views::attachment::AttachedPrompt> {
+        self.attachments.take_prompt(text)
+    }
+
     pub fn handle_composer_action(&mut self, action: &'static Definition) -> EditorSignal {
-        self.composer.handle_action(action)
+        let attached_submission = matches!(
+            action.name,
+            "input_submit" | "input_force_submit" | "prompt_submit"
+        ) && self
+            .attachments
+            .has_attached_prompt(&self.composer.submission_text());
+        if attached_submission {
+            self.composer.handle_action_without_history(action)
+        } else {
+            self.composer.handle_action(action)
+        }
     }
 
     /// Route a pointer gesture into the attached child's own composer.
@@ -307,6 +340,19 @@ impl LiveSessionView {
         self.transcript
             .transcript_mut()
             .push(Message::user(text.into()));
+        self.transcript.follow();
+    }
+
+    pub(crate) fn push_user_submission_with_attachments(
+        &mut self,
+        text: impl Into<String>,
+        attachments: &[crate::views::attachment::AttachmentLabel],
+    ) {
+        let mut message = Message::user(text.into());
+        for attachment in attachments {
+            message.attach(&attachment.filename, Some(attachment.mime.clone()));
+        }
+        self.transcript.transcript_mut().push(message);
         self.transcript.follow();
     }
 

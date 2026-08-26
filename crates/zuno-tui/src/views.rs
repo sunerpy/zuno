@@ -44,6 +44,7 @@ use ratatui::text::{Line, Span};
 use std::sync::{Arc, PoisonError, RwLock};
 
 pub mod ambient;
+pub mod attachment;
 pub mod autocomplete;
 pub mod background;
 pub mod basics;

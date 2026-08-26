@@ -268,7 +268,8 @@ pub fn classify_response(
         // a new variant forces a decision here.
         other @ (ProviderError::RateLimited { .. }
         | ProviderError::ContextLimit { .. }
-        | ProviderError::Refused { .. }) => other,
+        | ProviderError::Refused { .. }
+        | ProviderError::UnsupportedCapability { .. }) => other,
     }
 }
 

@@ -550,6 +550,7 @@ pub struct SessionScreen {
     pointer: Option<PointerGesture>,
     status: StatusView,
     editor: InputEditor,
+    attachments: crate::views::attachment::AttachmentDraft,
     autocomplete: AutocompleteView,
     autocomplete_area: Option<Rect>,
     slash: SlashRouter,
@@ -914,6 +915,7 @@ impl SessionScreen {
             welcome_enabled: true,
             sidebar: crate::views::ambient::SidebarView::new(context.clone()),
             editor: InputEditor::new(context.clone()).with_placeholder(PROMPT_PLACEHOLDER),
+            attachments: crate::views::attachment::AttachmentDraft::default(),
             autocomplete: AutocompleteView::new(
                 context.clone(),
                 Box::new(SlashSource::new(slash.clone())),
@@ -1493,6 +1495,19 @@ impl SessionScreen {
     /// had gone away, rendered identically to one accepted, is the defect where "no
     /// results" and "cannot see the data" look the same.
     fn submit(&mut self, text: String, force: bool) {
+        if let Some(attached) = self.attachments.take_prompt(&text) {
+            let submission = PromptSubmission::Content {
+                text: text.clone(),
+                content: attached.content,
+            };
+            let submission = if force {
+                PromptSubmission::Steer(Box::new(submission))
+            } else {
+                submission
+            };
+            self.submit_to_driver_with_attachments(text, submission, attached.labels);
+            return;
+        }
         match self.slash.resolve(&text) {
             SlashSubmission::Prompt(prompt) => {
                 let submission = PromptSubmission::Text(prompt.clone());
@@ -1765,6 +1780,15 @@ impl SessionScreen {
     }
 
     fn submit_to_driver(&mut self, shown: String, submission: PromptSubmission) {
+        self.submit_to_driver_with_attachments(shown, submission, Vec::new());
+    }
+
+    fn submit_to_driver_with_attachments(
+        &mut self,
+        shown: String,
+        submission: PromptSubmission,
+        attachments: Vec<crate::views::attachment::AttachmentLabel>,
+    ) {
         let submission = if self.status.is_running()
             && !matches!(
                 submission,
@@ -1774,9 +1798,11 @@ impl SessionScreen {
         } else {
             submission
         };
-        self.transcript
-            .transcript_mut()
-            .push(Message::user(shown.clone()));
+        let mut message = Message::user(shown.clone());
+        for attachment in attachments {
+            message.attach(attachment.filename, Some(attachment.mime));
+        }
+        self.transcript.transcript_mut().push(message);
         if let Some(prompts) = self.prompts.as_ref() {
             let tracks_model_turn = matches!(
                 submission,
@@ -1813,13 +1839,25 @@ impl SessionScreen {
             return EventResult::IGNORED;
         };
         let session_id = live.session_id().to_owned();
-        let submission = PromptSubmission::Text(shown.clone());
+        let attached = live.take_attached_prompt(&shown);
+        let (submission, attachments) = attached.map_or_else(
+            || (PromptSubmission::Text(shown.clone()), Vec::new()),
+            |attached| {
+                (
+                    PromptSubmission::Content {
+                        text: shown.clone(),
+                        content: attached.content,
+                    },
+                    attached.labels,
+                )
+            },
+        );
         let submission = if live.is_running() {
             PromptSubmission::Steer(Box::new(submission))
         } else {
             submission
         };
-        live.push_user_submission(shown.clone());
+        live.push_user_submission_with_attachments(shown.clone(), &attachments);
 
         if let Some(prompts) = self.prompts.as_ref() {
             match prompts.try_send(TargetedPromptSubmission::session(session_id, submission)) {
@@ -1839,12 +1877,18 @@ impl SessionScreen {
 
     fn paste_into_live_from_clipboard(&mut self) -> EventResult {
         let (level, notice) = match self.clipboard.read() {
-            Ok(Some(content)) if content.is_image() => (
-                ToastLevel::Warning,
-                String::from(
-                    "the clipboard holds an image; pasting an attachment is not supported yet",
-                ),
-            ),
+            Ok(Some(content)) if content.is_image() => {
+                let Some(live) = self.live_session.as_mut() else {
+                    return EventResult::IGNORED;
+                };
+                return match live.attach_clipboard_image(&content.mime, &content.data) {
+                    Ok(()) => EventResult::REDRAW,
+                    Err(error) => {
+                        self.toasts.push(Toast::error(error));
+                        EventResult::REDRAW
+                    }
+                };
+            }
             Ok(Some(content)) => {
                 return self
                     .live_session
@@ -1920,6 +1964,20 @@ impl SessionScreen {
                 )));
             return EventResult::REDRAW;
         }
+        match self.attachments.attach_pasted_path(text) {
+            Ok(Some(placeholder)) => {
+                self.editor.insert_text(&placeholder);
+                self.refresh_autocomplete();
+                return EventResult::REDRAW;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.transcript
+                    .transcript_mut()
+                    .push(Message::noticed(ToastLevel::Error, error));
+                return EventResult::REDRAW;
+            }
+        }
         if self.editor.insert_paste(text) == EditorSignal::None {
             return EventResult::IGNORED;
         }
@@ -1942,12 +2000,24 @@ impl SessionScreen {
         // `§11.5` gives those different colours, and the copy path beside this one already
         // makes exactly that distinction with its toasts.
         let (level, notice) = match self.clipboard.read() {
-            Ok(Some(content)) if content.is_image() => (
-                ToastLevel::Warning,
-                String::from(
-                    "the clipboard holds an image; pasting an attachment is not supported yet",
-                ),
-            ),
+            Ok(Some(content)) if content.is_image() => {
+                return match self
+                    .attachments
+                    .attach_clipboard_image(&content.mime, &content.data)
+                {
+                    Ok(placeholder) => {
+                        self.editor.insert_text(&placeholder);
+                        self.refresh_autocomplete();
+                        EventResult::REDRAW
+                    }
+                    Err(error) => {
+                        self.transcript
+                            .transcript_mut()
+                            .push(Message::noticed(ToastLevel::Error, error));
+                        EventResult::REDRAW
+                    }
+                };
+            }
             Ok(Some(content)) => return self.paste(&content.data),
             Ok(None) => (
                 ToastLevel::Warning,
@@ -2287,10 +2357,18 @@ impl Component for SessionScreen {
             && let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Paste(text))) = event
         {
             if let Some(live) = self.live_session.as_mut() {
-                // Unlike the root composer, a child has no slash router. Keep the terminal
-                // payload literal rather than applying `InputEditor::insert_paste`'s leading
-                // slash escape for root commands.
-                return live.insert_text(text);
+                return match live.attach_pasted_image(text) {
+                    Ok(true) => EventResult::REDRAW,
+                    Ok(false) => {
+                        // Unlike the root composer, a child has no slash router. Keep the
+                        // terminal payload literal rather than applying the root command escape.
+                        live.insert_text(text)
+                    }
+                    Err(error) => {
+                        self.toasts.push(Toast::error(error));
+                        EventResult::REDRAW
+                    }
+                };
             }
             return self.paste(text);
         }
@@ -4646,7 +4724,18 @@ impl ActionComponent for SessionScreen {
         if self.handle_view_action(action).handled {
             return EventResult::REDRAW;
         }
-        match self.editor.handle_action(action) {
+        let attached_submission = matches!(
+            action.name,
+            "input_submit" | "input_force_submit" | "prompt_submit"
+        ) && self
+            .attachments
+            .has_attached_prompt(&self.editor.submission_text());
+        let signal = if attached_submission {
+            self.editor.handle_action_without_history(action)
+        } else {
+            self.editor.handle_action(action)
+        };
+        match signal {
             EditorSignal::None => EventResult::IGNORED,
             EditorSignal::Submit(text) => {
                 self.submit(text, action.name == "input_force_submit");

@@ -798,8 +798,15 @@ pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
                     content: truncate_tool_output_owned(content),
                     is_error,
                 },
-                RequestContentBlock::Image { media_type, .. } => RequestContentBlock::Text {
-                    text: format!("[Attached {media_type}]"),
+                RequestContentBlock::Image {
+                    filename,
+                    media_type,
+                    ..
+                } => RequestContentBlock::Text {
+                    text: filename.map_or_else(
+                        || format!("[Attached {media_type}]"),
+                        |filename| format!("[Attached {filename} ({media_type})]"),
+                    ),
                 },
                 RequestContentBlock::Text { text } => RequestContentBlock::Text { text },
                 RequestContentBlock::SignedThinking {
@@ -980,4 +987,30 @@ fn compaction_part_id(attempt_id: &str) -> String {
 
 fn summary_part_id(attempt_id: &str) -> String {
     format!("prt_{attempt_id}_summary")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_safe_images_keep_their_human_filename_without_their_bytes() {
+        let message = Message::from_content(
+            Role::User,
+            vec![RequestContentBlock::Image {
+                filename: Some("diagram.png".to_owned()),
+                media_type: "image/png".to_owned(),
+                data: "large-base64-payload".to_owned(),
+            }],
+        );
+
+        let safe = summary_safe_message_owned(message);
+
+        assert_eq!(
+            safe.content,
+            vec![RequestContentBlock::Text {
+                text: "[Attached diagram.png (image/png)]".to_owned(),
+            }]
+        );
+    }
 }

@@ -178,7 +178,9 @@ fn content_value(block: &RequestContentBlock) -> Result<Value, ProviderError> {
             }
             Ok(value)
         }
-        RequestContentBlock::Image { media_type, data } => Ok(json!({
+        RequestContentBlock::Image {
+            media_type, data, ..
+        } => Ok(json!({
             "type": "image",
             "source": {
                 "type": "base64",

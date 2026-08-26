@@ -10,7 +10,6 @@ use std::fs::File;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
 use zuno_llm::event::RequestContentBlock;
 use zuno_tui::views::autocomplete::{Candidate, CandidateKind, CompletionSource, Trigger};
 use zuno_tui::views::session::PromptSubmission;
@@ -113,17 +112,27 @@ pub(super) async fn resolve_submission(
         Delivery::Queue => PromptSubmission::Queue(Box::new(submission)),
         Delivery::Steer => PromptSubmission::Steer(Box::new(submission)),
     };
-    let PromptSubmission::Text(text) = submission else {
-        return Ok(wrap(submission));
+    let (text, existing_content) = match submission {
+        PromptSubmission::Text(text) => (text, None),
+        PromptSubmission::Content { text, content } => (text, Some(content)),
+        submission => return Ok(wrap(submission)),
     };
     let references = reference_tokens(&text)?;
     let resolved = if references.is_empty() {
-        PromptSubmission::Text(text)
+        existing_content.map_or_else(
+            || PromptSubmission::Text(text.clone()),
+            |content| PromptSubmission::Content {
+                text: text.clone(),
+                content,
+            },
+        )
     } else {
         let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || resolve_text_submission(&root, text, references))
-            .await
-            .map_err(|error| format!("file reference worker failed: {error}"))??
+        tokio::task::spawn_blocking(move || {
+            resolve_text_submission(&root, text, existing_content, references)
+        })
+        .await
+        .map_err(|error| format!("file reference worker failed: {error}"))??
     };
     Ok(wrap(resolved))
 }
@@ -150,6 +159,7 @@ fn reference_tokens(text: &str) -> Result<Vec<String>, String> {
 fn resolve_text_submission(
     root: &Path,
     text: String,
+    existing_content: Option<Vec<RequestContentBlock>>,
     references: Vec<String>,
 ) -> Result<PromptSubmission, String> {
     let canonical_root = root.canonicalize().map_err(|error| {
@@ -158,20 +168,24 @@ fn resolve_text_submission(
             root.display()
         )
     })?;
-    let mut content = vec![RequestContentBlock::Text { text: text.clone() }];
+    let mut content =
+        existing_content.unwrap_or_else(|| vec![RequestContentBlock::Text { text: text.clone() }]);
     for reference in references {
         let path = resolve_path(&canonical_root, &reference)?;
-        let bytes = read_bounded(&path, &reference)?;
-        if let Some(media_type) = image_media_type(&bytes) {
+        if let Some(image) = zuno_tui::views::attachment::load_image_file(&path)
+            .map_err(|error| format!("file reference `@{reference}` refused: {error}"))?
+        {
             content.push(RequestContentBlock::Text {
                 text: format!("Referenced image: {reference}"),
             });
             content.push(RequestContentBlock::Image {
-                media_type: media_type.to_owned(),
-                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                filename: Some(image.filename),
+                media_type: image.media_type,
+                data: image.data,
             });
             continue;
         }
+        let bytes = read_bounded(&path, &reference)?;
         let body = String::from_utf8(bytes).map_err(|_| {
             format!(
                 "file reference `@{reference}` is neither UTF-8 text nor a supported PNG, JPEG, GIF, or WebP image"
@@ -233,20 +247,6 @@ fn read_bounded(path: &Path, reference: &str) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(bytes)
-}
-
-fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
 }
 
 fn slash(path: &Path) -> String {

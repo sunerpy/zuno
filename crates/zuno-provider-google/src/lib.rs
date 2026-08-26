@@ -614,9 +614,12 @@ fn lower_gemini_block(
     match (role, block) {
         (Role::User, RequestContentBlock::Text { text })
         | (Role::Assistant, RequestContentBlock::Text { text }) => Ok(json!({"text": text})),
-        (Role::User, RequestContentBlock::Image { media_type, data }) => {
-            Ok(json!({"inlineData": {"mimeType": media_type, "data": data}}))
-        }
+        (
+            Role::User,
+            RequestContentBlock::Image {
+                media_type, data, ..
+            },
+        ) => Ok(json!({"inlineData": {"mimeType": media_type, "data": data}})),
         (
             Role::Assistant,
             RequestContentBlock::SignedThinking {
@@ -1364,7 +1367,12 @@ fn lower_anthropic_block(
         | (Role::Assistant, RequestContentBlock::Text { text }) => {
             Ok(json!({"type": "text", "text": text}))
         }
-        (Role::User, RequestContentBlock::Image { media_type, data }) => Ok(json!({
+        (
+            Role::User,
+            RequestContentBlock::Image {
+                media_type, data, ..
+            },
+        ) => Ok(json!({
             "type": "image",
             "source": {"type": "base64", "media_type": media_type, "data": data},
         })),

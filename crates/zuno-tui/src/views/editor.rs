@@ -668,11 +668,28 @@ impl InputEditor {
     }
 
     /// Act on one resolved binding.
+    pub fn handle_action(&mut self, action: &'static Definition) -> EditorSignal {
+        self.handle_action_recording(action, true)
+    }
+
+    /// Act on one resolved binding without adding a submitted prompt to text history.
+    ///
+    /// Rich attachments are held outside the editor. Remembering only their visible
+    /// `[Image #N]` token would create a history entry that cannot reconstruct the
+    /// corresponding bytes, so attachment owners use this path for that submission.
+    pub fn handle_action_without_history(&mut self, action: &'static Definition) -> EditorSignal {
+        self.handle_action_recording(action, false)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one arm per binding; splitting it would only hide the table"
     )]
-    pub fn handle_action(&mut self, action: &'static Definition) -> EditorSignal {
+    fn handle_action_recording(
+        &mut self,
+        action: &'static Definition,
+        record_submission: bool,
+    ) -> EditorSignal {
         match action.name {
             // -- submission and external surfaces ---------------------------
             "input_submit" | "input_force_submit" | "prompt_submit" => {
@@ -680,7 +697,9 @@ impl InputEditor {
                 if text.trim().is_empty() {
                     return EditorSignal::None;
                 }
-                self.remember(&text);
+                if record_submission {
+                    self.remember(&text);
+                }
                 self.lines = vec![String::new()];
                 self.cursor = Position::default();
                 self.anchor = None;

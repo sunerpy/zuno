@@ -238,7 +238,9 @@ fn chat_plain(message: &Message) -> Result<Value, ProviderError> {
                 text.push_str(fragment);
                 parts.push(json!({ "type": "text", "text": fragment }));
             }
-            RequestContentBlock::Image { media_type, data } => {
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } => {
                 has_image = true;
                 parts.push(json!({
                     "type": "image_url",
@@ -372,7 +374,9 @@ fn responses_tool_results(message: &Message) -> Vec<Value> {
         .content
         .iter()
         .filter_map(|block| match block {
-            RequestContentBlock::Image { media_type, data } => Some(json!({
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } => Some(json!({
                 "type": "input_image",
                 "image_url": format!("data:{media_type};base64,{data}"),
             })),
@@ -412,7 +416,9 @@ fn responses_content(message: &Message, text_type: &str, image_type: &str) -> Ve
         .iter()
         .filter_map(|block| match block {
             RequestContentBlock::Text { text } => Some(json!({ "type": text_type, "text": text })),
-            RequestContentBlock::Image { media_type, data } => Some(json!({
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } => Some(json!({
                 "type": image_type,
                 "image_url": format!("data:{media_type};base64,{data}"),
             })),

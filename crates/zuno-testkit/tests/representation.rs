@@ -567,7 +567,9 @@ fn message_payload_bytes(message: &Message) -> usize {
                 content,
                 is_error: _,
             } => tool_use_id.len() + content.len(),
-            RequestContentBlock::Image { media_type, data } => media_type.len() + data.len(),
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } => media_type.len() + data.len(),
         })
         .sum()
 }

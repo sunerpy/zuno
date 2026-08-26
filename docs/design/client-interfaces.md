@@ -117,6 +117,12 @@ The TUI favors dense, keyboard-first operation:
   Root and attached-child composers use the same captured drag selection and
   clipboard path, and render an inverse theme-derived caret on both empty and
   populated input buffers;
+  pasting one supported local image path, or image bytes supplied by the
+  clipboard backend, inserts a visible `[Image #N]` draft handle while retaining
+  filename, MIME, and bytes as separate typed content. `@project/path` resolves
+  bounded text or images below the project root, and the same rich submission
+  shape survives queue, steer, child continuation, durable replay, and provider
+  encoding. See [images and file references](../reference/attachments.md);
   `mouse: false` opts back into terminal-native selection and alternate-scroll
   translation;
 - ordinary modal overlays are centred in both axes; composer-owned questions

@@ -128,7 +128,7 @@ fn views_every_view_source_reaches_the_palette_through_the_context() {
             .unwrap_or("");
         if matches!(
             name,
-            "scroll.rs" | "external.rs" | "slash.rs" | "selection.rs"
+            "attachment.rs" | "scroll.rs" | "external.rs" | "slash.rs" | "selection.rs"
         ) {
             continue;
         }

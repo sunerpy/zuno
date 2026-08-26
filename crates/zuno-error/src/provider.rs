@@ -69,6 +69,18 @@ pub enum ProviderError {
         provider_text: Option<String>,
     },
 
+    /// The selected model cannot accept a typed input capability present in the request.
+    ///
+    /// This is a local permanent failure: retrying the same model cannot make an
+    /// image-capable request valid, and silently dropping the typed input would change
+    /// what the user asked the model to inspect.
+    #[error("model `{provider}/{model}` does not support `{capability}` input")]
+    UnsupportedCapability {
+        provider: String,
+        model: String,
+        capability: &'static str,
+    },
+
     /// A failure no retry can fix: a malformed request, an unknown model, a
     /// protocol violation, a revoked account.
     #[error("unrecoverable provider failure (status={status:?})")]
@@ -153,6 +165,7 @@ impl ProviderError {
             | Self::Transient { .. }
             | Self::Auth { .. }
             | Self::Refused { .. }
+            | Self::UnsupportedCapability { .. }
             | Self::Fatal { .. } => None,
         }
     }
@@ -171,7 +184,9 @@ impl Recoverable for ProviderError {
             },
             Self::Transient { .. } => Recovery::Retry { after: None },
             Self::Auth { .. } => Recovery::Reauthenticate,
-            Self::Refused { .. } | Self::Fatal { .. } => Recovery::Fail,
+            Self::Refused { .. } | Self::UnsupportedCapability { .. } | Self::Fatal { .. } => {
+                Recovery::Fail
+            }
         }
     }
 }
@@ -271,6 +286,21 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_capability_is_explicit_and_terminal() {
+        let error = ProviderError::UnsupportedCapability {
+            provider: "custom".to_owned(),
+            model: "text-only".to_owned(),
+            capability: "attachments",
+        };
+        assert_eq!(
+            error.to_string(),
+            "model `custom/text-only` does not support `attachments` input"
+        );
+        assert_eq!(error.recovery(), Recovery::Fail);
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
     fn status_classification_covers_the_codes_message_matching_used_to_chase() {
         let cases: &[(u16, Recovery)] = &[
             (401, Recovery::Reauthenticate),
@@ -341,6 +371,11 @@ mod tests {
             ProviderError::Refused {
                 provider: "google".to_owned(),
                 provider_text: None,
+            },
+            ProviderError::UnsupportedCapability {
+                provider: "google".to_owned(),
+                model: "text-only".to_owned(),
+                capability: "attachments",
             },
             ProviderError::Fatal {
                 status: None,

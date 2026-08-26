@@ -357,6 +357,15 @@ interrupt at the nearest safe step boundary. `Shift+Enter`, `Alt+Enter`, and
 commits it, and pending items can be edited or cancelled by revision and survive
 a process restart.
 
+User input is typed rich content, not only a rendered string. A local image is
+persisted before execution as a durable file part carrying filename, MIME type,
+data URL, and base64 payload, then reconstructed as a provider-neutral image
+block on replay. Root sessions, attached child sessions, direct sends, queued
+inputs, and steering use the same content path. The visible `[Image #N]` token
+is draft presentation state and is never treated as attachment identity. Bounded
+UTF-8 `@file` and `zuno run --file` inputs become explicit text context; supported
+images remain typed. See [images and file references](reference/attachments.md).
+
 A provider stream or provider-retry delay is wakeable for explicit steering:
 Zuno checkpoints any partial assistant output with `finish: steer`, promotes the
 durable input, and starts the next model step without emitting
@@ -428,6 +437,11 @@ prompt provenance, and usage are durable. Proactive compaction uses the validate
 with `compaction.auto: false`. A provider-confirmed context-limit failure retains
 its bounded recovery compaction, while a manual command is always eligible.
 
+Historical image bytes are excluded from the compaction model request. The
+summary input keeps a stable human label such as
+`[Attached diagram.png (image/png)]`, while the original durable file part
+remains unchanged for authoritative replay.
+
 A hard interruption is session-scoped and linearizable across turn handoff. If
 the previous run guard has dropped but an already admitted follow-up has not yet
 acquired its guard, the registry arms that next guard instead of discarding the
@@ -484,7 +498,7 @@ Recovery is selected from typed errors, never rendered messages:
 - Transport failures, rate limits, incomplete streams, SQLite writer contention, empty assistant messages, and per-turn step limits schedule another goal turn.
 - Context-limit failures compact retained history before retrying. Successful compaction is persisted as its own retry phase so a restart does not compact the same history twice.
 - Authentication failures, user interruption, and a closed event consumer pause the goal for human action.
-- Invalid provider protocol, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal.
+- Invalid provider protocol, unsupported typed input such as an image sent to a text-only model, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal.
 
 ### Tool effects and strict authorization
 

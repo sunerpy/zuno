@@ -383,6 +383,78 @@ fn session_screen_a_pasted_path_is_not_taken_for_a_slash_command() {
 }
 
 #[test]
+fn session_screen_a_pasted_image_path_becomes_an_atomic_rich_attachment() {
+    let fixture = tempfile::tempdir().expect("attachment fixture");
+    let image = fixture.path().join("diagram.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\nfixture").expect("image fixture");
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let (history, mut recorded_history) = mpsc::channel(1);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_prompt_history(Vec::new(), history);
+
+    screen.handle_event(&paste(image.to_str().expect("UTF-8 fixture path")));
+    assert_eq!(screen.editor.text(), "[Image #1]");
+    screen.handle_action(action("input_submit"), &press_none());
+
+    let submitted = submitted.try_recv().expect("rich image submission");
+    let PromptSubmission::Content { text, content } = submitted.submission else {
+        panic!("a pasted image path was not submitted as rich content");
+    };
+    assert_eq!(text, "[Image #1]");
+    assert!(content.iter().any(|block| matches!(
+        block,
+        zuno_llm::event::RequestContentBlock::Image { media_type, data, .. }
+            if media_type == "image/png" && !data.is_empty()
+    )));
+    let message = screen
+        .transcript
+        .transcript()
+        .messages()
+        .last()
+        .expect("user attachment message");
+    assert!(message.parts.iter().any(|part| matches!(
+        part,
+        crate::views::message::MessagePart::Attachment { filename, mime }
+            if filename == "diagram.png" && mime.as_deref() == Some("image/png")
+    )));
+    assert!(
+        screen.editor.history().is_empty(),
+        "an image placeholder entered recall history without its bytes"
+    );
+    assert!(
+        recorded_history.try_recv().is_err(),
+        "an image placeholder entered persisted prompt history without its bytes"
+    );
+}
+
+#[test]
+fn session_screen_clipboard_image_becomes_the_same_attachment_shape() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(1);
+    let clipboard = Arc::new(crate::views::external::MemoryClipboard::holding(
+        crate::views::external::ClipboardContent {
+            data: String::from("iVBORw0KGgpmaXh0dXJl"),
+            mime: String::from("image/png"),
+        },
+    ));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_clipboard(clipboard);
+
+    screen.handle_action(action("input_paste"), &press_none());
+    assert_eq!(screen.editor.text(), "[Image #1]");
+    screen.handle_action(action("input_submit"), &press_none());
+
+    let submitted = submitted.try_recv().expect("clipboard image submission");
+    assert!(matches!(
+        submitted.submission,
+        PromptSubmission::Content { .. }
+    ));
+}
+
+#[test]
 fn session_screen_refuses_a_paste_while_a_modal_owns_the_keyboard() {
     // `DialogHost` forwards every non-key event to the base unconditionally — that is
     // what keeps an open dialog from stalling the loop — so a paste would otherwise land

@@ -213,7 +213,65 @@ async fn image_reference_becomes_an_image_content_block() {
     };
     assert!(content.iter().any(|block| matches!(
         block,
-        RequestContentBlock::Image { media_type, data }
+        RequestContentBlock::Image { media_type, data, .. }
             if media_type == "image/png" && !data.is_empty()
+    )));
+}
+
+#[tokio::test]
+async fn image_reference_uses_the_image_limit_instead_of_the_text_file_limit() {
+    let root = fixture();
+    let mut bytes = b"\x89PNG\r\n\x1a\nfixture".to_vec();
+    bytes.resize(REFERENCE_MAX_BYTES + 1, 0);
+    fs::write(root.path().join("large-diagram.png"), bytes).expect("large image fixture");
+
+    let resolved = resolve_submission(
+        root.path(),
+        PromptSubmission::Text("describe @large-diagram.png".to_owned()),
+    )
+    .await
+    .expect("a valid image below the image limit is accepted");
+
+    let PromptSubmission::Content { content, .. } = resolved else {
+        panic!("the image reference was not promoted to rich content");
+    };
+    assert!(content.iter().any(|block| matches!(
+        block,
+        RequestContentBlock::Image { filename, .. }
+            if filename.as_deref() == Some("large-diagram.png")
+    )));
+}
+
+#[tokio::test]
+async fn an_existing_image_attachment_can_be_combined_with_a_project_reference() {
+    let root = fixture();
+    let original_image = RequestContentBlock::Image {
+        filename: Some("clipboard.png".to_owned()),
+        media_type: "image/png".to_owned(),
+        data: "iVBORw0KGgo=".to_owned(),
+    };
+    let resolved = resolve_submission(
+        root.path(),
+        PromptSubmission::Content {
+            text: "compare [Image #1] with @src/main.rs".to_owned(),
+            content: vec![
+                RequestContentBlock::Text {
+                    text: "compare [Image #1] with @src/main.rs".to_owned(),
+                },
+                original_image.clone(),
+            ],
+        },
+    )
+    .await
+    .expect("resolve a project reference beside an existing image");
+
+    let PromptSubmission::Content { content, .. } = resolved else {
+        panic!("rich content was downgraded while resolving a file reference");
+    };
+    assert!(content.contains(&original_image));
+    assert!(content.iter().any(|block| matches!(
+        block,
+        RequestContentBlock::Text { text }
+            if text.contains("src/main.rs") && text.contains("fn real_file() {}")
     )));
 }
