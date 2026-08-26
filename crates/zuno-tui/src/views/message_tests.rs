@@ -518,26 +518,58 @@ fn views_blocked_tool_is_a_warning_while_an_execution_failure_remains_an_error()
     let lines = view.lines(96);
     let blocked = lines
         .iter()
-        .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.contains("bash blocked"))
+        .find(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("! Tool · $ bash blocked")
+        })
         .expect("blocked tool header");
     let failed = lines
         .iter()
-        .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.contains("bash failed"))
+        .find(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("✗ Tool · $ bash failed")
+        })
         .expect("failed tool header");
+    let blocked_glyph = blocked
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "!")
+        .expect("blocked status glyph");
+    let failed_glyph = failed
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "✗")
+        .expect("failed status glyph");
+    let blocked_title = blocked
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "bash blocked")
+        .expect("blocked title");
+    let failed_title = failed
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "bash failed")
+        .expect("failed title");
     assert_eq!(
-        blocked.style.fg,
+        blocked_glyph.style.fg,
         Some(ratatui::style::Color::from(
             ViewContext::defaults().palette().warning
         ))
     );
     assert_eq!(
-        failed.style.fg,
+        failed_glyph.style.fg,
         Some(ratatui::style::Color::from(
             ViewContext::defaults().palette().error
         ))
     );
+    assert_eq!(blocked_title.style.fg, ViewContext::defaults().text().fg);
+    assert_eq!(failed_title.style.fg, ViewContext::defaults().text().fg);
 
     let joined = draw(&mut view, 96, 18).join("\n");
     assert!(
@@ -584,6 +616,75 @@ fn views_user_messages_render_commonmark_tables_instead_of_literal_pipes() {
 }
 
 #[test]
+fn views_assistant_markdown_and_header_use_neutral_scan_hierarchy() {
+    let context = ViewContext::defaults();
+    let mut view = TranscriptView::new(context.clone());
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::TextDelta(
+        String::from("## Approach\n\n1. inspect the call path\n\nBody copy stays primary."),
+    ))));
+
+    let lines = view.lines(72);
+    let assistant = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "Assistant")
+        })
+        .expect("assistant heading");
+    let title = assistant
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "Assistant")
+        .expect("assistant title span");
+    assert!(
+        title.style.add_modifier.contains(Modifier::BOLD),
+        "the speaker title should be stronger than its body"
+    );
+    let separator = assistant
+        .spans
+        .iter()
+        .find(|span| span.content.contains('─'))
+        .expect("weak separator after the assistant title");
+    assert_eq!(
+        separator.style.fg,
+        context.muted().fg,
+        "the speaker separator should recede instead of becoming an accent bar"
+    );
+
+    let heading = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "Approach")
+        .expect("markdown heading");
+    assert_eq!(heading.style.fg, context.title().fg);
+    assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+
+    let enumeration = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "1. ")
+        .expect("ordered-list marker");
+    assert_eq!(
+        enumeration.style.fg,
+        context.muted().fg,
+        "list chrome should use a neutral theme role rather than a bright cyan/blue"
+    );
+
+    let body = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "Body")
+        .expect("markdown body");
+    assert_eq!(
+        body.style.fg,
+        context.text().fg,
+        "ordinary prose must remain the primary reading layer"
+    );
+}
+
+#[test]
 fn views_thinking_style_matches_codex_neutral_dim_italic_text() {
     let context = ViewContext::defaults();
     let style = context.thinking();
@@ -610,6 +711,82 @@ fn views_secondary_ui_text_uses_muted_neutral_foreground() {
         context.secondary().fg,
         context.muted().fg,
         "secondary TUI and sidebar copy should not inherit the theme's purple accent"
+    );
+}
+
+#[test]
+fn views_tool_header_layers_disclosure_status_name_and_summary() {
+    let context = ViewContext::defaults();
+    let mut view = TranscriptView::new(context.clone());
+    view.handle_event(&AppEvent::Engine(started()));
+    complete_tool(
+        &mut view,
+        "call_read",
+        "read",
+        r#"{"filePath":"crates/zuno-tui/src/views/message.rs"}"#,
+        "source",
+    );
+
+    let lines = view.lines(96);
+    let header = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .contains("Tool · → read crates/zuno-tui/src/views/message.rs")
+        })
+        .expect("tool header");
+    let exact = |text: &str| {
+        header
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == text)
+            .unwrap_or_else(|| panic!("tool header has no {text:?} span: {header:#?}"))
+    };
+
+    assert_eq!(exact("▸").style.fg, context.muted().fg);
+    assert_eq!(exact("✓").style.fg, context.text().fg);
+    assert!(
+        exact("Tool").style.add_modifier.contains(Modifier::BOLD),
+        "the activity kind should read as a compact title"
+    );
+    assert!(
+        exact("read").style.add_modifier.contains(Modifier::BOLD),
+        "the tool identity should remain scannable across a dense activity list"
+    );
+    assert_eq!(
+        exact("crates/zuno-tui/src/views/message.rs").style.fg,
+        context.muted().fg,
+        "the argument summary should recede beneath the tool identity"
+    );
+}
+
+#[test]
+fn views_tool_overflow_hint_uses_muted_chrome_instead_of_accent_text() {
+    let context = ViewContext::defaults();
+    let mut view = TranscriptView::new(context.clone());
+    view.handle_event(&AppEvent::Engine(started()));
+    complete_tool(
+        &mut view,
+        "call_read",
+        "read",
+        r#"{"filePath":"src/lib.rs"}"#,
+        "one\ntwo\nthree\nfour\nfive",
+    );
+
+    let overflow = view
+        .lines(72)
+        .into_iter()
+        .flat_map(|line| line.spans.into_iter())
+        .find(|span| span.content.contains("more lines"))
+        .expect("collapsed output notice");
+    assert_eq!(overflow.style.fg, context.muted().fg);
+    assert_ne!(
+        overflow.style.fg,
+        context.accent().fg,
+        "a recurring disclosure hint should not read as a purple/green primary action"
     );
 }
 

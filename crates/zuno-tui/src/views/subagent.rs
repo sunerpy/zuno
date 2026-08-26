@@ -11,6 +11,7 @@ use crate::views::message::{Message, MessagePart, ToolStatus};
 use crate::views::{ViewContext, truncate};
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -565,10 +566,24 @@ fn state_glyph(state: &str) -> &'static str {
     match state {
         "completed" => "✓",
         "failed" => "✗",
-        "cancelled" => "■",
+        "blocked" => "!",
+        "cancelled" => "×",
         "uncertain" => "?",
-        "running" | "cancelling" => "…",
+        "running" | "in_progress" | "cancelling" => "…",
+        "pending" | "queued" => "○",
         _ => "~",
+    }
+}
+
+/// State is carried by a glyph and a theme role rather than tinting the complete row.
+fn state_style(state: &str, context: &ViewContext) -> Style {
+    match state {
+        "failed" => context.error(),
+        "blocked" | "uncertain" => context.warning(),
+        "running" | "in_progress" | "cancelling" => context.title(),
+        "completed" => context.text(),
+        "cancelled" | "pending" | "queued" => context.muted(),
+        _ => context.muted(),
     }
 }
 
@@ -697,6 +712,148 @@ impl SubagentView {
         DialogStep::Emitted(DialogOutcome::JobCancel { job_id })
     }
 
+    fn finish_line(
+        &self,
+        mut spans: Vec<Span<'static>>,
+        width: usize,
+        selected: bool,
+    ) -> Line<'static> {
+        if selected {
+            for span in &mut spans {
+                span.style = self.context.on_element(span.style);
+            }
+        }
+        let mut spans = crate::views::markdown::truncate_row(spans, width);
+        let used = crate::views::markdown::row_width(&spans);
+        if used < width {
+            let fill = if selected {
+                self.context.on_element(self.context.surface())
+            } else {
+                self.context.surface()
+            };
+            spans.push(Span::styled(" ".repeat(width - used), fill));
+        }
+        Line::from(spans)
+    }
+
+    fn task_line(&self, task: &Delegation, selected: bool, width: usize) -> Line<'static> {
+        let marker = if selected { "›" } else { " " };
+        let target = task.target.as_deref().unwrap_or("subagent");
+        let objective = task.objective.as_deref().unwrap_or("(no description)");
+        self.finish_line(
+            vec![
+                Span::styled(
+                    marker.to_owned(),
+                    if selected {
+                        self.context.title()
+                    } else {
+                        self.context.muted()
+                    },
+                ),
+                Span::styled(String::from(" "), self.context.surface()),
+                Span::styled(
+                    state_glyph(&task.state).to_owned(),
+                    state_style(&task.state, &self.context),
+                ),
+                Span::styled(String::from(" "), self.context.surface()),
+                Span::styled(task.product.clone(), self.context.title()),
+                Span::styled(String::from(" "), self.context.surface()),
+                Span::styled(target.to_owned(), self.context.text()),
+                Span::styled(String::from(": "), self.context.muted()),
+                Span::styled(objective.to_owned(), self.context.muted()),
+            ],
+            width,
+            selected,
+        )
+    }
+
+    fn detail_title(&self, width: usize) -> Line<'static> {
+        let inset = "  ";
+        let label = "Details";
+        let used = crate::views::display_width(inset) + crate::views::display_width(label);
+        let mut spans = vec![
+            Span::styled(inset.to_owned(), self.context.surface()),
+            Span::styled(label.to_owned(), self.context.title()),
+        ];
+        if used < width {
+            spans.push(Span::styled(String::from(" "), self.context.surface()));
+            let remaining = width.saturating_sub(used).saturating_sub(1);
+            if remaining > 0 {
+                spans.push(Span::styled("─".repeat(remaining), self.context.muted()));
+            }
+        }
+        self.finish_line(spans, width, false)
+    }
+
+    fn detail_row(
+        &self,
+        width: usize,
+        label: &str,
+        value: String,
+        value_style: Style,
+    ) -> Line<'static> {
+        self.finish_line(
+            vec![
+                Span::styled(String::from("  "), self.context.surface()),
+                Span::styled(label.to_owned(), self.context.muted()),
+                Span::styled(String::from(" "), self.context.surface()),
+                Span::styled(value, value_style),
+            ],
+            width,
+            false,
+        )
+    }
+
+    fn status_detail_row(&self, width: usize, state: &str) -> Line<'static> {
+        self.finish_line(
+            vec![
+                Span::styled(String::from("  "), self.context.surface()),
+                Span::styled(
+                    state_glyph(state).to_owned(),
+                    state_style(state, &self.context),
+                ),
+                Span::styled(String::from(" "), self.context.surface()),
+                Span::styled(String::from("status"), self.context.muted()),
+                Span::styled(String::from(" "), self.context.surface()),
+                Span::styled(state.to_owned(), self.context.text()),
+            ],
+            width,
+            false,
+        )
+    }
+
+    fn child_detail_row(
+        &self,
+        width: usize,
+        child: &zuno_types::JobChildProjection,
+    ) -> Line<'static> {
+        let owner = child.owner.as_deref().unwrap_or("unassigned");
+        self.finish_line(
+            vec![
+                Span::styled(String::from("  "), self.context.surface()),
+                Span::styled(
+                    state_glyph(&child.status).to_owned(),
+                    state_style(&child.status, &self.context),
+                ),
+                Span::styled(String::from(" "), self.context.surface()),
+                Span::styled(child.subject.clone(), self.context.title()),
+                Span::styled(String::from(" · "), self.context.muted()),
+                Span::styled(child.status.clone(), self.context.muted()),
+                Span::styled(String::from(" · "), self.context.muted()),
+                Span::styled(owner.to_owned(), self.context.text()),
+                Span::styled(String::from(" · "), self.context.muted()),
+                Span::styled(
+                    crate::views::ambient::compact_duration(
+                        i64::try_from(child.span.elapsed_ms).unwrap_or(i64::MAX),
+                    ),
+                    self.context.muted(),
+                ),
+            ],
+            width,
+            false,
+        )
+    }
+
     fn detail(&self, width: usize) -> Vec<Line<'static>> {
         let Some(task) = self.selected() else {
             return vec![Line::from(Span::styled(
@@ -704,43 +861,51 @@ impl SubagentView {
                 self.context.muted(),
             ))];
         };
-        let mut lines = Vec::new();
-        let row = |lines: &mut Vec<Line<'static>>, label: &str, value: String| {
-            lines.push(Line::from(Span::styled(
-                truncate(&format!("  {label} {value}"), width),
-                self.context.muted(),
-            )));
-        };
-        row(&mut lines, "product", task.product.clone());
-        row(
-            &mut lines,
-            "target",
-            task.target
-                .clone()
-                .unwrap_or_else(|| "not reported".to_owned()),
+        let mut lines = vec![self.detail_title(width)];
+        lines.push(self.detail_row(width, "product", task.product.clone(), self.context.text()));
+        lines.push(
+            self.detail_row(
+                width,
+                "target",
+                task.target
+                    .clone()
+                    .unwrap_or_else(|| "not reported".to_owned()),
+                self.context.text(),
+            ),
         );
-        row(&mut lines, "status", task.state.clone());
-        row(&mut lines, "elapsed", task.elapsed());
-        row(
-            &mut lines,
-            "job",
-            task.job_id
-                .clone()
-                .unwrap_or_else(|| "foreground".to_owned()),
+        lines.push(self.status_detail_row(width, &task.state));
+        lines.push(self.detail_row(width, "elapsed", task.elapsed(), self.context.text()));
+        lines.push(
+            self.detail_row(
+                width,
+                "job",
+                task.job_id
+                    .clone()
+                    .unwrap_or_else(|| "foreground".to_owned()),
+                self.context.text(),
+            ),
         );
-        row(
-            &mut lines,
-            "report",
-            task.report_delivery
-                .clone()
-                .unwrap_or_else(|| "foreground".to_owned()),
+        lines.push(
+            self.detail_row(
+                width,
+                "report",
+                task.report_delivery
+                    .clone()
+                    .unwrap_or_else(|| "foreground".to_owned()),
+                self.context.text(),
+            ),
         );
         if let Some(session) = &task.session_id {
-            row(&mut lines, "session", session.clone());
-            row(&mut lines, "note", CHILD_TRANSCRIPT_NOTE.to_owned());
+            lines.push(self.detail_row(width, "session", session.clone(), self.context.text()));
+            lines.push(self.detail_row(
+                width,
+                "note",
+                CHILD_TRANSCRIPT_NOTE.to_owned(),
+                self.context.muted(),
+            ));
         }
         if let Some(run) = &task.run_id {
-            row(&mut lines, "run", run.clone());
+            lines.push(self.detail_row(width, "run", run.clone(), self.context.text()));
         }
         if !task.children.is_empty() {
             let completed = task
@@ -758,47 +923,36 @@ impl SubagentView {
             } else {
                 "nodes"
             };
-            row(
-                &mut lines,
+            lines.push(self.detail_row(
+                width,
                 "progress",
                 format!(
                     "{completed}/{} {noun} done · {running} running",
                     task.children.len()
                 ),
-            );
+                self.context.text(),
+            ));
             for child in &task.children {
-                let (glyph, style) = match child.status.as_str() {
-                    "completed" => ("✓", self.context.muted()),
-                    "in_progress" | "running" => ("◐", self.context.accent()),
-                    "blocked" => ("!", self.context.warning()),
-                    "failed" | "uncertain" => ("✗", self.context.error()),
-                    "cancelled" => ("×", self.context.muted()),
-                    _ => ("○", self.context.text()),
-                };
-                let owner = child.owner.as_deref().unwrap_or("unassigned");
-                lines.push(Line::from(Span::styled(
-                    truncate(
-                        &format!(
-                            "  {glyph} {} · {} · {owner} · {}",
-                            child.subject,
-                            child.status,
-                            crate::views::ambient::compact_duration(
-                                i64::try_from(child.span.elapsed_ms).unwrap_or(i64::MAX),
-                            )
-                        ),
-                        width,
-                    ),
-                    style,
-                )));
+                lines.push(self.child_detail_row(width, child));
             }
         }
         if let Some(result) = &task.result {
-            row(&mut lines, "result", result.clone());
+            lines.push(self.detail_row(width, "result", result.clone(), self.context.text()));
         }
         if let Some(diagnostic) = &task.diagnostic {
-            row(&mut lines, "diagnostic", diagnostic.clone());
+            lines.push(self.detail_row(
+                width,
+                "diagnostic",
+                diagnostic.clone(),
+                self.context.error(),
+            ));
         }
-        row(&mut lines, "safety", task.safety().to_owned());
+        lines.push(self.detail_row(
+            width,
+            "safety",
+            task.safety().to_owned(),
+            self.context.muted(),
+        ));
         lines
     }
 }
@@ -825,15 +979,7 @@ impl Dialog for SubagentView {
         let body = usize::from(width.saturating_sub(2)).max(1);
         let mut lines = Vec::new();
         for (index, task) in self.tasks.iter().enumerate() {
-            let marker = if index == self.cursor { "›" } else { " " };
-            lines.push(Line::from(Span::styled(
-                truncate(&format!("{marker} {}", task.headline(body)), body),
-                if index == self.cursor {
-                    self.context.element()
-                } else {
-                    self.context.muted()
-                },
-            )));
+            lines.push(self.task_line(task, index == self.cursor, body));
         }
         if self.tasks.is_empty() {
             lines.push(Line::from(Span::styled(

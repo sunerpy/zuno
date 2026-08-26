@@ -1815,7 +1815,7 @@ impl TranscriptView {
         if previous != Some(message.role)
             && let Some(label) = self.role_label(message.role)
         {
-            lines.push(self.ruled(message.role, rule, label, self.context.title(), width));
+            lines.push(self.role_header(message.role, rule, label, width));
         }
         let mut parts = message.parts.iter().enumerate().peekable();
         while let Some((part_index, part)) = parts.next() {
@@ -2257,6 +2257,34 @@ impl TranscriptView {
         }
     }
 
+    /// A speaker title followed by a weak rule, so a new answer is visible without boxing
+    /// the prose or painting a full-width accent stripe.
+    fn role_header(&self, role: Role, rule: Style, label: &str, width: u16) -> Line<'static> {
+        let room = usize::from(width).saturating_sub(display_width(role.marker()) + 1);
+        self.ruled_spans(role, rule, self.title_rule_spans("", label, room), width)
+    }
+
+    /// A neutral title plus a weak trailing rule within `room` terminal columns.
+    fn title_rule_spans(&self, inset: &str, label: &str, room: usize) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        if !inset.is_empty() {
+            spans.push(Span::styled(inset.to_owned(), self.context.surface()));
+        }
+        spans.push(Span::styled(label.to_owned(), self.context.title()));
+        let used = display_width(inset).saturating_add(display_width(label));
+        if used < room {
+            spans.push(Span::styled(String::from(" "), self.context.surface()));
+            let rule = room.saturating_sub(used).saturating_sub(1);
+            if rule > 0 {
+                spans.push(Span::styled(
+                    USER_BOX_RULE.repeat(rule),
+                    self.context.muted(),
+                ));
+            }
+        }
+        spans
+    }
+
     fn rule_style(&self, role: Role) -> Style {
         match role {
             Role::User => self.context.accent(),
@@ -2330,6 +2358,37 @@ impl TranscriptView {
         Line::from(out)
     }
 
+    /// Rebase Markdown chrome onto neutral semantic roles while retaining the parser's
+    /// emphasis, heading, code, link, and syntax-highlight modifiers.
+    fn neutral_markdown_row(&self, mut row: Vec<Span<'static>>) -> Vec<Span<'static>> {
+        let heading = {
+            let palette = self.context.palette();
+            ratatui::style::Color::from(palette.markdown_heading)
+        };
+        let title = self.context.title();
+        let muted = self.context.muted();
+        for span in &mut row {
+            let text = span.content.as_ref();
+            let ordered = text
+                .strip_suffix(' ')
+                .and_then(|text| text.strip_suffix('.'))
+                .is_some_and(|number| {
+                    !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
+                });
+            let chrome = ordered
+                || matches!(text, "• " | "◦ " | "▪ " | "│ " | "[ ] " | "[x] " | "[X] ")
+                || (!text.is_empty() && text.chars().all(|character| character == '─'));
+            if span.style.fg == Some(heading) {
+                span.style.fg = title.fg;
+                span.style.bg = title.bg;
+            } else if chrome {
+                span.style.fg = muted.fg;
+                span.style.bg = muted.bg;
+            }
+        }
+        row
+    }
+
     fn part_lines(
         &self,
         role: Role,
@@ -2352,7 +2411,7 @@ impl TranscriptView {
             MessagePart::Text { text } if role != Role::System => {
                 for row in crate::views::markdown::render(text, body_width, &self.context.palette())
                 {
-                    out.push(self.ruled_spans(role, rule, row, width));
+                    out.push(self.ruled_spans(role, rule, self.neutral_markdown_row(row), width));
                 }
             }
             MessagePart::Text { text } => {
@@ -2473,30 +2532,45 @@ impl TranscriptView {
                 //
                 // `title` remains the fallback for a completed call whose arguments never
                 // parsed, because a provider's own sentence beats a bare wire name.
-                let row = match (crate::views::tool::summary(name, arguments), title, status) {
-                    (Some(summary), _, _) => {
-                        // Measured against what the head actually spent, not against a
-                        // constant: the name's width runs from `read` to `goal_update`, and
-                        // the summary has to be fitted to what is left after it. One more
-                        // column is charged for the space that joins them.
-                        let room = usize::from(body_width)
-                            .saturating_sub(display_width(&head))
-                            .saturating_sub(1);
-                        format!("{head} {}", summary.fit(room))
-                    }
-                    (None, Some(title), _) => {
-                        format!(" {} {glyph} Tool · {icon} {title}", display.glyph())
-                    }
-                    (None, None, ToolStatus::Pending) => {
-                        format!(" {} {glyph} Tool · {icon} {placeholder}", display.glyph())
-                    }
-                    (None, None, _) => head,
+                let summary = crate::views::tool::summary(name, arguments);
+                let has_summary = summary.is_some();
+                // Measured against what the head actually spent, not against a constant:
+                // the name's width runs from `read` to `goal_update`, and the summary has to
+                // be fitted to what is left after it. One more column is charged for the
+                // space that joins them.
+                let room = usize::from(body_width)
+                    .saturating_sub(display_width(&head))
+                    .saturating_sub(1);
+                let detail = summary
+                    .map(|summary| summary.fit(room))
+                    .filter(|summary| !summary.is_empty());
+                let identity = if has_summary {
+                    name.as_str()
+                } else if let Some(title) = title.as_deref() {
+                    title
+                } else if *status == ToolStatus::Pending {
+                    placeholder
+                } else {
+                    name.as_str()
                 };
-                push(
-                    &row,
-                    crate::views::tool::status_style(*status, *ui_intent, &self.context),
-                    out,
-                );
+                let styles = crate::views::tool::header_styles(*status, *ui_intent, &self.context);
+                let mut spans = vec![
+                    Span::styled(String::from(" "), self.context.surface()),
+                    Span::styled(display.glyph().to_owned(), styles.chrome),
+                    Span::styled(String::from(" "), self.context.surface()),
+                    Span::styled(glyph.to_owned(), styles.status),
+                    Span::styled(String::from(" "), self.context.surface()),
+                    Span::styled(String::from("Tool"), styles.title),
+                    Span::styled(String::from(" · "), styles.chrome),
+                    Span::styled(icon.to_owned(), styles.chrome),
+                    Span::styled(String::from(" "), self.context.surface()),
+                    Span::styled(identity.to_owned(), styles.title),
+                ];
+                if let Some(detail) = detail {
+                    spans.push(Span::styled(String::from(" "), self.context.surface()));
+                    spans.push(Span::styled(detail, styles.detail));
+                }
+                out.push(self.ruled_spans(role, rule, spans, width));
                 let frame = RowFrame { role, rule, width };
                 if display == ToolDisplay::Expanded {
                     self.tool_argument_lines(frame, arguments, out);
@@ -2607,11 +2681,12 @@ impl TranscriptView {
     const TOOL_ARGUMENT_CHARS: usize = 16_000;
 
     fn tool_section_label(&self, frame: RowFrame, label: &str, out: &mut Vec<Line<'static>>) {
-        out.push(self.ruled(
+        let room = usize::from(frame.width)
+            .saturating_sub(display_width(frame.role.marker()).saturating_add(1));
+        out.push(self.ruled_spans(
             frame.role,
             frame.rule,
-            &format!("{}{label}", Self::RESULT_INSET),
-            self.context.secondary().add_modifier(Modifier::BOLD),
+            self.title_rule_spans(Self::RESULT_INSET, label, room),
             frame.width,
         ));
     }
@@ -2798,7 +2873,7 @@ impl TranscriptView {
             frame.role,
             frame.rule,
             &notice,
-            self.context.accent(),
+            self.context.muted(),
             frame.width,
         ));
     }

@@ -969,6 +969,40 @@ fn views_sidebar_states_the_session_name_above_the_context_block() {
 }
 
 #[test]
+fn views_sidebar_title_drag_selection_is_available_to_the_clipboard_host() {
+    // `SessionScreen::end_pointer` already copies `selected_text()` on mouse release. The
+    // sidebar therefore owns the geometry-to-text half of that contract, including the
+    // separately rendered session title above its scrollable body.
+    let mut view = view();
+    let title = "deepwork 子命令功能分析";
+    view.ambient_mut().title = Some(String::from(title));
+    let lines = rows(&render_offscreen(&mut view, SIDEBAR_WIDTH, 40).expect("infallible"));
+    let row = u16::try_from(row_of(&lines, "deepwork")).expect("the frame is under 65536 rows");
+    let start = 2;
+    let end = start
+        + u16::try_from(display_width(title).saturating_sub(1))
+            .expect("the title fits in a terminal row");
+
+    assert!(
+        view.contains(start, row),
+        "the separately rendered title is not owned by the sidebar mouse surface"
+    );
+    assert!(
+        view.begin_selection(start, row),
+        "mouse-down on the title did not begin a sidebar selection"
+    );
+    assert!(
+        view.update_selection(end, row),
+        "mouse-drag across the title did not extend the selection"
+    );
+    assert_eq!(
+        view.selected_text().as_deref(),
+        Some(title),
+        "mouse release would not hand the selected title to the existing clipboard path"
+    );
+}
+
+#[test]
 fn views_sidebar_says_nothing_at_all_when_the_session_has_no_name_yet() {
     // Given: a session that has not been named — the state every session starts in.
     let mut view = view();

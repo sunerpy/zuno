@@ -3,7 +3,7 @@
 use crate::views::message::{ToolDisplay, ToolStatus, tool_affordance};
 use crate::views::tool::{
     COLLAPSED_CHARS, EXPANDED_CHARS, EXPANDED_ROWS, Elide, READ_EXPANDED_CHARS, READ_EXPANDED_ROWS,
-    SUMMARISED, output_budget, status_style, summary,
+    SUMMARISED, header_styles, output_budget, status_style, summary,
 };
 use crate::views::{ViewContext, display_width};
 use std::path::{Path, PathBuf};
@@ -539,5 +539,30 @@ fn tool_status_style_paints_from_the_palette_and_separates_the_terminal_states()
     assert_ne!(
         delegated.fg, completed.fg,
         "delegated work must remain visually distinct from ordinary tools"
+    );
+}
+
+#[test]
+fn tool_header_styles_keep_status_chroma_local_and_text_hierarchy_neutral() {
+    let context = ViewContext::defaults();
+    let styles = header_styles(
+        ToolStatus::Error,
+        zuno_tool::ToolUiIntent::Generic,
+        &context,
+    );
+    assert_eq!(styles.status.fg, context.error().fg);
+    assert_eq!(styles.chrome.fg, context.muted().fg);
+    assert_eq!(styles.detail.fg, context.muted().fg);
+    assert_eq!(styles.title.fg, context.text().fg);
+    assert!(
+        styles
+            .title
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD),
+        "tool identity should remain scannable without using an accent colour"
+    );
+    assert_ne!(
+        styles.status, styles.title,
+        "error colour leaked from the status glyph into the tool title"
     );
 }

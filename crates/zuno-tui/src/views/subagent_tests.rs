@@ -2,6 +2,7 @@ use super::*;
 use crate::views::message::{Message, Role};
 use crate::views::testkit::{action, press};
 use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::style::Modifier;
 
 fn message(parts: Vec<MessagePart>) -> Message {
     Message {
@@ -324,6 +325,86 @@ fn enter_opens_details_with_product_job_delivery_result_and_safety() {
     ] {
         assert!(body.contains(expected), "missing `{expected}`:\n{body}");
     }
+}
+
+#[test]
+fn subagent_rows_layer_selection_status_identity_and_objective() {
+    let context = ViewContext::defaults();
+    let tasks = delegations(&[message(vec![product("running", Some("job_1"))])]);
+    let mut view = SubagentView::new(context.clone(), tasks);
+    let lines = view.lines(100);
+    let row = &lines[0];
+    let exact = |text: &str| {
+        row.spans
+            .iter()
+            .find(|span| span.content.as_ref() == text)
+            .unwrap_or_else(|| panic!("subagent row has no {text:?} span: {row:#?}"))
+    };
+
+    assert!(
+        exact("›").style.add_modifier.contains(Modifier::BOLD),
+        "the selected projection needs an explicit focus marker"
+    );
+    assert!(
+        exact("…").style.add_modifier.contains(Modifier::BOLD),
+        "running state should be emphasized only on its glyph"
+    );
+    assert!(
+        exact("codex").style.add_modifier.contains(Modifier::BOLD),
+        "the delegated product should be the row title"
+    );
+    assert_eq!(exact("reviewer").style.fg, context.text().fg);
+    assert_eq!(
+        exact("review patch").style.fg,
+        context.muted().fg,
+        "the objective is supporting copy, not a competing title"
+    );
+    let selected_bg = context.element().bg;
+    assert!(
+        row.spans.iter().all(|span| span.style.bg == selected_bg),
+        "every span in the selected row must retain the focus background"
+    );
+}
+
+#[test]
+fn subagent_details_separate_labels_values_and_section_title() {
+    let context = ViewContext::defaults();
+    let tasks = delegations(&[message(vec![product("running", Some("job_1"))])]);
+    let mut view = SubagentView::new(context.clone(), tasks);
+    view.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+    let lines = view.lines(100);
+
+    let title = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "Details")
+        .expect("details section title");
+    assert!(title.style.add_modifier.contains(Modifier::BOLD));
+
+    let product = lines
+        .iter()
+        .find(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content.as_ref() == "product")
+        })
+        .expect("product detail row");
+    let label = product
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "product")
+        .expect("product label");
+    let value = product
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "codex")
+        .expect("product value");
+    assert_eq!(label.style.fg, context.muted().fg);
+    assert_eq!(value.style.fg, context.text().fg);
+    assert_ne!(
+        label.style, value.style,
+        "metadata labels and values should not collapse into one undifferentiated row"
+    );
 }
 
 #[test]

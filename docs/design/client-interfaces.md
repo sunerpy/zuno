@@ -155,18 +155,31 @@ The TUI favors dense, keyboard-first operation:
   capsule, the client projects one block while retaining both durable records;
 - user and assistant prose use the same CommonMark renderer, including GFM
   tables, lists, headings, code, quotes, and links. Rendering never changes the
-  durable source text;
+  durable source text. The transcript adds hierarchy without adding saturated
+  panels: a speaker title is followed by a weak neutral rule, Markdown headings
+  use the neutral title role, and list/quote/rule chrome uses the muted role while
+  prose remains primary. Structure therefore remains visible without relying on
+  purple, green, or colour alone;
 - per-call tool disclosure in the complete transcript, with subagent rendering
   selected by persisted `ToolUiIntent::Subagent` rather than hard-coded tool
   names. The collapsed row stays summary-only; expanding a call renders a
   pretty-printed `Arguments` section and a distinct `Result` section, with explicit
   bounded-overflow notices for pathological inputs. A call refused before execution is projected as `blocked` with warning
   styling and a durable block kind; only a call that actually ran and failed is
-  projected as an error;
+  projected as an error. Tool headers are composed from separate theme roles:
+  disclosure and separators are muted, `Tool` and the tool identity are neutral
+  titles, the argument summary is secondary, and warning/error/running emphasis
+  is confined to the status glyph. Overflow hints are muted rather than rendered
+  as primary actions. These span-level distinctions retain the existing per-call
+  disclosure target and remain legible in monochrome terminals;
 - one subagent overview for native child sessions and configured Codex or Claude Code
   product agents. It shows product/target, objective, status, elapsed time,
   session/run, job, report delivery, result, and safety diagnostics without
   exposing product-internal reasoning or tool streams. Enter toggles details;
+  each compact row separates focus, status glyph, product title, target, and muted
+  objective, with the selection background applied across the complete row.
+  Expanded details use a weak `Details` divider, muted field labels, readable
+  values, and per-child status glyphs instead of tinting whole rows;
   pressing `x` twice requests cancellation of a running job and keeps the list
   mounted for consecutive cancellations. Native child hosts additionally publish a
   full main-pane session projection: `Ctrl+X Down` enters the first direct child,
@@ -184,7 +197,11 @@ The TUI favors dense, keyboard-first operation:
   are not dispatched as root or host commands. Switching siblings or returning to the
   parent preserves each child draft. A child may delegate only when its selected Agent
   exposes `task`, names the target in `delegates`, passes permission, and remains below
-  `subagent_depth`; using the same host does not bypass those limits;
+  `subagent_depth`; using the same host does not bypass those limits. Historical
+  navigation follows durable direct-child session edges rather than inferring a child
+  from ordinary tool activity. When a retained session has no delegated child,
+  `Ctrl+X Down` leaves the transcript in place and directs the user to the transcript
+  details instead of implying that history restoration failed;
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
   row `✓ skill-name · loaded`. Expanded skills are grouped with loaded skills
@@ -192,7 +209,8 @@ The TUI favors dense, keyboard-first operation:
   Same-named skills display their source locator, and completion marks only the
   exact source selected by the tool call;
 - an independently scrollable and selectable sidebar whose current-session title
-  is a fixed header and whose location/version footer stays fixed. Only the
+  is a fixed header and participates in the same application-owned drag-selection
+  and clipboard path as the body; its location/version footer stays fixed. Only the
   projection body scrolls. Foreground transcript-backed delegations appear
   immediately under `Agents`; once a call acquires a matching durable job it yields
   to the richer `Jobs` projection rather than appearing twice. The sidebar also

@@ -556,6 +556,7 @@ pub struct SidebarView {
     offset: usize,
     content_height: usize,
     viewport_height: usize,
+    title_area: Option<Rect>,
     body_area: Option<Rect>,
     selection: Option<TextSelection>,
     /// Where each section's heading was drawn in the frame that was drawn.
@@ -583,6 +584,7 @@ impl SidebarView {
             offset: 0,
             content_height: 0,
             viewport_height: 0,
+            title_area: None,
             body_area: None,
             selection: None,
             hits: Vec::new(),
@@ -668,18 +670,21 @@ impl SidebarView {
         true
     }
 
-    /// Whether `(column, row)` belongs to the scrollable body drawn last frame.
+    /// Whether `(column, row)` belongs to selectable sidebar text drawn last frame.
     #[must_use]
     pub fn contains(&self, column: u16, row: u16) -> bool {
-        self.body_area.is_some_and(|area| {
-            column >= area.left()
-                && column < area.right()
-                && row >= area.top()
-                && row < area.bottom()
-        })
+        [self.title_area, self.body_area]
+            .into_iter()
+            .flatten()
+            .any(|area| {
+                column >= area.left()
+                    && column < area.right()
+                    && row >= area.top()
+                    && row < area.bottom()
+            })
     }
 
-    /// Begin a selection in the sidebar body.
+    /// Begin a selection in the sidebar title or body.
     pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
         let Some(point) = self.point_at(column, row, false) else {
             return false;
@@ -691,7 +696,7 @@ impl SidebarView {
         true
     }
 
-    /// Extend the active selection, clamped to the sidebar body.
+    /// Extend the active selection, clamped to the sidebar title and body.
     pub fn update_selection(&mut self, column: u16, row: u16) -> bool {
         let Some(point) = self.point_at(column, row, true) else {
             return false;
@@ -712,32 +717,41 @@ impl SidebarView {
     #[must_use]
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection?;
-        let area = self.body_area?;
-        if area.width == 0 {
-            return None;
-        }
-        let rows = self.rows(area.width).lines;
-        let (start, end) = selection.ordered();
-        if start.row >= rows.len() {
-            return None;
-        }
         let mut selected = Vec::new();
-        let last = end.row.min(rows.len().saturating_sub(1));
-        for (row, line) in rows
-            .iter()
-            .enumerate()
-            .take(last.saturating_add(1))
-            .skip(start.row)
-        {
-            let Some((left, right)) = selection.columns(row, area.width) else {
-                continue;
-            };
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            selected.push(slice_columns(&text, left, right).trim_end().to_owned());
+        let title_height = self.title_area.map_or(0, |area| usize::from(area.height));
+
+        if let Some(area) = self.title_area.filter(|area| area.width > 0) {
+            for (row, line) in self
+                .title_lines(area.width)
+                .into_iter()
+                .take(usize::from(area.height))
+                .enumerate()
+            {
+                let Some((left, right)) = selection.columns(row, area.width) else {
+                    continue;
+                };
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                selected.push(slice_columns(&text, left, right).trim_end().to_owned());
+            }
+        }
+
+        if let Some(area) = self.body_area.filter(|area| area.width > 0) {
+            for (row, line) in self.rows(area.width).lines.into_iter().enumerate() {
+                let content_row = title_height.saturating_add(row);
+                let Some((left, right)) = selection.columns(content_row, area.width) else {
+                    continue;
+                };
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                selected.push(slice_columns(&text, left, right).trim_end().to_owned());
+            }
         }
         let text = selected.join("\n");
         (!text.is_empty()).then_some(text)
@@ -759,24 +773,41 @@ impl SidebarView {
     }
 
     fn point_at(&self, column: u16, row: u16, clamp: bool) -> Option<TextPoint> {
-        let area = self.body_area?;
-        if area.width == 0 || area.height == 0 {
-            return None;
-        }
-        if !clamp
-            && (column < area.left()
-                || column >= area.right()
-                || row < area.top()
-                || row >= area.bottom())
+        let point_in = |area: Rect, row_offset: usize| {
+            if area.width == 0 || area.height == 0 {
+                return None;
+            }
+            if !clamp
+                && (column < area.left()
+                    || column >= area.right()
+                    || row < area.top()
+                    || row >= area.bottom())
+            {
+                return None;
+            }
+            let column = column.clamp(area.left(), area.right().saturating_sub(1)) - area.left();
+            let visible_row = row.clamp(area.top(), area.bottom().saturating_sub(1)) - area.top();
+            Some(TextPoint {
+                row: row_offset.saturating_add(usize::from(visible_row)),
+                column,
+            })
+        };
+        let title_height = self.title_area.map_or(0, |area| usize::from(area.height));
+
+        if let Some(area) = self
+            .title_area
+            .filter(|area| area.width > 0 && area.height > 0)
+            && row < area.bottom()
         {
-            return None;
+            return point_in(area, 0);
         }
-        let column = column.clamp(area.left(), area.right().saturating_sub(1)) - area.left();
-        let visible_row = row.clamp(area.top(), area.bottom().saturating_sub(1)) - area.top();
-        Some(TextPoint {
-            row: self.offset.saturating_add(usize::from(visible_row)),
-            column,
-        })
+        if let Some(area) = self
+            .body_area
+            .filter(|area| area.width > 0 && area.height > 0)
+        {
+            return point_in(area, title_height.saturating_add(self.offset));
+        }
+        self.title_area.and_then(|area| point_in(area, 0))
     }
 
     /// Discard the recorded heading positions.
@@ -786,6 +817,7 @@ impl SidebarView {
     /// geometry would keep answering clicks aimed at whatever now occupies those columns.
     pub fn forget_hit_targets(&mut self) {
         self.hits.clear();
+        self.title_area = None;
         self.body_area = None;
         self.selection = None;
     }
@@ -1705,6 +1737,7 @@ impl Component for SidebarView {
         // Cleared before any early return, so a frame that draws nothing leaves no target
         // behind. Every path below that does draw refills it.
         self.hits.clear();
+        self.title_area = None;
         self.body_area = None;
         fill(frame.buffer_mut(), area, self.context.surface());
         if area.width == 0 || area.height == 0 {
@@ -1733,6 +1766,11 @@ impl Component for SidebarView {
 
         let title = self.title_lines(inner.width);
         let title_height = title.len().min(usize::from(inner.height));
+        let title_area = Rect {
+            height: u16::try_from(title_height).unwrap_or(inner.height),
+            ..inner
+        };
+        self.title_area = (title_area.width > 0 && title_area.height > 0).then_some(title_area);
         let remaining = inner
             .height
             .saturating_sub(u16::try_from(title_height).unwrap_or(inner.height));
@@ -1764,13 +1802,7 @@ impl Component for SidebarView {
         if title_height > 0 {
             Paragraph::new(title.into_iter().take(title_height).collect::<Vec<_>>())
                 .style(self.context.surface())
-                .render(
-                    Rect {
-                        height: u16::try_from(title_height).unwrap_or(inner.height),
-                        ..inner
-                    },
-                    frame.buffer_mut(),
-                );
+                .render(title_area, frame.buffer_mut());
         }
         self.body_area = Some(body);
         self.content_height = rows.lines.len();
@@ -1818,8 +1850,22 @@ impl Component for SidebarView {
 
         if let Some(selection) = self.selection {
             let selected = self.context.selected();
+            if let Some(title) = self.title_area {
+                for visible_row in 0..title.height {
+                    let content_row = usize::from(visible_row);
+                    let Some((left, right)) = selection.columns(content_row, title.width) else {
+                        continue;
+                    };
+                    for column in left..right {
+                        frame.buffer_mut()[(title.x + column, title.y + visible_row)]
+                            .set_style(selected);
+                    }
+                }
+            }
             for visible_row in 0..body.height {
-                let content_row = self.offset.saturating_add(usize::from(visible_row));
+                let content_row = title_height
+                    .saturating_add(self.offset)
+                    .saturating_add(usize::from(visible_row));
                 let Some((left, right)) = selection.columns(content_row, body.width) else {
                     continue;
                 };

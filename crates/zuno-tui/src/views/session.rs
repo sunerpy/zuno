@@ -2432,13 +2432,17 @@ impl SessionScreen {
             .map(|live| live.session_id().to_owned())
             .or_else(|| self.catalog.session.clone());
         let Some(parent) = parent else {
-            self.toasts
-                .push(Toast::info("this session has no delegated child yet"));
+            self.toasts.push(Toast::info(
+                "there is no active session to inspect for delegated children",
+            ));
             return EventResult::REDRAW;
         };
         let Some(child) = self.live_sessions.children(&parent).into_iter().next() else {
-            self.toasts
-                .push(Toast::info("this session has no delegated child yet"));
+            let details = crate::views::pressable_label("messages_transcript", &self.context)
+                .unwrap_or_else(|| String::from("transcript details"));
+            self.toasts.push(Toast::info(format!(
+                "this session has no delegated child session; use {details} to inspect its recorded tool activity"
+            )));
             return EventResult::REDRAW;
         };
         self.attach_live_session(&child)

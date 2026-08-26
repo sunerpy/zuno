@@ -8272,6 +8272,31 @@ fn choosing_a_reasoning_model_clears_an_unsupported_level() {
 /// `ctrl+x` then `down` attaches the full screen to a running child immediately, and
 /// `ctrl+x` then `up` returns to the still-mounted parent.
 #[test]
+fn child_navigation_without_a_real_child_distinguishes_tool_activity_from_delegation() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_tool_only_history"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender).with_catalog(offered);
+    screen
+        .transcript_mut()
+        .transcript_mut()
+        .push(Message::user("inspect this repository with ordinary tools"));
+
+    screen.handle_action(action("session_child_first"), &press_none());
+
+    let notices = screen.drain_toasts();
+    assert_eq!(notices.len(), 1, "the missing child was not explained");
+    assert!(
+        notices[0].text().contains("no delegated child session"),
+        "the notice still implies a historical child merely failed to load: {notices:?}"
+    );
+    assert!(
+        notices[0].text().contains("ctrl+t") && notices[0].text().contains("tool activity"),
+        "ordinary tool history has no discoverable inspection path: {notices:?}"
+    );
+}
+
+#[test]
 fn leader_down_and_up_switch_between_parent_and_live_child_without_a_dialog() {
     let keymap = Keymap::defaults().expect("the shipped table builds");
     let (sender, _receiver) = terminal_event_channel();

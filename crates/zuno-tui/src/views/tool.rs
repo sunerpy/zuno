@@ -468,11 +468,40 @@ pub fn output_budget(name: &str, display: ToolDisplay) -> OutputBudget {
     }
 }
 
-/// The style a tool row is painted in, by how far the call has got.
+/// Theme roles for one compact tool header.
 ///
-/// Here rather than in the transcript because it is the one part of a tool row that is a
-/// *colour* decision, and keeping it beside the icon table means the two cannot drift
-/// into disagreeing about which states are terminal.
+/// Status colour is intentionally isolated to [`Self::status`]. A blocked or failed call
+/// must remain obvious, but painting its name, arguments, and disclosure control the same
+/// warning/error colour creates a large saturated stripe in a dense transcript. The title
+/// and detail roles keep the row readable when colour is unavailable as well.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeaderStyles {
+    pub chrome: Style,
+    pub status: Style,
+    pub title: Style,
+    pub detail: Style,
+}
+
+/// Resolve the semantic theme roles for a compact tool header.
+#[must_use]
+pub fn header_styles(
+    status: crate::views::message::ToolStatus,
+    intent: zuno_tool::ToolUiIntent,
+    context: &ViewContext,
+) -> HeaderStyles {
+    HeaderStyles {
+        chrome: context.muted(),
+        status: status_style(status, intent, context),
+        title: context.title(),
+        detail: context.secondary(),
+    }
+}
+
+/// The style a tool status glyph is painted in, by how far the call has got.
+///
+/// Here rather than in the transcript because it is the one part of a tool header that is
+/// a colour decision, and keeping it beside the icon table means the two cannot drift into
+/// disagreeing about which states are terminal.
 #[must_use]
 pub fn status_style(
     status: crate::views::message::ToolStatus,
