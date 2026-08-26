@@ -914,7 +914,7 @@ mod tests {
     #[test]
     fn retaining_first_party_skills_rebuilds_exact_source_and_name_indexes() {
         let skills = Skills::from_loaded(builtin::skills())
-            .retaining(|skill| builtin::visible_to(&skill.location, "plan", None));
+            .retaining(|skill| builtin::visible_to(&skill.location, "plan", None, &[]));
         assert_eq!(
             skills
                 .all()
@@ -925,7 +925,8 @@ mod tests {
                 "customize-zuno",
                 "deepwork",
                 "codemap",
-                "verification-planning"
+                "verification-planning",
+                "ui-design"
             ]
         );
         for skill in skills.all() {

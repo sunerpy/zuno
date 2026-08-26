@@ -105,7 +105,7 @@ fn test_capability() -> Arc<CapabilitySnapshot> {
         PackIdentity {
             id: zuno_orchestration::PACK_ID.to_owned(),
             version: zuno_orchestration::PACK_VERSION.to_owned(),
-            upstream_revision: zuno_orchestration::UPSTREAM_REVISION.to_owned(),
+            upstream_revision: zuno_orchestration::CAPABILITY_REVIEW_REVISION.to_owned(),
         },
         0,
         sha256_text("test permission policy"),

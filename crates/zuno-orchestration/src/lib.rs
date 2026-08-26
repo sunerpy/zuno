@@ -23,8 +23,8 @@ pub const PACK_ID: &str = "zuno-orchestration";
 /// Version of the descriptors and embedded Skill resources.
 pub const PACK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Zuno source revision used when the original Skill text was authored.
-pub const UPSTREAM_REVISION: &str = "zuno@ef709e571d40c2cd9fbf12ad5e4c6de81cd498d9";
+/// Zuno source revision against which the embedded capability requirements were reviewed.
+pub const CAPABILITY_REVIEW_REVISION: &str = "zuno@ef709e571d40c2cd9fbf12ad5e4c6de81cd498d9";
 
 /// License review shared by the original first-party resources.
 pub const LICENSE_REVIEW: &str =
@@ -56,7 +56,7 @@ pub struct BuiltinSkillDescriptor {
     pub location: &'static str,
     /// Agent profiles for which the Skill may be advertised.
     pub allowed_profiles: &'static [&'static str],
-    /// Tools that must already be visible before the Skill may be selected.
+    /// Tools that must already be registered and permission-visible before selection.
     pub required_tools: &'static [&'static str],
     /// Lowercase hexadecimal SHA-256 digest of [`Self::content`].
     pub content_sha256: &'static str,
@@ -149,14 +149,26 @@ const REFLECT_PROFILES: &[&str] = &["orchestrator", "build", "deep", "general", 
 
 const MUTATING_WORK_PROFILES: &[&str] = &["orchestrator", "build", "deep", "fixer", "general"];
 
+const UI_DESIGN_PROFILES: &[&str] = &[
+    "orchestrator",
+    "build",
+    "plan",
+    "deep",
+    "fixer",
+    "general",
+    "oracle",
+    "looker",
+    "designer",
+];
+
 const NATIVE_PROVENANCE: SkillProvenance = SkillProvenance {
     inspiration: "Zuno's native Rust capability, prompt, work-state, memory, and lifecycle contracts.",
     license_review: LICENSE_REVIEW,
-    upstream_revision: UPSTREAM_REVISION,
+    upstream_revision: CAPABILITY_REVIEW_REVISION,
 };
 
 /// Every Skill shipped by the first-party pack, in stable presentation order.
-pub const SKILLS: [BuiltinSkillDescriptor; 7] = [
+pub const SKILLS: [BuiltinSkillDescriptor; 8] = [
     BuiltinSkillDescriptor {
         name: "customize-zuno",
         description: "Inspect or change Zuno configuration, providers, authentication, permissions, Agents, workflows, Skills, MCP servers, or extensions.",
@@ -232,6 +244,17 @@ pub const SKILLS: [BuiltinSkillDescriptor; 7] = [
         allowed_profiles: MUTATING_WORK_PROFILES,
         required_tools: &["read", "shell"],
         content_sha256: "0561c6522da0501cb5a0f68a7c96fa1181a9330f1e2c429952f255ebbd4e6cbf",
+        provenance: NATIVE_PROVENANCE,
+    },
+    BuiltinSkillDescriptor {
+        name: "ui-design",
+        description: "Review or implement UI with existing-system alignment, interaction and accessibility requirements, and real visual acceptance evidence.",
+        content: include_str!("skills/ui-design.md"),
+        source_id: "zuno-orchestration:skill/ui-design@0.1.0",
+        location: "builtin://zuno-orchestration/0.1.0/ui-design",
+        allowed_profiles: UI_DESIGN_PROFILES,
+        required_tools: &["read", "skill"],
+        content_sha256: "a998b55e4eb4da6114c95d6785f2e46b6f21ae36214e0910cf23f97bbade859a",
         provenance: NATIVE_PROVENANCE,
     },
 ];

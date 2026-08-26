@@ -5,7 +5,7 @@ use zuno_orchestration::{
     COUNCILS, PACK_ID, PACK_VERSION, SKILLS, council, councils, pack, skill, skills,
 };
 
-const EXPECTED_NAMES: [&str; 7] = [
+const EXPECTED_NAMES: [&str; 8] = [
     "customize-zuno",
     "deepwork",
     "codemap",
@@ -13,6 +13,7 @@ const EXPECTED_NAMES: [&str; 7] = [
     "reflect",
     "worktree",
     "git-workflow",
+    "ui-design",
 ];
 
 const AUTHORITY_GUARD: &str = "This Skill does not grant tools, permissions, filesystem access, network access,\nor environment access.";
@@ -201,5 +202,19 @@ fn worktree_skill_is_explicitly_preflight_only() {
         worktree
             .content
             .contains("or claim that Zuno will clean them up")
+    );
+}
+
+#[test]
+fn reusable_design_method_is_a_skill_but_product_workflows_remain_user_owned() {
+    assert!(skill("dual-review").is_none());
+    assert!(skill("auto-release").is_none());
+    let design = skill("ui-design").expect("ui-design descriptor");
+    assert!(design.required_tools.contains(&"read"));
+    assert!(design.required_tools.contains(&"skill"));
+    assert!(design.content.contains("existing design system"));
+    assert!(
+        design.content.contains("visual evidence"),
+        "the design workflow must require runtime evidence rather than source-only confidence"
     );
 }

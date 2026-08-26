@@ -79,6 +79,71 @@ explicit Agent deny. A user can replace the Agent permission overlay explicitly,
 doing so intentionally changes `explorer`'s read-only contract and is normally less
 clear than selecting the correct Agent.
 
+That deny remains until the active platform provides the complete OS sandbox gate
+described in [the Shell sandbox roadmap](design/shell-sandbox-roadmap.md). Zuno does
+not treat command parsing, process groups, or a prompt that says "read-only" as
+confinement.
+
+### Optional configured designer
+
+UI method is provided by the first-party `ui-design` Skill rather than a new native
+Agent. When a project benefits from a separate model/context lane, add
+`.zuno/agent/designer.md`:
+
+```markdown
+---
+description: Review and implement bounded UI and interaction work
+mode: subagent
+permission:
+  mode: standard
+  rules:
+    "*": deny
+    read: allow
+    glob: allow
+    grep: allow
+    lsp: allow
+    edit: allow
+    shell: ask
+    skill: allow
+    plan_get: allow
+    todo_get: allow
+---
+
+Own only the delegated UI/UX implementation scope. Load the `ui-design` Skill before
+acting. Respect the existing design system, do not perform broad external research,
+do not make product or backend architecture decisions, and do not delegate children.
+Return changed files, interaction/accessibility checks, visual evidence, and risks.
+```
+
+Add the configured Agent to the orchestrator's exact delegation allowlist. The
+list replaces rather than extends the native value, so preserve every default
+specialist explicitly:
+
+```json
+{
+  "agents": {
+    "orchestrator": {
+      "delegates": [
+        "deep",
+        "fixer",
+        "general",
+        "explorer",
+        "librarian",
+        "oracle",
+        "looker",
+        "designer"
+      ]
+    }
+  }
+}
+```
+
+Do not hard-code a model unless the project needs a dedicated route. Screenshot,
+image, PDF, or video observation stays with `looker`; the parent passes structured
+observations to `designer`. Promote `designer` into the native roster only if repeated
+evidence shows incorrect routing, context pollution, or a required capability boundary
+that configuration cannot express.
+
 The orchestrator prompt asks for bounded child objectives, explicit
 deliverables, non-overlapping writers, dependency-aware scheduling, and parent
 verification. Child output is evidence for the parent; it is not automatically

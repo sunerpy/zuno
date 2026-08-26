@@ -6200,6 +6200,7 @@ dependencies = [
  "zuno-network",
  "zuno-orchestration",
  "zuno-paths",
+ "zuno-permission",
  "zuno-testkit",
 ]
 

@@ -297,9 +297,11 @@ remain as aliases. `deep` remains distinct from `fixer`: Deep owns a bounded but
 cross-cutting implementation objective, while Fixer owns a narrow change whose
 scope is already known.
 
-`designer` may be added later as a UI-limited write profile if real workflows
-show that `general` plus visual Skills are insufficient. It is not required to
-copy another project's nominal seven-Agent roster.
+`ui-design` now carries the shared visual and interaction method. Projects may
+add a deny-by-default configured `designer` subagent when a separate model or
+context is useful. A native `designer` profile remains deferred until real
+workflows show that `general` plus the Skill cannot express the required boundary;
+Zuno does not copy another project's nominal roster for name parity.
 
 ### One enforceable profile
 
@@ -527,8 +529,8 @@ After the named-capability registry exists, external packages may contribute
 descriptors through a transactional capability generation. Raw provider
 objects, credentials, database handles, or `HarnessRuntime` are never exposed.
 
-Implementation checkpoint (2026-08-25): the static
-`zuno-orchestration` crate is data-only and contributes the seven Skill
+Implementation checkpoint (2026-08-26): the static
+`zuno-orchestration` crate is data-only and contributes the eight Skill
 descriptors below, including stable source ids, hashes, profile/tool gates, and
 license provenance. It deliberately owns no scheduler, provider, permission,
 session, or lifecycle service. The native profile composition root publishes
@@ -550,10 +552,22 @@ The first orchestration pack should adapt, not copy, these workflow ideas:
 | `customize-zuno` | explain native configuration, providers, auth, permissions, agents, workflows, Skills, MCP, and plugins |
 | `worktree` | perform read-only preflight now; request a lifecycle-owned lease only after the quota, provenance, status, and cleanup service lands |
 | `git-workflow` | preserve user changes, scope commits, inspect history when needed, and verify the staged diff |
+| `ui-design` | align with the existing design system, separate visual observation from implementation, and require real runtime visual evidence |
 
 `git-workflow` is the adapted Zuno name for the useful portion of OMO's
 `git-master` guidance. Worktree lifecycle remains a runtime service rather than
 being hidden in Git prompt prose.
+
+`dual-review` and `auto-release` are deliberately not built in. The named workflow's
+reviewer topology, release gates, remote authority, artifact targets, and rollback
+policy are owned by the user or project. They may be authored as global or project
+Skills; because a unique Skill already receives a direct slash entry, a second
+Markdown command is still unnecessary. The built-in `balanced-review` council is a
+generic synthesis primitive, not an implementation of either user-owned workflow.
+
+`ui-design` is the shared method source for UI work. A project may add a configured
+`designer` subagent with a dedicated model and context, but the native roster remains
+unchanged until real workflows prove that `general` plus this Skill is insufficient.
 
 Every built-in Skill records source inspiration, license review, version,
 content hash, allowed profiles, required capabilities, and tests.

@@ -683,6 +683,7 @@ impl TurnPlan {
                 &skill.location,
                 agent.name(),
                 definition.tools.as_deref(),
+                agent.capabilities().rules(),
             )
         }));
         let mut runtime_surface =
@@ -6032,7 +6033,7 @@ fn orchestration_capability(
         PackIdentity {
             id: zuno_orchestration::PACK_ID.to_owned(),
             version: zuno_orchestration::PACK_VERSION.to_owned(),
-            upstream_revision: zuno_orchestration::UPSTREAM_REVISION.to_owned(),
+            upstream_revision: zuno_orchestration::CAPABILITY_REVIEW_REVISION.to_owned(),
         },
         extension_revision,
         permission_policy_sha256,

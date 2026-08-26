@@ -4,6 +4,8 @@
 //! adapts those descriptors to the catalog's source-identity and visibility model.
 
 use crate::skill::Skill;
+use zuno_permission::Rule;
+use zuno_permission::visibility::is_tool_visible;
 
 /// The customization Skill's stable name, retained for callers testing collisions.
 pub const NAME: &str = zuno_orchestration::SKILLS[0].name;
@@ -54,16 +56,14 @@ pub fn is_location(location: &str) -> bool {
 /// `None` means the profile did not restrict tools, so the runtime's canonical
 /// native surface remains available. External Skills are not governed by this pack.
 #[must_use]
-pub fn visible_to(location: &str, profile: &str, tools: Option<&[String]>) -> bool {
+pub fn visible_to(location: &str, profile: &str, tools: Option<&[String]>, rules: &[Rule]) -> bool {
     let Some(descriptor) = descriptor_by_location(location) else {
         return true;
     };
     descriptor.allowed_profiles.contains(&profile)
-        && tools.is_none_or(|tools| {
-            descriptor
-                .required_tools
-                .iter()
-                .all(|required| tools.iter().any(|tool| tool == required))
+        && descriptor.required_tools.iter().all(|required| {
+            tools.is_none_or(|tools| tools.iter().any(|tool| tool == required))
+                && is_tool_visible(required, rules)
         })
 }
 
@@ -83,8 +83,8 @@ mod tests {
     #[test]
     fn visibility_requires_an_allowed_profile_and_every_explicit_tool() {
         let deepwork = zuno_orchestration::skill("deepwork").expect("deepwork descriptor");
-        assert!(visible_to(deepwork.location, "orchestrator", None));
-        assert!(!visible_to(deepwork.location, "explorer", None));
+        assert!(visible_to(deepwork.location, "orchestrator", None, &[]));
+        assert!(!visible_to(deepwork.location, "explorer", None, &[]));
 
         let incomplete = [
             "plan_get".to_owned(),
@@ -94,7 +94,8 @@ mod tests {
         assert!(!visible_to(
             deepwork.location,
             "orchestrator",
-            Some(&incomplete)
+            Some(&incomplete),
+            &[],
         ));
         let complete = deepwork
             .required_tools
@@ -104,8 +105,24 @@ mod tests {
         assert!(visible_to(
             deepwork.location,
             "orchestrator",
-            Some(&complete)
+            Some(&complete),
+            &[],
         ));
+    }
+
+    #[test]
+    fn visibility_respects_permission_denies_for_first_party_skills() {
+        let design = zuno_orchestration::skill("ui-design").expect("design descriptor");
+        let tools = ["read", "skill"].map(str::to_owned).to_vec();
+        assert!(visible_to(design.location, "build", Some(&tools), &[],));
+
+        let denied = zuno_permission::rules_from_config(
+            &serde_json::from_value(serde_json::json!({
+                "rules": {"skill": "deny"}
+            }))
+            .expect("permission config"),
+        );
+        assert!(!visible_to(design.location, "build", Some(&tools), &denied,));
     }
 
     #[test]
@@ -113,7 +130,8 @@ mod tests {
         assert!(visible_to(
             "/project/.zuno/skills/custom/SKILL.md",
             "custom-agent",
-            Some(&[])
+            Some(&[]),
+            &[],
         ));
         assert!(!is_location("builtin://zuno-orchestration/unknown"));
     }
