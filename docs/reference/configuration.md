@@ -38,13 +38,18 @@ The default enables application-owned mouse interaction:
 ```json
 {
   "theme": "system",
-  "mouse": true
+  "mouse": true,
+  "leader_timeout": 5000
 }
 ```
 
-With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events. The transcript provides its own selection and copy behavior, clamps a drag to the transcript instead of crossing into the sidebar, exposes clickable tool and sidebar disclosure rows, and mounts a draggable scrollbar when a conversation overflows.
+`leader_timeout` is milliseconds. Its default is 5000, so the `Ctrl+X` continuation
+overlay remains readable for five seconds unless another key completes or cancels the
+sequence first.
 
-Set `"mouse": false` to opt out of those interactions and return drag selection to the terminal. In that mode native selection may cross the transcript, sidebar, and input area; terminals that implement alternate-scroll mode can still translate wheel notches into transcript scrolling while the composer is empty.
+With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events. The transcript and both root and child composers provide their own selection and copy behavior. Releasing a drag copies the selected text through the configured clipboard and leaves the highlight visible. Transcript selection remains clamped instead of crossing into the sidebar; tool and sidebar disclosure rows are clickable, and an overflowing conversation mounts a draggable scrollbar.
+
+Set `"mouse": false` to opt out of those interactions and return drag selection to the terminal. In that mode native selection may cross the transcript, sidebar, and input area; terminals that implement alternate-scroll mode can still translate wheel notches into transcript scrolling while the composer is empty. The composer still renders a high-contrast theme-derived caret for keyboard editing.
 
 The `system` theme queries the terminal's OSC 10/11 foreground and background colours before the TUI starts, then derives its text, panel, input, border, and syntax colours from that result. Terminals which do not support colour queries fall back to `COLORFGBG`; if neither source is available, Zuno applies a neutral root, panel, and input hierarchy so the interface does not collapse into one near-black surface.
 

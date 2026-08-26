@@ -83,6 +83,11 @@ fn an_empty_document_enables_pane_bounded_mouse_selection() {
         .expect("resolve succeeds");
 
     assert_eq!(resolved.leader_timeout, DEFAULT_LEADER_TIMEOUT);
+    assert_eq!(
+        resolved.leader_timeout,
+        Duration::from_secs(5),
+        "the which-key panel must remain readable for at least five seconds by default"
+    );
     assert!(
         resolved.mouse,
         "pane-bounded selection is the documented default"

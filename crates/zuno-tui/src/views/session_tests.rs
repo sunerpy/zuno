@@ -4517,6 +4517,57 @@ fn session_screen_copying_prefers_the_selection_over_the_whole_buffer() {
     );
 }
 
+#[test]
+fn session_prompt_mouse_drag_selects_and_copies_on_welcome_and_conversation_surfaces() {
+    for conversation in [false, true] {
+        let (mut screen, clipboard, _shutdown) = screen_with_clipboard();
+        if conversation {
+            screen
+                .transcript_mut()
+                .transcript_mut()
+                .push(Message::user("conversation is active"));
+        }
+        screen.editor.set_text("abcdef");
+        let rendered = rows(&render_offscreen(&mut screen, 80, 18).expect("infallible"));
+        let row = rendered
+            .iter()
+            .position(|line| line.contains("abcdef"))
+            .expect("the prompt text is visible");
+        let byte = rendered[row]
+            .find("abcdef")
+            .expect("the prompt text has a terminal column");
+        let column = crate::views::display_width(&rendered[row][..byte]);
+        let row = u16::try_from(row).expect("the row fits in the terminal");
+        let column = u16::try_from(column).expect("the column fits in the terminal");
+
+        pointer_at(
+            &mut screen,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column + 1,
+            row,
+        );
+        pointer_at(
+            &mut screen,
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column + 4,
+            row,
+        );
+        pointer_at(
+            &mut screen,
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column + 4,
+            row,
+        );
+
+        assert_eq!(screen.editor.selection(), Some(String::from("bcd")));
+        assert_eq!(
+            clipboard.read().expect("a memory clipboard cannot fail"),
+            Some(crate::views::external::ClipboardContent::text("bcd")),
+            "the {conversation:?} prompt drag did not copy its selection"
+        );
+    }
+}
+
 /// How many rows the prompt band occupied in a `width` x `height` frame.
 ///
 /// Measured back out of the frame rather than by calling `prompt_rows`. Asserting that
@@ -6286,6 +6337,46 @@ fn tab_cycles_the_agent_through_the_production_dispatch_chain() {
         joined.contains("general"),
         "the switch reached the host but nothing on screen says so, which is \
          indistinguishable from a dead key:\n{joined}"
+    );
+}
+
+#[test]
+fn agent_identity_stays_below_the_prompt_and_updates_during_a_running_turn() {
+    let (mut screen, mut applied) = cyclable();
+    screen.status.describe("build", "test-provider/test-model");
+    screen.status.mark_running();
+
+    let initial = rows(&render_offscreen(&mut screen, 100, 18).expect("infallible"));
+    let prompt = initial
+        .iter()
+        .position(|row| row.contains('▏'))
+        .expect("the prompt caret is visible");
+    assert!(
+        initial
+            .iter()
+            .skip(prompt + 1)
+            .any(|row| row.contains("build") && row.contains("test-model")),
+        "the active agent/model identity is not below the prompt: {initial:?}"
+    );
+
+    screen.handle_action(action("agent_cycle"), &press_none());
+    assert_eq!(
+        applied
+            .try_recv()
+            .expect("the agent change reaches the host"),
+        Selection::Agent(String::from("general"))
+    );
+    let cycled = rows(&render_offscreen(&mut screen, 100, 18).expect("infallible"));
+    let prompt = cycled
+        .iter()
+        .position(|row| row.contains('▏'))
+        .expect("the prompt caret remains visible");
+    assert!(
+        cycled
+            .iter()
+            .skip(prompt + 1)
+            .any(|row| row.contains("general") && row.contains("test-model")),
+        "Tab changed the host but not the persistent identity below the input: {cycled:?}"
     );
 }
 
@@ -8274,6 +8365,63 @@ fn leader_down_and_up_switch_between_parent_and_live_child_without_a_dialog() {
 }
 
 #[test]
+fn leader_down_enters_a_restored_completed_child_after_tui_restart() {
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let (sender, _receiver) = terminal_event_channel();
+    let sessions = crate::views::live_session::LiveSessions::default();
+    sessions.restore(crate::views::live_session::LiveSessionOpen {
+        session_id: String::from("ses_restored_child"),
+        parent_session_id: String::from("ses_parent"),
+        title: String::from("restored child"),
+        agent: String::from("explorer"),
+        model: String::from("test/model"),
+        effort: None,
+        messages: vec![
+            Message::user("inspect durable state"),
+            Message {
+                role: Role::Assistant,
+                id: None,
+                parts: vec![crate::views::message::MessagePart::Text {
+                    text: String::from("durable child result"),
+                }],
+            },
+        ],
+        usage: None,
+    });
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions);
+    let host = crate::views::dialog::DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+    for event in [
+        KeyEvent {
+            code: crossterm::event::KeyCode::Char('x'),
+            modifiers: crossterm::event::KeyModifiers::CONTROL,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        },
+        press(crossterm::event::KeyCode::Down),
+    ] {
+        dispatcher.handle_event(&crate::app::AppEvent::Terminal(TerminalEvent::Input(
+            crossterm::event::Event::Key(event),
+        )));
+    }
+
+    let child = rows(&render_offscreen(&mut dispatcher, 100, 24).expect("infallible")).join("\n");
+    assert!(
+        child.contains("durable child result"),
+        "ctrl+x down ignored the restored child session:\n{child}"
+    );
+    assert!(
+        child.contains("enter continue"),
+        "a completed restored child was rendered as running:\n{child}"
+    );
+}
+
+#[test]
 fn live_running_child_enter_submits_plain_text_as_a_targeted_steer() {
     let (sender, _shutdown) = terminal_event_channel();
     let (prompts, mut submitted) = mpsc::channel(2);
@@ -8375,6 +8523,72 @@ fn live_completed_child_enter_submits_a_targeted_continuation() {
     assert!(
         rendered.contains("continue with refresh handling"),
         "the accepted child input was not reflected in its transcript:\n{rendered}"
+    );
+}
+
+#[test]
+fn live_child_prompt_mouse_drag_selects_and_copies_without_detaching_the_child() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let clipboard = Arc::new(crate::views::external::MemoryClipboard::default());
+    let sessions = crate::views::live_session::LiveSessions::default();
+    sessions.restore(crate::views::live_session::LiveSessionOpen {
+        session_id: String::from("ses_child"),
+        parent_session_id: String::from("ses_parent"),
+        title: String::from("inspect auth"),
+        agent: String::from("explorer"),
+        model: String::from("test/model"),
+        effort: None,
+        messages: vec![Message::user("inspect the auth flow")],
+        usage: None,
+    });
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions)
+        .with_clipboard(clipboard.clone());
+    screen.attach_live_session("ses_child");
+    type_into_screen(&mut screen, "abcdef");
+    let rendered = rows(&render_offscreen(&mut screen, 90, 18).expect("infallible"));
+    let row = rendered
+        .iter()
+        .position(|line| line.contains("abcdef"))
+        .expect("the child prompt is visible");
+    let byte = rendered[row]
+        .find("abcdef")
+        .expect("the child prompt has a terminal column");
+    let column = crate::views::display_width(&rendered[row][..byte]);
+    let row = u16::try_from(row).expect("the row fits");
+    let column = u16::try_from(column).expect("the column fits");
+
+    for (kind, column) in [
+        (
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column + 1,
+        ),
+        (
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column + 4,
+        ),
+        (
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column + 4,
+        ),
+    ] {
+        pointer_at(&mut screen, kind, column, row);
+    }
+
+    assert_eq!(
+        clipboard.read().expect("a memory clipboard cannot fail"),
+        Some(crate::views::external::ClipboardContent::text("bcd"))
+    );
+    assert_eq!(
+        screen
+            .live_session
+            .as_ref()
+            .expect("the child remains attached")
+            .session_id(),
+        "ses_child"
     );
 }
 

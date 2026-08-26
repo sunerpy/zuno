@@ -2096,6 +2096,113 @@ fn tool_call_shown(
     draw(&mut view, 90, 30)
 }
 
+fn complete_tool(view: &mut TranscriptView, id: &str, name: &str, arguments: &str, output: &str) {
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
+        id: id.to_owned(),
+        name: name.to_owned(),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
+        id: id.to_owned(),
+        delta: arguments.to_owned(),
+    })));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd {
+        id: id.to_owned(),
+    })));
+    view.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: id.to_owned(),
+        name: name.to_owned(),
+        title: String::from("Ran a tool"),
+        output: output.to_owned(),
+        diff: None,
+        written_paths: Vec::new(),
+        is_error: false,
+    }));
+}
+
+#[test]
+fn views_compacted_activity_lists_each_command_read_and_search_summary() {
+    let context = ViewContext::defaults();
+    let mut view = TranscriptView::new(context.clone());
+    view.set_activity_display(ActivityDisplay::Summary);
+    view.handle_event(&AppEvent::Engine(started()));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDelta(
+        String::from("Inspect the rendering path before changing it."),
+    ))));
+    view.handle_event(&AppEvent::Engine(provider(StreamEvent::ReasoningDone {
+        duration_secs: 1.2,
+    })));
+    complete_tool(
+        &mut view,
+        "command",
+        "exec_command",
+        r#"{"cmd":"cargo test -p zuno-tui"}"#,
+        "command output",
+    );
+    complete_tool(
+        &mut view,
+        "read",
+        "read",
+        r#"{"path":"crates/zuno-tui/src/views/message.rs","offset":1884,"limit":48}"#,
+        "file contents",
+    );
+    complete_tool(
+        &mut view,
+        "search",
+        "google_search",
+        r#"{"query":"Codex tool activity presentation"}"#,
+        "search results",
+    );
+
+    let compact_lines = view.cached_lines_for_test(100);
+    let compact = row_text(&compact_lines).join("\n");
+    for expected in [
+        "$ cargo test -p zuno-tui",
+        "→ read · crates/zuno-tui/src/views/message.rs [offset=1884,limit=48]",
+        "◈ search · Codex tool activity presentation",
+        "Ctrl+T details",
+    ] {
+        assert!(
+            compact.contains(expected),
+            "compacted activity omitted {expected:?}:\n{compact}"
+        );
+    }
+    for hidden in ["command output", "file contents", "search results"] {
+        assert!(
+            !compact.contains(hidden),
+            "compacted activity leaked full result {hidden:?}:\n{compact}"
+        );
+    }
+    let command_style = compact_lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.contains("cargo test -p zuno-tui"))
+        .expect("the command summary has a rendered span")
+        .style;
+    assert_eq!(
+        command_style.fg,
+        context.secondary().fg,
+        "activity summaries should use the neutral secondary palette"
+    );
+
+    view.set_activity_display(ActivityDisplay::Detailed);
+    view.toggle_tool_output();
+    let detailed = draw(&mut view, 120, 80).join("\n");
+    for expected in [
+        "Arguments",
+        r#""cmd": "cargo test -p zuno-tui""#,
+        "Result",
+        "command output",
+        "file contents",
+        "search results",
+    ] {
+        assert!(
+            detailed.contains(expected),
+            "expanded activity lost {expected:?}:\n{detailed}"
+        );
+    }
+}
+
 #[test]
 fn views_tool_row_names_the_argument_and_not_only_the_kind_of_work() {
     // The P2-4 defect, stated as an assertion: `title` alone said `Read src/main.rs` for

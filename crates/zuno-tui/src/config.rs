@@ -72,8 +72,9 @@ mod tests;
 
 /// The leader-key timeout applied when the user configures none.
 ///
-/// `packages/tui/src/config/index.tsx:21` — `LeaderTimeoutDefault = 2000`.
-pub const DEFAULT_LEADER_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Five seconds keeps the discoverability panel readable without slowing a completed
+/// chord: a valid continuation still dispatches as soon as its next key arrives.
+pub const DEFAULT_LEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The smallest scroll speed upstream accepts (`index.tsx:26`).
 pub const MIN_SCROLL_SPEED: f64 = 0.001;

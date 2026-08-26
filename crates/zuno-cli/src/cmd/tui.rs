@@ -495,6 +495,11 @@ fn execute_once(
             }
         });
     }
+    let child_restore_diagnostics = if host.is_session_materialized() {
+        restore_child_sessions(&host.database_pool(), host.session_id(), &live_sessions)
+    } else {
+        Vec::new()
+    };
     driver_options.extension_composition = super::turn::ExtensionComposition::Active;
     catalog.sessions = session_entries(&host)?;
     catalog.session = host
@@ -641,6 +646,12 @@ fn execute_once(
                 .transcript_mut()
                 .push(super::tui_replay::failure_notice(host.session_id(), &error));
         }
+    }
+    for diagnostic in child_restore_diagnostics {
+        screen
+            .transcript_mut()
+            .transcript_mut()
+            .push(Message::notice(diagnostic));
     }
     // Theme fallback is recoverable, unlike an unreadable or malformed config file.
     // Put its diagnostic in the transcript rather than stderr: the alternate screen
@@ -944,6 +955,89 @@ struct TitleProjectionSink {
 struct TuiChildObserver {
     sessions: LiveSessions,
     wake: mpsc::Sender<TerminalEvent>,
+}
+
+/// Restore the durable child tree before the first frame of a resumed parent session.
+///
+/// A child created by an earlier process is still a real session. Keeping this projection
+/// process-only made `ctrl+x down` report that the parent had never delegated even though
+/// SQLite held the complete tree and transcript. Each history is hydrated through the same
+/// compaction boundary the next model request uses; one corrupt child becomes a visible notice
+/// inside that child instead of hiding its siblings.
+fn restore_child_sessions(
+    pool: &zuno_db::pool::Pool,
+    root_session_id: &str,
+    sessions: &LiveSessions,
+) -> Vec<String> {
+    let connection = match pool.get() {
+        Ok(connection) => connection,
+        Err(error) => {
+            return vec![format!(
+                "warning: child sessions could not be restored: {error}"
+            )];
+        }
+    };
+    let mut diagnostics = Vec::new();
+    let mut pending = VecDeque::from([root_session_id.to_owned()]);
+    let mut seen = BTreeSet::from([root_session_id.to_owned()]);
+
+    while let Some(parent_session_id) = pending.pop_front() {
+        let mut children = match zuno_db::session::children(&connection, &parent_session_id) {
+            Ok(children) => children,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "warning: children of session `{parent_session_id}` could not be restored: \
+                     {error}"
+                ));
+                continue;
+            }
+        };
+        children.sort_by(|left, right| {
+            (left.time_created, left.id.as_str()).cmp(&(right.time_created, right.id.as_str()))
+        });
+        for child in children {
+            if !seen.insert(child.id.clone()) {
+                diagnostics.push(format!(
+                    "warning: child session cycle ignored at `{}`",
+                    child.id
+                ));
+                continue;
+            }
+            pending.push_back(child.id.clone());
+            let messages =
+                match zuno_engine::r#loop::hydrate_retained_history(&connection, &child.id) {
+                    Ok(history) => {
+                        let replay = super::tui_replay::project(history);
+                        let omission = replay.omission_notice();
+                        let mut messages = replay.messages;
+                        if let Some(notice) = omission {
+                            messages.push(notice);
+                        }
+                        messages
+                    }
+                    Err(error) => vec![super::tui_replay::failure_notice(&child.id, &error)],
+                };
+            sessions.restore(LiveSessionOpen {
+                session_id: child.id,
+                parent_session_id: parent_session_id.clone(),
+                title: child.title,
+                agent: child.agent.unwrap_or_default(),
+                model: persisted_model_label(child.model.as_deref()).unwrap_or_default(),
+                effort: None,
+                messages,
+                usage: Some(child.usage.snapshot()),
+            });
+        }
+    }
+
+    diagnostics
+}
+
+fn persisted_model_label(raw: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw?).ok()?;
+    let provider = value.get("providerID")?.as_str()?;
+    let model = value.get("id")?.as_str()?;
+    Some(format!("{provider}/{model}"))
 }
 
 impl ChildTurnObserver for TuiChildObserver {
@@ -3599,6 +3693,53 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn durable_child_sessions_are_restored_before_navigation() {
+        let pool = Arc::new(
+            zuno_db::pool::Pool::open(&zuno_paths::DbLocation::Memory)
+                .expect("open child projection database"),
+        );
+        {
+            let mut connection = pool.get().expect("seed connection");
+            zuno_db::migration::apply(&mut connection).expect("apply schema");
+            connection
+                .execute_batch(
+                    "INSERT INTO project \
+                       (id, worktree, time_created, time_updated, sandboxes) \
+                     VALUES ('project-child-projection', '/workspace', 1, 1, '[]');
+                     INSERT INTO session \
+                       (id, project_id, parent_id, slug, directory, title, version, agent, model, \
+                        time_created, time_updated) \
+                     VALUES \
+                       ('ses_parent', 'project-child-projection', NULL, 'parent', '/workspace', \
+                        'parent', '1', 'build', \
+                        '{\"id\":\"root-model\",\"providerID\":\"test\"}', 1, 1),
+                       ('ses_child', 'project-child-projection', 'ses_parent', 'child', \
+                        '/workspace', 'durable child', '1', 'explorer', \
+                        '{\"id\":\"child-model\",\"providerID\":\"test\"}', 2, 2);",
+                )
+                .expect("seed parent and child");
+        }
+        let sessions = LiveSessions::default();
+
+        let diagnostics = restore_child_sessions(&pool, "ses_parent", &sessions);
+
+        assert!(
+            diagnostics.is_empty(),
+            "a valid durable child emitted diagnostics: {diagnostics:?}"
+        );
+        let snapshot = sessions
+            .snapshot("ses_child")
+            .expect("durable child is restored");
+        assert_eq!(snapshot.parent_session_id, "ses_parent");
+        assert_eq!(snapshot.agent, "explorer");
+        assert_eq!(snapshot.model, "test/child-model");
+        assert!(
+            !snapshot.transcript.is_running(),
+            "a historical child was restored as active"
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_forwarder_fires_the_active_sessions_interrupt_signal() {
         let registry = SessionRunRegistry::new();
@@ -4108,6 +4249,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    static FOREGROUND_EDITOR_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(target_os = "linux")]
     fn contained_system_editor(spec: String) -> Arc<dyn ExternalEditor> {
         let test_executable = std::env::current_exe().expect("locate the zuno-cli test binary");
         let debug_directory = test_executable
@@ -4276,6 +4420,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn external_editor_timeout_kills_and_reaps_before_forced_reclaim() {
+        // These fixtures all contend for the test process's one foreground
+        // terminal. Running them together can stop a sibling process group
+        // before its script writes the PID that the assertion observes.
+        let _foreground = FOREGROUND_EDITOR_TEST.lock().await;
         let owner = Arc::new(FakeTerminalOwner::new());
         let transcript = owner.transcript();
         let lease: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::with_timeout(
@@ -4322,6 +4470,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn external_editor_wrapper_descendant_is_gone_before_terminal_reclaim() {
+        let _foreground = FOREGROUND_EDITOR_TEST.lock().await;
         let (_directory, editor, wrapper_pid_path, descendant_pid_path) = wrapper_system_editor();
         let owner = Arc::new(DescendantObservingOwner {
             descendant_pid: descendant_pid_path.clone(),
@@ -4478,6 +4627,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn external_editor_task_cancellation_kills_and_reaps_before_releasing_the_lease() {
+        let _foreground = FOREGROUND_EDITOR_TEST.lock().await;
         let owner = Arc::new(FakeTerminalOwner::new());
         let transcript = owner.transcript();
         let lease: Arc<dyn TerminalLease> = Arc::new(TerminalBroker::new(owner));

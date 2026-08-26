@@ -2314,7 +2314,11 @@ impl Component for SessionScreen {
         // than returned early, so the drain below still runs on a scroll — see its
         // comment: an event that skips it can be the last event the loop ever sees.
         let wheel = match event {
-            _ if self.live_session.is_some() => EventResult::IGNORED,
+            AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse)))
+                if self.live_session.is_some() =>
+            {
+                self.handle_live_mouse(mouse)
+            }
             AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse))) => {
                 self.handle_mouse(mouse, self.now_ms())
             }
@@ -2619,6 +2623,14 @@ impl SessionScreen {
                 ));
             }
         }
+        let identity = self.status.compact_spans();
+        if !identity.is_empty() {
+            left.push(ratatui::text::Span::styled(
+                String::from(" · "),
+                self.context.muted(),
+            ));
+            left.extend(identity);
+        }
 
         let ambient = self.sidebar.ambient();
         let context = ambient.context.map(|context| {
@@ -2669,6 +2681,8 @@ impl SessionScreen {
     pub(crate) fn info_line(&self, width: u16) -> ratatui::text::Line<'static> {
         let ambient = self.sidebar.ambient();
         let directory = ambient.directory.clone().unwrap_or_default();
+        let identity = self.status.compact_spans();
+        let identity_width = crate::views::markdown::row_width(&identity);
         let mut trailing = Vec::new();
         if let Some(context) = ambient.context {
             trailing.push(format!(
@@ -2694,22 +2708,59 @@ impl SessionScreen {
             // One column of air at each end plus one between the two halves, so neither half
             // ever touches the frame's edge or the other.
             let room = columns.saturating_sub(right + if right == 0 { 2 } else { 3 });
-            if room < INFO_MIN_DIRECTORY_COLS && !directory.is_empty() {
+            let identity_separator = usize::from(!identity.is_empty() && !directory.is_empty()) * 3;
+            if room
+                < identity_width
+                    .saturating_add(identity_separator)
+                    .saturating_add(usize::from(!directory.is_empty()) * INFO_MIN_DIRECTORY_COLS)
+            {
                 continue;
             }
-            let left = crate::views::ambient::elide_left(&directory, room);
+            let mut left = identity.clone();
+            if !directory.is_empty() {
+                if !left.is_empty() {
+                    left.push(ratatui::text::Span::styled(
+                        String::from(" · "),
+                        self.context.muted(),
+                    ));
+                }
+                let directory_room = room.saturating_sub(crate::views::markdown::row_width(&left));
+                left.push(ratatui::text::Span::styled(
+                    crate::views::ambient::elide_left(&directory, directory_room),
+                    muted,
+                ));
+            }
+            let left_width = crate::views::markdown::row_width(&left);
             let gap = columns
-                .saturating_sub(crate::views::display_width(&left) + right + 2)
+                .saturating_sub(left_width + right + 2)
                 .max(usize::from(right > 0));
-            return ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(String::from(" "), self.context.surface()),
-                ratatui::text::Span::styled(left, muted),
-                ratatui::text::Span::styled(" ".repeat(gap), self.context.surface()),
-                ratatui::text::Span::styled(trailer, muted),
-                ratatui::text::Span::styled(String::from(" "), self.context.surface()),
-            ]);
+            let mut spans = vec![ratatui::text::Span::styled(
+                String::from(" "),
+                self.context.surface(),
+            )];
+            spans.extend(left);
+            spans.push(ratatui::text::Span::styled(
+                " ".repeat(gap),
+                self.context.surface(),
+            ));
+            spans.push(ratatui::text::Span::styled(trailer, muted));
+            spans.push(ratatui::text::Span::styled(
+                String::from(" "),
+                self.context.surface(),
+            ));
+            return ratatui::text::Line::from(spans);
         }
-        crate::views::padded(&format!(" {directory}"), width, muted)
+        let mut left = identity;
+        if !directory.is_empty() {
+            if !left.is_empty() {
+                left.push(ratatui::text::Span::styled(
+                    String::from(" · "),
+                    self.context.muted(),
+                ));
+            }
+            left.push(ratatui::text::Span::styled(directory, muted));
+        }
+        ratatui::text::Line::from(crate::views::markdown::truncate_row(left, columns))
     }
 
     /// How many rows the session's own notices need at `width`.
@@ -2970,6 +3021,22 @@ impl SessionScreen {
     /// reporting (`?1003`) remains disabled, so moving the pointer without a held button
     /// still costs no channel traffic.
     fn handle_mouse(&mut self, mouse: &MouseEvent, now_ms: u64) -> EventResult {
+        let editor = self.editor.handle_mouse(mouse);
+        if editor != EditorSignal::None {
+            self.pointer = None;
+            self.transcript.clear_selection();
+            self.sidebar.clear_selection();
+            if editor == EditorSignal::Changed
+                && matches!(
+                    mouse.kind,
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left)
+                )
+                && let Some(text) = self.editor.selection()
+            {
+                return self.copy(text);
+            }
+            return EventResult::REDRAW;
+        }
         let notches: f64 = match mouse.kind {
             MouseEventKind::ScrollUp => -1.0,
             MouseEventKind::ScrollDown => 1.0,
@@ -2997,6 +3064,21 @@ impl SessionScreen {
             };
         }
         self.scroll_transcript(notches, now_ms)
+    }
+
+    fn handle_live_mouse(&mut self, mouse: &MouseEvent) -> EventResult {
+        let signal = self
+            .live_session
+            .as_mut()
+            .map_or(EditorSignal::None, |live| live.handle_mouse(mouse));
+        match signal {
+            EditorSignal::None => EventResult::IGNORED,
+            EditorSignal::Copy(text) => self.copy(text),
+            EditorSignal::Changed => EventResult::REDRAW,
+            EditorSignal::Submit(_) | EditorSignal::OpenExternalEditor | EditorSignal::Paste => {
+                EventResult::IGNORED
+            }
+        }
     }
 
     fn begin_pointer(&mut self, column: u16, row: u16) -> EventResult {

@@ -132,7 +132,7 @@ impl Summary {
     }
 }
 
-/// Every tool this module has a hand-written summary rule for.
+/// Every canonical built-in tool this module has a hand-written summary rule for.
 ///
 /// **Not a hand-kept list of what exists.** It is a hand-kept list of what has been
 /// *given a rule*, and `tool_summaries_cover_every_tool_the_registry_can_expose` fails
@@ -146,6 +146,8 @@ impl Summary {
 /// the render layer to learn twenty-one strings is a worse trade than a scan. It is the
 /// same technique [`crate::views::views_tests`] already uses for the colour and keybind
 /// disciplines.
+/// Runtime aliases such as `exec_command` and `google_search` reuse those rules but stay
+/// out of this registry-wire-id list, because the stale-rule half of that test is exact.
 pub const SUMMARISED: [&str; 26] = [
     // The 18 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
@@ -195,23 +197,26 @@ pub const SUMMARISED: [&str; 26] = [
 pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
     let value = serde_json::from_str::<Value>(arguments).ok()?;
     let text = |key: &str| field(&value, key);
+    let first_text = |keys: &[&str]| keys.iter().find_map(|key| field(&value, key));
     match name {
         // `$ cmd`, the oracle's own shell form. The prompt character is carried in the
         // summary rather than in the icon because `bash`'s icon is already `$`: printing
         // it twice would read as a nested shell.
-        "bash" => text("command").map(|command| {
-            let mut out = command.replace('\n', " ");
-            if value.get("background").and_then(Value::as_bool) == Some(true) {
-                // Stated because it changes what the *result* row will mean: a background
-                // command's output arrives later and its exit code is not this row's.
-                out.push_str(" &");
-            }
-            Summary::tail(out)
-        }),
+        "bash" | "shell" | "exec" | "exec_command" => {
+            first_text(&["command", "cmd"]).map(|command| {
+                let mut out = command.replace('\n', " ");
+                if value.get("background").and_then(Value::as_bool) == Some(true) {
+                    // Stated because it changes what the *result* row will mean: a background
+                    // command's output arrives later and its exit code is not this row's.
+                    out.push_str(" &");
+                }
+                Summary::tail(out)
+            })
+        }
         // The read window is appended only when the model asked for one. A permanent
         // `[offset=0,limit=∞]` on every read would be three tools' worth of noise on the
         // one tool that is called most.
-        "read" => text("filePath").map(|path| {
+        "read" => first_text(&["filePath", "path"]).map(|path| {
             let offset = value.get("offset").and_then(Value::as_u64);
             let limit = value.get("limit").and_then(Value::as_u64);
             let window = match (offset, limit) {
@@ -225,7 +230,7 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
             // identified by its basename.
             Summary::head(path).detail(window)
         }),
-        "write" | "edit" => text("filePath").map(Summary::head),
+        "write" | "edit" => first_text(&["filePath", "path"]).map(Summary::head),
         // `apply_patch` carries no path field at all — the paths are inside the patch
         // envelope, one per file. Reading the first one is what makes this row say the
         // same kind of thing `edit` says, instead of `apply_patch` twice.
@@ -254,16 +259,21 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
             Summary::tail(out)
         }),
         // A URL's tail is its path, which is what distinguishes two fetches of one host.
-        "webfetch" => text("url").map(Summary::head),
-        "web_search" => {
+        "webfetch" | "web_fetch" => text("url").map(Summary::head),
+        "web_search" | "google_search" => {
             let queries = value
                 .get("queries")
-                .and_then(Value::as_array)?
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ");
-            (!queries.is_empty()).then(|| Summary::tail(queries))
+                .and_then(Value::as_array)
+                .map(|queries| {
+                    queries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|queries| !queries.is_empty())
+                .or_else(|| first_text(&["query", "question"]))?;
+            Some(Summary::tail(queries))
         }
         // `<subagent_type>: <description>`, so a transcript of six delegations says which
         // six. `description` alone would omit the agent; `prompt` is a paragraph.

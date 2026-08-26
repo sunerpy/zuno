@@ -329,10 +329,18 @@ its own composer draft while navigation changes the visible session.
 Pressing Enter in a running child admits the text to that child's durable inbox and steers
 its active turn. Pressing Enter after the child settles admits a continuation and wakes the
 same child identity with its resolved Agent, model, effort, permissions, and orchestration
-lineage. Child text is literal: slash-looking input such as `/help` is sent to the child and
-is not executed as a root TUI command. This direct conversation path is available only for
-native child sessions attached to the current Zuno process; product-agent invocations and
-workflow projections are not presented as resumable child conversations.
+lineage. The resolved continuation identity is persisted in the child session metadata, and
+the TUI rebuilds the durable child tree and retained transcript when the parent is resumed in
+a later process. A restored child therefore supports continuation rather than becoming a
+read-only historical panel. Child text is literal: slash-looking input such as `/help` is sent
+to the child and is not executed as a root TUI command. Product-agent invocations and workflow
+projections are not presented as resumable child conversations.
+
+Direct child input opens the same complete `TurnHost` path as a root turn. It receives the
+assembled tool dispatcher, normal permission and question bridges, cancellation and lifecycle
+events, durable usage, retry behavior, and proactive or recovery compaction. This is engine
+parity, not an authority expansion: recursive `task` registration still requires the child
+Agent's explicit delegate set and remaining depth described below.
 
 ## Depth, permissions, and capacity
 

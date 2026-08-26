@@ -152,13 +152,13 @@ impl ToolStatus {
 #[must_use]
 pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
     match name {
-        "bash" => ("$", "Writing command..."),
+        "bash" | "shell" | "exec" | "exec_command" => ("$", "Writing command..."),
         "glob" => ("✱", "Finding files..."),
         "grep" => ("✱", "Searching content..."),
         "read" => ("→", "Reading file..."),
         "write" | "edit" => ("→", "Preparing write..."),
-        "webfetch" => ("%", "Fetching from the web..."),
-        "web_search" => ("◈", "Searching web..."),
+        "webfetch" | "web_fetch" => ("%", "Fetching from the web..."),
+        "web_search" | "google_search" => ("◈", "Searching web..."),
         "task" => ("#", "Delegating..."),
         "job" => ("◷", "Checking job..."),
         "bg" => ("◉", "Inspecting background execution..."),
@@ -1819,16 +1819,11 @@ impl TranscriptView {
         }
         let mut parts = message.parts.iter().enumerate().peekable();
         while let Some((part_index, part)) = parts.next() {
-            if self.activity == ActivityDisplay::Summary
-                && let Some(kind) = compact_activity(part)
-            {
-                let mut activity = zuno_types::ActivityProjection::default();
+            if self.activity == ActivityDisplay::Summary && compact_activity(part).is_some() {
                 let mut compacted = vec![part];
-                activity.record(kind);
                 while let Some((_, next)) = parts.peek()
-                    && let Some(kind) = compact_activity(next)
+                    && compact_activity(next).is_some()
                 {
-                    activity.record(kind);
                     compacted.push(parts.next().expect("peeked part exists").1);
                 }
                 if compacted.len() == 1 {
@@ -1851,7 +1846,7 @@ impl TranscriptView {
                         &mut lines,
                     );
                 } else {
-                    self.activity_lines(message.role, rule, activity, width, &mut lines);
+                    self.activity_lines(message.role, rule, &compacted, width, &mut lines);
                 }
                 continue;
             }
@@ -1885,10 +1880,15 @@ impl TranscriptView {
         &self,
         role: Role,
         rule: Style,
-        activity: zuno_types::ActivityProjection,
+        parts: &[&MessagePart],
         width: u16,
         out: &mut Vec<Line<'static>>,
     ) {
+        let mut activity = zuno_types::ActivityProjection::default();
+        for part in parts {
+            let kind = compact_activity(part).expect("activity group contains compactable parts");
+            activity.record(kind);
+        }
         let mut labels = Vec::new();
         let mut push = |count: usize, singular: &str, plural: &str| {
             if count > 0 {
@@ -1905,7 +1905,66 @@ impl TranscriptView {
         push(activity.images, "image", "images");
         push(activity.tools, "tool", "tools");
         let row = format!(" • {} · Ctrl+T details", labels.join(" · "));
-        out.push(self.ruled(role, rule, &row, self.context.accent(), width));
+        out.push(self.ruled(role, rule, &row, self.context.muted(), width));
+
+        let gutter = u16::try_from(display_width(role.marker()) + 1).unwrap_or(2);
+        let body_width = width.saturating_sub(gutter);
+        for part in parts {
+            if let Some(row) = Self::activity_item_line(part, body_width) {
+                out.push(self.ruled(role, rule, &row, self.context.secondary(), width));
+            }
+        }
+    }
+
+    fn activity_item_line(part: &MessagePart, body_width: u16) -> Option<String> {
+        match part {
+            MessagePart::Tool {
+                name,
+                arguments,
+                title,
+                ..
+            } => {
+                let (icon, _) = tool_affordance(name);
+                let (label, separator) = match compact_activity(part)? {
+                    zuno_types::ActivityKind::Command => (None, " "),
+                    zuno_types::ActivityKind::Read => (Some("read"), " · "),
+                    zuno_types::ActivityKind::Search => (Some("search"), " · "),
+                    zuno_types::ActivityKind::Delegation => (Some("task"), " · "),
+                    zuno_types::ActivityKind::Image => (Some("image"), " · "),
+                    zuno_types::ActivityKind::Tool => (Some(name.as_str()), " · "),
+                };
+                let prefix = label.map_or_else(
+                    || format!("   {icon}"),
+                    |label| format!("   {icon} {label}"),
+                );
+                let detail_room = usize::from(body_width)
+                    .saturating_sub(display_width(&prefix))
+                    .saturating_sub(display_width(separator));
+                let detail = crate::views::tool::summary(name, arguments)
+                    .map(|summary| summary.fit(detail_room))
+                    .or_else(|| {
+                        title
+                            .as_deref()
+                            .filter(|title| !title.is_empty())
+                            .map(|title| truncate(title, detail_room))
+                    })
+                    .filter(|detail| !detail.is_empty());
+                let row = detail.map_or(prefix.clone(), |detail| {
+                    format!("{prefix}{separator}{detail}")
+                });
+                Some(truncate(&row, usize::from(body_width)))
+            }
+            MessagePart::Attachment { filename, .. } => {
+                let prefix = "   ⎘ attachment · ";
+                let room = usize::from(body_width).saturating_sub(display_width(prefix));
+                let filename = crate::views::ambient::elide_left(filename, room);
+                Some(truncate(
+                    &format!("{prefix}{filename}"),
+                    usize::from(body_width),
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// The user's message as a closed box: a titled top rule, the body, a closing rule.
@@ -3397,15 +3456,19 @@ impl StatusView {
             .unwrap_or_else(|| model.split_once('/').map_or(model, |(_, id)| id))
     }
 
-    /// The reply identity, styled as one compact OpenCode-like line.
+    /// Compact current identity for a prompt-adjacent footer.
+    ///
+    /// The marker is intentionally neutral: routine identity is persistent metadata, not a
+    /// warning or an active accent. The agent remains bold so Tab changes are immediately
+    /// visible without relying on purple or green foregrounds.
     #[must_use]
-    pub fn line(&self, width: u16) -> Line<'static> {
+    pub fn compact_spans(&self) -> Vec<Span<'static>> {
         let agent = self.agent.as_ref().or(self.configured_agent.as_ref());
         let model = self.model.as_ref().or(self.configured_model.as_ref());
         if agent.is_none() && model.is_none() {
-            return padded("", width, self.context.surface());
+            return Vec::new();
         }
-        let mut spans = vec![Span::styled(" ▣ ".to_owned(), self.context.accent())];
+        let mut spans = vec![Span::styled("▣ ".to_owned(), self.context.muted())];
         if let Some(agent) = agent {
             spans.push(Span::styled(agent.clone(), self.context.title()));
         }
@@ -3424,6 +3487,18 @@ impl StatusView {
                 self.context.muted(),
             ));
         }
+        spans
+    }
+
+    /// The reply identity, styled as one compact OpenCode-like line.
+    #[must_use]
+    pub fn line(&self, width: u16) -> Line<'static> {
+        let identity = self.compact_spans();
+        if identity.is_empty() {
+            return padded("", width, self.context.surface());
+        }
+        let mut spans = vec![Span::styled(" ".to_owned(), self.context.surface())];
+        spans.extend(identity);
         let columns = usize::from(width);
         let mut spans = crate::views::markdown::truncate_row(spans, columns);
         let used = crate::views::markdown::row_width(&spans);

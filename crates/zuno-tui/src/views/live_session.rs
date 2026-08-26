@@ -2,7 +2,7 @@
 //!
 //! A delegated turn owns its own engine channel and host. The TUI must not remount the
 //! parent merely to inspect that channel: remounting tears the parent host down. This
-//! projection is the process-local read model between those independently running hosts
+//! projection is the read model between durable child history, independently running hosts,
 //! and the one terminal surface.
 
 use crate::app::{AppEvent, Component, EventResult};
@@ -11,9 +11,10 @@ use crate::views::editor::{EditorSignal, InputEditor, PromptGutter};
 use crate::views::message::{ActivityDisplay, Message, StatusView, Transcript, TranscriptView};
 use crate::views::session::{PROMPT_MARKER, prompt_frame, prompt_rows};
 use crate::views::{ViewContext, fill, padded, pressable_label};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -55,19 +56,30 @@ struct ProjectionState {
     sessions: BTreeMap<String, LiveSessionSnapshot>,
 }
 
-/// Process-local projections for every child host the current TUI composition observes.
+/// Durable and live projections for every child the current TUI composition can inspect.
 #[derive(Debug, Clone, Default)]
 pub struct LiveSessions(Arc<Mutex<ProjectionState>>);
 
 impl LiveSessions {
     /// Publish the replayed prefix before the child turn starts.
     pub fn open(&self, opened: LiveSessionOpen) {
+        self.publish(opened, true);
+    }
+
+    /// Restore one durable child whose turn is not currently process-owned.
+    pub fn restore(&self, opened: LiveSessionOpen) {
+        self.publish(opened, false);
+    }
+
+    fn publish(&self, opened: LiveSessionOpen, running: bool) {
         let mut transcript = Transcript::new();
         if let Some(usage) = opened.usage {
             transcript.restore_usage(usage);
         }
         transcript.replay(opened.messages);
-        transcript.mark_running();
+        if running {
+            transcript.mark_running();
+        }
 
         let mut state = self.lock();
         if !state.sessions.contains_key(&opened.session_id) {
@@ -244,6 +256,18 @@ impl LiveSessionView {
         self.composer.handle_action(action)
     }
 
+    /// Route a pointer gesture into the attached child's own composer.
+    pub fn handle_mouse(&mut self, mouse: &MouseEvent) -> EditorSignal {
+        let signal = self.composer.handle_mouse(mouse);
+        if signal == EditorSignal::Changed
+            && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && let Some(text) = self.composer.selection()
+        {
+            return EditorSignal::Copy(text);
+        }
+        signal
+    }
+
     pub fn push_user_submission(&mut self, text: impl Into<String>) {
         self.transcript
             .transcript_mut()
@@ -343,11 +367,21 @@ impl LiveSessionView {
             || String::from("next sibling"),
             |key| format!("{key} next sibling"),
         );
-        padded(
-            &format!(" {submit} · {parent} · {next}"),
-            width,
-            self.context.muted(),
-        )
+        let right = format!("{submit} · {parent} · {next}");
+        let columns = usize::from(width);
+        let mut left = vec![Span::styled(" ".to_owned(), self.context.surface())];
+        left.extend(self.status.compact_spans());
+        let left_width = crate::views::markdown::row_width(&left);
+        let right_width = crate::views::display_width(&right);
+        if left_width + right_width < columns {
+            left.push(Span::styled(
+                " ".repeat(columns - left_width - right_width),
+                self.context.surface(),
+            ));
+            left.push(Span::styled(right, self.context.muted()));
+            return Line::from(left);
+        }
+        Line::from(crate::views::markdown::truncate_row(left, columns))
     }
 }
 
@@ -400,6 +434,42 @@ mod tests {
     use crate::views::message::{Message, Role};
     use zuno_engine::r#loop::TurnEvent;
     use zuno_llm::event::StreamEvent;
+
+    #[test]
+    fn restored_child_history_is_attachable_without_claiming_a_live_turn() {
+        let sessions = LiveSessions::default();
+        sessions.restore(LiveSessionOpen {
+            session_id: String::from("ses_restored_child"),
+            parent_session_id: String::from("ses_parent"),
+            title: String::from("completed child"),
+            agent: String::from("explorer"),
+            model: String::from("test/model"),
+            effort: None,
+            messages: vec![
+                Message::user("inspect the repository"),
+                Message {
+                    role: Role::Assistant,
+                    id: None,
+                    parts: vec![crate::views::message::MessagePart::Text {
+                        text: String::from("inspection complete"),
+                    }],
+                },
+            ],
+            usage: None,
+        });
+
+        let snapshot = sessions
+            .snapshot("ses_restored_child")
+            .expect("restored child is indexed");
+        assert!(
+            !snapshot.transcript.is_running(),
+            "durable history was restored as an active child turn"
+        );
+        assert_eq!(
+            sessions.children("ses_parent"),
+            [String::from("ses_restored_child")]
+        );
+    }
 
     #[test]
     fn child_events_are_visible_before_the_child_completes() {

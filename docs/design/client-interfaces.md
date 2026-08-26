@@ -114,6 +114,9 @@ The TUI favors dense, keyboard-first operation:
   application-owned text selection that is clipped to the transcript. Releasing
   a drag copies automatically, right-click copies the retained selection, and
   success or failure is reported without clearing the highlight.
+  Root and attached-child composers use the same captured drag selection and
+  clipboard path, and render an inverse theme-derived caret on both empty and
+  populated input buffers;
   `mouse: false` opts back into terminal-native selection and alternate-scroll
   translation;
 - ordinary modal overlays are centred in both axes; composer-owned questions
@@ -121,7 +124,9 @@ The TUI favors dense, keyboard-first operation:
   centred, titled, bordered overlay: it preserves readable cell widths and reports
   `+N more` instead of filling the frame with clipped descriptions. Numeric quick-session
   bindings remain active but are omitted from this help surface so nine repeated
-  `Switch to session in quick slot` rows do not obscure higher-value commands. An open modal captures pointer input
+  `Switch to session in quick slot` rows do not obscure higher-value commands. The
+  default leader timeout is five seconds, so the continuation overlay does not vanish
+  before it can be read. An open modal captures pointer input
   so clicks cannot activate covered transcript or sidebar content. Picker rows
   and confirmation buttons accept left-click selection as well as keyboard
   actions. Slash autocomplete, structured questions, permissions, sessions,
@@ -135,7 +140,10 @@ The TUI favors dense, keyboard-first operation:
   `/undo`, and only Restore admits the typed undo command;
 - step-level activity summaries for completed routine commands, reads, searches,
   images, and delegations. Running work, approvals, failures, and important
-  results remain visible. `Ctrl+T` opens the complete scrollable durable
+  results remain visible. A folded group retains one bounded identifier line per
+  call: shell command text, read path and requested window, search query, or the
+  tool-specific summary. Full arguments and results remain behind disclosure rather
+  than flooding the main answer. `Ctrl+T` opens the complete scrollable durable
   transcript and preserves manual scroll position; `Alt+T` changes reasoning
   effort. Each thinking block remains folded by default, uses muted styling in
   both states, and owns an independent disclosure target. Its header is
@@ -167,9 +175,16 @@ The TUI favors dense, keyboard-first operation:
   events, so child progress is visible before the foreground `task` call completes.
   Every attached child owns its own `InputEditor` draft. Enter steers a running child
   and continues a completed child; the text is admitted to the child inbox before
-  execution. Child input is literal text, so `/help` and other slash-looking strings
+  execution. Durable child rows and retained history are projected again when a TUI
+  resumes the parent after a process restart. The child continuation identity stores
+  its resolved Agent, model, effort, parent Attempt, and workflow lineage in session
+  metadata, so a restored child is not view-only. Child input reopens the same full
+  `TurnHost` used by a root session, including tools, permissions, cancellation,
+  lifecycle reporting, usage, and automatic context compaction. Child input is literal text, so `/help` and other slash-looking strings
   are not dispatched as root or host commands. Switching siblings or returning to the
-  parent preserves each child draft;
+  parent preserves each child draft. A child may delegate only when its selected Agent
+  exposes `task`, names the target in `delegates`, passes permission, and remains below
+  `subagent_depth`; using the same host does not bypass those limits;
 - a skill census that separates discovery from use: the heading reports
   `loaded/discovered`, and only a successfully completed `skill` tool call marks a
   row `✓ skill-name · loaded`. Expanded skills are grouped with loaded skills

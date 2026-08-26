@@ -1201,6 +1201,36 @@ pub fn set_title(transaction: &Transaction<'_>, id: &str, title: &str) -> Result
     Ok(now)
 }
 
+/// Replace a session's opaque caller metadata and advance its activity time.
+///
+/// Runtime-owned identities use this after session creation once their resolved fields are
+/// known. Keeping the mutation one column wide prevents a continuation checkpoint from
+/// clobbering the agent, model, usage, or lifecycle fields updated by the turn itself.
+///
+/// # Errors
+///
+/// [`DbError::NotFound`] when no row has `id`. [`DbError::Query`] if the clock or update fails.
+pub fn set_metadata(
+    transaction: &Transaction<'_>,
+    id: &str,
+    metadata: &str,
+) -> Result<i64, DbError> {
+    let now = unix_milliseconds()?;
+    let updated = transaction
+        .execute(
+            "UPDATE session SET metadata = ?2, time_updated = ?3 WHERE id = ?1",
+            params![id, metadata, now],
+        )
+        .map_err(open::map_error)?;
+    if updated == 0 {
+        return Err(DbError::NotFound {
+            table: TABLE.to_owned(),
+            id: id.to_owned(),
+        });
+    }
+    Ok(now)
+}
+
 /// Replace the agent and append the corresponding projected switch message.
 pub fn switch_agent_at(
     transaction: &Transaction<'_>,
@@ -1755,6 +1785,17 @@ impl<'pool> Store<'pool> {
     pub fn set_title(&self, id: &str, title: &str) -> Result<i64, DbError> {
         self.pool
             .transaction(|transaction| set_title(transaction, id, title))
+    }
+
+    /// See [`set_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`set_metadata`] returns, plus [`DbError::Open`] if no connection could
+    /// be obtained.
+    pub fn set_metadata(&self, id: &str, metadata: &str) -> Result<i64, DbError> {
+        self.pool
+            .transaction(|transaction| set_metadata(transaction, id, metadata))
     }
 
     pub fn switch_agent_at(

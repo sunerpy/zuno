@@ -368,12 +368,15 @@ The conversation surface separates reply identity from transient work state. The
 identity row contains the resolved agent, catalog model display name, and configured
 reasoning effort. It follows the bottom of a short assistant reply; once transcript
 content fills the available viewport, the same row becomes sticky immediately above
-the composer. It does not invent cost or speed multipliers when no authoritative
-runtime metadata exists.
+the composer. The final row also repeats the current agent/model/effort as a neutral,
+prompt-adjacent badge so the next-turn selection remains visible while a turn is running;
+Tab updates that badge immediately while host replacement remains deferred to the turn
+boundary. It does not invent cost or speed multipliers when no authoritative runtime
+metadata exists.
 
 The frame's final row is the live control surface. During a turn it shows one
 animation-clock-driven pulse, the resolved interrupt key, latest provider-prompt
-occupancy, and the command-list key. The first interrupt press changes that same row
+occupancy, command-list key, and current neutral agent/model badge. The first interrupt press changes that same row
 to its confirmation state, so the transcript and composer do not reflow. Permission
 and question waits replace the pulse with their explicit reason. When idle, the row
 returns to directory, context, and command discovery. Transient `working` rows are not

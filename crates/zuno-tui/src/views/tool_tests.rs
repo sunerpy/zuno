@@ -232,6 +232,48 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
 }
 
 #[test]
+fn tool_summary_understands_runtime_activity_aliases_and_common_argument_shapes() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "exec_command",
+            r#"{"cmd":"cargo test -p zuno-tui"}"#,
+            "cargo test -p zuno-tui",
+        ),
+        (
+            "read",
+            r#"{"path":"crates/zuno-tui/src/views/message.rs","offset":1884,"limit":48}"#,
+            "crates/zuno-tui/src/views/message.rs [offset=1884,limit=48]",
+        ),
+        (
+            "google_search",
+            r#"{"query":"Codex tool activity presentation"}"#,
+            "Codex tool activity presentation",
+        ),
+        (
+            "web_search",
+            r#"{"query":"neutral dense TUI activity"}"#,
+            "neutral dense TUI activity",
+        ),
+        (
+            "web_fetch",
+            r#"{"url":"https://example.com/design"}"#,
+            "https://example.com/design",
+        ),
+    ];
+
+    for (name, arguments, expected) in cases {
+        let produced = summary(name, arguments)
+            .unwrap_or_else(|| panic!("`{name}` produced no summary from {arguments}"));
+        assert_eq!(
+            produced.fit(200),
+            *expected,
+            "`{name}` summarised {arguments} as {:?}",
+            produced.fit(200)
+        );
+    }
+}
+
+#[test]
 fn tool_summary_is_absent_rather_than_invented_when_there_is_nothing_to_say() {
     // Three different reasons to say nothing, all rendering the same honest way: the row
     // states the tool and claims nothing about its input.

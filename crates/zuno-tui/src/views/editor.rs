@@ -23,6 +23,12 @@
 //! never be left inconsistent with the cursor — the invariant a stored range has to
 //! be maintained against.
 //!
+//! Pointer selection uses the same invariant. The editor remembers the rectangle and
+//! scroll offset from its most recent render, maps a left-button press into a character
+//! position, and then clamps drags and release events to that visible rectangle. The
+//! resulting anchor and cursor feed the same [`InputEditor::selection`] and
+//! `messages_copy` path as a keyboard selection; the clipboard remains a host concern.
+//!
 //! # Undo snapshots whole states
 //!
 //! The stack holds `(lines, cursor)` snapshots rather than an operation log. A log
@@ -60,11 +66,13 @@
 //! for the prompt band, which [`crate::views::session`] caps at a third of the
 //! screen, and never a truncation.
 
-use crate::app::{AppEvent, Component, EventResult};
+use crate::app::{AppEvent, Component, EventResult, TerminalEvent};
 use crate::keybind::Definition;
 use crate::views::{ViewContext, fill, padded};
+use crossterm::event::{Event as CrosstermEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use serde::{Deserialize, Serialize};
@@ -299,6 +307,20 @@ pub struct InputEditor {
     paste_counter: usize,
     /// First rendered line, for a buffer taller than its area.
     offset: usize,
+    /// The editor rectangle from the most recently painted frame.
+    ///
+    /// Pointer events carry terminal coordinates but no layout identity. Retaining the
+    /// actual rectangle here lets the editor reject presses aimed at neighbouring
+    /// surfaces and map a captured drag through the same scroll offset it rendered.
+    rendered_area: Option<Rect>,
+    /// The cursor position whose caret cell was present in [`Self::rendered_area`].
+    ///
+    /// A caret occupies one terminal column without occupying one buffer character.
+    /// Pointer mapping uses this rendered snapshot rather than the possibly newer live
+    /// cursor, so queued drag events still refer to the frame the user actually saw.
+    rendered_cursor: Position,
+    /// Whether a left-button press inside [`Self::rendered_area`] owns the pointer.
+    pointer_selecting: bool,
     /// Muted text standing where the buffer is empty, or empty for none.
     placeholder: String,
 }
@@ -321,6 +343,9 @@ impl InputEditor {
             pastes: Vec::new(),
             paste_counter: 0,
             offset: 0,
+            rendered_area: None,
+            rendered_cursor: Position::default(),
+            pointer_selecting: false,
             placeholder: String::new(),
         }
     }
@@ -472,6 +497,88 @@ impl InputEditor {
         out.push('\n');
         out.push_str(&slice(&self.lines[end.line], 0, end.column));
         Some(out)
+    }
+
+    /// Apply a terminal mouse event to the prompt's selection state.
+    ///
+    /// A press is accepted only inside the rectangle saved by the most recent render.
+    /// Once accepted, a drag or release remains captured and clamps to that rectangle,
+    /// which makes selecting past an edge deterministic without stealing a press from
+    /// the transcript or sidebar. The returned [`EditorSignal::Changed`] asks the host
+    /// for a frame; copying still travels through `messages_copy`, so the existing
+    /// clipboard path receives exactly [`Self::selection`].
+    pub fn handle_mouse(&mut self, mouse: &MouseEvent) -> EditorSignal {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(position) = self.pointer_position(mouse.column, mouse.row, false) else {
+                    return EditorSignal::None;
+                };
+                self.cursor = position;
+                self.anchor = Some(position);
+                self.pointer_selecting = true;
+                EditorSignal::Changed
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.pointer_selecting => {
+                if let Some(position) = self.pointer_position(mouse.column, mouse.row, true) {
+                    self.cursor = position;
+                }
+                EditorSignal::Changed
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.pointer_selecting => {
+                if let Some(position) = self.pointer_position(mouse.column, mouse.row, true) {
+                    self.cursor = position;
+                }
+                self.pointer_selecting = false;
+                if self.anchor == Some(self.cursor) {
+                    self.anchor = None;
+                }
+                EditorSignal::Changed
+            }
+            _ => EditorSignal::None,
+        }
+    }
+
+    /// Map one terminal cell through the last rendered rectangle and scroll offset.
+    fn pointer_position(&self, column: u16, row: u16, clamp: bool) -> Option<Position> {
+        let area = self.rendered_area?;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let right = area.x.saturating_add(area.width);
+        let bottom = area.y.saturating_add(area.height);
+        let inside = column >= area.x && column < right && row >= area.y && row < bottom;
+        if !inside && !clamp {
+            return None;
+        }
+
+        let visible_row = if row < area.y {
+            0
+        } else if row >= bottom {
+            usize::from(area.height - 1)
+        } else {
+            usize::from(row - area.y)
+        };
+        let line = self
+            .offset
+            .saturating_add(visible_row)
+            .min(self.lines.len() - 1);
+        let text = &self.lines[line];
+        let line_width = chars(text);
+        let visual_column = if column < area.x {
+            0
+        } else if column >= right {
+            line_width
+        } else {
+            character_column_at_cell(
+                text,
+                (line == self.rendered_cursor.line).then_some(self.rendered_cursor.column),
+                usize::from(column - area.x),
+            )
+        };
+        Some(Position {
+            line,
+            column: visual_column,
+        })
     }
 
     /// Insert one character at the cursor.
@@ -1029,15 +1136,18 @@ impl InputEditor {
                     spans.push(Span::styled(character.to_string(), style));
                 }
                 if index == self.cursor.line {
-                    // A block glyph rather than a real terminal cursor: the frame is
-                    // also what an off-screen assertion sees, and a hardware cursor
-                    // leaves no trace in the buffer.
+                    // Keep the long-standing glyph because layout assertions and copied
+                    // screenshots use it to prove the caret remains inside the prompt band.
+                    // Reverse video makes the entire cell visible instead of relying on a
+                    // one-pixel-looking stroke, while all colours still come from theme roles.
                     let at = self.cursor.column.min(spans.len());
                     spans.insert(
                         at,
                         Span::styled(
                             String::from("▏"),
-                            self.context.on_element(self.context.accent()),
+                            self.context
+                                .on_element(self.context.text())
+                                .add_modifier(Modifier::REVERSED),
                         ),
                     );
                 }
@@ -1088,6 +1198,8 @@ impl InputEditor {
 
 impl Component for InputEditor {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.rendered_area = Some(area);
+        self.rendered_cursor = self.cursor;
         // `element`, not `text`. The two differ only in background, and `text`'s is
         // `background_panel` — the surface the transcript and the welcome screen are filled
         // with, so an editor painted with it is invisible as a region and the band's four rows
@@ -1114,9 +1226,15 @@ impl Component for InputEditor {
             .render(area, frame.buffer_mut());
     }
 
-    fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
-        // Keys arrive as actions through `handle_action`; nothing else concerns the
-        // editor. Returning `IGNORED` keeps engine events flowing past it.
+    fn handle_event(&mut self, event: &AppEvent) -> EventResult {
+        if let AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse))) = event {
+            return match self.handle_mouse(mouse) {
+                EditorSignal::Changed => EventResult::REDRAW,
+                _ => EventResult::IGNORED,
+            };
+        }
+        // Keys arrive as actions through `handle_action`. Returning `IGNORED` for every
+        // other event keeps engine state flowing past the editor.
         EventResult::IGNORED
     }
 }
@@ -1167,6 +1285,32 @@ fn split(text: &str) -> Vec<String> {
 
 fn chars(text: &str) -> usize {
     text.chars().count()
+}
+
+/// Character boundary under one rendered terminal cell.
+///
+/// The buffer stores character columns while pointer events report terminal cells. A wide
+/// glyph occupies more than one cell, a combining mark may occupy none, and the visible caret
+/// inserts one extra cell at its character boundary. Walking the exact rendered sequence keeps
+/// all three cases aligned.
+fn character_column_at_cell(text: &str, caret: Option<usize>, target: usize) -> usize {
+    let length = chars(text);
+    let caret = caret.map(|column| column.min(length));
+    let mut cell = 0usize;
+    for (column, character) in text.chars().enumerate() {
+        if caret == Some(column) {
+            if target == cell {
+                return column;
+            }
+            cell = cell.saturating_add(1);
+        }
+        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if target < cell.saturating_add(width) {
+            return column;
+        }
+        cell = cell.saturating_add(width);
+    }
+    length
 }
 
 fn byte_index(text: &str, column: usize) -> usize {

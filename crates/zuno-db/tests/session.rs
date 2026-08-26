@@ -777,6 +777,29 @@ fn setting_a_session_title_updates_the_row_and_its_activity_time() {
 }
 
 #[test]
+fn setting_session_metadata_persists_an_opaque_runtime_identity() {
+    let pool = pool();
+    {
+        let connection = pool.get().expect("check out a connection");
+        insert_project(&connection, "prj_a", WORKTREE, None);
+    }
+    let store = Store::new(&pool);
+    store
+        .create(&draft("ses_a", "prj_a", WORKTREE, "child").at(1))
+        .expect("create");
+
+    let metadata = r#"{"kind":"zuno.child","schemaVersion":1}"#;
+    let updated = store
+        .set_metadata("ses_a", metadata)
+        .expect("persist session metadata");
+    let session = store.get("ses_a").expect("session");
+
+    assert_eq!(session.metadata.as_deref(), Some(metadata));
+    assert_eq!(session.time_updated, updated);
+    assert!(updated > 1);
+}
+
+#[test]
 fn session_path_matches_the_oracles_relative_computation() {
     assert_eq!(
         session_path(Path::new(WORKTREE), Path::new("/srv/app/pkg/core")),

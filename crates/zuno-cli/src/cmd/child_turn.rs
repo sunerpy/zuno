@@ -14,8 +14,10 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -30,6 +32,7 @@ use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_engine::wake::{PendingInputDriver, SessionWakeCoordinator};
+use zuno_orchestration::AttemptSnapshot;
 use zuno_tool::{InterruptHandle, PermissionAsker};
 use zuno_tools::question::QuestionAsker;
 use zuno_tools::task::{
@@ -48,6 +51,11 @@ use crate::environment::StartupEnvironment;
 /// reason. A bound is enough here because any real chain is bounded by
 /// `subagent_depth`, which is single digits.
 const MAX_ANCESTRY_WALK: u32 = 64;
+const CHILD_SESSION_METADATA_KIND: &str = "zuno.child";
+const CHILD_SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
+const CHILD_SESSION_METADATA_MAX_ATTEMPTS: u32 = 3;
+const CHILD_SESSION_METADATA_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const CHILD_SESSION_METADATA_MAX_DELAY: Duration = Duration::from_millis(250);
 
 /// One process-local generation shared by every host observing the same work.
 #[derive(Debug, Clone)]
@@ -107,38 +115,56 @@ impl Default for BackgroundJobSupervisor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ChildSessionSpec {
-    request: ChildTurnRequest,
+    parent_session_id: String,
+    parent_attempt: Option<AttemptSnapshot>,
+    workflow: Option<String>,
+    workflow_node: Option<String>,
+    description: Option<String>,
     agent: String,
     model: String,
     effort: Option<zuno_llm::effort::ReasoningEffort>,
+}
+
+impl ChildSessionSpec {
+    fn resolved(
+        request: &ChildTurnRequest,
+        agent: &str,
+        model: &str,
+        effort: Option<zuno_llm::effort::ReasoningEffort>,
+    ) -> Self {
+        Self {
+            parent_session_id: request.parent_session_id.clone(),
+            parent_attempt: request.parent_attempt.as_deref().cloned(),
+            workflow: request.workflow.clone(),
+            workflow_node: request.workflow_node.clone(),
+            description: request.description.clone(),
+            agent: agent.to_owned(),
+            model: model.to_owned(),
+            effort,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChildSessionMetadata {
+    kind: String,
+    schema_version: u32,
+    continuation: ChildSessionSpec,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ChildSessionSpecs(Arc<Mutex<BTreeMap<String, ChildSessionSpec>>>);
 
 impl ChildSessionSpecs {
-    fn remember(
-        &self,
-        session_id: &str,
-        request: &ChildTurnRequest,
-        agent: &str,
-        model: &str,
-        effort: Option<zuno_llm::effort::ReasoningEffort>,
-    ) {
+    fn remember(&self, session_id: &str, spec: ChildSessionSpec) {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                session_id.to_owned(),
-                ChildSessionSpec {
-                    request: request.clone(),
-                    agent: agent.to_owned(),
-                    model: model.to_owned(),
-                    effort,
-                },
-            );
+            .insert(session_id.to_owned(), spec);
     }
 
     fn get(&self, session_id: &str) -> Option<ChildSessionSpec> {
@@ -148,6 +174,95 @@ impl ChildSessionSpecs {
             .get(session_id)
             .cloned()
     }
+
+    fn get_or_restore(
+        &self,
+        database: &Arc<zuno_db::pool::Pool>,
+        session_id: &str,
+    ) -> Result<ChildSessionSpec, String> {
+        if let Some(spec) = self.get(session_id) {
+            return Ok(spec);
+        }
+        let connection = database.open_connection().map_err(to_string)?;
+        let session = zuno_db::session::get(&connection, session_id).map_err(to_string)?;
+        let encoded = session.metadata.as_deref().ok_or_else(|| {
+            format!(
+                "child session `{session_id}` has no durable continuation identity; start a new delegation"
+            )
+        })?;
+        let metadata: ChildSessionMetadata = serde_json::from_str(encoded).map_err(|error| {
+            format!("child session `{session_id}` has invalid continuation metadata: {error}")
+        })?;
+        if metadata.kind != CHILD_SESSION_METADATA_KIND
+            || metadata.schema_version != CHILD_SESSION_METADATA_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "child session `{session_id}` has unsupported continuation metadata"
+            ));
+        }
+        if session.parent_id.as_deref() != Some(metadata.continuation.parent_session_id.as_str()) {
+            return Err(format!(
+                "child session `{session_id}` continuation identity does not match its durable parent"
+            ));
+        }
+        self.remember(session_id, metadata.continuation.clone());
+        Ok(metadata.continuation)
+    }
+}
+
+async fn persist_child_session_spec(
+    database: &Arc<zuno_db::pool::Pool>,
+    session_id: &str,
+    spec: &ChildSessionSpec,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let metadata = serde_json::to_string(&ChildSessionMetadata {
+        kind: CHILD_SESSION_METADATA_KIND.to_owned(),
+        schema_version: CHILD_SESSION_METADATA_SCHEMA_VERSION,
+        continuation: spec.clone(),
+    })
+    .map_err(to_string)?;
+    for attempt in 1..=CHILD_SESSION_METADATA_MAX_ATTEMPTS {
+        match zuno_db::session::Store::new(database).set_metadata(session_id, &metadata) {
+            Ok(_) => return Ok(()),
+            Err(zuno_error::DbError::Busy { retry_after })
+                if attempt < CHILD_SESSION_METADATA_MAX_ATTEMPTS =>
+            {
+                let delay = child_session_metadata_retry_delay(attempt, retry_after);
+                tracing::warn!(
+                    session_id,
+                    attempt,
+                    max_attempts = CHILD_SESSION_METADATA_MAX_ATTEMPTS,
+                    ?delay,
+                    "retrying child continuation checkpoint after SQLite contention"
+                );
+                tokio::select! {
+                    () = cancellation.cancelled() => {
+                        return Err(
+                            "child turn was cancelled while waiting to persist its continuation identity"
+                                .to_owned(),
+                        );
+                    }
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    unreachable!("the bounded metadata checkpoint loop returns on every terminal attempt")
+}
+
+fn child_session_metadata_retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(retry_after) = retry_after.filter(|delay| !delay.is_zero()) {
+        return retry_after
+            .min(CHILD_SESSION_METADATA_MAX_DELAY)
+            .max(Duration::from_millis(1));
+    }
+    let exponent = attempt.saturating_sub(1).min(31);
+    let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    CHILD_SESSION_METADATA_INITIAL_DELAY
+        .saturating_mul(multiplier)
+        .min(CHILD_SESSION_METADATA_MAX_DELAY)
 }
 
 #[derive(Debug)]
@@ -660,20 +775,21 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
-        self.children.remember(
-            session_id,
+        let spec = ChildSessionSpec::resolved(
             request,
             plan.agent_name(),
             &plan.qualified_model(),
             plan.effort(),
         );
-        let parent_attempt = request.parent_attempt.as_deref().ok_or_else(|| {
+        let parent_attempt = spec.parent_attempt.as_ref().ok_or_else(|| {
             "delegated child turn is missing the immutable parent Attempt snapshot".to_owned()
         })?;
+        persist_child_session_spec(&self.database, session_id, &spec, &cancellation).await?;
+        self.children.remember(session_id, spec.clone());
         plan.inherit_orchestration(
             parent_attempt,
-            request.workflow.as_deref(),
-            request.workflow_node.as_deref(),
+            spec.workflow.as_deref(),
+            spec.workflow_node.as_deref(),
         )?;
         let mut host = TurnHost::open_with_dependencies(
             plan,
@@ -930,28 +1046,25 @@ impl PendingInputDriver for InteractiveChildInputDriver {
                 )
             })?
             .to_owned();
-        let spec = self.children.get(&input.session_id).ok_or_else(|| {
-            format!(
-                "child session `{}` has no process-owned continuation identity",
-                input.session_id
-            )
-        })?;
+        let spec = self
+            .children
+            .get_or_restore(&self.database, &input.session_id)?;
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
             model: Some(spec.model.clone()),
             agent: Some(spec.agent.clone()),
             preset: None,
             session: SessionChoice::Existing(input.session_id.clone()),
-            title: spec.request.description.clone(),
+            title: spec.description.clone(),
             effort: spec.effort,
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
-        if let Some(parent_attempt) = spec.request.parent_attempt.as_deref() {
+        if let Some(parent_attempt) = spec.parent_attempt.as_ref() {
             plan.inherit_orchestration(
                 parent_attempt,
-                spec.request.workflow.as_deref(),
-                spec.request.workflow_node.as_deref(),
+                spec.workflow.as_deref(),
+                spec.workflow_node.as_deref(),
             )?;
         }
         let mut host = TurnHost::open_with_dependencies(
@@ -986,11 +1099,11 @@ impl PendingInputDriver for InteractiveChildInputDriver {
             };
             observer.opened(ChildSessionOpened {
                 session_id: input.session_id.clone(),
-                parent_session_id: spec.request.parent_session_id.clone(),
+                parent_session_id: spec.parent_session_id.clone(),
                 title: host
                     .session_title()
                     .map(str::to_owned)
-                    .or_else(|| spec.request.description.clone())
+                    .or_else(|| spec.description.clone())
                     .unwrap_or_else(|| input.session_id.clone()),
                 agent: host.agent_name().to_owned(),
                 model: host.qualified_model(),

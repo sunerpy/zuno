@@ -491,6 +491,69 @@ async fn a_fresh_delegation_creates_a_child_session_owned_by_its_parent() {
     );
 }
 
+#[tokio::test]
+async fn a_child_continuation_identity_survives_process_local_cache_loss() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let request = fixture.request("ses_owner");
+    let child = fixture
+        .host
+        .session_for(&request)
+        .expect("a fresh delegation creates a child");
+    let spec = ChildSessionSpec::resolved(
+        &request,
+        "worker",
+        "test-provider/test-model",
+        Some(zuno_llm::effort::ReasoningEffort::High),
+    );
+    persist_child_session_spec(
+        &fixture.host.database,
+        &child,
+        &spec,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("persist the continuation identity");
+
+    let restarted = ChildSessionSpecs::default();
+    let restored = restarted
+        .get_or_restore(&fixture.host.database, &child)
+        .expect("a new process restores the child identity from SQLite");
+
+    assert_eq!(restored, spec);
+    assert_eq!(restored.parent_session_id, "ses_owner");
+    assert_eq!(restored.agent, "worker");
+    assert_eq!(restored.model, "test-provider/test-model");
+}
+
+#[test]
+fn child_continuation_checkpoint_backoff_is_positive_capped_and_honors_retry_after() {
+    assert_eq!(
+        child_session_metadata_retry_delay(1, None),
+        Duration::from_millis(25)
+    );
+    assert_eq!(
+        child_session_metadata_retry_delay(2, None),
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        child_session_metadata_retry_delay(u32::MAX, None),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        child_session_metadata_retry_delay(1, Some(Duration::ZERO)),
+        Duration::from_millis(25)
+    );
+    assert_eq!(
+        child_session_metadata_retry_delay(1, Some(Duration::from_millis(90))),
+        Duration::from_millis(90)
+    );
+    assert_eq!(
+        child_session_metadata_retry_delay(1, Some(Duration::from_secs(30))),
+        Duration::from_millis(250)
+    );
+}
+
 /// `task_id` must name a child of *this* session, not any session at all.
 ///
 /// Accepting a stranger's child would let one delegation continue a session its caller

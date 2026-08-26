@@ -2,8 +2,16 @@
 //! off-screen assertion.
 
 use super::*;
-use crate::app::render_offscreen;
+use crate::app::{AppEvent, TerminalEvent, render_offscreen};
 use crate::views::testkit::{action, rows};
+use crossterm::event::{
+    Event as CrosstermEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 
 fn editor() -> InputEditor {
     InputEditor::new(ViewContext::defaults())
@@ -23,6 +31,23 @@ fn act(editor: &mut InputEditor, names: &[&'static str]) {
     }
 }
 
+fn render_at(editor: &mut InputEditor, width: u16, height: u16, area: Rect) -> Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal
+        .draw(|frame| editor.render(frame, area))
+        .expect("infallible");
+    terminal.backend().buffer().clone()
+}
+
+const fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The off-screen assertion
 // ---------------------------------------------------------------------------
@@ -34,7 +59,11 @@ fn views_input_editor_renders_offscreen_with_its_cursor() {
     let rendered = rows(&buffer);
     assert_eq!(
         rendered[0], "hello▏",
-        "the buffer text or the cursor glyph is missing: {rendered:?}"
+        "the buffer text or caret glyph is missing: {rendered:?}"
+    );
+    assert!(
+        buffer[(5, 0)].modifier.contains(Modifier::REVERSED),
+        "the end-of-line caret is not a visible inverse cell"
     );
 }
 
@@ -43,8 +72,17 @@ fn views_input_editor_renders_multiple_lines_offscreen() {
     let mut editor = editor();
     editor.insert_text("first\nsecond\nthird");
     assert_eq!(editor.height(), 3);
-    let rendered = rows(&render_offscreen(&mut editor, 12, 4).expect("infallible"));
+    let buffer = render_offscreen(&mut editor, 12, 4).expect("infallible");
+    let rendered = rows(&buffer);
     assert_eq!(&rendered[..3], ["first", "second", "third▏"]);
+    assert!(
+        buffer[(5, 2)].modifier.contains(Modifier::REVERSED),
+        "the caret is not visible on the active line"
+    );
+    assert!(
+        !buffer[(5, 0)].modifier.contains(Modifier::REVERSED),
+        "an inactive line was painted as if it owned the caret"
+    );
 }
 
 #[test]
@@ -53,8 +91,10 @@ fn views_input_editor_scrolls_to_keep_the_cursor_visible() {
     editor.insert_text("a\nb\nc\nd\ne");
     // The area holds two rows and the cursor is on the fifth line, so the first
     // rendered row has to be the fourth.
-    let rendered = rows(&render_offscreen(&mut editor, 8, 2).expect("infallible"));
+    let buffer = render_offscreen(&mut editor, 8, 2).expect("infallible");
+    let rendered = rows(&buffer);
     assert_eq!(rendered, vec![String::from("d"), String::from("e▏")]);
+    assert!(buffer[(1, 1)].modifier.contains(Modifier::REVERSED));
 }
 
 #[test]
@@ -69,9 +109,52 @@ fn views_input_editor_paints_from_the_palette() {
     );
     assert_eq!(
         buffer[(1, 0)].fg,
-        ratatui::style::Color::from(context.palette().border_active),
-        "the cursor glyph did not use the palette's active border colour"
+        ratatui::style::Color::from(context.palette().text),
+        "the caret did not derive its foreground from the theme text role"
     );
+    assert_eq!(
+        buffer[(1, 0)].bg,
+        ratatui::style::Color::from(context.palette().background_element),
+        "the caret did not remain seated on the editor's theme surface"
+    );
+    assert!(
+        buffer[(1, 0)].modifier.contains(Modifier::REVERSED),
+        "the theme-derived caret is not visibly distinct from adjacent text"
+    );
+}
+
+#[test]
+fn views_input_editor_shows_a_theme_derived_caret_in_an_empty_prompt() {
+    let context = ViewContext::defaults();
+    let mut editor = InputEditor::new(context.clone());
+    let buffer = render_offscreen(&mut editor, 6, 1).expect("infallible");
+
+    assert_eq!(buffer[(0, 0)].symbol(), "▏");
+    assert_eq!(
+        buffer[(0, 0)].fg,
+        ratatui::style::Color::from(context.palette().text)
+    );
+    assert_eq!(
+        buffer[(0, 0)].bg,
+        ratatui::style::Color::from(context.palette().background_element)
+    );
+    assert!(
+        buffer[(0, 0)].modifier.contains(Modifier::REVERSED),
+        "an empty prompt has no visible caret"
+    );
+}
+
+#[test]
+fn views_input_editor_shows_the_caret_at_the_requested_text_position() {
+    let mut editor = typing("abcd");
+    act(&mut editor, &["input_move_left", "input_move_left"]);
+    let buffer = render_offscreen(&mut editor, 8, 1).expect("infallible");
+
+    assert_eq!(rows(&buffer)[0], "ab▏cd");
+    assert_eq!(buffer[(2, 0)].symbol(), "▏");
+    assert!(buffer[(2, 0)].modifier.contains(Modifier::REVERSED));
+    assert!(!buffer[(1, 0)].modifier.contains(Modifier::REVERSED));
+    assert!(!buffer[(3, 0)].modifier.contains(Modifier::REVERSED));
 }
 
 #[test]
@@ -245,6 +328,160 @@ fn views_input_select_all_covers_the_whole_buffer() {
     act(&mut editor, &["input_select_all"]);
     assert_eq!(editor.selection(), Some(String::from("a\nb")));
     assert_eq!(editor.anchor(), Some(Position { line: 0, column: 0 }));
+}
+
+#[test]
+fn views_input_mouse_drag_selects_from_the_last_rendered_editor_area() {
+    let mut editor = typing("abcdef");
+    let area = Rect::new(4, 2, 10, 2);
+    let _buffer = render_at(&mut editor, 20, 8, area);
+
+    assert_eq!(
+        editor.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 5, 2)),
+        EditorSignal::Changed
+    );
+    assert_eq!(
+        editor.handle_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 8, 2)),
+        EditorSignal::Changed
+    );
+    assert_eq!(
+        editor.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 8, 2)),
+        EditorSignal::Changed
+    );
+
+    assert_eq!(editor.anchor(), Some(Position { line: 0, column: 1 }));
+    assert_eq!(editor.cursor(), Position { line: 0, column: 4 });
+    assert_eq!(editor.selection(), Some(String::from("bcd")));
+    assert_eq!(
+        editor.handle_action(action("messages_copy")),
+        EditorSignal::Copy(String::from("bcd")),
+        "the pointer selection did not reuse the existing clipboard signal"
+    );
+}
+
+#[test]
+fn views_input_mouse_selection_maps_visible_rows_through_the_scroll_offset() {
+    let mut editor = editor();
+    editor.insert_text("zero\none\ntwo\nthree");
+    let area = Rect::new(3, 4, 8, 2);
+    let _buffer = render_at(&mut editor, 16, 8, area);
+
+    editor.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 4, 4));
+    editor.handle_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 6, 5));
+    editor.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 6, 5));
+
+    assert_eq!(editor.anchor(), Some(Position { line: 2, column: 1 }));
+    assert_eq!(editor.cursor(), Position { line: 3, column: 3 });
+    assert_eq!(editor.selection(), Some(String::from("wo\nthr")));
+}
+
+#[test]
+fn views_input_mouse_drag_clamps_outside_the_rendered_area_after_capture() {
+    let mut editor = editor();
+    editor.insert_text("abcd\nef");
+    act(&mut editor, &["input_buffer_home"]);
+    let area = Rect::new(2, 1, 6, 2);
+    let _buffer = render_at(&mut editor, 12, 6, area);
+
+    editor.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
+    editor.handle_mouse(&mouse(MouseEventKind::Drag(MouseButton::Left), 40, 20));
+    editor.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 40, 20));
+
+    assert_eq!(editor.anchor(), Some(Position { line: 0, column: 2 }));
+    assert_eq!(editor.cursor(), Position { line: 1, column: 2 });
+    assert_eq!(editor.selection(), Some(String::from("cd\nef")));
+}
+
+#[test]
+fn views_input_mouse_click_moves_the_caret_without_leaving_an_empty_selection() {
+    let mut editor = typing("abcdef");
+    let area = Rect::new(2, 1, 8, 1);
+    let _buffer = render_at(&mut editor, 12, 4, area);
+
+    editor.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 5, 1));
+    editor.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 5, 1));
+
+    assert_eq!(editor.cursor(), Position { line: 0, column: 3 });
+    assert_eq!(editor.anchor(), None);
+    assert_eq!(editor.selection(), None);
+}
+
+#[test]
+fn views_input_mouse_selection_requires_a_rendered_area_and_a_left_press() {
+    let mut editor = typing("abcdef");
+    assert_eq!(
+        editor.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 2, 0)),
+        EditorSignal::None,
+        "a pointer coordinate was interpreted without a rendered editor area"
+    );
+
+    let _buffer = render_at(&mut editor, 12, 4, Rect::new(2, 1, 8, 1));
+    assert_eq!(
+        editor.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Right), 4, 1)),
+        EditorSignal::None
+    );
+    assert_eq!(editor.cursor(), Position { line: 0, column: 6 });
+}
+
+#[test]
+fn views_input_mouse_coordinates_skip_the_rendered_caret_cell() {
+    let mut editor = typing("abcd");
+    act(&mut editor, &["input_move_left", "input_move_left"]);
+    let _buffer = render_offscreen(&mut editor, 8, 1).expect("infallible");
+
+    editor.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 4, 0));
+    editor.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 4, 0));
+
+    assert_eq!(
+        editor.cursor(),
+        Position { line: 0, column: 3 },
+        "the caret's own display cell shifted every text coordinate after it"
+    );
+}
+
+#[test]
+fn views_input_mouse_coordinates_follow_terminal_columns_for_wide_glyphs() {
+    let mut editor = typing("你ab");
+    let _buffer = render_offscreen(&mut editor, 8, 1).expect("infallible");
+
+    editor.handle_mouse(&mouse(MouseEventKind::Down(MouseButton::Left), 2, 0));
+    editor.handle_mouse(&mouse(MouseEventKind::Up(MouseButton::Left), 2, 0));
+
+    assert_eq!(
+        editor.cursor(),
+        Position { line: 0, column: 1 },
+        "the first narrow glyph after a two-cell glyph was mapped as a character column"
+    );
+}
+
+#[test]
+fn views_input_editor_component_handles_captured_mouse_selection_events() {
+    let mut editor = typing("abcdef");
+    let _buffer = render_offscreen(&mut editor, 8, 1).expect("infallible");
+    let event = |kind| {
+        AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse(
+            kind, 1, 0,
+        ))))
+    };
+
+    assert!(
+        editor
+            .handle_event(&event(MouseEventKind::Down(MouseButton::Left)))
+            .handled
+    );
+    let drag = AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        4,
+        0,
+    ))));
+    assert!(editor.handle_event(&drag).handled);
+    let release = AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse(
+        MouseEventKind::Up(MouseButton::Left),
+        4,
+        0,
+    ))));
+    assert!(editor.handle_event(&release).handled);
+    assert_eq!(editor.selection(), Some(String::from("bcd")));
 }
 
 #[test]
