@@ -16,6 +16,7 @@ This directory is organized so it can be projected into a documentation site wit
 - [Plugins, custom agents, and workflows](plugins.md): package installation, WASI/process runtimes, capabilities, protocols, and examples.
 - [Trusted process plugin development](process-plugin-development.md): package and JSON-RPC contracts, security, lifecycle, tests, and the OpenCode Antigravity bridge case study.
 - [Client interfaces](design/client-interfaces.md): TUI, HTTP, ACP, and future GUI ownership.
+- [Zed ACP integration](design/zed-acp-integration.md): stable protocol pins, official adapter references, implemented capabilities, Zed setup, and acceptance tests.
 - [Memory learning](design/memory-learning.md): durable candidates, reflection, review, promotion, and undo.
 
 ## Operate

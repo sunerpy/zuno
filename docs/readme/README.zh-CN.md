@@ -235,6 +235,7 @@ Profile 中还可以挂载 provider、远程执行器、审批、评测或 bench
 | [docs/plugins.md](../plugins.md) | 插件安装、Agent/Workflow、WASI/进程能力与协议示例 |
 | [docs/design/harness-comparison.md](../design/harness-comparison.md) | DSH、Codex、OMO、pi-agent、OpenCode 与 Claw Code 的借鉴决策 |
 | [docs/design/client-interfaces.md](../design/client-interfaces.md) | TUI、ACP、HTTP 与未来 GUI 共用的事件和投影接口 |
+| [docs/design/zed-acp-integration.md](../design/zed-acp-integration.md) | 稳定协议固定版本、Zed 配置、HITL、diff、持久回放与验收步骤 |
 | [docs/design/memory-learning.md](../design/memory-learning.md) | 可审计记忆候选、反思提取、审核、晋升与撤销 |
 | [docs/logging.md](../logging.md) | 多进程安全结构化日志、`RUST_LOG`、脱敏、保留与明文诊断 |
 | [docs/migration.md](../migration.md) | Zuno 数据库文件选择与 schema 演进 |
