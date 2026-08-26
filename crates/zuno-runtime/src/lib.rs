@@ -1309,7 +1309,7 @@ struct StartFailure {
 async fn start_composition(
     prepared: PreparedComposition,
     stop_timeout: Duration,
-) -> Result<StartedComposition, StartFailure> {
+) -> Result<StartedComposition, Box<StartFailure>> {
     let definition = prepared.definition;
     let mut active = Vec::<ActiveComponent>::new();
     let mut services = Vec::new();
@@ -1338,7 +1338,7 @@ async fn start_composition(
                         requirements: requirements.clone(),
                     });
                     let cleanup_failures = stop_components(active, stop_timeout).await;
-                    return Err(StartFailure {
+                    return Err(Box::new(StartFailure {
                         definition,
                         diagnostic: LifecycleDiagnostic {
                             component_id: component_definition.id,
@@ -1348,7 +1348,7 @@ async fn start_composition(
                             message: error.to_string(),
                         },
                         cleanup_failures,
-                    });
+                    }));
                 }
             }
         }

@@ -110,8 +110,16 @@ zuno models myopenai --verbose
 [`examples/config/zuno.json`](../../examples/config/zuno.json) 所示内容。Provider 配置只接受原生
 `transport`；不接受 `npm` 字段。
 
-`zuno export` 与 `zuno import` 构成 Zuno 自身的导出/导入闭环。两者都是**顶层命令**，
-不是 `session` 的子命令；`zuno session` 只有 `list`、`prune`、`delete`。
+`zuno export` 会生成跨 Linux、macOS、Windows 可移植的 `.zuno-bundle`，包含解析后的
+Zuno 全局配置根目录和 `$HOME/.zuno`：配置、`AGENTS.md`、Agent、Skill、Markdown 命令、
+扩展、Profile 等用户资产。会话数据库、对话、日志、缓存与凭据默认不导出；凭据只有在显式
+使用未加密的 `--include-credentials` 时才会进入包。`zuno import` 会校验摘要和可移植路径，
+支持 `--dry-run`，并要求先使用 `--replace` 才会事务性替换非空目标。详见
+[Zuno 可移植环境包](../reference/portable-bundles.md)。
+
+在 TUI 中粘贴受支持的本地图片路径或剪贴板图片会生成 `[Image #N]` 附件；
+`@relative/path` 可加入有界的项目文本或图片，headless 模式可重复使用 `zuno run -f`。
+详见[图片与文件引用](../reference/attachments.md)。
 
 ## Harness Runtime
 

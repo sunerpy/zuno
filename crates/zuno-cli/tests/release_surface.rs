@@ -440,17 +440,6 @@ fn allow_has_reason(attribute: &str) -> bool {
         .contains("reason=")
 }
 
-/// The memory harness is frozen by the performance methodology. Its writer takes
-/// all immutable report inputs explicitly; replacing them with an options object
-/// solely to satisfy Clippy would alter the file whose executable hash keys the
-/// resumable measurement cache. Todo 122 therefore records this one exact legacy
-/// attribute here instead of changing `tests/memory.rs` after the measured run.
-const FROZEN_ALLOW_WITH_EXTERNAL_REASON: (&str, usize, &str) = (
-    "crates/zuno-testkit/tests/memory.rs",
-    915,
-    "#[allow(clippy::too_many_arguments)]",
-);
-
 fn collect_rust_files(dir: &Path, crate_name: &str, out: &mut Vec<(String, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -515,7 +504,6 @@ fn every_first_party_lint_suppression_has_a_reason() {
     );
 
     let mut offenders = Vec::new();
-    let mut frozen_exception_seen = false;
     for (crate_name, path) in &sources {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
@@ -527,10 +515,6 @@ fn every_first_party_lint_suppression_has_a_reason() {
             if allow_has_reason(&attribute) {
                 continue;
             }
-            if (relative.as_ref(), line, attribute.as_str()) == FROZEN_ALLOW_WITH_EXTERNAL_REASON {
-                frozen_exception_seen = true;
-                continue;
-            }
             offenders.push(format!(
                 "  {relative}:{line} [crate {crate_name}]\n    {}",
                 attribute.replace('\n', " ")
@@ -538,11 +522,6 @@ fn every_first_party_lint_suppression_has_a_reason() {
         }
     }
 
-    assert!(
-        frozen_exception_seen,
-        "the single documented frozen-harness exception moved or disappeared; remove or update \
-         FROZEN_ALLOW_WITH_EXTERNAL_REASON deliberately"
-    );
     assert!(
         offenders.is_empty(),
         "{} first-party `allow` attribute(s) lack `reason = ...`; justify each suppression at \

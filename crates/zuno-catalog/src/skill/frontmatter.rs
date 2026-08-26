@@ -322,10 +322,9 @@ pub fn sanitize(source: &str) -> String {
 fn first_block(source: &str) -> Option<(usize, usize, &str)> {
     let after_open = if let Some(rest) = source.strip_prefix("---\r\n") {
         source.len() - rest.len()
-    } else if let Some(rest) = source.strip_prefix("---\n") {
-        source.len() - rest.len()
     } else {
-        return None;
+        let rest = source.strip_prefix("---\n")?;
+        source.len() - rest.len()
     };
 
     let tail = &source[after_open..];

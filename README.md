@@ -112,8 +112,17 @@ For a prebuilt installation without a source checkout, create the contents of
 [`examples/config/zuno.json`](./examples/config/zuno.json) directly at the same configuration
 path. Provider configuration accepts native `transport` values and has no `npm` field.
 
-`zuno export` and `zuno import` close Zuno's own round trip. Both are **top-level** commands, not
-subcommands of `session`; `zuno session` carries only `list`, `prune`, and `delete`.
+`zuno export` creates a cross-platform `.zuno-bundle` containing the resolved global Zuno
+configuration and `$HOME/.zuno`: config, `AGENTS.md`, Agents, Skills, Markdown commands,
+extensions, profiles, and other user assets. Session databases, transcripts, logs, caches, and
+credentials are excluded by default; credentials require the explicit unencrypted
+`--include-credentials` option. `zuno import` validates checksums and portable paths, supports
+`--dry-run`, and requires `--replace` before transactionally replacing non-empty target roots.
+See [Portable Zuno environment bundles](./docs/reference/portable-bundles.md).
+
+In the TUI, pasting a supported local image path or clipboard image creates an `[Image #N]`
+attachment. `@relative/path` adds bounded project text or images, and headless `zuno run -f`
+accepts repeated files. See [Images and file references](./docs/reference/attachments.md).
 
 ## Harness runtime
 

@@ -5,6 +5,8 @@ This directory is organized so it can be projected into a documentation site wit
 ## Learn
 
 - [Configuration](reference/configuration.md): files, precedence, JSON Schema, and TUI settings.
+- [Portable environment bundles](reference/portable-bundles.md): cross-platform export/import, exclusions, credentials, validation, and rollback.
+- [Images and file references](reference/attachments.md): TUI image paste, `@file`, headless attachments, durability, and model capability checks.
 - [Providers and credentials](reference/providers.md): provider setup, credential storage, `myopenai`, and native request transports.
 - [Provider authentication](design/provider-authentication.md): credential precedence, login-method registration, OpenAI API keys, and ChatGPT OAuth.
 - [Web search and Antigravity roadmap](design/web-search-antigravity-roadmap.md): default anonymous Exa, authenticated Google grounding, integration auth, risks, and acceptance gates.

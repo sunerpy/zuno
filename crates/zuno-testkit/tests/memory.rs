@@ -365,8 +365,10 @@ fn two_dispatch_passes_reconstruct_the_public_pair_order() {
     assert_eq!(second.len(), 10);
 
     let reconstructed: Vec<PairedSide> = first
-        .chunks_exact(2)
-        .chain(second.chunks_exact(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .chain(second.as_chunks::<2>().0.iter())
         .map(|pair| {
             assert_eq!(pair[0], pair[1]);
             pair[0]
@@ -912,7 +914,10 @@ fn assert_w_real_provenance(label: &str, report: &BaselineReport) {
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the frozen gate artifact records each measured input explicitly"
+)]
 fn write_gate_artifact(
     target: &Path,
     baseline: &BaselineReport,

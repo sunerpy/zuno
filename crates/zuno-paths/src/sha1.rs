@@ -73,13 +73,17 @@ pub fn digest(input: &[u8]) -> [u8; 20] {
     }
     padded.extend_from_slice(&bit_length.to_be_bytes());
 
-    for block in padded.chunks_exact(64) {
+    let (blocks, remainder) = padded.as_chunks::<64>();
+    debug_assert!(remainder.is_empty());
+    for block in blocks {
         compress(&mut state, block);
     }
 
     let mut out = [0u8; 20];
-    for (chunk, word) in out.chunks_exact_mut(4).zip(state) {
-        chunk.copy_from_slice(&word.to_be_bytes());
+    let (chunks, remainder) = out.as_chunks_mut::<4>();
+    debug_assert!(remainder.is_empty());
+    for (chunk, word) in chunks.iter_mut().zip(state) {
+        *chunk = word.to_be_bytes();
     }
     out
 }
@@ -89,8 +93,10 @@ fn compress(state: &mut [u32; 5], block: &[u8]) {
     debug_assert_eq!(block.len(), 64);
 
     let mut schedule = [0u32; 80];
-    for (index, word) in block.chunks_exact(4).enumerate() {
-        schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    let (words, remainder) = block.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    for (index, word) in words.iter().enumerate() {
+        schedule[index] = u32::from_be_bytes(*word);
     }
     for index in 16..80 {
         let mixed =

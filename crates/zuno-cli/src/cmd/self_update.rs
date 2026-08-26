@@ -538,7 +538,6 @@ enum UpdateError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::Write as _;
 
     use super::*;
 

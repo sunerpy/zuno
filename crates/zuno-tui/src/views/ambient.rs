@@ -373,7 +373,7 @@ fn wrap(text: &str, width: usize, rows: usize) -> Vec<String> {
         let taken = if rest[head.len()..].starts_with(char::is_whitespace) {
             head.len()
         } else {
-            head.rfind(char::is_whitespace).map_or(head.len(), |at| at)
+            head.rfind(char::is_whitespace).unwrap_or(head.len())
         };
         let (line, remainder) = rest.split_at(taken);
         let line = line.trim_end();

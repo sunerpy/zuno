@@ -89,8 +89,52 @@ fn harness_guide_documents_the_native_extension_contract() {
             "uncertain",
             "queries: string[]",
             "WebSearchProvider",
+            "typed rich content",
+            "[Image #N]",
+            "unsupported typed input",
         ],
     );
+}
+
+#[test]
+fn portable_bundle_and_attachment_guides_document_the_public_contracts() {
+    contains_all(
+        "docs/reference/portable-bundles.md",
+        &[
+            "zuno export",
+            "zuno import",
+            ".zuno-bundle",
+            "AGENTS.md",
+            "--include-credentials",
+            "--dry-run",
+            "--replace",
+            "SHA-256",
+            "Windows reserved device names",
+            "session databases",
+        ],
+    );
+    contains_all(
+        "docs/reference/attachments.md",
+        &[
+            "[Image #1]",
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "20 MiB",
+            "@src/main.rs",
+            "51,200 bytes",
+            "zuno run -f/--file",
+            "unsupported_capability",
+            "durable file part",
+        ],
+    );
+    for relative in ["README.md", "docs/readme/README.zh-CN.md", "docs/README.md"] {
+        contains_all(
+            relative,
+            &["reference/portable-bundles.md", "reference/attachments.md"],
+        );
+    }
 }
 
 #[test]
