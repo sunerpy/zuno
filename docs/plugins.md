@@ -106,6 +106,10 @@ participate in the normal child-model precedence ladder, and the child turn
 re-resolves the same extension package, prompt, permissions, skills, tools, and
 working directory. A `primary`-only agent is not a delegation target.
 
+See [agent orchestration and model routing](orchestration.md) for the exact
+direct-Agent and category precedence ladders, reasoning overrides, background
+report delivery, configured workflow DAGs, and Council.
+
 A workflow is a slash-command prompt template. `$ARGUMENTS` and positional
 placeholders use the normal command expansion. When a workflow must run a
 specific custom agent, its prompt should issue `task` with that
@@ -222,7 +226,16 @@ Frames and captured stderr are bounded, diagnostics are scrubbed against known
 secret environment values, timeouts and cancellation stop the process tree, and
 protocol loss after a request is sent is reported as `Uncertain`.
 
-See [`examples/plugins/process-review`](../examples/plugins/process-review).
+See [`examples/plugins/process-review`](../examples/plugins/process-review) for
+the minimal executable example. The complete implementation guide is
+[trusted process plugin development](process-plugin-development.md), including
+protocol frames, security review, cancellation and uncertain outcomes, testing,
+and the operator-local OpenCode Antigravity search bridge.
+
+That bridge is deliberately documented as an external tool adapter. It reuses
+credentials owned and refreshed by an installed OpenCode package after explicit
+operator authorization; it does not copy OAuth identity or complete Zuno's
+native Antigravity login, credential, or Integration lifecycle.
 
 ## Tool declarations and HITL
 

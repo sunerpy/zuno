@@ -7,9 +7,12 @@ This directory is organized so it can be projected into a documentation site wit
 - [Configuration](reference/configuration.md): files, precedence, JSON Schema, and TUI settings.
 - [Providers and credentials](reference/providers.md): provider setup, credential storage, `myopenai`, and native request transports.
 - [Provider authentication](design/provider-authentication.md): credential precedence, login-method registration, OpenAI API keys, and ChatGPT OAuth.
+- [Web search and Antigravity roadmap](design/web-search-antigravity-roadmap.md): default anonymous Exa, authenticated Google grounding, integration auth, risks, and acceptance gates.
 - [Codex and Claude Code product agents](design/product-agents.md): native product protocols, permissions, background jobs, cancellation, and credential ownership.
 - [Harness runtime](harness-runtime.md): components, profiles, durable delivery, goals, and recovery.
+- [Agent orchestration and model routing](orchestration.md): orchestrator delegation, child-agent models and reasoning, presets, workflows, and Council.
 - [Plugins, custom agents, and workflows](plugins.md): package installation, WASI/process runtimes, capabilities, protocols, and examples.
+- [Trusted process plugin development](process-plugin-development.md): package and JSON-RPC contracts, security, lifecycle, tests, and the OpenCode Antigravity bridge case study.
 - [Client interfaces](design/client-interfaces.md): TUI, HTTP, ACP, and future GUI ownership.
 - [Memory learning](design/memory-learning.md): durable candidates, reflection, review, promotion, and undo.
 

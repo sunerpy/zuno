@@ -130,6 +130,10 @@ provider-neutral reasoning level for an Agent or semantic workflow category;
 they do not create Agents, grant tools, change permissions, or authorize
 delegation.
 
+See [agent orchestration and model routing](../orchestration.md) for complete
+Agent definitions, direct delegation, category routing, background delivery,
+workflow DAGs, and Council.
+
 ```json
 {
   "preset": "house",
@@ -159,13 +163,19 @@ flat compatibility forms and provider-specific `variant` fields are rejected.
 The expanded form accepts `reasoning` values `off`, `low`, `medium`, `high`,
 `xhigh`, and `max`. A bare `provider/model` string leaves reasoning unchanged.
 
-For delegated work, an explicit task `model`/`effort` wins, followed by the
-configured Agent route, the active preset's Agent or category route, and the
-parent session model. The top-level turn follows the same specificity rule for
-its selected Agent. An unavailable route produces a visible diagnostic before
-falling through; Zuno never ships hidden model-id defaults. The selected preset
-is frozen with the turn plan, so editing configuration cannot mutate an
-in-flight attempt.
+For direct `task` delegation with `subagent_type`, model precedence is an
+explicit task `model`, `agents.<target>.model`, the active preset's Agent route,
+then the parent session model. For `category`, the child is the `general` Agent
+and model precedence is an explicit task `model`, the active preset's category
+route, then the parent session model; the `general` Agent route is deliberately
+not consulted. Effort precedence is explicit task `effort`, the reasoning or
+variant attached to the winning route, then the model/provider default.
+
+The top-level turn follows the same specificity principle for its selected
+Agent. An unavailable route produces a visible diagnostic before falling
+through; Zuno never ships hidden model-id defaults. The selected preset is
+frozen with the turn plan, so editing configuration cannot mutate an in-flight
+attempt.
 
 In the TUI, `/preset` opens the configured preset picker and
 `/preset <name>` selects one directly. The replacement is prepared and applied
