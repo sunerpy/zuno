@@ -2292,6 +2292,73 @@ fn all_internals_resolve_with_the_roster_prompt_and_a_reachable_model() {
     );
 }
 
+#[test]
+fn internal_models_keep_the_responses_surface_selected_by_the_catalog() {
+    let document = serde_json::from_str("{}").expect("empty catalog document");
+    let config: zuno_config::schema::Config = serde_json::from_str(
+        r#"{
+          "small_model": "kiro-local/gpt-5.6-sol",
+          "memory": {"reflection": true},
+          "provider": {
+            "kiro-local": {
+              "transport": "openai",
+              "surface": "responses",
+              "options": {"baseURL": "http://127.0.0.1:8787/v1"},
+              "models": {
+                "gpt-5.6-sol": {
+                  "name": "GPT 5.6 Sol via Kiro",
+                  "limit": {"context": 272000, "output": 64000}
+                }
+              }
+            }
+          }
+        }"#,
+    )
+    .expect("responses provider config");
+    let catalog = Catalog::resolve(&document, &ResolveInput::new().with_config(&config));
+    let model = catalog
+        .model("kiro-local", "gpt-5.6-sol")
+        .expect("configured responses model");
+    let env = Env::empty();
+    let mut notes = Vec::new();
+
+    let internals = resolve_internals(
+        ResolveInternalsInput {
+            config: &config,
+            presets: &PresetLibrary::new(),
+            catalog: &catalog,
+            provider_id: "kiro-local",
+            model_id: "gpt-5.6-sol",
+            session_model: model,
+            env: &env,
+            plugin_small_model: None,
+        },
+        &mut notes,
+    )
+    .expect("responses internals resolve");
+
+    for internal in [
+        &internals.title,
+        &internals.compaction,
+        &internals.summary,
+        &internals.council_synth,
+    ] {
+        assert_eq!(internal.model.provider.surface, ApiSurface::Responses);
+        assert_eq!(
+            internal.model.surface,
+            ApiSurface::Responses,
+            "{} replaced the catalog surface instead of preserving it",
+            internal.name
+        );
+    }
+
+    let reflection = resolve_reflection_model(&config, &catalog, "kiro-local", &env, &mut notes)
+        .expect("reflection resolution succeeds")
+        .expect("reflection is enabled by the explicit small model");
+    assert_eq!(reflection.provider.surface, ApiSurface::Responses);
+    assert_eq!(reflection.surface, ApiSurface::Responses);
+}
+
 /// Every name the roster declares internal must resolve here.
 ///
 /// The assertion is over [`zuno_agent::builtin::INTERNAL_NAMES`] and not an independent

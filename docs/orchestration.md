@@ -68,6 +68,17 @@ typed runtime decisions.
 | `oracle` | Read-only architecture and root-cause review | No recursive delegation |
 | `looker` | Visual artifact inspection | No recursive delegation |
 
+`explorer` is deliberately native-read-only, not shell-read-only. Its default tool
+surface contains `read`, `glob`, `grep`, and read-only `lsp`, and denies `bash`, edits,
+delegation, and network research. Commands such as `du`, `stat`, and `file` therefore do
+not belong to `explorer`: they are executables reached through `bash`, not native read
+operations. Delegate command-based inspection to `deep`, `general`, or another
+shell-capable Agent, or execute the bounded command in the parent session. Global
+`permission.mode: "allow_all"` skips ordinary confirmation but does not erase this
+explicit Agent deny. A user can replace the Agent permission overlay explicitly, but
+doing so intentionally changes `explorer`'s read-only contract and is normally less
+clear than selecting the correct Agent.
+
 The orchestrator prompt asks for bounded child objectives, explicit
 deliverables, non-overlapping writers, dependency-aware scheduling, and parent
 verification. Child output is evidence for the parent; it is not automatically

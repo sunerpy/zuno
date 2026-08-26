@@ -692,6 +692,17 @@ impl Component for DialogHost {
     }
 
     fn handle_event(&mut self, event: &AppEvent) -> EventResult {
+        if matches!(
+            event,
+            AppEvent::Terminal(crate::app::TerminalEvent::Input(_))
+        ) {
+            // A visible transient panel belongs to an interaction, not to the first
+            // keystroke that happened to open it. Pointer movement, wheel input and keys
+            // routed to its current surface all buy a fresh timeout. Completed or
+            // abandoned key sequences clear the prefix before they reach this branch, so
+            // `touch` cannot keep a panel alive after its action has resolved.
+            self.which_key.touch(Instant::now());
+        }
         match event {
             AppEvent::Terminal(crate::app::TerminalEvent::Input(crossterm::event::Event::Key(
                 key,

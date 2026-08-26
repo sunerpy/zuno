@@ -2725,6 +2725,22 @@ pub const LOCAL_DEFINITIONS: &[Definition] = &[
         description: "Steer the active turn immediately",
     },
     Definition {
+        name: "session_child_previous_direct",
+        scope: "session.child",
+        keys: "left",
+        command: "session.child.previous.direct",
+        prevent_default: None,
+        description: "Go directly to the previous child session",
+    },
+    Definition {
+        name: "session_child_next_direct",
+        scope: "session.child",
+        keys: "right",
+        command: "session.child.next.direct",
+        prevent_default: None,
+        description: "Go directly to the next child session",
+    },
+    Definition {
         name: "dialog.question.prev_question",
         scope: "dialog.question",
         keys: "left,h",

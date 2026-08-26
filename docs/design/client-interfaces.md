@@ -183,7 +183,14 @@ The TUI favors dense, keyboard-first operation:
   pressing `x` twice requests cancellation of a running job and keeps the list
   mounted for consecutive cancellations. Native child hosts additionally publish a
   full main-pane session projection: `Ctrl+X Down` enters the first direct child,
-  `Ctrl+X Up` returns to its parent, and `Ctrl+X Left`/`Right` cycle siblings. The
+  `Ctrl+X Up` returns to its parent, and `Ctrl+X Left`/`Right` remain available for
+  sibling navigation. While the attached child's composer is empty, plain Left/Right
+  cycle siblings directly; once a draft exists, those same keys return to ordinary
+  cursor movement rather than stealing text editing. Mouse-wheel events scroll the
+  attached child's own transcript instead of being dropped at the child composer. The
+  fixed two-row child footer shows the resolved Agent/model, current context occupancy,
+  direct-child position such as `3/8`, sibling keys, the parent key, and whether Enter
+  will steer or continue. The
   parent host remains mounted and running while the child transcript receives live
   events, so child progress is visible before the foreground `task` call completes.
   Every attached child owns its own `InputEditor` draft. Enter steers a running child

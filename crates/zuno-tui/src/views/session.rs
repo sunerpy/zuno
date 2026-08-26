@@ -284,7 +284,7 @@ const INFO_MIN_DIRECTORY_COLS: usize = 8;
 /// Upper-case suffixes match the compact work-state vocabulary used by the
 /// reference surface, while one decimal keeps pressure changes visible before a
 /// whole-thousand boundary.
-fn compact_live_tokens(value: u64) -> String {
+pub(crate) fn compact_live_tokens(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}M", value as f64 / 1_000_000.0)
     } else if value >= 1_000 {
@@ -2317,7 +2317,7 @@ impl Component for SessionScreen {
             AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse)))
                 if self.live_session.is_some() =>
             {
-                self.handle_live_mouse(mouse)
+                self.handle_live_mouse(mouse, self.now_ms())
             }
             AppEvent::Terminal(TerminalEvent::Input(CrosstermEvent::Mouse(mouse))) => {
                 self.handle_mouse(mouse, self.now_ms())
@@ -3070,13 +3070,24 @@ impl SessionScreen {
         self.scroll_transcript(notches, now_ms)
     }
 
-    fn handle_live_mouse(&mut self, mouse: &MouseEvent) -> EventResult {
+    fn handle_live_mouse(&mut self, mouse: &MouseEvent, now_ms: u64) -> EventResult {
         let signal = self
             .live_session
             .as_mut()
             .map_or(EditorSignal::None, |live| live.handle_mouse(mouse));
         match signal {
-            EditorSignal::None => EventResult::IGNORED,
+            EditorSignal::None => {
+                let notches = match mouse.kind {
+                    MouseEventKind::ScrollUp => -1.0,
+                    MouseEventKind::ScrollDown => 1.0,
+                    _ => return EventResult::IGNORED,
+                };
+                self.live_session
+                    .as_mut()
+                    .map_or(EventResult::IGNORED, |live| {
+                        live.scroll_wheel(notches, now_ms)
+                    })
+            }
             EditorSignal::Copy(text) => self.copy(text),
             EditorSignal::Changed => EventResult::REDRAW,
             EditorSignal::Submit(_) | EditorSignal::OpenExternalEditor | EditorSignal::Paste => {
@@ -4184,7 +4195,13 @@ impl ActionComponent for SessionScreen {
     }
 
     fn focused_scopes(&self) -> Vec<&'static str> {
-        if self.autocomplete.is_open() {
+        if let Some(live) = self.live_session.as_ref() {
+            if live.composer_is_empty() {
+                vec!["session.child"]
+            } else {
+                Vec::new()
+            }
+        } else if self.autocomplete.is_open() {
             vec!["prompt.autocomplete"]
         } else if self.editor.is_empty()
             && self.transcript.content_height() > self.transcript.viewport_height()
@@ -4533,8 +4550,10 @@ impl ActionComponent for SessionScreen {
             let navigation = match action.name {
                 "session_parent" => self.return_to_parent_session(),
                 "session_child_first" => self.enter_first_child(),
-                "session_child_cycle" => self.cycle_live_sibling(1),
-                "session_child_cycle_reverse" => self.cycle_live_sibling(-1),
+                "session_child_cycle" | "session_child_next_direct" => self.cycle_live_sibling(1),
+                "session_child_cycle_reverse" | "session_child_previous_direct" => {
+                    self.cycle_live_sibling(-1)
+                }
                 "sidebar_toggle" => {
                     self.sidebar_visible = !self.sidebar_visible;
                     EventResult::REDRAW

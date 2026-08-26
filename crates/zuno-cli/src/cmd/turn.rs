@@ -1094,12 +1094,7 @@ fn resolve_internals(
             InternalAgent {
                 name: name.to_owned(),
                 prompt,
-                model: EngineModel::new(
-                    model_spec(catalog, catalog_model, env)?,
-                    catalog_model.api.id.clone(),
-                    ApiSurface::Chat,
-                )
-                .with_catalog_identity(&catalog_model.provider_id, &catalog_model.id),
+                model: engine_model(catalog, catalog_model, env)?,
             },
         );
         debug_assert!(
@@ -1169,8 +1164,8 @@ fn resolve_reflection_model(
         ));
         return Ok(None);
     }
-    let spec = match model_spec(catalog, model, env) {
-        Ok(spec) => spec,
+    let resolved = match engine_model(catalog, model, env) {
+        Ok(resolved) => resolved,
         Err(error) => {
             notes.push(format!(
                 "memory reflection disabled: small_model `{qualified}` is unreachable ({error})"
@@ -1178,10 +1173,7 @@ fn resolve_reflection_model(
             return Ok(None);
         }
     };
-    Ok(Some(
-        EngineModel::new(spec, model.api.id.clone(), ApiSurface::Chat)
-            .with_catalog_identity(&model.provider_id, &model.id),
-    ))
+    Ok(Some(resolved))
 }
 
 /// The upstream native's prompt for one internal agent.
@@ -5679,6 +5671,22 @@ fn model_spec(
         }
     }
     Ok(spec)
+}
+
+/// Lift one catalog model into the engine without changing its resolved API surface.
+///
+/// Main turns copy [`Spec::surface`] into [`EngineModel::surface`]. Internal Agents and
+/// reflection must do the same: forcing Chat here makes a Responses-only compatible
+/// endpoint fail even though its provider spec was resolved correctly.
+fn engine_model(
+    catalog: &Catalog,
+    model: &zuno_llm::catalog::ResolvedModel,
+    env: &zuno_paths::Env,
+) -> Result<EngineModel, String> {
+    let spec = model_spec(catalog, model, env)?;
+    let surface = spec.surface;
+    Ok(EngineModel::new(spec, model.api.id.clone(), surface)
+        .with_catalog_identity(&model.provider_id, &model.id))
 }
 
 fn provider_string_option(

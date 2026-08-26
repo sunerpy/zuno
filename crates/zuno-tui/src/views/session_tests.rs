@@ -5503,15 +5503,22 @@ fn session_dragging_the_visible_scrollbar_moves_the_transcript_to_the_bottom() {
 }
 
 #[test]
-fn session_wheel_notch_uses_the_default_three_lines_when_nothing_is_configured() {
-    // `scroll.ts:26` — the default is three lines per notch, not one. Getting it wrong is
-    // a difference every user notices.
+fn session_wheel_default_is_precise_then_accelerates_during_a_fast_streak() {
     let (mut screen, _shutdown) = scrollable(scroll_config(None, None));
     notch(&mut screen, 1_000);
-    // The literal three, not `DEFAULT_SCROLL_SPEED`. Asserting against the constant is a
-    // tautology that survives editing the constant, which is exactly the change this test
-    // is here to catch.
-    assert_eq!(screen.transcript.offset(), 3);
+    assert_eq!(
+        screen.transcript.offset(),
+        1,
+        "one deliberate notch should move one row"
+    );
+    for step in 1..4 {
+        notch(&mut screen, 1_000 + step * 50);
+    }
+    assert!(
+        screen.transcript.offset() > 4,
+        "a rapid wheel streak never accelerated: offset {}",
+        screen.transcript.offset()
+    );
 }
 
 #[test]
@@ -8614,6 +8621,150 @@ fn live_child_prompt_mouse_drag_selects_and_copies_without_detaching_the_child()
             .expect("the child remains attached")
             .session_id(),
         "ses_child"
+    );
+}
+
+#[test]
+fn live_child_mouse_wheel_scrolls_its_own_transcript() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let sessions = crate::views::live_session::LiveSessions::default();
+    sessions.restore(crate::views::live_session::LiveSessionOpen {
+        session_id: String::from("ses_child"),
+        parent_session_id: String::from("ses_parent"),
+        title: String::from("inspect history"),
+        agent: String::from("explorer"),
+        model: String::from("test/model"),
+        effort: None,
+        messages: (0..80)
+            .map(|index| Message::user(format!("child line {index}")))
+            .collect(),
+        usage: None,
+    });
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions);
+    screen.attach_live_session("ses_child");
+    let _ = render_offscreen(&mut screen, 50, 16).expect("infallible");
+    let live = screen.live_session.as_mut().expect("child attached");
+    live.set_scroll_offset(0);
+    assert_eq!(live.scroll_offset(), 0);
+
+    let result = pointer_at(
+        &mut screen,
+        crossterm::event::MouseEventKind::ScrollDown,
+        4,
+        4,
+    );
+
+    assert!(result.redraw, "the child wheel event requested no frame");
+    assert_eq!(
+        screen
+            .live_session
+            .as_ref()
+            .expect("child remains attached")
+            .scroll_offset(),
+        1,
+        "the child transcript dropped the mouse wheel event"
+    );
+}
+
+#[test]
+fn live_child_footer_shows_context_position_and_navigation() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let sessions = crate::views::live_session::LiveSessions::default();
+    for index in 0..8 {
+        sessions.restore(crate::views::live_session::LiveSessionOpen {
+            session_id: format!("ses_child_{index}"),
+            parent_session_id: String::from("ses_parent"),
+            title: format!("child {}", index + 1),
+            agent: String::from("explorer"),
+            model: String::from("test/model"),
+            effort: None,
+            messages: vec![Message::user("inspect")],
+            usage: (index == 2).then_some(zuno_types::UsageSnapshot {
+                confirmed: zuno_types::TokenUsage {
+                    input: 37_000,
+                    ..zuno_types::TokenUsage::default()
+                },
+                last_prompt_tokens: Some(37_000),
+                context_limit: Some(100_000),
+                confirmed_known: true,
+                ..zuno_types::UsageSnapshot::default()
+            }),
+        });
+    }
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions);
+    screen.attach_live_session("ses_child_2");
+
+    let rendered = rows(&render_offscreen(&mut screen, 140, 18).expect("infallible")).join("\n");
+    for expected in [
+        "ctx 37.0K/100.0K (37%)",
+        "child 3/8",
+        "left/right siblings",
+        "ctrl+x up parent",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "the child footer is missing {expected:?}:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn direct_child_arrows_switch_siblings_only_while_the_child_composer_is_empty() {
+    let keymap = Keymap::defaults().expect("the shipped table builds");
+    let (sender, _shutdown) = terminal_event_channel();
+    let sessions = crate::views::live_session::LiveSessions::default();
+    for (session_id, title) in [
+        ("ses_child_one", "first child"),
+        ("ses_child_two", "second child"),
+    ] {
+        sessions.restore(crate::views::live_session::LiveSessionOpen {
+            session_id: session_id.to_owned(),
+            parent_session_id: String::from("ses_parent"),
+            title: title.to_owned(),
+            agent: String::from("explorer"),
+            model: String::from("test/model"),
+            effort: None,
+            messages: Vec::new(),
+            usage: None,
+        });
+    }
+    let mut offered = catalog();
+    offered.session = Some(String::from("ses_parent"));
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_catalog(offered)
+        .with_live_sessions(sessions);
+    screen.attach_live_session("ses_child_one");
+    let host = DialogHost::new(ViewContext::defaults(), Box::new(screen));
+    let mut dispatcher = KeyDispatcher::new(keymap, scopes(), Box::new(host));
+
+    dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        crossterm::event::Event::Key(press(crossterm::event::KeyCode::Right)),
+    )));
+    let second = rows(&render_offscreen(&mut dispatcher, 100, 18).expect("infallible")).join("\n");
+    assert!(
+        second.contains("second child"),
+        "right did not switch to the next child:\n{second}"
+    );
+
+    dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        crossterm::event::Event::Key(press(crossterm::event::KeyCode::Char('x'))),
+    )));
+    dispatcher.handle_event(&AppEvent::Terminal(TerminalEvent::Input(
+        crossterm::event::Event::Key(press(crossterm::event::KeyCode::Left)),
+    )));
+    let composing =
+        rows(&render_offscreen(&mut dispatcher, 100, 18).expect("infallible")).join("\n");
+    assert!(
+        composing.contains("second child") && composing.contains('x'),
+        "left stole the cursor key from a non-empty child composer:\n{composing}"
     );
 }
 

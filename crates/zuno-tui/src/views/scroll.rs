@@ -1,19 +1,13 @@
 //! Scrolling: `scroll_speed`, `scroll_acceleration`, and the accumulator that makes
 //! fractional multipliers usable on a character grid.
 //!
-//! # The two configuration keys are mutually exclusive, and acceleration wins
+//! # Slow input is precise and fast input accelerates
 //!
-//! `packages/tui/src/util/scroll.ts:18-27`:
-//!
-//! ```text
-//! if (tuiConfig?.scroll_acceleration?.enabled) return new MacOSScrollAccel()
-//! if (tuiConfig?.scroll_speed !== undefined)   return new CustomSpeedScroll(tuiConfig.scroll_speed)
-//! return new CustomSpeedScroll(3)
-//! ```
-//!
-//! So a user who set both gets acceleration, and the default is a **constant three
-//! lines per notch** — not one. That default is why an unconfigured TUI feels
-//! responsive, and getting it wrong is a difference every user notices.
+//! An unconfigured TUI starts at one row per notch and uses the velocity curve below for
+//! a sustained wheel gesture. This avoids the visibly chunky three-row jump on a careful
+//! scroll while still crossing a long transcript quickly. An explicit `scroll_speed`
+//! selects constant movement; `scroll_acceleration.enabled = true` wins when both are
+//! present, while `false` explicitly keeps constant movement.
 //!
 //! # The acceleration curve is ported exactly, because it is not derivable
 //!
@@ -38,8 +32,8 @@ use crate::config::{ResolvedTuiConfig, ScrollAcceleration};
 #[path = "scroll_tests.rs"]
 mod tests;
 
-/// Lines per notch when nothing is configured (`scroll.ts:26`).
-pub const DEFAULT_SCROLL_SPEED: f64 = 3.0;
+/// Precise lines per notch at the start of a gesture or when acceleration is disabled.
+pub const DEFAULT_SCROLL_SPEED: f64 = 1.0;
 
 /// `A` in the exponential curve.
 pub const ACCEL_A: f64 = 0.8;
@@ -71,7 +65,7 @@ pub trait ScrollAccel: Send {
     fn reset(&mut self);
 }
 
-/// A constant multiplier: `scroll_speed`, or the default of three.
+/// A constant multiplier: `scroll_speed`, or the precise default of one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConstantSpeed(pub f64);
 
@@ -145,7 +139,8 @@ impl ScrollAccel for MacOsAccel {
 
 /// Build the accelerator the configuration asks for.
 ///
-/// The precedence is the oracle's and is cited in the module docs.
+/// Explicit acceleration wins over speed. With no setting, use the smooth default:
+/// precise first movement followed by velocity-based acceleration.
 #[must_use]
 pub fn accel_for(config: &ResolvedTuiConfig) -> Box<dyn ScrollAccel> {
     if matches!(
@@ -154,9 +149,16 @@ pub fn accel_for(config: &ResolvedTuiConfig) -> Box<dyn ScrollAccel> {
     ) {
         return Box::new(MacOsAccel::new());
     }
-    Box::new(ConstantSpeed(
-        config.scroll_speed.unwrap_or(DEFAULT_SCROLL_SPEED),
-    ))
+    if let Some(speed) = config.scroll_speed {
+        return Box::new(ConstantSpeed(speed));
+    }
+    if matches!(
+        config.scroll_acceleration,
+        Some(ScrollAcceleration { enabled: false })
+    ) {
+        return Box::new(ConstantSpeed(DEFAULT_SCROLL_SPEED));
+    }
+    Box::new(MacOsAccel::new())
 }
 
 /// A scroll position with the fractional accumulator.

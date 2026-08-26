@@ -17,11 +17,17 @@ fn config(speed: Option<f64>, acceleration: Option<bool>) -> ResolvedTuiConfig {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn views_scroll_default_is_three_lines_per_notch() {
-    // `scroll.ts:26` — the default is a constant three, not one. A user notices.
+fn views_scroll_default_is_precise_then_accelerates_during_a_fast_streak() {
     let mut accel = accel_for(&config(None, None));
-    assert_eq!(accel.tick(0), DEFAULT_SCROLL_SPEED);
-    assert_eq!(accel.tick(1_000_000), DEFAULT_SCROLL_SPEED);
+    assert_eq!(
+        accel.tick(0),
+        DEFAULT_SCROLL_SPEED,
+        "the first notch must remain a precise one-row movement"
+    );
+    assert!(
+        accel.tick(50) > DEFAULT_SCROLL_SPEED,
+        "rapid follow-up notches did not accelerate"
+    );
 }
 
 #[test]
@@ -45,6 +51,13 @@ fn views_scroll_acceleration_wins_over_speed() {
 fn views_scroll_acceleration_disabled_falls_through_to_speed() {
     let mut accel = accel_for(&config(Some(7.0), Some(false)));
     assert_eq!(accel.tick(0), 7.0);
+}
+
+#[test]
+fn views_scroll_explicitly_disabled_acceleration_keeps_the_precise_default() {
+    let mut accel = accel_for(&config(None, Some(false)));
+    assert_eq!(accel.tick(0), DEFAULT_SCROLL_SPEED);
+    assert_eq!(accel.tick(50), DEFAULT_SCROLL_SPEED);
 }
 
 // ---------------------------------------------------------------------------

@@ -847,6 +847,21 @@ impl WhichKeyView {
         was != self.is_active()
     }
 
+    /// Restart the timeout after input while the panel is still active.
+    ///
+    /// Old expiry wakes are harmless: [`Self::prune`] compares their arrival time with
+    /// this newest interaction timestamp, while this call arms the wake for the new
+    /// deadline. Inactive panels stay inactive instead of being resurrected by an
+    /// unrelated key or pointer event.
+    pub fn touch(&mut self, now: Instant) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        self.shown = Some(now);
+        self.arm();
+        true
+    }
+
     /// Drop a prefix that has outlived the leader timeout by `now`.
     pub fn prune(&mut self, now: Instant) -> bool {
         let expired = self

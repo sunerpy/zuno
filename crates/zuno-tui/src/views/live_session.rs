@@ -9,7 +9,8 @@ use crate::app::{AppEvent, Component, EventResult};
 use crate::keybind::Definition;
 use crate::views::editor::{EditorSignal, InputEditor, PromptGutter};
 use crate::views::message::{ActivityDisplay, Message, StatusView, Transcript, TranscriptView};
-use crate::views::session::{PROMPT_MARKER, prompt_frame, prompt_rows};
+use crate::views::scroll::Scroller;
+use crate::views::session::{PROMPT_MARKER, compact_live_tokens, prompt_frame, prompt_rows};
 use crate::views::{ViewContext, fill, padded, pressable_label};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -180,6 +181,7 @@ pub struct LiveSessionView {
     title: String,
     generation: u64,
     transcript: TranscriptView,
+    scroller: Scroller,
     status: StatusView,
     composer: InputEditor,
 }
@@ -203,6 +205,7 @@ impl LiveSessionView {
         if snapshot.transcript.is_running() {
             status.mark_running();
         }
+        let scroller = Scroller::new(&context.config);
         let composer = InputEditor::new(context.clone()).with_placeholder(CHILD_PROMPT_PLACEHOLDER);
         Some(Self {
             context,
@@ -212,6 +215,7 @@ impl LiveSessionView {
             title: snapshot.title,
             generation: snapshot.generation,
             transcript,
+            scroller,
             status,
             composer,
         })
@@ -242,6 +246,21 @@ impl LiveSessionView {
         self.transcript.transcript().is_running()
     }
 
+    #[must_use]
+    pub fn composer_is_empty(&self) -> bool {
+        self.composer.is_empty()
+    }
+
+    #[must_use]
+    pub fn scroll_offset(&self) -> usize {
+        self.transcript.offset()
+    }
+
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        self.transcript.set_offset(offset);
+        self.sync_scroller();
+    }
+
     pub fn insert_char(&mut self, character: char) -> EventResult {
         self.composer.insert_char(character);
         EventResult::REDRAW
@@ -266,6 +285,22 @@ impl LiveSessionView {
             return EditorSignal::Copy(text);
         }
         signal
+    }
+
+    /// Scroll this child's transcript while preserving its independent viewport.
+    pub fn scroll_wheel(&mut self, notches: f64, now_ms: u64) -> EventResult {
+        self.sync_scroller();
+        if self.scroller.wheel(notches, now_ms) == 0 {
+            return EventResult::IGNORED;
+        }
+        self.transcript.set_offset(self.scroller.offset());
+        EventResult::REDRAW
+    }
+
+    fn sync_scroller(&mut self) {
+        self.scroller.total = self.transcript.content_height();
+        self.scroller.viewport = self.transcript.viewport_height();
+        self.scroller.sync_offset(self.transcript.offset());
     }
 
     pub fn push_user_submission(&mut self, text: impl Into<String>) {
@@ -355,7 +390,7 @@ impl LiveSessionView {
         ]
     }
 
-    fn footer(&self, width: u16) -> Line<'static> {
+    fn footer(&self, width: u16) -> Vec<Line<'static>> {
         let submit = if self.is_running() {
             "enter steer"
         } else {
@@ -363,25 +398,58 @@ impl LiveSessionView {
         };
         let parent = pressable_label("session_parent", &self.context)
             .map_or_else(|| String::from("parent"), |key| format!("{key} parent"));
-        let next = pressable_label("session_child_cycle", &self.context).map_or_else(
-            || String::from("next sibling"),
-            |key| format!("{key} next sibling"),
-        );
-        let right = format!("{submit} · {parent} · {next}");
+        let previous = pressable_label("session_child_previous_direct", &self.context)
+            .unwrap_or_else(|| String::from("left"));
+        let next = pressable_label("session_child_next_direct", &self.context)
+            .unwrap_or_else(|| String::from("right"));
+        let siblings = self.sessions.children(&self.parent_session_id);
+        let position = siblings
+            .iter()
+            .position(|session| session == &self.session_id)
+            .map_or(1, |index| index + 1);
+        let total = siblings.len().max(1);
+        let mut facts = Vec::new();
+        if let Some(context) = self.transcript.transcript().context_window() {
+            facts.push(format!(
+                "ctx {}{}/{} ({:.0}%)",
+                if context.estimated { "≈" } else { "" },
+                compact_live_tokens(context.prompt_tokens),
+                compact_live_tokens(context.limit),
+                context.percent()
+            ));
+        }
+        facts.push(format!("child {position}/{total}"));
+        let state = facts.join(" · ");
+        let navigation = format!("{previous}/{next} siblings · {parent} · {submit}");
         let columns = usize::from(width);
         let mut left = vec![Span::styled(" ".to_owned(), self.context.surface())];
         left.extend(self.status.compact_spans());
-        let left_width = crate::views::markdown::row_width(&left);
-        let right_width = crate::views::display_width(&right);
-        if left_width + right_width < columns {
-            left.push(Span::styled(
-                " ".repeat(columns - left_width - right_width),
-                self.context.surface(),
-            ));
-            left.push(Span::styled(right, self.context.muted()));
-            return Line::from(left);
-        }
-        Line::from(crate::views::markdown::truncate_row(left, columns))
+        let align = |mut left: Vec<Span<'static>>, right: String| {
+            let left_width = crate::views::markdown::row_width(&left);
+            let right_width = crate::views::display_width(&right);
+            if left_width + right_width < columns {
+                left.push(Span::styled(
+                    " ".repeat(columns - left_width - right_width),
+                    self.context.surface(),
+                ));
+                left.push(Span::styled(right, self.context.muted()));
+                return Line::from(left);
+            }
+            if right_width <= columns {
+                return Line::from(vec![
+                    Span::styled(" ".repeat(columns - right_width), self.context.surface()),
+                    Span::styled(right, self.context.muted()),
+                ]);
+            }
+            Line::from(crate::views::markdown::truncate_row(left, columns))
+        };
+        vec![
+            align(left, state),
+            align(
+                vec![Span::styled(" ".to_owned(), self.context.surface())],
+                navigation,
+            ),
+        ]
     }
 }
 
@@ -395,7 +463,7 @@ impl Component for LiveSessionView {
             Constraint::Min(1),
             Constraint::Length(u16::from(self.status.has_identity())),
             Constraint::Length(composer_rows),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .areas(area);
         Paragraph::new(self.header(header.width))
@@ -409,7 +477,7 @@ impl Component for LiveSessionView {
             PromptGutter::new(self.context.clone(), PROMPT_MARKER.to_owned()).render(frame, gutter);
         }
         self.composer.render(frame, buffer);
-        Paragraph::new(vec![self.footer(footer.width)])
+        Paragraph::new(self.footer(footer.width))
             .style(self.context.surface())
             .render(footer, frame.buffer_mut());
     }

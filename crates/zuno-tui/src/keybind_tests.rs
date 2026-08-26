@@ -708,6 +708,27 @@ fn scope_precedence_is_ordered_rather_than_arbitrary() {
 }
 
 #[test]
+fn child_session_arrows_win_only_in_the_focused_child_scope() {
+    let mut keymap = Keymap::defaults().expect("defaults build");
+    let start = Instant::now();
+    let right = Chord::parse("right").expect("parses");
+
+    match keymap.resolve(&["session.child", "input", "session"], right, start) {
+        Resolution::Action { definition, .. } => {
+            assert_eq!(definition.name, "session_child_next_direct");
+        }
+        other => panic!("expected direct child navigation: {other:?}"),
+    }
+
+    match keymap.resolve(&["input", "session"], right, start) {
+        Resolution::Action { definition, .. } => {
+            assert_eq!(definition.name, "input_move_right");
+        }
+        other => panic!("expected input cursor movement: {other:?}"),
+    }
+}
+
+#[test]
 fn an_unmatched_chord_abandons_a_pending_sequence() {
     let mut keymap = Keymap::defaults().expect("defaults build");
     let start = Instant::now();

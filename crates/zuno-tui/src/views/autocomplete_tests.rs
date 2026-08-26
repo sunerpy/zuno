@@ -734,6 +734,28 @@ fn views_which_key_expires_on_the_leader_timeout() {
 }
 
 #[test]
+fn views_which_key_interaction_restarts_the_leader_timeout() {
+    let timeout = ViewContext::defaults().config.leader_timeout;
+    let shown = Instant::now();
+    let interacted = shown + timeout - Duration::from_millis(1);
+    let mut view = which_key_at(3, shown);
+
+    assert!(
+        view.touch(interacted),
+        "interacting with an active panel did not refresh its deadline"
+    );
+    assert!(
+        !view.prune(shown + timeout),
+        "the panel expired on its original deadline after the user interacted with it"
+    );
+    assert!(view.is_active());
+    assert!(
+        view.prune(interacted + timeout),
+        "the refreshed panel outlived the new interaction deadline"
+    );
+}
+
+#[test]
 fn views_which_key_never_takes_more_than_half_the_frame() {
     // 32 continuations against a 10-row frame. Without the ceiling the panel is the
     // whole screen and the transcript it exists to annotate is gone.

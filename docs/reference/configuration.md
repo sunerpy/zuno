@@ -6,6 +6,101 @@ Zuno reads only `zuno.json` and `zuno.jsonc`. The global files are under `$XDG_C
 
 Objects merge recursively from lower to higher precedence. Arrays and scalar values replace the lower value. The top level rejects unknown keys.
 
+### Switchable configuration overlays
+
+Zuno does not currently have a named `--profile` flag. Use a final configuration
+directory as a switchable overlay instead. A normal launch keeps the global and
+project configuration unchanged; setting `ZUNO_CONFIG_DIR` adds one higher-precedence
+directory containing `zuno.json` or `zuno.jsonc`:
+
+```sh
+zuno
+
+ZUNO_CONFIG_DIR="$HOME/.config/zuno/profiles/kiro" zuno
+```
+
+The overlay is a deep merge, so a provider defined there is added without deleting the
+global provider. Top-level `model`, `small_model`, and a non-null `preset` replace their
+lower-layer values. This distinction matters when switching a whole agent team: changing
+only `model` changes the root turn, while an active lower-layer preset can keep delegated
+Agents routed to its original provider. Do not use `"preset": null` as a tombstone:
+optional typed fields currently treat JSON null as no higher-layer value, so the inherited
+preset remains selected. Select an explicit overlay preset instead.
+
+For a loopback [kiro-provider](https://github.com/sunerpy/kiro-provider) Responses
+gateway, a complete overlay at
+`$HOME/.config/zuno/profiles/kiro/zuno.json` can be:
+
+```json
+{
+  "model": "kiro-local/gpt-5.6-sol",
+  "small_model": "kiro-local/gpt-5.6-sol",
+  "preset": "kiro-local",
+  "presets": {
+    "kiro-local": {
+      "agents": {
+        "orchestrator": "kiro-local/gpt-5.6-sol",
+        "build": "kiro-local/gpt-5.6-sol",
+        "plan": "kiro-local/gpt-5.6-sol",
+        "deep": "kiro-local/gpt-5.6-sol",
+        "fixer": "kiro-local/gpt-5.6-sol",
+        "general": "kiro-local/gpt-5.6-sol",
+        "explorer": "kiro-local/gpt-5.6-sol",
+        "librarian": "kiro-local/gpt-5.6-sol",
+        "oracle": "kiro-local/gpt-5.6-sol",
+        "looker": "kiro-local/gpt-5.6-sol"
+      }
+    }
+  },
+  "provider": {
+    "kiro-local": {
+      "name": "Kiro local gateway",
+      "env": ["ZUNO_KIRO_LOCAL_API_KEY"],
+      "transport": "openai",
+      "surface": "responses",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1"
+      },
+      "models": {
+        "gpt-5.6-sol": {
+          "name": "GPT 5.6 Sol via Kiro",
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 272000,
+            "output": 64000
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Use a unique provider id such as `kiro-local`: Zuno checks configured and stored
+credentials before the provider's environment-variable list, so reusing an unrelated
+provider id can select an old credential. The gateway and Zuno need the same private
+loopback key, but that key should remain in the environment or a secret manager rather
+than in either JSON file:
+
+```sh
+KIRO_PROVIDER_API_KEYS="$ZUNO_KIRO_LOCAL_API_KEY" \
+  /path/to/kiro-provider/dist/kiro-provider serve
+
+ZUNO_CONFIG_DIR="$HOME/.config/zuno/profiles/kiro" \
+ZUNO_KIRO_LOCAL_API_KEY="$ZUNO_KIRO_LOCAL_API_KEY" \
+  zuno
+```
+
+The custom OpenAI-compatible transport appends `/responses`, so the Kiro API root in
+`baseURL` must end in `/v1`. `kiro-provider` defaults to `127.0.0.1:8787`, fails closed
+without a non-empty `KIRO_PROVIDER_API_KEYS`, and by default uses its `opencode-shared`
+authentication authority. That shared account authority and the local Bearer key are
+separate layers: the former authorizes the gateway upstream, while the latter protects
+the loopback HTTP endpoint. The resolved Responses surface is also preserved for title,
+compaction, summary, Council synthesis, and memory reflection requests; those internal
+Agents do not silently fall back to Chat Completions.
+
 ## JSON Schema
 
 The canonical schema is [`schemas/zuno.json`](../../schemas/zuno.json). It is generated from the same Rust types that deserialize configuration:
@@ -45,9 +140,18 @@ The default enables application-owned mouse interaction:
 
 `leader_timeout` is milliseconds. Its default is 5000, so the `Ctrl+X` continuation
 overlay remains readable for five seconds unless another key completes or cancels the
-sequence first.
+sequence first. Keyboard or pointer interaction while the overlay remains active
+restarts the five-second deadline; resolving or abandoning the sequence still closes it
+immediately.
 
 With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events. The transcript and both root and child composers provide their own selection and copy behavior. Releasing a drag copies the selected text through the configured clipboard and leaves the highlight visible. Transcript selection remains clamped instead of crossing into the sidebar; tool and sidebar disclosure rows are clickable, and an overflowing conversation mounts a draggable scrollbar.
+
+Wheel input is precise at the start of a gesture: the default first notch moves one
+row, then a sustained fast gesture accelerates. Setting `scroll_speed` chooses a
+constant row multiplier. Setting `scroll_acceleration.enabled` to `true` explicitly
+selects velocity acceleration and wins when both fields are present; setting it to
+`false` keeps constant movement (one row when no speed is supplied). Root and attached
+child transcripts use the same policy and keep independent offsets.
 
 Set `"mouse": false` to opt out of those interactions and return drag selection to the terminal. In that mode native selection may cross the transcript, sidebar, and input area; terminals that implement alternate-scroll mode can still translate wheel notches into transcript scrolling while the composer is empty. The composer still renders a high-contrast theme-derived caret for keyboard editing.
 
