@@ -30,9 +30,11 @@ This directory is organized so it can be projected into a documentation site wit
 ## Design
 
 - [Harness comparison](design/harness-comparison.md)
+- [Codex GitHub tooling and system Skills](design/codex-github-and-system-skills.md)
 - [Build-agent prompt and request comparison](design/agent-prompt-request-comparison.md)
 - [Provider authentication](design/provider-authentication.md)
 - [Product agents](design/product-agents.md)
+- [Zed ACP integration](design/zed-acp-integration.md)
 - [Memory learning](design/memory-learning.md)
 - [Migration and durable schema](migration.md)
 

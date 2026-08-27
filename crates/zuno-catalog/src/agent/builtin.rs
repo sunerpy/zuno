@@ -12,14 +12,28 @@ use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
 
+macro_rules! delivery_prompt {
+    ($path:literal) => {
+        concat!(
+            include_str!($path),
+            "\n\nExecution plans are advisory checklists, separate from the explicit read-only \
+             `plan` Agent/collaboration mode and from durable Goals. For a non-simple \
+             multi-step task, call `plan_update` before substantial work and keep stable step \
+             IDs and statuses current as evidence changes. Keep exactly one step in progress \
+             while pending work remains. Simple tasks need no formal plan. An unfinished plan \
+             never auto-continues; only an active durable Goal does."
+        )
+    };
+}
+
 /// Default multi-agent coordinator.
-pub const PROMPT_ORCHESTRATOR: &str = include_str!("prompt/orchestrator.txt");
+pub const PROMPT_ORCHESTRATOR: &str = delivery_prompt!("prompt/orchestrator.txt");
 /// Direct end-to-end implementation agent.
-pub const PROMPT_BUILD: &str = include_str!("prompt/build.txt");
+pub const PROMPT_BUILD: &str = delivery_prompt!("prompt/build.txt");
 /// Read-only planning agent.
 pub const PROMPT_PLAN: &str = include_str!("prompt/plan.txt");
 /// Thorough cross-cutting implementation agent.
-pub const PROMPT_DEEP: &str = include_str!("prompt/deep.txt");
+pub const PROMPT_DEEP: &str = delivery_prompt!("prompt/deep.txt");
 /// Focused local implementation specialist.
 pub const PROMPT_FIXER: &str = include_str!("prompt/fixer.txt");
 /// Bounded miscellaneous implementation specialist.
@@ -611,7 +625,7 @@ mod tests {
             (
                 "orchestrator",
                 PROMPT_ORCHESTRATOR,
-                220,
+                290,
                 [
                     "dependency graph",
                     "non-overlapping ownership",
@@ -622,7 +636,7 @@ mod tests {
             (
                 "build",
                 PROMPT_BUILD,
-                270,
+                340,
                 [
                     "Do not declare completion from intent",
                     "authoritative evidence",
@@ -644,7 +658,7 @@ mod tests {
             (
                 "deep",
                 PROMPT_DEEP,
-                210,
+                275,
                 [
                     "without delegating",
                     "owning abstraction",
@@ -667,6 +681,31 @@ mod tests {
                 "{name} prompt grew to {words} words; concise role policy belongs here, not a \
                  second harness manual"
             );
+        }
+    }
+
+    #[test]
+    fn delivery_agents_use_advisory_execution_plans_for_non_simple_work() {
+        for (name, prompt) in [
+            ("orchestrator", PROMPT_ORCHESTRATOR),
+            ("build", PROMPT_BUILD),
+            ("deep", PROMPT_DEEP),
+        ] {
+            for clause in [
+                "advisory checklists",
+                "non-simple multi-step task",
+                "`plan_update`",
+                "exactly one step in progress while pending work remains",
+                "Simple tasks need no formal plan",
+                "never auto-continues",
+                "active durable Goal",
+                "read-only `plan` Agent/collaboration mode",
+            ] {
+                assert!(
+                    prompt.contains(clause),
+                    "{name} prompt is missing `{clause}`:\n{prompt}"
+                );
+            }
         }
     }
 
