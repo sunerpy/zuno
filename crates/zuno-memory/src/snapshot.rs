@@ -301,7 +301,7 @@ mod tests {
     };
     use zuno_error::ProviderError;
     use zuno_llm::cache::{CacheTracker, LockedTools};
-    use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
+    use zuno_llm::event::{Message, Role, StreamEvent};
     use zuno_llm::registry::{Capabilities, CompletionRequest, Provider, ProviderStream};
 
     const BASE_PROMPT: &str = "You are a coding agent.";
@@ -600,18 +600,13 @@ mod tests {
     }
 
     fn text_of(message: &Message) -> String {
-        message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                RequestContentBlock::Text { text } => Some(text.as_str()),
-                RequestContentBlock::SignedThinking { .. }
-                | RequestContentBlock::ProviderEncryptedReasoning { .. }
-                | RequestContentBlock::ToolUse { .. }
-                | RequestContentBlock::ToolResult { .. }
-                | RequestContentBlock::Image { .. } => None,
-            })
-            .collect()
+        let mut text = String::new();
+        for block in &message.content {
+            if let Some(fragment) = block.provider_text() {
+                text.push_str(fragment.as_ref());
+            }
+        }
+        text
     }
 
     async fn force_compaction(

@@ -290,20 +290,25 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             diff,
             written_paths,
             is_error,
-        } => (
-            "tool.dispatch.completed",
-            object(json!({
-                "step": step,
-                "callID": call_id,
-                "name": name,
-                "displayName": display_name,
-                "title": title,
-                "output": output,
-                "diff": diff,
-                "writtenPaths": written_paths,
-                "isError": is_error,
-            })),
-        ),
+        } => {
+            let unified = diff.as_ref().and_then(|diff| diff.unified());
+            let files = diff.as_ref().map_or(&[][..], |diff| diff.files());
+            (
+                "tool.dispatch.completed",
+                object(json!({
+                    "step": step,
+                    "callID": call_id,
+                    "name": name,
+                    "displayName": display_name,
+                    "title": title,
+                    "output": output,
+                    "diff": unified,
+                    "fileDiffs": files,
+                    "writtenPaths": written_paths,
+                    "isError": is_error,
+                })),
+            )
+        }
         TurnEvent::ToolResultAppended {
             step,
             call_id,

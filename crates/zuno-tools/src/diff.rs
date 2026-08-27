@@ -28,6 +28,8 @@
 //! this feeds scrolls horizontally, so the room is not worth the lie.
 
 use similar::TextDiff;
+use std::path::Path;
+use zuno_tool::FileDiff;
 
 /// Lines of unchanged text kept on each side of a change.
 ///
@@ -83,6 +85,23 @@ pub fn unified_diff_bytes(path: &str, old: &[u8], new: &[u8]) -> Option<String> 
     unified_diff(path, strip_bom(old), strip_bom(new))
 }
 
+/// A native text-file diff suitable for durable client projections.
+///
+/// `old == None` means the file did not exist before the tool call. Binary pre/post
+/// images are intentionally omitted: ACP's stable `diff` content carries text, so
+/// lossy decoding would claim an edit the client cannot safely apply or display.
+#[must_use]
+pub fn file_diff_bytes(path: &Path, old: Option<&[u8]>, new: &[u8]) -> Option<FileDiff> {
+    let old = old
+        .map(std::str::from_utf8)
+        .transpose()
+        .ok()?
+        .map(strip_bom)
+        .map(str::to_owned);
+    let new = strip_bom(std::str::from_utf8(new).ok()?).to_owned();
+    FileDiff::new(path, old, new)
+}
+
 /// Drops a UTF-8 BOM so it does not appear as a change on the first line.
 ///
 /// A tool preserves the pre-image's BOM, so both sides normally carry one and it cancels;
@@ -136,6 +155,24 @@ mod tests {
         assert_eq!(
             unified_diff_bytes("blob.bin", &[0xff, 0xfe], b"text\n"),
             None
+        );
+        assert_eq!(
+            file_diff_bytes(Path::new("/work/blob.bin"), Some(&[0xff, 0xfe]), b"text\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn native_file_diff_preserves_creation_vs_empty_existing_file() {
+        let created = file_diff_bytes(Path::new("/work/new.txt"), None, b"")
+            .expect("creating an empty file is still a filesystem change");
+        assert_eq!(created.old_text(), None);
+        assert_eq!(created.new_text(), "");
+
+        assert_eq!(
+            file_diff_bytes(Path::new("/work/existing.txt"), Some(b""), b""),
+            None,
+            "an unchanged existing empty file is not a diff"
         );
     }
 

@@ -175,6 +175,7 @@ fn pair_ids(entries: &[TranscriptEntry]) -> (BTreeSet<String>, BTreeSet<String>)
                     results.insert(tool_use_id.clone());
                 }
                 RequestContentBlock::Text { .. }
+                | RequestContentBlock::ResourceLink { .. }
                 | RequestContentBlock::SignedThinking { .. }
                 | RequestContentBlock::ProviderEncryptedReasoning { .. }
                 | RequestContentBlock::Image { .. } => {}
@@ -460,7 +461,8 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
         .iter()
         .find_map(|block| match block {
             RequestContentBlock::Text { text } => Some(text.as_str()),
-            RequestContentBlock::SignedThinking { .. }
+            RequestContentBlock::ResourceLink { .. }
+            | RequestContentBlock::SignedThinking { .. }
             | RequestContentBlock::ProviderEncryptedReasoning { .. }
             | RequestContentBlock::ToolUse { .. }
             | RequestContentBlock::ToolResult { .. }

@@ -427,12 +427,12 @@ fn converse_body(
     for message in &request.messages {
         if message.role == Role::System {
             for block in &message.content {
-                let RequestContentBlock::Text { text } = block else {
+                let Some(text) = block.provider_text() else {
                     return Err(ProviderError::fatal(
                         RequestShapeError::UnsupportedSystemBlock,
                     ));
                 };
-                system.push(json!({"text": text}));
+                system.push(json!({"text": text.as_ref()}));
             }
             continue;
         }
@@ -476,6 +476,12 @@ fn converse_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provid
         .iter()
         .map(|block| match block {
             RequestContentBlock::Text { text } => Ok(json!({"text": text})),
+            RequestContentBlock::ResourceLink { .. } => {
+                let Some(text) = block.provider_text() else {
+                    unreachable!("resource links always have a provider text projection")
+                };
+                Ok(json!({"text": text.as_ref()}))
+            }
             RequestContentBlock::SignedThinking {
                 thinking,
                 signature,
@@ -578,13 +584,12 @@ fn anthropic_native_body(
     for message in &request.messages {
         if message.role == Role::System {
             for block in &message.content {
-                if let RequestContentBlock::Text { text } = block {
-                    system.push(json!({"type": "text", "text": text}));
-                } else {
+                let Some(text) = block.provider_text() else {
                     return Err(ProviderError::fatal(
                         RequestShapeError::UnsupportedSystemBlock,
                     ));
-                }
+                };
+                system.push(json!({"type": "text", "text": text.as_ref()}));
             }
         } else {
             messages.push(json!({
@@ -631,6 +636,12 @@ fn anthropic_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provi
         .iter()
         .map(|block| match block {
             RequestContentBlock::Text { text } => Ok(json!({"type": "text", "text": text})),
+            RequestContentBlock::ResourceLink { .. } => {
+                let Some(text) = block.provider_text() else {
+                    unreachable!("resource links always have a provider text projection")
+                };
+                Ok(json!({"type": "text", "text": text.as_ref()}))
+            }
             RequestContentBlock::SignedThinking {
                 thinking,
                 signature,
@@ -672,14 +683,12 @@ fn openai_messages(messages: &[Message]) -> Result<Vec<Value>, ProviderError> {
 fn openai_message(message: &Message) -> Result<Value, ProviderError> {
     let mut text = String::new();
     for block in &message.content {
-        match block {
-            RequestContentBlock::Text { text: value } => text.push_str(value),
-            _ => {
-                return Err(ProviderError::fatal(
-                    RequestShapeError::OpenAiBlockUnsupported,
-                ));
-            }
-        }
+        let Some(value) = block.provider_text() else {
+            return Err(ProviderError::fatal(
+                RequestShapeError::OpenAiBlockUnsupported,
+            ));
+        };
+        text.push_str(value.as_ref());
     }
     Ok(json!({
         "role": match message.role {

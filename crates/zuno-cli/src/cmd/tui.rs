@@ -3329,6 +3329,12 @@ fn soft_interrupt(
                     zuno_llm::event::RequestContentBlock::Text { text: block } => {
                         text.push(block.clone());
                     }
+                    zuno_llm::event::RequestContentBlock::ResourceLink { .. } => {
+                        let Some(block) = block.provider_text() else {
+                            unreachable!("resource links always have a provider text projection")
+                        };
+                        text.push(block.into_owned());
+                    }
                     zuno_llm::event::RequestContentBlock::Image {
                         media_type, data, ..
                     } => {

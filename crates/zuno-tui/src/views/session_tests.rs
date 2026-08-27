@@ -2680,7 +2680,10 @@ fn session_reports_every_file_one_multi_file_patch_wrote() {
         name: String::from("apply_patch"),
         title: String::from("Success. Updated the following files:\nM a.rs\nA b.rs"),
         output: String::from("Success. Updated the following files:\nM a.rs\nA b.rs"),
-        diff: Some(String::from("@@ -1 +1 @@\n-old\n+new\n")),
+        diff: zuno_engine::r#loop::ToolDiff::new(
+            Some(String::from("@@ -1 +1 @@\n-old\n+new\n")),
+            Vec::new(),
+        ),
         written_paths: vec![String::from("a.rs"), String::from("b.rs")],
         is_error: false,
     }));

@@ -329,11 +329,20 @@ pub(crate) fn report_post_write_warnings(
 /// nothing, so `metadata["diff"]` being present means "here is the change" and its
 /// absence means "there is none to show". See [`crate::diff`] for why this is metadata
 /// and not output.
-pub(crate) fn report_diff(output: ToolOutput, label: &str, old: &[u8], new: &[u8]) -> ToolOutput {
-    match crate::diff::unified_diff_bytes(label, old, new) {
-        Some(patch) => output.with_metadata(crate::diff::METADATA_DIFF_KEY, patch),
-        None => output,
+pub(crate) fn report_diff(
+    mut output: ToolOutput,
+    path: &Path,
+    label: &str,
+    old: Option<&[u8]>,
+    new: &[u8],
+) -> ToolOutput {
+    if let Some(patch) = crate::diff::unified_diff_bytes(label, old.unwrap_or_default(), new) {
+        output = output.with_metadata(crate::diff::METADATA_DIFF_KEY, patch);
     }
+    if let Some(diff) = crate::diff::file_diff_bytes(path, old, new) {
+        output = output.with_file_diff(diff);
+    }
+    output
 }
 
 pub(crate) fn write_with_dirs(path: &Path, bytes: &[u8]) -> io::Result<()> {

@@ -490,18 +490,14 @@ fn build_gemini_body(
     for message in messages {
         if message.role == Role::System {
             for block in &message.content {
-                match block {
-                    RequestContentBlock::Text { text } => {
-                        system.push(json!({"text": text}));
-                    }
-                    other => {
-                        return Err(unsupported_content(
-                            GOOGLE_PROVIDER_ID,
-                            message.role,
-                            block_kind(other),
-                        ));
-                    }
-                }
+                let Some(text) = block.provider_text() else {
+                    return Err(unsupported_content(
+                        GOOGLE_PROVIDER_ID,
+                        message.role,
+                        block_kind(block),
+                    ));
+                };
+                system.push(json!({"text": text.as_ref()}));
             }
             continue;
         }
@@ -614,6 +610,12 @@ fn lower_gemini_block(
     match (role, block) {
         (Role::User, RequestContentBlock::Text { text })
         | (Role::Assistant, RequestContentBlock::Text { text }) => Ok(json!({"text": text})),
+        (Role::User | Role::Assistant, RequestContentBlock::ResourceLink { .. }) => {
+            let Some(text) = block.provider_text() else {
+                unreachable!("resource links always have a provider text projection")
+            };
+            Ok(json!({"text": text.as_ref()}))
+        }
         (
             Role::User,
             RequestContentBlock::Image {
@@ -1287,16 +1289,14 @@ fn build_vertex_anthropic_body(
     for message in messages {
         if message.role == Role::System {
             for block in &message.content {
-                match block {
-                    RequestContentBlock::Text { text } => system.push(text.clone()),
-                    other => {
-                        return Err(unsupported_content(
-                            VERTEX_ANTHROPIC_PROVIDER_ID,
-                            message.role,
-                            block_kind(other),
-                        ));
-                    }
-                }
+                let Some(text) = block.provider_text() else {
+                    return Err(unsupported_content(
+                        VERTEX_ANTHROPIC_PROVIDER_ID,
+                        message.role,
+                        block_kind(block),
+                    ));
+                };
+                system.push(text.into_owned());
             }
             continue;
         }
@@ -1366,6 +1366,12 @@ fn lower_anthropic_block(
         (Role::User, RequestContentBlock::Text { text })
         | (Role::Assistant, RequestContentBlock::Text { text }) => {
             Ok(json!({"type": "text", "text": text}))
+        }
+        (Role::User | Role::Assistant, RequestContentBlock::ResourceLink { .. }) => {
+            let Some(text) = block.provider_text() else {
+                unreachable!("resource links always have a provider text projection")
+            };
+            Ok(json!({"type": "text", "text": text.as_ref()}))
         }
         (
             Role::User,
@@ -2305,6 +2311,7 @@ fn unsupported_content(
 const fn block_kind(block: &RequestContentBlock) -> &'static str {
     match block {
         RequestContentBlock::Text { .. } => "text",
+        RequestContentBlock::ResourceLink { .. } => "resource-link",
         RequestContentBlock::SignedThinking { .. } => "signed-thinking",
         RequestContentBlock::ProviderEncryptedReasoning { .. } => "provider-encrypted-reasoning",
         RequestContentBlock::ToolUse { .. } => "tool-use",

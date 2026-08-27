@@ -129,8 +129,9 @@ impl TypedTool for WriteTool {
                         .with_metadata("exists", json!(existing.is_some()))
                         .with_metadata("formatted", outcome.changed)
                         .with_written_path(&target.canonical),
+                    &target.canonical,
                     &label,
-                    existing.as_deref().unwrap_or_default(),
+                    existing.as_deref(),
                     &final_bytes,
                 ),
                 &outcome.failures,

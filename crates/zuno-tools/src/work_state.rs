@@ -86,12 +86,31 @@ impl WorkItemPriority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl PlanStepStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlanStep {
     pub id: String,
     pub title: String,
-    pub status: WorkItemStatus,
+    pub status: PlanStepStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +252,7 @@ impl WorkStateStore {
                             actual: current.revision,
                         });
                     }
+                    validate_plan_transition(&current, &params)?;
                     let changed = tx
                         .execute(
                             "UPDATE work_plan SET goal_id=?1,title=?2,steps=?3,\
@@ -470,6 +490,8 @@ fn validate_plan(params: &PlanUpdateParams) -> Result<(), WorkStateError> {
         ));
     }
     let mut ids = BTreeSet::new();
+    let mut pending = 0_usize;
+    let mut in_progress = 0_usize;
     for step in &params.steps {
         if step.id.trim().is_empty() || step.title.trim().is_empty() {
             return Err(WorkStateError::Invalid(
@@ -480,6 +502,48 @@ fn validate_plan(params: &PlanUpdateParams) -> Result<(), WorkStateError> {
             return Err(WorkStateError::Invalid(format!(
                 "duplicate plan step id `{}`",
                 step.id
+            )));
+        }
+        match step.status {
+            PlanStepStatus::Pending => pending += 1,
+            PlanStepStatus::InProgress => in_progress += 1,
+            PlanStepStatus::Completed => {}
+        }
+    }
+    if in_progress > 1 {
+        return Err(WorkStateError::Invalid(
+            "at most one plan step may be in_progress".to_owned(),
+        ));
+    }
+    if pending > 0 && in_progress != 1 {
+        return Err(WorkStateError::Invalid(
+            "pending plan steps require exactly one in_progress step".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plan_transition(
+    current: &WorkPlan,
+    candidate: &PlanUpdateParams,
+) -> Result<(), WorkStateError> {
+    let candidate_statuses = candidate
+        .steps
+        .iter()
+        .map(|step| (step.id.as_str(), step.status))
+        .collect::<BTreeMap<_, _>>();
+    for step in &current.steps {
+        let Some(status) = candidate_statuses.get(step.id.as_str()).copied() else {
+            return Err(WorkStateError::Invalid(format!(
+                "existing plan step id `{}` must remain stable across revisions",
+                step.id
+            )));
+        };
+        if step.status == PlanStepStatus::Completed && status != PlanStepStatus::Completed {
+            return Err(WorkStateError::Invalid(format!(
+                "completed plan step `{}` cannot regress to `{}`",
+                step.id,
+                status.as_str()
             )));
         }
     }
@@ -1086,12 +1150,188 @@ mod tests {
         WorkStateStore::new(pool)
     }
 
-    fn step(id: &str) -> PlanStep {
+    fn step(id: &str, status: PlanStepStatus) -> PlanStep {
         PlanStep {
             id: id.to_owned(),
             title: format!("step {id}"),
-            status: WorkItemStatus::Pending,
+            status,
         }
+    }
+
+    #[test]
+    fn plan_steps_reject_work_item_only_terminal_states() {
+        for status in ["blocked", "cancelled"] {
+            let decoded = serde_json::from_value::<PlanUpdateParams>(serde_json::json!({
+                "title": "ship",
+                "steps": [{
+                    "id": "verify",
+                    "title": "verify release",
+                    "status": status,
+                }]
+            }));
+            assert!(
+                decoded.is_err(),
+                "plan status `{status}` is not representable by stable ACP and must be rejected"
+            );
+        }
+
+        serde_json::from_value::<PlanUpdateParams>(serde_json::json!({
+            "title": "ship",
+            "steps": [{"id":"verify","title":"verify release","status":"completed"}]
+        }))
+        .expect("the three ACP execution states remain valid");
+    }
+
+    #[test]
+    fn plan_snapshots_enforce_execution_progress_invariants() {
+        let valid = PlanUpdateParams {
+            expected_revision: None,
+            goal_id: None,
+            title: "release".to_owned(),
+            steps: vec![
+                step("scan", PlanStepStatus::InProgress),
+                step("verify", PlanStepStatus::Pending),
+            ],
+        };
+        validate_plan(&valid).expect("one active step may lead pending work");
+
+        for (label, params, expected) in [
+            (
+                "blank title",
+                PlanUpdateParams {
+                    title: " \t".to_owned(),
+                    ..valid.clone()
+                },
+                "plan title must not be empty",
+            ),
+            (
+                "duplicate ids",
+                PlanUpdateParams {
+                    steps: vec![
+                        step("scan", PlanStepStatus::InProgress),
+                        step("scan", PlanStepStatus::Pending),
+                    ],
+                    ..valid.clone()
+                },
+                "duplicate plan step id `scan`",
+            ),
+            (
+                "two active steps",
+                PlanUpdateParams {
+                    steps: vec![
+                        step("scan", PlanStepStatus::InProgress),
+                        step("verify", PlanStepStatus::InProgress),
+                    ],
+                    ..valid.clone()
+                },
+                "at most one plan step may be in_progress",
+            ),
+            (
+                "pending without active work",
+                PlanUpdateParams {
+                    steps: vec![
+                        step("scan", PlanStepStatus::Completed),
+                        step("verify", PlanStepStatus::Pending),
+                    ],
+                    ..valid.clone()
+                },
+                "pending plan steps require exactly one in_progress step",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate_plan(&params),
+                    Err(WorkStateError::Invalid(message)) if message.contains(expected)
+                ),
+                "{label} was accepted"
+            );
+        }
+
+        validate_plan(&PlanUpdateParams {
+            steps: vec![
+                step("scan", PlanStepStatus::Completed),
+                step("verify", PlanStepStatus::Completed),
+            ],
+            ..valid
+        })
+        .expect("a fully completed plan needs no in_progress step");
+    }
+
+    #[test]
+    fn plan_updates_keep_step_ids_and_completed_steps_stable() {
+        let store = store();
+        let first = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: None,
+                    title: "release".to_owned(),
+                    steps: vec![
+                        step("scan", PlanStepStatus::Completed),
+                        step("verify", PlanStepStatus::InProgress),
+                    ],
+                },
+            )
+            .expect("create plan");
+
+        let removed = store.update_plan(
+            "ses",
+            PlanUpdateParams {
+                expected_revision: Some(first.revision),
+                goal_id: None,
+                title: "release".to_owned(),
+                steps: vec![step("verify", PlanStepStatus::InProgress)],
+            },
+        );
+        assert!(matches!(
+            removed,
+            Err(WorkStateError::Invalid(message))
+                if message.contains("existing plan step id `scan` must remain stable")
+        ));
+        assert_eq!(
+            store
+                .plan("ses")
+                .expect("read plan")
+                .expect("plan")
+                .revision,
+            first.revision,
+            "a rejected update changed durable state"
+        );
+
+        let regressed = store.update_plan(
+            "ses",
+            PlanUpdateParams {
+                expected_revision: Some(first.revision),
+                goal_id: None,
+                title: "release".to_owned(),
+                steps: vec![
+                    step("scan", PlanStepStatus::Pending),
+                    step("verify", PlanStepStatus::InProgress),
+                ],
+            },
+        );
+        assert!(matches!(
+            regressed,
+            Err(WorkStateError::Invalid(message))
+                if message.contains("completed plan step `scan` cannot regress")
+        ));
+
+        let completed = store
+            .update_plan(
+                "ses",
+                PlanUpdateParams {
+                    expected_revision: Some(first.revision),
+                    goal_id: None,
+                    title: "release".to_owned(),
+                    steps: vec![
+                        step("scan", PlanStepStatus::Completed),
+                        step("verify", PlanStepStatus::Completed),
+                    ],
+                },
+            )
+            .expect("complete plan");
+        assert_eq!(completed.revision, first.revision + 1);
     }
 
     #[test]
@@ -1104,7 +1344,7 @@ mod tests {
                     expected_revision: None,
                     goal_id: Some("goal".to_owned()),
                     title: "release".to_owned(),
-                    steps: vec![step("scan")],
+                    steps: vec![step("scan", PlanStepStatus::InProgress)],
                 },
             )
             .expect("create plan");
@@ -1116,7 +1356,10 @@ mod tests {
                     expected_revision: Some(1),
                     goal_id: first.goal_id.clone(),
                     title: "release safely".to_owned(),
-                    steps: vec![step("scan"), step("verify")],
+                    steps: vec![
+                        step("scan", PlanStepStatus::Completed),
+                        step("verify", PlanStepStatus::InProgress),
+                    ],
                 },
             )
             .expect("update plan");

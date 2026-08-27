@@ -68,6 +68,7 @@ fn surface_registered_commands_match_their_dispositions() {
     }
 
     assert!(registered.contains(&"completion"));
+    assert!(registered.contains(&"acp"));
     assert!(registered.contains(&"providers"));
     assert!(registered.contains(&"plugin"));
 }
@@ -206,6 +207,11 @@ struct Probe {
 }
 
 const IMPLEMENTED_PROBES: &[Probe] = &[
+    Probe {
+        command: "acp",
+        argv: &["acp", "--check"],
+        evidence: "ACP stdio adapter ready",
+    },
     Probe {
         command: "agent",
         argv: &["agent", "list"],

@@ -41,6 +41,33 @@ fn event_history_only_trace_is_stored_but_excluded_from_the_outbound_request() {
 }
 
 #[test]
+fn resource_link_round_trips_and_has_one_stable_provider_projection() {
+    let link = RequestContentBlock::ResourceLink {
+        name: "notes.md".to_owned(),
+        uri: "file:///workspace/notes.md".to_owned(),
+        title: Some("Design notes".to_owned()),
+        description: Some("ACP design context".to_owned()),
+        media_type: Some("text/markdown".to_owned()),
+        size: Some(42),
+    };
+
+    let encoded = serde_json::to_string(&link).expect("resource link serializes");
+    let decoded: RequestContentBlock =
+        serde_json::from_str(&encoded).expect("resource link deserializes");
+
+    assert_eq!(decoded, link);
+    assert_eq!(
+        link.provider_text().as_deref(),
+        Some(
+            "Referenced resource `Design notes` (name: `notes.md`): file:///workspace/notes.md\n\
+             Description: ACP design context\n\
+             Media type: text/markdown\n\
+             Size: 42 bytes"
+        )
+    );
+}
+
+#[test]
 fn event_signed_thinking_round_trips_through_storage_and_into_a_request() {
     let stored = TranscriptMessage::new(
         Role::Assistant,

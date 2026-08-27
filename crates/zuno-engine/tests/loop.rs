@@ -2214,6 +2214,7 @@ async fn loop_repairs_a_missing_tool_result_before_the_provider_sees_history() {
                     assert_eq!(*is_error, Some(true));
                 }
                 RequestContentBlock::Text { .. }
+                | RequestContentBlock::ResourceLink { .. }
                 | RequestContentBlock::SignedThinking { .. }
                 | RequestContentBlock::ProviderEncryptedReasoning { .. }
                 | RequestContentBlock::ToolUse { .. }

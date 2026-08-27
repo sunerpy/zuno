@@ -154,8 +154,9 @@ impl TypedTool for EditTool {
                         .with_metadata("replacements", replacements)
                         .with_metadata("formatted", outcome.changed)
                         .with_written_path(&target.canonical),
+                    &target.canonical,
                     &label,
-                    &source,
+                    Some(&source),
                     &final_bytes,
                 ),
                 &outcome.failures,

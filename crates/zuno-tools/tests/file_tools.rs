@@ -642,6 +642,28 @@ async fn file_apply_patch_adds_updates_moves_and_deletes_files() {
         patch.contains("delete.txt") && patch.contains("-gone"),
         "a delete's pre-image is captured before it is removed:\n{patch}"
     );
+    let diffs = output.file_diffs();
+    assert_eq!(diffs.len(), 4, "add, move source, move target, delete");
+    assert!(diffs.iter().any(|diff| {
+        diff.path() == slash(&workspace.path().join("added.txt"))
+            && diff.old_text().is_none()
+            && diff.new_text() == "one\ntwo\n"
+    }));
+    assert!(diffs.iter().any(|diff| {
+        diff.path() == slash(&workspace.path().join("source.txt"))
+            && diff.old_text() == Some("old\n")
+            && diff.new_text().is_empty()
+    }));
+    assert!(diffs.iter().any(|diff| {
+        diff.path() == slash(&workspace.path().join("moved.txt"))
+            && diff.old_text().is_none()
+            && diff.new_text() == "new\n"
+    }));
+    assert!(diffs.iter().any(|diff| {
+        diff.path() == slash(&workspace.path().join("delete.txt"))
+            && diff.old_text() == Some("gone\n")
+            && diff.new_text().is_empty()
+    }));
 }
 
 #[tokio::test]
@@ -987,6 +1009,11 @@ async fn file_edit_reports_the_patch_of_what_it_changed() {
         patch.contains("edited.txt"),
         "the patch names the file it changed:\n{patch}"
     );
+    let diffs = output.file_diffs();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0].path(), slash(&path));
+    assert_eq!(diffs[0].old_text(), Some("one\ntwo\nthree\n"));
+    assert_eq!(diffs[0].new_text(), "one\nTWO\nthree\n");
 }
 
 #[tokio::test]
@@ -1006,6 +1033,11 @@ async fn file_write_reports_the_patch_for_both_a_creation_and_an_overwrite() {
         .as_str()
         .expect("creating a file is a change");
     assert!(patch.contains("+first"), "{patch}");
+    let diffs = created.file_diffs();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0].path(), slash(&path));
+    assert_eq!(diffs[0].old_text(), None);
+    assert_eq!(diffs[0].new_text(), "first\n");
 
     tools
         .read
@@ -1028,6 +1060,11 @@ async fn file_write_reports_the_patch_for_both_a_creation_and_an_overwrite() {
         .expect("an overwrite is a change");
     assert!(patch.contains("-first"), "{patch}");
     assert!(patch.contains("+second"), "{patch}");
+    let diffs = overwritten.file_diffs();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0].path(), slash(&path));
+    assert_eq!(diffs[0].old_text(), Some("first\n"));
+    assert_eq!(diffs[0].new_text(), "second\n");
 }
 
 /// A write of byte-identical content attaches nothing, so a present `diff` always means

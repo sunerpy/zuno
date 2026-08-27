@@ -45,7 +45,7 @@ const CHANNELS: &[ChannelGate] = &[
         "OUTBOUND_FRAME_CHANNEL_CAPACITY=64",
         Policy::LosslessBlock,
         "zuno-acp/src/transport.rs",
-        ".send(Outbound {",
+        ".send(Outbound::Frame {",
     ),
     gate(
         "mcp-stdio-notifications",

@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use zuno_db::message::{MessageRecord, MessageRole, MessageWithParts, PartKind, PartRecord};
 use zuno_engine::r#loop::{
-    ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, ToolBlockKind, TurnEvent, project_history,
-    project_history_owned,
+    ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, ToolBlockKind, ToolDiff, TurnEvent,
+    project_history, project_history_owned,
 };
 use zuno_llm::event::{
     ConnectionPhase, FinishReason, Message, RequestContentBlock, StreamEvent, ThoughtSignature,
@@ -202,7 +202,7 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
                 String,
                 String,
                 String,
-                Option<String>,
+                Option<ToolDiff>,
                 Vec<String>,
                 bool,
             )>(),
@@ -359,11 +359,11 @@ fn d0_enum_boxing_baseline() {
         );
     }
 
-    let worst_total =
-        stream.saving_per_element().max(turn.saving_per_element()) * TURN_EVENT_CHANNEL_CAPACITY;
+    let total_upper_bound =
+        (stream.saving_per_element() + turn.saving_per_element()) * TURN_EVENT_CHANNEL_CAPACITY;
     println!(
         "  VERDICT: the whole D2 opportunity on these two enums is bounded by \
-         {worst_total} B,"
+         {total_upper_bound} B,"
     );
     println!(
         "  because neither is ever collected into a length-unbounded container - the \
@@ -380,10 +380,10 @@ fn d0_enum_boxing_baseline() {
     // unbounded Vec this stops being true, and the number above stops being the
     // answer to D2.
     assert!(
-        worst_total < 16 * 1024,
+        total_upper_bound < 16 * 1024,
         "the bounded-population argument that closes D2 no longer holds: the upper \
-         bound is now {worst_total} B. Re-run D0 and re-open D2 rather than raising \
-         this number."
+         bound is now {total_upper_bound} B. Re-run D0 and re-open D2 rather than \
+         raising this number."
     );
 }
 
@@ -534,6 +534,20 @@ fn message_payload_bytes(message: &Message) -> usize {
         .iter()
         .map(|block| match block {
             RequestContentBlock::Text { text } => text.len(),
+            RequestContentBlock::ResourceLink {
+                name,
+                uri,
+                title,
+                description,
+                media_type,
+                size: _,
+            } => {
+                name.len()
+                    + uri.len()
+                    + title.as_ref().map_or(0, String::len)
+                    + description.as_ref().map_or(0, String::len)
+                    + media_type.as_ref().map_or(0, String::len)
+            }
             RequestContentBlock::SignedThinking {
                 thinking,
                 signature,

@@ -238,6 +238,13 @@ fn chat_plain(message: &Message) -> Result<Value, ProviderError> {
                 text.push_str(fragment);
                 parts.push(json!({ "type": "text", "text": fragment }));
             }
+            RequestContentBlock::ResourceLink { .. } => {
+                let Some(fragment) = block.provider_text() else {
+                    unreachable!("resource links always have a provider text projection")
+                };
+                text.push_str(fragment.as_ref());
+                parts.push(json!({ "type": "text", "text": fragment.as_ref() }));
+            }
             RequestContentBlock::Image {
                 media_type, data, ..
             } => {
@@ -267,6 +274,12 @@ fn chat_assistant(message: &Message) -> Result<Value, ProviderError> {
     for block in &message.content {
         match block {
             RequestContentBlock::Text { text: fragment } => text.push_str(fragment),
+            RequestContentBlock::ResourceLink { .. } => {
+                let Some(fragment) = block.provider_text() else {
+                    unreachable!("resource links always have a provider text projection")
+                };
+                text.push_str(fragment.as_ref());
+            }
             RequestContentBlock::ToolUse {
                 id, name, input, ..
             } => calls.push(json!({
@@ -322,6 +335,12 @@ fn responses_assistant(message: &Message) -> Result<Vec<Value>, ProviderError> {
         match block {
             RequestContentBlock::Text { text } => {
                 output_content.push(json!({ "type": "output_text", "text": text }));
+            }
+            RequestContentBlock::ResourceLink { .. } => {
+                let Some(text) = block.provider_text() else {
+                    unreachable!("resource links always have a provider text projection")
+                };
+                output_content.push(json!({ "type": "output_text", "text": text.as_ref() }));
             }
             RequestContentBlock::ProviderEncryptedReasoning {
                 summary,
@@ -416,6 +435,9 @@ fn responses_content(message: &Message, text_type: &str, image_type: &str) -> Ve
         .iter()
         .filter_map(|block| match block {
             RequestContentBlock::Text { text } => Some(json!({ "type": text_type, "text": text })),
+            RequestContentBlock::ResourceLink { .. } => block
+                .provider_text()
+                .map(|text| json!({ "type": text_type, "text": text.as_ref() })),
             RequestContentBlock::Image {
                 media_type, data, ..
             } => Some(json!({
@@ -428,15 +450,13 @@ fn responses_content(message: &Message, text_type: &str, image_type: &str) -> Ve
 }
 
 fn joined_text(message: &Message) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            RequestContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
+    let mut text = String::new();
+    for block in &message.content {
+        if let Some(fragment) = block.provider_text() {
+            text.push_str(fragment.as_ref());
+        }
+    }
+    text
 }
 
 #[derive(Debug)]

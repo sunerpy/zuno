@@ -173,7 +173,7 @@ variant missing from it fails the test rather than producing a stale projection.
 | type | inline stride | largest variant | runner-up | stride floor if boxed | saving/element |
 | --- | ---: | --- | --- | ---: | ---: |
 | `StreamEvent` | 120 B | `GeneratedImage` = 120 B | `ProviderReasoningItem` = 96 B | 104 B | 16 B |
-| `TurnEvent` | 128 B | `Provider` = 128 B | `ToolDispatchCompleted` = 128 B | 136 B | 0 B |
+| `TurnEvent` | 200 B | `ToolDispatchCompleted` = 200 B | `Provider` = 128 B | 136 B | 64 B |
 
 Hot-type footprints measured alongside them, which §3.4 records as an assertion
 **both** this project and the reference implementation lacked:
@@ -186,10 +186,10 @@ Hot-type footprints measured alongside them, which §3.4 records as an assertion
 | `PartKind` | 1 B | 1 B |
 | `MessageRole` | 1 B | 1 B |
 | `StreamEvent` | 120 B | 8 B |
-| `TurnEvent` | 128 B | 8 B |
+| `TurnEvent` | 200 B | 8 B |
 | `ProjectedMessage` | 56 B | 8 B |
 | `Message` | 32 B | 8 B |
-| `RequestContentBlock` | 104 B | 8 B |
+| `RequestContentBlock` | 136 B | 8 B |
 | `String` | 24 B | 8 B |
 | `serde_json::Value` | 32 B | 8 B |
 
@@ -197,10 +197,11 @@ The decisive quantity is not the stride but the **population**. Neither enum is
 ever collected into a length-unbounded container: the only multi-element home
 either has is the 64-slot `TURN_EVENT_CHANNEL_CAPACITY` channel, and `StreamEvent`
 reaches a consumer only inside `TurnEvent::Provider`. So the whole D2 opportunity
-across both is bounded by **1,024 B** — 16 B x 64 for `StreamEvent`, and 0 B for
-`TurnEvent`, whose largest and runner-up variants are the same size, so boxing
-would make it 8 B *larger*. A test fails if that bound ever exceeds 16 KiB, which
-is the case where the bounded-population argument stops holding.
+across both is bounded by **5,120 B** — 16 B x 64 for `StreamEvent` plus 64 B x
+64 for `TurnEvent`. This deliberately additive calculation is an upper bound:
+the two enum layouts are nested rather than independently queued. A test fails if
+that bound ever exceeds 16 KiB, which is the case where the bounded-population
+argument stops holding.
 
 ### D0-c — derived copies
 
@@ -239,8 +240,8 @@ satisfied and none of them rests on a transferred number.
   cloning projection creates is 3.74 MB against a 70.48 MB transcript, because
   95% of stored payload never reaches a provider request at all. A test fails if
   that fraction ever exceeds 20%.
-- **D2 (boxing large variants) — not worth doing here,** bounded at 1,024 B total
-  by population, and actively harmful for `TurnEvent`.
+- **D2 (boxing large variants) — not worth doing here,** bounded at 5,120 B total
+  by the 64-slot population.
 - **D3 (`SmallVec` for part lists)** was not measured: it is gated on D2, and D2
   is closed.
 - **D4 (`CompactString`) — weaker than it looks.** Only 3.17% of string bytes sit

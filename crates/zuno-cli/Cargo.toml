@@ -18,6 +18,7 @@ default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
+zuno-acp = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }

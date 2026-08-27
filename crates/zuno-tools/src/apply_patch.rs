@@ -47,7 +47,9 @@ struct FileChange {
     ///
     /// Captured during preparation rather than re-read during application because a
     /// `Delete` has no pre-image left to read once it has run.
-    old_bytes: Vec<u8>,
+    old_bytes: Option<Vec<u8>>,
+    /// The pre-image at a move destination, absent when the destination did not exist.
+    destination_old_bytes: Option<Vec<u8>>,
     new_bytes: Vec<u8>,
 }
 
@@ -133,6 +135,7 @@ impl TypedTool for ApplyPatchTool {
         // own `---`/`+++` pair — so the viewer scrolls through the whole change rather
         // than showing whichever file happened to be last.
         let mut patches = Vec::<String>::new();
+        let mut file_diffs = Vec::new();
         for change in changes {
             after_effect(check_interrupt("apply_patch", &ctx), &applied)?;
             let source_path = change.source.canonical.clone();
@@ -208,10 +211,49 @@ impl TypedTool for ApplyPatchTool {
                     &applied,
                 )?
             };
-            if let Some(patch) =
-                crate::diff::unified_diff_bytes(&relative, &change.old_bytes, &post)
-            {
+            if let Some(patch) = crate::diff::unified_diff_bytes(
+                &relative,
+                change.old_bytes.as_deref().unwrap_or_default(),
+                &post,
+            ) {
                 patches.push(patch);
+            }
+            match change.kind {
+                ChangeKind::Add => {
+                    if let Some(diff) = crate::diff::file_diff_bytes(&target_path, None, &post) {
+                        file_diffs.push(diff);
+                    }
+                }
+                ChangeKind::Update => {
+                    if let Some(diff) = crate::diff::file_diff_bytes(
+                        &target_path,
+                        change.old_bytes.as_deref(),
+                        &post,
+                    ) {
+                        file_diffs.push(diff);
+                    }
+                }
+                ChangeKind::Move => {
+                    if let Some(diff) =
+                        crate::diff::file_diff_bytes(&source_path, change.old_bytes.as_deref(), &[])
+                    {
+                        file_diffs.push(diff);
+                    }
+                    if let Some(diff) = crate::diff::file_diff_bytes(
+                        &target_path,
+                        change.destination_old_bytes.as_deref(),
+                        &post,
+                    ) {
+                        file_diffs.push(diff);
+                    }
+                }
+                ChangeKind::Delete => {
+                    if let Some(diff) =
+                        crate::diff::file_diff_bytes(&source_path, change.old_bytes.as_deref(), &[])
+                    {
+                        file_diffs.push(diff);
+                    }
+                }
             }
             summaries.push(format!("{marker} {relative}"));
             files.push(json!({
@@ -233,6 +275,9 @@ impl TypedTool for ApplyPatchTool {
         }
         if !patches.is_empty() {
             result = result.with_metadata(crate::diff::METADATA_DIFF_KEY, patches.concat());
+        }
+        for diff in file_diffs {
+            result = result.with_file_diff(diff);
         }
         Ok(report_formatting(result, &failures))
     }
@@ -306,7 +351,8 @@ impl ApplyPatchTool {
                         source,
                         destination: None,
                         kind: ChangeKind::Add,
-                        old_bytes: Vec::new(),
+                        old_bytes: None,
+                        destination_old_bytes: None,
                         new_bytes: content.as_bytes().to_vec(),
                     });
                 }
@@ -318,7 +364,8 @@ impl ApplyPatchTool {
                         source,
                         destination: None,
                         kind: ChangeKind::Delete,
-                        old_bytes,
+                        old_bytes: Some(old_bytes),
+                        destination_old_bytes: None,
                         new_bytes: Vec::new(),
                     });
                 }
@@ -355,11 +402,17 @@ impl ApplyPatchTool {
                     } else {
                         ChangeKind::Update
                     };
+                    let destination_old_bytes = destination
+                        .as_ref()
+                        .map(|target| read_optional_file(&target.canonical))
+                        .transpose()?
+                        .flatten();
                     changes.push(FileChange {
                         source,
                         destination,
                         kind,
-                        old_bytes: bytes,
+                        old_bytes: Some(bytes),
+                        destination_old_bytes,
                         new_bytes: encode_text(&content, decoded.bom),
                     });
                 }
@@ -411,6 +464,21 @@ fn ensure_regular_file(path: &Path) -> Result<(), ToolError> {
         ));
     }
     Ok(())
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, ToolError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => Err(invalid(
+            "apply_patch",
+            format!(
+                "apply_patch verification failed: move destination is a directory: {}",
+                path.display()
+            ),
+        )),
+        Err(error) => Err(failed("apply_patch", error)),
+    }
 }
 
 fn apply_chunks(

@@ -372,6 +372,12 @@ fn translate_response_assistant(message: &Message) -> Vec<Value> {
             RequestContentBlock::Text { text } => {
                 content.push(json!({"type": "output_text", "text": text}));
             }
+            RequestContentBlock::ResourceLink { .. } => {
+                let Some(text) = block.provider_text() else {
+                    unreachable!("resource links always have a provider text projection")
+                };
+                content.push(json!({"type": "output_text", "text": text.as_ref()}));
+            }
             RequestContentBlock::ProviderEncryptedReasoning {
                 summary,
                 encrypted_content,
@@ -483,6 +489,9 @@ fn response_content(message: &Message, quirks: &Quirks) -> Vec<Value> {
         .iter()
         .filter_map(|block| match block {
             RequestContentBlock::Text { text } => Some(json!({"type": "input_text", "text": text})),
+            RequestContentBlock::ResourceLink { .. } => block
+                .provider_text()
+                .map(|text| json!({"type": "input_text", "text": text.as_ref()})),
             RequestContentBlock::Image {
                 media_type, data, ..
             } if quirks.accepts_attachments() => Some(json!({
@@ -495,14 +504,13 @@ fn response_content(message: &Message, quirks: &Quirks) -> Vec<Value> {
 }
 
 fn joined_text(message: &Message) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            RequestContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+    let mut text = String::new();
+    for block in &message.content {
+        if let Some(fragment) = block.provider_text() {
+            text.push_str(fragment.as_ref());
+        }
+    }
+    text
 }
 
 fn translate_plain(message: &Message, quirks: &Quirks) -> Vec<Value> {
@@ -521,6 +529,13 @@ fn translate_plain(message: &Message, quirks: &Quirks) -> Vec<Value> {
             RequestContentBlock::Text { text: value } => {
                 text.push_str(value);
                 parts.push(json!({"type": "text", "text": value}));
+            }
+            RequestContentBlock::ResourceLink { .. } => {
+                let Some(value) = block.provider_text() else {
+                    unreachable!("resource links always have a provider text projection")
+                };
+                text.push_str(value.as_ref());
+                parts.push(json!({"type": "text", "text": value.as_ref()}));
             }
             RequestContentBlock::Image {
                 media_type, data, ..
@@ -563,6 +578,12 @@ fn translate_assistant(message: &Message, quirks: &Quirks) -> Vec<Value> {
     for block in &message.content {
         match block {
             RequestContentBlock::Text { text: value } => text.push_str(value),
+            RequestContentBlock::ResourceLink { .. } => {
+                let Some(value) = block.provider_text() else {
+                    unreachable!("resource links always have a provider text projection")
+                };
+                text.push_str(value.as_ref());
+            }
             // The only replayable reasoning shapes `RequestContentBlock` can
             // carry. Both are collected here and then either echoed or dropped;
             // the decision is rule 3, below.
@@ -638,6 +659,7 @@ fn translate_tool_results(message: &Message) -> Vec<Value> {
                 "content": content
             })),
             RequestContentBlock::Text { .. }
+            | RequestContentBlock::ResourceLink { .. }
             | RequestContentBlock::SignedThinking { .. }
             | RequestContentBlock::ProviderEncryptedReasoning { .. }
             | RequestContentBlock::ToolUse { .. }

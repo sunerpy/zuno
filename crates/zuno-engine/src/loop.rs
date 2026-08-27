@@ -46,7 +46,7 @@ use zuno_orchestration::{
     SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity, sha256_json, sha256_text,
 };
 use zuno_tool::{
-    ToolConcurrencyPolicy, ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
+    FileDiff, ToolConcurrencyPolicy, ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
 };
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
@@ -121,6 +121,48 @@ impl TurnEventSender {
     pub fn with_hooks(mut self, hooks: Arc<dyn TurnHooks>) -> Self {
         self.hooks = hooks;
         self
+    }
+}
+
+/// File changes a completed tool exposes to interface-neutral clients.
+///
+/// The unified patch remains useful for terminal/log projections and third-party tools.
+/// Native text pre/post images are the durable source for clients such as ACP that have
+/// a typed diff content block. An event exists only when at least one representation is
+/// present, so consumers never have to distinguish an empty diff from no change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDiff {
+    unified: Option<String>,
+    files: Vec<FileDiff>,
+}
+
+impl ToolDiff {
+    #[must_use]
+    pub fn new(unified: Option<String>, files: Vec<FileDiff>) -> Option<Self> {
+        let unified = unified.filter(|patch| !patch.is_empty());
+        (unified.is_some() || !files.is_empty()).then_some(Self { unified, files })
+    }
+
+    #[must_use]
+    pub fn from_output(output: &ToolOutput) -> Option<Self> {
+        Self::new(
+            output
+                .metadata
+                .get("diff")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            output.file_diffs(),
+        )
+    }
+
+    #[must_use]
+    pub fn unified(&self) -> Option<&str> {
+        self.unified.as_deref()
+    }
+
+    #[must_use]
+    pub fn files(&self) -> &[FileDiff] {
+        &self.files
     }
 }
 
@@ -213,15 +255,13 @@ pub enum TurnEvent {
         name: String,
         title: String,
         output: String,
-        /// The unified patch this call produced, when it changed a file.
+        /// Typed file pre/post images and the optional unified patch this call produced.
         ///
-        /// Lifted out of the result's `metadata["diff"]` rather than carrying the whole
+        /// Lifted out of the result's durable metadata rather than carrying the whole
         /// metadata map, because this enum is a typed event stream for hosts: a
         /// `Map<String, Value>` here would make every projection decide which
-        /// tool-private keys to leak, and the only thing a host needs is the patch.
-        /// `None` for every tool that changed nothing — see
-        /// `zuno_tools::diff` for why an absent patch is not an empty one.
-        diff: Option<String>,
+        /// tool-private keys to leak. `None` means the tool reported no file change.
+        diff: Option<ToolDiff>,
         /// The files this call wrote, lifted from
         /// [`zuno_tool::output::METADATA_WRITTEN_PATHS_KEY`].
         ///
@@ -2025,13 +2065,7 @@ async fn run_turn_in_span(
                             name: call.name,
                             title: dispatch.output.title.clone(),
                             output: dispatch.output.output.clone(),
-                            diff: dispatch
-                                .output
-                                .metadata
-                                .get("diff")
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|patch| !patch.is_empty())
-                                .map(str::to_owned),
+                            diff: ToolDiff::from_output(&dispatch.output),
                             written_paths: dispatch
                                 .output
                                 .written_paths()
@@ -2678,19 +2712,8 @@ fn append_user_message(messages: &mut Vec<Message>, message: &MessageWithParts) 
                 }
             }
             PartKind::File => {
-                let filename = part
-                    .data
-                    .get("filename")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                let media_type = part.data.get("mime").and_then(Value::as_str);
-                let data = part.data.get("data").and_then(Value::as_str);
-                if let (Some(media_type), Some(data)) = (media_type, data) {
-                    content.push(RequestContentBlock::Image {
-                        filename,
-                        media_type: media_type.to_owned(),
-                        data: data.to_owned(),
-                    });
+                if let Some(block) = request_file_block(&part.data) {
+                    content.push(block);
                 }
             }
             PartKind::Subtask
@@ -2727,15 +2750,8 @@ fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>
                 }
             }
             PartKind::File => {
-                let filename = take_string(&mut part.data, "filename");
-                let media_type = take_string(&mut part.data, "mime");
-                let data = take_string(&mut part.data, "data");
-                if let (Some(media_type), Some(data)) = (media_type, data) {
-                    content.push(RequestContentBlock::Image {
-                        filename,
-                        media_type,
-                        data,
-                    });
+                if let Some(block) = take_request_file_block(&mut part.data) {
+                    content.push(block);
                 }
             }
             PartKind::Subtask
@@ -2753,6 +2769,70 @@ fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>
     if !content.is_empty() {
         messages.push(Message::from_content(Role::User, content));
     }
+}
+
+fn request_file_block(data: &Map<String, Value>) -> Option<RequestContentBlock> {
+    let filename = data
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let media_type = data.get("mime").and_then(Value::as_str).map(str::to_owned);
+    let payload = data.get("data").and_then(Value::as_str).map(str::to_owned);
+    if let (Some(media_type), Some(payload)) = (media_type.clone(), payload) {
+        return Some(RequestContentBlock::Image {
+            filename,
+            media_type,
+            data: payload,
+        });
+    }
+    let uri = data.get("url").and_then(Value::as_str)?.to_owned();
+    let name = filename.unwrap_or_else(|| {
+        uri.rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("attachment")
+            .to_owned()
+    });
+    Some(RequestContentBlock::ResourceLink {
+        name,
+        uri,
+        title: data.get("title").and_then(Value::as_str).map(str::to_owned),
+        description: data
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        media_type,
+        size: data.get("size").and_then(Value::as_u64),
+    })
+}
+
+fn take_request_file_block(data: &mut Map<String, Value>) -> Option<RequestContentBlock> {
+    let filename = take_string(data, "filename");
+    let media_type = take_string(data, "mime");
+    let payload = take_string(data, "data");
+    if let (Some(media_type), Some(payload)) = (media_type.clone(), payload) {
+        return Some(RequestContentBlock::Image {
+            filename,
+            media_type,
+            data: payload,
+        });
+    }
+    let uri = take_string(data, "url")?;
+    let name = filename.unwrap_or_else(|| {
+        uri.rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("attachment")
+            .to_owned()
+    });
+    Some(RequestContentBlock::ResourceLink {
+        name,
+        uri,
+        title: take_string(data, "title"),
+        description: take_string(data, "description"),
+        media_type,
+        size: data.remove("size").and_then(|value| value.as_u64()),
+    })
 }
 
 fn append_assistant_message(messages: &mut Vec<Message>, message: &MessageWithParts) {

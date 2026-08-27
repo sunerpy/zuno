@@ -2496,7 +2496,11 @@ impl TurnHost {
         self.session_identity.is_materialized()
     }
 
-    fn materialize_session_for_control(&mut self) -> Result<bool, String> {
+    /// Acquire the durable row before a protocol client returns `session/new`.
+    ///
+    /// Interactive surfaces may remain lazy; an advertised ACP id must already be
+    /// listable and resumable before its first prompt.
+    pub(crate) fn materialize_session(&mut self) -> Result<bool, String> {
         let SessionMaterializer::Pending(input) = &self.session_materializer else {
             return Ok(false);
         };
@@ -2553,6 +2557,22 @@ impl TurnHost {
                 &self.session_id,
                 &format!("msg_agent_{}", Uuid::new_v4().simple()),
                 &self.agent,
+                zuno_db::message::now_millis(),
+            )
+            .map_err(to_string)
+    }
+
+    /// Persist the active model after a successful client-surface host replacement.
+    pub(super) fn persist_active_model(&self) -> Result<(), String> {
+        if !self.is_session_materialized() {
+            return Ok(());
+        }
+        let model = zuno_db::session::model_reference(&self.provider_id, &self.model_id);
+        zuno_db::session::Store::new(&self.database)
+            .switch_model_at(
+                &self.session_id,
+                &format!("msg_model_{}", Uuid::new_v4().simple()),
+                &model,
                 zuno_db::message::now_millis(),
             )
             .map_err(to_string)
@@ -2634,7 +2654,7 @@ impl TurnHost {
                 if value.is_empty() {
                     return Err("usage: /goal create <objective>".to_owned());
                 }
-                self.materialize_session_for_control()?;
+                self.materialize_session()?;
                 let goal = self
                     .goal_store
                     .create_goal(&self.session_id, value, None)
@@ -2771,14 +2791,10 @@ impl TurnHost {
                 .map(|step| step.id.as_str())
                 .collect::<BTreeSet<_>>();
             let terminal = !plan.steps.is_empty()
-                && plan.steps.iter().all(|step| {
-                    matches!(
-                        step.status,
-                        zuno_tools::WorkItemStatus::Completed
-                            | zuno_tools::WorkItemStatus::Cancelled
-                            | zuno_tools::WorkItemStatus::Blocked
-                    )
-                });
+                && plan
+                    .steps
+                    .iter()
+                    .all(|step| step.status == zuno_tools::PlanStepStatus::Completed);
             aggregate_work_item_span(
                 work.items.iter().filter(|item| {
                     item.plan_step_id
@@ -4432,16 +4448,13 @@ fn goal_turn_accounting_known(before: GoalUsage, after: GoalUsage) -> bool {
 fn dynamic_context_from_goal_entry(
     entry: &zuno_engine::compaction::TranscriptEntry,
 ) -> DynamicContext {
-    let text = entry
-        .message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            RequestContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut parts = Vec::new();
+    for block in &entry.message.content {
+        if let Some(text) = block.provider_text() {
+            parts.push(text.into_owned());
+        }
+    }
+    let text = parts.join("\n");
     DynamicContext::new(text)
 }
 
@@ -6525,6 +6538,26 @@ fn request_content_parts(
                     "type": "text",
                     "text": text,
                 }),
+                RequestContentBlock::ResourceLink {
+                    name,
+                    uri,
+                    title,
+                    description,
+                    media_type,
+                    size,
+                } => json!({
+                    "id": prefixed_id("prt"),
+                    "sessionID": input.session_id,
+                    "messageID": message_id,
+                    "type": "file",
+                    "filename": name,
+                    "url": uri,
+                    "title": title,
+                    "description": description,
+                    "mime": media_type,
+                    "size": size,
+                    "resourceLink": true,
+                }),
                 RequestContentBlock::Image {
                     filename,
                     media_type,
@@ -6544,7 +6577,8 @@ fn request_content_parts(
                 | RequestContentBlock::ToolUse { .. }
                 | RequestContentBlock::ToolResult { .. } => {
                     return Err(
-                        "resolved user prompt content may contain only text and images".to_owned(),
+                        "resolved user prompt content may contain only text, resource links, and images"
+                            .to_owned(),
                     );
                 }
             };

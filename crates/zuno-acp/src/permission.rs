@@ -29,6 +29,7 @@ impl PermissionAsker for AcpPermissionAsker {
         tool: &str,
         ask: PermissionAsk,
     ) -> Result<(), ToolError> {
+        let allow_always = !ask.always.is_empty();
         let response = self
             .client
             .request_permission(json!({
@@ -44,23 +45,41 @@ impl PermissionAsker for AcpPermissionAsker {
                         "metadata": ask.metadata,
                     },
                 },
-                "options": permission_options(!ask.always.is_empty()),
+                "options": permission_options(allow_always),
             }))
             .await
             .map_err(|_| ToolError::Denied {
                 tool: tool.to_owned(),
             })?;
-        let selected =
-            response.pointer("/outcome/outcome").and_then(Value::as_str) == Some("selected");
-        let option = response
-            .pointer("/outcome/optionId")
-            .and_then(Value::as_str);
-        if selected && matches!(option, Some("allow_once" | "allow_always")) {
-            return Ok(());
+        match permission_resolution(&response, allow_always) {
+            PermissionResolution::Allowed => Ok(()),
+            PermissionResolution::Denied | PermissionResolution::Cancelled => {
+                Err(ToolError::Denied {
+                    tool: tool.to_owned(),
+                })
+            }
         }
-        Err(ToolError::Denied {
-            tool: tool.to_owned(),
-        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionResolution {
+    Allowed,
+    Denied,
+    Cancelled,
+}
+
+fn permission_resolution(response: &Value, allow_always: bool) -> PermissionResolution {
+    match (
+        response.pointer("/outcome/outcome").and_then(Value::as_str),
+        response
+            .pointer("/outcome/optionId")
+            .and_then(Value::as_str),
+    ) {
+        (Some("cancelled"), _) => PermissionResolution::Cancelled,
+        (Some("selected"), Some("allow_once")) => PermissionResolution::Allowed,
+        (Some("selected"), Some("allow_always")) if allow_always => PermissionResolution::Allowed,
+        _ => PermissionResolution::Denied,
     }
 }
 
@@ -82,6 +101,13 @@ fn permission_options(always: bool) -> Vec<Value> {
         "name": "Reject",
         "kind": "reject_once",
     }));
+    if always {
+        options.push(json!({
+            "optionId": "reject_always",
+            "name": "Always reject",
+            "kind": "reject_always",
+        }));
+    }
     options
 }
 
@@ -95,5 +121,73 @@ fn tool_kind(tool: &str) -> &'static str {
         "shell" | "execute" => "execute",
         "fetch" | "webfetch" => "fetch",
         _ => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn option_ids(always: bool) -> Vec<Value> {
+        permission_options(always)
+            .into_iter()
+            .map(|option| option["optionId"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn standing_permission_options_are_symmetric() {
+        assert_eq!(
+            option_ids(false),
+            vec![json!("allow_once"), json!("reject_once")],
+        );
+        assert_eq!(
+            option_ids(true),
+            vec![
+                json!("allow_once"),
+                json!("allow_always"),
+                json!("reject_once"),
+                json!("reject_always"),
+            ],
+        );
+    }
+
+    #[test]
+    fn permission_responses_fail_closed_and_recognize_cancellation() {
+        let selected =
+            |option: &str| json!({ "outcome": { "outcome": "selected", "optionId": option } });
+        assert_eq!(
+            permission_resolution(&selected("allow_once"), false),
+            PermissionResolution::Allowed
+        );
+        assert_eq!(
+            permission_resolution(&selected("allow_always"), true),
+            PermissionResolution::Allowed
+        );
+        assert_eq!(
+            permission_resolution(&selected("allow_always"), false),
+            PermissionResolution::Denied,
+            "a client cannot select an option that was not offered"
+        );
+        for option in ["reject_once", "reject_always", "unknown"] {
+            assert_eq!(
+                permission_resolution(&selected(option), true),
+                PermissionResolution::Denied
+            );
+        }
+        assert_eq!(
+            permission_resolution(&json!({ "outcome": { "outcome": "cancelled" } }), true),
+            PermissionResolution::Cancelled
+        );
+        for malformed in [
+            json!({}),
+            json!({ "outcome": null }),
+            json!({ "outcome": { "outcome": "selected" } }),
+        ] {
+            assert_eq!(
+                permission_resolution(&malformed, true),
+                PermissionResolution::Denied
+            );
+        }
     }
 }

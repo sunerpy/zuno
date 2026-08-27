@@ -6131,10 +6131,13 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "uuid",
+ "zuno-db",
  "zuno-engine",
  "zuno-error",
  "zuno-llm",
  "zuno-tool",
+ "zuno-tools",
+ "zuno-types",
 ]
 
 [[package]]
@@ -6237,6 +6240,7 @@ dependencies = [
  "which",
  "wiremock",
  "zip",
+ "zuno-acp",
  "zuno-agent",
  "zuno-auth",
  "zuno-catalog",

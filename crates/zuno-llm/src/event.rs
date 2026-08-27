@@ -6,6 +6,7 @@
 //! types: [`ContentBlock`] can retain reasoning that must never be replayed,
 //! while [`RequestContentBlock`] has no variant capable of carrying it.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::time::Duration;
 
@@ -174,6 +175,24 @@ impl ContentBlock {
 pub enum RequestContentBlock {
     /// User- or assistant-visible prose.
     Text { text: String },
+    /// A named external resource supplied by a client such as ACP.
+    ///
+    /// Providers that do not have a native resource-link block receive the stable
+    /// text projection returned by [`Self::provider_text`]. Keeping the typed fields
+    /// here lets durable storage and client replay preserve the original link instead
+    /// of reconstructing it from prose.
+    ResourceLink {
+        name: String,
+        uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+    },
     /// Thinking whose provider signature is preserved.
     SignedThinking { thinking: String, signature: String },
     /// A native encrypted reasoning item replayed as provider state.
@@ -206,6 +225,51 @@ pub enum RequestContentBlock {
         media_type: String,
         data: String,
     },
+}
+
+impl RequestContentBlock {
+    /// Text a provider receives for prose and resource links.
+    ///
+    /// The projection is stable and includes every model-visible resource field, so
+    /// replaying a stored link sends the same information as the original request.
+    #[must_use]
+    pub fn provider_text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::Text { text } => Some(Cow::Borrowed(text)),
+            Self::ResourceLink {
+                name,
+                uri,
+                title,
+                description,
+                media_type,
+                size,
+            } => {
+                let mut text = match title.as_deref() {
+                    Some(title) if title != name => {
+                        format!("Referenced resource `{title}` (name: `{name}`): {uri}")
+                    }
+                    _ => format!("Referenced resource `{name}`: {uri}"),
+                };
+                if let Some(description) = description {
+                    text.push_str("\nDescription: ");
+                    text.push_str(description);
+                }
+                if let Some(media_type) = media_type {
+                    text.push_str("\nMedia type: ");
+                    text.push_str(media_type);
+                }
+                if let Some(size) = size {
+                    text.push_str(&format!("\nSize: {size} bytes"));
+                }
+                Some(Cow::Owned(text))
+            }
+            Self::SignedThinking { .. }
+            | Self::ProviderEncryptedReasoning { .. }
+            | Self::ToolUse { .. }
+            | Self::ToolResult { .. }
+            | Self::Image { .. } => None,
+        }
+    }
 }
 
 /// A stored message whose content has not yet been filtered for replay.

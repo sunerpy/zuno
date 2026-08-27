@@ -450,7 +450,9 @@ fn event_json(event: TurnEvent) -> Value {
             written_paths,
             is_error,
         } => {
-            json!({"type":"tool_dispatch_completed","step":step,"callID":call_id,"name":name,"displayName":display_name,"title":title,"output":output,"diff":diff,"writtenPaths":written_paths,"isError":is_error})
+            let unified = diff.as_ref().and_then(|diff| diff.unified());
+            let files = diff.as_ref().map_or(&[][..], |diff| diff.files());
+            json!({"type":"tool_dispatch_completed","step":step,"callID":call_id,"name":name,"displayName":display_name,"title":title,"output":output,"diff":unified,"fileDiffs":files,"writtenPaths":written_paths,"isError":is_error})
         }
         TurnEvent::ToolResultAppended {
             step,

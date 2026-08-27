@@ -1086,7 +1086,10 @@ impl Transcript {
                     *rendered_name = display_name.clone();
                     *slot = Some(title.clone());
                     *body = Some(output.clone());
-                    *patch = diff.clone();
+                    *patch = diff
+                        .as_ref()
+                        .and_then(|diff| diff.unified())
+                        .map(str::to_owned);
                 }
             }),
             TurnEvent::TurnCompleted { .. } => {

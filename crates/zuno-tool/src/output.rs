@@ -51,6 +51,77 @@ pub const METADATA_OUTPUT_PATHS_KEY: &str = "outputPaths";
 /// itself reported cannot fall out of a list nobody remembered to update.
 pub const METADATA_WRITTEN_PATHS_KEY: &str = "writtenPaths";
 
+/// The metadata key carrying structured file pre/post images.
+///
+/// This is the durable source for client surfaces that can render native diffs. The
+/// existing `diff` metadata remains the compact unified patch for terminals and logs;
+/// keeping both lets each consumer use the representation it actually understands.
+pub const METADATA_FILE_DIFFS_KEY: &str = "fileDiffs";
+
+/// One text file modification produced by a tool call.
+///
+/// Paths are absolute at this boundary because ACP clients resolve edits outside the
+/// agent process. `old_text` is absent only for a newly-created file; deletion is an
+/// existing `old_text` with an empty `new_text`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileDiff {
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    old_text: Option<String>,
+    new_text: String,
+}
+
+impl FileDiff {
+    /// Creates a changed absolute file image.
+    ///
+    /// Returns `None` for a relative path or an existing file whose pre/post images
+    /// are identical. A new empty file remains a real change because `None` and `""`
+    /// describe different filesystem states.
+    #[must_use]
+    pub fn new(path: &std::path::Path, old_text: Option<String>, new_text: String) -> Option<Self> {
+        let diff = Self {
+            path: path.to_string_lossy().into_owned(),
+            old_text,
+            new_text,
+        };
+        diff.is_valid().then_some(diff)
+    }
+
+    /// Absolute modified path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Original text, absent for a newly-created file.
+    #[must_use]
+    pub fn old_text(&self) -> Option<&str> {
+        self.old_text.as_deref()
+    }
+
+    /// Text after the tool completed.
+    #[must_use]
+    pub fn new_text(&self) -> &str {
+        &self.new_text
+    }
+
+    fn is_valid(&self) -> bool {
+        std::path::Path::new(&self.path).is_absolute()
+            && self.old_text.as_deref() != Some(self.new_text.as_str())
+    }
+
+    fn into_value(self) -> Value {
+        let mut value = Map::new();
+        value.insert("path".to_owned(), Value::String(self.path));
+        if let Some(old_text) = self.old_text {
+            value.insert("oldText".to_owned(), Value::String(old_text));
+        }
+        value.insert("newText".to_owned(), Value::String(self.new_text));
+        Value::Object(value)
+    }
+}
+
 /// A file a tool produced alongside its text.
 ///
 /// The oracle types these as `Omit<FilePart, "id" | "sessionID" | "messageID">`
@@ -132,6 +203,38 @@ impl ToolOutput {
     pub fn with_attachment(mut self, attachment: Attachment) -> Self {
         self.attachments.push(attachment);
         self
+    }
+
+    /// Adds one structured file diff, chaining.
+    #[must_use]
+    pub fn with_file_diff(mut self, diff: FileDiff) -> Self {
+        let entry = diff.into_value();
+        match self.metadata.get_mut(METADATA_FILE_DIFFS_KEY) {
+            Some(Value::Array(diffs)) => diffs.push(entry),
+            Some(_) | None => {
+                self.metadata.insert(
+                    METADATA_FILE_DIFFS_KEY.to_owned(),
+                    Value::Array(vec![entry]),
+                );
+            }
+        }
+        self
+    }
+
+    /// Valid structured file diffs recorded on this result.
+    ///
+    /// Durable or extension-provided metadata is validated again here: malformed
+    /// entries and relative paths never cross into a client protocol projection.
+    #[must_use]
+    pub fn file_diffs(&self) -> Vec<FileDiff> {
+        self.metadata
+            .get(METADATA_FILE_DIFFS_KEY)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| serde_json::from_value::<FileDiff>(value.clone()).ok())
+            .filter(FileDiff::is_valid)
+            .collect()
     }
 
     /// Measures this output against `limits`.
@@ -476,6 +579,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_diffs_are_typed_validated_and_durable() {
+        let diff = FileDiff::new(
+            Path::new("/work/demo.rs"),
+            Some("old\n".to_owned()),
+            "new\n".to_owned(),
+        )
+        .expect("absolute changed file is valid");
+        let output = ToolOutput::text("edit", "ok").with_file_diff(diff.clone());
+
+        assert_eq!(output.file_diffs(), vec![diff.clone()]);
+        assert_eq!(
+            output.metadata[METADATA_FILE_DIFFS_KEY],
+            serde_json::json!([{
+                "path": "/work/demo.rs",
+                "oldText": "old\n",
+                "newText": "new\n",
+            }])
+        );
+
+        let restored = ToolOutput::text("edit", "ok").with_metadata(
+            METADATA_FILE_DIFFS_KEY,
+            serde_json::json!([
+                {"path": "relative.rs", "oldText": "old", "newText": "new"},
+                {"path": "/work/new.rs", "newText": "created"},
+            ]),
+        );
+        assert_eq!(restored.file_diffs().len(), 1);
+        assert_eq!(restored.file_diffs()[0].path(), "/work/new.rs");
+    }
     #[test]
     fn tool_output_round_trips() {
         let output = ToolOutput::text("read", "contents")

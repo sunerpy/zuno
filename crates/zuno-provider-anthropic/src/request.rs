@@ -96,12 +96,10 @@ fn split_system(
             continue;
         }
         for block in &message.content {
-            match block {
-                RequestContentBlock::Text { text } => system_text.push(text.as_str()),
-                _ => {
-                    return Err(ProviderError::fatal(RequestShapeError::NonTextSystemBlock));
-                }
-            }
+            let Some(text) = block.provider_text() else {
+                return Err(ProviderError::fatal(RequestShapeError::NonTextSystemBlock));
+            };
+            system_text.push(text.into_owned());
         }
     }
 
@@ -134,6 +132,12 @@ fn message_value(message: &Message) -> Result<Value, ProviderError> {
 fn content_value(block: &RequestContentBlock) -> Result<Value, ProviderError> {
     match block {
         RequestContentBlock::Text { text } => Ok(json!({ "type": "text", "text": text })),
+        RequestContentBlock::ResourceLink { .. } => {
+            let Some(text) = block.provider_text() else {
+                unreachable!("resource links always have a provider text projection")
+            };
+            Ok(json!({ "type": "text", "text": text.as_ref() }))
+        }
         RequestContentBlock::SignedThinking {
             thinking,
             signature,

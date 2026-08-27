@@ -809,6 +809,7 @@ pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
                     ),
                 },
                 RequestContentBlock::Text { text } => RequestContentBlock::Text { text },
+                link @ RequestContentBlock::ResourceLink { .. } => link,
                 RequestContentBlock::SignedThinking {
                     thinking,
                     signature,
@@ -1012,5 +1013,22 @@ mod tests {
                 text: "[Attached diagram.png (image/png)]".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn summary_safe_resource_links_keep_their_typed_metadata() {
+        let link = RequestContentBlock::ResourceLink {
+            name: "notes.md".to_owned(),
+            uri: "file:///workspace/notes.md".to_owned(),
+            title: Some("Design notes".to_owned()),
+            description: Some("ACP design context".to_owned()),
+            media_type: Some("text/markdown".to_owned()),
+            size: Some(42),
+        };
+        let message = Message::from_content(Role::User, vec![link.clone()]);
+
+        let safe = summary_safe_message_owned(message);
+
+        assert_eq!(safe.content, vec![link]);
     }
 }

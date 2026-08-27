@@ -80,7 +80,8 @@ pub use crate::context::{
     PermissionOrigin, ToolContext,
 };
 pub use crate::output::{
-    Attachment, LimitExceeded, OutputLimits, SizeMeasurement, SizeVerdict, ToolOutput,
+    Attachment, FileDiff, LimitExceeded, METADATA_FILE_DIFFS_KEY, OutputLimits, SizeMeasurement,
+    SizeVerdict, ToolOutput,
 };
 pub use crate::schema::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY};
 pub use crate::store::{StoredOutput, ToolOutputStore};

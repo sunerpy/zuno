@@ -1,3 +1,4 @@
+mod acp;
 mod agent;
 pub(crate) mod child_turn;
 mod completion;
@@ -53,6 +54,9 @@ impl CommandDispatcher for HeadlessCommandDispatcher<'_> {
         let command = request.command;
         let to_error = |error: String| DispatchError::command(command, error);
         match &request.args {
+            DispatchArguments::Acp(args) => {
+                acp::execute(args, &request.environment).map_err(to_error)
+            }
             DispatchArguments::Db(args) => db::execute(args).map_err(to_error),
             DispatchArguments::Session(args) => session::execute(args).map_err(to_error),
             DispatchArguments::Agent(args) => {

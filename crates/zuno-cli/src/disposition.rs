@@ -38,8 +38,8 @@ const COMMAND_DISPOSITIONS: [CommandDisposition; 23] = [
     CommandDisposition {
         upstream_symbol: "AcpCommand",
         command: "acp",
-        disposition: Disposition::NotRegistered,
-        reason: "todo 78 owns the zuno-acp protocol adapter; registering it before that handler exists would advertise a server that cannot speak ACP",
+        disposition: Disposition::Implemented,
+        reason: "the production stdio adapter serves stable ACP v1 through Zuno's durable session runtime",
     },
     CommandDisposition {
         upstream_symbol: "AgentCommand",

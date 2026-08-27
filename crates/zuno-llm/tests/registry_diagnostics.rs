@@ -70,6 +70,9 @@ impl Provider for Echo {
                 RequestContentBlock::Text { text } => {
                     Some(Ok(StreamEvent::TextDelta(text.clone())))
                 }
+                RequestContentBlock::ResourceLink { .. } => block
+                    .provider_text()
+                    .map(|text| Ok(StreamEvent::TextDelta(text.into_owned()))),
                 RequestContentBlock::SignedThinking { .. }
                 | RequestContentBlock::ProviderEncryptedReasoning { .. }
                 | RequestContentBlock::ToolUse { .. }

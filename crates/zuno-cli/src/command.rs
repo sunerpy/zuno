@@ -684,9 +684,19 @@ pub struct SelfUpdateArgs {
     pub yes: bool,
 }
 
+/// Serve Agent Client Protocol over stdin/stdout for editor integrations.
+#[derive(Debug, Clone, Args)]
+pub struct AcpArgs {
+    /// Validate that the production ACP adapter is available, then exit.
+    #[arg(long)]
+    pub check: bool,
+}
+
 /// Every command intentionally registered by this skeleton.
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
+    /// Serve Agent Client Protocol over stdin/stdout.
+    Acp(AcpArgs),
     /// Run Zuno with a message.
     Run(RunArgs),
     /// Start the interactive terminal application. Also the default with no command.
@@ -741,6 +751,7 @@ pub enum Command {
 impl Command {
     fn action(self, environment: StartupEnvironment) -> Action {
         match self {
+            Self::Acp(args) => dispatch(DispatchArguments::Acp(args), environment),
             Self::Run(args) => dispatch(DispatchArguments::Run(args), environment),
             Self::Tui(args) => dispatch(DispatchArguments::Tui(args), environment),
             Self::Serve(args) => dispatch(DispatchArguments::Serve(args), environment),
@@ -789,6 +800,8 @@ fn reject(command: &'static str, environment: StartupEnvironment) -> Action {
 /// Commands whose syntax is registered and whose behavior has a named owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImplementedCommand {
+    /// `acp`.
+    Acp,
     /// `run`.
     Run,
     /// `tui`, and the bare invocation upstream registers as `$0`.
@@ -826,6 +839,7 @@ impl ImplementedCommand {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Acp => "acp",
             Self::Run => "run",
             Self::Tui => "tui",
             Self::Serve => "serve",
@@ -847,6 +861,7 @@ impl ImplementedCommand {
 
 #[derive(Debug, Clone)]
 pub enum DispatchArguments {
+    Acp(AcpArgs),
     Run(RunArgs),
     Tui(TuiArgs),
     Serve(ServeArgs),
@@ -868,6 +883,7 @@ impl DispatchArguments {
     #[must_use]
     pub const fn command(&self) -> ImplementedCommand {
         match self {
+            Self::Acp(_) => ImplementedCommand::Acp,
             Self::Run(_) => ImplementedCommand::Run,
             Self::Tui(_) => ImplementedCommand::Tui,
             Self::Serve(_) => ImplementedCommand::Serve,
@@ -917,7 +933,7 @@ impl DispatchArguments {
             | Self::SelfUpdate(_)
             | Self::Export(_)
             | Self::Import(_) => true,
-            Self::Tui(_) | Self::Serve(_) => false,
+            Self::Acp(_) | Self::Tui(_) | Self::Serve(_) => false,
         }
     }
 
@@ -939,7 +955,7 @@ impl DispatchArguments {
     #[must_use]
     pub const fn deserves_a_memory_sampler(&self) -> bool {
         match self {
-            Self::Tui(_) | Self::Serve(_) => true,
+            Self::Acp(_) | Self::Tui(_) | Self::Serve(_) => true,
             Self::Run(_)
             | Self::Session(_)
             | Self::Agent(_)

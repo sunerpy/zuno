@@ -1664,7 +1664,7 @@ fn views_transcript_finds_the_patch_of_a_mutation_whose_output_is_a_sentence() {
         title: String::from("src/main.rs"),
         // Exactly what `edit` really returns, and deliberately not a patch.
         output: String::from("Edit applied successfully."),
-        diff: Some(String::from(patch)),
+        diff: zuno_engine::r#loop::ToolDiff::new(Some(String::from(patch)), Vec::new()),
         written_paths: Vec::new(),
         is_error: false,
     }));
@@ -2317,7 +2317,9 @@ fn tool_call_shown(
         // is what a real provider sends and what used to be all the row said.
         title: String::from("Ran a tool"),
         output: output.to_owned(),
-        diff: diff.map(str::to_owned),
+        diff: diff.and_then(|patch| {
+            zuno_engine::r#loop::ToolDiff::new(Some(patch.to_owned()), Vec::new())
+        }),
         written_paths: Vec::new(),
         is_error: false,
     }));
@@ -2847,7 +2849,10 @@ fn views_a_diff_bearing_result_uses_the_diff_palette_not_the_muted_output_style(
         name: String::from("edit"),
         title: String::from("Edit"),
         output: String::from("applied 1 change"),
-        diff: Some(String::from("@@ -1,2 +1,2 @@\n-old\n+new\n")),
+        diff: zuno_engine::r#loop::ToolDiff::new(
+            Some(String::from("@@ -1,2 +1,2 @@\n-old\n+new\n")),
+            Vec::new(),
+        ),
         written_paths: Vec::new(),
         is_error: false,
     }));
@@ -3089,9 +3094,12 @@ fn views_a_tool_call_survives_the_smallest_supported_frame() {
         name: String::from("edit"),
         title: String::from("Edit"),
         output: String::from("applied"),
-        diff: Some(String::from(
-            "@@ -1,4 +1,4 @@\n context\n-removed line\n+added line\n more context\n",
-        )),
+        diff: zuno_engine::r#loop::ToolDiff::new(
+            Some(String::from(
+                "@@ -1,4 +1,4 @@\n context\n-removed line\n+added line\n more context\n",
+            )),
+            Vec::new(),
+        ),
         written_paths: Vec::new(),
         is_error: false,
     }));
@@ -3200,7 +3208,7 @@ fn realistic() -> TranscriptView {
             name: String::from("edit"),
             title: String::from("Edit session.rs"),
             output: String::from("applied 1 change"),
-            diff: Some(String::from(patch)),
+            diff: zuno_engine::r#loop::ToolDiff::new(Some(String::from(patch)), Vec::new()),
             written_paths: vec![String::from("crates/zuno-tui/src/views/session.rs")],
             is_error: false,
         },
