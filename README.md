@@ -252,7 +252,8 @@ durable events, the inbox, and projections. See the
 | [Plugins](./docs/plugins.md)                                | Installation, agents/workflows, WASI/process grants, and protocols       |
 | [Harness comparison](./docs/design/harness-comparison.md)   | Decisions from DSH, Codex, OMO, pi-agent, OpenCode, and Claw Code        |
 | [Client interfaces](./docs/design/client-interfaces.md)     | Shared events and projections for TUI, ACP, HTTP, and a future GUI       |
-| [Zed ACP integration](./docs/design/zed-acp-integration.md) | Stable pins, Zed setup, HITL, diffs, replay, and acceptance tests        |
+| [Use Zuno in Zed](./docs/reference/zed-acp.md)              | Cross-platform ACP setup, Agent selection, permissions, and diagnostics  |
+| [Zed ACP integration](./docs/design/zed-acp-integration.md) | Stable pins, protocol surface, HITL, diffs, replay, and acceptance tests |
 | [Memory learning](./docs/design/memory-learning.md)         | Auditable candidates, reflection, review, promotion, and undo            |
 | [Operational logging](./docs/logging.md)                    | Multi-process store, filters, redaction, retention, and plaintext debug  |
 | [Database lifecycle](./docs/migration.md)                   | Zuno database selection and schema changes                               |

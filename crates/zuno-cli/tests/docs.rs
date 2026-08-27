@@ -138,6 +138,35 @@ fn portable_bundle_and_attachment_guides_document_the_public_contracts() {
 }
 
 #[test]
+fn zed_acp_guide_documents_cross_platform_setup_and_agent_selection() {
+    contains_all(
+        "docs/reference/zed-acp.md",
+        &[
+            "zuno acp --check",
+            "agent_servers",
+            r#""args": ["acp"]"#,
+            "command -v zuno",
+            "Get-Command zuno",
+            r#""C:\\Users\\you\\.local\\bin\\zuno.exe""#,
+            "ZUNO_CONFIG_DIR",
+            "Agent",
+            "`deep`",
+            "dev: open acp logs",
+            "stdout",
+            "cargo test -p zuno-cli --test acp_stdio",
+            "https://zed.dev/docs/ai/external-agents",
+        ],
+    );
+    for relative in ["README.md", "docs/readme/README.zh-CN.md", "docs/README.md"] {
+        contains_all(relative, &["reference/zed-acp.md"]);
+    }
+    contains_all(
+        "docs/design/zed-acp-integration.md",
+        &["../reference/zed-acp.md"],
+    );
+}
+
+#[test]
 fn plugin_guide_documents_capabilities_protocols_and_examples() {
     contains_all(
         "docs/plugins.md",

@@ -124,35 +124,15 @@ lossy prose in place of the original URI metadata.
 
 ## Zed setup and verification
 
-First verify the installed binary and production handler:
+The canonical operator guide is
+[Use Zuno in Zed through ACP](../reference/zed-acp.md). It contains the current
+Zed `agent_servers` entry, Linux/macOS/Windows executable discovery, Zuno
+configuration overlays, `deep` and other Agent selection, permission ownership,
+logging, troubleshooting, and a copyable acceptance sequence.
 
-```sh
-command -v zuno
-zuno acp --check
-```
-
-The check must print the production protocol and schema versions. Then use
-Zed's Agent Settings, open the External Agents page, choose **Add Agent** and
-**Add Custom Agent**, and configure:
-
-```json
-{
-  "agent_servers": {
-    "Zuno": {
-      "type": "custom",
-      "command": "zuno",
-      "args": ["acp"],
-      "env": {}
-    }
-  }
-}
-```
-
-If Zed does not inherit the same `PATH`, use an absolute executable path. On
-this Linux installation that path is `/config/.local/bin/zuno`; Windows should
-point to `zuno.exe`, and macOS should point to the installed native binary.
-Provider keys, OAuth state, model selection, agents, skills, extensions,
-permissions, and MCP configuration remain Zuno-owned rather than Zed-owned.
+This design document remains the protocol and architecture authority. Provider
+keys, OAuth state, model routing, Agents, Skills, extensions, permissions, and
+MCP configuration remain Zuno-owned rather than Zed-owned.
 
 Run this acceptance sequence from a Zed External Agent thread:
 
