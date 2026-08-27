@@ -2614,6 +2614,14 @@ async fn api_agent_roster_is_the_resolved_native_set() {
     assert_eq!(build["mode"], "primary");
     assert_eq!(build["hidden"], false);
     assert!(build["request"]["headers"].is_object());
+    let deep = agents
+        .iter()
+        .find(|entry| entry["id"] == "deep")
+        .expect("deep is present");
+    assert_eq!(
+        deep["mode"], "all",
+        "deep must be both directly selectable and delegable"
+    );
     let plan = agents
         .iter()
         .find(|entry| entry["id"] == "plan")

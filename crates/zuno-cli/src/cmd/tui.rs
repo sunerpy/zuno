@@ -1722,18 +1722,7 @@ async fn session_catalog(
     // filter is what stops them disagreeing about what "the agents" are. A subagent is
     // reachable only by delegation and `hidden` is its author asking not to be offered, so
     // neither is a valid choice for the session's own agent.
-    let agents = plan
-        .agents()
-        .iter()
-        .filter(|agent| {
-            !matches!(agent.mode, zuno_catalog::agent::AgentMode::Subagent)
-                && agent.hidden != Some(true)
-        })
-        .map(|agent| zuno_tui::views::picker::AgentEntry {
-            name: agent.name.clone(),
-            description: agent.description.clone().unwrap_or_default(),
-        })
-        .collect();
+    let agents = selectable_session_agents(plan.agents());
     zuno_tui::views::session::SessionCatalog {
         models,
         agents,
@@ -1755,6 +1744,22 @@ async fn session_catalog(
         reasoning_efforts,
         effort: plan.effort(),
     }
+}
+
+fn selectable_session_agents(
+    agents: &[zuno_catalog::agent::Agent],
+) -> Vec<zuno_tui::views::picker::AgentEntry> {
+    agents
+        .iter()
+        .filter(|agent| {
+            !matches!(agent.mode, zuno_catalog::agent::AgentMode::Subagent)
+                && agent.hidden != Some(true)
+        })
+        .map(|agent| zuno_tui::views::picker::AgentEntry {
+            name: agent.name.clone(),
+            description: agent.description.clone().unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn session_entries(host: &TurnHost) -> Result<Vec<zuno_tui::views::picker::SessionEntry>, String> {
@@ -3703,6 +3708,18 @@ mod tests {
     use zuno_tui::keybind::{Chord, Resolution};
 
     use super::*;
+
+    #[test]
+    fn primary_agent_selector_includes_deep_and_excludes_subagent_only_roles() {
+        let agents =
+            zuno_catalog::agent::resolve(&zuno_config::schema::ordered::OrderedMap::new(), &[]);
+        let names = selectable_session_agents(&agents)
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["orchestrator", "build", "plan", "deep"]);
+    }
 
     #[test]
     fn durable_child_sessions_are_restored_before_navigation() {

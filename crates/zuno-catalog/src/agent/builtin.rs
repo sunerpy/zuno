@@ -184,10 +184,10 @@ fn deep() -> Builtin {
     Builtin {
         name: "deep",
         description: Some(
-            "Handles ambiguous or cross-cutting work that needs sustained investigation, \
-             implementation, and verification in one bounded child session.",
+            "Runs difficult debugging and cross-cutting implementation either as the selected \
+             session Agent or as one bounded delegated objective, without spawning children.",
         ),
-        mode: AgentMode::Subagent,
+        mode: AgentMode::All,
         hidden: false,
         temperature: Some(0.1),
         prompt: Some(PROMPT_DEEP),
@@ -336,10 +336,11 @@ fn council_synth() -> Builtin {
 impl Builtin {
     /// Native permission overlay merged after the common defaults.
     ///
-    /// Every subagent is deny-by-default. The primary `orchestrator` inherits the
-    /// common tool set and may delegate; direct `build` explicitly denies delegation.
-    /// `plan` may inspect and write only its plan document; the path-specific edit
-    /// grants are added by the CLI composition root.
+    /// Every delegable Agent is deny-by-default. The primary `orchestrator`
+    /// inherits the common tool set and may delegate; direct `build` explicitly
+    /// denies delegation. `deep` is directly selectable and delegable but still has
+    /// no child tools. `plan` may inspect and write only its plan document; the
+    /// path-specific edit grants are added by the CLI composition root.
     #[must_use]
     pub fn permission_overlay(&self) -> Option<PermissionConfig> {
         let rules: Vec<(&str, PermissionRule)> = match self.name {
@@ -379,7 +380,25 @@ impl Builtin {
                 ("todo_update", allow()),
                 ("skill", allow()),
             ],
-            "deep" | "general" => vec![
+            "deep" => vec![
+                ("*", deny()),
+                ("read", allow()),
+                ("glob", allow()),
+                ("grep", allow()),
+                ("lsp", allow()),
+                ("edit", allow()),
+                ("shell", allow()),
+                ("webfetch", allow()),
+                ("web_search", allow()),
+                ("plan_get", allow()),
+                ("plan_update", allow()),
+                ("todo_get", allow()),
+                ("todo_update", allow()),
+                ("skill", allow()),
+                ("execute", allow()),
+                ("question", allow()),
+            ],
+            "general" => vec![
                 ("*", deny()),
                 ("read", allow()),
                 ("glob", allow()),
@@ -517,10 +536,10 @@ mod tests {
     }
 
     #[test]
-    fn subagents_are_deny_by_default_and_cannot_delegate() {
+    fn delegable_agents_are_deny_by_default_and_cannot_delegate() {
         for builtin in all()
             .into_iter()
-            .filter(|builtin| builtin.mode == AgentMode::Subagent)
+            .filter(|builtin| matches!(builtin.mode, AgentMode::Subagent | AgentMode::All))
         {
             let overlay = builtin.permission_overlay().expect("overlay").rules;
             let first = overlay.iter().next().expect("at least wildcard deny");
@@ -625,7 +644,16 @@ mod tests {
         );
         assert_eq!(get("build").expect("build").mode, AgentMode::Primary);
         assert_eq!(get("plan").expect("plan").mode, AgentMode::Primary);
-        assert_eq!(get("deep").expect("deep").mode, AgentMode::Subagent);
+        assert_eq!(get("deep").expect("deep").mode, AgentMode::All);
+        assert_eq!(
+            get("deep")
+                .expect("deep")
+                .permission_overlay()
+                .expect("deep permissions")
+                .rules
+                .get("question"),
+            Some(&PermissionRule::Action(PermissionAction::Allow))
+        );
     }
 
     #[test]
@@ -667,12 +695,12 @@ mod tests {
             (
                 "deep",
                 PROMPT_DEEP,
-                275,
+                350,
                 [
                     "without delegating",
-                    "owning abstraction",
-                    "interruption and recovery",
-                    "`write` only for new files",
+                    "Reproduce the failure",
+                    "Rank competing hypotheses",
+                    "causal chain",
                 ],
             ),
         ];

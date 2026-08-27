@@ -60,13 +60,20 @@ typed runtime decisions.
 | `orchestrator` | Own the outcome, partition work, integrate results, and verify completion | May delegate |
 | `build` | Direct end-to-end implementation in one lane | No child tools |
 | `plan` | Read-only research and implementation-ready planning | No child tools |
-| `deep` | Difficult cross-cutting implementation | No recursive delegation |
+| `deep` | Direct deep-work mode or delegated root-cause and cross-cutting implementation | No recursive delegation |
 | `fixer` | Focused local change and regression scope | No recursive delegation |
 | `general` | Bounded work without a narrower specialist | No recursive delegation |
 | `explorer` | Read-only repository and call-chain research | No recursive delegation |
 | `librarian` | Current external documentation and upstream research | No recursive delegation |
 | `oracle` | Read-only architecture and root-cause review | No recursive delegation |
 | `looker` | Visual artifact inspection | No recursive delegation |
+
+`deep` has mode `all`: `/agent`, the TUI cycling keys, ACP configuration, and
+headless Agent selection may choose it as the session Agent, while `orchestrator`
+may still target it through `task`. Direct selection does not grant recursive
+delegation; the same frozen profile withholds `task` and exposes the work-capable
+inspection, edit, Shell, Skill/MCP, external-research, question, and progress
+tools.
 
 `explorer` is deliberately native-read-only, not shell-read-only. Its default tool
 surface contains `read`, `glob`, `grep`, and read-only `lsp`, and denies `shell`, edits,

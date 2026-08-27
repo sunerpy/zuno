@@ -1014,7 +1014,7 @@ mod tests {
         assert_eq!(headers[0], "build (primary)");
         assert!(headers.contains(&"orchestrator (primary)".to_owned()));
         assert!(headers.contains(&"build (primary)".to_owned()));
-        assert!(headers.contains(&"deep (subagent)".to_owned()));
+        assert!(headers.contains(&"deep (all)".to_owned()));
     }
 
     #[test]

@@ -46,8 +46,9 @@ The delivery Agents apply the following policy:
    an unfinished checklist as a reason to manufacture another turn.
 
 `orchestrator` remains responsible for integration and may delegate bounded lanes. `build`
-owns a direct lane without delegation. `deep` owns one difficult cross-cutting lane without
-recursive delegation. All three share the same execution-plan semantics.
+owns a direct lane without delegation. `deep` can own one difficult cross-cutting lane as
+the selected session Agent or as a delegated target, always without recursive delegation.
+All three share the same execution-plan semantics.
 
 ## Snapshot invariants
 

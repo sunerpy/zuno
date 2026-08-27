@@ -1,13 +1,13 @@
-//! The native execution roster: two primary modes, seven specialists, and internals.
+//! The native execution roster: primary modes, seven specialists, and internals.
 //!
 //! # Why this roster is bounded on purpose
 //!
 //! A delegation surface fails in two directions. Too few agents and every task
 //! funnels through one context window; too many and the orchestrator spends its turn
 //! choosing a lane instead of doing work. The primary modes are deliberately distinct:
-//! [`ORCHESTRATOR`] owns decomposition and integration, while [`BUILD`] is one direct
-//! execution lane with delegation removed by capability. Specialists then separate
-//! cross-cutting implementation ([`DEEP`]), a known local change ([`FIXER`]), bounded
+//! [`ORCHESTRATOR`] owns decomposition and integration, [`BUILD`] is one direct
+//! execution lane, and [`DEEP`] is a directly selectable or delegable lane for difficult
+//! root-cause work. Specialists then separate a known local change ([`FIXER`]), bounded
 //! miscellaneous execution ([`GENERAL`]), local evidence, external evidence,
 //! architecture/review, and visual inspection.
 //!
@@ -510,15 +510,15 @@ pub const BUILD: Agent = Agent {
     gate: Gate::Always,
 };
 
-/// Thorough cross-cutting implementation without recursive delegation.
+/// Thorough cross-cutting implementation, directly selectable or delegable.
 pub const DEEP: Agent = Agent {
     name: "deep",
     role: Role::Subagent,
-    mode: AgentMode::Subagent,
+    mode: AgentMode::All,
     hidden: false,
-    description: "Owns one difficult cross-cutting objective from evidence gathering through \
-                  implementation and verification. Uses a larger investigation budget than a \
-                  bounded fixer but cannot spawn children.",
+    description: "Owns one difficult debugging or cross-cutting objective from evidence \
+                  gathering through implementation and real-surface verification. It may be \
+                  selected directly or delegated, but cannot spawn children.",
     boundary: Boundary::DontDelegateWhen(
         "the change is already well specified and local enough for `fixer` • the caller needs \
          only repository locations or external research • the task still needs product \
@@ -527,7 +527,7 @@ pub const DEEP: Agent = Agent {
     temperature: 0.1,
     output: OutputContract::Natural,
     permissions: Permissions {
-        denied: &["task", "question", "plan_exit"],
+        denied: &["task", "plan_exit"],
         allowed: &[
             "read",
             "glob",
@@ -543,6 +543,7 @@ pub const DEEP: Agent = Agent {
             "todo_update",
             "skill",
             "execute",
+            "question",
         ],
         extension_tools: ExtensionTools::Inherit,
     },
@@ -913,9 +914,10 @@ pub fn get(name: &str, vision_available: bool) -> Option<Agent> {
 
 /// Valid `task` targets: everything a caller may actually name.
 ///
-/// The `task` tool rejects a `subagent_type` outside this set. Neither primary mode
-/// appears here: the orchestrator cannot target itself, and direct build mode has no
-/// children by construction.
+/// The `task` tool rejects a `subagent_type` outside this set. Primary-only modes do
+/// not appear here: the orchestrator cannot target itself, and direct build mode has
+/// no children by construction. `deep` remains here because its catalog mode is
+/// `all` and its runtime role is still [`Role::Subagent`].
 #[must_use]
 pub fn delegable(vision_available: bool) -> Vec<Agent> {
     roster(vision_available)

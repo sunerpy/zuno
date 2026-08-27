@@ -92,6 +92,13 @@ replay, input admission, goal state, and lifecycle remain typed runtime policy.
 The TUI similarly distinguishes live steering from queued follow-up work and
 projects human waits as approval or answer states.
 
+The directly selectable `deep` mode also adapts the outcome-oriented discipline
+in Codex's base instructions at `openai/codex@e9a446d`: inspect before guessing,
+fix root causes with focused changes, continue until the requested outcome is
+real, and validate from narrow checks toward the user-facing surface. Zuno keeps
+those principles in a concise role prompt; sandbox, approval, durability, and
+completion remain runtime contracts.
+
 Codex's memory writer separates rollout extraction from workspace consolidation.
 Zuno adapts the learning goal but keeps a narrower mutation boundary: durable
 delivered-turn admission selects an isolated reviewer, the reviewer receives the
@@ -103,6 +110,14 @@ instead of allowing a model to rewrite a memory directory directly.
 ### oh-my-openagent
 
 oh-my-openagent contributes a useful orchestration lesson: a bounded roster is easier for a primary agent to route than a large collection of overlapping personas. Each Zuno specialist therefore carries both a responsibility and a negative delegation boundary. `orchestrator` is the only recursive coordinator; `build` is a direct no-child mode, while `deep`, `fixer`, and `general` can implement but cannot fan out.
+
+OMO's Hephaestus prompt at `sunerpy/oh-my-openagent@44c95e9` is the closest
+reference for direct deep work. Zuno adapts its useful investigation loop:
+establish or reproduce the behavior, test competing hypotheses, inspect one more
+dependency when the first answer is suspiciously shallow, prefer the owning
+root fix, and verify through the real surface. Zuno does not copy Hephaestus's
+identity, model gating, mandatory fan-out, or model-specific prompt variants;
+`deep` remains provider-neutral and cannot create children.
 
 Zuno keeps agent identity, permissions, delegation boundaries, and prompt policy as data so validation and rendered prompts cannot drift apart. It adapts OMO's explicit positive and negative role boundaries, but rejects unconsumed XML reply envelopes: user-facing agents return concise natural Markdown, while structured output is reserved for typed runtime consumers.
 

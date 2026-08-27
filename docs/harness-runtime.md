@@ -47,8 +47,10 @@ same value is available to future server, ACP, and GUI surfaces.
 Agent prompts define role ownership, not a second copy of the runtime manual.
 `build` owns delivery and requirement-by-requirement completion evidence; `plan`
 owns repository-grounded implementation decisions without product mutation; and
-`deep` owns one cross-cutting implementation without recursive delegation. Each
-specialist states both its positive responsibility and its delegation boundary.
+`deep` owns difficult root-cause and cross-cutting work without recursive
+delegation. `deep` may be selected for the session directly or used as one
+bounded `task` target. Each specialist states both its positive responsibility
+and its delegation boundary.
 
 The primary prompt requires authoritative evidence before mutation, forbids
 duplicate delegated discovery, and treats interruption, restart, and uncertain
@@ -162,7 +164,7 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 | `orchestrator` | Default multi-agent delivery owner and the only native agent that may delegate. |
 | `build` | Direct end-to-end implementation in one lane, with all subagent tools withheld. |
 | `plan` | Read-only repository research and implementation-ready planning. |
-| `deep` | Difficult cross-cutting implementation without recursive delegation. |
+| `deep` | Directly selectable or delegable deep debugging and cross-cutting implementation, without recursive delegation. |
 | `fixer` | Focused local implementation with minimal change and regression scope. |
 | `general` | Bounded miscellaneous execution when no narrower specialist owns the work. |
 | `explorer` | Read-only repository structure, definition, caller, and impact discovery. |

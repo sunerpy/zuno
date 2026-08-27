@@ -355,7 +355,11 @@ fn every_delegable_agent_has_a_real_catalog_definition() {
                 agent.name
             )
         });
-        assert_eq!(catalog.mode, AgentMode::Subagent, "{}", agent.name);
+        assert!(
+            matches!(catalog.mode, AgentMode::Subagent | AgentMode::All),
+            "{} must remain selectable as a task target",
+            agent.name
+        );
         assert!(
             catalog
                 .prompt
@@ -368,11 +372,20 @@ fn every_delegable_agent_has_a_real_catalog_definition() {
 
 #[test]
 fn deep_owns_cross_cutting_implementation_without_children() {
+    assert_eq!(DEEP.mode, AgentMode::All);
+    assert_eq!(DEEP.role, Role::Subagent);
     assert_eq!(DEEP.write, Write::Capable);
     assert_eq!(DEEP.research, Research::Allowed);
     assert_eq!(DEEP.delegation, Delegation::NoChildren);
     assert!(is_tool_hidden("task", &DEEP.rules()));
-    for capability in ["edit", "shell", "web_search", "plan_update", "todo_update"] {
+    for capability in [
+        "edit",
+        "shell",
+        "web_search",
+        "plan_update",
+        "todo_update",
+        "question",
+    ] {
         assert!(
             !is_tool_hidden(capability, &DEEP.rules()),
             "deep needs `{capability}`"

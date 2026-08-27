@@ -283,7 +283,7 @@ arbitrary executable graphs.
 | `orchestrator` | primary, default | decompose, admit, track, integrate, and verify multi-agent work | approved subagents and workflows |
 | `build` | primary | direct end-to-end implementation when the user wants one execution lane | none |
 | `plan` | primary, read-only | investigate, clarify, and produce durable Goal/Plan/Todo state | read-only profiles only |
-| `deep` | subagent | broad, cross-cutting implementation requiring sustained investigation | none |
+| `deep` | all | directly selected or delegated root-cause and cross-cutting implementation requiring sustained investigation | none |
 | `fixer` | subagent | bounded local code change with focused verification | none |
 | `general` | subagent | bounded miscellaneous work under an explicit capability envelope | none |
 | `explorer` | subagent, read-only | repository and CodeGraph evidence | none |
