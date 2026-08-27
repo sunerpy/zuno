@@ -1,9 +1,11 @@
+mod support;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zuno_pty::{BackgroundExecutionId, BackgroundExecutionService, BackgroundExecutionStatus};
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
-use zuno_tools::shell::{ShellParams, ShellTool};
+use zuno_tools::shell::ShellParams;
 use zuno_tools::timeout::{MAX_FOREGROUND_TIMEOUT_MS, normalize_foreground_timeout};
 
 fn context() -> ToolContext {
@@ -51,9 +53,8 @@ async fn timeout_policy_promotes_a_live_process_to_a_reachable_background_task()
         pid_file.display(),
         marker.display()
     );
-    let tool = ShellTool::new(workspace.path())
-        .expect("shell tool")
-        .with_background_executions(service.clone());
+    let tool =
+        support::sandbox::shell_tool(workspace.path()).with_background_executions(service.clone());
 
     let output = tool
         .run(params(command, Some(40)), context())
@@ -102,8 +103,7 @@ async fn timeout_policy_hard_ceiling_still_terminates_the_process_group() {
     );
     let pid_file = workspace.path().join("ceiling.pid");
     let command = format!("printf '%s' \"$$\" > '{}'; sleep 30", pid_file.display());
-    let tool = ShellTool::new(workspace.path())
-        .expect("shell tool")
+    let tool = support::sandbox::shell_tool(workspace.path())
         .with_background_executions(service.clone())
         .with_hard_ceiling(Duration::from_millis(120));
     let started = Instant::now();
@@ -141,9 +141,8 @@ async fn completed_foreground_commands_leave_no_background_records_or_files() {
     let service = Arc::new(
         BackgroundExecutionService::open(background_dir.path()).expect("background service"),
     );
-    let tool = ShellTool::new(workspace.path())
-        .expect("shell tool")
-        .with_background_executions(service.clone());
+    let tool =
+        support::sandbox::shell_tool(workspace.path()).with_background_executions(service.clone());
 
     let output = tool
         .run(params("printf foreground", Some(1_000)), context())

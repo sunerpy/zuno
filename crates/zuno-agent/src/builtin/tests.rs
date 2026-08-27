@@ -387,13 +387,13 @@ fn fixer_is_a_focused_writer_and_general_is_the_bounded_fallback() {
     assert_eq!(FIXER.delegation, Delegation::NoChildren);
 
     let fixer = FIXER.rules();
-    for allowed in ["read", "grep", "glob", "lsp", "edit", "shell"] {
+    for allowed in ["read", "grep", "glob", "lsp", "edit", "shell", "skill"] {
         assert!(
             !is_tool_hidden(allowed, &fixer),
             "the fixer needs `{allowed}` to inspect, edit, and verify"
         );
     }
-    for forbidden in ["task", "webfetch", "web_search", "skill", "execute"] {
+    for forbidden in ["task", "webfetch", "web_search", "execute"] {
         assert!(
             is_tool_hidden(forbidden, &fixer),
             "fixer sees `{forbidden}`"
@@ -421,19 +421,35 @@ fn fixer_is_a_focused_writer_and_general_is_the_bounded_fallback() {
 }
 
 #[test]
-fn read_only_agents_cannot_reach_a_writing_or_delegating_tool() {
+fn read_only_agents_get_shell_without_write_or_delegation_authority() {
     for agent in roster(true) {
-        if agent.write != Write::ReadOnly {
+        if agent.write != Write::ReadOnly || agent.role == Role::Internal {
             continue;
         }
         let rules = agent.rules();
-        for forbidden in ["edit", "write", "apply_patch", "shell", "task", "execute"] {
+        assert!(
+            !is_tool_hidden("shell", &rules),
+            "{}: the OS sandbox makes Shell read-only for this Agent",
+            agent.name
+        );
+        for forbidden in ["edit", "write", "apply_patch", "task", "execute"] {
             assert!(
                 is_tool_hidden(forbidden, &rules),
                 "{}: read-only agents must not see `{forbidden}`",
                 agent.name
             );
         }
+    }
+}
+
+#[test]
+fn every_delegable_agent_can_load_skills() {
+    for agent in delegable(true) {
+        assert!(
+            !is_tool_hidden("skill", &agent.rules()),
+            "{} must be able to load an explicitly available Skill",
+            agent.name
+        );
     }
 }
 
@@ -538,10 +554,10 @@ fn the_allows_survive_the_catch_all_deny() {
 }
 
 #[test]
-fn work_capable_primary_agents_inherit_extension_tools() {
+fn work_capable_agents_inherit_extension_tools_from_the_parent_authority() {
     let mcp = ["playwright_navigate", "github_create_issue"];
 
-    for primary in [ORCHESTRATOR, BUILD] {
+    for primary in [ORCHESTRATOR, BUILD, DEEP, GENERAL] {
         let rules = primary.rules_with_extension_tools(&mcp);
         for tool in mcp {
             assert!(
@@ -558,7 +574,7 @@ fn work_capable_primary_agents_inherit_extension_tools() {
 
     for agent in roster(true) {
         if agent.permissions.extension_tools == ExtensionTools::Inherit {
-            assert!(["orchestrator", "build"].contains(&agent.name));
+            assert!(["orchestrator", "build", "deep", "general"].contains(&agent.name));
             continue;
         }
         let rules = agent.rules_with_extension_tools(&mcp);

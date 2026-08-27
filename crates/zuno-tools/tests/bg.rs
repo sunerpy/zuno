@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
+mod support;
+
 use serde_json::json;
-use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 use zuno_pty::{
@@ -24,10 +24,7 @@ fn context(session_id: &str) -> ToolContext {
 
 fn input(directory: &std::path::Path, session_id: &str, command: &str) -> BackgroundExecutionInput {
     BackgroundExecutionInput {
-        program: OsString::from("/bin/sh"),
-        arguments: vec![OsString::from("-c"), OsString::from(command)],
-        cwd: directory.to_owned(),
-        environment: std::env::vars_os().collect::<BTreeMap<_, _>>(),
+        prepared: support::sandbox::direct_prepared(directory, command),
         session_id: session_id.to_owned(),
         title: command.to_owned(),
         command: command.to_owned(),

@@ -50,6 +50,18 @@ owner is part of the contract. On Linux those guards block on signals and use
 `PR_SET_PDEATHSIG`; other Unix platforms use a bounded parent-liveness fallback,
 and Windows retains Job Object containment.
 
+Shell has an additional security layer before this lifecycle ownership begins.
+`zuno-sandbox` compiles raw argv plus immutable authority into
+`PreparedCommand`; `zuno-pty` accepts only that prepared value. In `read-only`
+and `workspace-write` on Linux, the prepared launch enters bubblewrap and a
+first-party seccomp helper before the requested interpreter executes. In
+explicit `danger-full-access`, the native backend preserves the requested
+program and arguments while still attaching durable authority and using the same
+process-tree lifecycle. Process containment therefore owns cancellation,
+timeouts, output, and restart reconciliation in every mode. The OS sandbox owns
+filesystem, network, capability, and syscall authority only in confined modes;
+the native backend does not pretend to provide that boundary.
+
 The prior `guard -> monitor -> payload` resident topology was rejected because
 the second Zuno process added memory and idle wakeups without adding a distinct
 ownership boundary. The foreground-editor path remains separate because it must

@@ -293,6 +293,95 @@ fn web_search_accepts_an_explicit_profile_master_switch() {
 }
 
 #[test]
+fn sandbox_defaults_to_denied_network_and_preserves_explicit_paths() {
+    let config = parse(
+        r#"{
+            "sandbox": {
+                "writableRoots": ["../shared-cache"],
+                "protectedPaths": [".zuno", ".agents"]
+            }
+        }"#,
+    )
+    .expect("sandbox config parses");
+    let sandbox = config.sandbox.expect("sandbox config");
+
+    assert_eq!(
+        sandbox.resolved_network(),
+        crate::schema::sandbox::SandboxNetworkMode::Deny
+    );
+    assert_eq!(
+        sandbox.writable_roots.as_deref(),
+        Some(["../shared-cache".to_owned()].as_slice())
+    );
+    assert_eq!(
+        sandbox.protected_paths.as_deref(),
+        Some([".zuno".to_owned(), ".agents".to_owned()].as_slice())
+    );
+}
+
+#[test]
+fn sandbox_modes_use_the_exact_public_vocabulary_and_default_to_workspace_write() {
+    use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode};
+
+    assert_eq!(
+        Config::default().sandbox_mode(),
+        SandboxMode::WorkspaceWrite
+    );
+    assert_eq!(
+        Config::default().sandbox_network(),
+        SandboxNetworkMode::Deny
+    );
+
+    for (spelling, expected) in [
+        ("read-only", SandboxMode::ReadOnly),
+        ("workspace-write", SandboxMode::WorkspaceWrite),
+        ("danger-full-access", SandboxMode::DangerFullAccess),
+    ] {
+        let config = parse(&format!(r#"{{"sandbox":{{"mode":"{spelling}"}}}}"#))
+            .unwrap_or_else(|error| panic!("{spelling} must parse: {error:?}"));
+        assert_eq!(config.sandbox_mode(), expected);
+    }
+
+    let danger = parse(r#"{"sandbox":{"mode":"danger-full-access"}}"#)
+        .expect("full access has host networking when no contradictory network policy is set");
+    assert_eq!(danger.sandbox_network(), SandboxNetworkMode::Allow);
+}
+
+#[test]
+fn sandbox_rejects_options_that_cannot_be_enforced_by_the_selected_mode() {
+    for (document, path, detail) in [
+        (
+            r#"{"sandbox":{"mode":"read-only","writableRoots":["../cache"]}}"#,
+            "sandbox.writableRoots",
+            "read-only",
+        ),
+        (
+            r#"{"sandbox":{"mode":"danger-full-access","network":"deny"}}"#,
+            "sandbox.network",
+            "host network",
+        ),
+        (
+            r#"{"sandbox":{"mode":"danger-full-access","writableRoots":["../cache"]}}"#,
+            "sandbox.writableRoots",
+            "danger-full-access",
+        ),
+        (
+            r#"{"sandbox":{"mode":"danger-full-access","protectedPaths":[".zuno"]}}"#,
+            "sandbox.protectedPaths",
+            "danger-full-access",
+        ),
+    ] {
+        let error = parse(document).expect_err("contradictory sandbox policy must fail");
+        assert_eq!(issue_path(&error), path);
+        assert!(
+            issue_detail(&error).contains(detail),
+            "{path}: {}",
+            issue_detail(&error)
+        );
+    }
+}
+
+#[test]
 fn permission_rejects_unknown_policy_keys() {
     let error = parse(r#"{"permission":{"mode":"strict","remember":true}}"#)
         .expect_err("permission must not silently ignore unknown policy fields");
@@ -542,6 +631,7 @@ fn agent_named_fields_are_not_swept() {
         "prompt": "p", "disable": false, "description": "d", "mode": "subagent",
         "hidden": true, "color": "primary", "steps": 10,
         "tools": ["read", "grep"], "delegates": ["researcher"],
+        "requiredSkills": ["codegraph"],
         "permission": { "mode": "allow_all" },
     }));
     assert!(agent.options.is_none(), "no named key may reach options");
@@ -556,6 +646,10 @@ fn agent_named_fields_are_not_swept() {
     assert_eq!(
         agent.delegates.as_deref(),
         Some(["researcher".to_owned()].as_slice())
+    );
+    assert_eq!(
+        agent.required_skills.as_deref(),
+        Some(["codegraph".to_owned()].as_slice())
     );
 }
 
@@ -647,7 +741,8 @@ fn agent_orchestration_fields_are_structured_and_validated() {
             "researcher": {
                 "model": "myopenai/gpt-5.6-sol",
                 "reasoning": "high",
-                "tools": ["read", "grep", "web_search"]
+                "tools": ["read", "grep", "web_search", "skill"],
+                "requiredSkills": ["codegraph"]
             },
             "implementer": {
                 "model": "myopenai/gpt-5.6-sol",
@@ -675,6 +770,12 @@ fn agent_orchestration_fields_are_structured_and_validated() {
         agents.get("researcher").and_then(|agent| agent.reasoning),
         Some(AgentReasoning::High)
     );
+    assert_eq!(
+        agents
+            .get("researcher")
+            .and_then(|agent| agent.required_skills.as_deref()),
+        Some(["codegraph".to_owned()].as_slice())
+    );
     let workflow = config
         .workflows
         .expect("workflows")
@@ -689,6 +790,16 @@ fn agent_orchestration_fields_are_structured_and_validated() {
         let error = parse_value(json!({"agents":{"worker":{"tools":bad}}}))
             .expect_err("invalid tool allowlist");
         assert!(error.report().contains("tools"), "{}", error.report());
+    }
+
+    for bad in [json!([]), json!(["codegraph", "codegraph"]), json!([""])] {
+        let error = parse_value(json!({"agents":{"worker":{"requiredSkills":bad}}}))
+            .expect_err("invalid required Skill list");
+        assert!(
+            error.report().contains("requiredSkills"),
+            "{}",
+            error.report()
+        );
     }
 }
 
@@ -880,6 +991,39 @@ fn unknown_provider_options_are_kept_for_the_sdk() {
         .expect("options present");
     assert_eq!(options.api_key.as_deref(), Some("k"));
     assert_eq!(options.extra["customKnob"], json!({ "deep": 1 }));
+}
+
+#[test]
+fn provider_and_model_headers_are_typed_configuration() {
+    let config = parse_value(json!({
+        "provider": {
+            "gateway": {
+                "headers": {"X-Provider": "provider"},
+                "models": {
+                    "primary": {"headers": {"X-Model": "model"}}
+                }
+            }
+        }
+    }))
+    .expect("provider and model headers deserialize");
+    let provider = config
+        .provider
+        .as_ref()
+        .and_then(|providers| providers.get("gateway"))
+        .expect("gateway provider");
+    assert_eq!(
+        provider.headers.as_ref().expect("provider headers")["X-Provider"],
+        "provider"
+    );
+    let model = provider
+        .models
+        .as_ref()
+        .and_then(|models| models.get("primary"))
+        .expect("primary model");
+    assert_eq!(
+        model.headers.as_ref().expect("model headers")["X-Model"],
+        "model"
+    );
 }
 
 // ---------------------------------------------------------------------------

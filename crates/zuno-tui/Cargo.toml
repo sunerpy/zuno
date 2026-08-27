@@ -65,6 +65,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # module has to get right — a missing layer versus an unreadable one — is a
 # filesystem distinction that an in-memory fixture cannot reproduce.
 tempfile = { workspace = true }
+zuno-sandbox = { workspace = true }
 
 [lints]
 workspace = true

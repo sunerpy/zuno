@@ -403,11 +403,10 @@ pub const INTERNAL_NAMES: [&str; 4] = ["compaction", "title", "summary", "counci
 /// `webfetch`/`websearch` are in here rather than merely uncovered because the
 /// external-research lane belongs to [`LIBRARIAN`] alone: an explorer that can also
 /// browse is an explorer that sometimes answers from a blog post instead of from
-/// the code in front of it. `skill` is denied for the same reason the draft drops
-/// per-call `load_skills` — skill access is a per-agent permission, so a lane that
-/// needs no skills says so.
+/// the code in front of it. Skill loading adds instructions and resources without
+/// granting edits, delegation, or MCP. Shell remains available under a
+/// read-only OS filesystem policy.
 const READ_ONLY_DENIED: &[&str] = &[
-    "shell",
     "edit",
     "task",
     "question",
@@ -417,11 +416,12 @@ const READ_ONLY_DENIED: &[&str] = &[
     "plan_exit",
     "webfetch",
     "web_search",
-    "skill",
 ];
 
 /// The inspection tools every read-only agent may call.
-const READ_ONLY_ALLOWED: &[&str] = &["read", "glob", "grep", "lsp", "plan_get", "todo_get"];
+const READ_ONLY_ALLOWED: &[&str] = &[
+    "read", "glob", "grep", "lsp", "shell", "plan_get", "todo_get", "skill",
+];
 
 /// The default primary coordinator and the only Agent that may delegate.
 pub const ORCHESTRATOR: Agent = Agent {
@@ -544,7 +544,7 @@ pub const DEEP: Agent = Agent {
             "skill",
             "execute",
         ],
-        extension_tools: ExtensionTools::Excluded,
+        extension_tools: ExtensionTools::Inherit,
     },
     delegation: Delegation::NoChildren,
     write: Write::Capable,
@@ -597,7 +597,6 @@ pub const LIBRARIAN: Agent = Agent {
     output: OutputContract::Natural,
     permissions: Permissions {
         denied: &[
-            "shell",
             "edit",
             "task",
             "question",
@@ -605,17 +604,18 @@ pub const LIBRARIAN: Agent = Agent {
             "todo_update",
             "execute",
             "plan_exit",
-            "skill",
         ],
         allowed: &[
             "read",
             "glob",
             "grep",
             "lsp",
+            "shell",
             "webfetch",
             "web_search",
             "plan_get",
             "todo_get",
+            "skill",
         ],
         extension_tools: ExtensionTools::Excluded,
     },
@@ -677,13 +677,12 @@ pub const FIXER: Agent = Agent {
             "plan_update",
             "todo_update",
             "web_search",
-            "skill",
             "execute",
             "question",
             "plan_exit",
         ],
         allowed: &[
-            "read", "glob", "grep", "lsp", "edit", "shell", "plan_get", "todo_get",
+            "read", "glob", "grep", "lsp", "edit", "shell", "plan_get", "todo_get", "skill",
         ],
         extension_tools: ExtensionTools::Excluded,
     },
@@ -727,7 +726,7 @@ pub const GENERAL: Agent = Agent {
             "skill",
             "execute",
         ],
-        extension_tools: ExtensionTools::Excluded,
+        extension_tools: ExtensionTools::Inherit,
     },
     delegation: Delegation::NoChildren,
     write: Write::Capable,

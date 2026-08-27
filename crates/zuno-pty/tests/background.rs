@@ -9,6 +9,40 @@ use zuno_pty::{
     BackgroundExecutionService, BackgroundExecutionStatus, MAX_RETAINED_TERMINAL_EXECUTIONS,
     ReplayCursor,
 };
+use zuno_sandbox::{
+    NetworkAccess, PrepareRequest, PreparedCommand, SandboxCapabilities, SandboxMode, SandboxPolicy,
+};
+
+fn prepared(directory: &Path, command: &str) -> PreparedCommand {
+    let arguments = vec![OsString::from("-c"), OsString::from(command)];
+    let request = PrepareRequest {
+        program: OsString::from("/bin/sh"),
+        arguments: arguments.clone(),
+        cwd: directory.to_owned(),
+        environment: std::env::vars_os().collect::<BTreeMap<_, _>>(),
+        policy: SandboxPolicy::new(
+            directory,
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Allowed,
+        )
+        .expect("test policy"),
+    };
+    PreparedCommand::from_backend(
+        request,
+        OsString::from("/bin/sh"),
+        arguments,
+        &SandboxCapabilities {
+            backend: "test_direct".to_owned(),
+            executable: Some(Path::new("/bin/sh").to_owned()),
+            read_only: true,
+            workspace_write: true,
+            danger_full_access: false,
+            network_isolation: true,
+        },
+        vec![directory.to_owned()],
+        Vec::new(),
+    )
+}
 
 fn input(
     directory: &Path,
@@ -17,16 +51,36 @@ fn input(
 ) -> BackgroundExecutionInput {
     let command = command.into();
     BackgroundExecutionInput {
-        program: OsString::from("/bin/sh"),
-        arguments: vec![OsString::from("-c"), OsString::from(command.clone())],
-        cwd: directory.to_owned(),
-        environment: std::env::vars_os().collect::<BTreeMap<_, _>>(),
+        prepared: prepared(directory, &command),
         session_id: "ses_background".to_owned(),
         title: command.clone(),
         command,
         hard_ceiling,
         retention: BackgroundExecutionRetention::Durable,
     }
+}
+
+#[tokio::test]
+async fn dropping_a_foreground_lease_cancels_an_already_spawned_process_tree() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let pid_file = directory.path().join("leased.pid");
+    let command = format!("printf '%s' \"$$\" > '{}'; sleep 30", pid_file.display());
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+    let (info, lease) = service
+        .start_leased(input(directory.path(), command, Duration::from_secs(30)))
+        .expect("command starts");
+    wait_for_file(&pid_file).await;
+    let pid = read_pid(&pid_file);
+
+    drop(lease);
+    let settled = service
+        .wait(&info.id, None)
+        .await
+        .expect("lease cancellation settles")
+        .info;
+
+    assert_eq!(settled.status, BackgroundExecutionStatus::Cancelled);
+    wait_for_process_exit(pid).await;
 }
 
 #[tokio::test]
@@ -202,7 +256,7 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
     std::fs::write(
         &status_file,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "format": 1,
+            "format": 3,
             "info": {
                 "id": id.as_str(),
                 "sessionId": "ses_background",
@@ -218,7 +272,8 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
                 "timeCompleted": null,
                 "error": null,
                 "outputFile": "/must/not/be/trusted",
-                "statusFile": "/must/not/be/trusted"
+                "statusFile": "/must/not/be/trusted",
+                "authority": prepared(directory.path(), "fixture").authority()
             }
         }))
         .expect("fixture JSON"),
@@ -241,7 +296,7 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
             &std::fs::read(&status_file).expect("rewritten status")
         )
         .expect("rewritten JSON")["format"],
-        2
+        3
     );
     assert_eq!(
         service
@@ -250,47 +305,6 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
             .bytes,
         b"partial"
     );
-}
-
-#[test]
-fn legacy_terminal_state_is_removed_instead_of_retained() {
-    let directory = tempfile::tempdir().expect("workspace");
-    let id =
-        BackgroundExecutionId::parse("bg_fedcba9876543210fedcba9876543210").expect("fixture id");
-    let output_file = directory.path().join(format!("{id}.output"));
-    let status_file = directory.path().join(format!("{id}.status.json"));
-    std::fs::write(&output_file, b"obsolete foreground output").expect("fixture output");
-    std::fs::write(
-        &status_file,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "format": 1,
-            "info": {
-                "id": id.as_str(),
-                "sessionId": "ses_legacy",
-                "title": "legacy",
-                "command": "legacy",
-                "cwd": directory.path(),
-                "status": "completed",
-                "pid": null,
-                "exitCode": 0,
-                "timedOut": false,
-                "timeCreated": 1,
-                "timeUpdated": 2,
-                "timeCompleted": 2,
-                "error": null,
-                "outputFile": "/must/not/be/trusted",
-                "statusFile": "/must/not/be/trusted"
-            }
-        }))
-        .expect("fixture JSON"),
-    )
-    .expect("fixture status");
-
-    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
-
-    assert!(service.list().is_empty());
-    assert!(!output_file.exists());
-    assert!(!status_file.exists());
 }
 
 async fn wait_for_file(path: &Path) {

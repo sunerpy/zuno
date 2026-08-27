@@ -1,4 +1,4 @@
-use zuno_agent::profile::AgentProfile;
+use zuno_agent::profile::{AgentProfile, ShellFilesystemAccess};
 use zuno_catalog::agent;
 use zuno_config::schema::ordered::OrderedMap;
 use zuno_permission::visibility::is_tool_hidden;
@@ -44,6 +44,49 @@ fn one_profile_snapshots_definition_rules_and_delegation_targets() {
     );
     assert!(profile.capabilities().can_delegate());
     assert!(!is_tool_hidden("read", profile.capabilities().rules()));
+}
+
+#[test]
+fn inherited_parent_tools_are_an_upper_bound_on_child_capabilities() {
+    let rules = vec![
+        rule("*", PermissionAction::Deny),
+        rule("read", PermissionAction::Allow),
+        rule("skill", PermissionAction::Allow),
+        rule("shell", PermissionAction::Allow),
+        rule("web_search", PermissionAction::Allow),
+    ];
+    let profile = AgentProfile::resolve(native("general"), rules, false)
+        .with_tool_authority(["read".to_owned(), "skill".to_owned()]);
+
+    assert!(profile.capabilities().tool_available("read"));
+    assert!(profile.capabilities().tool_available("skill"));
+    assert!(!profile.capabilities().tool_available("shell"));
+    assert!(!profile.capabilities().tool_available("web_search"));
+    assert!(!profile.capabilities().tool_available("task"));
+    assert!(
+        profile.prompt_policy().contains("shell: unavailable"),
+        "{}",
+        profile.prompt_policy()
+    );
+}
+
+#[test]
+fn extension_inheritance_precedes_later_user_denies_and_stays_role_bounded() {
+    let rules = vec![
+        rule("*", PermissionAction::Deny),
+        rule("codegraph_query", PermissionAction::Deny),
+    ];
+    let deep =
+        AgentProfile::resolve_with_extension_boundary(native("deep"), rules.clone(), 1, false);
+    let effective = deep.rules_with_extension_tools(&["codegraph_query", "codegraph_status"]);
+
+    assert!(is_tool_hidden("codegraph_query", &effective));
+    assert!(!is_tool_hidden("codegraph_status", &effective));
+
+    let explorer =
+        AgentProfile::resolve_with_extension_boundary(native("explorer"), rules, 1, false);
+    let effective = explorer.rules_with_extension_tools(&["codegraph_status"]);
+    assert!(is_tool_hidden("codegraph_status", &effective));
 }
 
 #[test]
@@ -134,5 +177,35 @@ fn capability_filter_preserves_custom_targets_for_runtime_validation() {
     assert_eq!(
         profile.capabilities().delegation_targets(),
         Some(["custom-review".to_owned()].as_slice())
+    );
+}
+
+#[test]
+fn shell_filesystem_access_is_derived_from_the_effective_edit_capability() {
+    let read_only = AgentProfile::resolve(
+        native("explorer"),
+        vec![
+            rule("*", PermissionAction::Deny),
+            rule("shell", PermissionAction::Allow),
+        ],
+        false,
+    );
+    assert_eq!(
+        read_only.capabilities().shell_filesystem_access(),
+        ShellFilesystemAccess::ReadOnly
+    );
+
+    let writable = AgentProfile::resolve(
+        native("build"),
+        vec![
+            rule("*", PermissionAction::Deny),
+            rule("edit", PermissionAction::Allow),
+            rule("shell", PermissionAction::Allow),
+        ],
+        false,
+    );
+    assert_eq!(
+        writable.capabilities().shell_filesystem_access(),
+        ShellFilesystemAccess::WorkspaceWrite
     );
 }

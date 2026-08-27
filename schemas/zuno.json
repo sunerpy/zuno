@@ -114,6 +114,16 @@
           ],
           "description": "Provider-neutral reasoning level, applied only with the configured model."
         },
+        "requiredSkills": {
+          "description": "Skills loaded at the start of every turn for this agent.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "steps": {
           "description": "Maximum agentic iterations before a text-only response is forced.",
           "format": "uint32",
@@ -2025,6 +2035,16 @@
             "null"
           ]
         },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Default extra HTTP headers for every model in this provider.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "id": {
           "description": "Provider id override.",
           "type": [
@@ -2255,6 +2275,90 @@
         {
           "const": "remote",
           "description": "A server reached over HTTP.",
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxConfig": {
+      "additionalProperties": false,
+      "description": "Policy additions shared by every Shell call in one resolved profile.",
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum Shell authority for this invocation. Absence defaults to\n`workspace-write`; read-only Agent contracts still narrow it."
+        },
+        "network": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxNetworkMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Network authority. Absence defaults to `deny` in confined modes and to\nhost networking in `danger-full-access`; that mode rejects explicit\n`deny` because it cannot enforce it."
+        },
+        "protectedPaths": {
+          "description": "Paths reapplied read-only after writable roots are mounted.\n\nRelative paths resolve against the active workspace. Missing paths are\nignored until they exist.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "writableRoots": {
+          "description": "Existing directories writable in addition to the workspace for write-capable Agents.\n\nRelative paths resolve against the active workspace.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SandboxMode": {
+      "description": "Filesystem/process confinement selected for model-initiated Shell calls.",
+      "oneOf": [
+        {
+          "const": "read-only",
+          "description": "Read the host filesystem, but do not permit host writes.",
+          "type": "string"
+        },
+        {
+          "const": "workspace-write",
+          "description": "Write the active workspace and explicitly trusted extra roots.",
+          "type": "string"
+        },
+        {
+          "const": "danger-full-access",
+          "description": "Run as the Zuno user with the host filesystem, processes, and network.",
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxNetworkMode": {
+      "description": "Network authority available to model-initiated Shell calls.",
+      "oneOf": [
+        {
+          "const": "deny",
+          "description": "Create a private network namespace and deny network syscalls.",
+          "type": "string"
+        },
+        {
+          "const": "allow",
+          "description": "Inherit the host network namespace.",
           "type": "string"
         }
       ]
@@ -2843,6 +2947,17 @@
         }
       ],
       "description": "Named git or local directory references."
+    },
+    "sandbox": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SandboxConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Native OS sandbox policy for model-initiated Shell calls."
     },
     "server": {
       "anyOf": [

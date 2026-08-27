@@ -29,6 +29,7 @@ zuno-provider-openai
 zuno-pty
 zuno-reaping-fixture
 zuno-runtime
+zuno-sandbox
 zuno-search
 zuno-server
 zuno-snapshot

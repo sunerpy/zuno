@@ -333,6 +333,15 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "not copied into `auth.json`",
         ],
     );
+    contains_all(
+        "docs/reference/providers.md",
+        &[
+            r#""headers": {"X-Tenant": "tenant-a"}"#,
+            "Provider-level headers are defaults for every configured model",
+            "model-level `headers` win",
+            "`Authorization`, `Content-Type`, and `Accept`",
+        ],
+    );
 }
 
 #[test]

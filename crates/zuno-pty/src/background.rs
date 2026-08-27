@@ -13,8 +13,7 @@
 
 use crate::{BUFFER_LIMIT, ReplayCursor, ScrollbackBuffer};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsString;
+use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -25,9 +24,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
+use zuno_sandbox::{ExecutionAuthority, PreparedCommand};
 
-const LEGACY_STATE_FORMAT: u32 = 1;
-const STATE_FORMAT: u32 = 2;
+const STATE_FORMAT: u32 = 3;
 const OUTPUT_SUFFIX: &str = ".output";
 const STATUS_SUFFIX: &str = ".status.json";
 const OUTPUT_CHUNK: usize = 8 * 1024;
@@ -138,6 +137,8 @@ pub struct BackgroundExecutionInfo {
     pub error: Option<String>,
     pub output_file: PathBuf,
     pub status_file: PathBuf,
+    /// Exact OS-sandbox authority compiled before this process was spawned.
+    pub authority: ExecutionAuthority,
 }
 
 /// Frontend-neutral snapshot consumed by TUI, server, and future clients.
@@ -168,10 +169,8 @@ impl BackgroundExecutionRetention {
 /// Command launch input. Environment values are never persisted.
 #[derive(Debug)]
 pub struct BackgroundExecutionInput {
-    pub program: OsString,
-    pub arguments: Vec<OsString>,
-    pub cwd: PathBuf,
-    pub environment: BTreeMap<OsString, OsString>,
+    /// Opaque launch produced by a sandbox backend.
+    pub prepared: PreparedCommand,
     pub session_id: String,
     pub title: String,
     pub command: String,
@@ -226,6 +225,34 @@ pub enum BackgroundExecutionError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Cancellation lease held by a foreground Shell future.
+///
+/// Dropping an armed lease requests cancellation synchronously. This closes the
+/// race where the dispatcher aborts the tool future after spawn but before the
+/// Shell tool enters its own cancellation `select!`.
+#[derive(Debug)]
+pub struct BackgroundExecutionLease {
+    service: BackgroundExecutionService,
+    id: BackgroundExecutionId,
+    armed: bool,
+}
+
+impl BackgroundExecutionLease {
+    /// Stops drop-driven cancellation after ownership was deliberately transferred
+    /// to durable background execution or after the command settled.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackgroundExecutionLease {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.service.cancel(&self.id);
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -320,14 +347,13 @@ impl BackgroundExecutionService {
                         source,
                     }
                 })?;
-            if !matches!(persisted.format, LEGACY_STATE_FORMAT | STATE_FORMAT) {
+            if persisted.format != STATE_FORMAT {
                 return Err(BackgroundExecutionError::State {
                     path: status_file,
                     source: std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "unsupported background state format {}; expected \
-                             {LEGACY_STATE_FORMAT} or {STATE_FORMAT}",
+                            "unsupported background state format {}; expected {STATE_FORMAT}",
                             persisted.format
                         ),
                     ),
@@ -339,10 +365,6 @@ impl BackgroundExecutionService {
             persisted.info.id = id.clone();
             persisted.info.output_file = output_file.clone();
             persisted.info.status_file = canonical_status_file;
-            if persisted.format == LEGACY_STATE_FORMAT && persisted.info.status.is_terminal() {
-                remove_execution_files(&persisted.info)?;
-                continue;
-            }
             if persisted.info.status == BackgroundExecutionStatus::Running {
                 let now = now_millis();
                 persisted.info.status = BackgroundExecutionStatus::Uncertain;
@@ -405,14 +427,15 @@ impl BackgroundExecutionService {
         let status_file = self.status_path(&id);
         std::fs::File::create(&output_file).map_err(|source| state_error(&output_file, source))?;
 
+        let prepared = input.prepared.into_parts();
         let (program, arguments) =
-            zuno_process::guarded_argv(&input.program, input.arguments.iter());
+            zuno_process::guarded_argv(&prepared.program, prepared.arguments.iter());
         let mut command = Command::new(program);
         command
             .args(arguments)
-            .current_dir(&input.cwd)
+            .current_dir(&prepared.cwd)
             .env_clear()
-            .envs(&input.environment)
+            .envs(&prepared.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -433,7 +456,7 @@ impl BackgroundExecutionService {
             session_id: input.session_id,
             title: input.title,
             command: input.command,
-            cwd: input.cwd,
+            cwd: prepared.cwd,
             status: BackgroundExecutionStatus::Running,
             pid,
             exit_code: None,
@@ -444,6 +467,7 @@ impl BackgroundExecutionService {
             error: None,
             output_file,
             status_file,
+            authority: prepared.authority,
         };
         let durable = input.retention.is_durable();
         if durable && let Err(error) = persist_info(&info) {
@@ -485,6 +509,20 @@ impl BackgroundExecutionService {
             self.prune_retained();
         }
         Ok(info)
+    }
+
+    /// Starts one foreground-owned command and returns a drop cancellation lease.
+    pub fn start_leased(
+        &self,
+        input: BackgroundExecutionInput,
+    ) -> Result<(BackgroundExecutionInfo, BackgroundExecutionLease), BackgroundExecutionError> {
+        let info = self.start(input)?;
+        let lease = BackgroundExecutionLease {
+            service: self.clone(),
+            id: info.id.clone(),
+            armed: true,
+        };
+        Ok((info, lease))
     }
 
     /// Every durable command in creation order.

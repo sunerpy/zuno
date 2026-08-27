@@ -141,6 +141,34 @@ fn a_markdown_agent_tools_must_be_a_sequence() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn markdown_agent_required_skills_reach_the_resolved_agent() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    write(
+        dir.path(),
+        "agent/indexer.md",
+        "---\nmode: subagent\nrequiredSkills:\n  - codegraph\n  - review\n---\nBody.\n",
+    )?;
+
+    let found = discover_in_directory(dir.path())?;
+    assert_eq!(
+        found[0].config.required_skills.as_deref(),
+        Some(["codegraph".to_owned(), "review".to_owned()].as_slice())
+    );
+
+    let (map, paths) = to_map(found);
+    let agents = agent::list(&map, &paths);
+    let indexer = agents
+        .iter()
+        .find(|candidate| candidate.name == "indexer")
+        .expect("Markdown Agent resolves");
+    assert_eq!(
+        indexer.required_skills.as_deref(),
+        Some(["codegraph".to_owned(), "review".to_owned()].as_slice())
+    );
+    Ok(())
+}
+
+#[test]
 fn both_agent_and_agents_directories_are_scanned() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     write(dir.path(), "agent/from-singular.md", "---\n---\nA.\n")?;

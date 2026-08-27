@@ -67,6 +67,8 @@ pub struct GlobalOptions {
     pub print_logs: bool,
     /// Override the environment's log level.
     pub log_level: Option<CliLogLevel>,
+    /// Override sandbox authority for this invocation.
+    pub sandbox: Option<CliSandboxMode>,
 }
 
 /// The root command parser.
@@ -94,6 +96,10 @@ pub struct Cli {
     #[arg(long, global = true, value_enum)]
     pub log_level: Option<CliLogLevel>,
 
+    /// Select Shell confinement for this invocation.
+    #[arg(long, global = true, value_enum)]
+    pub sandbox: Option<CliSandboxMode>,
+
     /// The default command's own options, accepted without naming it.
     #[command(flatten)]
     pub tui: TuiArgs,
@@ -110,6 +116,7 @@ impl Cli {
         GlobalOptions {
             print_logs: self.print_logs,
             log_level: self.log_level,
+            sandbox: self.sandbox,
         }
     }
 
@@ -128,6 +135,25 @@ impl Cli {
             // exactly what `tui` does rather than explaining an absence — including
             // the options it was given without the subcommand's name.
             None => dispatch(DispatchArguments::Tui(root_tui), environment),
+        }
+    }
+}
+
+/// Public Shell sandbox modes accepted by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliSandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl CliSandboxMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
         }
     }
 }
@@ -1166,6 +1192,25 @@ mod tests {
         ] {
             let cli = Cli::try_parse_from(args).expect("global flags");
             assert!(cli.print_logs);
+        }
+    }
+
+    #[test]
+    fn sandbox_mode_is_a_global_trusted_invocation_override() {
+        for (spelling, expected) in [
+            ("read-only", "read-only"),
+            ("workspace-write", "workspace-write"),
+            ("danger-full-access", "danger-full-access"),
+        ] {
+            let cli = Cli::try_parse_from(["zuno", "--sandbox", spelling, "run"])
+                .unwrap_or_else(|error| panic!("{spelling} must parse: {error}"));
+            let Action::Dispatch(request) = cli.action(&Env::empty()) else {
+                panic!("sandbox override must still dispatch");
+            };
+            assert_eq!(
+                request.environment.flags.value(crate::ZUNO_SANDBOX_MODE),
+                Some(expected)
+            );
         }
     }
 

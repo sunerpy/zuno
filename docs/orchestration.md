@@ -79,10 +79,66 @@ explicit Agent deny. A user can replace the Agent permission overlay explicitly,
 doing so intentionally changes `explorer`'s read-only contract and is normally less
 clear than selecting the correct Agent.
 
-That deny remains until the active platform provides the complete OS sandbox gate
-described in [the Shell sandbox roadmap](design/shell-sandbox-roadmap.md). Zuno does
-not treat command parsing, process groups, or a prompt that says "read-only" as
-confinement.
+That deny remains a built-in role boundary even after the Linux sandbox gate in
+[the Shell sandbox roadmap](design/shell-sandbox-roadmap.md) became available.
+A custom read-only Agent may expose `shell`; runtime assembly then compiles
+`SandboxMode::ReadOnly` and refuses registration if the active platform cannot
+prove it. Zuno does not automatically widen specialists merely because a backend
+exists, and it does not treat command parsing, process groups, or a prompt that
+says "read-only" as confinement.
+
+## Child capability ceiling and required Skills
+
+Delegation preserves engine behavior without creating a second source of authority.
+The parent Attempt records the exact tool schemas that were visible to the parent
+provider request. A child can use only the intersection of:
+
+1. that frozen parent Attempt schema set;
+2. the target Agent role and its extension-tool inheritance policy;
+3. the Agent's exact `tools` allowlist, when configured;
+4. effective user and Agent permission rules.
+
+These are narrowing layers. A role, allowlist, or permission rule may remove a
+capability, but an `allow` cannot add a tool that was absent from the parent Attempt.
+The schema identity is significant: replacing a tool with another same-named schema
+does not satisfy the inherited authority. `permission.mode: "allow_all"` suppresses
+ordinary HITL prompts only and does not widen this intersection.
+
+Work-capable roles may opt into automatic MCP and extension inheritance. Zuno does not
+expose every parent MCP tool to every read-only specialist: unknown MCP operations remain
+side-effecting by default, and an explicit deny always wins. An operator may explicitly
+allow one audited dynamic tool id in a read-only Agent's own `permission.rules`; the
+parent schema ceiling and exact-schema check still apply. This lets work-capable Agents
+inherit a bounded dynamic tool surface and lets a repository specialist use an audited
+read-only query without weakening the default contract for every extension.
+
+Skills use a different path. Each initial or resumed child host runs normal Skill
+discovery for its working directory and active profile; the parent does not copy
+already-loaded Skill bodies into the child prompt. Add stable role guidance with
+`agents.<name>.requiredSkills`:
+
+```json
+{
+  "agents": {
+    "explorer": {
+      "requiredSkills": ["codegraph"]
+    }
+  }
+}
+```
+
+Before each provider-bound input, each required name must resolve to one visible source;
+Zuno ensures that source is loaded and de-duplicates it by source path. A missing Skill
+or two visible sources with the same name fails that child startup rather than choosing
+a hidden precedence winner. Required Skills remain instructions: the example guarantees
+that the Agent receives CodeGraph guidance, not that it receives CodeGraph MCP tools.
+Those tools still require an exact parent schema, automatic role inheritance or an
+exact per-Agent grant, survival through the Agent `tools` allowlist, and no explicit
+permission deny.
+
+This model borrows the useful Codex pattern of deriving a child from the parent's
+effective capabilities while allowing a role overlay to reduce them. It is a Zuno
+runtime design decision, not a Codex compatibility promise.
 
 ### Optional configured designer
 
@@ -160,6 +216,7 @@ the final answer.
 - `model` plus either `reasoning` or provider-specific `variant`;
 - `temperature`, `top_p`, provider options, and `steps`;
 - exact model-visible `tools`;
+- `requiredSkills`, whose uniquely resolved bodies are preloaded for every child turn;
 - exact direct-child `delegates`;
 - per-tool `permission`.
 

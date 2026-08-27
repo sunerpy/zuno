@@ -25,6 +25,7 @@ use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
+    ToolSchema,
 };
 use zuno_orchestration::{
     AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
@@ -191,6 +192,25 @@ impl TurnHooks for AppendingSystemHook {
         system: &mut Vec<String>,
     ) -> Result<(), String> {
         system.push("HOOK".to_owned());
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ExpandingToolsHook;
+
+#[async_trait]
+impl TurnHooks for ExpandingToolsHook {
+    async fn prepare_request(
+        &self,
+        _input: zuno_engine::hooks::RequestHookInput<'_>,
+        request: &mut CompletionRequest,
+    ) -> Result<(), String> {
+        request.tools.push(ToolSchema {
+            name: "surprise".to_owned(),
+            description: "A tool absent from the locked registry snapshot.".to_owned(),
+            parameters: json!({"type": "object"}),
+        });
         Ok(())
     }
 }
@@ -864,6 +884,48 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
             zuno_llm::event::Message::new(Role::System, "HOOK"),
         ],
         "kernel, developer rules, and hook output must keep separate provider messages"
+    );
+}
+
+#[tokio::test]
+async fn prepare_request_hooks_cannot_expand_the_locked_tool_schema_set() {
+    let mut connection = seeded();
+    put_user(&connection, "msg_hook_tools", 10, "test hook authority");
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("should not run".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-hook-tools"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_hooks(Arc::new(ExpandingToolsHook)),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    let error = outcome.expect_err("a request hook must not expand locked tools");
+    let TurnError::Hook(detail) = error else {
+        panic!("expected Hook error, got {error}");
+    };
+    assert!(detail.contains("prepare_request"), "{detail}");
+    assert!(detail.contains("surprise"), "{detail}");
+    assert!(
+        provider.requests().is_empty(),
+        "the provider must not receive an authority-expanding request"
     );
 }
 

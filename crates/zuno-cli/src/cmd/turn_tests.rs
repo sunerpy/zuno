@@ -11,6 +11,57 @@ use zuno_catalog::agent::{Agent, AgentMode, AgentSource};
 use zuno_llm::sse::StreamIdleTimeout;
 use zuno_paths::Env;
 
+#[derive(Debug)]
+struct DirectTestSandbox {
+    capabilities: zuno_sandbox::SandboxCapabilities,
+}
+
+impl DirectTestSandbox {
+    fn new() -> Self {
+        Self {
+            capabilities: zuno_sandbox::SandboxCapabilities {
+                backend: "test_direct".to_owned(),
+                executable: Some("/bin/sh".into()),
+                read_only: true,
+                workspace_write: true,
+                danger_full_access: true,
+                network_isolation: true,
+            },
+        }
+    }
+}
+
+impl zuno_sandbox::SandboxBackend for DirectTestSandbox {
+    fn capabilities(&self) -> &zuno_sandbox::SandboxCapabilities {
+        &self.capabilities
+    }
+
+    fn prepare(
+        &self,
+        request: zuno_sandbox::PrepareRequest,
+    ) -> Result<zuno_sandbox::PreparedCommand, zuno_sandbox::SandboxError> {
+        let program = request.program.clone();
+        let arguments = request.arguments.clone();
+        let writable_roots = if request.policy.mode() == zuno_sandbox::SandboxMode::WorkspaceWrite {
+            vec![request.policy.workspace().to_owned()]
+        } else {
+            Vec::new()
+        };
+        Ok(zuno_sandbox::PreparedCommand::from_backend(
+            request,
+            program,
+            arguments,
+            &self.capabilities,
+            writable_roots,
+            Vec::new(),
+        ))
+    }
+}
+
+fn test_sandbox() -> Option<Arc<dyn zuno_sandbox::SandboxBackend>> {
+    Some(Arc::new(DirectTestSandbox::new()))
+}
+
 fn agent(name: &str) -> Agent {
     Agent {
         name: name.to_owned(),
@@ -27,6 +78,7 @@ fn agent(name: &str) -> Agent {
         steps: None,
         tools: None,
         delegates: None,
+        required_skills: None,
         options: serde_json::Map::new(),
         permission: None,
         source: AgentSource::Native,
@@ -359,7 +411,9 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         catalog_models: Vec::new(),
         reasoning_efforts: std::collections::BTreeMap::new(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
+        required_skills: Vec::new(),
         capability: test_capability(),
+        tool_authority: None,
         agents: vec![agent.clone()],
         extensions: zuno_extension::ResolvedExtensions::default(),
         extension_scope,
@@ -442,6 +496,45 @@ fn parent_attempt(capability: CapabilitySnapshot) -> AttemptSnapshot {
         },
         tools: Vec::new(),
     }
+}
+
+#[test]
+fn delegated_agent_attempt_identity_hashes_the_full_parent_tool_schema_authority() {
+    let directory = tempfile::TempDir::new().expect("temporary workspace");
+    let profile = agent_profile(
+        agent("deep"),
+        directory.path(),
+        &zuno_config::schema::Config::default(),
+    );
+    let first = ToolSchemaIdentity {
+        name: "codegraph_query".to_owned(),
+        description_sha256: sha256_text("first description"),
+        schema_sha256: sha256_text("same schema"),
+        ui_intent: "generic".to_owned(),
+    };
+    let changed = ToolSchemaIdentity {
+        description_sha256: sha256_text("changed description"),
+        ..first.clone()
+    };
+
+    let unrestricted = agent_attempt_identity(&profile, None).expect("unrestricted identity");
+    let first_identity = agent_attempt_identity(&profile, Some(std::slice::from_ref(&first)))
+        .expect("first authority identity");
+    let changed_identity = agent_attempt_identity(&profile, Some(std::slice::from_ref(&changed)))
+        .expect("changed authority identity");
+
+    assert_eq!(
+        first_identity.definition_sha256,
+        changed_identity.definition_sha256
+    );
+    assert_ne!(
+        unrestricted.permission_sha256,
+        first_identity.permission_sha256
+    );
+    assert_ne!(
+        first_identity.permission_sha256,
+        changed_identity.permission_sha256
+    );
 }
 
 #[test]
@@ -3171,6 +3264,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
             background_executions: test_background_executions(directory.path()),
+            sandbox: test_sandbox(),
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
@@ -3186,6 +3280,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            tool_authority: None,
         },
     )
     .expect("production registry assembles");
@@ -3228,6 +3323,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
             background_executions: test_background_executions(directory.path()),
+            sandbox: test_sandbox(),
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
@@ -3243,6 +3339,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            tool_authority: None,
         },
     )
     .expect("production registry assembles");
@@ -3271,6 +3368,176 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
     assert_eq!(output.metadata["shell"], "sh");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecycle_metadata() {
+    use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let outside = tempfile::TempDir::new().expect("external destination");
+    let proof = outside.path().join("full-access-proof");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config = zuno_config::schema::Config::from_json_str(
+        Path::new("zuno.json"),
+        r#"{"shell":"/bin/sh","sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("full-access config");
+    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+    let runtime = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &config,
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            question: None,
+            background_executions: test_background_executions(directory.path()),
+            sandbox: None,
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+            tool_authority: None,
+        },
+    )
+    .expect("full access must not probe bubblewrap");
+    let shell = runtime
+        .tools
+        .iter()
+        .find(|tool| tool.id() == "shell")
+        .expect("build exposes Shell");
+    let output = shell
+        .invoke(
+            serde_json::json!({
+                "command": format!("printf native > '{}'", proof.display())
+            }),
+            ToolContext::new(
+                "ses_full_access",
+                "msg_full_access",
+                "call_full_access",
+                "build",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            ),
+        )
+        .await
+        .expect("native command executes through the background service");
+
+    assert_eq!(std::fs::read_to_string(proof).expect("proof"), "native");
+    assert_eq!(output.metadata["sandboxMode"], "danger-full-access");
+    assert_eq!(output.metadata["sandboxBackend"], "danger_full_access");
+    assert_eq!(output.metadata["sandboxNetwork"], "allowed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
+    use zuno_config::schema::permission::PermissionAction;
+    use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config = zuno_config::schema::Config::from_json_str(
+        Path::new("zuno.json"),
+        r#"{"shell":"/bin/sh","sandbox":{"mode":"danger-full-access"}}"#,
+    )
+    .expect("full-access config");
+    let rules = vec![
+        zuno_permission::Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        },
+        zuno_permission::Rule {
+            permission: "apply_patch".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Deny,
+        },
+        zuno_permission::Rule {
+            permission: "write".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Deny,
+        },
+        zuno_permission::Rule {
+            permission: "edit".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Deny,
+        },
+    ];
+    let selected_agent =
+        zuno_agent::profile::AgentProfile::resolve(agent("read-only-shell"), rules, false);
+    let runtime = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &config,
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            question: None,
+            background_executions: test_background_executions(directory.path()),
+            sandbox: test_sandbox(),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+            tool_authority: None,
+        },
+    )
+    .expect("read-only effective policy assembles");
+    let shell = runtime
+        .tools
+        .iter()
+        .find(|tool| tool.id() == "shell")
+        .expect("the custom read-only profile retains Shell");
+    let output = shell
+        .invoke(
+            serde_json::json!({"command": "printf narrowed"}),
+            ToolContext::new(
+                "ses_narrowed",
+                "msg_narrowed",
+                "call_narrowed",
+                "read-only-shell",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            ),
+        )
+        .await
+        .expect("read-only command executes");
+
+    assert_eq!(output.metadata["sandboxMode"], "read-only");
+    assert_eq!(output.metadata["sandboxNetwork"], "denied");
+}
+
 #[test]
 fn production_registry_exposes_council_only_to_a_delegating_profile() {
     fn ids_for(agent_name: &str) -> Vec<String> {
@@ -3291,6 +3558,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
                 background_executions: test_background_executions(directory.path()),
+                sandbox: test_sandbox(),
                 todo_store: Arc::new(
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),
@@ -3308,6 +3576,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                tool_authority: None,
             },
         )
         .expect("production registry assembles");
@@ -3391,6 +3660,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
             background_executions: test_background_executions(directory.path()),
+            sandbox: test_sandbox(),
             todo_store: Arc::new(
                 zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
             ),
@@ -3406,6 +3676,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            tool_authority: None,
         },
     )
     .expect("production registry assembles");
@@ -4294,6 +4565,54 @@ mod production_registry {
         intents: std::collections::BTreeMap<String, zuno_tool::ToolUiIntent>,
     }
 
+    const DYNAMIC_TOOL_ID: &str = "codegraph_query";
+
+    struct DynamicTool {
+        description: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl zuno_tool::Tool for DynamicTool {
+        fn id(&self) -> &str {
+            DYNAMIC_TOOL_ID
+        }
+
+        fn description(&self) -> &str {
+            self.description
+        }
+
+        fn raw_parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: zuno_tool::ToolContext,
+        ) -> Result<zuno_tool::ToolOutput, zuno_error::ToolError> {
+            Ok(zuno_tool::ToolOutput::text(self.description, "ok"))
+        }
+    }
+
+    fn dynamic_tool(description: &'static str) -> Arc<dyn zuno_tool::Tool> {
+        Arc::new(DynamicTool { description })
+    }
+
+    #[derive(Clone)]
+    struct FixedMcpLoader(Vec<Arc<dyn zuno_tool::Tool>>);
+
+    impl zuno_tools::registry::McpToolLoader for FixedMcpLoader {
+        fn tools(&self) -> Vec<zuno_tools::registry::CustomTool> {
+            self.0.clone()
+        }
+    }
+
+    fn authority_for(
+        tool: &Arc<dyn zuno_tool::Tool>,
+    ) -> Arc<[zuno_orchestration::ToolSchemaIdentity]> {
+        Arc::from(vec![tool.definition().schema_identity()])
+    }
+
     fn try_assemble_with(
         skills: zuno_catalog::skill::Skills,
         config: zuno_config::schema::Config,
@@ -4306,13 +4625,24 @@ mod production_registry {
         skills: zuno_catalog::skill::Skills,
         config: zuno_config::schema::Config,
     ) -> Result<Fixture, String> {
+        try_assemble_for_agent_runtime(agent_name, skills, config, None, None)
+    }
+
+    fn try_assemble_for_agent_runtime(
+        agent_name: &str,
+        skills: zuno_catalog::skill::Skills,
+        config: zuno_config::schema::Config,
+        mcp_loader: Option<Arc<dyn zuno_tools::registry::McpToolLoader>>,
+        tool_authority: Option<Arc<[zuno_orchestration::ToolSchemaIdentity]>>,
+    ) -> Result<Fixture, String> {
         let directory = tempfile::TempDir::new().expect("temporary tool workspace");
         let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
-        let selected_definition =
-            zuno_catalog::agent::resolve(&zuno_config::schema::ordered::OrderedMap::new(), &[])
-                .into_iter()
-                .find(|entry| entry.name == agent_name)
-                .unwrap_or_else(|| panic!("native Agent `{agent_name}`"));
+        let empty_agents = zuno_config::schema::ordered::OrderedMap::new();
+        let configured_agents = config.agent.as_ref().unwrap_or(&empty_agents);
+        let selected_definition = zuno_catalog::agent::resolve(configured_agents, &[])
+            .into_iter()
+            .find(|entry| entry.name == agent_name)
+            .unwrap_or_else(|| panic!("native Agent `{agent_name}`"));
         let selected_agent = agent_profile(selected_definition, directory.path(), &config);
         let runtime = tool_runtime::assemble(
             directory.path(),
@@ -4327,6 +4657,7 @@ mod production_registry {
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
                 background_executions: test_background_executions(directory.path()),
+                sandbox: test_sandbox(),
                 todo_store: Arc::new(
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),
@@ -4335,7 +4666,7 @@ mod production_registry {
                     GoalStore::open_memory(goal_spill.path().to_owned())
                         .expect("in-memory goal store"),
                 ),
-                mcp_loader: None,
+                mcp_loader,
                 skills: Arc::new(skills),
                 capability: test_capability(),
                 delegation: test_delegation(),
@@ -4344,6 +4675,7 @@ mod production_registry {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                tool_authority,
             },
         )?;
         let ids = runtime
@@ -4371,6 +4703,121 @@ mod production_registry {
 
     fn assemble() -> Fixture {
         assemble_with(zuno_catalog::skill::Skills::default())
+    }
+
+    #[test]
+    fn delegated_work_agents_inherit_matching_mcp_tools_from_the_parent_attempt() {
+        for agent in ["deep", "general"] {
+            let tool = dynamic_tool("query the indexed code graph");
+            let fixture = try_assemble_for_agent_runtime(
+                agent,
+                zuno_catalog::skill::Skills::default(),
+                zuno_config::schema::Config::default(),
+                Some(Arc::new(FixedMcpLoader(vec![Arc::clone(&tool)]))),
+                Some(authority_for(&tool)),
+            )
+            .unwrap_or_else(|error| panic!("{agent} registry assembles: {error}"));
+
+            assert_eq!(fixture.ids, vec![DYNAMIC_TOOL_ID], "{agent}");
+        }
+    }
+
+    #[test]
+    fn read_only_agents_do_not_inherit_arbitrary_mcp_tools() {
+        for agent in ["explorer", "oracle"] {
+            let tool = dynamic_tool("query the indexed code graph");
+            let fixture = try_assemble_for_agent_runtime(
+                agent,
+                zuno_catalog::skill::Skills::default(),
+                zuno_config::schema::Config::default(),
+                Some(Arc::new(FixedMcpLoader(vec![Arc::clone(&tool)]))),
+                Some(authority_for(&tool)),
+            )
+            .unwrap_or_else(|error| panic!("{agent} registry assembles: {error}"));
+
+            assert!(fixture.ids.is_empty(), "{agent}: {:?}", fixture.ids);
+        }
+    }
+
+    #[test]
+    fn a_read_only_agent_can_explicitly_opt_into_one_known_mcp_tool() {
+        let config = zuno_config::schema::Config::from_json_str(
+            Path::new("zuno.json"),
+            r#"{
+                "agents": {
+                    "explorer": {
+                        "permission": {
+                            "rules": {"codegraph_query": "allow"}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("Agent permission parses");
+        let tool = dynamic_tool("query the indexed code graph");
+        let fixture = try_assemble_for_agent_runtime(
+            "explorer",
+            zuno_catalog::skill::Skills::default(),
+            config,
+            Some(Arc::new(FixedMcpLoader(vec![Arc::clone(&tool)]))),
+            Some(authority_for(&tool)),
+        )
+        .expect("explorer registry assembles");
+
+        assert_eq!(fixture.ids, vec![DYNAMIC_TOOL_ID]);
+    }
+
+    #[test]
+    fn a_child_cannot_gain_an_mcp_tool_absent_from_the_parent_attempt() {
+        let tool = dynamic_tool("query the indexed code graph");
+        let fixture = try_assemble_for_agent_runtime(
+            "deep",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+            Some(Arc::new(FixedMcpLoader(vec![tool]))),
+            Some(Arc::from(
+                Vec::<zuno_orchestration::ToolSchemaIdentity>::new(),
+            )),
+        )
+        .expect("deep registry assembles");
+
+        assert!(fixture.ids.is_empty(), "{:?}", fixture.ids);
+    }
+
+    #[test]
+    fn a_same_name_mcp_tool_with_a_changed_schema_is_not_inherited() {
+        let parent_tool = dynamic_tool("parent schema");
+        let child_tool = dynamic_tool("changed child schema");
+        let fixture = try_assemble_for_agent_runtime(
+            "deep",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+            Some(Arc::new(FixedMcpLoader(vec![child_tool]))),
+            Some(authority_for(&parent_tool)),
+        )
+        .expect("deep registry assembles");
+
+        assert!(fixture.ids.is_empty(), "{:?}", fixture.ids);
+    }
+
+    #[test]
+    fn explicit_user_denies_override_role_level_mcp_inheritance() {
+        let config = zuno_config::schema::Config::from_json_str(
+            Path::new("zuno.json"),
+            r#"{"permission":{"rules":{"codegraph_query":"deny"}}}"#,
+        )
+        .expect("permission profile parses");
+        let tool = dynamic_tool("query the indexed code graph");
+        let fixture = try_assemble_for_agent_runtime(
+            "deep",
+            zuno_catalog::skill::Skills::default(),
+            config,
+            Some(Arc::new(FixedMcpLoader(vec![Arc::clone(&tool)]))),
+            Some(authority_for(&tool)),
+        )
+        .expect("deep registry assembles");
+
+        assert!(fixture.ids.is_empty(), "{:?}", fixture.ids);
     }
 
     #[test]
@@ -4610,6 +5057,7 @@ mod production_registry {
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
                 background_executions: test_background_executions(directory.path()),
+                sandbox: test_sandbox(),
                 todo_store: Arc::new(
                     zuno_db::Pool::open(&zuno_paths::DbLocation::Memory)
                         .expect("in-memory todo store"),
@@ -4627,6 +5075,7 @@ mod production_registry {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                tool_authority: None,
             },
         )
         .expect("production registry assembles");
@@ -4757,6 +5206,125 @@ mod skill_prompt {
         assert!(
             resolver.system_prompt.contains("action `load`"),
             "the prompt does not require loading the selected skill body"
+        );
+    }
+
+    #[test]
+    fn required_skills_resolve_unique_sources_in_configured_order() {
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "review",
+                Some("Review guidance".to_owned()),
+                PathBuf::from("/skills/review/SKILL.md"),
+                "review body",
+            ),
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "codegraph",
+                Some("CodeGraph guidance".to_owned()),
+                PathBuf::from("/skills/codegraph/SKILL.md"),
+                "codegraph body",
+            ),
+        ]);
+        let configured = vec!["codegraph".to_owned(), "review".to_owned()];
+
+        let resolved =
+            resolve_required_skill_identities("explorer", Some(configured.as_slice()), &skills)
+                .expect("required Skills resolve");
+
+        assert_eq!(
+            resolved,
+            vec![
+                SelectedSkillIdentity {
+                    name: "codegraph".to_owned(),
+                    source: "/skills/codegraph/SKILL.md".to_owned(),
+                },
+                SelectedSkillIdentity {
+                    name: "review".to_owned(),
+                    source: "/skills/review/SKILL.md".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn required_skills_fail_closed_when_missing_or_ambiguous() {
+        let missing = resolve_required_skill_identities(
+            "explorer",
+            Some(&["codegraph".to_owned()]),
+            &zuno_catalog::skill::Skills::default(),
+        )
+        .expect_err("missing required Skill must stop turn resolution");
+        assert!(
+            missing.contains("agents.explorer.requiredSkills"),
+            "{missing}"
+        );
+        assert!(missing.contains("codegraph"), "{missing}");
+
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "codegraph",
+                None,
+                PathBuf::from("/skills/one/SKILL.md"),
+                "one",
+            ),
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "codegraph",
+                None,
+                PathBuf::from("/skills/two/SKILL.md"),
+                "two",
+            ),
+        ]);
+        let ambiguous =
+            resolve_required_skill_identities("explorer", Some(&["codegraph".to_owned()]), &skills)
+                .expect_err("ambiguous required Skill must stop turn resolution");
+        assert!(
+            ambiguous.contains("agents.explorer.requiredSkills"),
+            "{ambiguous}"
+        );
+        assert!(ambiguous.contains("/skills/one/SKILL.md"), "{ambiguous}");
+        assert!(ambiguous.contains("/skills/two/SKILL.md"), "{ambiguous}");
+    }
+
+    #[tokio::test]
+    async fn required_skills_load_before_explicit_mentions_and_deduplicate_by_source() {
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "codegraph",
+                Some("Navigate indexed code.".to_owned()),
+                PathBuf::from("/skills/codegraph/SKILL.md"),
+                "# Complete codegraph guidance",
+            ),
+        ]);
+        let required = vec![SelectedSkillIdentity {
+            name: "codegraph".to_owned(),
+            source: "/skills/codegraph/SKILL.md".to_owned(),
+        }];
+        let mut resolver = resolver();
+        let mut loaded = BTreeSet::new();
+
+        let first = preload_required_skills(&mut resolver, &skills, &mut loaded, &required)
+            .await
+            .expect("required Skill preloads");
+        let explicit = preload_explicit_skills(
+            &mut resolver,
+            &skills,
+            &mut loaded,
+            "use codegraph for this task",
+        )
+        .await
+        .expect("explicit Skill scan");
+
+        assert_eq!(first, required);
+        assert!(explicit.is_empty());
+        assert_eq!(
+            resolver
+                .prompt_assembly
+                .as_ref()
+                .expect("prompt")
+                .envelope()
+                .selected_skills
+                .len(),
+            1
         );
     }
 

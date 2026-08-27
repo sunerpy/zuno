@@ -17,6 +17,7 @@
       "options": {
         "baseURL": "https://gateway.example.com/v1"
       },
+      "headers": {"X-Tenant": "tenant-a"},
       "models": {
         "primary-model": {
           "name": "Primary model",
@@ -42,6 +43,19 @@
 ```
 
 The checked starter file is [`examples/config/zuno.json`](../../examples/config/zuno.json). `transport` names a native Rust wire implementation; it is not the provider type, provider identity, authentication method, or concrete endpoint. `surface` selects `responses`, `chat`, or `messages`; an OpenAI-wire gateway should normally declare `"transport": "openai", "surface": "responses"`. A model may override the provider default under `models.<id>.provider.surface`. Use `openai-compatible` only when a gateway's behavior differs from OpenAI. Neither transport loads npm packages, starts Node, or runs an AI SDK.
+
+Provider-level headers are defaults for every configured model. A model may add
+or replace them under `provider.<id>.models.<model>.headers`; model-level `headers` win
+when the same name is present. A trusted runtime component may also attach
+request-local headers, which are applied last. This is the intended
+extension point for gateway routing, tenant, feature, and vendor-version
+headers, so those values do not need to be hard-coded in a Rust provider.
+
+Do not use configurable headers to reproduce another product's OAuth identity
+or service authorization. `Authorization`, `Content-Type`, and `Accept` belong
+to provider authentication and transport framing; native OpenAI ChatGPT OAuth
+also owns its account and residency headers. Store bearer credentials through
+the provider login flow or declared environment variables instead.
 
 ## First-run initialization
 
@@ -157,6 +171,8 @@ Important options include:
 | Key | Meaning |
 | --- | --- |
 | provider `surface` | Concrete API shape: `responses`, `chat`, or `messages` |
+| provider `headers` | Default extra HTTP headers for every model in the provider |
+| model `headers` | Per-model additions and overrides applied after provider headers |
 | `baseURL` or option `endpoint` | API base URL; option `endpoint` wins when both are set |
 | `apiKey` | config-local credential, preferred over the credential store |
 | `timeout` | whole-request timeout in milliseconds, or `false` |

@@ -34,6 +34,9 @@ pub struct ProviderConfig {
     /// Default request surface for this provider's models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surface: Option<ProviderSurface>,
+    /// Default extra HTTP headers for every model in this provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
     /// Models to keep, to the exclusion of the rest.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub whitelist: Option<Vec<String>>,

@@ -1,3 +1,5 @@
+mod support;
+
 use serde_json::json;
 use std::sync::Arc;
 use zuno_tool::{
@@ -5,7 +7,6 @@ use zuno_tool::{
     ToolOutput, ToolOutputStore,
 };
 use zuno_tools::output_policy::OutputPolicy;
-use zuno_tools::shell::ShellTool;
 
 fn limits() -> OutputLimits {
     OutputLimits {
@@ -117,8 +118,7 @@ fn output_policy_leaves_output_within_limits_unstored_and_unchanged() {
 async fn output_policy_shell_reads_the_central_accept_large_output_flag_before_decoding() {
     let workspace = tempfile::tempdir().expect("workspace");
     let store_dir = tempfile::tempdir().expect("store dir");
-    let tool = ShellTool::new(workspace.path())
-        .expect("shell tool")
+    let tool = support::sandbox::shell_tool(workspace.path())
         .with_output_store(ToolOutputStore::new(store_dir.path()))
         .with_output_limits(limits());
 

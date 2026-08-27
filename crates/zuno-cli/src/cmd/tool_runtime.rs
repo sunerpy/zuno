@@ -44,18 +44,22 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use zuno_agent::profile::AgentProfile;
+use zuno_agent::profile::ShellFilesystemAccess;
 use zuno_config::schema::Config;
+use zuno_config::schema::permission::PermissionMode;
+use zuno_config::schema::sandbox::{SandboxMode as ConfigSandboxMode, SandboxNetworkMode};
 use zuno_error::ToolError;
-use zuno_orchestration::CapabilitySnapshot;
+use zuno_orchestration::{CapabilitySnapshot, ToolSchemaIdentity, sha256_json};
 use zuno_paths::Env;
 use zuno_permission::Rule;
 use zuno_permission::visibility::permission_key;
+use zuno_sandbox::{NetworkAccess, SandboxBackend, SandboxMode, SandboxPolicy};
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase};
 use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::question::{QuestionAsker, QuestionTool};
 use zuno_tools::registry::{
-    BuiltinSlot, McpToolLoader, RegistryFlags, ResolveInput, ToolRegistryBuilder,
+    BuiltinSlot, CustomTool, McpToolLoader, RegistryFlags, ResolveInput, ToolRegistryBuilder,
 };
 use zuno_tools::search_common::{SearchScope, SearchTooling};
 use zuno_tools::websearch::gating::{SearchConfig, require_provider};
@@ -81,6 +85,11 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) contributions: Arc<zuno_harness::ToolContributions>,
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
     pub(crate) background_executions: Arc<zuno_pty::BackgroundExecutionService>,
+    /// Test seam for a backend already probed by the composition root.
+    ///
+    /// Production passes `None` and performs native discovery only when Shell
+    /// survives the final Agent capability intersection.
+    pub(crate) sandbox: Option<Arc<dyn SandboxBackend>>,
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
@@ -92,6 +101,19 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) councils: Arc<dyn zuno_tools::council::CouncilHost>,
     pub(crate) job_controller: Arc<dyn zuno_tools::job_cancel::JobController>,
     pub(crate) memory: Option<Arc<dyn Tool>>,
+    /// Exact provider-visible tools from the immutable parent Attempt.
+    pub(crate) tool_authority: Option<Arc<[ToolSchemaIdentity]>>,
+}
+
+#[derive(Clone)]
+struct FrozenMcpToolLoader {
+    tools: Vec<CustomTool>,
+}
+
+impl McpToolLoader for FrozenMcpToolLoader {
+    fn tools(&self) -> Vec<CustomTool> {
+        self.tools.clone()
+    }
 }
 
 /// The collaborators `task` needs, which only a surface that can drive a turn has.
@@ -136,7 +158,6 @@ pub(crate) fn assemble(
     selection: ToolSelection<'_>,
 ) -> Result<ToolRuntime, String> {
     let selected_agent = selected_profile.definition();
-    let rules = selected_profile.capabilities().rules().to_vec();
     let search = SearchConfig::from_profile(
         |key| env.value(key).map(str::to_owned),
         config.web_search.as_ref(),
@@ -157,6 +178,22 @@ pub(crate) fn assemble(
         .iter()
         .map(|tool| tool.id().to_owned())
         .collect::<BTreeSet<_>>();
+    let frozen_mcp_tools = selection.mcp_loader.as_ref().map(|loader| loader.tools());
+    let dynamic_tool_names = harness_tool_names
+        .iter()
+        .cloned()
+        .chain(
+            frozen_mcp_tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.id().to_owned()),
+        )
+        .collect::<BTreeSet<_>>();
+    let dynamic_tool_ids = dynamic_tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let rules = selected_profile.rules_with_extension_tools(&dynamic_tool_ids);
 
     let file_tools = FileTools::new(directory).map_err(to_string)?;
     let mut builder = ToolRegistryBuilder::new(directory, file_tools, flags)
@@ -167,10 +204,30 @@ pub(crate) fn assemble(
         worktree: worktree.map_or_else(|| directory.to_path_buf(), Path::to_path_buf),
     };
     let tooling = SearchTooling::discover(scope).map_err(to_string)?;
-    let shell =
-        zuno_tools::shell::ShellTool::with_configured_shell(directory, config.shell.as_deref())
-            .map_err(to_string)?
-            .with_background_executions(Arc::clone(&selection.background_executions));
+    let shell = shell_visible(selected_profile, selected_agent, &selection).then(|| {
+        let policy = sandbox_policy(directory, config, selected_profile, &rules)?;
+        let backend = selection.sandbox.clone().map_or_else(
+            || {
+                zuno_sandbox::system_backend(directory, policy.mode())
+                    .map(Arc::<dyn SandboxBackend>::from)
+                    .map_err(to_string)
+            },
+            Ok,
+        )?;
+        backend
+            .capabilities()
+            .supports(&policy)
+            .map_err(to_string)?;
+        zuno_tools::shell::ShellTool::with_sandbox_backend(
+            directory,
+            config.shell.as_deref(),
+            backend,
+            policy,
+        )
+        .map_err(to_string)
+        .map(|tool| tool.with_background_executions(Arc::clone(&selection.background_executions)))
+    });
+    let shell = shell.transpose()?;
     if selection.manifest.contains(BuiltinSlot::Question)
         && let Some(asker) = selection.question
     {
@@ -268,7 +325,6 @@ pub(crate) fn assemble(
             BuiltinSlot::Invalid,
             erase(zuno_tools::invalid::InvalidTool::new()),
         ),
-        (BuiltinSlot::Shell, Arc::new(shell) as Arc<dyn Tool>),
         (
             BuiltinSlot::Background,
             erase(zuno_tools::BackgroundTool::new(Arc::clone(
@@ -296,8 +352,15 @@ pub(crate) fn assemble(
                 .map_err(|error| error.to_string())?;
         }
     }
-    if let Some(loader) = selection.mcp_loader {
-        builder = builder.with_mcp_loader(loader);
+    if selection.manifest.contains(BuiltinSlot::Shell)
+        && let Some(shell) = shell
+    {
+        builder
+            .register_builtin(BuiltinSlot::Shell, Arc::new(shell))
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(tools) = frozen_mcp_tools {
+        builder = builder.with_mcp_loader(Arc::new(FrozenMcpToolLoader { tools }));
     }
 
     if let Some(memory) = selection.memory {
@@ -358,11 +421,100 @@ pub(crate) fn assemble(
     if !selected_profile.capabilities().can_delegate() {
         tools.retain(|tool| tool.ui_intent() != ToolUiIntent::Subagent);
     }
+    if let Some(authority) = selection.tool_authority.as_deref() {
+        tools.retain(|tool| {
+            let identity = tool.definition().schema_identity();
+            authority.iter().any(|expected| expected == &identity)
+        });
+    }
     Ok(ToolRuntime {
         tools,
         rules,
         suppressions,
     })
+}
+
+fn shell_visible(
+    selected_profile: &AgentProfile,
+    selected_agent: &zuno_catalog::agent::Agent,
+    selection: &ToolSelection<'_>,
+) -> bool {
+    selection.manifest.contains(BuiltinSlot::Shell)
+        && selected_profile.capabilities().tool_available("shell")
+        && selected_agent
+            .tools
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|tool| tool == "shell"))
+}
+
+fn sandbox_policy(
+    directory: &Path,
+    config: &Config,
+    selected_profile: &AgentProfile,
+    rules: &[Rule],
+) -> Result<SandboxPolicy, String> {
+    let configured_mode = config.sandbox_mode();
+    let mode = match selected_profile.capabilities().shell_filesystem_access() {
+        ShellFilesystemAccess::ReadOnly => SandboxMode::ReadOnly,
+        ShellFilesystemAccess::WorkspaceWrite => match configured_mode {
+            ConfigSandboxMode::ReadOnly => SandboxMode::ReadOnly,
+            ConfigSandboxMode::WorkspaceWrite => SandboxMode::WorkspaceWrite,
+            ConfigSandboxMode::DangerFullAccess => SandboxMode::DangerFullAccess,
+        },
+    };
+    let network = if mode == SandboxMode::DangerFullAccess {
+        NetworkAccess::Allowed
+    } else {
+        match config
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.network)
+            .unwrap_or(SandboxNetworkMode::Deny)
+        {
+            SandboxNetworkMode::Deny => NetworkAccess::Denied,
+            SandboxNetworkMode::Allow => NetworkAccess::Allowed,
+        }
+    };
+    let mut policy = SandboxPolicy::new(directory, mode, network).map_err(to_string)?;
+    if let Some(sandbox) = &config.sandbox {
+        if mode == SandboxMode::WorkspaceWrite {
+            policy = policy
+                .with_writable_roots(
+                    sandbox
+                        .writable_roots
+                        .iter()
+                        .flatten()
+                        .map(|path| resolve_sandbox_path(directory, path)),
+                )
+                .map_err(to_string)?;
+        }
+        policy = policy
+            .with_protected_paths(
+                sandbox
+                    .protected_paths
+                    .iter()
+                    .flatten()
+                    .map(|path| resolve_sandbox_path(directory, path)),
+            )
+            .map_err(to_string)?;
+    }
+    let mode = match config.permission_mode() {
+        PermissionMode::Standard => "standard",
+        PermissionMode::Strict => "strict",
+        PermissionMode::AllowAll => "allow_all",
+    };
+    let policy_sha256 =
+        sha256_json(&serde_json::to_value(rules).map_err(|error| error.to_string())?);
+    Ok(policy.with_approval_context(mode, policy_sha256))
+}
+
+fn resolve_sandbox_path(directory: &Path, configured: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(configured);
+    if path.is_absolute() {
+        path
+    } else {
+        directory.join(path)
+    }
 }
 
 fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {

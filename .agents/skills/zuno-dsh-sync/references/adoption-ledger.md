@@ -126,6 +126,22 @@ proves configured parallel-call ceilings above the bound and two-sided
 while keeping durable results in model order. No DSH API was copied and the
 unchanged baseline does not move.
 
+## 2026-08-27 no-delta review
+
+The recorded baseline and locally available upstream head both resolve to
+`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` (`dsh-v0.1.1-rc.2`). Refreshing the
+external checkout could not update `.git/FETCH_HEAD` from this restricted
+workspace, so this comparison is explicitly cache-derived. No new commit was
+observed and the baseline JSON was not advanced.
+
+The three-mode Shell vocabulary was classified `adapt`. Zuno exposes
+`read-only`, `workspace-write`, and `danger-full-access` as native typed policy,
+but adds a trusted configuration-source ceiling, Agent capability narrowing,
+fail-closed platform probes for confined modes, durable execution-authority
+schema version 2, and an explicit native backend for full access. Confined
+backend failure never selects full access. Approval, background execution,
+cancellation, logs, usage, and process lifecycle remain one shared path.
+
 ## dsh-v0.1.1-rc.1
 
 | Change | Classification | Zuno action |

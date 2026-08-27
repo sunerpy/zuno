@@ -154,6 +154,7 @@ impl ServerHostSpec {
             session: SessionChoice::Existing(self.session_id.clone()),
             title: None,
             effort: None,
+            tool_authority: None,
             extension_composition,
         }
     }

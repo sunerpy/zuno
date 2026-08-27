@@ -108,11 +108,16 @@ impl DynamicRules {
     }
 }
 
-pub(crate) fn resolved_rules(
+struct ResolvedRules {
+    rules: Vec<Rule>,
+    extension_rule_index: usize,
+}
+
+fn resolved_rule_set(
     entry: &agent::Agent,
     config: &Config,
     dynamic: &DynamicRules,
-) -> Vec<Rule> {
+) -> ResolvedRules {
     let mut rules = default_rules(dynamic);
 
     if entry.source.is_native()
@@ -128,6 +133,9 @@ pub(crate) fn resolved_rules(
         }
     }
 
+    // Extension grants belong to the native role layer. User and per-Agent rules
+    // follow this boundary and therefore retain final authority to deny them.
+    let extension_rule_index = rules.len();
     if let Some(user) = &config.permission {
         rules.extend(rules_from_config(user));
     }
@@ -147,7 +155,10 @@ pub(crate) fn resolved_rules(
             PermissionAction::Allow,
         ));
     }
-    rules
+    ResolvedRules {
+        rules,
+        extension_rule_index,
+    }
 }
 
 /// Freeze one catalog entry together with the exact rules this process enforces.
@@ -157,8 +168,13 @@ pub(crate) fn resolved_profile(
     dynamic: &DynamicRules,
     vision_available: bool,
 ) -> AgentProfile {
-    let rules = resolved_rules(&entry, config, dynamic);
-    AgentProfile::resolve(entry, rules, vision_available)
+    let resolved = resolved_rule_set(&entry, config, dynamic);
+    AgentProfile::resolve_with_extension_boundary(
+        entry,
+        resolved.rules,
+        resolved.extension_rule_index,
+        vision_available,
+    )
 }
 
 fn default_rules(dynamic: &DynamicRules) -> Vec<Rule> {

@@ -183,6 +183,7 @@ impl ProductionAcpAgent {
             session: SessionChoice::New,
             title: None,
             effort: None,
+            tool_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
         let session = self.open_session(options, client).await?;
@@ -240,6 +241,7 @@ impl ProductionAcpAgent {
                 session: choice,
                 title: None,
                 effort: None,
+                tool_authority: None,
                 extension_composition: ExtensionComposition::Active,
             };
             let session = self.open_session(options, client.clone()).await?;
@@ -861,6 +863,7 @@ fn host_options(host: &TurnHost, model: Option<String>) -> TurnOptions {
         session: host.rebuild_session_choice(),
         title: None,
         effort: host.effort_override(),
+        tool_authority: None,
         extension_composition: ExtensionComposition::Active,
     }
 }

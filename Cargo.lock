@@ -3610,6 +3610,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6269,6 +6278,7 @@ dependencies = [
  "zuno-provider-openai",
  "zuno-pty",
  "zuno-runtime",
+ "zuno-sandbox",
  "zuno-search",
  "zuno-server",
  "zuno-snapshot",
@@ -6712,6 +6722,7 @@ dependencies = [
  "uuid",
  "which",
  "zuno-process",
+ "zuno-sandbox",
 ]
 
 [[package]]
@@ -6736,6 +6747,21 @@ dependencies = [
  "futures",
  "thiserror 2.0.19",
  "tokio",
+]
+
+[[package]]
+name = "zuno-sandbox"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "libc",
+ "rustix 1.1.4",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -6893,6 +6919,7 @@ dependencies = [
  "zuno-paths",
  "zuno-permission",
  "zuno-pty",
+ "zuno-sandbox",
  "zuno-search",
  "zuno-testkit",
  "zuno-tool",
@@ -6941,6 +6968,7 @@ dependencies = [
  "zuno-observability",
  "zuno-permission",
  "zuno-pty",
+ "zuno-sandbox",
  "zuno-tool",
  "zuno-types",
 ]

@@ -90,8 +90,8 @@ use zuno_orchestration::{
     AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
     CouncilPresetDescriptor, CouncilRetryPolicyDescriptor, CouncilSeatDescriptor,
     CouncilSynthesisPolicyDescriptor, PackIdentity, PresetDescriptor, PresetRouteDescriptor,
-    PresetSelection, ProfileDescriptor, SkillCapabilityDescriptor, WorkflowNodeDescriptor,
-    WorkflowTemplateDescriptor, sha256_json, sha256_text,
+    PresetSelection, ProfileDescriptor, SkillCapabilityDescriptor, ToolSchemaIdentity,
+    WorkflowNodeDescriptor, WorkflowTemplateDescriptor, sha256_json, sha256_text,
 };
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_runtime::HarnessRuntime;
@@ -264,6 +264,8 @@ pub(crate) struct TurnOptions {
     /// default in place and keeps the request byte-identical to a build without this
     /// field.
     pub(crate) effort: Option<zuno_llm::effort::ReasoningEffort>,
+    /// Exact provider-visible tools from the parent Attempt for a delegated turn.
+    pub(crate) tool_authority: Option<Arc<[ToolSchemaIdentity]>>,
     /// Whether this host consumes the committed extension composition or the one
     /// pending transaction prepared for a quiescent replacement.
     pub(crate) extension_composition: ExtensionComposition,
@@ -305,6 +307,7 @@ pub(crate) struct TurnPlan {
     agents: Vec<zuno_catalog::agent::Agent>,
     agent: AgentProfile,
     capability: Arc<CapabilitySnapshot>,
+    tool_authority: Option<Arc<[ToolSchemaIdentity]>>,
     extensions: zuno_extension::ResolvedExtensions,
     extension_scope: zuno_extension::Scope,
     extension_revision: u64,
@@ -351,6 +354,8 @@ pub(crate) struct TurnPlan {
     /// load could hand back a body for a name the prompt never advertised, or refuse
     /// one it did.
     skills: Arc<zuno_catalog::skill::Skills>,
+    /// Exact visible Skill sources the active Agent requires on every turn.
+    required_skills: Vec<SelectedSkillIdentity>,
     /// The `AGENTS.md`-class rule files this session runs under, read once here.
     ///
     /// Loaded during resolution rather than at host construction because the read is
@@ -572,6 +577,12 @@ impl TurnPlan {
             .find(|profile| profile.name() == agent_name)
             .cloned()
             .ok_or_else(|| format!("Agent profile not found after resolution: {agent_name}"))?;
+        let agent = match options.tool_authority.as_deref() {
+            Some(authority) => {
+                agent.with_tool_authority(authority.iter().map(|tool| tool.name.clone()))
+            }
+            None => agent,
+        };
         let definition = agent.definition();
         let routed_variant = options
             .model
@@ -672,7 +683,7 @@ impl TurnPlan {
         let preset = selected_preset(&presets)?;
         resolver.orchestration_seed = Some(Arc::new(AttemptSeed {
             capability: capability.as_ref().clone(),
-            agent: agent_attempt_identity(&agent)?,
+            agent: agent_attempt_identity(&agent, options.tool_authority.as_deref())?,
             preset,
             parent_attempt: None,
             workflow: None,
@@ -686,6 +697,11 @@ impl TurnPlan {
                 agent.capabilities().rules(),
             )
         }));
+        let required_skills = resolve_required_skill_identities(
+            agent.name(),
+            definition.required_skills.as_deref(),
+            &skills,
+        )?;
         let mut runtime_surface =
             zuno_extension::runtime_surface(&extensions, &directory).map_err(to_string)?;
         let mut extension_tools = zuno_extension::lifecycle_tools(
@@ -720,6 +736,7 @@ impl TurnPlan {
             agents,
             agent,
             capability,
+            tool_authority: options.tool_authority.clone(),
             extensions,
             extension_scope,
             extension_revision,
@@ -745,6 +762,7 @@ impl TurnPlan {
             catalog_models,
             reasoning_efforts,
             skills,
+            required_skills,
             instructions,
             delegation_facts,
             vision_available,
@@ -1267,6 +1285,7 @@ pub(crate) struct TurnHost {
     resolver: Resolver,
     skills: Arc<zuno_catalog::skill::Skills>,
     selected_skills: BTreeSet<SelectedSkillIdentity>,
+    required_skills: Vec<SelectedSkillIdentity>,
     council_presets: Vec<String>,
     dispatcher: ToolRegistryDispatcher,
     tool_concurrency: ToolConcurrencyLimit,
@@ -2318,6 +2337,7 @@ impl TurnHost {
                     contributions: tool_contributions,
                     question,
                     background_executions: Arc::clone(&background_executions),
+                    sandbox: None,
                     todo_store,
                     goal_store: Arc::clone(&goal_store),
                     mcp_loader: mcp.map(|catalog| {
@@ -2349,6 +2369,7 @@ impl TurnHost {
                     councils: Arc::new(workflow_host.clone()),
                     job_controller: Arc::new(background_jobs.clone()),
                     memory: memory_tool,
+                    tool_authority: plan.tool_authority.clone(),
                 },
             )?;
             // Joins the notes so shadowing reaches whatever surface is watching: the
@@ -2387,6 +2408,7 @@ impl TurnHost {
                 resolver: plan.resolver,
                 skills: plan.skills,
                 selected_skills,
+                required_skills: plan.required_skills,
                 council_presets,
                 dispatcher,
                 tool_concurrency,
@@ -3655,6 +3677,22 @@ impl TurnHost {
         events: TurnEventSender,
     ) -> Result<(), String> {
         self.require_active_extension_composition()?;
+        let required = preload_required_skills(
+            &mut self.resolver,
+            &self.skills,
+            &mut self.selected_skills,
+            &self.required_skills,
+        )
+        .await?;
+        for skill in required {
+            events
+                .publish(TurnEvent::SkillLoaded {
+                    name: skill.name,
+                    source: skill.source,
+                })
+                .await
+                .map_err(to_string)?;
+        }
         let newly_loaded = preload_explicit_skills(
             &mut self.resolver,
             &self.skills,
@@ -4566,6 +4604,56 @@ fn restore_selected_skills(
         restored.insert(selected.identity);
     }
     Ok(restored)
+}
+
+fn resolve_required_skill_identities(
+    agent_name: &str,
+    required: Option<&[String]>,
+    skills: &zuno_catalog::skill::Skills,
+) -> Result<Vec<SelectedSkillIdentity>, String> {
+    let mut resolved = Vec::new();
+    for name in required.unwrap_or_default() {
+        let matches = skills.named(name);
+        match matches.as_slice() {
+            [] => {
+                return Err(format!(
+                    "agents.{agent_name}.requiredSkills references unavailable Skill `{name}` after Agent visibility filtering"
+                ));
+            }
+            [skill] => resolved.push(SelectedSkillIdentity {
+                name: skill.name.clone(),
+                source: skill.location.clone(),
+            }),
+            many => {
+                let sources = many
+                    .iter()
+                    .map(|skill| format!("`{}`", skill.location))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "agents.{agent_name}.requiredSkills references ambiguous Skill `{name}`; matching sources: {sources}"
+                ));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+async fn preload_required_skills(
+    resolver: &mut Resolver,
+    skills: &zuno_catalog::skill::Skills,
+    loaded: &mut BTreeSet<SelectedSkillIdentity>,
+    required: &[SelectedSkillIdentity],
+) -> Result<Vec<SelectedSkillIdentity>, String> {
+    let mut selected = Vec::new();
+    for skill in required {
+        if let Some(identity) =
+            preload_selected_skill(resolver, skills, loaded, &skill.name, &skill.source).await?
+        {
+            selected.push(identity);
+        }
+    }
+    Ok(selected)
 }
 
 async fn preload_selected_skill(
@@ -6118,13 +6206,19 @@ fn profile_descriptor(profile: &AgentProfile) -> Result<ProfileDescriptor, Strin
     })
 }
 
-fn agent_attempt_identity(profile: &AgentProfile) -> Result<AgentAttemptIdentity, String> {
+fn agent_attempt_identity(
+    profile: &AgentProfile,
+    tool_authority: Option<&[ToolSchemaIdentity]>,
+) -> Result<AgentAttemptIdentity, String> {
     let descriptor = profile_descriptor(profile)?;
     Ok(AgentAttemptIdentity {
         name: descriptor.name,
         source_id: descriptor.source_id,
         definition_sha256: descriptor.definition_sha256,
-        permission_sha256: descriptor.permission_sha256,
+        permission_sha256: sha256_json(&serde_json::json!({
+            "rules": profile.capabilities().rules(),
+            "parentToolAuthority": tool_authority,
+        })),
         prompt_policy_sha256: sha256_text(profile.prompt_policy()),
     })
 }

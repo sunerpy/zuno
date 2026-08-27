@@ -209,6 +209,56 @@ approval layer. The foreground TUI broker serializes all such asks, scopes stand
 to one session, and fails closed by rejecting pending requests when its last surface or
 wake channel closes.
 
+### Child capability authority and Skill loading
+
+A native child does not recompute an independent tool superset from the current
+configuration. The parent Attempt persists the exact provider-visible tool schemas used
+for its model request, and child resolution treats that frozen set of
+`ToolSchemaIdentity` values as its authority ceiling. Matching only a wire id is
+insufficient: a same-named tool whose provider-visible schema changed is not inherited
+from that Attempt.
+
+The target Agent role, its extension-tool policy, the configured exact `tools`
+allowlist, and the effective global, user, and Agent permission rules are then
+intersected with that ceiling. Each layer may hide or deny more tools; no later
+`allow` or `permission.mode: "allow_all"` can restore a tool schema that the parent
+model did not receive. `allow_all` affects HITL prompting, not capability construction.
+
+`prepare_request` hooks run after the registry snapshot is locked. They may remove or
+reorder tool schemas, but the engine rejects any added, replaced, or duplicated schema
+before provider dispatch. The durable Attempt therefore records the exact post-hook set
+without allowing the hook seam to widen registered authority.
+
+MCP and extension tools therefore do not flow unconditionally into every child. An
+exact schema must be present in the parent Attempt and no later allowlist or explicit
+deny may remove it. Work-capable native roles may opt into automatic extension
+inheritance. Read-only roles deliberately do not inherit arbitrary dynamic tools
+automatically; an operator may still grant one audited tool id with an exact per-Agent
+permission rule. This avoids treating every unknown MCP operation as read-only merely
+because the receiving Agent is read-only, without making a safe repository query
+impossible to authorize.
+
+Skill loading is separate from tool authority. Each initial or resumed child host
+independently discovers the Skill catalog from its own working directory,
+configuration layers, mounted profile, and active extensions. A Skill body already
+loaded by the parent is not copied into the child prompt. Instead,
+`agents.<name>.requiredSkills` names instruction sets that must resolve, after Agent and
+profile visibility filtering, to exactly one source. Before each provider-bound input,
+Zuno ensures those exact sources are loaded and de-duplicates sources already present
+in the durable prompt. A missing name or multiple visible sources with the same name
+fails child startup; Zuno never silently picks the first discovery result.
+
+For example, a code-retrieval Agent may declare
+`requiredSkills: ["codegraph"]` so every child turn receives the CodeGraph operating
+instructions. That declaration grants no executable capability. CodeGraph MCP tools
+remain available only when their exact schemas are inside the parent Attempt ceiling,
+the role either inherits extension tools or has exact per-Agent grants, its `tools`
+allowlist retains them, and no effective permission rule denies them.
+
+This authority model is informed by Codex's child-from-parent-effective-capability
+design. Codex is a design source, not a compatibility target: Zuno does not promise
+Codex configuration, role, MCP, Skill, wire, or runtime semantics.
+
 ## Prompt provenance
 
 Prompt assembly is ordered data, not string concatenation spread across the CLI. Every section has a stable identifier, source, exact content, and SHA-256 digest. The composition root currently orders:
@@ -537,8 +587,8 @@ temporary directory is creation rather than overwrite and does not receive this
 extra risk prompt. An exact, non-recursive forced removal of a statically named
 path that is currently absent below the OS temporary directory is likewise a
 no-op cleanup; existing targets, recursive removal, and dynamic targets remain
-human-only. The filesystem probe is advisory and does not turn `shell` into a
-sandbox.
+human-only. This filesystem probe is advisory risk classification; actual
+confinement comes from the separately selected sandbox mode and backend.
 
 Refusal is a typed lifecycle outcome rather than an execution failure.
 Malformed or unsafe arguments, unavailable tools, and permission denials emit
@@ -633,11 +683,9 @@ ripgrep-compatible walker. `rg` major version 14 or newer must be available on
 `PATH` (or packaged beside Zuno by a distributor). Missing or unsupported
 ripgrep is a startup error for the tool runtime, never a silent fallback.
 
-The Shell tool is not an OS sandbox. Its tree-sitter command analysis,
-deterministic destructive-command gate, permission checks, process-tree
-containment, working directory, and time limits reduce accidental execution
-risk, but the child still inherits the Zuno process's filesystem, network, and
-credentials. Existing redirect targets and other confirmable destructive
+The Shell tool is admitted through tree-sitter command analysis, the deterministic
+destructive-command gate, and permission checks, then compiled by the selected
+sandbox backend before process-tree containment starts. Existing redirect targets and other confirmable destructive
 operations require a fresh attached-user decision; static creation under the
 working directory or OS temporary directory and exact non-recursive `rm -f`
 cleanup of an absent OS-temporary path do not. Strict authorization adds HITL to
@@ -656,10 +704,30 @@ a POSIX shell or PowerShell because those are the syntax families the permission
 risk gates understand. Fish, Nushell, unknown interpreters, and `cmd.exe` fail closed;
 they are not treated as Bash-compatible aliases.
 
-Read-only Agents still do not receive this tool. A complete OS sandbox requires a
-typed authority snapshot, backend capability validation, policy compilation, and
-platform enforcement; a bwrap command prefix alone is insufficient. The
-fail-closed design and registration gate are recorded in
+On Linux, the backend resolves trusted system bubblewrap outside the workspace,
+probes namespace support, mounts the host root read-only, overlays exact writable
+roots, reapplies protected descendants, drops capabilities, sets `NoNewPrivs`,
+and installs seccomp in a first-party helper. Network is denied by default.
+The process layer accepts only `PreparedCommand`; it cannot spawn a
+confinement-required Shell call from raw argv.
+
+The public modes are `read-only`, `workspace-write`, and
+`danger-full-access`. `workspace-write` is the default. Trusted global, explicit,
+managed, environment, and CLI sources define the maximum; project configuration
+may only narrow it. An Agent's capability contract is intersected with that
+maximum, so a read-only Agent remains read-only under a wider invocation.
+
+`read-only` and `workspace-write` require a proved OS backend. Unavailable
+backends fail tool assembly without publishing a Shell definition; they never
+fall back to native execution. `danger-full-access` is an explicit native backend
+that retains host filesystem, process, credential, and network authority. It
+still produces a `PreparedCommand`, persists authority schema version 2, and
+uses the same cancellation, background, log, usage, and lifecycle paths.
+
+Confined macOS and Windows modes currently fail closed as unsupported, while
+explicit `danger-full-access` remains available. Tool output and durable
+background state expose the effective mode, backend, and network policy. The
+invariants and E2E matrix are recorded in
 [Shell sandbox roadmap](design/shell-sandbox-roadmap.md).
 
 ## Resident process containment

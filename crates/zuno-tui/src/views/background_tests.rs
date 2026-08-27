@@ -3,8 +3,44 @@ use crate::views::dialog::DialogStep;
 use crate::views::testkit::{action, press};
 use crossterm::event::KeyCode;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::Path;
 use std::time::Duration;
 use zuno_pty::{BackgroundExecutionInput, BackgroundExecutionRetention};
+use zuno_sandbox::{
+    NetworkAccess, PrepareRequest, PreparedCommand, SandboxCapabilities, SandboxMode, SandboxPolicy,
+};
+
+fn prepared(directory: &Path, command: &str) -> PreparedCommand {
+    let arguments = vec![OsString::from("-c"), OsString::from(command)];
+    let request = PrepareRequest {
+        program: OsString::from("/bin/sh"),
+        arguments: arguments.clone(),
+        cwd: directory.to_owned(),
+        environment: std::env::vars_os().collect::<BTreeMap<_, _>>(),
+        policy: SandboxPolicy::new(
+            directory,
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Allowed,
+        )
+        .expect("test sandbox policy"),
+    };
+    PreparedCommand::from_backend(
+        request,
+        OsString::from("/bin/sh"),
+        arguments,
+        &SandboxCapabilities {
+            backend: "test_direct".to_owned(),
+            executable: Some("/bin/sh".into()),
+            read_only: true,
+            workspace_write: true,
+            danger_full_access: false,
+            network_isolation: true,
+        },
+        vec![directory.to_owned()],
+        Vec::new(),
+    )
+}
 
 fn running() -> (
     tempfile::TempDir,
@@ -18,10 +54,7 @@ fn running() -> (
     );
     let info = service
         .start(BackgroundExecutionInput {
-            program: "/bin/sh".into(),
-            arguments: vec!["-c".into(), "printf ready; sleep 30".into()],
-            cwd: directory.path().to_owned(),
-            environment: std::env::vars_os().collect::<BTreeMap<_, _>>(),
+            prepared: prepared(directory.path(), "printf ready; sleep 30"),
             session_id: "session-a".to_owned(),
             title: "preview server".to_owned(),
             command: "printf ready; sleep 30".to_owned(),

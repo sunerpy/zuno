@@ -1,6 +1,12 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "shell": "/bin/zsh",
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "writableRoots": ["../shared-cache"],
+    "protectedPaths": [".zuno", ".agents"]
+  },
   "logLevel": "DEBUG",
   "server": {
     "port": 4096,
@@ -81,6 +87,7 @@
       "options": { "reasoningEffort": "medium" },
       "color": "#ff5733",
       "steps": 120,
+      "requiredSkills": ["codegraph"],
       "permission": {
         "mode": "standard",
         "rules": {
@@ -117,6 +124,7 @@
       "id": "anthropic",
       "transport": "anthropic",
       "surface": "messages",
+      "headers": { "X-Provider-Route": "anthropic" },
       "whitelist": ["claude-sonnet-4-5"],
       "blacklist": ["claude-2"],
       "options": {

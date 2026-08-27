@@ -242,6 +242,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         session,
         title: None,
         effort: None,
+        tool_authority: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
     let mut terminal = None;

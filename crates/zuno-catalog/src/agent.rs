@@ -134,6 +134,9 @@ pub struct Agent {
     /// Exact child-agent allowlist for direct delegation and workflows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegates: Option<Vec<String>>,
+    /// Skills loaded at the start of every turn for this agent.
+    #[serde(rename = "requiredSkills", skip_serializing_if = "Option::is_none")]
+    pub required_skills: Option<Vec<String>>,
     /// Provider options, including every unknown key swept in by
     /// [`AgentConfig`]'s deserializer.
     pub options: JsonMap,
@@ -502,6 +505,7 @@ fn from_builtin(builtin: builtin::Builtin) -> Agent {
         delegates: builtin
             .delegates
             .map(|targets| targets.iter().map(|target| (*target).to_owned()).collect()),
+        required_skills: None,
         options: JsonMap::new(),
         permission: None,
         source: AgentSource::Native,
@@ -525,6 +529,7 @@ fn new_agent(name: &str) -> Agent {
         steps: None,
         tools: None,
         delegates: None,
+        required_skills: None,
         options: JsonMap::new(),
         permission: None,
         source: AgentSource::Config,
@@ -576,6 +581,9 @@ fn apply(agent: &mut Agent, config: &AgentConfig) {
     }
     if let Some(delegates) = &config.delegates {
         agent.delegates = Some(delegates.clone());
+    }
+    if let Some(required_skills) = &config.required_skills {
+        agent.required_skills = Some(required_skills.clone());
     }
 
     // A `name` key renames the resolved agent while the config lookup key remains
@@ -900,6 +908,57 @@ mod tests {
         assert_eq!(
             custom.options.get("nested"),
             Some(&serde_json::json!({ "a": 1, "b": 2 }))
+        );
+    }
+
+    #[test]
+    fn required_skills_survive_agent_merge_and_the_overlay_replaces_the_list() {
+        let base = map(serde_json::json!({
+            "custom": { "requiredSkills": ["codegraph", "review"] },
+        }));
+        let overlay = map(serde_json::json!({
+            "custom": { "requiredSkills": ["security-review"] },
+        }));
+        let merged = merge_agent_maps(&base, &overlay).expect("merge succeeds");
+        assert_eq!(
+            merged
+                .get("custom")
+                .and_then(|config| config.required_skills.as_deref()),
+            Some(["security-review".to_owned()].as_slice())
+        );
+
+        let agents = resolve(&merged, &[]);
+        let custom = agents
+            .iter()
+            .find(|agent| agent.name == "custom")
+            .expect("custom exists");
+        assert_eq!(
+            custom.required_skills.as_deref(),
+            Some(["security-review".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn resolved_agent_serializes_required_skills_with_the_public_field_name() {
+        let agents = resolve(
+            &map(serde_json::json!({
+                "custom": { "requiredSkills": ["codegraph", "review"] },
+            })),
+            &[],
+        );
+        let custom = agents
+            .iter()
+            .find(|agent| agent.name == "custom")
+            .expect("custom exists");
+        let serialized = serde_json::to_value(custom).expect("agent serializes");
+
+        assert_eq!(
+            serialized.get("requiredSkills"),
+            Some(&serde_json::json!(["codegraph", "review"]))
+        );
+        assert!(
+            serialized.get("required_skills").is_none(),
+            "the Rust field name must not leak into the public JSON shape"
         );
     }
 

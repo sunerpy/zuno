@@ -47,9 +47,10 @@ use tokio::sync::broadcast;
 
 pub use crate::background::{
     BackgroundExecutionError, BackgroundExecutionEvent, BackgroundExecutionId,
-    BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionOutput,
-    BackgroundExecutionProjection, BackgroundExecutionRetention, BackgroundExecutionService,
-    BackgroundExecutionStatus, BackgroundWaitOutcome, MAX_RETAINED_TERMINAL_EXECUTIONS,
+    BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionLease,
+    BackgroundExecutionOutput, BackgroundExecutionProjection, BackgroundExecutionRetention,
+    BackgroundExecutionService, BackgroundExecutionStatus, BackgroundWaitOutcome,
+    MAX_RETAINED_TERMINAL_EXECUTIONS,
 };
 pub use crate::buffer::{BUFFER_LIMIT, Replay, ReplayCursor, ScrollbackBuffer};
 pub use crate::retention::EXITED_LIMIT;

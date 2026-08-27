@@ -37,7 +37,7 @@ use zuno_llm::event::{
     FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
     ThoughtSignature,
 };
-use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec};
+use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec, ToolSchema};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_observability::span;
 use zuno_orchestration::{
@@ -1448,6 +1448,7 @@ async fn run_turn_in_span(
             .last()
             .cloned()
             .unwrap_or_else(|| Message::new(Role::System, ""));
+        let hook_tool_authority = completion.tools.clone();
         context
             .hooks
             .prepare_request(
@@ -1460,6 +1461,8 @@ async fn run_turn_in_span(
                 &mut completion,
             )
             .await
+            .map_err(TurnError::Hook)?;
+        ensure_prepare_request_tool_subset(&hook_tool_authority, &completion.tools)
             .map_err(TurnError::Hook)?;
         completion
             .validate_tool_arguments()
@@ -3457,6 +3460,33 @@ fn completion_request(
     }
 }
 
+fn ensure_prepare_request_tool_subset(
+    locked: &[ToolSchema],
+    actual: &[ToolSchema],
+) -> Result<(), String> {
+    let mut remaining = locked.to_vec();
+    let mut unauthorized = Vec::new();
+    for tool in actual {
+        if let Some(position) = remaining.iter().position(|candidate| candidate == tool) {
+            remaining.remove(position);
+        } else {
+            unauthorized.push(tool.name.as_str());
+        }
+    }
+    if unauthorized.is_empty() {
+        return Ok(());
+    }
+    unauthorized.sort_unstable();
+    unauthorized.dedup();
+    Err(format!(
+        "prepare_request hook cannot add, replace, or duplicate tools after the registry snapshot is locked; unauthorized tool schemas: {}",
+        unauthorized
+            .into_iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
 fn hook_messages(history: &[MessageWithParts]) -> Vec<HookMessageWithParts> {
     let retained = retained_history(history);
     project_history("", retained)

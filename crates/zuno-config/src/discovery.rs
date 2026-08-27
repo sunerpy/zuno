@@ -9,6 +9,7 @@
 
 use crate::Config;
 use crate::schema::JsonMap;
+use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -16,17 +17,24 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use zuno_error::ConfigError;
+use zuno_error::{ConfigError, ConfigIssue};
 use zuno_paths::project::ResolvedProject;
-use zuno_paths::{CONFIG_FILE_STEM, Env, Layout};
+use zuno_paths::{CONFIG_FILE_STEM, Env, Layout, PROJECT_CONFIG_DIRECTORY};
 
 const ZUNO_CONFIG: &str = "ZUNO_CONFIG";
 const ZUNO_CONFIG_CONTENT: &str = "ZUNO_CONFIG_CONTENT";
 const ZUNO_PERMISSION: &str = "ZUNO_PERMISSION";
+const ZUNO_SANDBOX_MODE: &str = "ZUNO_SANDBOX_MODE";
 const ZUNO_DISABLE_AUTOCOMPACT: &str = "ZUNO_DISABLE_AUTOCOMPACT";
 const ZUNO_DISABLE_PRUNE: &str = "ZUNO_DISABLE_PRUNE";
 const ZUNO_TEST_MANAGED_CONFIG_DIR: &str = "ZUNO_TEST_MANAGED_CONFIG_DIR";
 const MERGED_CONFIG_SOURCE: &str = "<merged config>";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxLayerAuthority {
+    Trusted,
+    Project,
+}
 
 /// A decoded macOS managed-preferences document and the plist it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,18 +197,22 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     // Each file is one layer, so list-like values retain their per-layer merge
     // semantics between JSON and JSONC too.
     for path in Layout::file_in_directory(options.layout.config(), CONFIG_FILE_STEM) {
-        merge_file(&mut result, &path)?;
+        merge_file(&mut result, &path, SandboxLayerAuthority::Trusted)?;
     }
 
     // config.ts:401-404.
     if let Some(path) = options.env.truthy_value(ZUNO_CONFIG) {
-        merge_file(&mut result, &resolve_from(&options.directory, path))?;
+        merge_file(
+            &mut result,
+            &resolve_from(&options.directory, path),
+            SandboxLayerAuthority::Trusted,
+        )?;
     }
 
     // config.ts:406-410 and ConfigPaths.files: ancestors first, nearest last.
     if !options.layout.project_config_disabled() {
         for path in Layout::config_files(CONFIG_FILE_STEM, &options.directory, options.worktree()) {
-            merge_file(&mut result, &path)?;
+            merge_file(&mut result, &path, SandboxLayerAuthority::Project)?;
         }
     }
 
@@ -209,29 +221,49 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
     for directory in
         read_config_directories(&options.layout, &options.directory, options.worktree())
     {
+        let authority = config_directory_authority(options, &directory);
         for path in Layout::file_in_directory(&directory, CONFIG_FILE_STEM) {
-            merge_file(&mut result, &path)?;
+            merge_file(&mut result, &path, authority)?;
         }
     }
     result.insert_if_absent("command", RawJson::empty_object());
 
     // config.ts:468-475. This virtual layer does not receive schema injection.
     if let Some(text) = options.env.truthy_value(ZUNO_CONFIG_CONTENT) {
-        let layer = parse_layer(Path::new(ZUNO_CONFIG_CONTENT), text)?;
+        let layer = parse_layer(
+            Path::new(ZUNO_CONFIG_CONTENT),
+            text,
+            SandboxLayerAuthority::Trusted,
+        )?;
         merge_config(&mut result, layer);
+    }
+
+    if let Some(value) = options.env.truthy_value(ZUNO_SANDBOX_MODE) {
+        let mode = SandboxMode::parse(value).ok_or_else(|| ConfigError::Invalid {
+            path: PathBuf::from(ZUNO_SANDBOX_MODE),
+            issues: vec![ConfigIssue::new(
+                ["sandbox", "mode"],
+                "expected read-only, workspace-write, or danger-full-access",
+            )],
+        })?;
+        apply_sandbox_mode_override(&mut result, mode);
     }
 
     // config.ts:516-522.
     if options.managed_config_dir.exists() {
         for path in Layout::file_in_directory(&options.managed_config_dir, CONFIG_FILE_STEM) {
-            merge_file(&mut result, &path)?;
+            merge_file(&mut result, &path, SandboxLayerAuthority::Trusted)?;
         }
     }
 
     // config.ts:524-534. This assignment is deliberately after every other
     // config source, making it testably highest precedence even on Linux.
     if let Some(preferences) = managed_preferences(options) {
-        let layer = parse_layer(preferences.source(), preferences.text())?;
+        let layer = parse_layer(
+            preferences.source(),
+            preferences.text(),
+            SandboxLayerAuthority::Trusted,
+        )?;
         merge_config(&mut result, layer);
     }
 
@@ -343,7 +375,11 @@ fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), Config
     Ok(())
 }
 
-fn merge_file(result: &mut RawJson, path: &Path) -> Result<(), ConfigError> {
+fn merge_file(
+    result: &mut RawJson,
+    path: &Path,
+    authority: SandboxLayerAuthority,
+) -> Result<(), ConfigError> {
     if !path.exists() {
         return Ok(());
     }
@@ -351,18 +387,103 @@ fn merge_file(result: &mut RawJson, path: &Path) -> Result<(), ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let layer = parse_layer(path, &text)?;
+    let layer = parse_layer(path, &text, authority)?;
     merge_config(result, layer);
     Ok(())
 }
 
-fn parse_layer(path: &Path, text: &str) -> Result<RawJson, ConfigError> {
+fn parse_layer(
+    path: &Path,
+    text: &str,
+    authority: SandboxLayerAuthority,
+) -> Result<RawJson, ConfigError> {
     // Todo 9's variable substitution seam is immediately before this byte-stable
     // JSONC pass. Discovery itself deliberately does not interpret {env:...} or
     // {file:...} tokens.
     let strict = strip_jsonc(text);
     let config = Config::from_json_str(path, &strict)?;
+    validate_layer_authority(path, &config, authority)?;
     raw_from_config(path, &config)
+}
+
+fn validate_layer_authority(
+    path: &Path,
+    config: &Config,
+    authority: SandboxLayerAuthority,
+) -> Result<(), ConfigError> {
+    if authority == SandboxLayerAuthority::Trusted {
+        return Ok(());
+    }
+    let Some(sandbox) = &config.sandbox else {
+        return Ok(());
+    };
+    let mut issues = Vec::new();
+    if sandbox
+        .mode
+        .is_some_and(|mode| mode != SandboxMode::ReadOnly)
+    {
+        issues.push(ConfigIssue::new(
+            ["sandbox", "mode"],
+            "project config may only narrow sandbox.mode to read-only; wider modes require a trusted global, managed, environment, or CLI layer",
+        ));
+    }
+    if sandbox.network == Some(SandboxNetworkMode::Allow) {
+        issues.push(ConfigIssue::new(
+            ["sandbox", "network"],
+            "project config cannot grant host network access; use a trusted global, managed, environment, or CLI layer",
+        ));
+    }
+    if sandbox
+        .writable_roots
+        .as_ref()
+        .is_some_and(|roots| !roots.is_empty())
+    {
+        issues.push(ConfigIssue::new(
+            ["sandbox", "writableRoots"],
+            "project config cannot grant external writable roots; use a trusted global, managed, environment, or CLI layer",
+        ));
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            issues,
+        })
+    }
+}
+
+fn config_directory_authority(
+    options: &DiscoveryOptions,
+    directory: &Path,
+) -> SandboxLayerAuthority {
+    let home = options.layout.home().join(PROJECT_CONFIG_DIRECTORY);
+    let explicit = options
+        .layout
+        .config_dir_override()
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| directory == Path::new(value));
+    if directory == home || explicit {
+        SandboxLayerAuthority::Trusted
+    } else {
+        SandboxLayerAuthority::Project
+    }
+}
+
+fn apply_sandbox_mode_override(config: &mut RawJson, mode: SandboxMode) {
+    let sandbox = config.entry_or_insert("sandbox", RawJson::empty_object());
+    sandbox.insert("mode", RawJson::String(mode.as_str().to_owned()));
+    match mode {
+        SandboxMode::ReadOnly => {
+            sandbox.remove("writableRoots");
+        }
+        SandboxMode::WorkspaceWrite => {}
+        SandboxMode::DangerFullAccess => {
+            sandbox.remove("network");
+            sandbox.remove("writableRoots");
+            sandbox.remove("protectedPaths");
+        }
+    }
 }
 
 fn raw_from_config(path: &Path, config: &Config) -> Result<RawJson, ConfigError> {
@@ -751,6 +872,12 @@ impl RawJson {
                 }
             }
             this => *this = Self::Object(vec![(key, value)]),
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Self::Object(entries) = self {
+            entries.retain(|(candidate, _)| candidate != key);
         }
     }
 

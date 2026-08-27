@@ -38,6 +38,7 @@ zuno-paths = { workspace = true }
 zuno-permission = { workspace = true }
 zuno-pty = { workspace = true }
 zuno-search = { workspace = true }
+zuno-sandbox = { workspace = true }
 zuno-tool = { workspace = true }
 zuno-types = { workspace = true }
 reqwest = { workspace = true }

@@ -1,3 +1,5 @@
+mod support;
+
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -10,9 +12,7 @@ use zuno_error::ToolError;
 use zuno_permission::{PermissionAction, Rule, evaluate};
 use zuno_tool::{ACCEPT_LARGE_OUTPUT_KEY, AllowAll, InterruptHandle, Tool, ToolContext};
 use zuno_tool::{OutputLimits, ToolOutputStore};
-use zuno_tools::shell::{
-    ShellEnvHook, ShellEnvInput, ShellParams, ShellSyntax, ShellTool, analyze_command,
-};
+use zuno_tools::shell::{ShellEnvHook, ShellEnvInput, ShellParams, ShellSyntax, analyze_command};
 
 #[derive(Default)]
 struct FirableInterrupt {
@@ -63,7 +63,7 @@ fn params(command: impl Into<String>) -> ShellParams {
 #[test]
 fn shell_description_bounds_git_apply_and_defines_non_destructive_recovery() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
-    let tool = ShellTool::new(workspace.path()).expect("shell tool");
+    let tool = support::sandbox::shell_tool(workspace.path());
     let description = tool.description();
 
     for clause in [
@@ -152,7 +152,7 @@ async fn shell_cancellation_kills_the_shell_and_its_whole_process_group() {
         child_file.display()
     );
     let interrupt = Arc::new(FirableInterrupt::default());
-    let tool = ShellTool::new(dir.path()).expect("shell tool");
+    let tool = support::sandbox::shell_tool(dir.path());
     let run_context = context(interrupt.clone());
 
     let running = tokio::spawn(async move { tool.run(params(command), run_context).await });
@@ -179,9 +179,8 @@ async fn shell_injected_hard_ceiling_really_terminates_the_process_under_two_sec
     let dir = tempfile::tempdir().expect("temp dir");
     let pid_file = dir.path().join("ceiling.pid");
     let command = format!("printf '%s' \"$$\" > '{}'; sleep 30", pid_file.display());
-    let tool = ShellTool::new(dir.path())
-        .expect("shell tool")
-        .with_hard_ceiling(Duration::from_millis(100));
+    let tool =
+        support::sandbox::shell_tool(dir.path()).with_hard_ceiling(Duration::from_millis(100));
     let started = Instant::now();
 
     let error = tool
@@ -216,9 +215,7 @@ impl ShellEnvHook for InjectEnv {
 #[tokio::test]
 async fn shell_env_hook_injects_call_scoped_environment() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let tool = ShellTool::new(dir.path())
-        .expect("shell tool")
-        .with_env_hook(Arc::new(InjectEnv));
+    let tool = support::sandbox::shell_tool(dir.path()).with_env_hook(Arc::new(InjectEnv));
 
     let output = tool
         .run(
@@ -235,8 +232,7 @@ async fn shell_env_hook_injects_call_scoped_environment() {
 #[tokio::test]
 async fn configured_shell_is_named_in_the_durable_output() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let tool = ShellTool::with_configured_shell(dir.path(), Some("/bin/sh"))
-        .expect("configured shell tool");
+    let tool = support::sandbox::configured_shell_tool(dir.path(), Some("/bin/sh"));
     let definition = tool.definition();
     assert_eq!(definition.id, "shell", "wire id is platform-neutral");
     assert_eq!(definition.display_name, "sh");
@@ -261,7 +257,7 @@ async fn shell_background_mode_returns_before_the_command_finishes() {
     let marker = dir.path().join("background-finished");
     let mut input = params(format!("sleep 0.1; touch '{}'", marker.display()));
     input.background = true;
-    let tool = ShellTool::new(dir.path()).expect("shell tool");
+    let tool = support::sandbox::shell_tool(dir.path());
     let started = Instant::now();
 
     let output = tool
@@ -280,8 +276,7 @@ async fn shell_oversized_output_is_detected_and_persisted_in_the_shared_store() 
     let dir = tempfile::tempdir().expect("temp dir");
     let store_dir = tempfile::tempdir().expect("store dir");
     let store = ToolOutputStore::new(store_dir.path());
-    let tool = ShellTool::new(dir.path())
-        .expect("shell tool")
+    let tool = support::sandbox::shell_tool(dir.path())
         .with_output_store(store.clone())
         .with_output_limits(OutputLimits {
             max_lines: 1,

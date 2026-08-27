@@ -10,6 +10,7 @@ use zuno_config::schema::ordered::OrderedMap;
 use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
+use zuno_config::schema::sandbox::{SandboxMode, SandboxNetworkMode};
 use zuno_error::ConfigError;
 use zuno_paths::Env;
 
@@ -151,6 +152,142 @@ fn explicit_config_overrides_ignore_unrelated_product_config() {
 
         assert_eq!(config.model.as_deref(), Some("provider/override"), "{key}");
     }
+}
+
+#[test]
+fn trusted_layers_may_select_full_access_but_project_layers_may_only_narrow() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    write(
+        &root.join("xdg-config/zuno/zuno.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    );
+    write(
+        &project.join(".zuno/zuno.json"),
+        r#"{"sandbox":{"mode":"read-only"}}"#,
+    );
+
+    let narrowed = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect("a project may narrow a trusted full-access choice");
+    assert_eq!(narrowed.sandbox_mode(), SandboxMode::ReadOnly);
+
+    write(
+        &project.join(".zuno/zuno.json"),
+        r#"{"sandbox":{"mode":"danger-full-access"}}"#,
+    );
+    let error = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect_err("a project file must not disable confinement");
+    let ConfigError::Invalid { path, issues } = error else {
+        panic!("expected project sandbox validation failure");
+    };
+    assert_eq!(path, project.join(".zuno/zuno.json"));
+    assert_eq!(issues[0].key_path, ["sandbox", "mode"]);
+    assert!(issues[0].detail.contains("trusted"));
+}
+
+#[test]
+fn project_layers_cannot_grant_host_network_or_external_write_roots() {
+    for (body, key) in [
+        (r#"{"sandbox":{"network":"allow"}}"#, "network"),
+        (
+            r#"{"sandbox":{"writableRoots":["../shared-cache"]}}"#,
+            "writableRoots",
+        ),
+        (r#"{"sandbox":{"mode":"workspace-write"}}"#, "mode"),
+    ] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join(".git")).expect("worktree marker");
+        let path = project.join(".zuno/zuno.json");
+        write(&path, body);
+
+        let error = discover_with(&fixture_options(temp.path(), &project, std::iter::empty()))
+            .expect_err("project sandbox authority must be monotonic");
+        let ConfigError::Invalid {
+            path: actual,
+            issues,
+        } = error
+        else {
+            panic!("expected project sandbox validation failure");
+        };
+        assert_eq!(actual, path);
+        assert_eq!(issues[0].key_path, ["sandbox", key]);
+        assert!(issues[0].detail.contains("trusted"));
+    }
+}
+
+#[test]
+fn sandbox_mode_env_override_clears_confined_fields_for_danger_full_access() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let config = discover_with(&fixture_options(
+        temp.path(),
+        &project,
+        [
+            (
+                "ZUNO_CONFIG_CONTENT".to_owned(),
+                r#"{
+                    "model":"provider/model",
+                    "sandbox":{
+                        "mode":"workspace-write",
+                        "network":"deny",
+                        "writableRoots":["../shared-cache"],
+                        "protectedPaths":[".git"]
+                    }
+                }"#
+                .to_owned(),
+            ),
+            (
+                "ZUNO_SANDBOX_MODE".to_owned(),
+                "danger-full-access".to_owned(),
+            ),
+        ],
+    ))
+    .expect("the invocation mode override must replace incompatible confined fields");
+
+    assert_eq!(config.model.as_deref(), Some("provider/model"));
+    let sandbox = config.sandbox.expect("sandbox config");
+    assert_eq!(sandbox.mode, Some(SandboxMode::DangerFullAccess));
+    assert_eq!(sandbox.network, None);
+    assert_eq!(sandbox.writable_roots, None);
+    assert_eq!(sandbox.protected_paths, None);
+}
+
+#[test]
+fn sandbox_mode_env_override_clears_only_writable_roots_for_read_only() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let config = discover_with(&fixture_options(
+        temp.path(),
+        &project,
+        [
+            (
+                "ZUNO_CONFIG_CONTENT".to_owned(),
+                r#"{
+                    "sandbox":{
+                        "mode":"workspace-write",
+                        "network":"allow",
+                        "writableRoots":["../shared-cache"],
+                        "protectedPaths":[".git"]
+                    }
+                }"#
+                .to_owned(),
+            ),
+            ("ZUNO_SANDBOX_MODE".to_owned(), "read-only".to_owned()),
+        ],
+    ))
+    .expect("the read-only override must remove write authority");
+
+    let sandbox = config.sandbox.expect("sandbox config");
+    assert_eq!(sandbox.mode, Some(SandboxMode::ReadOnly));
+    assert_eq!(sandbox.network, Some(SandboxNetworkMode::Allow));
+    assert_eq!(sandbox.writable_roots, None);
+    assert_eq!(
+        sandbox.protected_paths.as_deref(),
+        Some([".git".to_owned()].as_slice())
+    );
 }
 
 #[test]

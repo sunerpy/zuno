@@ -1,6 +1,6 @@
 # Harness design comparison
 
-Status: 2026-08-23.
+Status: 2026-08-27.
 
 This document records which ideas Zuno adopts from other agent harnesses. The source projects are references, not runtime compatibility targets.
 
@@ -63,6 +63,11 @@ Zuno adapts:
   `host.full` processes when a guest needs unrestricted host APIs. Rust dynamic
   libraries remain rejected because unload safety and ABI compatibility cannot
   be proven;
+- DSH's `read-only | workspace-write | danger-full-access` vocabulary becomes a
+  typed native Shell authority. Zuno adds trusted-source provenance, Agent
+  capability narrowing, fail-closed confined backends, durable authority
+  snapshots, and an explicit native backend instead of treating full access as
+  a fallback;
 - worker-thread orchestration becomes Tokio tasks with durable SQLite coordination.
 - product-owned Codex and Claude Code subagents become native Rust protocol
   providers, static Zuno tools, and durable `ProductAgent` jobs rather than a
@@ -71,6 +76,12 @@ Zuno adapts:
 ### Codex
 
 Codex demonstrates the value of a focused Rust core, explicit sandbox and approval decisions, durable thread state, and a goal store that survives ordinary conversation churn. Zuno adopts a separate goal database, typed terminal states, persistent recovery metadata, and user-input priority.
+
+Zuno follows Codex's key security split: approval decides whether an intent may
+run, while confinement limits what the process can do. `allow_all` and TUI
+automation therefore do not widen the sandbox, and selecting
+`danger-full-access` does not erase permission denials. Every mode retains one
+process lifecycle and durable authority path.
 
 Zuno extends the goal idea with cross-turn exponential backoff. Provider retries remain bounded inside one request, while an active goal can schedule another turn indefinitely for typed recoverable failures. Unknown side-effect outcomes are never blindly replayed.
 

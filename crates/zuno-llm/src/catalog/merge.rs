@@ -323,6 +323,12 @@ pub fn apply_config(
         }
     }
 
+    if let Some(headers) = &config.headers {
+        for model in models.values_mut() {
+            model.headers.extend(headers.clone());
+        }
+    }
+
     if let Some(declared) = &config.models {
         for (model_key, model_config) in declared.iter() {
             // `:1437` looks the existing model up by the *wire* id when config
@@ -576,6 +582,13 @@ fn merge_model(
     let mut headers = existing
         .map(|model| model.headers.clone())
         .unwrap_or_default();
+    if let Some(provider_headers) = &provider_config.headers {
+        headers.extend(
+            provider_headers
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
     if let Some(config_headers) = &config.headers {
         headers.extend(
             config_headers
@@ -972,6 +985,50 @@ mod tests {
         assert_eq!(model.cost.cache.write, 0.0, "absent upstream becomes zero");
         assert!(model.capabilities.attachment, "inherited");
         assert_eq!(model.api.url, "https://api.deepseek.com", "inherited");
+    }
+
+    #[test]
+    fn provider_headers_apply_to_every_model_and_model_headers_win() {
+        let catalog = catalog_provider();
+        let existing = from_catalog("deepseek", &catalog);
+        let mut outcome = MergeOutcome::default();
+
+        let defaults_only =
+            provider_config(r#"{"headers":{"X-Provider":"provider","X-Shared":"provider"}}"#);
+        let resolved = apply_config(
+            "deepseek",
+            &defaults_only,
+            Some(&existing),
+            Some(&catalog),
+            &mut outcome,
+        );
+        let inherited = &resolved.models["deepseek-chat"];
+        assert_eq!(inherited.headers["X-Provider"], "provider");
+        assert_eq!(inherited.headers["X-Shared"], "provider");
+
+        let with_models = provider_config(
+            r#"{
+                "headers":{"X-Provider":"provider","X-Shared":"provider"},
+                "models":{
+                    "deepseek-chat":{"headers":{"X-Shared":"model"}},
+                    "brand-new":{"headers":{"X-Model":"model"}}
+                }
+            }"#,
+        );
+        let resolved = apply_config(
+            "deepseek",
+            &with_models,
+            Some(&existing),
+            Some(&catalog),
+            &mut outcome,
+        );
+        let overridden = &resolved.models["deepseek-chat"];
+        assert_eq!(overridden.headers["X-Provider"], "provider");
+        assert_eq!(overridden.headers["X-Shared"], "model");
+        let brand_new = &resolved.models["brand-new"];
+        assert_eq!(brand_new.headers["X-Provider"], "provider");
+        assert_eq!(brand_new.headers["X-Shared"], "provider");
+        assert_eq!(brand_new.headers["X-Model"], "model");
     }
 
     #[test]

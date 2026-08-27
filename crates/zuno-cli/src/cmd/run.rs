@@ -48,6 +48,7 @@ pub(super) fn execute(
         session,
         title: args.title.clone(),
         effort: None,
+        tool_authority: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
     report_progress(progress);

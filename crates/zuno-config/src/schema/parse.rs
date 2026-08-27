@@ -22,6 +22,7 @@
 //! enclosing object and the deserializer's own message ("unknown variant `maybe`,
 //! expected `allow` or `deny`") supplies the rest.
 
+use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode};
 use crate::schema::{Config, KNOWN_TOP_LEVEL_KEYS};
 use serde_json::Value;
 use std::path::Path;
@@ -47,7 +48,9 @@ impl Config {
             source,
         })?;
         reject_unknown_top_level_keys(path, &value)?;
-        serde_json::from_str::<Self>(text).map_err(|error| invalid(path, &value, &error))
+        let config =
+            serde_json::from_str::<Self>(text).map_err(|error| invalid(path, &value, &error))?;
+        validate_semantics(path, config)
     }
 
     /// Parse one config layer from an already-decoded JSON document.
@@ -57,7 +60,60 @@ impl Config {
     /// [`from_json_str`](Self::from_json_str) whenever the text is still at hand.
     pub fn from_json_value(path: &Path, value: Value) -> Result<Self, ConfigError> {
         reject_unknown_top_level_keys(path, &value)?;
-        serde_json::from_value::<Self>(value.clone()).map_err(|error| invalid(path, &value, &error))
+        let config = serde_json::from_value::<Self>(value.clone())
+            .map_err(|error| invalid(path, &value, &error))?;
+        validate_semantics(path, config)
+    }
+}
+
+fn validate_semantics(path: &Path, config: Config) -> Result<Config, ConfigError> {
+    let Some(sandbox) = &config.sandbox else {
+        return Ok(config);
+    };
+    let mode = sandbox.resolved_mode();
+    let mut issues = Vec::new();
+    let has_writable_roots = sandbox
+        .writable_roots
+        .as_ref()
+        .is_some_and(|roots| !roots.is_empty());
+    let has_protected_paths = sandbox
+        .protected_paths
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty());
+
+    if mode == SandboxMode::ReadOnly && has_writable_roots {
+        issues.push(ConfigIssue::new(
+            ["sandbox", "writableRoots"],
+            "read-only mode cannot grant writable roots",
+        ));
+    }
+    if mode == SandboxMode::DangerFullAccess {
+        if sandbox.network == Some(SandboxNetworkMode::Deny) {
+            issues.push(ConfigIssue::new(
+                ["sandbox", "network"],
+                "danger-full-access inherits the host network and cannot enforce network deny",
+            ));
+        }
+        if has_writable_roots {
+            issues.push(ConfigIssue::new(
+                ["sandbox", "writableRoots"],
+                "danger-full-access already has host write authority; writableRoots would be misleading",
+            ));
+        }
+        if has_protected_paths {
+            issues.push(ConfigIssue::new(
+                ["sandbox", "protectedPaths"],
+                "danger-full-access cannot enforce protectedPaths",
+            ));
+        }
+    }
+    if issues.is_empty() {
+        Ok(config)
+    } else {
+        Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            issues,
+        })
     }
 }
 

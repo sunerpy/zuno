@@ -53,6 +53,7 @@ zuno-provider-google = { workspace = true }
 zuno-provider-openai = { workspace = true }
 zuno-pty = { workspace = true }
 zuno-runtime = { workspace = true }
+zuno-sandbox = { workspace = true }
 zuno-search = { workspace = true }
 zuno-server = { workspace = true }
 zuno-snapshot = { workspace = true }

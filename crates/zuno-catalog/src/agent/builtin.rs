@@ -367,6 +367,7 @@ impl Builtin {
                 ("glob", allow()),
                 ("grep", allow()),
                 ("lsp", allow()),
+                ("shell", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
                 ("question", allow()),
@@ -405,6 +406,7 @@ impl Builtin {
                 ("shell", allow()),
                 ("plan_get", allow()),
                 ("todo_get", allow()),
+                ("skill", allow()),
             ],
             "explorer" => vec![
                 ("*", deny()),
@@ -412,6 +414,8 @@ impl Builtin {
                 ("glob", allow()),
                 ("grep", allow()),
                 ("lsp", allow()),
+                ("shell", allow()),
+                ("skill", allow()),
             ],
             "librarian" => vec![
                 ("*", deny()),
@@ -419,8 +423,10 @@ impl Builtin {
                 ("glob", allow()),
                 ("grep", allow()),
                 ("lsp", allow()),
+                ("shell", allow()),
                 ("webfetch", allow()),
                 ("web_search", allow()),
+                ("skill", allow()),
             ],
             "oracle" | "looker" => vec![
                 ("*", deny()),
@@ -428,6 +434,8 @@ impl Builtin {
                 ("glob", allow()),
                 ("grep", allow()),
                 ("lsp", allow()),
+                ("shell", allow()),
+                ("skill", allow()),
             ],
             "compaction" | "title" | "summary" | "council-synth" => vec![("*", deny())],
             _ => return None,
@@ -583,6 +591,7 @@ mod tests {
             "glob",
             "grep",
             "lsp",
+            "shell",
             "webfetch",
             "web_search",
             "question",
@@ -599,7 +608,7 @@ mod tests {
                 "Plan mode must expose `{allowed}`"
             );
         }
-        for denied in ["shell", "write", "edit", "patch", "task", "execute"] {
+        for denied in ["write", "edit", "patch", "task", "execute"] {
             assert_ne!(
                 overlay.get(denied),
                 Some(&PermissionRule::Action(PermissionAction::Allow)),

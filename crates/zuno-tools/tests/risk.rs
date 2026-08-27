@@ -1,9 +1,11 @@
+mod support;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use zuno_error::ToolError;
 use zuno_tool::{NeverInterrupted, PermissionAsk, PermissionAsker, ToolContext};
 use zuno_tools::risk::{GateOutcome, RiskContext, assess_command, gate};
-use zuno_tools::shell::{ShellParams, ShellSyntax, ShellTool};
+use zuno_tools::shell::{ShellParams, ShellSyntax};
 
 fn risk_context() -> RiskContext {
     RiskContext {
@@ -334,7 +336,7 @@ async fn risk_existing_redirect_target_requires_fresh_human_approval() {
     let target = root.path().join("existing.txt");
     std::fs::write(&target, b"keep").expect("existing target");
     let permission = Arc::new(RecordingDenial::default());
-    let tool = ShellTool::new(&workspace).expect("shell tool");
+    let tool = support::sandbox::shell_tool(&workspace);
 
     let error = tool
         .run(
@@ -378,7 +380,7 @@ async fn risk_gate_runs_before_explicit_background_dispatch() {
     let target = directory.path().join("build");
     std::fs::create_dir(&target).expect("build directory");
     std::fs::write(target.join("sentinel"), b"keep").expect("sentinel");
-    let tool = ShellTool::new(directory.path()).expect("shell tool");
+    let tool = support::sandbox::shell_tool(directory.path());
     let permission = Arc::new(RecordingDenial::default());
 
     let error = tool

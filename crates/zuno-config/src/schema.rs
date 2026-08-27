@@ -25,6 +25,7 @@ pub mod preset;
 pub mod product_agent;
 pub mod provider;
 pub mod reference;
+pub mod sandbox;
 pub mod workflow;
 
 #[cfg(test)]
@@ -40,6 +41,7 @@ use crate::schema::preset::PresetConfig;
 use crate::schema::product_agent::ProductAgentConfig;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
+use crate::schema::sandbox::{SandboxConfig, SandboxMode, SandboxNetworkMode};
 use crate::schema::workflow::AgentWorkflowConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -54,6 +56,7 @@ pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "$schema",
     "shell",
+    "sandbox",
     "logLevel",
     "server",
     "command",
@@ -107,6 +110,9 @@ pub struct Config {
     /// Default shell for terminals and the model-facing Shell tool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// Native OS sandbox policy for model-initiated Shell calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxConfig>,
     /// Log level.
     #[serde(rename = "logLevel", skip_serializing_if = "Option::is_none")]
     pub log_level: Option<LogLevel>,
@@ -226,6 +232,22 @@ pub struct Config {
 }
 
 impl Config {
+    /// Resolve the maximum Shell sandbox authority.
+    #[must_use]
+    pub fn sandbox_mode(&self) -> SandboxMode {
+        self.sandbox
+            .as_ref()
+            .map_or(SandboxMode::WorkspaceWrite, SandboxConfig::resolved_mode)
+    }
+
+    /// Resolve configured network authority.
+    #[must_use]
+    pub fn sandbox_network(&self) -> SandboxNetworkMode {
+        self.sandbox
+            .as_ref()
+            .map_or(SandboxNetworkMode::Deny, SandboxConfig::resolved_network)
+    }
+
     /// Resolve the memory master switch and all component defaults.
     #[must_use]
     pub fn resolved_memory(&self) -> ResolvedMemoryConfig {

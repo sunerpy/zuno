@@ -761,6 +761,9 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
         if cancellation.is_cancelled() {
             return Err("child turn was cancelled before it started".to_owned());
         }
+        let parent_attempt = request.parent_attempt.as_deref().ok_or_else(|| {
+            "delegated child turn is missing the immutable parent Attempt snapshot".to_owned()
+        })?;
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
             model: request.model.as_ref().map(|model| model.model.clone()),
@@ -769,6 +772,7 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             session: SessionChoice::Existing(session_id.to_owned()),
             title: request.description.clone(),
             effort: request.effort,
+            tool_authority: Some(Arc::from(parent_attempt.tools.clone())),
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
@@ -778,9 +782,6 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             &plan.qualified_model(),
             plan.effort(),
         );
-        let parent_attempt = spec.parent_attempt.as_ref().ok_or_else(|| {
-            "delegated child turn is missing the immutable parent Attempt snapshot".to_owned()
-        })?;
         persist_child_session_spec(&self.database, session_id, &spec, &cancellation).await?;
         self.children.remember(session_id, spec.clone());
         plan.inherit_orchestration(
@@ -1046,6 +1047,9 @@ impl PendingInputDriver for InteractiveChildInputDriver {
         let spec = self
             .children
             .get_or_restore(&self.database, &input.session_id)?;
+        let parent_attempt = spec.parent_attempt.as_ref().ok_or_else(|| {
+            "interactive child session is missing the immutable parent Attempt snapshot".to_owned()
+        })?;
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
             model: Some(spec.model.clone()),
@@ -1054,16 +1058,15 @@ impl PendingInputDriver for InteractiveChildInputDriver {
             session: SessionChoice::Existing(input.session_id.clone()),
             title: spec.description.clone(),
             effort: spec.effort,
+            tool_authority: Some(Arc::from(parent_attempt.tools.clone())),
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
-        if let Some(parent_attempt) = spec.parent_attempt.as_ref() {
-            plan.inherit_orchestration(
-                parent_attempt,
-                spec.workflow.as_deref(),
-                spec.workflow_node.as_deref(),
-            )?;
-        }
+        plan.inherit_orchestration(
+            parent_attempt,
+            spec.workflow.as_deref(),
+            spec.workflow_node.as_deref(),
+        )?;
         let mut host = TurnHost::open_with_dependencies(
             plan,
             &self.environment,
@@ -1167,6 +1170,7 @@ impl PendingInputDriver for ParentReportDriver {
             session: SessionChoice::Existing(input.session_id.clone()),
             title: None,
             effort: self.effort,
+            tool_authority: None,
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let plan = TurnPlan::resolve(&options, &self.environment).await?;

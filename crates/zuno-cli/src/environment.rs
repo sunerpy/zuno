@@ -28,9 +28,11 @@ pub const ZUNO_PID: &str = "ZUNO_PID";
 pub const ZUNO_PRINT_LOGS: &str = "ZUNO_PRINT_LOGS";
 /// Selects one of the five supported log levels.
 pub const ZUNO_LOG_LEVEL: &str = "ZUNO_LOG_LEVEL";
+/// Trusted per-invocation Shell sandbox override.
+pub const ZUNO_SANDBOX_MODE: &str = "ZUNO_SANDBOX_MODE";
 
 /// Environment values read by the CLI and its command implementations.
-pub const ZUNO_FLAG_NAMES: [&str; 36] = [
+pub const ZUNO_FLAG_NAMES: [&str; 37] = [
     "ZUNO_ALWAYS_NOTIFY_UPDATE",
     "ZUNO_AUTO_HEAP_SNAPSHOT",
     "ZUNO_CLIENT",
@@ -67,6 +69,7 @@ pub const ZUNO_FLAG_NAMES: [&str; 36] = [
     ZUNO_LOG_LEVEL,
     ZUNO_PID,
     ZUNO_PRINT_LOGS,
+    ZUNO_SANDBOX_MODE,
 ];
 
 /// The complete flag snapshot handed to command implementations.
@@ -154,6 +157,9 @@ impl StartupEnvironment {
         }
         if let Some(level) = globals.log_level {
             overrides.insert(ZUNO_LOG_LEVEL, level.as_str().to_owned());
+        }
+        if let Some(mode) = globals.sandbox {
+            overrides.insert(ZUNO_SANDBOX_MODE, mode.as_str().to_owned());
         }
         let resolved = overrides.iter().fold(base.clone(), |env, (name, value)| {
             env.with(*name, value.clone())
@@ -280,6 +286,7 @@ mod tests {
         let globals = GlobalOptions {
             print_logs: true,
             log_level: Some(CliLogLevel::Warn),
+            sandbox: None,
         };
         let startup = StartupEnvironment::resolve(&Env::empty(), &globals);
 

@@ -242,6 +242,55 @@ Foreground native `task` delegation is not detached: it inherits the parent
 turn interrupt, aborts the live child turn when fired, and waits for child drain
 and runtime shutdown before the tool call settles.
 
+## Agent capability ceilings and required Skills
+
+An Agent definition may set an exact `tools` allowlist and may require instruction
+sets by name:
+
+```json
+{
+  "agents": {
+    "explorer": {
+      "requiredSkills": ["codegraph"]
+    }
+  }
+}
+```
+
+`requiredSkills` is an array of non-empty, unique Skill names. Like other arrays,
+a higher-precedence configuration layer replaces the lower array. The field does
+not copy a Skill into configuration and does not grant tools.
+
+For a delegated turn, the parent Attempt's actual provider-visible tool schemas
+form an immutable upper bound. The target role, its MCP/extension inheritance
+policy, the Agent's exact `tools` allowlist, and effective permission rules can
+only narrow that set. A configured `allow`, including `permission.mode:
+"allow_all"`, cannot restore an absent parent schema. A same-named tool with a
+different provider-visible schema is also outside the bound.
+
+MCP and extension tools are not automatically available to all read-only Agents.
+The exact schema must have been visible in the parent Attempt, the target role
+must either inherit extension tools automatically or carry an exact per-Agent
+`permission.rules` grant, the Agent allowlist must retain the wire id, and no later
+explicit permission rule may deny it. Unknown MCP tools remain side-effecting by
+default; granting one audited query tool does not opt the Agent into every MCP tool.
+
+Every initial or resumed child host performs Skill discovery independently.
+Parent-loaded Skill bodies are not copied. After profile and Agent visibility
+filtering, each `requiredSkills` name must resolve to exactly one source. Before each
+provider-bound input, Zuno ensures the resolved body is present in the durable prompt
+and de-duplicates an already loaded source. A missing name or an ambiguous same-name
+source fails child startup instead of silently skipping the requirement.
+
+Consequently, `"requiredSkills": ["codegraph"]` guarantees CodeGraph instructions,
+not CodeGraph execution authority. CodeGraph MCP tools still have to survive the
+parent Attempt ceiling, automatic role inheritance or an exact per-Agent grant, the
+exact `tools` allowlist, and explicit permission rules.
+
+This child-capability construction is informed by Codex's effective-parent-config
+pattern, but it is Zuno's own contract. It does not make Codex configuration, MCP,
+Skill, role, or wire behavior a compatibility target.
+
 ## Agent model presets
 
 Presets are typed team-wide model routes. They select a model and optional
@@ -443,9 +492,9 @@ requires approval. Shell, file writes, durable state changes, delegation,
 product agents, extension lifecycle mutations, and unknown harness or MCP tools
 are side-effecting by default.
 
-`shell` always requires strict approval, even for a command such as `rg`, because
-the shell is not an operating-system sandbox. Use the native `grep` or `glob`
-tool when the intended operation is read-only.
+`shell` always requires strict approval in strict mode, even for a command such
+as `rg`. Approval and confinement are independent: the native OS sandbox still
+compiles the effective read-only or workspace-write policy after admission.
 
 The top-level `shell` field chooses the actual interpreter for both terminal and
 model-issued command execution. The command tool resolves an explicit value first,
@@ -462,7 +511,72 @@ than being analyzed as Bash. On Windows the command resolver tries `pwsh`, Power
 and Git Bash; a host with only `cmd.exe` has no model command shell until a native `cmd`
 parser and risk gate exist.
 
-Independently of strict mode, the shell risk gate requires fresh approval before
+The top-level `sandbox` object sets the maximum authority for model-issued Shell
+commands. The default is `workspace-write`:
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "writableRoots": ["../shared-cache"],
+    "protectedPaths": [".zuno", ".agents", "secrets"]
+  }
+}
+```
+
+The exact modes are:
+
+- `read-only`: the host filesystem is read-only. Private temporary storage may
+  still be used, but no host writable root is accepted.
+- `workspace-write`: the host root is read-only while the active workspace and
+  explicitly trusted `writableRoots` are writable. This is the default.
+- `danger-full-access`: run the configured shell directly as the Zuno user, with
+  host filesystem, process, credential, and network access. This mode is explicit
+  and is never selected when a confined backend fails.
+
+An Agent's own capability contract may only narrow that configured maximum. A
+read-only Agent therefore receives `read-only` even when the invocation selected
+`workspace-write` or `danger-full-access`.
+
+In confined modes, `network` defaults to `deny`; set it to `allow` only from a
+trusted layer when model-initiated commands genuinely need host networking.
+`danger-full-access` always inherits host networking, so combining it with
+`network: "deny"` is invalid. It also rejects `writableRoots` and
+`protectedPaths`, because claiming to enforce either would be misleading.
+
+Relative paths resolve from the active workspace. `writableRoots` entries must
+already be directories and are considered only in `workspace-write`.
+`protectedPaths` must exist, may not be symbolic links, and are reapplied
+read-only after writable mounts. Zuno protects existing `.git`, `.zuno`,
+`.agents`, resolved external Git metadata, and its sandbox helper; configuration
+can add protections but cannot disable confinement.
+
+Sandbox authority follows configuration provenance. Trusted global, explicit
+config, managed, environment, and CLI layers may select any mode. Project
+`zuno.json[c]` and `.zuno` layers may only narrow to `read-only`, deny networking,
+or add protected paths; they cannot select a wider mode, grant host networking,
+or add external writable roots. Use a trusted one-invocation override when
+needed:
+
+```sh
+zuno --sandbox read-only
+zuno --sandbox workspace-write
+zuno --sandbox danger-full-access
+```
+
+Managed policy has later precedence and may still narrow that override.
+
+On Linux, confined Shell registration requires a trusted system bubblewrap plus
+successful user, mount, PID, UTS, IPC, seccomp, and—when `network` is
+`deny`—network namespace probes. A failed probe stops tool assembly; Zuno never
+falls back to raw host execution. Confined macOS and Windows backends are not yet
+implemented and fail closed, while an explicit `danger-full-access` invocation
+uses the native process backend on all supported platforms. See the
+[sandbox FAQ](../faq.md) for the security boundary, Ubuntu AppArmor setup, and
+nested-sandbox diagnosis.
+
+Independently of sandbox mode and strict mode, the shell risk gate requires fresh approval before
 bounded destructive operations or replacing an existing redirect target. New
 static files under the working directory or OS temporary directory are treated
 as creation. An exact, non-recursive `rm -f` of a statically named path that is
@@ -514,6 +628,13 @@ Use `zuno debug skill` after restarting to inspect the exact catalog and source
 locations visible to a session. A generic prompt such
 as "follow skill guidance" does not select every skill; a skill is loaded only
 when its name is explicit or its description clearly matches the request.
+
+Child turns run this discovery independently. Loading a Skill in the parent does
+not inject its body into a delegated child. Use `agents.<name>.requiredSkills`
+when a child role must receive a particular instruction set on every initial or
+continued turn. Required names resolve only after profile and Agent visibility
+filtering and must identify one source; missing and ambiguous names fail child
+startup.
 
 Zuno also compiles nine original first-party Skills into the
 `zuno-orchestration` pack: `customize-zuno`, `develop-zuno`, `deepwork`, `codemap`,

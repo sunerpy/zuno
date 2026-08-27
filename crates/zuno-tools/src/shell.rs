@@ -19,6 +19,7 @@ use zuno_pty::{
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionRetention,
     BackgroundExecutionService, BackgroundExecutionStatus, CommandShell, CommandShellKind,
 };
+use zuno_sandbox::{NetworkAccess, PrepareRequest, SandboxBackend, SandboxMode, SandboxPolicy};
 use zuno_tool::{OutputLimits, PermissionAsk, Tool, ToolContext, ToolOutput, ToolOutputStore};
 
 const TOOL_ID: &str = "shell";
@@ -96,6 +97,12 @@ pub struct ShellAnalysis {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellAuthorization {
+    writable_roots: Vec<PathBuf>,
+    git_metadata_writable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellEnvInput {
     pub cwd: PathBuf,
     pub session_id: String,
@@ -125,6 +132,8 @@ pub struct ShellTool {
     output_limits: OutputLimits,
     hard_ceiling: Duration,
     background_executions: Arc<BackgroundExecutionService>,
+    sandbox: Arc<dyn SandboxBackend>,
+    sandbox_policy: SandboxPolicy,
 }
 
 impl ShellTool {
@@ -133,6 +142,25 @@ impl ShellTool {
     }
 
     pub fn with_configured_shell(workspace: &Path, configured: Option<&str>) -> io::Result<Self> {
+        let sandbox: Arc<dyn SandboxBackend> = Arc::from(
+            zuno_sandbox::system_backend(workspace, SandboxMode::WorkspaceWrite)
+                .map_err(io::Error::other)?,
+        );
+        let policy = SandboxPolicy::new(
+            workspace,
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Denied,
+        )
+        .map_err(io::Error::other)?;
+        Self::with_sandbox_backend(workspace, configured, sandbox, policy)
+    }
+
+    pub fn with_sandbox_backend(
+        workspace: &Path,
+        configured: Option<&str>,
+        sandbox: Arc<dyn SandboxBackend>,
+        sandbox_policy: SandboxPolicy,
+    ) -> io::Result<Self> {
         let workspace = workspace.canonicalize()?;
         let shell = zuno_pty::shells::command(configured)?;
         let output_store = ToolOutputStore::new(
@@ -156,6 +184,8 @@ impl ShellTool {
             output_limits: OutputLimits::default(),
             hard_ceiling: crate::timeout::DEFAULT_HARD_CEILING,
             background_executions,
+            sandbox,
+            sandbox_policy,
         })
     }
 
@@ -227,14 +257,15 @@ impl ShellTool {
                     });
                 }
             };
-        self.authorize(
-            &params.command,
-            &cwd,
-            &analysis,
-            risk_confirmation.as_ref(),
-            &ctx,
-        )
-        .await?;
+        let authorization = self
+            .authorize(
+                &params.command,
+                &cwd,
+                &analysis,
+                risk_confirmation.as_ref(),
+                &ctx,
+            )
+            .await?;
         if ctx.is_interrupted() {
             return Err(interrupted());
         }
@@ -246,16 +277,20 @@ impl ShellTool {
         } else {
             BackgroundExecutionRetention::Ephemeral
         };
-        let execution = self
+        let input = self.execution_input(&command, &cwd, env, &ctx, retention, &authorization)?;
+        let (execution, mut lease) = self
             .background_executions
-            .start(self.execution_input(&command, &cwd, env, &ctx, retention))
+            .start_leased(input)
             .map_err(failed)?;
 
         if params.background {
-            return Ok(background_started_output(
-                self.display_command(&command),
-                &execution,
-            ));
+            lease.disarm();
+            return Ok(
+                background_started_output(self.display_command(&command), &execution)
+                    .with_metadata("sandboxBackend", execution.authority.backend.clone())
+                    .with_metadata("sandboxMode", json!(execution.authority.mode))
+                    .with_metadata("sandboxNetwork", json!(execution.authority.network)),
+            );
         }
 
         let foreground_timeout = Duration::from_millis(foreground_timeout_ms);
@@ -274,6 +309,7 @@ impl ShellTool {
                         "could not remove interrupted foreground execution"
                     );
                 }
+                lease.disarm();
                 return Err(interrupted());
             }
         };
@@ -282,16 +318,21 @@ impl ShellTool {
                 .background_executions
                 .promote(&execution.id)
                 .map_err(failed)?;
+            lease.disarm();
             return Ok(timeout_promoted_output(
                 self.display_command(&command),
                 foreground_timeout_ms,
                 &promoted,
-            ));
+            )
+            .with_metadata("sandboxBackend", promoted.authority.backend.clone())
+            .with_metadata("sandboxMode", json!(promoted.authority.mode))
+            .with_metadata("sandboxNetwork", json!(promoted.authority.network)));
         }
         let full = self
             .background_executions
             .finish_foreground(&execution.id)
             .map_err(failed)?;
+        lease.disarm();
         self.completed_output(
             &command,
             foreground_timeout_ms,
@@ -335,7 +376,7 @@ impl ShellTool {
         analysis: &ShellAnalysis,
         risk_confirmation: Option<&(String, Option<String>)>,
         ctx: &ToolContext,
-    ) -> Result<(), ToolError> {
+    ) -> Result<ShellAuthorization, ToolError> {
         let mut directories = external_directories(analysis, cwd, &self.workspace);
         if !cwd.starts_with(&self.workspace) {
             directories.insert(cwd.to_owned());
@@ -375,7 +416,10 @@ impl ShellTool {
             .filter(|resource| !resource.changes_directory)
             .collect();
         if resources.is_empty() && risk_confirmation.is_none() {
-            return Ok(());
+            return Ok(ShellAuthorization {
+                writable_roots: directories.into_iter().collect(),
+                git_metadata_writable: false,
+            });
         }
         let mut metadata = Map::new();
         metadata.insert("command".to_owned(), Value::String(command.to_owned()));
@@ -407,7 +451,43 @@ impl ShellTool {
         } else {
             ask
         };
-        ctx.ask(TOOL_ID, ask).await
+        ctx.ask(TOOL_ID, ask).await?;
+
+        let git_metadata_writable = mutates_git_metadata(analysis);
+        if git_metadata_writable {
+            if self.sandbox_policy.mode() == SandboxMode::ReadOnly {
+                return Err(failed(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "this Agent's Shell policy is read-only and cannot modify Git metadata",
+                )));
+            }
+            let git_pattern = format!(
+                "{}{}*",
+                self.workspace.join(".git").display(),
+                std::path::MAIN_SEPARATOR
+            );
+            let mut metadata = Map::new();
+            metadata.insert("command".to_owned(), Value::String(command.to_owned()));
+            metadata.insert(
+                "workspace".to_owned(),
+                Value::String(self.workspace.to_string_lossy().into_owned()),
+            );
+            ctx.ask(
+                TOOL_ID,
+                PermissionAsk {
+                    permission: "git_metadata".to_owned(),
+                    patterns: vec![git_pattern.clone()],
+                    metadata,
+                    always: vec![git_pattern],
+                    ..PermissionAsk::default()
+                },
+            )
+            .await?;
+        }
+        Ok(ShellAuthorization {
+            writable_roots: directories.into_iter().collect(),
+            git_metadata_writable,
+        })
     }
 
     async fn environment(
@@ -435,7 +515,8 @@ impl ShellTool {
         env: BTreeMap<String, String>,
         ctx: &ToolContext,
         retention: BackgroundExecutionRetention,
-    ) -> BackgroundExecutionInput {
+        authorization: &ShellAuthorization,
+    ) -> Result<BackgroundExecutionInput, ToolError> {
         let arguments = match self.shell.kind() {
             CommandShellKind::PowerShell => vec![
                 OsString::from("-NoLogo"),
@@ -446,20 +527,35 @@ impl ShellTool {
             ],
             CommandShellKind::Posix => vec![OsString::from("-lc"), OsString::from(command)],
         };
-        BackgroundExecutionInput {
-            program: self.shell.path().as_os_str().to_owned(),
-            arguments,
-            cwd: cwd.to_owned(),
-            environment: env
-                .into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
+        let environment = env
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+        let mut policy = self.sandbox_policy.clone();
+        if policy.mode() == SandboxMode::WorkspaceWrite {
+            policy = policy
+                .with_writable_roots(authorization.writable_roots.clone())
+                .map_err(failed)?;
+        }
+        policy = policy.with_git_metadata_writable(authorization.git_metadata_writable);
+        let prepared = self
+            .sandbox
+            .prepare(PrepareRequest {
+                program: self.shell.path().as_os_str().to_owned(),
+                arguments,
+                cwd: cwd.to_owned(),
+                environment,
+                policy,
+            })
+            .map_err(failed)?;
+        Ok(BackgroundExecutionInput {
+            prepared,
             session_id: ctx.session_id.clone(),
             title: self.display_command(command),
             command: command.to_owned(),
             hard_ceiling: self.hard_ceiling,
             retention,
-        }
+        })
     }
 
     fn completed_output(
@@ -509,6 +605,9 @@ impl ShellTool {
             .with_metadata("background", false)
             .with_metadata("task_id", execution.id.as_str())
             .with_metadata("shell", self.shell.name())
+            .with_metadata("sandboxBackend", execution.authority.backend)
+            .with_metadata("sandboxMode", json!(execution.authority.mode))
+            .with_metadata("sandboxNetwork", json!(execution.authority.network))
             .with_metadata("timeout", json!(foreground_timeout_ms));
         OutputPolicy::new(self.output_store.clone(), self.output_limits)
             .apply(TOOL_ID, session_id, output, accept_large_output)
@@ -843,6 +942,108 @@ fn external_directories(
     directories
 }
 
+fn mutates_git_metadata(analysis: &ShellAnalysis) -> bool {
+    analysis.commands.iter().any(|resource| {
+        let Some(first) = resource.tokens.first() else {
+            return false;
+        };
+        if !unquote(first).eq_ignore_ascii_case("git") {
+            return false;
+        }
+        let mut index = 1;
+        while let Some(argument) = resource.tokens.get(index) {
+            let argument = unquote(argument).to_ascii_lowercase();
+            if matches!(
+                argument.as_str(),
+                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace"
+            ) {
+                index = index.saturating_add(2);
+                continue;
+            }
+            if argument.starts_with('-') {
+                index = index.saturating_add(1);
+                continue;
+            }
+            let remaining = &resource.tokens[index + 1..];
+            return !git_subcommand_is_read_only(&argument, remaining);
+        }
+        false
+    })
+}
+
+fn git_subcommand_is_read_only(subcommand: &str, arguments: &[String]) -> bool {
+    if matches!(
+        subcommand,
+        "annotate"
+            | "blame"
+            | "cat-file"
+            | "diff"
+            | "diff-files"
+            | "diff-index"
+            | "diff-tree"
+            | "for-each-ref"
+            | "grep"
+            | "log"
+            | "ls-files"
+            | "ls-remote"
+            | "ls-tree"
+            | "merge-base"
+            | "name-rev"
+            | "rev-list"
+            | "rev-parse"
+            | "shortlog"
+            | "show"
+            | "show-ref"
+            | "status"
+            | "verify-commit"
+            | "verify-tag"
+            | "version"
+            | "whatchanged"
+    ) {
+        return true;
+    }
+    if subcommand == "branch" {
+        return arguments.is_empty()
+            || arguments.iter().all(|argument| {
+                matches!(
+                    unquote(argument).as_str(),
+                    "--all"
+                        | "-a"
+                        | "--list"
+                        | "-l"
+                        | "--show-current"
+                        | "--verbose"
+                        | "-v"
+                        | "-vv"
+                        | "--no-color"
+                )
+            });
+    }
+    if subcommand == "config" {
+        if arguments.iter().any(|argument| {
+            matches!(
+                unquote(argument).as_str(),
+                "--add"
+                    | "--edit"
+                    | "-e"
+                    | "--rename-section"
+                    | "--remove-section"
+                    | "--replace-all"
+                    | "--unset"
+                    | "--unset-all"
+            )
+        }) {
+            return false;
+        }
+        let positionals = arguments
+            .iter()
+            .filter(|argument| !unquote(argument).starts_with('-'))
+            .count();
+        return positionals <= 1;
+    }
+    false
+}
+
 fn path_arguments<'a>(tokens: &'a [String], command: &str) -> Vec<&'a str> {
     tokens
         .iter()
@@ -896,4 +1097,39 @@ fn interrupted() -> ToolError {
         io::ErrorKind::Interrupted,
         "shell command was interrupted",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mutates(command: &str) -> bool {
+        mutates_git_metadata(&analyze_command(command, ShellSyntax::Bash).expect("analysis"))
+    }
+
+    #[test]
+    fn git_read_commands_keep_metadata_read_only() {
+        for command in [
+            "git status --short",
+            "git diff --stat",
+            "git -C repo log -1",
+            "git branch --show-current",
+            "git config --get user.name",
+        ] {
+            assert!(!mutates(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn git_mutations_require_a_per_call_metadata_grant() {
+        for command in [
+            "git add src/lib.rs",
+            "git commit -m test",
+            "git checkout main",
+            "git config user.name zuno",
+            "git branch feature",
+        ] {
+            assert!(mutates(command), "{command}");
+        }
+    }
 }

@@ -5,17 +5,29 @@
 //! every consumer let the prompt describe one role while the registry enforced
 //! another. [`AgentProfile`] joins them once at the composition boundary.
 
-use zuno_catalog::agent::Agent;
-use zuno_permission::Rule;
-use zuno_permission::visibility::is_tool_hidden;
+use std::collections::BTreeSet;
 
-use crate::builtin;
+use zuno_catalog::agent::Agent;
+use zuno_permission::visibility::is_tool_hidden;
+use zuno_permission::{PermissionAction, Rule};
+
+use crate::builtin::{self, ExtensionTools};
+
+/// Filesystem authority the OS sandbox must compile for Shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFilesystemAccess {
+    /// The Agent may inspect through Shell but cannot change host files.
+    ReadOnly,
+    /// The Agent may change the workspace and explicitly approved roots.
+    WorkspaceWrite,
+}
 
 /// Runtime-enforced capabilities for one Agent attempt.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapabilityPolicy {
     rules: Vec<Rule>,
     delegation_targets: Option<Vec<String>>,
+    tool_authority: Option<BTreeSet<String>>,
 }
 
 impl CapabilityPolicy {
@@ -29,6 +41,7 @@ impl CapabilityPolicy {
                     .cloned()
                     .collect()
             }),
+            tool_authority: None,
         }
     }
 
@@ -44,24 +57,57 @@ impl CapabilityPolicy {
         self.delegation_targets.as_deref()
     }
 
-    /// Whether the final rules expose the delegation permission.
+    /// Exact parent-attempt tool upper bound, when this is a delegated turn.
+    #[must_use]
+    pub const fn tool_authority(&self) -> Option<&BTreeSet<String>> {
+        self.tool_authority.as_ref()
+    }
+
+    /// Whether a tool survives the parent-attempt authority upper bound.
+    #[must_use]
+    pub fn within_tool_authority(&self, tool: &str) -> bool {
+        self.tool_authority
+            .as_ref()
+            .is_none_or(|authority| authority.contains(tool))
+    }
+
+    /// Whether both the role rules and parent-attempt authority expose a tool.
+    #[must_use]
+    pub fn tool_available(&self, tool: &str) -> bool {
+        self.within_tool_authority(tool) && !is_tool_hidden(tool, &self.rules)
+    }
+
+    /// Whether the final capability intersection exposes delegation.
     #[must_use]
     pub fn can_delegate(&self) -> bool {
-        !is_tool_hidden("task", &self.rules)
+        self.tool_available("task")
     }
 
     fn can_edit(&self) -> bool {
         ["apply_patch", "write", "edit"]
             .into_iter()
-            .any(|tool| !is_tool_hidden(tool, &self.rules))
+            .any(|tool| self.tool_available(tool))
+    }
+
+    /// Filesystem authority derived from the effective edit capability.
+    ///
+    /// This uses the frozen rules and parent-attempt authority, so a custom or
+    /// delegated Agent cannot regain write access merely by retaining Shell.
+    #[must_use]
+    pub fn shell_filesystem_access(&self) -> ShellFilesystemAccess {
+        if self.can_edit() {
+            ShellFilesystemAccess::WorkspaceWrite
+        } else {
+            ShellFilesystemAccess::ReadOnly
+        }
     }
 
     fn can_shell(&self) -> bool {
-        !is_tool_hidden("shell", &self.rules)
+        self.tool_available("shell")
     }
 
     fn can_research_externally(&self) -> bool {
-        !is_tool_hidden("webfetch", &self.rules) || !is_tool_hidden("web_search", &self.rules)
+        self.tool_available("webfetch") || self.tool_available("web_search")
     }
 }
 
@@ -71,19 +117,92 @@ pub struct AgentProfile {
     definition: Agent,
     capabilities: CapabilityPolicy,
     prompt_policy: String,
+    vision_available: bool,
+    extension_rule_index: Option<usize>,
 }
 
 impl AgentProfile {
     /// Freeze a resolved catalog entry and permission rules into one profile.
     #[must_use]
     pub fn resolve(definition: Agent, rules: Vec<Rule>, vision_available: bool) -> Self {
+        Self::resolve_inner(definition, rules, vision_available, None)
+    }
+
+    /// Freeze a profile and remember where extension grants precede user overrides.
+    #[must_use]
+    pub fn resolve_with_extension_boundary(
+        definition: Agent,
+        rules: Vec<Rule>,
+        extension_rule_index: usize,
+        vision_available: bool,
+    ) -> Self {
+        assert!(
+            extension_rule_index <= rules.len(),
+            "extension rule boundary must be inside the resolved ruleset"
+        );
+        Self::resolve_inner(
+            definition,
+            rules,
+            vision_available,
+            Some(extension_rule_index),
+        )
+    }
+
+    fn resolve_inner(
+        definition: Agent,
+        rules: Vec<Rule>,
+        vision_available: bool,
+        extension_rule_index: Option<usize>,
+    ) -> Self {
         let capabilities = CapabilityPolicy::resolve(&definition, rules, vision_available);
         let prompt_policy = render_prompt_policy(&definition, &capabilities, vision_available);
         Self {
             definition,
             capabilities,
             prompt_policy,
+            vision_available,
+            extension_rule_index,
         }
+    }
+
+    /// Restrict this profile to the tools visible in the delegating attempt.
+    ///
+    /// Role rules remain intact for auditability, but every runtime and prompt
+    /// capability query observes the intersection. A child can therefore reduce
+    /// authority further and can never regain a tool omitted from its parent request.
+    #[must_use]
+    pub fn with_tool_authority(mut self, tools: impl IntoIterator<Item = String>) -> Self {
+        self.capabilities.tool_authority = Some(tools.into_iter().collect());
+        self.prompt_policy =
+            render_prompt_policy(&self.definition, &self.capabilities, self.vision_available);
+        self
+    }
+
+    /// Resolve extension tools through the native role boundary before user rules.
+    #[must_use]
+    pub fn rules_with_extension_tools(&self, extension_tool_ids: &[&str]) -> Vec<Rule> {
+        let mut rules = self.capabilities.rules.clone();
+        let Some(index) = self.extension_rule_index else {
+            return rules;
+        };
+        let inherits = builtin::get(&self.definition.name, self.vision_available)
+            .is_some_and(|agent| agent.permissions.extension_tools == ExtensionTools::Inherit);
+        if !inherits {
+            return rules;
+        }
+
+        let grants = extension_tool_ids
+            .iter()
+            .copied()
+            .filter(|tool| self.capabilities.within_tool_authority(tool))
+            .map(|tool| Rule {
+                permission: tool.to_owned(),
+                pattern: "*".to_owned(),
+                action: PermissionAction::Allow,
+            })
+            .collect::<Vec<_>>();
+        rules.splice(index..index, grants);
+        rules
     }
 
     /// Stable Agent identity.

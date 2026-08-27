@@ -14,6 +14,7 @@ publish.workspace = true
 # what makes `unsafe_code = "forbid"` satisfiable for this crate.
 portable-pty = { workspace = true }
 zuno-process = { workspace = true }
+zuno-sandbox = { workspace = true }
 # `tokio::sync::mpsc`'s bounded channel is the per-subscriber output path and
 # `broadcast` is the lifecycle event path. Both are used through `try_send` /
 # `send`, which need no reactor, so the reader and waiter threads stay plain OS

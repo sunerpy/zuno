@@ -201,6 +201,9 @@ pub struct AgentConfig {
     /// Exact child-agent allowlist for direct delegation and workflows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegates: Option<Vec<String>>,
+    /// Skills loaded at the start of every turn for this agent.
+    #[serde(rename = "requiredSkills", skip_serializing_if = "Option::is_none")]
+    pub required_skills: Option<Vec<String>>,
     /// Per-tool permissions for this agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<PermissionConfig>,
@@ -256,6 +259,8 @@ impl<'de> Deserialize<'de> for AgentConfig {
         }
         validate_name_list("tools", wire.tools.as_deref()).map_err(de::Error::custom)?;
         validate_name_list("delegates", wire.delegates.as_deref()).map_err(de::Error::custom)?;
+        validate_name_list("requiredSkills", wire.required_skills.as_deref())
+            .map_err(de::Error::custom)?;
         Ok(wire.sweep())
     }
 }
@@ -277,6 +282,8 @@ struct AgentWire {
     steps: Option<NonZeroU32>,
     tools: Option<Vec<String>>,
     delegates: Option<Vec<String>>,
+    #[serde(rename = "requiredSkills")]
+    required_skills: Option<Vec<String>>,
     permission: Option<PermissionConfig>,
     #[serde(flatten)]
     extra: JsonMap,
@@ -310,6 +317,7 @@ impl AgentWire {
             steps: self.steps,
             tools: self.tools,
             delegates: self.delegates,
+            required_skills: self.required_skills,
             permission: self.permission,
             extra: self.extra,
         }
