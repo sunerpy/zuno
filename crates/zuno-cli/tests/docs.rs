@@ -380,6 +380,18 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "`Authorization`, `Content-Type`, and `Accept`",
         ],
     );
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "`legacy-user-prefix` changes instruction projection only",
+            "enable_legacy_chat_completions: false",
+            "`previous_response_id`",
+            "`store: true`",
+            "PDF/file input",
+            "remote image URLs",
+            "one long-lived kiro-provider process",
+        ],
+    );
 }
 
 #[test]
@@ -427,6 +439,18 @@ fn multi_provider_example_routes_only_zuno_agents() {
         providers["kiro-local"]["models"]["claude-opus-5"]["limit"]["output"],
         128_000
     );
+    for (model, definition) in providers["kiro-local"]["models"]
+        .as_object()
+        .expect("Kiro models are an object")
+    {
+        let input = definition["modalities"]["input"]
+            .as_array()
+            .expect("every Kiro model declares its accepted input subset");
+        assert!(
+            !input.iter().any(|modality| modality == "pdf"),
+            "{model} advertises PDF even though the verified Responses subset rejects files"
+        );
+    }
 
     let expected_agents = [
         "build",

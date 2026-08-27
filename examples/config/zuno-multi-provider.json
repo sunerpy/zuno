@@ -159,7 +159,7 @@
             "output": 128000
           },
           "modalities": {
-            "input": ["text", "image", "pdf"],
+            "input": ["text", "image"],
             "output": ["text"]
           },
           "variants": {
@@ -180,7 +180,7 @@
             "output": 64000
           },
           "modalities": {
-            "input": ["text", "image", "pdf"],
+            "input": ["text", "image"],
             "output": ["text"]
           },
           "variants": {
@@ -201,7 +201,7 @@
             "output": 64000
           },
           "modalities": {
-            "input": ["text", "image", "pdf"],
+            "input": ["text", "image"],
             "output": ["text"]
           },
           "variants": {

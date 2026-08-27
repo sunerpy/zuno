@@ -81,9 +81,12 @@ Model names belong to a provider implementation, not to an account. The
 checked example follows `kiro-provider` v0.5.0-rc.3, whose source and live
 `GET /v1/models` response both expose `claude-opus-5` plus
 `low`/`medium`/`high`/`xhigh`/`max`, a 1,000,000-token context limit, a
-128,000-token output limit, and text/image/PDF input. Keep the static Zuno
-catalog aligned with the gateway version actually deployed; do not infer a
-gateway model merely because an authentication plugin advertises it.
+128,000-token output limit. The gateway catalog also reports PDF input, but
+its verified Responses subset rejects file inputs. The checked Zuno profile
+therefore deliberately narrows every Kiro model to text plus inline image
+data. Keep the static Zuno catalog aligned with the usable gateway protocol,
+not merely the broadest model-catalog declaration, and do not infer a gateway
+model because an authentication plugin advertises it.
 
 For a loopback [kiro-provider](https://github.com/sunerpy/kiro-provider)
 Responses gateway, use a unique provider id such as `kiro-local`: Zuno checks
@@ -129,6 +132,13 @@ functional deployment uses kiro-provider's explicit
 provider's default `safe` mode correctly rejects that request rather than
 silently rewriting it.
 
+`legacy-user-prefix` changes instruction projection only; it does not select
+Chat Completions. Keep Zuno on `surface: "responses"` and keep
+kiro-provider's `enable_legacy_chat_completions: false`. The migration mode
+joins instruction, system, and developer text into the first user content, so
+role priority is no longer a security boundary. Tool authorization remains
+owned by Zuno's permission and approval layers.
+
 For a foreground root or delegated-child turn, Zuno attaches the session's
 durable identity to standard Responses
 `metadata.zuno_session_id`. Tool continuations and a later process resume reuse
@@ -140,6 +150,18 @@ using `session_affinity_mode: "explicit-only"` can therefore bind the request
 without private headers or model-visible prompt prefixes. See
 [Kiro Provider Native Integration](../design/kiro-provider-native-integration.md)
 for the ownership and verification contract.
+
+Do not add `previous_response_id`, Responses `conversation`, `store: true`,
+structured-output controls, native Web Search, or PDF/file input through
+`extraBody`; remote image URLs are unsupported too. The gateway rejects those
+fields instead of silently weakening them. Inline data-URL images and function
+tools are the supported rich-input subset. Standard `reasoning.effort` remains
+independent from legacy instruction projection.
+
+Run one long-lived kiro-provider process for the credential-owning OS user.
+Do not spawn a provider per Zuno session: the process owns shared
+authentication, refresh locking, persisted affinity, and account-scoped
+transport pools.
 
 ## JSON Schema
 

@@ -6363,6 +6363,49 @@ fn a_configured_output_limit_outranks_the_catalogs_own() {
 }
 
 #[test]
+fn a_null_output_limit_suppresses_the_catalog_default_on_responses() {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "stub": {
+                "name": "Responses fixture",
+                "transport": "openai",
+                "surface": "responses",
+                "options": {
+                    "baseURL": "https://gateway.example/v1",
+                    "maxTokens": null
+                },
+                "models": {
+                    "mixed": {
+                        "name": "Mixed model gateway",
+                        "reasoning": true,
+                        "tool_call": true,
+                        "limit": {
+                            "context": 272_000,
+                            "output": 64_000
+                        }
+                    }
+                }
+            }
+        }
+    }))
+    .expect("Responses provider config");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let body = generation_body(&catalog, "mixed", &agent("build"));
+
+    assert!(
+        body.get("max_output_tokens").is_none(),
+        "`maxTokens: null` must suppress the generic output ceiling on Responses: {body}"
+    );
+    assert!(
+        body.get("max_tokens").is_none(),
+        "a Responses request must not fall back to the Chat output-limit field: {body}"
+    );
+}
+
+#[test]
 fn an_agents_sampling_declarations_reach_the_request_body() {
     let catalog = generation_catalog(
         "capped",

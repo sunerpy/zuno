@@ -193,6 +193,12 @@ Zuno's static custom-provider catalog remains authoritative for capabilities.
 must not infer attachment, reasoning, context, or output capabilities from a
 model id alone.
 
+The checked Kiro profile intentionally advertises only text and inline image
+input. Although the gateway's broad model catalog can report PDF support, its
+current Responses protocol rejects file inputs, remote image URLs, stateful
+response fields, structured output, and native Web Search. Zuno must not turn
+catalog metadata into unsupported wire fields.
+
 ## TDD evidence
 
 - `zuno-llm` tests cover typed purpose, identity validation, and inaccessible
