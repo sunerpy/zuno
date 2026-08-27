@@ -164,6 +164,15 @@ The request path is native Rust:
 
 The `openai-compatible` transport is implemented separately by `zuno-provider-compatible` and defaults to `/chat/completions`; rule-driven compatible providers may select `/responses`. `anthropic`, `bedrock`, and the Google transports use separate native crates because their request and stream protocols are not OpenAI-compatible.
 
+For foreground Responses requests, the engine supplies a private typed routing
+context containing the durable root or child session identity. The official
+OpenAI adapter and the compatible adapter used for a custom OpenAI `baseURL`
+project it as `metadata.zuno_session_id`; tool continuations reuse it, while
+title, summary, compaction, reflection, and Council calls are isolated. The
+field is reserved against `extraBody` and request-parameter overrides and is
+never copied into model input, instructions, headers, or tool definitions.
+Chat Completions and Messages surfaces ignore this routing context.
+
 Supported configuration values are `openai`, `openai-compatible`, `openrouter`, `anthropic`, `bedrock`, `bedrock-mantle`, `google`, `google-vertex`, and `google-vertex-anthropic`. Provider configuration has no `npm` field.
 
 Important options include:

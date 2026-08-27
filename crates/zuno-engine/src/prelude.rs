@@ -41,7 +41,7 @@ use zuno_db::{Connection, open, session};
 use zuno_error::{DbError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools};
 use zuno_llm::event::{Message, Role, StreamEvent};
-use zuno_llm::registry::{CompletionRequest, Provider};
+use zuno_llm::registry::{CompletionRequest, Provider, ProviderRequestContext};
 use zuno_observability::span;
 use zuno_tool::ToolDefinition;
 
@@ -269,9 +269,15 @@ pub async fn generate_title(
             .map(|projected| projected.message),
     );
 
-    let text = complete_internal_text(session_id, "title", provider.as_ref(), agent, messages)
-        .await
-        .map_err(TitleSkipped::Reason)?;
+    let text = complete_internal_text(
+        session_id,
+        ProviderRequestContext::Title,
+        provider.as_ref(),
+        agent,
+        messages,
+    )
+    .await
+    .map_err(TitleSkipped::Reason)?;
     let Some(title) = clean_title(&text) else {
         return Err(TitleSkipped::Reason(
             "the title model returned no usable line".to_owned(),
@@ -481,8 +487,14 @@ pub async fn summarize(
             .skip(1)
             .map(|projected| projected.message),
     );
-    let text =
-        complete_internal_text(session_id, "summary", provider.as_ref(), agent, messages).await?;
+    let text = complete_internal_text(
+        session_id,
+        ProviderRequestContext::Summary,
+        provider.as_ref(),
+        agent,
+        messages,
+    )
+    .await?;
     if text.trim().is_empty() {
         return Err("the summary model returned no text".to_owned());
     }
@@ -645,20 +657,18 @@ fn requested_agent(history: &[MessageWithParts]) -> Option<String> {
 /// choose a model, or expose a dispatcher.
 pub async fn complete_internal_text(
     session_id: &str,
-    operation: &str,
+    request_context: ProviderRequestContext,
     provider: &dyn Provider,
     agent: &InternalAgent,
     messages: Vec<Message>,
 ) -> Result<String, String> {
-    let request = CompletionRequest {
-        model_id: agent.model.model_id.clone(),
-        surface: agent.model.surface,
-        messages,
-        developer_context: Vec::new(),
-        tools: Vec::new(),
-        parameters: serde_json::Map::new(),
-        headers: std::collections::BTreeMap::new(),
-    };
+    if request_context.session_identity().is_some() {
+        return Err("internal model requests cannot carry session affinity".to_owned());
+    }
+    let operation = request_context.purpose().as_str();
+    let request = CompletionRequest::new(agent.model.model_id.clone(), messages)
+        .on_surface(agent.model.surface)
+        .with_request_context(request_context);
     let request_span = span::provider_request_for_session(
         session_id,
         &agent.model.catalog_provider_id,

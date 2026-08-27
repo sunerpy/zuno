@@ -20,7 +20,7 @@
           "reasoning": "max"
         },
         "deep": {
-          "model": "kiro-local/claude-opus-4-8",
+          "model": "kiro-local/claude-opus-5",
           "reasoning": "high"
         },
         "fixer": {
@@ -52,7 +52,7 @@
     "kiro-local": {
       "agents": {
         "orchestrator": {
-          "model": "kiro-local/claude-opus-4-8",
+          "model": "kiro-local/claude-opus-5",
           "reasoning": "xhigh"
         },
         "build": {
@@ -60,11 +60,11 @@
           "reasoning": "max"
         },
         "plan": {
-          "model": "kiro-local/claude-opus-4-8",
+          "model": "kiro-local/claude-opus-5",
           "reasoning": "max"
         },
         "deep": {
-          "model": "kiro-local/claude-opus-4-8",
+          "model": "kiro-local/claude-opus-5",
           "reasoning": "high"
         },
         "fixer": {
@@ -72,7 +72,7 @@
           "reasoning": "medium"
         },
         "general": {
-          "model": "kiro-local/claude-opus-4-8",
+          "model": "kiro-local/claude-opus-5",
           "reasoning": "xhigh"
         },
         "explorer": {
@@ -145,9 +145,31 @@
       "transport": "openai",
       "surface": "responses",
       "options": {
-        "baseURL": "http://127.0.0.1:8787/v1"
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "maxTokens": null
       },
       "models": {
+        "claude-opus-5": {
+          "name": "Claude Opus 5 via Kiro",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "modalities": {
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        },
         "claude-opus-4-8": {
           "name": "Claude Opus 4.8 via Kiro",
           "attachment": true,

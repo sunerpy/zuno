@@ -132,6 +132,145 @@ impl Capabilities {
     }
 }
 
+/// Why a model request exists.
+///
+/// The purpose is provider-routing state, not prompt content. Foreground and
+/// delegated turns carry their own durable session identity; lifecycle-owned
+/// requests remain explicitly isolated from either conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestPurpose {
+    /// A user-facing turn in a root session.
+    MainTurn,
+    /// A user-facing turn in a delegated child session.
+    ChildTurn,
+    /// Automatic session-title generation.
+    Title,
+    /// Lifecycle summary generation outside the foreground turn.
+    Summary,
+    /// Context compaction.
+    Compaction,
+    /// Post-turn durable-memory reflection.
+    Reflection,
+    /// Tool-free Council synthesis.
+    Council,
+}
+
+impl RequestPurpose {
+    /// Stable value written to durable provider-request events.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MainTurn => "main-turn",
+            Self::ChildTurn => "child-turn",
+            Self::Title => "title",
+            Self::Summary => "summary",
+            Self::Compaction => "compaction",
+            Self::Reflection => "reflection",
+            Self::Council => "council",
+        }
+    }
+}
+
+/// A validated durable Zuno session identity used only for provider routing.
+///
+/// This wrapper prevents arbitrary request metadata, prompts, directories, or
+/// headers from impersonating a session. It is intentionally not serializable:
+/// each provider decides whether its wire protocol has a non-model-visible
+/// projection for the identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderSessionIdentity(String);
+
+impl ProviderSessionIdentity {
+    /// Validate a durable `ses_` identifier at the provider boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty, differently prefixed, or non-portable identifier.
+    pub fn parse(value: impl Into<String>) -> Result<Self, InvalidProviderSessionIdentity> {
+        let value = value.into();
+        let valid = value.strip_prefix("ses_").is_some_and(|tail| {
+            !tail.is_empty()
+                && tail
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        });
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(InvalidProviderSessionIdentity(value))
+        }
+    }
+
+    /// The durable identity as stored by Zuno.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProviderSessionIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A malformed durable identity presented to provider routing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "provider session identity `{0}` must start with `ses_` and contain only ASCII letters, digits, `_`, or `-`"
+)]
+pub struct InvalidProviderSessionIdentity(String);
+
+/// Typed, non-model-visible routing context for one provider request.
+///
+/// The enum shape makes invalid combinations unrepresentable: a foreground
+/// purpose always has one durable identity, while lifecycle-owned requests can
+/// never accidentally inherit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRequestContext {
+    /// A root-session turn and its tool continuations.
+    MainTurn(ProviderSessionIdentity),
+    /// A delegated child-session turn and its tool continuations.
+    ChildTurn(ProviderSessionIdentity),
+    /// Automatic session-title generation.
+    Title,
+    /// Lifecycle summary generation.
+    Summary,
+    /// Context compaction.
+    Compaction,
+    /// Post-turn durable-memory reflection.
+    Reflection,
+    /// Tool-free Council synthesis.
+    Council,
+}
+
+impl ProviderRequestContext {
+    /// The stable semantic purpose of this request.
+    #[must_use]
+    pub const fn purpose(&self) -> RequestPurpose {
+        match self {
+            Self::MainTurn(_) => RequestPurpose::MainTurn,
+            Self::ChildTurn(_) => RequestPurpose::ChildTurn,
+            Self::Title => RequestPurpose::Title,
+            Self::Summary => RequestPurpose::Summary,
+            Self::Compaction => RequestPurpose::Compaction,
+            Self::Reflection => RequestPurpose::Reflection,
+            Self::Council => RequestPurpose::Council,
+        }
+    }
+
+    /// Durable affinity identity, only for foreground root or child turns.
+    #[must_use]
+    pub const fn session_identity(&self) -> Option<&ProviderSessionIdentity> {
+        match self {
+            Self::MainTurn(identity) | Self::ChildTurn(identity) => Some(identity),
+            Self::Title | Self::Summary | Self::Compaction | Self::Reflection | Self::Council => {
+                None
+            }
+        }
+    }
+}
+
 /// One completion request, as the registry's contract sees it.
 ///
 /// # Scope
@@ -175,6 +314,8 @@ pub struct CompletionRequest {
     pub parameters: serde_json::Map<String, serde_json::Value>,
     /// Per-request HTTP headers contributed after model resolution.
     pub headers: BTreeMap<String, String>,
+    /// Typed routing context, inaccessible to arbitrary request-hook mutation.
+    request_context: Option<ProviderRequestContext>,
 }
 
 /// One tool as the model is told about it, before any provider's wire shape.
@@ -218,6 +359,7 @@ impl CompletionRequest {
             tools: Vec::new(),
             parameters: serde_json::Map::new(),
             headers: BTreeMap::new(),
+            request_context: None,
         }
     }
 
@@ -240,6 +382,36 @@ impl CompletionRequest {
     pub fn on_surface(mut self, surface: ApiSurface) -> Self {
         self.surface = surface;
         self
+    }
+
+    /// Attach request-local provider parameters.
+    #[must_use]
+    pub fn with_parameters(
+        mut self,
+        parameters: serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        self.parameters = parameters;
+        self
+    }
+
+    /// Attach request-local HTTP headers.
+    #[must_use]
+    pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Attach typed, non-model-visible provider routing context.
+    #[must_use]
+    pub fn with_request_context(mut self, context: ProviderRequestContext) -> Self {
+        self.request_context = Some(context);
+        self
+    }
+
+    /// Typed provider routing context, when the caller owns one.
+    #[must_use]
+    pub const fn request_context(&self) -> Option<&ProviderRequestContext> {
+        self.request_context.as_ref()
     }
 
     /// Reject a request that would serialize a scalar tool argument value.
@@ -347,6 +519,40 @@ impl<T: CredentialPresence + ?Sized> CredentialPresence for Arc<T> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn provider_request_context_keeps_routing_identity_out_of_arbitrary_metadata() {
+        let identity = ProviderSessionIdentity::parse("ses_affinity_test")
+            .expect("a durable session id is valid");
+        let main = ProviderRequestContext::MainTurn(identity.clone());
+        assert_eq!(main.purpose(), RequestPurpose::MainTurn);
+        assert_eq!(main.session_identity(), Some(&identity));
+
+        let child = ProviderRequestContext::ChildTurn(identity.clone());
+        assert_eq!(child.purpose(), RequestPurpose::ChildTurn);
+        assert_eq!(child.session_identity(), Some(&identity));
+
+        for isolated in [
+            ProviderRequestContext::Title,
+            ProviderRequestContext::Summary,
+            ProviderRequestContext::Compaction,
+            ProviderRequestContext::Reflection,
+            ProviderRequestContext::Council,
+        ] {
+            assert!(
+                isolated.session_identity().is_none(),
+                "{isolated:?} must not inherit a conversation affinity"
+            );
+        }
+
+        assert!(ProviderSessionIdentity::parse("").is_err());
+        assert!(ProviderSessionIdentity::parse("turn_not_a_session").is_err());
+        assert!(ProviderSessionIdentity::parse("ses_contains whitespace").is_err());
+
+        let request =
+            CompletionRequest::new("gpt-test", Vec::new()).with_request_context(main.clone());
+        assert_eq!(request.request_context(), Some(&main));
+    }
 
     #[test]
     fn provider_bound_tool_arguments_must_be_json_objects() {

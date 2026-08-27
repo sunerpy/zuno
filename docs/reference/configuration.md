@@ -60,7 +60,7 @@ overlay only select the top-level defaults. For example,
 
 ```json
 {
-  "model": "kiro-local/claude-opus-4-8",
+  "model": "kiro-local/claude-opus-5",
   "small_model": "kiro-local/gpt-5.6-luna",
   "preset": "kiro-local"
 }
@@ -77,14 +77,13 @@ overlay need not duplicate either provider definition. Checked selector files
 for all three teams live under
 [`examples/config/profiles`](../../examples/config/profiles).
 
-Model names belong to a provider implementation, not to an account. On
-2026-08-26 the locally checked `opencode-kiro-auth` catalog advertises
-`claude-opus-5`, but the separately checked loopback `kiro-provider` catalog
-does not yet expose that id. Its current long-context Claude routes are
-`claude-opus-4-8` and `claude-sonnet-5`. Do not copy `kiro-auth` model ids into
-`kiro-local` until the running gateway's `/v1/models` response and its source
-both expose them. This distinction is why the checked example uses Claude Opus
-5 only under `myopenai`, and Claude Opus 4.8 under `kiro-local`.
+Model names belong to a provider implementation, not to an account. The
+checked example follows `kiro-provider` v0.5.0-rc.3, whose source and live
+`GET /v1/models` response both expose `claude-opus-5` plus
+`low`/`medium`/`high`/`xhigh`/`max`, a 1,000,000-token context limit, a
+128,000-token output limit, and text/image/PDF input. Keep the static Zuno
+catalog aligned with the gateway version actually deployed; do not infer a
+gateway model merely because an authentication plugin advertises it.
 
 For a loopback [kiro-provider](https://github.com/sunerpy/kiro-provider)
 Responses gateway, use a unique provider id such as `kiro-local`: Zuno checks
@@ -102,14 +101,45 @@ ZUNO_KIRO_LOCAL_API_KEY="$ZUNO_KIRO_LOCAL_API_KEY" \
   zuno
 ```
 
-The custom OpenAI-compatible transport appends `/responses`, so the Kiro API root in
-`baseURL` must end in `/v1`. `kiro-provider` defaults to `127.0.0.1:8787`, fails closed
-without a non-empty `KIRO_PROVIDER_API_KEYS`, and by default uses its `opencode-shared`
-authentication authority. That shared account authority and the local Bearer key are
-separate layers: the former authorizes the gateway upstream, while the latter protects
-the loopback HTTP endpoint. The resolved Responses surface is also preserved for title,
-compaction, summary, Council synthesis, and memory reflection requests; those internal
-Agents do not silently fall back to Chat Completions.
+The custom OpenAI `baseURL` route is handled by Zuno's native compatible
+Responses adapter and appends `/responses`, so the Kiro API root in `baseURL`
+must end in `/v1`. `kiro-provider` defaults to `127.0.0.1:8787`, fails closed
+without a non-empty `KIRO_PROVIDER_API_KEYS`, and by default uses its
+`opencode-shared` authentication authority. That shared account authority and
+the local Bearer key are separate layers: the former authorizes the gateway
+upstream, while the latter protects the loopback HTTP endpoint. The resolved
+Responses surface is also preserved for title, compaction, summary, Council
+synthesis, and memory reflection requests; those internal Agents do not
+silently fall back to Chat Completions.
+
+Set the provider options to:
+
+```json
+{
+  "baseURL": "http://127.0.0.1:8787/v1",
+  "maxTokens": null
+}
+```
+
+The null output default prevents Zuno's generic provider layer from injecting
+an unsupported 32,000-token cap. Declare each model's real `limit.output`
+instead. Current Zuno sends native Responses `instructions`, so the verified
+functional deployment uses kiro-provider's explicit
+`protocol_projection_mode: "legacy-user-prefix"` migration mode. The
+provider's default `safe` mode correctly rejects that request rather than
+silently rewriting it.
+
+For a foreground root or delegated-child turn, Zuno attaches the session's
+durable identity to standard Responses
+`metadata.zuno_session_id`. Tool continuations and a later process resume reuse
+the same identity. Title, summary, compaction, reflection, and Council requests
+remain explicitly isolated and do not receive foreground affinity.
+`zuno_session_id` is reserved: provider `extraBody` or request parameters may
+add unrelated object-shaped metadata but cannot override that field. A gateway
+using `session_affinity_mode: "explicit-only"` can therefore bind the request
+without private headers or model-visible prompt prefixes. See
+[Kiro Provider Native Integration](../design/kiro-provider-native-integration.md)
+for the ownership and verification contract.
 
 ## JSON Schema
 

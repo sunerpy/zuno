@@ -10,13 +10,14 @@ use zuno_db::{Connection, migration, open};
 use zuno_error::ProviderError;
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{
-    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderStream, Spec,
+    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRequestContext, ProviderStream,
+    Spec,
 };
 
 use super::{
     CompactionSkipped, InternalAgent, InternalProviders, Internals, PreludeContext,
-    TITLE_INSTRUCTION, TitleSkipped, compact_if_overflowing, estimate_tokens, generate_title,
-    run_prelude, summarize, transcript, transcript_owned,
+    TITLE_INSTRUCTION, TitleSkipped, compact_if_overflowing, complete_internal_text,
+    estimate_tokens, generate_title, run_prelude, summarize, transcript, transcript_owned,
 };
 use crate::compaction::{
     AutoContinueHookInput, CompactionHookInput, CompactionHooks, CompactionPrompt, CompactionState,
@@ -453,6 +454,11 @@ async fn a_new_sessions_first_turn_issues_a_tool_free_title_request_and_persists
         requests[0].tools.is_empty(),
         "the title request offered tools, but every internal denies all of them: {:#?}",
         requests[0].tools
+    );
+    assert_eq!(
+        requests[0].request_context(),
+        Some(&ProviderRequestContext::Title),
+        "title generation must stay out of the foreground provider conversation"
     );
     assert_eq!(
         outcome.title.as_deref(),
@@ -1116,6 +1122,43 @@ async fn summarize_issues_one_tool_free_request_carrying_the_summary_agents_prom
     assert_eq!(requests.len(), 1);
     assert!(requests[0].tools.is_empty());
     assert_eq!(text_of(&requests[0].messages[0]), SUMMARY_PROMPT);
+    assert_eq!(
+        requests[0].request_context(),
+        Some(&ProviderRequestContext::Summary),
+        "summary generation must stay out of the foreground provider conversation"
+    );
+}
+
+#[tokio::test]
+async fn council_synthesis_is_an_explicitly_isolated_internal_request() {
+    let provider = RecordingProvider::answering(&["Council synthesis"]);
+    let agent = internals().council_synth;
+
+    let answer = complete_internal_text(
+        SESSION_ID,
+        ProviderRequestContext::Council,
+        provider.as_ref(),
+        &agent,
+        vec![Message::new(Role::User, "seat results")],
+    )
+    .await
+    .expect("Council synthesis completes");
+
+    assert_eq!(answer, "Council synthesis");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].request_context(),
+        Some(&ProviderRequestContext::Council)
+    );
+    assert!(
+        requests[0]
+            .request_context()
+            .expect("Council context")
+            .session_identity()
+            .is_none(),
+        "Council synthesis must not join its parent session's provider conversation"
+    );
 }
 
 #[test]

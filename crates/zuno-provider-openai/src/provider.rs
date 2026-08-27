@@ -354,7 +354,7 @@ async fn start_stream(
     config: OpenAiConfig,
     request: CompletionRequest,
 ) -> Result<ProviderStream<'static>, ProviderError> {
-    let mut body = build_request_body(&request, &config)?;
+    let body = build_request_body(&request, &config)?;
     let surface = resolve_surface(request.surface);
     let request_auth = auth.resolve(config.provider()).await?;
     if request_auth.chatgpt && surface != ApiSurface::Responses {
@@ -363,7 +363,6 @@ async fn start_stream(
             "ChatGPT OAuth supports the OpenAI Responses surface only",
         )));
     }
-    request.apply_parameters(&mut body, surface);
     let endpoint = endpoint(&config.base_url, surface, request_auth.chatgpt);
     let provider = config.provider.clone();
     let model = request.model_id;

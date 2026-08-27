@@ -9,6 +9,8 @@ use zuno_llm::registry::{ApiSurface, CompletionRequest};
 
 use crate::provider::OpenAiConfig;
 
+const ZUNO_SESSION_METADATA_KEY: &str = "zuno_session_id";
+
 /// Sampling parameters understood by genuine OpenAI models.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Sampling {
@@ -67,13 +69,63 @@ pub fn build_request_body(
     request
         .validate_tool_arguments()
         .map_err(ProviderError::fatal)?;
-    match resolve_surface(request.surface) {
+    reject_reserved_session_metadata(request)?;
+    let surface = resolve_surface(request.surface);
+    let mut body = match surface {
         ApiSurface::Chat => build_chat_body(request, config),
         ApiSurface::Responses => build_responses_body(request, config),
         ApiSurface::Messages | ApiSurface::Default => {
             Err(ProviderError::fatal(RequestShapeError::UnsupportedSurface))
         }
+    }?;
+    request.apply_parameters(&mut body, surface);
+    if surface == ApiSurface::Responses {
+        project_session_affinity(request, &mut body)?;
     }
+    Ok(body)
+}
+
+fn reject_reserved_session_metadata(request: &CompletionRequest) -> Result<(), ProviderError> {
+    let overrides_reserved_key = request
+        .parameters
+        .get("metadata")
+        .and_then(Value::as_object)
+        .is_some_and(|metadata| metadata.contains_key(ZUNO_SESSION_METADATA_KEY));
+    if overrides_reserved_key {
+        Err(ProviderError::fatal(
+            RequestShapeError::ReservedSessionMetadata,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn project_session_affinity(
+    request: &CompletionRequest,
+    body: &mut Value,
+) -> Result<(), ProviderError> {
+    let Some(identity) = request
+        .request_context()
+        .and_then(|context| context.session_identity())
+    else {
+        return Ok(());
+    };
+    let root = body
+        .as_object_mut()
+        .expect("OpenAI request builders always return an object");
+    let metadata = root
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(metadata) = metadata.as_object_mut() else {
+        return Err(ProviderError::fatal(
+            RequestShapeError::MetadataMustBeObject,
+        ));
+    };
+    metadata.insert(
+        ZUNO_SESSION_METADATA_KEY.to_owned(),
+        Value::String(identity.as_str().to_owned()),
+    );
+    Ok(())
 }
 
 fn build_chat_body(
@@ -466,6 +518,8 @@ enum RequestShapeError {
     EncryptedReasoningOnChat,
     MissingEncryptedReasoning,
     ForeignThinking,
+    ReservedSessionMetadata,
+    MetadataMustBeObject,
 }
 
 impl fmt::Display for RequestShapeError {
@@ -489,6 +543,12 @@ impl fmt::Display for RequestShapeError {
             Self::ForeignThinking => formatter.write_str(
                 "signed thinking from another provider cannot be sent to OpenAI Responses",
             ),
+            Self::ReservedSessionMetadata => formatter.write_str(
+                "OpenAI request parameter `metadata.zuno_session_id` is reserved for Zuno's typed durable session affinity",
+            ),
+            Self::MetadataMustBeObject => formatter.write_str(
+                "OpenAI request parameter `metadata` must be an object when Zuno session affinity is attached",
+            ),
         }
     }
 }
@@ -498,7 +558,89 @@ impl std::error::Error for RequestShapeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
     use zuno_llm::event::RequestContentBlock;
+    use zuno_llm::registry::{ProviderRequestContext, ProviderSessionIdentity};
+
+    fn main_turn_context() -> ProviderRequestContext {
+        ProviderRequestContext::MainTurn(
+            ProviderSessionIdentity::parse("ses_openai_affinity").expect("valid session id"),
+        )
+    }
+
+    #[test]
+    fn responses_projects_typed_session_affinity_into_reserved_metadata() {
+        let request = CompletionRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::new(Role::User, "keep routing out of the prompt")],
+        )
+        .with_request_context(main_turn_context());
+
+        let body = build_request_body(&request, &OpenAiConfig::default()).expect("body");
+
+        assert_eq!(body["metadata"]["zuno_session_id"], "ses_openai_affinity");
+        assert!(
+            !body["input"].to_string().contains("ses_openai_affinity"),
+            "routing identity must not become model-visible input: {body}"
+        );
+    }
+
+    #[test]
+    fn chat_does_not_fabricate_a_session_affinity_field() {
+        let request =
+            CompletionRequest::new("gpt-4.1", vec![Message::new(Role::User, "plain chat")])
+                .on_surface(ApiSurface::Chat)
+                .with_request_context(main_turn_context());
+
+        let body = build_request_body(&request, &OpenAiConfig::default()).expect("body");
+
+        assert!(
+            body.get("metadata").is_none(),
+            "Chat Completions has no Zuno affinity projection: {body}"
+        );
+    }
+
+    #[test]
+    fn responses_rejects_an_attempt_to_override_the_reserved_affinity_key() {
+        let mut request = CompletionRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::new(Role::User, "do not override routing")],
+        )
+        .with_request_context(main_turn_context());
+        request.parameters.insert(
+            "metadata".to_owned(),
+            json!({
+                "tenant": "kept",
+                "zuno_session_id": "ses_attacker_controlled"
+            }),
+        );
+
+        let error = build_request_body(&request, &OpenAiConfig::default())
+            .expect_err("the reserved metadata key must be rejected locally");
+
+        let source = error.source().expect("request-shape source is preserved");
+        assert!(
+            source.to_string().contains("zuno_session_id"),
+            "the local error must name the reserved field: {source}"
+        );
+    }
+
+    #[test]
+    fn responses_preserves_unrelated_request_metadata_beside_affinity() {
+        let mut request = CompletionRequest::new(
+            "gpt-5.6-sol",
+            vec![Message::new(Role::User, "keep caller metadata")],
+        )
+        .with_request_context(main_turn_context());
+        request
+            .parameters
+            .insert("metadata".to_owned(), json!({"tenant": "tenant-a"}));
+
+        let body = build_request_body(&request, &OpenAiConfig::default()).expect("body");
+
+        assert_eq!(body["metadata"]["tenant"], "tenant-a");
+        assert_eq!(body["metadata"]["zuno_session_id"], "ses_openai_affinity");
+    }
 
     #[test]
     fn responses_uses_native_instructions_and_developer_context() {

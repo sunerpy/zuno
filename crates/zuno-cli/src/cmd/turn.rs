@@ -80,7 +80,8 @@ use zuno_llm::catalog::resolved::ModelEndpoint;
 use zuno_llm::catalog::{Catalog, CatalogProvenance, CatalogSource, ResolveInput};
 use zuno_llm::event::{Message as ProviderMessage, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{
-    ApiSurface, CompletionRequest, Provider, ProviderRegistry, Spec, ToolSchema, generation,
+    ApiSurface, CompletionRequest, Provider, ProviderRegistry, ProviderRequestContext, Spec,
+    ToolSchema, generation,
 };
 use zuno_llm::stream::StreamAccumulator;
 use zuno_memory::{
@@ -1530,7 +1531,8 @@ impl ReflectionRunner for ProviderReflectionRunner {
             let mut stream = self.provider.stream(
                 CompletionRequest::new(self.model.model_id.clone(), messages)
                     .on_surface(self.model.surface)
-                    .with_tools(vec![schema]),
+                    .with_tools(vec![schema])
+                    .with_request_context(ProviderRequestContext::Reflection),
             );
             let mut accumulator =
                 StreamAccumulator::for_stream(self.model.catalog_provider_id.clone(), "reflection");

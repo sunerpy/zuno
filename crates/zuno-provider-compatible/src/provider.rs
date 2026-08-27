@@ -53,6 +53,20 @@ pub const MODEL_CAPABILITIES_OPTION: &str = "modelCapabilities";
 /// [`PROTECTED_KEYS`](crate::request::PROTECTED_KEYS) are ignored.
 pub const EXTRA_BODY_OPTION: &str = "extraBody";
 
+const ZUNO_SESSION_METADATA_KEY: &str = "zuno_session_id";
+
+#[derive(Debug, thiserror::Error)]
+enum RequestShapeError {
+    #[error(
+        "OpenAI-compatible request parameter `metadata.zuno_session_id` is reserved for Zuno's typed durable session affinity"
+    )]
+    ReservedSessionMetadata,
+    #[error(
+        "OpenAI-compatible request parameter `metadata` must be an object when Zuno session affinity is attached"
+    )]
+    MetadataMustBeObject,
+}
+
 /// An OpenAI-compatible provider.
 #[derive(Debug)]
 pub struct CompatibleProvider {
@@ -197,8 +211,27 @@ impl CompatibleProvider {
     /// Exposed for the same reason as [`endpoint`](Self::endpoint): the
     /// reasoning-content echo and the `thinking` ordering are properties of the
     /// bytes, and asserting them should not require a socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `request` violates a local request-shape invariant. Production
+    /// dispatch uses [`try_body_for`](Self::try_body_for) and returns that typed
+    /// failure through the provider stream; this convenience accessor exists for
+    /// diagnostics and tests that construct known-valid requests.
     #[must_use]
     pub fn body_for(&self, request: &CompletionRequest) -> Value {
+        self.try_body_for(request)
+            .expect("diagnostic request body must satisfy local request-shape invariants")
+    }
+
+    /// Build one request body while preserving local request-shape failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns a permanent local error when caller metadata tries to override
+    /// Zuno's reserved session-affinity field, or when affinity cannot be merged
+    /// into an object-shaped metadata value.
+    pub fn try_body_for(&self, request: &CompletionRequest) -> Result<Value, ProviderError> {
         let quirks = self.quirks_for(&request.model_id, request.surface);
         let mut body = RequestBody::new(request.model_id.clone(), request.messages.clone());
         body.developer_context
@@ -214,19 +247,24 @@ impl CompatibleProvider {
         // `/chat/completions` or `/responses`. The endpoint is built from the same
         // resolved value on the next line of `http_request`.
         request.apply_parameters(&mut body, quirks.surface);
-        body
+        project_session_affinity(&self.extra_body, request, quirks.surface, &mut body)?;
+        Ok(body)
     }
 
     /// The full request one completion will send.
-    #[must_use]
-    pub fn http_request(&self, request: &CompletionRequest) -> HttpRequest {
+    ///
+    /// # Errors
+    ///
+    /// Propagates local request-shape failures from
+    /// [`try_body_for`](Self::try_body_for).
+    pub fn http_request(&self, request: &CompletionRequest) -> Result<HttpRequest, ProviderError> {
         let mut headers = self.headers();
         headers.extend(request.headers.clone());
-        HttpRequest {
+        Ok(HttpRequest {
             url: self.endpoint(&request.model_id, request.surface),
             headers,
-            body: self.body_for(request),
-        }
+            body: self.try_body_for(request)?,
+        })
     }
 
     /// Capabilities for one model: the per-model override, else the provider set.
@@ -275,7 +313,10 @@ impl Provider for CompatibleProvider {
             return Box::pin(futures::stream::once(async move { Err(error) }));
         }
         let surface = quirks.surface;
-        let http = self.http_request(&request);
+        let http = match self.http_request(&request) {
+            Ok(http) => http,
+            Err(error) => return Box::pin(futures::stream::once(async move { Err(error) })),
+        };
         let provider = self.spec.provider.clone();
         let model = request.model_id.clone();
         let idle = self.idle;
@@ -291,6 +332,50 @@ impl Provider for CompatibleProvider {
             .flatten(),
         )
     }
+}
+
+fn project_session_affinity(
+    provider_parameters: &Map<String, Value>,
+    request: &CompletionRequest,
+    surface: ApiSurface,
+    body: &mut Value,
+) -> Result<(), ProviderError> {
+    for parameters in [provider_parameters, &request.parameters] {
+        let overrides_reserved_key = parameters
+            .get("metadata")
+            .and_then(Value::as_object)
+            .is_some_and(|metadata| metadata.contains_key(ZUNO_SESSION_METADATA_KEY));
+        if overrides_reserved_key {
+            return Err(ProviderError::fatal(
+                RequestShapeError::ReservedSessionMetadata,
+            ));
+        }
+    }
+    if surface != ApiSurface::Responses {
+        return Ok(());
+    }
+    let Some(identity) = request
+        .request_context()
+        .and_then(|context| context.session_identity())
+    else {
+        return Ok(());
+    };
+    let root = body
+        .as_object_mut()
+        .expect("compatible request builders always return an object");
+    let metadata = root
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(metadata) = metadata.as_object_mut() else {
+        return Err(ProviderError::fatal(
+            RequestShapeError::MetadataMustBeObject,
+        ));
+    };
+    metadata.insert(
+        ZUNO_SESSION_METADATA_KEY.to_owned(),
+        Value::String(identity.as_str().to_owned()),
+    );
+    Ok(())
 }
 
 fn request_contains_attachment(request: &CompletionRequest) -> bool {
@@ -503,7 +588,9 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::error::Error as _;
     use std::sync::Mutex;
+    use zuno_llm::registry::{ProviderRequestContext, ProviderSessionIdentity};
 
     #[derive(Debug)]
     struct NeverCalled;
@@ -556,6 +643,116 @@ mod tests {
 
     fn groq() -> CompatibleProvider {
         build(Spec::new("groq").with_base_url("https://api.groq.com/openai/v1")).expect("claimed")
+    }
+
+    fn responses_provider() -> CompatibleProvider {
+        build(
+            Spec::new("wire-test")
+                .with_base_url("https://gateway.example/v1")
+                .with_surface(ApiSurface::Responses)
+                .with_option(crate::family::TRANSPORT_OPTION, json!("openai-compatible")),
+        )
+        .expect("declared compatible Responses provider")
+    }
+
+    fn affinity_request() -> CompletionRequest {
+        CompletionRequest::new(
+            "gateway-model",
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "hello",
+            )],
+        )
+        .with_request_context(ProviderRequestContext::MainTurn(
+            ProviderSessionIdentity::parse("ses_compatible_affinity")
+                .expect("valid session identity"),
+        ))
+    }
+
+    #[test]
+    fn compatible_responses_projects_typed_session_affinity() {
+        let body = responses_provider().body_for(&affinity_request());
+
+        assert_eq!(
+            body["metadata"]["zuno_session_id"],
+            "ses_compatible_affinity"
+        );
+        assert!(
+            !body["input"]
+                .to_string()
+                .contains("ses_compatible_affinity"),
+            "routing identity became model-visible: {body}"
+        );
+    }
+
+    #[test]
+    fn compatible_responses_preserves_unrelated_metadata_beside_affinity() {
+        let mut request = affinity_request();
+        request
+            .parameters
+            .insert("metadata".to_owned(), json!({"tenant": "tenant-a"}));
+
+        let body = responses_provider().body_for(&request);
+
+        assert_eq!(body["metadata"]["tenant"], "tenant-a");
+        assert_eq!(
+            body["metadata"]["zuno_session_id"],
+            "ses_compatible_affinity"
+        );
+    }
+
+    #[test]
+    fn compatible_responses_rejects_reserved_affinity_overrides() {
+        let mut request = affinity_request();
+        request.parameters.insert(
+            "metadata".to_owned(),
+            json!({"zuno_session_id":"ses_overridden"}),
+        );
+
+        let error = responses_provider()
+            .try_body_for(&request)
+            .expect_err("reserved metadata must fail locally");
+        let source = error.source().expect("request-shape source is preserved");
+        assert!(source.to_string().contains("zuno_session_id"), "{source}");
+    }
+
+    #[test]
+    fn compatible_responses_rejects_provider_extra_body_affinity_overrides() {
+        let provider = build(
+            Spec::new("wire-test")
+                .with_base_url("https://gateway.example/v1")
+                .with_surface(ApiSurface::Responses)
+                .with_option(crate::family::TRANSPORT_OPTION, json!("openai-compatible"))
+                .with_option(
+                    EXTRA_BODY_OPTION,
+                    json!({"metadata": {"zuno_session_id": "ses_provider_override"}}),
+                ),
+        )
+        .expect("declared compatible Responses provider");
+
+        let error = provider
+            .try_body_for(&affinity_request())
+            .expect_err("provider metadata must not replace durable affinity");
+        let source = error.source().expect("request-shape source is preserved");
+        assert!(source.to_string().contains("zuno_session_id"), "{source}");
+    }
+
+    #[test]
+    fn compatible_chat_does_not_fabricate_session_affinity_metadata() {
+        let provider = build(
+            Spec::new("wire-test")
+                .with_base_url("https://gateway.example/v1")
+                .with_surface(ApiSurface::Chat)
+                .with_option(crate::family::TRANSPORT_OPTION, json!("openai-compatible")),
+        )
+        .expect("declared compatible Chat provider");
+
+        let body = provider.body_for(&affinity_request());
+
+        assert!(
+            body.get("metadata").is_none(),
+            "Chat Completions has no Zuno affinity projection: {body}"
+        );
     }
 
     #[test]
@@ -759,7 +956,9 @@ mod tests {
             "the trap only exists when the request itself names no surface"
         );
 
-        let sent = provider.http_request(&request);
+        let sent = provider
+            .http_request(&request)
+            .expect("valid Responses request");
         assert!(
             sent.url.ends_with("/responses"),
             "this spec must route to the Responses surface: {}",

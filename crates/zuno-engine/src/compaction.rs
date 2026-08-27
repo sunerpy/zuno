@@ -18,7 +18,7 @@ use zuno_db::message::{MessageRecord, MessageStore, PartRecord, now_millis};
 use zuno_error::{DbError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools};
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
-use zuno_llm::registry::{CompletionRequest, Provider};
+use zuno_llm::registry::{CompletionRequest, Provider, ProviderRequestContext};
 use zuno_observability::span;
 
 use crate::retry::{RecoveryBudget, RecoveryBudgets};
@@ -642,10 +642,10 @@ where
     );
     let operation_span = request_span.clone();
     let (chunks, provider_failure) = async move {
-        let mut stream = provider.stream(CompletionRequest::new(
-            request.small_model_id,
-            model_messages,
-        ));
+        let mut stream = provider.stream(
+            CompletionRequest::new(request.small_model_id, model_messages)
+                .with_request_context(ProviderRequestContext::Compaction),
+        );
         let mut chunks = Vec::new();
         let mut provider_failure = None;
         while let Some(event) = stream.next().await {

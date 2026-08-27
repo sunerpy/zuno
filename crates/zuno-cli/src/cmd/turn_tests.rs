@@ -6585,6 +6585,7 @@ fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
 mod reflection_runtime {
     use super::*;
     use futures::stream;
+    use std::sync::Mutex;
     use zuno_agent::reflection::{
         ReflectionMemoryEntry, ReflectionMemoryScope, ReflectionTurn, TranscriptEvent,
         TurnDelivery, TurnTranscript,
@@ -6596,6 +6597,7 @@ mod reflection_runtime {
     #[derive(Debug)]
     struct ScriptedProvider {
         events: Vec<StreamEvent>,
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
     }
 
     impl Provider for ScriptedProvider {
@@ -6610,7 +6612,11 @@ mod reflection_runtime {
             }
         }
 
-        fn stream(&self, _request: CompletionRequest) -> ProviderStream<'_> {
+        fn stream(&self, request: CompletionRequest) -> ProviderStream<'_> {
+            self.requests
+                .lock()
+                .expect("reflection request lock")
+                .push(request);
             Box::pin(stream::iter(self.events.clone().into_iter().map(Ok)))
         }
     }
@@ -6620,6 +6626,7 @@ mod reflection_runtime {
         memory: Arc<MemoryService>,
         events: zuno_db::event_log::SessionEventLog,
         fork: ReflectionFork,
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
     }
 
     fn fixture(provider_events: Vec<StreamEvent>) -> Fixture {
@@ -6652,9 +6659,11 @@ mod reflection_runtime {
             PromotionPolicy::Review,
         ));
         let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let runner = ProviderReflectionRunner {
             provider: Arc::new(ScriptedProvider {
                 events: provider_events,
+                requests: Arc::clone(&requests),
             }),
             model: EngineModel::new(
                 Spec::new("reflection-provider"),
@@ -6672,6 +6681,7 @@ mod reflection_runtime {
             memory,
             events,
             fork,
+            requests,
         }
     }
 
@@ -6769,6 +6779,13 @@ mod reflection_runtime {
         );
         assert_eq!(events[1].properties["status"], "completed");
         assert_eq!(events[1].properties["toolCalls"], 1);
+        let requests = fixture.requests.lock().expect("reflection requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].request_context(),
+            Some(&ProviderRequestContext::Reflection),
+            "reflection must not join the foreground provider conversation"
+        );
     }
 
     #[tokio::test]

@@ -99,8 +99,9 @@ mod spec;
 
 pub use crate::registry::error::{Declined, FactoryOutcome, RegistryError, Unavailable};
 pub use crate::registry::provider::{
-    Capabilities, CompletionRequest, CredentialPresence, FinishReason, Message, Provider,
-    ProviderStream, Role, StreamEvent, ToolSchema,
+    Capabilities, CompletionRequest, CredentialPresence, FinishReason,
+    InvalidProviderSessionIdentity, Message, Provider, ProviderRequestContext,
+    ProviderSessionIdentity, ProviderStream, RequestPurpose, Role, StreamEvent, ToolSchema,
 };
 pub use crate::registry::spec::{ApiSurface, Spec, generation};
 

@@ -37,7 +37,9 @@ use zuno_llm::event::{
     FinishReason, Message, PromptAccounting, RequestContentBlock, Role, StreamEvent,
     ThoughtSignature,
 };
-use zuno_llm::registry::{ApiSurface, ProviderRegistry, Spec, ToolSchema};
+use zuno_llm::registry::{
+    ApiSurface, ProviderRegistry, ProviderRequestContext, ProviderSessionIdentity, Spec, ToolSchema,
+};
 use zuno_llm::sse::{StreamLimits, append_tool_input};
 use zuno_observability::span;
 use zuno_orchestration::{
@@ -1252,6 +1254,13 @@ async fn run_turn_in_span(
 ) -> Result<TurnOutcome, TurnError> {
     let events = events.with_hooks(Arc::clone(&context.hooks));
     let session = session::get(context.connection, &request.session_id)?;
+    let provider_session_identity =
+        ProviderSessionIdentity::parse(session.id.clone()).map_err(ProviderError::fatal)?;
+    let provider_request_context = if session.is_root() {
+        ProviderRequestContext::MainTurn(provider_session_identity)
+    } else {
+        ProviderRequestContext::ChildTurn(provider_session_identity)
+    };
     touch_session(context.connection, &request.session_id)?;
     events
         .send(TurnEvent::TurnStarted {
@@ -1442,7 +1451,7 @@ async fn run_turn_in_span(
             })
             .await?;
 
-        let mut completion = completion_request(&model, prepared);
+        let mut completion = completion_request(&model, prepared, provider_request_context.clone());
         let hook_message = completion
             .messages
             .last()
@@ -1496,6 +1505,9 @@ async fn run_turn_in_span(
                 estimated_prompt_tokens,
                 assistant_message_id: &assistant_id,
                 orchestration_snapshot: &orchestration_snapshot,
+                request_context: completion
+                    .request_context()
+                    .expect("foreground completion always has provider routing context"),
             },
         )?;
         events
@@ -3198,6 +3210,7 @@ struct ProviderRequestStart<'a> {
     estimated_prompt_tokens: u64,
     assistant_message_id: &'a str,
     orchestration_snapshot: &'a AttemptSnapshot,
+    request_context: &'a ProviderRequestContext,
 }
 
 fn append_provider_request_started(
@@ -3222,7 +3235,21 @@ fn append_provider_request_started(
             "assistantMessageID".to_owned(),
             Value::String(start.assistant_message_id.to_owned()),
         ),
+        (
+            "requestPurpose".to_owned(),
+            Value::String(start.request_context.purpose().as_str().to_owned()),
+        ),
+        (
+            "affinityAttached".to_owned(),
+            Value::Bool(start.request_context.session_identity().is_some()),
+        ),
     ]);
+    if start.request_context.session_identity().is_some() {
+        properties.insert(
+            "affinitySource".to_owned(),
+            Value::String("durable-session".to_owned()),
+        );
+    }
     if let Some(prompt_receipt_id) = start.prompt_receipt_id {
         properties.insert(
             "promptReceiptID".to_owned(),
@@ -3440,24 +3467,24 @@ fn estimate_prepared_prompt_tokens(prepared: &PreparedTurn<ToolDefinition>) -> u
 fn completion_request(
     model: &ResolvedModel,
     prepared: PreparedTurn<ToolDefinition>,
+    request_context: ProviderRequestContext,
 ) -> zuno_llm::registry::CompletionRequest {
     let (messages, developer_context, tools) = prepared.into_request_parts();
-    zuno_llm::registry::CompletionRequest {
-        model_id: model.model_id.clone(),
-        surface: model.surface,
-        messages,
-        developer_context,
-        tools: tools
-            .iter()
-            .map(|tool| zuno_llm::registry::ToolSchema {
-                name: tool.id.clone(),
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
-            })
-            .collect(),
-        parameters: model.reasoning_options.clone(),
-        headers: std::collections::BTreeMap::new(),
-    }
+    zuno_llm::registry::CompletionRequest::new(model.model_id.clone(), messages)
+        .on_surface(model.surface)
+        .with_developer_context(developer_context)
+        .with_tools(
+            tools
+                .iter()
+                .map(|tool| zuno_llm::registry::ToolSchema {
+                    name: tool.id.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.parameters.clone(),
+                })
+                .collect(),
+        )
+        .with_parameters(model.reasoning_options.clone())
+        .with_request_context(request_context)
 }
 
 fn ensure_prepare_request_tool_subset(

@@ -17,7 +17,9 @@ use zuno_engine::compaction::{
 use zuno_error::{ProviderError, Recovery};
 use zuno_llm::cache::{CacheTracker, LockedTools, McpToolStatus, StaticSystemPrompt};
 use zuno_llm::event::{Message, RequestContentBlock, Role, StreamEvent};
-use zuno_llm::registry::{Capabilities, CompletionRequest, Provider, ProviderStream};
+use zuno_llm::registry::{
+    Capabilities, CompletionRequest, Provider, ProviderRequestContext, ProviderStream,
+};
 
 const SESSION_ID: &str = "ses_compaction_test";
 const SUMMARY: &str = "## Objective\n- Finish the Rust compactor.\n\n## Important Details\n- Never split tool pairs.\n\n## Work State\n### Completed\n- Boundary selected.\n\n### Active\n- Compaction tests.\n\n### Blocked\n- (none)\n\n## Next Move\n1. Run the next turn.\n2. Verify the result.\n\n## Relevant Files\n- crates/zuno-engine/src/compaction.rs: compactor.";
@@ -453,6 +455,11 @@ async fn compaction_summarizes_two_hundred_messages_with_the_small_model_and_res
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].model_id, "small-cassette-model");
+    assert_eq!(
+        requests[0].request_context(),
+        Some(&ProviderRequestContext::Compaction),
+        "compaction must not join the foreground provider conversation"
+    );
     let prompt = requests[0]
         .messages
         .last()

@@ -24,8 +24,8 @@ use zuno_error::ProviderError;
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{
-    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
-    ToolSchema,
+    ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry,
+    ProviderRequestContext, ProviderStream, RequestPurpose, Spec, ToolSchema,
 };
 use zuno_orchestration::{
     AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
@@ -757,6 +757,89 @@ async fn run_full_turn_once() -> (Vec<TurnEvent>, Vec<CompletionRequest>, Vec<Di
 }
 
 #[tokio::test]
+async fn one_durable_session_identity_spans_every_tool_continuation() {
+    let (_events, requests, _calls) = run_full_turn_once().await;
+
+    assert_eq!(
+        requests.len(),
+        2,
+        "the fixture must exercise a tool continuation"
+    );
+    for request in &requests {
+        let context = request
+            .request_context()
+            .expect("foreground turns carry typed provider routing context");
+        assert_eq!(context.purpose(), RequestPurpose::MainTurn);
+        assert_eq!(
+            context
+                .session_identity()
+                .expect("main turn has affinity")
+                .as_str(),
+            SESSION_ID
+        );
+    }
+    assert_eq!(
+        requests[0].request_context(),
+        requests[1].request_context(),
+        "tool continuation must keep the exact durable session affinity"
+    );
+}
+
+#[tokio::test]
+async fn a_child_turn_uses_its_own_session_instead_of_the_parent_affinity() {
+    let mut connection = seeded();
+    connection
+        .execute(
+            "UPDATE session SET parent_id = ?1 WHERE id = ?2",
+            ["ses_parent", SESSION_ID],
+        )
+        .expect("mark the fixture as a child session");
+    put_user(&connection, "msg_child_affinity", 10, "answer as child");
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("child answer".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-child-affinity"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    outcome.expect("child turn succeeds");
+
+    let requests = provider.requests();
+    let context = requests[0]
+        .request_context()
+        .expect("child turn carries typed context");
+    assert_eq!(
+        context,
+        &ProviderRequestContext::ChildTurn(
+            zuno_llm::registry::ProviderSessionIdentity::parse(SESSION_ID)
+                .expect("valid child session id")
+        )
+    );
+    assert_ne!(
+        context.session_identity().expect("child affinity").as_str(),
+        "ses_parent",
+        "a child request must not join the parent provider conversation"
+    );
+}
+
+#[tokio::test]
 async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
     let mut connection = seeded();
     put_user(&connection, "msg_prompt_trace", 10, "trace the prompt");
@@ -847,6 +930,9 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
     assert_eq!(lifecycle[0]["requestID"], lifecycle[1]["requestID"]);
     assert_eq!(lifecycle[0]["turnID"], "turn-prompt-trace");
     assert_eq!(lifecycle[0]["promptReceiptID"], prompt_event_id);
+    assert_eq!(lifecycle[0]["requestPurpose"], "main-turn");
+    assert_eq!(lifecycle[0]["affinityAttached"], true);
+    assert_eq!(lifecycle[0]["affinitySource"], "durable-session");
     assert!(lifecycle[0]["estimatedPromptTokens"].as_u64().is_some());
     let snapshot: AttemptSnapshot =
         serde_json::from_value(lifecycle[0]["orchestrationSnapshot"].clone())

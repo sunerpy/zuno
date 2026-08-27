@@ -25,7 +25,7 @@ use zuno_db::job::{
 use zuno_db::pool::Pool;
 use zuno_engine::prelude::{InternalAgent, complete_internal_text};
 use zuno_llm::event::{Message, Role};
-use zuno_llm::registry::Provider;
+use zuno_llm::registry::{Provider, ProviderRequestContext};
 use zuno_tools::council::{CouncilHost, CouncilRequest, CouncilSeatRequest, CouncilTurn};
 use zuno_tools::task::{ChildTurn, ChildTurnRequest, ReportDelivery};
 use zuno_tools::work_state::{
@@ -297,7 +297,7 @@ impl CouncilSynthesizer for ProviderCouncilSynthesizer {
     async fn synthesize(&self, session_id: &str, payload: String) -> Result<String, String> {
         complete_internal_text(
             session_id,
-            "council-synth",
+            ProviderRequestContext::Council,
             self.provider.as_ref(),
             &self.agent,
             vec![

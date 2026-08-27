@@ -72,6 +72,12 @@ fn harness_guide_documents_the_native_extension_contract() {
             "`deep`",
             "Prompt provenance",
             "session.prompt.assembled",
+            "Provider request routing context",
+            "ProviderRequestContext",
+            "metadata.zuno_session_id",
+            "requestPurpose",
+            "affinityAttached",
+            "affinitySource",
             "durable inbox",
             "`Ctrl+Enter`",
             "`Shift+Enter`",
@@ -360,6 +366,9 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "zuno auth login openai --method api-key",
             "first non-empty variable",
             "not copied into `auth.json`",
+            "metadata.zuno_session_id",
+            "durable root or child session identity",
+            "title, summary, compaction, reflection, and Council calls are isolated",
         ],
     );
     contains_all(
@@ -394,6 +403,7 @@ fn multi_provider_example_routes_only_zuno_agents() {
         "the myopenai catalog must include Claude Fable 5"
     );
     for model in [
+        "claude-opus-5",
         "claude-opus-4-8",
         "claude-sonnet-5",
         "gpt-5.6-sol",
@@ -404,11 +414,18 @@ fn multi_provider_example_routes_only_zuno_agents() {
             "the Kiro catalog must include {model}"
         );
     }
-    assert!(
-        providers["kiro-local"]["models"]
-            .get("claude-opus-5")
-            .is_none(),
-        "the example must not advertise a model absent from the referenced Kiro gateway"
+    assert_eq!(
+        providers["kiro-local"]["options"]["maxTokens"],
+        serde_json::Value::Null,
+        "Zuno must not inject a generic output cap into Kiro Responses requests"
+    );
+    assert_eq!(
+        providers["kiro-local"]["models"]["claude-opus-5"]["limit"]["context"],
+        1_000_000
+    );
+    assert_eq!(
+        providers["kiro-local"]["models"]["claude-opus-5"]["limit"]["output"],
+        128_000
     );
 
     let expected_agents = [
@@ -445,6 +462,10 @@ fn multi_provider_example_routes_only_zuno_agents() {
             "OMO categories must not be copied into Zuno presets"
         );
     }
+    assert_eq!(
+        presets["kiro-local"]["agents"]["deep"]["model"],
+        "kiro-local/claude-opus-5"
+    );
 
     let text = read(relative);
     for foreign in [
@@ -472,7 +493,6 @@ fn multi_provider_example_routes_only_zuno_agents() {
             "`kiro-local`",
             "`hybrid`",
             "claude-opus-5",
-            "claude-opus-4-8",
             "ZUNO_CONFIG_DIR",
             "/preset",
         ],

@@ -324,6 +324,34 @@ in scope.
 
 Before the provider request, the loop persists `session.prompt.assembled`. The event records the ordered sections and the actual post-hook system prompt, so a model request can be reconstructed even when a hook transformed the assembled text. Identical prompt content is logged once per turn.
 
+### Provider request routing context
+
+Foreground requests carry a private, typed `ProviderRequestContext` beside the
+model-visible request. A root turn uses `MainTurn` with its durable session id;
+a delegated child uses `ChildTurn` with the child's own durable session id.
+Every continuation in one tool loop reuses that same context, and resuming the
+durable session after a process restart reconstructs the same identity.
+
+Title generation, lifecycle summaries, compaction, memory reflection, and
+Council synthesis use explicit isolated purposes with no foreground-session
+identity. This prevents lifecycle work from joining either the root or a child
+provider conversation.
+
+Only an OpenAI Responses wire surface projects the typed identity, as
+`metadata.zuno_session_id`. Both the official OpenAI adapter and the compatible
+adapter used by a custom OpenAI `baseURL` implement the same projection. Chat
+Completions and Anthropic Messages do not receive a fabricated equivalent.
+Unrelated object-shaped metadata is preserved, while
+`metadata.zuno_session_id` is reserved and cannot be replaced through provider
+options or request parameters. The routing context remains private to
+`CompletionRequest`, so ordinary request hooks cannot mutate it or move it into
+prompts, headers, or tool definitions.
+
+Each foreground `session.provider.request` event records `requestPurpose`,
+`affinityAttached`, and, when attached,
+`affinitySource: "durable-session"`. It does not persist the raw routing
+identity, credentials, or upstream account and conversation identifiers.
+
 ## Auditable memory and reflection
 
 Resident memory has one mutation boundary: `memory_propose`. Foreground agents
