@@ -228,6 +228,7 @@ struct ChildSessionSpec {
     model: String,
     effort: Option<zuno_llm::effort::ReasoningEffort>,
     provider_options: Map<String, Value>,
+    background: bool,
 }
 
 impl ChildSessionSpec {
@@ -247,6 +248,7 @@ impl ChildSessionSpec {
             model: model.to_owned(),
             effort,
             provider_options: request.provider_options.clone(),
+            background: request.background,
         }
     }
 
@@ -651,6 +653,20 @@ impl BackgroundJobSupervisor {
         }
     }
 
+    /// Request cancellation for work owned by one root or child session.
+    pub(crate) fn cancel_for_parent(&self, parent_session_id: &str) {
+        let tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for job in tasks.iter().filter(|job| {
+            job.parent_session_id == parent_session_id
+                && job.task.as_ref().is_none_or(|task| !task.is_finished())
+        }) {
+            job.cancellation.cancel();
+        }
+    }
+
     /// Whether this process still owns a task that can write one session's state.
     pub(crate) fn has_running_tasks(&self, parent_session_id: &str) -> bool {
         self.tasks
@@ -698,6 +714,35 @@ impl BackgroundJobSupervisor {
                 .retain(|job| job.internal_id != internal_id);
         }
     }
+
+    /// Join only work owned by one session, leaving peer roots untouched.
+    pub(crate) async fn wait_for_parent(&self, parent_session_id: &str) {
+        let _waiter = self.waiter.lock().await;
+        loop {
+            let next = {
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                tasks.iter_mut().find_map(|job| {
+                    (job.parent_session_id == parent_session_id)
+                        .then(|| job.task.take().map(|task| (job.internal_id, task)))
+                        .flatten()
+                })
+            };
+            let Some((internal_id, task)) = next else {
+                return;
+            };
+            if let Err(error) = task.await {
+                tracing::error!(%error, "background subagent task panicked");
+            }
+            self.tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|job| job.internal_id != internal_id);
+            self.notify_changed();
+        }
+    }
 }
 
 #[async_trait]
@@ -740,6 +785,8 @@ pub(crate) struct ChildSessionOpened {
     pub(crate) agent: String,
     pub(crate) model: String,
     pub(crate) effort: Option<zuno_llm::effort::ReasoningEffort>,
+    pub(crate) prompt: String,
+    pub(crate) background: bool,
     pub(crate) messages: Vec<zuno_tui::views::message::Message>,
     pub(crate) usage: Option<zuno_types::UsageSnapshot>,
 }
@@ -1321,6 +1368,8 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
                 agent: host.agent_name().to_owned(),
                 model: host.qualified_model(),
                 effort: host.effort_override(),
+                prompt: request.prompt.clone(),
+                background: request.background,
                 messages,
                 usage: Some(host.session_usage().snapshot()),
             });
@@ -1600,6 +1649,8 @@ impl PendingInputDriver for InteractiveChildInputDriver {
                 agent: host.agent_name().to_owned(),
                 model: host.qualified_model(),
                 effort: host.effort_override(),
+                prompt: text.clone(),
+                background: spec.background,
                 messages,
                 usage: Some(host.session_usage().snapshot()),
             });

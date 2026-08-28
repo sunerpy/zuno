@@ -109,14 +109,60 @@ loop.
 | Commands and Skills | Publishes native `/compact`, `/goal`, `/plan`, `/start-plan`, and `/start-work` controls with real handlers, executable Catalog commands, and unambiguous slash-invokable Skills through `available_commands_update` after new/load/resume and successful reconfiguration. Native commands resolve first and suppress same-named Catalog or Skill entries. Compact and Goal invoke shared durable `TurnHost` handlers; Plan controls transactionally replace the collaboration host, publish standard mode/config updates, and require a durable plan before returning to Work. Native command text never enters the model; other `/name arguments` invocations reuse the same command or Skill driver as other Zuno surfaces. |
 | Prompt execution | Admits input through the durable Zuno turn path, streams projections while the turn runs, and projects the final durable plan before returning. Concurrent prompts for one session are rejected. |
 | Prompt content | Advertises and accepts text, inline image, native `resource_link`, embedded text resource, and embedded image resource content. Audio remains `false`. Resource links stay typed; images use typed durable file parts; embedded text keeps URI, MIME, and body in one stable persisted envelope. Selection, diagnostics, fetched context, and branch diff use the generic embedded-resource path rather than Zed-specific prompt branches. |
-| Assistant and tool projection | Streams assistant text and reasoning, tool start/update/completion, accumulated raw input, raw output, JSON/text content, written-file locations, and usage. |
+| Assistant and tool projection | Streams assistant text and real provider reasoning, tool start/update/completion, accumulated raw input, raw output, JSON/text content, written-file locations, and usage. A generated session title is a typed `session_info_update`; operational status and provider error text never masquerade as `agent_thought_chunk`. |
+| Delegation and child sessions | Every `task` call has a stable human-readable tool card plus raw details. If the client explicitly advertises the draft `clientCapabilities.subagents` object, Zuno advertises the matching session capability and additionally routes foreground child replay and live updates on the durable child session id. Spawn and terminal state stay on the direct parent route; child transcript, tools, reasoning, plan, and usage stay on the child route. Background children remain on the durable task/job lifecycle and are never represented as foreground native subagents. |
 | File edits and diffs | Zuno's native file tools produce stable ACP `diff` content with an absolute path and exact `oldText`/`newText`. A unified-diff text fallback remains only for tools that cannot provide typed file state. |
-| Human input | Routes tool permission through `session/request_permission` and the question tool through stable form elicitation when the client advertises it. Unknown, malformed, declined, and cancelled outcomes fail closed. |
-| Cancellation | `session/cancel`, JSON-RPC `$/cancel_request`, stdin EOF, and process shutdown abort active work and settle pending agent-to-client requests instead of leaving the transport hung. Request-id cancellation calls back into the Agent with the original method and params before dropping the handler future, allowing Zuno to abort the matching session process tree. Cancelling a parent prompt also cancels its pending permission or elicitation request. |
-| Durable load replay | Reconstructs a bounded retained suffix of user/assistant content, reasoning, tools, raw input/output, safe typed diffs and locations, resource links and image output, followed by the current plan and latest-context usage. Omitted history is reported explicitly. |
+| Human input | Routes ordinary tool permission through `session/request_permission` and the question tool through stable form elicitation when the client advertises it. Question options remain native ACP `oneOf` single-select or array multi-select controls; when a typed answer is allowed, Zuno adds a separate optional `Other` field instead of degrading the choices into descriptive text. Reusable permission asks expose an ACP `allow_always` choice labelled `Allow for session`; Zuno stores the exact grant across host remounts and clears it on `session/close`. Manual asks remain one-shot. Effective `allow_all`, including `danger-full-access`, emits no permission request. A child ask uses its child route only after native subagents were negotiated; otherwise it uses the declared root session and carries `_meta.zuno.childSessionId` for attribution. Unknown, malformed, declined, and cancelled outcomes fail closed. |
+| Cancellation | `session/cancel`, JSON-RPC `$/cancel_request`, stdin EOF, and process shutdown abort active work and settle pending agent-to-client requests instead of leaving the transport hung. Request-id cancellation calls back into the Agent with the original method and params before dropping the handler future, allowing Zuno to abort the matching session process tree. Cancelling a parent prompt also cancels its foreground child and pending permission or elicitation request. `session/close` cancels and joins only background jobs owned by that root before releasing the host, MCP runtime, child projector, permission grants, and session slot. |
+| Durable load replay | Reconstructs a bounded retained suffix of user/assistant content, reasoning, tools, raw input/output, safe typed diffs and locations, resource links and image output, followed by the current plan and latest-context usage. Question and delegation tools replay as static cards while retaining raw details. When native subagents are negotiated, the durable child tree is restored in parent-before-child order and historical terminal state is conservatively `disconnected`. Omitted history is reported explicitly. |
 | ACP-provided MCP | HTTP and SSE MCP capabilities remain `false`. Zuno may still mount MCP servers from its own validated native configuration. |
 | Client filesystem RPC | Not advertised. Agent file reads and writes use Zuno tools, sandbox/permission policy, and durable events; they do not masquerade as ACP client filesystem handlers. |
 | Terminal RPC | Not advertised. Zuno will not emit terminal references until create/output/wait/kill/release ownership and cancellation are implemented as one lifecycle. |
+
+### Draft native-subagent extension
+
+Native subagent projection is an adapter extension reviewed against the pinned
+`codex-acp` implementation; it is not part of Zuno's stable ACP V1.21 contract.
+Zuno therefore enables it only after direct two-sided negotiation:
+
+```json
+{
+  "clientCapabilities": {
+    "subagents": {}
+  }
+}
+```
+
+The initialize response then includes:
+
+```json
+{
+  "agentCapabilities": {
+    "sessionCapabilities": {
+      "subagents": {}
+    }
+  }
+}
+```
+
+Zuno does not recognize product-private `_meta` aliases as capability
+negotiation. Without this direct object, clients receive the stable `task`
+tool-call card only. With it, a foreground child adds:
+
+1. `subagent_spawned` on the direct parent session;
+2. ordinary user, assistant, thought, tool, plan, and usage updates on the
+   durable child session;
+3. one `subagent_state_update` on the parent after all queued child output has
+   drained.
+
+The parent `session/prompt` response is held behind that drain barrier, so the
+client cannot observe a completed parent while child output is still queued.
+Live terminal states are `completed`, `failed`, or `cancelled`; reloaded
+historical children use `disconnected`, because process liveness cannot be
+reconstructed from SQLite alone. Zuno advertises child `cancel` and `close` as
+`false` until those methods have real durable handlers. Nested foreground
+children follow the same direct-parent routing. Background work remains a
+durable job and never enters this foreground stream.
 
 `resource_link` remains typed through ingress, SQLite, compaction, goal
 continuation, steering, and load replay. Text-only provider protocols lower it
@@ -204,14 +250,21 @@ Run this acceptance sequence from a Zed External Agent thread:
    the supported content without a protocol error.
 7. Ask for a read-only inspection and verify reasoning and tool details stream
    without corrupting stdout JSON-RPC.
-5. Request a file creation under strict permission policy, answer the Zed
+8. Delegate one foreground child. If Zed negotiated native subagents, verify
+   spawn appears on the parent, transcript/tools appear on the child route, and
+   terminal state arrives before the parent prompt completes. Otherwise verify
+   the stable task card remains complete and usable.
+9. Delegate one background child, close the root session, and verify the job is
+   cancelled and joined without a native foreground-child stream.
+10. Request a file creation under strict permission policy, answer the Zed
    permission card, and verify the native creation diff has `oldText: null`.
-6. Ask a structured question and verify the elicitation form returns the answer
-   to the same turn.
-7. Cancel a running prompt and verify the thread returns to an idle state.
-8. Close and reopen or import the thread, then verify content, tools, diff,
-   plan, resource link, and usage are replayed once.
-9. Load the same open session again and verify the transcript is not duplicated.
+11. Ask a structured question with at least two options and verify Zed renders
+   clickable choices plus an `Other` input, then returns either answer to the
+   same turn.
+12. Cancel a running prompt and verify the thread returns to an idle state.
+13. Close and reopen or import the thread, then verify content, question/task
+   cards, child history, diff, plan, resource link, and usage are replayed once.
+14. Load the same open session again and verify the transcript is not duplicated.
 
 Use Zed's `dev: open acp logs` command when diagnosing framing, ordering, or
 capability problems. ACP stdout is protocol-only; diagnostics belong on stderr

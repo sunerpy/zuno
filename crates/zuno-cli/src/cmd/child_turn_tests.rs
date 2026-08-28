@@ -1250,6 +1250,31 @@ async fn background_supervisor_cancels_every_owned_task_before_waiting() {
     assert!(!jobs.has_running_tasks("ses_two"));
 }
 
+#[tokio::test]
+async fn background_supervisor_cancels_and_joins_only_one_parent_session() {
+    let jobs = BackgroundJobSupervisor::default();
+    for (job, session) in [("job_one", "ses_one"), ("job_two", "ses_two")] {
+        let cancellation = CancellationToken::new();
+        let cancelled = cancellation.clone();
+        jobs.spawn(job, session, cancellation, async move {
+            cancelled.cancelled().await;
+        });
+    }
+    tokio::task::yield_now().await;
+
+    jobs.cancel_for_parent("ses_one");
+    jobs.wait_for_parent("ses_one").await;
+
+    assert!(!jobs.has_running_tasks("ses_one"));
+    assert!(
+        jobs.has_running_tasks("ses_two"),
+        "closing one ACP session must not cancel another root session's work"
+    );
+
+    jobs.cancel_all();
+    jobs.wait_all().await;
+}
+
 struct TaskDropFlag(Arc<AtomicBool>);
 
 impl Drop for TaskDropFlag {

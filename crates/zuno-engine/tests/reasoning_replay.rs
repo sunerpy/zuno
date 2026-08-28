@@ -501,7 +501,10 @@ mod production_round_trip {
 
     impl AgentModelResolver for Resolver {
         fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-            (requested == "build").then(|| ResolvedAgent::new("build", SYSTEM))
+            (requested == "build").then(|| {
+                ResolvedAgent::new("build", SYSTEM)
+                    .with_max_steps(std::num::NonZeroU32::new(4).expect("test limit is non-zero"))
+            })
         }
 
         fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {

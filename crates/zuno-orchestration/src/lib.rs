@@ -260,7 +260,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/git-workflow",
         allowed_profiles: MUTATING_WORK_PROFILES,
         required_tools: &["read", "shell"],
-        content_sha256: "9340c1ff9f292f94833c95154c5f7ac38cf29659a34d7ad280dbc011de6f1310",
+        content_sha256: "43b7bf1bfb989c13b6352af40531587e480f62151ec7cb94fa7a6206e0d299ab",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {

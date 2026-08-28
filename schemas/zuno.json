@@ -125,7 +125,7 @@
           ]
         },
         "steps": {
-          "description": "Maximum agentic iterations before a text-only response is forced.",
+          "description": "Optional maximum tool-capable iterations before one text-only finalization request.\n\nWhen omitted, the agent has no fixed step limit.",
           "format": "uint32",
           "minimum": 1,
           "type": [

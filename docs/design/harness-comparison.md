@@ -94,6 +94,23 @@ replay, input admission, goal state, and lifecycle remain typed runtime policy.
 The TUI similarly distinguishes live steering from queued follow-up work and
 projects human waits as approval or answer states.
 
+At `openai/codex@f98649c`, the public CLI turn loop continues while the model
+requires follow-up and does not use a fixed step counter; the public
+configuration reference likewise exposes no mandatory turn-count ceiling.
+Zuno adapts that behavior by leaving Agent `steps` unset by default. A user may
+still configure a positive `steps` guard, after which Zuno permits one
+tool-free finalization request and durably records why tool authority was
+closed. This is a Zuno-native safety and reporting contract, not Codex
+configuration compatibility.
+
+The same comparison informs execution economy rather than another scheduler.
+Simple isolated actions execute directly. The orchestrator batches independent
+reads and checks, avoids re-reading unchanged state, and classifies a complete
+commit set before changing the index. The `git-workflow` Skill carries the
+longer repository procedure and runs shared gates after cohesive commit
+batches. Runtime permissions, durability, and verification remain authoritative
+if model guidance is ignored.
+
 The directly selectable `deep` mode also adapts the outcome-oriented discipline
 in Codex's base instructions at `openai/codex@e9a446d`: inspect before guessing,
 fix root causes with focused changes, continue until the requested outcome is

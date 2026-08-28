@@ -2967,6 +2967,13 @@ impl TurnHost {
         self.background_jobs.has_running_tasks(&self.session_id)
     }
 
+    /// Clone the process owner and durable id needed to close this session's work.
+    pub(super) fn background_job_scope(
+        &self,
+    ) -> (super::child_turn::BackgroundJobSupervisor, String) {
+        (self.background_jobs.clone(), self.session_id.clone())
+    }
+
     pub(super) fn background_executions(&self) -> Arc<zuno_pty::BackgroundExecutionService> {
         Arc::clone(&self.background_executions)
     }

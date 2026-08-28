@@ -192,7 +192,9 @@ pub struct AgentConfig {
     /// Display colour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<AgentColor>,
-    /// Maximum agentic iterations before a text-only response is forced.
+    /// Optional maximum tool-capable iterations before one text-only finalization request.
+    ///
+    /// When omitted, the agent has no fixed step limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steps: Option<NonZeroU32>,
     /// Exact model-visible tool allowlist for this agent.

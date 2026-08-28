@@ -1,6 +1,7 @@
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 const TEST_CONFIG: &str = r#"{"formatter":false,"lsp":false,"model":"test/test-model","provider":{"test":{"name":"test","id":"test","env":[],"transport":"openai-compatible","models":{"test-model":{"id":"test-model","name":"Test model","attachment":false,"reasoning":false,"temperature":false,"tool_call":true,"release_date":"2025-01-01","limit":{"context":100000,"output":10000},"cost":{"input":0,"output":0},"options":{}}},"options":{"apiKey":"acp-probe","baseURL":"https://example.invalid/v1"}}}}"#;
 
@@ -66,18 +67,6 @@ fn danger_full_access_config(base_url: &str) -> String {
         serde_json::from_str(&strict_config(base_url)).expect("strict test config JSON");
     config["sandbox"] = json!({"mode":"danger-full-access"});
     serde_json::to_string(&config).expect("encode danger-full-access test config")
-}
-
-fn manual_compaction_config(base_url: &str) -> String {
-    let mut config: Value =
-        serde_json::from_str(&config_with_second_model(base_url)).expect("test config JSON");
-    config["small_model"] = json!("test/test-model");
-    config["compaction"] = json!({
-        "auto": false,
-        "tail_turns": 1,
-        "preserve_recent_tokens": 1_000
-    });
-    serde_json::to_string(&config).expect("encode compaction test config")
 }
 
 fn config_with_remote_mcp(mcp_url: &str, provider_url: &str) -> String {
@@ -168,6 +157,18 @@ fn rich_prompt_config(base_url: &str) -> String {
         "output": ["text"]
     });
     serde_json::to_string(&config).expect("encode rich prompt test config")
+}
+
+fn manual_compaction_config(base_url: &str) -> String {
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model(base_url)).expect("test config JSON");
+    config["small_model"] = json!("test/test-model");
+    config["compaction"] = json!({
+        "auto": false,
+        "tail_turns": 1,
+        "preserve_recent_tokens": 1_000
+    });
+    serde_json::to_string(&config).expect("encode compaction test config")
 }
 
 fn put_durable_message(
@@ -371,6 +372,136 @@ fn seed_durable_text_replay(root: &std::path::Path, session_id: &str) {
     );
 }
 
+fn seed_durable_child_replay(
+    root: &std::path::Path,
+    parent_session_id: &str,
+    child_session_id: &str,
+) {
+    let location = zuno_paths::DbLocation::File(root.join("zuno-acp.db"));
+    let pool = zuno_db::Pool::open(&location).expect("open ACP child replay pool");
+    let store = zuno_db::session::Store::new(&pool);
+    let parent = store
+        .get(parent_session_id)
+        .expect("load ACP replay parent");
+    let mut child = zuno_db::session::SessionCreate::new(
+        child_session_id,
+        "child-replay",
+        parent.project_id,
+        root.to_string_lossy(),
+        parent.directory,
+        "Inspect child history",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .with_parent(parent_session_id)
+    .at(300);
+    child.agent = Some("explorer".to_owned());
+    child.model = Some(
+        serde_json::to_string(&json!({
+            "providerID": "test",
+            "id": "test-model"
+        }))
+        .expect("child model"),
+    );
+    store.create(&child).expect("create ACP replay child");
+
+    let connection = pool.get().expect("open ACP child replay connection");
+    put_durable_message(
+        &connection,
+        child_session_id,
+        "msg_child_user",
+        "user",
+        310,
+        Value::Null,
+    );
+    put_durable_part(
+        &connection,
+        child_session_id,
+        "msg_child_user",
+        "prt_child_user",
+        310,
+        json!({"type":"text","text":"inspect the child tree"}),
+    );
+    put_durable_message(
+        &connection,
+        child_session_id,
+        "msg_child_assistant",
+        "assistant",
+        320,
+        json!({
+            "tokens": {
+                "input": 40,
+                "output": 10,
+                "reasoning": 0,
+                "cache": {"read": 0, "write": 0},
+                "accounting": "cache-inside-input"
+            }
+        }),
+    );
+    put_durable_part(
+        &connection,
+        child_session_id,
+        "msg_child_assistant",
+        "prt_child_assistant",
+        320,
+        json!({"type":"text","text":"child history restored"}),
+    );
+}
+
+fn seed_compactable_history(root: &std::path::Path, session_id: &str) {
+    let location = zuno_paths::DbLocation::File(root.join("zuno-acp.db"));
+    let connection = zuno_db::open::open(&location).expect("open ACP database");
+    for turn in 0_i64..4 {
+        let created = 1_000 + turn * 10;
+        let user_id = format!("msg_compact_user_{turn}");
+        put_durable_message(
+            &connection,
+            session_id,
+            &user_id,
+            "user",
+            created,
+            Value::Null,
+        );
+        put_durable_part(
+            &connection,
+            session_id,
+            &user_id,
+            &format!("prt_compact_user_{turn}"),
+            created,
+            json!({"type":"text","text":format!("user request {turn}")}),
+        );
+
+        let assistant_id = format!("msg_compact_assistant_{turn}");
+        put_durable_message(
+            &connection,
+            session_id,
+            &assistant_id,
+            "assistant",
+            created + 1,
+            json!({
+                "providerID": "test",
+                "modelID": "test-model",
+                "finish": "stop",
+                "cost": 0.0,
+                "tokens": {
+                    "input": 20,
+                    "output": 5,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                    "accounting": "cache-inside-input"
+                }
+            }),
+        );
+        put_durable_part(
+            &connection,
+            session_id,
+            &assistant_id,
+            &format!("prt_compact_assistant_{turn}"),
+            created + 1,
+            json!({"type":"text","text":format!("assistant response {turn}")}),
+        );
+    }
+}
+
 #[test]
 fn acp_initialize_uses_stable_v1_without_fake_authentication() {
     let root = tempfile::tempdir().expect("ACP test root");
@@ -445,61 +576,6 @@ fn acp_initialize_uses_stable_v1_without_fake_authentication() {
         response["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
         true
     );
-}
-
-fn seed_compactable_history(root: &std::path::Path, session_id: &str) {
-    let location = zuno_paths::DbLocation::File(root.join("zuno-acp.db"));
-    let connection = zuno_db::open::open(&location).expect("open ACP database");
-    for turn in 0_i64..4 {
-        let created = 1_000 + turn * 10;
-        let user_id = format!("msg_compact_user_{turn}");
-        put_durable_message(
-            &connection,
-            session_id,
-            &user_id,
-            "user",
-            created,
-            Value::Null,
-        );
-        put_durable_part(
-            &connection,
-            session_id,
-            &user_id,
-            &format!("prt_compact_user_{turn}"),
-            created,
-            json!({"type":"text","text":format!("user request {turn}")}),
-        );
-
-        let assistant_id = format!("msg_compact_assistant_{turn}");
-        put_durable_message(
-            &connection,
-            session_id,
-            &assistant_id,
-            "assistant",
-            created + 1,
-            json!({
-                "providerID": "test",
-                "modelID": "test-model",
-                "finish": "stop",
-                "cost": 0.0,
-                "tokens": {
-                    "input": 20,
-                    "output": 5,
-                    "reasoning": 0,
-                    "cache": {"read": 0, "write": 0},
-                    "accounting": "cache-inside-input"
-                }
-            }),
-        );
-        put_durable_part(
-            &connection,
-            session_id,
-            &assistant_id,
-            &format!("prt_compact_assistant_{turn}"),
-            created + 1,
-            json!({"type":"text","text":format!("assistant response {turn}")}),
-        );
-    }
 }
 
 fn request(
@@ -642,6 +718,51 @@ fn request_with_updates(
         let update = response["params"]["update"].clone();
         if update["sessionUpdate"] != "available_commands_update" {
             updates.push(update);
+        }
+    }
+}
+
+fn request_with_routed_updates(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> (Value, Vec<Value>) {
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&frame).expect("encode ACP request")
+    )
+    .expect("write ACP request");
+    stdin.flush().expect("flush ACP request");
+
+    let mut updates = Vec::new();
+    loop {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read ACP frame");
+        assert!(!line.is_empty(), "ACP closed before responding to {method}");
+        let response: Value = serde_json::from_str(&line).expect("ACP response JSON");
+        if response.get("id") == Some(&json!(id)) {
+            assert!(
+                response.get("error").is_none(),
+                "ACP request {method} failed: {response}"
+            );
+            return (response["result"].clone(), updates);
+        }
+        assert_eq!(
+            response.get("method").and_then(Value::as_str),
+            Some("session/update"),
+            "unexpected frame while waiting for {method}: {response}"
+        );
+        if response["params"]["update"]["sessionUpdate"] != "available_commands_update" {
+            updates.push(response["params"].clone());
         }
     }
 }
@@ -916,6 +1037,240 @@ impl Respond for QuestionTurnResponder {
 }
 
 #[derive(Clone)]
+struct SubagentTurnResponder;
+
+impl Respond for SubagentTurnResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return compatible_text_response("ACP subagent title");
+        }
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let child_turn = messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .to_string()
+                    .contains("Inspect child live stream.")
+        });
+        if child_turn {
+            return compatible_text_response("child live result");
+        }
+        let has_task_result = messages
+            .iter()
+            .any(|message| message["role"] == "tool" && message["tool_call_id"] == "call_task");
+        if has_task_result {
+            compatible_text_response("parent observed child")
+        } else {
+            compatible_tool_response(
+                "call_task",
+                "task",
+                json!({
+                    "objective": "Inspect live child",
+                    "deliverable": "A concise inspection result.",
+                    "instructions": "Inspect child live stream.",
+                    "success_evidence": "Return the inspection result in the child session.",
+                    "agent": "explorer",
+                    "background": false
+                }),
+            )
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SubagentQuestionTurnResponder;
+
+impl Respond for SubagentQuestionTurnResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return compatible_text_response("ACP child question title");
+        }
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let child_turn = messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .to_string()
+                    .contains("Ask child for database.")
+        });
+        if child_turn {
+            let answered = messages.iter().any(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == "call_question"
+            });
+            return if answered {
+                compatible_text_response("child selected SQLite")
+            } else {
+                compatible_tool_response(
+                    "call_question",
+                    "question",
+                    json!({
+                        "questions": [{
+                            "question": "Which database?",
+                            "header": "Database",
+                            "options": [
+                                {"label": "Postgres", "description": "Relational database"},
+                                {"label": "SQLite", "description": "Embedded database"}
+                            ]
+                        }]
+                    }),
+                )
+            };
+        }
+        let has_task_result = messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "call_task_child_question"
+        });
+        if has_task_result {
+            compatible_text_response("parent received child answer")
+        } else {
+            compatible_tool_response(
+                "call_task_child_question",
+                "task",
+                json!({
+                    "objective": "Ask child question",
+                    "deliverable": "The selected database.",
+                    "instructions": "Ask child for database.",
+                    "success_evidence": "Return the accepted database choice.",
+                    "agent": "deep",
+                    "background": false
+                }),
+            )
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SubagentWriteTurnResponder {
+    path: String,
+}
+
+impl Respond for SubagentWriteTurnResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return compatible_text_response("ACP child write title");
+        }
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let child_turn = messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .to_string()
+                    .contains("Create the delegated file.")
+        });
+        if child_turn {
+            let answered = messages.iter().any(|message| {
+                message["role"] == "tool" && message["tool_call_id"] == "call_child_write"
+            });
+            return if answered {
+                compatible_text_response("child created the file")
+            } else {
+                compatible_tool_response(
+                    "call_child_write",
+                    "write",
+                    json!({
+                        "filePath": self.path,
+                        "content": "created by ACP child\n"
+                    }),
+                )
+            };
+        }
+        let has_task_result = messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "call_task_child_write"
+        });
+        if has_task_result {
+            compatible_text_response("parent received child write")
+        } else {
+            compatible_tool_response(
+                "call_task_child_write",
+                "task",
+                json!({
+                    "objective": "Create delegated file",
+                    "deliverable": "The requested file on disk.",
+                    "instructions": "Create the delegated file.",
+                    "success_evidence": "The file exists with the requested content.",
+                    "agent": "deep",
+                    "background": false
+                }),
+            )
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BackgroundSubagentTurnResponder;
+
+impl Respond for BackgroundSubagentTurnResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return compatible_text_response("ACP background child title");
+        }
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let child_turn = messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .to_string()
+                    .contains("Wait until the parent session closes.")
+        });
+        if child_turn {
+            return compatible_text_response("background child unexpectedly completed")
+                .set_delay(Duration::from_secs(30));
+        }
+        let has_task_result = messages.iter().any(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "call_background_task"
+        });
+        if has_task_result {
+            compatible_text_response("background child started")
+        } else {
+            compatible_tool_response(
+                "call_background_task",
+                "task",
+                json!({
+                    "objective": "Wait for parent close",
+                    "deliverable": "A cancellation lifecycle record.",
+                    "instructions": "Wait until the parent session closes.",
+                    "success_evidence": "The job is cancelled when the parent closes.",
+                    "agent": "deep",
+                    "background": true,
+                    "reportDelivery": "quiet"
+                }),
+            )
+        }
+    }
+}
+
+#[derive(Clone)]
 struct PlanTurnResponder;
 
 impl Respond for PlanTurnResponder {
@@ -1047,6 +1402,21 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
                 .any(|command| command["name"] == "acp-check")),
         "project commands must be published after session/new: {command_update}"
     );
+    let compact = command_update["availableCommands"]
+        .as_array()
+        .expect("available commands")
+        .iter()
+        .filter(|command| command["name"] == "compact")
+        .collect::<Vec<_>>();
+    assert_eq!(compact.len(), 1, "compact must be advertised exactly once");
+    assert_eq!(
+        compact[0]["description"],
+        "Summarize older context and keep the recent turn tail"
+    );
+    assert!(
+        compact[0].get("input").is_none(),
+        "native /compact does not accept prompt arguments"
+    );
     let planned = request(
         &mut stdin,
         &mut stdout,
@@ -1148,6 +1518,251 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
             .read_to_string(&mut stderr)
             .expect("read ACP stderr");
         panic!("ACP lifecycle process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_compact_is_native_and_persists_a_summary_without_model_prompt_dispatch() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TextTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let command_dir = root.path().join(".zuno/command");
+    std::fs::create_dir_all(&command_dir).expect("create project command directory");
+    std::fs::write(
+        command_dir.join("compact.md"),
+        "This user command must never shadow native compaction.",
+    )
+    .expect("write colliding project command");
+    let config = manual_compaction_config(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let commands = read_session_update(&mut stdout);
+    let compact = commands["update"]["availableCommands"]
+        .as_array()
+        .expect("available commands")
+        .iter()
+        .filter(|command| command["name"] == "compact")
+        .collect::<Vec<_>>();
+    assert_eq!(compact.len(), 1);
+    assert_eq!(
+        compact[0]["description"],
+        "Summarize older context and keep the recent turn tail"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    seed_compactable_history(root.path(), &session_id);
+    let (_loaded, _replay) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/load",
+        json!({
+            "sessionId": &session_id,
+            "cwd": root.path(),
+            "mcpServers": []
+        }),
+    );
+    let (completed, _updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"/compact"}]
+        }),
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+
+    let received = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert_eq!(
+        received.len(),
+        1,
+        "native compaction must make exactly its summary request"
+    );
+    let request_body = String::from_utf8_lossy(&received[0].body);
+    assert!(
+        !request_body.contains("/compact"),
+        "native command leaked into the model prompt: {request_body}"
+    );
+    assert!(
+        request_body.contains("## Objective"),
+        "compaction summary prompt was not used: {request_body}"
+    );
+
+    let connection = zuno_db::open::open(&zuno_paths::DbLocation::File(
+        root.path().join("zuno-acp.db"),
+    ))
+    .expect("open compacted ACP database");
+    let history = zuno_db::message::MessageStore::new(&connection)
+        .hydrate_session(&session_id)
+        .expect("hydrate compacted session");
+    assert!(
+        history
+            .iter()
+            .flat_map(|message| &message.parts)
+            .any(|part| { part.kind == zuno_db::message::PartKind::Compaction })
+    );
+    assert!(history.iter().any(|message| {
+        message.info.data.get("summary") == Some(&json!(true))
+            && message.info.data.get("finish") == Some(&json!("stop"))
+            && message
+                .parts
+                .iter()
+                .any(|part| part.data.get("text") == Some(&json!("ACP title")))
+    }));
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP compact process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP compact process failed: {stderr}");
+    }
+}
+
+#[test]
+fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
+    let root = tempfile::tempdir().expect("temporary ACP root");
+    let config = danger_full_access_config("https://example.invalid");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let commands = read_session_update(&mut stdout);
+    let native = commands["update"]["availableCommands"]
+        .as_array()
+        .expect("available commands")
+        .iter()
+        .take(5)
+        .map(|command| command["name"].as_str().expect("command name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        native,
+        ["compact", "goal", "plan", "start-plan", "start-work"]
+    );
+
+    let (goal, goal_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"/goal create ship ACP commands"}]
+        }),
+    );
+    assert_eq!(goal["stopReason"], "end_turn");
+    assert!(goal_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("ship ACP commands"))
+    }));
+
+    let (plan, plan_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"/plan"}]
+        }),
+    );
+    assert_eq!(plan["stopReason"], "end_turn");
+    assert!(plan_updates.iter().any(|update| {
+        update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] == "plan"
+    }));
+    assert!(plan_updates.iter().any(|update| {
+        update["sessionUpdate"] == "config_option_update" && update["configOptions"].is_array()
+    }));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP native command process failed: {stderr}");
     }
 }
 
@@ -1957,6 +2572,469 @@ async fn acp_prompt_round_trips_question_tool_through_stable_elicitation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_prompt_streams_a_negotiated_foreground_subagent_on_its_child_session() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SubagentTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model(&provider.uri())).expect("test config");
+    config["permission"] = json!({"mode":"allow_all"});
+    config["sandbox"] = json!({"mode":"danger-full-access"});
+    let config = serde_json::to_string(&config).expect("encode subagent config");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "subagents": {}
+            }
+        }),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let parent_session_id = created["sessionId"]
+        .as_str()
+        .expect("parent session id")
+        .to_owned();
+    let (completed, routed) = request_with_routed_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &parent_session_id,
+            "prompt": [{"type":"text","text":"Delegate the inspection."}]
+        }),
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+
+    let spawned = routed
+        .iter()
+        .find(|params| params["update"]["sessionUpdate"] == "subagent_spawned")
+        .expect("negotiated child spawn");
+    assert_eq!(spawned["sessionId"], parent_session_id);
+    assert_eq!(spawned["update"]["name"], "explorer");
+    assert!(
+        spawned["update"]["task"]
+            .as_str()
+            .is_some_and(|task| task.contains("Instructions:\nInspect child live stream.")),
+        "negotiated child spawn did not carry the rendered delegation contract: {spawned:#?}"
+    );
+    let child_session_id = spawned["update"]["subagentSessionId"]
+        .as_str()
+        .expect("child session id");
+    assert!(routed.iter().any(|params| {
+        params["sessionId"] == child_session_id
+            && params["update"]["sessionUpdate"] == "user_message_chunk"
+            && params["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Instructions:\nInspect child live stream."))
+    }));
+    assert!(routed.iter().any(|params| {
+        params["sessionId"] == child_session_id
+            && params["update"]["sessionUpdate"] == "agent_message_chunk"
+            && params["update"]["content"]["text"] == "child live result"
+    }));
+    let terminal_index = routed
+        .iter()
+        .position(|params| {
+            params["sessionId"] == parent_session_id
+                && params["update"]["sessionUpdate"] == "subagent_state_update"
+                && params["update"]["subagentSessionId"] == child_session_id
+                && params["update"]["state"] == "completed"
+        })
+        .expect("child terminal state");
+    let child_result_index = routed
+        .iter()
+        .position(|params| {
+            params["sessionId"] == child_session_id
+                && params["update"]["sessionUpdate"] == "agent_message_chunk"
+                && params["update"]["content"]["text"] == "child live result"
+        })
+        .expect("child result");
+    assert!(
+        child_result_index < terminal_index,
+        "the terminal state must follow all child output: {routed:#?}"
+    );
+    assert!(
+        routed.iter().any(|params| {
+            params["sessionId"] == parent_session_id
+                && params["update"]["sessionUpdate"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("tool_call"))
+                && params["update"]["_meta"]["zuno"]["subagent"]["agent"] == "explorer"
+        }),
+        "the stable task fallback must remain beside the negotiated child stream: {routed:#?}"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": &parent_session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_fallback_routes_child_elicitation_through_the_declared_root_session() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(SubagentQuestionTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model(&provider.uri())).expect("test config");
+    config["permission"] = json!({"mode":"allow_all"});
+    config["sandbox"] = json!({"mode":"danger-full-access"});
+    let config = serde_json::to_string(&config).expect("encode child question config");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "elicitation": {
+                    "form": {}
+                }
+            }
+        }),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let parent_session_id = created["sessionId"]
+        .as_str()
+        .expect("parent session id")
+        .to_owned();
+    let (completed, updates, elicitation) = request_with_elicitation(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &parent_session_id,
+            "prompt": [{"type":"text","text":"Delegate a child question."}]
+        }),
+        &parent_session_id,
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+    let durable_child_id = elicitation["_meta"]["zuno"]["childSessionId"]
+        .as_str()
+        .expect("durable child id in fallback metadata");
+    assert_ne!(durable_child_id, parent_session_id);
+    assert!(
+        updates
+            .iter()
+            .all(|update| update["sessionUpdate"] != "subagent_spawned"),
+        "unnegotiated clients must receive only the stable task fallback: {updates:#?}"
+    );
+    assert!(updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"] == "parent received child answer"
+    }));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": &parent_session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_fallback_routes_child_permission_through_the_declared_root_session() {
+    let provider = MockServer::start().await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let target = root.path().join("created-by-child.txt");
+    Mock::given(method("POST"))
+        .respond_with(SubagentWriteTurnResponder {
+            path: target.to_string_lossy().into_owned(),
+        })
+        .mount(&provider)
+        .await;
+    let config = strict_config(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let parent_session_id = created["sessionId"]
+        .as_str()
+        .expect("parent session id")
+        .to_owned();
+    let (completed, updates, permissions) = request_with_permissions(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &parent_session_id,
+            "prompt": [{"type":"text","text":"Delegate the file creation."}]
+        }),
+    );
+
+    assert_eq!(completed["stopReason"], "end_turn");
+    let permission = permissions
+        .iter()
+        .find(|request| request["toolCall"]["toolCallId"] == "call_child_write")
+        .expect("child write permission");
+    assert_eq!(permission["sessionId"], parent_session_id);
+    let durable_child_id = permission["_meta"]["zuno"]["childSessionId"]
+        .as_str()
+        .expect("durable child id in fallback permission metadata");
+    assert_ne!(durable_child_id, parent_session_id);
+    assert_eq!(permission["toolCall"]["kind"], "edit");
+    assert!(
+        updates
+            .iter()
+            .all(|update| update["sessionUpdate"] != "subagent_spawned"),
+        "unnegotiated clients must keep the stable task fallback: {updates:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("delegated file"),
+        "created by ACP child\n"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": &parent_session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_close_cancels_and_joins_its_background_child_without_native_projection() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(BackgroundSubagentTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model(&provider.uri())).expect("test config");
+    config["permission"] = json!({"mode":"allow_all"});
+    config["sandbox"] = json!({"mode":"danger-full-access"});
+    let config = serde_json::to_string(&config).expect("encode background child config");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "subagents": {}
+            }
+        }),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let parent_session_id = created["sessionId"]
+        .as_str()
+        .expect("parent session id")
+        .to_owned();
+    let (completed, updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &parent_session_id,
+            "prompt": [{"type":"text","text":"Start a background child."}]
+        }),
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+    assert!(
+        updates
+            .iter()
+            .all(|update| update["sessionUpdate"] != "subagent_spawned"),
+        "background jobs remain on the stable task/job lifecycle: {updates:#?}"
+    );
+    assert!(updates.iter().any(|update| {
+        update["_meta"]["zuno"]["subagent"]["background"] == true
+            && update["_meta"]["zuno"]["subagent"]["state"] == "running"
+    }));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let child_request_seen = provider
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|request| {
+                    serde_json::from_slice::<Value>(&request.body)
+                        .ok()
+                        .and_then(|body| body.get("messages").cloned())
+                        .is_some_and(|messages| {
+                            messages
+                                .to_string()
+                                .contains("Wait until the parent session closes.")
+                        })
+                });
+            if child_request_seen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background child reaches the provider before close");
+
+    let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+    let close_session_id = parent_session_id.clone();
+    std::thread::spawn(move || {
+        let response = request(
+            &mut stdin,
+            &mut stdout,
+            4,
+            "session/close",
+            json!({"sessionId": close_session_id}),
+        );
+        let _sent = closed_tx.send(response);
+    });
+    let closed = match closed_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(closed) => closed,
+        Err(error) => {
+            let _killed = child.kill();
+            panic!("session/close did not join the cancelled background child: {error}");
+        }
+    };
+    assert_eq!(closed, json!({}));
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP process failed: {stderr}");
+    }
+
+    let location = zuno_paths::DbLocation::File(root.path().join("zuno-acp.db"));
+    let pool = Arc::new(zuno_db::Pool::open(&location).expect("open ACP background-job store"));
+    let jobs = zuno_db::job::AgentJobStore::new(pool)
+        .list_for_parent(&parent_session_id)
+        .expect("list ACP background jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, zuno_db::job::JobStatus::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_prompt_projects_the_final_durable_plan_before_responding() {
     let provider = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2233,251 +3311,6 @@ async fn acp_danger_full_access_emits_no_tool_approval_request() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_compact_is_native_and_persists_a_summary_without_model_prompt_dispatch() {
-    let provider = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(TextTurnResponder)
-        .mount(&provider)
-        .await;
-    let root = tempfile::tempdir().expect("ACP test root");
-    let command_dir = root.path().join(".zuno/command");
-    std::fs::create_dir_all(&command_dir).expect("create project command directory");
-    std::fs::write(
-        command_dir.join("compact.md"),
-        "This user command must never shadow native compaction.",
-    )
-    .expect("write colliding project command");
-    let config = manual_compaction_config(&provider.uri());
-    let mut child = isolated_command_with_config(root.path(), &config)
-        .arg("acp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start zuno acp");
-    let mut stdin = child.stdin.take().expect("ACP stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
-
-    request(
-        &mut stdin,
-        &mut stdout,
-        1,
-        "initialize",
-        json!({"protocolVersion": 1}),
-    );
-    let created = request(
-        &mut stdin,
-        &mut stdout,
-        2,
-        "session/new",
-        json!({"cwd": root.path(), "mcpServers": []}),
-    );
-    let session_id = created["sessionId"]
-        .as_str()
-        .expect("session id")
-        .to_owned();
-    let commands = read_session_update(&mut stdout);
-    let compact = commands["update"]["availableCommands"]
-        .as_array()
-        .expect("available commands")
-        .iter()
-        .filter(|command| command["name"] == "compact")
-        .collect::<Vec<_>>();
-    assert_eq!(compact.len(), 1);
-    assert_eq!(
-        compact[0]["description"],
-        "Summarize older context and keep the recent turn tail"
-    );
-
-    request(
-        &mut stdin,
-        &mut stdout,
-        3,
-        "session/close",
-        json!({"sessionId": &session_id}),
-    );
-    seed_compactable_history(root.path(), &session_id);
-    let (_loaded, _replay) = request_with_updates(
-        &mut stdin,
-        &mut stdout,
-        4,
-        "session/load",
-        json!({
-            "sessionId": &session_id,
-            "cwd": root.path(),
-            "mcpServers": []
-        }),
-    );
-    let (completed, _updates) = request_with_updates(
-        &mut stdin,
-        &mut stdout,
-        5,
-        "session/prompt",
-        json!({
-            "sessionId": &session_id,
-            "prompt": [{"type":"text","text":"/compact"}]
-        }),
-    );
-    assert_eq!(completed["stopReason"], "end_turn");
-
-    let received = provider
-        .received_requests()
-        .await
-        .expect("provider requests");
-    assert_eq!(
-        received.len(),
-        1,
-        "native compaction must make exactly its summary request"
-    );
-    let request_body = String::from_utf8_lossy(&received[0].body);
-    assert!(
-        !request_body.contains("/compact"),
-        "native command leaked into the model prompt: {request_body}"
-    );
-    assert!(
-        request_body.contains("## Objective"),
-        "compaction summary prompt was not used: {request_body}"
-    );
-
-    let connection = zuno_db::open::open(&zuno_paths::DbLocation::File(
-        root.path().join("zuno-acp.db"),
-    ))
-    .expect("open compacted ACP database");
-    let history = zuno_db::message::MessageStore::new(&connection)
-        .hydrate_session(&session_id)
-        .expect("hydrate compacted session");
-    assert!(
-        history
-            .iter()
-            .flat_map(|message| &message.parts)
-            .any(|part| { part.kind == zuno_db::message::PartKind::Compaction })
-    );
-    assert!(history.iter().any(|message| {
-        message.info.data.get("summary") == Some(&json!(true))
-            && message.info.data.get("finish") == Some(&json!("stop"))
-            && message
-                .parts
-                .iter()
-                .any(|part| part.data.get("text") == Some(&json!("ACP title")))
-    }));
-
-    drop(stdin);
-    let status = child.wait().expect("wait for ACP compact process");
-    if !status.success() {
-        let mut stderr = String::new();
-        child
-            .stderr
-            .take()
-            .expect("ACP stderr")
-            .read_to_string(&mut stderr)
-            .expect("read ACP stderr");
-        panic!("ACP compact process failed: {stderr}");
-    }
-}
-
-#[test]
-fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
-    let root = tempfile::tempdir().expect("temporary ACP root");
-    let config = danger_full_access_config("https://example.invalid");
-    let mut child = isolated_command_with_config(root.path(), &config)
-        .arg("acp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start zuno acp");
-    let mut stdin = child.stdin.take().expect("ACP stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
-
-    request(
-        &mut stdin,
-        &mut stdout,
-        1,
-        "initialize",
-        json!({"protocolVersion": 1}),
-    );
-    let created = request(
-        &mut stdin,
-        &mut stdout,
-        2,
-        "session/new",
-        json!({"cwd": root.path(), "mcpServers": []}),
-    );
-    let session_id = created["sessionId"]
-        .as_str()
-        .expect("session id")
-        .to_owned();
-    let commands = read_session_update(&mut stdout);
-    let native = commands["update"]["availableCommands"]
-        .as_array()
-        .expect("available commands")
-        .iter()
-        .take(5)
-        .map(|command| command["name"].as_str().expect("command name"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        native,
-        ["compact", "goal", "plan", "start-plan", "start-work"]
-    );
-
-    let (goal, goal_updates) = request_with_updates(
-        &mut stdin,
-        &mut stdout,
-        3,
-        "session/prompt",
-        json!({
-            "sessionId": &session_id,
-            "prompt": [{"type":"text","text":"/goal create ship ACP commands"}]
-        }),
-    );
-    assert_eq!(goal["stopReason"], "end_turn");
-    assert!(goal_updates.iter().any(|update| {
-        update["sessionUpdate"] == "agent_message_chunk"
-            && update["content"]["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("ship ACP commands"))
-    }));
-
-    let (plan, plan_updates) = request_with_updates(
-        &mut stdin,
-        &mut stdout,
-        4,
-        "session/prompt",
-        json!({
-            "sessionId": &session_id,
-            "prompt": [{"type":"text","text":"/plan"}]
-        }),
-    );
-    assert_eq!(plan["stopReason"], "end_turn");
-    assert!(plan_updates.iter().any(|update| {
-        update["sessionUpdate"] == "current_mode_update" && update["currentModeId"] == "plan"
-    }));
-    assert!(plan_updates.iter().any(|update| {
-        update["sessionUpdate"] == "config_option_update" && update["configOptions"].is_array()
-    }));
-
-    request(
-        &mut stdin,
-        &mut stdout,
-        5,
-        "session/close",
-        json!({"sessionId": &session_id}),
-    );
-    drop(stdin);
-    let status = child.wait().expect("wait for ACP process");
-    if !status.success() {
-        let mut stderr = String::new();
-        child
-            .stderr
-            .take()
-            .expect("ACP stderr")
-            .read_to_string(&mut stderr)
-            .expect("read ACP stderr");
-        panic!("ACP native command process failed: {stderr}");
-    }
-}
-
 #[test]
 fn acp_load_replays_durable_content_tools_plan_and_usage() {
     let root = tempfile::tempdir().expect("ACP test root");
@@ -2640,5 +3473,122 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
             .read_to_string(&mut stderr)
             .expect("read ACP stderr");
         panic!("ACP load process failed: {stderr}");
+    }
+}
+
+#[test]
+fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
+    let root = tempfile::tempdir().expect("ACP test root");
+    let mut config: Value = serde_json::from_str(TEST_CONFIG).expect("test config JSON");
+    config["sandbox"] = json!({"mode":"danger-full-access"});
+    let config = serde_json::to_string(&config).expect("encode child replay config");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    let initialized = request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "subagents": {}
+            }
+        }),
+    );
+    assert!(initialized["agentCapabilities"]["sessionCapabilities"]["subagents"].is_object());
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let parent_session_id = created["sessionId"]
+        .as_str()
+        .expect("parent session id")
+        .to_owned();
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/close",
+        json!({"sessionId": &parent_session_id}),
+    );
+    let child_session_id = "ses_acp_replayed_child";
+    seed_durable_child_replay(root.path(), &parent_session_id, child_session_id);
+
+    let (_loaded, routed) = request_with_routed_updates(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/load",
+        json!({
+            "sessionId": &parent_session_id,
+            "cwd": root.path(),
+            "mcpServers": []
+        }),
+    );
+
+    let routes = routed
+        .iter()
+        .map(|params| {
+            (
+                params["sessionId"].as_str().unwrap_or_default(),
+                params["update"]["sessionUpdate"]
+                    .as_str()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routes,
+        vec![
+            (parent_session_id.as_str(), "subagent_spawned"),
+            (child_session_id, "user_message_chunk"),
+            (child_session_id, "agent_message_chunk"),
+            (child_session_id, "usage_update"),
+            (parent_session_id.as_str(), "subagent_state_update"),
+        ],
+        "session/load must rebuild the durable child tree before returning: {routed:#?}"
+    );
+    assert_eq!(routed[0]["update"]["subagentSessionId"], child_session_id);
+    assert_eq!(routed[0]["update"]["name"], "explorer");
+    assert_eq!(
+        routed[1]["update"]["content"]["text"],
+        "inspect the child tree"
+    );
+    assert_eq!(
+        routed[2]["update"]["content"]["text"],
+        "child history restored"
+    );
+    assert_eq!(routed[4]["update"]["state"], "disconnected");
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/close",
+        json!({"sessionId": &parent_session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP process failed: {stderr}");
     }
 }

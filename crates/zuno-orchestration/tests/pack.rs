@@ -239,6 +239,24 @@ fn worktree_skill_guides_only_authorized_and_safe_lifecycle_operations() {
 }
 
 #[test]
+fn git_workflow_batches_commit_preparation_instead_of_rechecking_every_hunk() {
+    let workflow = skill("git-workflow").expect("git-workflow descriptor");
+    for clause in [
+        "Classify the complete diff before changing the index",
+        "Batch independent inspection commands",
+        "Do not re-read unchanged diffs",
+        "Run shared repository gates once",
+        "Verify each staged commit with one staged-diff review",
+    ] {
+        assert!(
+            workflow.content.contains(clause),
+            "git-workflow is missing `{clause}`:\n{}",
+            workflow.content
+        );
+    }
+}
+
+#[test]
 fn reusable_design_method_is_a_skill_but_product_workflows_remain_user_owned() {
     assert!(skill("dual-review").is_none());
     assert!(skill("auto-release").is_none());

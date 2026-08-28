@@ -217,6 +217,29 @@ The built-in catalog separates primary modes, delegable specialists, and hidden 
 
 `compaction`, `title`, and `summary` are hidden engine agents. A user-defined agent may be declared under `agents.<name>` or as Markdown under `.zuno/agent/**/*.md`; it enters the same resolution, permission, prompt, and provenance pipeline as a native agent.
 
+Agents have no fixed provider-step ceiling by default. A user who needs a
+deployment guard may set `agents.<name>.steps` to a positive integer:
+
+```json
+{
+  "agents": {
+    "orchestrator": {
+      "steps": 200
+    }
+  }
+}
+```
+
+The configured number limits tool-capable provider iterations, not the total
+lifetime of a goal. If the final permitted iteration still requests
+continuation, the engine issues exactly one additional request with an empty
+tool list and a volatile developer instruction to report what completed, what
+remains, and any evidence or blocker. The `session.provider.request` event
+persists that exact instruction and its digest under
+`stepLimitFinalization`, so replay can reconstruct why the request was
+text-only. A provider that still emits tool calls cannot extend that turn; the
+protocol failure becomes a typed `StepLimit` recovery.
+
 See [agent orchestration and model routing](orchestration.md) for the exact
 delegate roster, per-Agent and preset model routes, reasoning precedence,
 background report delivery, configured workflow DAGs, and Council.
@@ -253,6 +276,19 @@ session, assistant message, and provider call that raised it through every rule 
 approval layer. The foreground TUI broker serializes all such asks, scopes standing grants
 to one session, and fails closed by rejecting pending requests when its last surface or
 wake channel closes.
+
+ACP consumes the same child observer without creating another child loop. The stable
+projection is always the `task` tool card. A client that directly negotiates the draft
+`subagents` capability additionally receives foreground child replay and live events on
+the durable child session id, with spawn and terminal state on the direct parent route.
+The parent prompt response waits for the child projection queue to drain. Historical
+children replay as `disconnected`; background children remain durable jobs.
+
+Child permissions and questions retain their immutable origin. A negotiated native ACP
+client receives them on the child route. A compatibility client receives them on the
+declared root route with the child id in typed metadata. Session-level permission grants
+are owned by that root and survive host replacement, but `session/close` clears them and
+cancels and joins only background jobs owned by the closing root.
 
 ### Child capability authority and Skill loading
 
@@ -765,7 +801,8 @@ Local delays use exponential backoff with symmetric jitter and never collapse to
 
 Recovery is selected from typed errors, never rendered messages:
 
-- Transport failures, rate limits, incomplete streams, SQLite writer contention, empty assistant messages, and per-turn step limits schedule another goal turn.
+- Transport failures, rate limits, incomplete streams, SQLite writer contention, and empty assistant messages schedule another goal turn.
+- An explicit Agent `steps` limit normally produces a text-only finalization. `StepLimit` recovery is reserved for a provider that attempts to continue with tools after that finalization boundary.
 - Context-limit failures compact retained history before retrying. Successful compaction is persisted as its own retry phase so a restart does not compact the same history twice.
 - Authentication failures, user interruption, and a closed event consumer pause the goal for human action.
 - Invalid provider protocol, unsupported typed input such as an image sent to a text-only model, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal.

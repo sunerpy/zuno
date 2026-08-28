@@ -162,9 +162,9 @@ fn resolver_step_limit_is_opt_in() {
     assert_eq!(unlimited.max_steps, None);
 
     let mut resolver = traced_resolver("AGENT");
-    resolver.max_steps = std::num::NonZeroU32::new(17);
+    resolver.max_steps = NonZeroU32::new(17);
     let limited = resolver.resolve_agent("build").expect("configured agent");
-    assert_eq!(limited.max_steps, std::num::NonZeroU32::new(17));
+    assert_eq!(limited.max_steps, NonZeroU32::new(17));
 }
 
 #[test]

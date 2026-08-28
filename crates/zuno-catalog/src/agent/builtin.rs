@@ -659,12 +659,15 @@ mod tests {
             (
                 "orchestrator",
                 PROMPT_ORCHESTRATOR,
-                150,
+                190,
                 &[
                     "dependency graph",
                     "non-overlapping objectives",
                     "Treat child reports as evidence",
                     "integration ownership",
+                    "Batch independent reads and checks",
+                    "Do not re-read unchanged state",
+                    "Run shared verification once",
                 ],
             ),
             (

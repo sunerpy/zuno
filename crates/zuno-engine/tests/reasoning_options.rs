@@ -4,6 +4,7 @@
 //! asserts is not entangled with that file's fixtures.
 
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -82,7 +83,10 @@ struct ReasoningResolver(serde_json::Map<String, Value>);
 
 impl AgentModelResolver for ReasoningResolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-        (requested == "build").then(|| ResolvedAgent::new("build", "You are a test agent."))
+        (requested == "build").then(|| {
+            ResolvedAgent::new("build", "You are a test agent.")
+                .with_max_steps(NonZeroU32::new(4).expect("test limit is non-zero"))
+        })
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {

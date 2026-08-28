@@ -336,6 +336,30 @@ Foreground native `task` delegation is not detached: it inherits the parent
 turn interrupt, aborts the live child turn when fired, and waits for child drain
 and runtime shutdown before the tool call settles.
 
+## Optional Agent step guard
+
+An Agent has no fixed provider-step limit unless its definition sets `steps`:
+
+```json
+{
+  "agents": {
+    "orchestrator": {
+      "steps": 200
+    }
+  }
+}
+```
+
+The same field is available in Agent Markdown frontmatter. `steps` must be a
+positive integer and counts tool-capable provider iterations within one turn.
+Omit it for the default unbounded behavior.
+
+When the configured iteration is exhausted and the model still requests
+continuation, Zuno sends one additional text-only request. That request has no
+tools and asks for a concise account of completed work, remaining work,
+evidence, and blockers. It does not silently raise or reset the configured
+limit.
+
 ## Agent capability ceilings and required Skills
 
 An Agent definition may set an exact `tools` allowlist and may require instruction

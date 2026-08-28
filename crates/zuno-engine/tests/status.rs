@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
@@ -418,7 +419,10 @@ struct FakeResolver;
 
 impl AgentModelResolver for FakeResolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-        (requested == "build").then(|| ResolvedAgent::new("build", "status test"))
+        (requested == "build").then(|| {
+            ResolvedAgent::new("build", "status test")
+                .with_max_steps(NonZeroU32::new(2).expect("test limit is non-zero"))
+        })
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {

@@ -238,12 +238,81 @@ Zed presents permission and elicitation requests, but Zuno remains the policy
 owner:
 
 - Zuno permission rules decide whether a tool runs, is denied, or asks;
+- reusable ACP asks offer `Allow once`, `Allow for session`, and `Reject`;
+  a session grant is exact to the permission and resource patterns, survives
+  Agent/model/reasoning remounts, and is cleared by `session/close`;
+- strict or Shell-risk human-only asks offer only `Allow once` and `Reject`;
+  effective `allow_all`, including `danger-full-access`, emits no permission
+  request at all;
 - Zuno's Shell sandbox controls filesystem and network authority;
 - native file tools emit typed creation and edit diffs for Zed;
 - Zuno-configured MCP servers remain available when the selected Agent profile
   permits them;
 - cancellation, session load, resume, close, plan state, usage, and tool
   history use the same durable runtime as the TUI.
+
+Structured `question` calls use ACP form controls rather than a generic prompt:
+
+- single-choice options are rendered from `oneOf`;
+- multi-choice options are rendered as an array selection;
+- when the question permits a custom answer, the choices remain clickable and
+  a separate optional `Other` field is shown;
+- submitting `Other` takes precedence over selected options, matching the Zuno
+  TUI, while an empty optional form is reported as unanswered.
+
+After completion and on historical replay, the question remains a static tool
+card showing its prompt, choices, status, and—when durable answer metadata is
+available—the selected values. `rawInput` and `rawOutput` remain available in
+tool details; loading history never reopens an elicitation request.
+
+Only provider reasoning deltas are projected into Zed's Thinking surface.
+Generated titles use ACP `session_info_update`, and operational status or
+provider failure text is handled by lifecycle/error reporting rather than being
+rendered as model thought.
+
+Shell tool-call titles are the exact submitted command, not an interpreter-prefixed
+pseudo-command. For example, Zed receives `git diff --check` as the copyable title
+and receives the resolved `zsh` identity separately in
+`_meta.zuno.interpreter`. Completion and historical replay preserve the same shape.
+
+### Delegated child sessions
+
+The ordinary `task` tool is always the compatibility surface. Its card shows
+the Agent, objective, state, and, when known, child session/job/model/effort
+identity while retaining the raw tool details.
+
+Zuno also supports the draft native-subagent projection used by the reviewed
+official `codex-acp` adapter. It is enabled only when the ACP client sends the
+direct initialize capability:
+
+```json
+"clientCapabilities": {
+  "subagents": {}
+}
+```
+
+When negotiated, foreground delegation is routed as a session tree:
+
+- the parent receives `subagent_spawned`;
+- the child session receives its own replay, prompt, messages, reasoning,
+  tools, plan, and usage;
+- the direct parent receives exactly one terminal
+  `subagent_state_update` after child output drains.
+
+Nested foreground children use their direct durable parent. Historical child
+trees are restored on `session/load`, but their state is shown as
+`disconnected` because a restarted process cannot prove that old work is still
+live. Child-specific cancel/close are not advertised yet.
+
+Background delegation deliberately stays on the stable task/job lifecycle,
+even when native subagents were negotiated. Closing a root session cancels and
+joins only that root's background jobs before releasing its runtime resources.
+
+Permissions and questions raised by a child use the child session id only in
+native mode. For clients without native-subagent support, Zuno sends the request
+on the known root session and includes the durable child id at
+`_meta.zuno.childSessionId`; this prevents a client from receiving an unknown
+session id while preserving attribution.
 
 ACP-provided client MCP, client filesystem RPC, and terminal RPC are not
 advertised. Zuno handles file and Shell work through its own tools, permission
@@ -373,16 +442,28 @@ After configuration:
 1. open a real project folder in Zed and create a Zuno Agent thread;
 2. select `deep`, the intended model, and `xhigh` or `max`, then confirm the
    choice is shown in the session controls;
-3. type `/` and execute one configured command or unambiguous Skill;
-4. attach an image, selection, and branch diff and confirm they reach the turn;
-5. send a read-only repository question and confirm reasoning
+3. type `/`, confirm `/compact`, `/goal`, `/plan`, `/start-plan`, and
+   `/start-work` each appear exactly once;
+4. execute `/goal create verify ACP`, then `/goal show`, and confirm the result
+   appears as Agent output rather than Thinking;
+5. execute `/start-plan`, confirm Zed switches to Plan, then create a durable
+   plan and execute `/start-work`;
+6. after enough conversation history exists, execute `/compact` and confirm the
+   summary survives a session reload;
+7. execute one configured command or unambiguous Skill;
+8. attach an image, selection, and branch diff and confirm they reach the turn;
+9. send a read-only repository question and confirm reasoning
    and tool updates stream incrementally;
-6. request one file edit under an ask policy and confirm Zed displays both the
+10. delegate a foreground child and confirm either the negotiated child-session
+    stream or the complete stable task card, depending on client capability;
+11. delegate a background child, close the root thread, and confirm the job is
+    cancelled without a foreground native-child stream;
+12. request one file edit under an ask policy and confirm Zed displays both the
    permission request and typed diff;
-7. cancel a running prompt and confirm the session returns to idle;
-8. close and reload the session and confirm content, tools, plan, and usage are
-   replayed once;
-9. load the same open session again and confirm the transcript is not duplicated.
+13. cancel a running prompt and confirm the session returns to idle;
+14. close and reload the session and confirm content, question/task cards,
+   child history, tools, plan, and usage are replayed once;
+15. load the same open session again and confirm the transcript is not duplicated.
 
 Repository-level ACP verification is:
 

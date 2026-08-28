@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +71,8 @@ struct AcpState {
     session_slots: Arc<Semaphore>,
     composition_gate: Mutex<()>,
     elicitation_form: AtomicBool,
+    native_subagents: AtomicBool,
+    permission_grants: Arc<zuno_acp::AcpPermissionGrants>,
 }
 
 #[async_trait]
@@ -135,7 +137,7 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
             "protocolVersion must be a number",
         ));
     }
-    Ok(json!({
+    let mut response = json!({
         "protocolVersion": ACP_PROTOCOL_VERSION,
         "agentCapabilities": {
             "loadSession": true,
@@ -162,7 +164,17 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
             "title": "Zuno",
             "version": env!("CARGO_PKG_VERSION"),
         },
-    }))
+    });
+    if supports_native_subagents(params) {
+        response["agentCapabilities"]["sessionCapabilities"]["subagents"] = json!({});
+    }
+    Ok(response)
+}
+
+fn supports_native_subagents(params: &Value) -> bool {
+    params
+        .pointer("/clientCapabilities/subagents")
+        .is_some_and(Value::is_object)
 }
 
 impl ProductionAcpAgent {
@@ -174,6 +186,9 @@ impl ProductionAcpAgent {
                 .is_some_and(Value::is_object),
             Ordering::Release,
         );
+        self.state
+            .native_subagents
+            .store(supports_native_subagents(params), Ordering::Release);
         Ok(response)
     }
 
@@ -186,6 +201,8 @@ impl ProductionAcpAgent {
                 session_slots: Arc::new(Semaphore::new(MAX_OPEN_ACP_SESSIONS)),
                 composition_gate: Mutex::new(()),
                 elicitation_form: AtomicBool::new(false),
+                native_subagents: AtomicBool::new(false),
+                permission_grants: Arc::new(zuno_acp::AcpPermissionGrants::default()),
             }),
         }
     }
@@ -299,7 +316,9 @@ impl ProductionAcpAgent {
             }
         };
         if replay {
-            session.replay(&client).await?;
+            session
+                .replay(&client, self.state.native_subagents.load(Ordering::Acquire))
+                .await?;
         } else {
             session.mark_replay_satisfied().await?;
         }
@@ -413,6 +432,7 @@ impl ProductionAcpAgent {
             }
         }
         drop(session);
+        self.state.permission_grants.clear_session(&session_id);
         shutdown.map_err(zuno_acp::RpcError::internal)?;
         Ok(json!({}))
     }
@@ -465,8 +485,7 @@ impl ProductionAcpAgent {
             plan,
             &self.state.environment,
             self.state.runs.clone(),
-            client,
-            self.state.elicitation_form.load(Ordering::Acquire),
+            AcpSurfaceContext::from_state(self.state.as_ref(), client),
             None,
         )
         .await
@@ -536,6 +555,7 @@ impl ProductionAcpAgent {
         let sessions = std::mem::take(&mut *self.state.sessions.lock().await);
         let mut failures = Vec::new();
         for session in sessions.into_values() {
+            self.state.permission_grants.clear_session(&session.id);
             if let Err(error) = session.shutdown().await {
                 failures.push(format!("{}: {error}", session.id));
             }
@@ -571,6 +591,8 @@ struct DormantSession {
 struct SessionResources {
     host: TurnHost,
     mcp: Option<McpRuntime>,
+    subagents: Option<super::acp_subagent::AcpSubagentBridge>,
+    subagent_flush: Option<super::acp_subagent::AcpSubagentFlush>,
     configuration: SessionConfiguration,
 }
 
@@ -594,14 +616,38 @@ struct PreparedReconfiguration {
     persistence: ConfigurationPersistence,
 }
 
+#[derive(Clone)]
+struct AcpSurfaceContext {
+    client: zuno_acp::ClientConnection,
+    permission_grants: Arc<zuno_acp::AcpPermissionGrants>,
+    elicitation_form: bool,
+    native_subagents: bool,
+}
+
+impl AcpSurfaceContext {
+    fn from_state(state: &AcpState, client: zuno_acp::ClientConnection) -> Self {
+        Self {
+            client,
+            permission_grants: Arc::clone(&state.permission_grants),
+            elicitation_form: state.elicitation_form.load(Ordering::Acquire),
+            native_subagents: state.native_subagents.load(Ordering::Acquire),
+        }
+    }
+}
+
 async fn open_session_resources(
     plan: TurnPlan,
     environment: &StartupEnvironment,
     runs: SessionRunRegistry,
-    client: zuno_acp::ClientConnection,
-    elicitation_form: bool,
+    surface: AcpSurfaceContext,
     build_agent: Option<&str>,
 ) -> Result<SessionResources, String> {
+    let AcpSurfaceContext {
+        client,
+        permission_grants,
+        elicitation_form,
+        native_subagents,
+    } = surface;
     let configuration = SessionConfiguration::from_plan(&plan, build_agent);
     let workspace = plan
         .worktree()
@@ -612,21 +658,38 @@ async fn open_session_resources(
         Some(mcp) => mcp.connect().await,
         None => Vec::new(),
     };
+    let session_route = Arc::new(zuno_acp::AcpSessionRoute::new(native_subagents));
     let question = elicitation_form.then(|| {
-        Arc::new(zuno_acp::AcpQuestionAsker::new(client.clone()))
-            as Arc<dyn zuno_tools::question::QuestionAsker>
+        Arc::new(zuno_acp::AcpQuestionAsker::with_route(
+            client.clone(),
+            Arc::clone(&session_route),
+        )) as Arc<dyn zuno_tools::question::QuestionAsker>
     });
-    let approval: Arc<dyn PermissionAsker> = Arc::new(zuno_acp::AcpPermissionAsker::new(
-        client,
-        "Approve Zuno tool call",
-    ));
-    let host = TurnHost::open_with_runtime_and_mcp(
+    let approval: Arc<dyn PermissionAsker> =
+        Arc::new(zuno_acp::AcpPermissionAsker::with_grants_and_route(
+            client.clone(),
+            "Approve Zuno tool call",
+            permission_grants,
+            Arc::clone(&session_route),
+        ));
+    let (child_observer, mut subagents) = if native_subagents {
+        let (observer, bridge) = super::acp_subagent::AcpSubagentBridge::start(
+            client.clone(),
+            workspace.clone(),
+            configuration.context_size,
+        )?;
+        (Some(observer), Some(bridge))
+    } else {
+        (None, None)
+    };
+    let host = TurnHost::open_with_runtime_mcp_and_observer(
         plan,
         environment,
         approval,
         question,
         runs,
         mcp.as_ref().map(McpRuntime::catalog),
+        child_observer,
     )
     .await;
     let mut host = match host {
@@ -635,18 +698,44 @@ async fn open_session_resources(
             if let Some(mcp) = mcp.take() {
                 mcp.shutdown().await;
             }
-            return Err(error);
+            let bridge = shutdown_subagent_bridge(&mut subagents).await;
+            return Err(bridge.map_or(error.clone(), |bridge| {
+                format!("{error}; ACP subagent projector shutdown also failed: {bridge}")
+            }));
         }
     };
+    if let Err(error) = session_route.bind_root(host.session_id()) {
+        let shutdown = host.shutdown().await;
+        if let Some(mcp) = mcp.take() {
+            mcp.shutdown().await;
+        }
+        let bridge = shutdown_subagent_bridge(&mut subagents).await;
+        let host = shutdown
+            .err()
+            .map(|shutdown| format!("; candidate ACP host shutdown failed: {shutdown}"))
+            .unwrap_or_default();
+        let bridge = bridge
+            .map(|bridge| format!("; ACP subagent projector shutdown failed: {bridge}"))
+            .unwrap_or_default();
+        return Err(format!("{error}{host}{bridge}"));
+    }
     if let Err(error) = host.activate_extension_composition() {
         let shutdown = host.shutdown().await;
         if let Some(mcp) = mcp.take() {
             mcp.shutdown().await;
         }
+        let bridge = shutdown_subagent_bridge(&mut subagents).await;
         return Err(match shutdown {
-            Ok(()) => error,
+            Ok(()) if bridge.is_none() => error,
+            Ok(()) => format!(
+                "{error}; ACP subagent projector shutdown also failed: {}",
+                bridge.expect("checked")
+            ),
             Err(shutdown) => {
-                format!("{error}; candidate ACP host shutdown also failed: {shutdown}")
+                let bridge = bridge
+                    .map(|bridge| format!("; ACP subagent projector shutdown failed: {bridge}"))
+                    .unwrap_or_default();
+                format!("{error}; candidate ACP host shutdown also failed: {shutdown}{bridge}")
             }
         });
     }
@@ -656,16 +745,29 @@ async fn open_session_resources(
         if let Some(mcp) = mcp.take() {
             mcp.shutdown().await;
         }
+        let bridge = shutdown_subagent_bridge(&mut subagents).await;
         return Err(match shutdown {
-            Ok(()) => error,
+            Ok(()) if bridge.is_none() => error,
+            Ok(()) => format!(
+                "{error}; ACP subagent projector shutdown also failed: {}",
+                bridge.expect("checked")
+            ),
             Err(shutdown) => {
-                format!("{error}; materialization cleanup also failed: {shutdown}")
+                let bridge = bridge
+                    .map(|bridge| format!("; ACP subagent projector shutdown failed: {bridge}"))
+                    .unwrap_or_default();
+                format!("{error}; materialization cleanup also failed: {shutdown}{bridge}")
             }
         });
     }
+    let subagent_flush = subagents
+        .as_ref()
+        .map(super::acp_subagent::AcpSubagentBridge::flush_handle);
     Ok(SessionResources {
         host,
         mcp,
+        subagents,
+        subagent_flush,
         configuration,
     })
 }
@@ -675,7 +777,24 @@ async fn shutdown_session_resources(mut resources: SessionResources) -> Result<(
     if let Some(mcp) = resources.mcp.take() {
         mcp.shutdown().await;
     }
-    host
+    let subagents = shutdown_subagent_bridge(&mut resources.subagents).await;
+    match (host, subagents) {
+        (Ok(()), None) => Ok(()),
+        (Err(host), None) => Err(host),
+        (Ok(()), Some(subagents)) => Err(subagents),
+        (Err(host), Some(subagents)) => Err(format!(
+            "{host}; ACP subagent projector shutdown failed: {subagents}"
+        )),
+    }
+}
+
+async fn shutdown_subagent_bridge(
+    bridge: &mut Option<super::acp_subagent::AcpSubagentBridge>,
+) -> Option<String> {
+    match bridge.take() {
+        Some(bridge) => bridge.shutdown().await.err(),
+        None => None,
+    }
 }
 
 async fn restore_session_after_failure(
@@ -693,8 +812,7 @@ async fn restore_session_after_failure(
             plan,
             &state.environment,
             state.runs.clone(),
-            client,
-            state.elicitation_form.load(Ordering::Acquire),
+            AcpSurfaceContext::from_state(state, client),
             Some(build_agent),
         )
         .await?;
@@ -897,8 +1015,7 @@ impl AcpSession {
             plan,
             &state.environment,
             state.runs.clone(),
-            client.clone(),
-            state.elicitation_form.load(Ordering::Acquire),
+            AcpSurfaceContext::from_state(state, client.clone()),
             Some(&build_agent),
         )
         .await
@@ -1097,6 +1214,7 @@ impl AcpSession {
         let projection = project_turn(&self.id, context_size, receiver, client.clone());
         let (driven, projected) = tokio::join!(drive, projection);
         let projected = projected?;
+        self.flush_subagents().await?;
         self.project_plan(&client).await?;
         match projected {
             ProjectedTurn::Completed(stop_reason) => {
@@ -1207,8 +1325,7 @@ impl AcpSession {
             plan,
             &state.environment,
             state.runs.clone(),
-            client,
-            state.elicitation_form.load(Ordering::Acquire),
+            AcpSurfaceContext::from_state(state, client),
             Some(&dormant.configuration.build_agent),
         )
         .await
@@ -1258,13 +1375,30 @@ impl AcpSession {
         Ok(())
     }
 
+    async fn flush_subagents(&self) -> Result<(), zuno_acp::RpcError> {
+        let flush = self
+            .resources
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|resources| resources.subagent_flush.clone());
+        if let Some(flush) = flush {
+            flush.flush().await.map_err(zuno_acp::RpcError::internal)?;
+        }
+        Ok(())
+    }
+
     fn cancel(&self) {
         if self.prompt_active.load(Ordering::Acquire) {
             let _disposition = self.control.abort();
         }
     }
 
-    async fn replay(&self, client: &zuno_acp::ClientConnection) -> Result<(), zuno_acp::RpcError> {
+    async fn replay(
+        &self,
+        client: &zuno_acp::ClientConnection,
+        native_subagents: bool,
+    ) -> Result<(), zuno_acp::RpcError> {
         let _replay = self.replay_gate.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(self.closed_error());
@@ -1319,6 +1453,16 @@ impl AcpSession {
             }
             client.session_update(&self.id, update).await?;
         }
+        if native_subagents {
+            replay_child_sessions(
+                client,
+                Arc::clone(&pool),
+                &self.id,
+                &self.replay_root,
+                configured_context_size,
+            )
+            .await?;
+        }
         self.replayed.store(true, Ordering::Release);
         Ok(())
     }
@@ -1343,12 +1487,11 @@ impl AcpSession {
         let _mount = self.mount_gate.lock().await;
         self.dormant.lock().await.take();
         let resources = self.resources.lock().await.take();
-        let result = if let Some(mut resources) = resources {
-            let host = resources.host.shutdown().await;
-            if let Some(mcp) = resources.mcp.take() {
-                mcp.shutdown().await;
-            }
-            host
+        let result = if let Some(resources) = resources {
+            let (background_jobs, session_id) = resources.host.background_job_scope();
+            background_jobs.cancel_for_parent(&session_id);
+            background_jobs.wait_for_parent(&session_id).await;
+            shutdown_session_resources(resources).await
         } else {
             Ok(())
         };
@@ -1408,6 +1551,98 @@ fn replay_work_state(
         todos,
         ..zuno_types::WorkStateProjection::default()
     })
+}
+
+async fn replay_child_sessions(
+    client: &zuno_acp::ClientConnection,
+    pool: Arc<zuno_db::pool::Pool>,
+    root_session_id: &str,
+    replay_root: &std::path::Path,
+    default_context_size: u64,
+) -> Result<(), zuno_acp::RpcError> {
+    let store = zuno_db::session::Store::new(pool.as_ref());
+    let mut pending = VecDeque::from([root_session_id.to_owned()]);
+    let mut seen = BTreeSet::from([root_session_id.to_owned()]);
+    let mut children = Vec::new();
+    while let Some(parent_session_id) = pending.pop_front() {
+        for child in store
+            .children(&parent_session_id)
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
+        {
+            if !seen.insert(child.id.clone()) {
+                continue;
+            }
+            pending.push_back(child.id.clone());
+            children.push((parent_session_id.clone(), child));
+        }
+    }
+    if children.is_empty() {
+        return Ok(());
+    }
+
+    let connection = pool
+        .open_connection()
+        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+    for (parent_session_id, child) in &children {
+        client
+            .session_update(
+                parent_session_id,
+                json!({
+                    "sessionUpdate": "subagent_spawned",
+                    "subagentSessionId": child.id,
+                    "name": child.agent.as_deref().unwrap_or("subagent"),
+                    "task": child.title,
+                    "capabilities": {
+                        "cancel": false,
+                        "close": false,
+                    },
+                }),
+            )
+            .await?;
+        let history = zuno_engine::r#loop::hydrate_retained_history_tail(
+            &connection,
+            &child.id,
+            zuno_acp::REPLAY_MESSAGE_CAP,
+            zuno_acp::REPLAY_TRANSCRIPT_BYTE_CAP,
+        )
+        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        let replay = zuno_acp::durable_updates(
+            &history.messages,
+            &zuno_acp::ReplayPolicy::for_workspace(replay_root),
+            history.omitted,
+        );
+        for update in replay.updates {
+            client.session_update(&child.id, update).await?;
+        }
+        let work_state = replay_work_state(Arc::clone(&pool), &child.id)?;
+        if let Some(update) = zuno_acp::durable_plan_update(&work_state) {
+            client.session_update(&child.id, update).await?;
+        }
+        let context_size = child
+            .usage
+            .context_limit
+            .and_then(|limit| u64::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(default_context_size);
+        if let Some(update) =
+            zuno_acp::durable_usage_update(&history.messages, context_size, child.usage.cost)
+        {
+            client.session_update(&child.id, update).await?;
+        }
+    }
+    for (parent_session_id, child) in children.iter().rev() {
+        client
+            .session_update(
+                parent_session_id,
+                json!({
+                    "sessionUpdate": "subagent_state_update",
+                    "subagentSessionId": child.id,
+                    "state": "disconnected",
+                }),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 fn live_options(host: &TurnHost) -> TurnOptions {
@@ -2395,6 +2630,25 @@ mod tests {
         assert_eq!(capabilities["image"], true);
         assert_eq!(capabilities["embeddedContext"], true);
         assert_eq!(capabilities["audio"], false);
+    }
+
+    #[test]
+    fn initialize_advertises_native_subagents_only_after_explicit_negotiation() {
+        let ordinary = initialize(&json!({"protocolVersion": 1})).expect("initialize");
+        assert!(
+            ordinary["agentCapabilities"]["sessionCapabilities"]
+                .get("subagents")
+                .is_none()
+        );
+
+        let negotiated = initialize(&json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "subagents": {}
+            }
+        }))
+        .expect("initialize");
+        assert!(negotiated["agentCapabilities"]["sessionCapabilities"]["subagents"].is_object());
     }
 
     #[test]

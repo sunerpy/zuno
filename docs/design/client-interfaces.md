@@ -72,6 +72,33 @@ Human input has priority over an automatic goal retry. The client may show the p
 - Background reports settle durably before they wake a parent.
 - A client disconnect never cancels an active goal unless it issued an explicit interrupt.
 
+## ACP child-session projection
+
+ACP always exposes delegation through the stable `task` tool-call projection.
+That card is sufficient for clients which know nothing about child sessions and
+is retained even when a richer projection is active.
+
+The draft native-subagent extension is opt-in presentation, not a different
+execution path. After direct `clientCapabilities.subagents` negotiation, a
+foreground child's durable session becomes an additional ACP update route:
+spawn and terminal state are sent to its direct parent, while replay and live
+turn events are sent to the child id. The adapter drains the bounded child
+projection queue before returning the parent prompt response. If high-frequency
+updates must be omitted under backpressure, it emits a typed omission notice;
+spawn and terminal transitions are protected.
+
+Historical child trees are reconstructed from durable parent edges and replayed
+parent-before-child. Their terminal state is `disconnected`, because durable
+history proves identity and content but not process liveness. Background
+children remain jobs: projecting them as foreground sessions would erase their
+independent cancellation, report-delivery, and uncertain-outcome semantics.
+
+Human requests follow the same routing contract. A negotiated native child uses
+its own session id. A compatibility client receives the ask on the known root
+session with `_meta.zuno.childSessionId`, so it never has to accept an unknown
+route. Reusable permission grants are still owned by the root ACP session and
+are cleared when it closes.
+
 ## TUI
 
 The TUI favors dense, keyboard-first operation:

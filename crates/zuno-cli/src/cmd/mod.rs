@@ -1,4 +1,5 @@
 mod acp;
+mod acp_subagent;
 mod agent;
 pub(crate) mod child_turn;
 mod completion;

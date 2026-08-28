@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -70,7 +71,10 @@ struct Resolver;
 
 impl AgentModelResolver for Resolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-        (requested == "build").then(|| ResolvedAgent::new("build", "dispatch test"))
+        (requested == "build").then(|| {
+            ResolvedAgent::new("build", "dispatch test")
+                .with_max_steps(NonZeroU32::new(4).expect("test limit is non-zero"))
+        })
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
