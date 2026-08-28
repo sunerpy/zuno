@@ -77,16 +77,16 @@ overlay need not duplicate either provider definition. Checked selector files
 for all three teams live under
 [`examples/config/profiles`](../../examples/config/profiles).
 
-Model names belong to a provider implementation, not to an account. The
-checked example follows `kiro-provider` v0.5.0-rc.3, whose source and live
-`GET /v1/models` response both expose `claude-opus-5` plus
-`low`/`medium`/`high`/`xhigh`/`max`, a 1,000,000-token context limit, a
-128,000-token output limit. The gateway catalog also reports PDF input, but
-its verified Responses subset rejects file inputs. The checked Zuno profile
-therefore deliberately narrows every Kiro model to text plus inline image
-data. Keep the static Zuno catalog aligned with the usable gateway protocol,
-not merely the broadest model-catalog declaration, and do not infer a gateway
-model because an authentication plugin advertises it.
+Model names belong to the provider's live account-aware catalog, not to an
+authentication plugin or to every account uniformly. The checked example is
+aligned with the 2026-08-28 compiled-provider validation, which observed
+`claude-opus-5`, `low`/`medium`/`high`/`xhigh`/`max`, a 1,000,000-token
+context limit, and a 128,000-token output limit. `kiro-provider` now accepts
+inline Responses documents in its verified native formats. Zuno does not yet
+have a native document request block or an end-to-end Kiro document test, so
+the checked profile deliberately continues to advertise only text plus inline
+image data. Keep the static Zuno capability catalog aligned with the path Zuno
+has actually verified, not merely the broadest model-catalog declaration.
 
 For a loopback [kiro-provider](https://github.com/sunerpy/kiro-provider)
 Responses gateway, use a unique provider id such as `kiro-local`: Zuno checks
@@ -120,19 +120,19 @@ Set the provider options to:
 ```json
 {
   "baseURL": "http://127.0.0.1:8787/v1",
-  "maxTokens": null,
-  "responsesTextBlocks": "single"
+  "maxTokens": null
 }
 ```
 
 The null output default prevents Zuno's generic provider layer from injecting
 an unsupported 32,000-token cap. Declare each model's real `limit.output`
-instead. The single-text declaration matches the gateway's current Responses
-projection: each message maps to one upstream text field. It joins text and
-resource-link projections only at the provider boundary, so a Zed attachment
-does not produce multiple `input_text` blocks while durable Zuno history keeps
-the original typed parts. This is an explicit compatible-endpoint rule, not
-behavior inferred from the `kiro-local` id.
+instead. Current `kiro-provider` preserves consecutive all-text blocks in its
+canonical request and concatenates them byte-for-byte with no inserted separator
+only at Kiro's scalar text boundary. Do not set
+`responsesTextBlocks: "single"` for this provider version: that older Zuno
+compatibility option inserts a blank line and therefore changes the request.
+Mixed text and non-text blocks whose ordering cannot be represented still fail
+closed at the provider boundary.
 
 Current Zuno sends native Responses `instructions`, so the verified
 functional deployment uses kiro-provider's explicit
@@ -147,6 +147,12 @@ joins instruction, system, and developer text into the first user content, so
 role priority is no longer a security boundary. Tool authorization remains
 owned by Zuno's permission and approval layers.
 
+Do not set `reasoningSummary` on a Kiro model or Agent route.
+`kiro-provider` has no proven lossless mapping for Responses
+`reasoning.summary` and rejects it before contacting Kiro. Reasoning levels
+remain available through the independent standard `reasoning.effort` field;
+Zuno must not add a provider-id special case that silently drops summary.
+
 For a foreground root or delegated-child turn, Zuno attaches the session's
 durable identity to standard Responses
 `metadata.zuno_session_id`. Tool continuations and a later process resume reuse
@@ -160,11 +166,13 @@ without private headers or model-visible prompt prefixes. See
 for the ownership and verification contract.
 
 Do not add `previous_response_id`, Responses `conversation`, `store: true`,
-structured-output controls, native Web Search, or PDF/file input through
-`extraBody`; remote image URLs are unsupported too. The gateway rejects those
-fields instead of silently weakening them. Inline data-URL images and function
-tools are the supported rich-input subset. Standard `reasoning.effort` remains
-independent from legacy instruction projection.
+structured-output controls, native Web Search, or document payloads through
+`extraBody`; remote image URLs are unsupported too. The gateway rejects
+unsupported fields instead of silently weakening them. Inline data-URL images
+and function tools are the rich-input subset currently emitted by Zuno. The
+provider's native `input_file` support can be enabled in Zuno only after a
+typed document block, capability validation, durable replay, and real E2E test
+land together.
 
 Run one long-lived kiro-provider process for the credential-owning OS user.
 Do not spawn a provider per Zuno session: the process owns shared

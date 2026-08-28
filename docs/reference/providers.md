@@ -197,13 +197,19 @@ typed, but joins their text projections with one blank line immediately before
 building the compatible Responses request. Inline images remain separate
 content blocks. Use it only when the target endpoint rejects more than one
 `input_text` block for a message; standards-compatible endpoints should keep
-the default `multiple` behavior.
+the default `multiple` behavior. Do not use it with the 2026-08-28
+`kiro-provider` build: that provider now concatenates consecutive all-text
+blocks byte-for-byte with no separator, while this option intentionally inserts
+a blank line.
 
 Model `options.reasoningEffort` is the default when neither the live session nor
 the selected agent chooses a level. On the Responses surface,
 `options.reasoningSummary` is lowered beside it as
 `reasoning: { effort, summary }`; Chat Completions receives only
-`reasoning_effort` because it has no reasoning-summary request field.
+`reasoning_effort` because it has no reasoning-summary request field. Omit
+`reasoningSummary` for a compatible endpoint that rejects
+`reasoning.summary`; Zuno does not silently strip an explicitly requested
+control based on the provider id.
 
 Run `zuno models myopenai --verbose` to inspect resolved models and `zuno debug config` to confirm the merged provider block without opening the credential file.
 

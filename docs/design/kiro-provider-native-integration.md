@@ -1,7 +1,9 @@
 # Kiro Provider native Responses integration
 
 Status: the Zuno session-affinity slice was implemented on 2026-08-27. The
-remaining native Kiro instruction-projection work is owned upstream.
+2026-08-28 compiled-provider validation is reflected here. Native Kiro
+instruction projection remains owned upstream; native document transport is a
+separate unimplemented Zuno capability.
 
 ## Decision
 
@@ -20,9 +22,17 @@ The current integration is functionally usable, with one upstream limitation:
 - Zuno sends each foreground root or child durable session id through standard
   Responses `metadata.zuno_session_id`, and keeps lifecycle model calls
   isolated;
+- the provider owns live account-aware model discovery, history-lineage
+  fallback, account/conversation pools, its single-instance database lock,
+  strict stream completion, and exact reasoning-placeholder filtering;
 - current Zuno instructions require the gateway's explicit
   `legacy-user-prefix` migration mode. Stable completion remains blocked until
   Kiro has a lossless native instruction projection.
+
+No Kiro-specific Zuno plugin is required for those provider-owned behaviors.
+In particular, Zuno must not install a request-rewriting plugin that strips
+unsupported fields or changes prompt content. Provider compatibility remains a
+validated custom-provider configuration plus the standard Responses adapter.
 
 ## Pre-affinity validation baseline
 
@@ -194,14 +204,15 @@ must not infer attachment, reasoning, context, or output capabilities from a
 model id alone.
 
 The checked Kiro profile intentionally advertises only text and inline image
-input. Although the gateway's broad model catalog can report PDF support, its
-current Responses protocol rejects file inputs, remote image URLs, stateful
-response fields, structured output, and native Web Search. Zuno must not turn
-catalog metadata into unsupported wire fields.
+input. The 2026-08-28 provider accepts inline Responses `input_file` documents
+in its verified native formats, but Zuno currently has no native document
+request block: ACP `resource_link` remains typed durable metadata and lowers to
+text, while inline bytes exist only for images. Advertising PDF now would
+therefore overstate the Zuno-to-provider path. Native documents should land
+only when the typed block, durable storage/replay, model capability check,
+compatible Responses projection, and real Kiro E2E test arrive together.
 
-The gateway also exposes one upstream text field for each projected input
-message. A Zed prompt containing a `resource_link` plus user text therefore
-needs an explicit compatible-provider projection rule:
+Current provider configuration is:
 
 ```json
 {
@@ -211,19 +222,36 @@ needs an explicit compatible-provider projection rule:
       "surface": "responses",
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
-        "maxTokens": null,
-        "responsesTextBlocks": "single"
+        "maxTokens": null
       }
     }
   }
 }
 ```
 
-This setting is generic and opt-in. Zuno preserves the resource link and user
-text as separate durable prompt parts, then joins only their text projections
-with one blank line at the compatible Responses boundary. It does not key
-behavior on `kiro-local`, alter OpenAI's default request shape, flatten images,
-or make the gateway limitation part of the core agent loop.
+The provider now retains consecutive all-text blocks in its canonical request
+and joins them byte-for-byte with no inserted separator only at Kiro's scalar
+text boundary. The old `responsesTextBlocks: "single"` Zuno compatibility
+option must be removed because it deliberately inserts one blank line. Mixed
+text and non-text blocks whose ordering cannot be preserved still fail closed.
+
+Do not configure `reasoningSummary` for Kiro routes. Zuno correctly lowers an
+explicit summary request to standard `reasoning.summary`, while the provider
+correctly rejects that field because no lossless Kiro equivalent is proven.
+`reasoning.effort` remains supported. This boundary is configuration, not a
+reason for provider-id special casing or a field-stripping plugin.
+
+The remaining 2026-08-28 provider changes do not require Zuno adaptation:
+
+- live model catalogs and per-account eligibility are routing facts owned by
+  the long-lived provider; Zuno's catalog remains the validated client
+  capability declaration;
+- history-lineage affinity is a provider fallback for clients without metadata;
+  Zuno continues to send the stronger durable `metadata.zuno_session_id`;
+- singleton SQLite ownership, transport/client pools, completion witnesses,
+  and encrypted reasoning replay are internal provider lifecycle concerns;
+- GPT 5.6 Sol placeholder suppression is response semantics owned by the
+  provider and must not be duplicated in Zuno rendering.
 
 ## TDD evidence
 
@@ -241,6 +269,8 @@ or make the gateway limitation part of the core agent loop.
 - Real kiro-provider validation proves `affinity_bound=true` and stable
   account/conversation hashes for Opus 5 across a provider-process restart and
   for a GPT 5.6 Sol native tool loop.
+- Documentation tests reject a stale Kiro `responsesTextBlocks: "single"`
+  option and reject `reasoningSummary` in the checked Kiro model definitions.
 
 Changing `CompletionRequest` affects all native providers and compaction
 callers. Constructors should therefore be updated in one change; providers

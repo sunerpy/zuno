@@ -2,25 +2,25 @@
 
 ## Is Zuno's Shell already OS-sandboxed?
 
-It depends on the explicitly selected mode:
+It depends on the selected sandbox mode:
 
 - `read-only` confines host writes.
-- `workspace-write` confines writes to the workspace and trusted extra roots.
-  It is the default.
+- `workspace-write` (the default) confines writes to the workspace and trusted
+  extra roots.
 - `danger-full-access` deliberately uses the native shell as the Zuno user, with
   host filesystem, process, credentials, and networking. It is not an OS security
   boundary.
 
 The two confined modes are OS-sandboxed only when the active platform backend
-passes its complete capability probe. Otherwise Shell registration fails closed;
+passes its full capability probe. Otherwise, Shell registration fails closed;
 Zuno never turns a failed `read-only` or `workspace-write` request into
 `danger-full-access`. Use `zuno --sandbox danger-full-access` only when native
 host execution is intentionally required.
 
-On supported Linux hosts, Zuno discovers a fixed, root-owned system
+On supported Linux hosts, Zuno locates a fixed, root-owned system `bwrap` at
 `/usr/bin/bwrap` or `/bin/bwrap`, probes the required namespaces, compiles the
-effective Agent policy, and passes only an opaque `PreparedCommand` to the process
-layer.
+effective Agent policy, and passes only an opaque `PreparedCommand` to the
+process layer.
 
 The Linux backend:
 
@@ -57,11 +57,10 @@ through the native process backend. See the
 ## Why does `bwrap` fail with `loopback: Failed RTM_NEWADDR: Operation not permitted`?
 
 `bwrap --unshare-net` creates a network namespace and initializes its loopback
-device before it executes the requested command. `RTM_NEWADDR` is the netlink
-operation used to add an address. `EPERM` at this point means an outer kernel,
-LSM, container, or virtualized-host policy denied the namespace-local network
-administration operation. It is not evidence that Zuno should silently omit the
-network namespace.
+device before running the requested command. `RTM_NEWADDR` is the netlink
+operation that adds an address. `EPERM` at this point means an outer kernel, LSM,
+container, or virtualized-host policy denied that namespace-local operation. It
+does not mean Zuno should silently omit the network namespace.
 
 ### Current Ubuntu host diagnosis
 
@@ -75,7 +74,8 @@ user.max_user_namespaces = 252820
 kernel.apparmor_restrict_unprivileged_userns = 1
 ```
 
-The binary is root-owned mode `0755`, with neither setuid nor file capabilities.
+The binary is root-owned with mode `0755` and has neither setuid nor file
+capabilities.
 The following independent probes then failed:
 
 ```sh
@@ -94,11 +94,12 @@ The following independent probes then failed:
   -- /usr/bin/true
 ```
 
-Before the AppArmor repair, the first returned `setting up uid map: Permission denied`; the second returned
-`loopback: Failed RTM_NEWADDR: Operation not permitted`. User namespaces are
-numerically enabled, but Ubuntu's AppArmor restriction transitions an otherwise
-unconfined process into the generic `unprivileged_userns` profile, which denies
-the capabilities `bwrap` needs while constructing the sandbox.
+Before the AppArmor repair, the first returned
+`setting up uid map: Permission denied`; the second returned
+`loopback: Failed RTM_NEWADDR: Operation not permitted`. User namespaces were
+numerically enabled, but Ubuntu's AppArmor restriction transitioned the
+otherwise unconfined process into the generic `unprivileged_userns` profile.
+That profile denied the capabilities `bwrap` needed to construct the sandbox.
 
 After loading the dedicated profile and correcting its ownership to `root:root`,
 both probes and Zuno's real backend E2E pass on this host. A Zuno process already
@@ -134,7 +135,7 @@ sudo journalctl -k --since '-10 minutes' \
   -g 'apparmor="DENIED"'
 ```
 
-The profile attaches to exactly `/usr/bin/bwrap`. A distribution that installs
+The profile attaches only to `/usr/bin/bwrap`. A distribution that installs
 the binary elsewhere needs a separately reviewed path rule; do not trust a
 workspace-controlled `PATH` entry or copy an arbitrary executable into the
 trusted location.
@@ -147,10 +148,10 @@ Do not use any of the following as a production repair:
 - removing network isolation, capability dropping, protected-path rules, or
   seccomp from the backend requirements.
 
-Enabling the AppArmor profile only makes the namespace probe eligible to pass.
-Zuno still enforces
-`PR_SET_NO_NEW_PRIVS`, capability drop, seccomp policy, read-only host root,
-precise writable roots, and protected-subpath overlays.
+Enabling the AppArmor profile only removes this AppArmor blocker; all other
+probe requirements still apply. Zuno continues to enforce
+`PR_SET_NO_NEW_PRIVS`, capability dropping, seccomp policy, a read-only host
+root, precise writable roots, and protected-subpath overlays.
 
 ### Containers, WSL, and other Linux hosts
 
@@ -161,39 +162,9 @@ specific seccomp, AppArmor/SELinux, user-namespace, and namespace settings, or
 run Zuno in a dedicated VM/bare-metal environment where the complete probe
 passes. Avoid blanket `--privileged` as a substitute for a reviewed policy.
 
-WSL1 must be rejected as unsupported. WSL2 is a Linux VM and may use the Linux
+WSL1 is unsupported. WSL2 is a Linux VM and may use the Linux
 backend only when the same user, mount, PID, network, filesystem, and seccomp
 probes pass.
-
-## Why does a Zed attachment fail through Kiro with `unsupported_content_block_projection`?
-
-Zed can send one ACP prompt as separate typed blocks, for example a
-`resource_link` followed by the user's text. A standards-compatible Responses
-endpoint accepts both as separate `input_text` blocks. The current Kiro gateway
-projects one message onto one upstream text field and rejects that standard
-shape with HTTP 400.
-
-Declare the limitation explicitly on that compatible provider:
-
-```json
-{
-  "provider": {
-    "kiro-local": {
-      "options": {
-        "baseURL": "http://127.0.0.1:8787/v1",
-        "maxTokens": null,
-        "responsesTextBlocks": "single"
-      }
-    }
-  }
-}
-```
-
-Zuno then joins only the provider-bound text projections with one blank line.
-The durable message still stores the resource link and user text as separate
-typed parts, and inline image blocks remain separate. The setting is generic
-and opt-in; do not apply it to an endpoint that supports normal multi-block
-Responses input.
 
 ### Upstream references
 
@@ -201,3 +172,37 @@ Responses input.
 - [Ubuntu restricted unprivileged user namespaces](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces)
 - [Ubuntu AppArmor documentation](https://documentation.ubuntu.com/server/how-to/security/apparmor/)
 - [AppArmor `bwrap-userns-restrict` profile](https://gitlab.com/apparmor/apparmor/-/blob/master/profiles/apparmor/profiles/extras/bwrap-userns-restrict)
+
+## Why does a Kiro prompt fail with `unsupported_content_block_projection`?
+
+The 2026-08-28 `kiro-provider` build accepts consecutive all-text Responses
+blocks. It preserves their boundaries in its canonical request and concatenates
+them byte-for-byte, with no separator, only at Kiro's scalar text boundary.
+A Zed `resource_link` plus ordinary text therefore no longer needs a Zuno-side
+single-text projection.
+
+Use the normal provider options:
+
+```json
+{
+  "provider": {
+    "kiro-local": {
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "maxTokens": null
+      }
+    }
+  }
+}
+```
+
+Remove a stale `responsesTextBlocks: "single"` setting when upgrading. That
+generic Zuno compatibility mode joins text with one blank line, so it changes
+the bytes compared with the provider's current lossless projection.
+
+The error remains intentional when several text blocks are interleaved with an
+image, document, tool content, or another non-text block whose ordering cannot
+be represented by Kiro's single text field. Zuno and the provider fail closed
+instead of reordering or flattening the prompt. If consecutive pure-text blocks
+still fail, verify the running provider binary rather than adding a hidden
+prompt rewrite.

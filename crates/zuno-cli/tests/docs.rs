@@ -387,7 +387,7 @@ fn provider_setup_recommends_native_transports_without_node_bootstrap() {
             "enable_legacy_chat_completions: false",
             "`previous_response_id`",
             "`store: true`",
-            "PDF/file input",
+            "`input_file` support",
             "remote image URLs",
             "one long-lived kiro-provider process",
         ],
@@ -431,6 +431,12 @@ fn multi_provider_example_routes_only_zuno_agents() {
         serde_json::Value::Null,
         "Zuno must not inject a generic output cap into Kiro Responses requests"
     );
+    assert!(
+        providers["kiro-local"]["options"]
+            .get("responsesTextBlocks")
+            .is_none(),
+        "current kiro-provider preserves consecutive text blocks itself; Zuno's single-text compatibility projection would insert a blank line"
+    );
     assert_eq!(
         providers["kiro-local"]["models"]["claude-opus-5"]["limit"]["context"],
         1_000_000
@@ -443,12 +449,16 @@ fn multi_provider_example_routes_only_zuno_agents() {
         .as_object()
         .expect("Kiro models are an object")
     {
+        assert!(
+            definition["options"].get("reasoningSummary").is_none(),
+            "{model} requests reasoning.summary even though kiro-provider rejects that field"
+        );
         let input = definition["modalities"]["input"]
             .as_array()
             .expect("every Kiro model declares its accepted input subset");
         assert!(
             !input.iter().any(|modality| modality == "pdf"),
-            "{model} advertises PDF even though the verified Responses subset rejects files"
+            "{model} advertises PDF before Zuno has a native document request block and an end-to-end Kiro document test"
         );
     }
 
@@ -519,6 +529,8 @@ fn multi_provider_example_routes_only_zuno_agents() {
             "claude-opus-5",
             "ZUNO_CONFIG_DIR",
             "/preset",
+            "byte-for-byte with no inserted separator",
+            "Do not set `reasoningSummary`",
         ],
     );
 }
