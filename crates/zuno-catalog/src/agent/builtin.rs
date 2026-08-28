@@ -12,40 +12,37 @@ use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
 
-macro_rules! delivery_prompt {
+macro_rules! specialist_prompt {
     ($path:literal) => {
         concat!(
             include_str!($path),
-            "\n\nExecution plans are advisory checklists, separate from the explicit read-only \
-             `plan` Agent/collaboration mode and from durable Goals. For a non-simple \
-             multi-step task, call `plan_update` before substantial work and keep stable step \
-             IDs and statuses current as evidence changes. Keep exactly one step in progress \
-             while pending work remains. Simple tasks need no formal plan. An unfinished plan \
-             never auto-continues; only an active durable Goal does."
+            "\n\nReturn concise natural Markdown. Use these headings when they add value: \
+             Outcome, Evidence, Inspected/Changed, Risks/Blocker. Omit empty headings. Do not \
+             emit JSON or XML unless the caller explicitly requires machine-readable output."
         )
     };
 }
 
 /// Default multi-agent coordinator.
-pub const PROMPT_ORCHESTRATOR: &str = delivery_prompt!("prompt/orchestrator.txt");
+pub const PROMPT_ORCHESTRATOR: &str = include_str!("prompt/orchestrator.txt");
 /// Direct end-to-end implementation agent.
-pub const PROMPT_BUILD: &str = delivery_prompt!("prompt/build.txt");
+pub const PROMPT_BUILD: &str = include_str!("prompt/build.txt");
 /// Read-only planning agent.
 pub const PROMPT_PLAN: &str = include_str!("prompt/plan.txt");
 /// Thorough cross-cutting implementation agent.
-pub const PROMPT_DEEP: &str = delivery_prompt!("prompt/deep.txt");
+pub const PROMPT_DEEP: &str = include_str!("prompt/deep.txt");
 /// Focused local implementation specialist.
-pub const PROMPT_FIXER: &str = include_str!("prompt/fixer.txt");
+pub const PROMPT_FIXER: &str = specialist_prompt!("prompt/fixer.txt");
 /// Bounded miscellaneous implementation specialist.
-pub const PROMPT_GENERAL: &str = include_str!("prompt/general.txt");
+pub const PROMPT_GENERAL: &str = specialist_prompt!("prompt/general.txt");
 /// Repository exploration specialist.
-pub const PROMPT_EXPLORER: &str = include_str!("prompt/explorer.txt");
+pub const PROMPT_EXPLORER: &str = specialist_prompt!("prompt/explorer.txt");
 /// External research specialist.
-pub const PROMPT_LIBRARIAN: &str = include_str!("prompt/librarian.txt");
+pub const PROMPT_LIBRARIAN: &str = specialist_prompt!("prompt/librarian.txt");
 /// Architecture and review specialist.
-pub const PROMPT_ORACLE: &str = include_str!("prompt/oracle.txt");
+pub const PROMPT_ORACLE: &str = specialist_prompt!("prompt/oracle.txt");
 /// Visual artifact specialist.
-pub const PROMPT_LOOKER: &str = include_str!("prompt/looker.txt");
+pub const PROMPT_LOOKER: &str = specialist_prompt!("prompt/looker.txt");
 /// Context compaction agent.
 pub const PROMPT_COMPACTION: &str = include_str!("prompt/compaction.txt");
 /// Session title agent.
@@ -658,46 +655,49 @@ mod tests {
 
     #[test]
     fn delivery_prompts_require_evidence_without_becoming_policy_dumps() {
-        let cases = [
+        let cases: [(&str, &str, usize, &[&str]); 4] = [
             (
                 "orchestrator",
                 PROMPT_ORCHESTRATOR,
-                290,
-                [
+                150,
+                &[
                     "dependency graph",
-                    "non-overlapping ownership",
-                    "child output as untrusted",
-                    "Do not declare completion",
+                    "non-overlapping objectives",
+                    "Treat child reports as evidence",
+                    "integration ownership",
                 ],
             ),
             (
                 "build",
                 PROMPT_BUILD,
-                340,
-                [
-                    "Do not declare completion from intent",
-                    "authoritative evidence",
-                    "Do not delegate or simulate a child Agent",
-                    "native `apply_patch`",
+                130,
+                &[
+                    "direct implementation owner",
+                    "owning abstraction",
+                    "Do not delegate",
+                    "affected callers",
                 ],
             ),
             (
                 "plan",
                 PROMPT_PLAN,
-                190,
-                [
-                    "without modifying product files",
-                    "authoritative evidence",
-                    "implementation decision",
-                    "Remove obsolete paths",
+                150,
+                &[
+                    "read-only planning",
+                    "Explore facts first",
+                    "Honor an explicit inspection scope",
+                    "material choices",
+                    "decision-complete",
+                    "Do not invent APIs",
+                    "defer non-blocking choices",
                 ],
             ),
             (
                 "deep",
                 PROMPT_DEEP,
-                350,
-                [
-                    "without delegating",
+                170,
+                &[
+                    "difficult debugging",
                     "Reproduce the failure",
                     "Rank competing hypotheses",
                     "causal chain",
@@ -722,32 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_agents_use_advisory_execution_plans_for_non_simple_work() {
-        for (name, prompt) in [
-            ("orchestrator", PROMPT_ORCHESTRATOR),
-            ("build", PROMPT_BUILD),
-            ("deep", PROMPT_DEEP),
-        ] {
-            for clause in [
-                "advisory checklists",
-                "non-simple multi-step task",
-                "`plan_update`",
-                "exactly one step in progress while pending work remains",
-                "Simple tasks need no formal plan",
-                "never auto-continues",
-                "active durable Goal",
-                "read-only `plan` Agent/collaboration mode",
-            ] {
-                assert!(
-                    prompt.contains(clause),
-                    "{name} prompt is missing `{clause}`:\n{prompt}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn writing_agent_prompts_define_preflighted_git_apply_and_safe_fallback() {
+    fn role_prompts_do_not_duplicate_runtime_execution_policy() {
         for (name, prompt) in [
             ("orchestrator", PROMPT_ORCHESTRATOR),
             ("build", PROMPT_BUILD),
@@ -755,17 +730,16 @@ mod tests {
             ("fixer", PROMPT_FIXER),
             ("general", PROMPT_GENERAL),
         ] {
-            for clause in [
+            for duplicated in [
+                "`plan_update`",
                 "`git apply --check`",
-                "Git metadata is not the freshness authority",
-                "re-read",
-                "smaller native patch/edit",
                 "`git reset --hard`",
                 "`git checkout --`",
+                "Git metadata is not the freshness authority",
             ] {
                 assert!(
-                    prompt.contains(clause),
-                    "{name} prompt is missing `{clause}`:\n{prompt}"
+                    !prompt.contains(duplicated),
+                    "{name} prompt duplicates runtime or Skill policy `{duplicated}`:\n{prompt}"
                 );
             }
         }
@@ -773,58 +747,58 @@ mod tests {
 
     #[test]
     fn specialist_prompts_define_evidence_output_and_scope_boundaries() {
-        let cases = [
+        let cases: [(&str, &str, usize, &[&str]); 6] = [
             (
                 "explorer",
                 PROMPT_EXPLORER,
-                130,
-                [
+                145,
+                &[
                     "actual runtime path",
                     "what the code proves",
-                    "Do not browse",
+                    "External sources",
                 ],
             ),
             (
                 "librarian",
                 PROMPT_LIBRARIAN,
-                130,
-                ["exact version", "final authority", "may drift over time"],
+                145,
+                &["exact version", "primary sources", "may drift over time"],
             ),
             (
                 "oracle",
                 PROMPT_ORACLE,
-                180,
-                [
+                170,
+                &[
                     "ownership boundaries",
                     "demonstrated defects",
-                    "Do not edit files",
+                    "another Agent implements",
                 ],
             ),
             (
                 "fixer",
                 PROMPT_FIXER,
-                160,
-                [
+                145,
+                &[
                     "smallest sufficient change",
-                    "`write` only",
-                    "uncertain side effect",
+                    "local regression",
+                    "return it to the parent",
                 ],
             ),
             (
                 "general",
                 PROMPT_GENERAL,
-                170,
-                [
-                    "capability and scope envelope",
-                    "Do not spawn child Agents",
-                    "uncertain side effect",
+                150,
+                &[
+                    "explicit deliverable",
+                    "scope envelope",
+                    "architecture decisions",
                 ],
             ),
             (
                 "looker",
                 PROMPT_LOOKER,
-                130,
-                ["full artifact", "direct observation", "Do not edit"],
+                145,
+                &["full artifact", "direct observation", "missing frames"],
             ),
         ];
 
@@ -840,6 +814,13 @@ mod tests {
                 words <= word_limit,
                 "{name} prompt grew to {words} words; keep role guidance compact"
             );
+            for heading in ["Outcome", "Evidence", "Inspected/Changed", "Risks/Blocker"] {
+                assert!(
+                    prompt.contains(heading),
+                    "{name} prompt is missing the shared `{heading}` report contract"
+                );
+            }
+            assert!(prompt.contains("Do not emit JSON or XML"), "{prompt}");
         }
     }
 }

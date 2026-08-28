@@ -8,7 +8,7 @@
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One ordered source of system-prompt text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +97,174 @@ pub struct PromptSemantics {
     pub trust: &'static str,
     /// Stable precedence; larger values are more authoritative.
     pub priority: u16,
+}
+
+/// Host-owned policy facts rendered only after the provider-step tool snapshot is final.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimePromptPolicy {
+    delegation_targets: Option<Vec<String>>,
+    delegation_guidance: Option<String>,
+    shell_workspace_write: bool,
+}
+
+impl RuntimePromptPolicy {
+    /// Construct policy facts that remain stable while concrete tool availability changes.
+    #[must_use]
+    pub fn new(
+        delegation_targets: Option<Vec<String>>,
+        delegation_guidance: Option<String>,
+        shell_workspace_write: bool,
+    ) -> Self {
+        Self {
+            delegation_targets,
+            delegation_guidance,
+            shell_workspace_write,
+        }
+    }
+
+    /// Render the canonical runtime sections from the exact provider-visible tool ids.
+    #[must_use]
+    pub fn sections(
+        &self,
+        tool_ids: impl IntoIterator<Item = impl AsRef<str>>,
+        durable_state_active: bool,
+    ) -> Vec<RuntimePromptSection> {
+        let tools = tool_ids
+            .into_iter()
+            .map(|tool| tool.as_ref().to_owned())
+            .collect::<BTreeSet<_>>();
+        let has = |tool: &str| tools.contains(tool);
+        let can_edit = ["apply_patch", "write", "edit"].into_iter().any(has)
+            || (self.shell_workspace_write && has("shell"));
+        let can_delegate = has("task")
+            && self
+                .delegation_targets
+                .as_ref()
+                .is_none_or(|targets| !targets.is_empty());
+        let has_durable_state = durable_state_active
+            || [
+                "goal_get",
+                "goal_update",
+                "plan_get",
+                "plan_update",
+                "todo_get",
+                "todo_update",
+                "job",
+                "job_cancel",
+            ]
+            .into_iter()
+            .any(has);
+
+        let mut execution = String::from(
+            "Choose the smallest coherent workflow. Batch independent reads and checks, do not \
+             re-read unchanged state, and do not rerun a check unless relevant inputs changed.",
+        );
+        if has("plan_update") {
+            execution.push_str(
+                " For dependent work with at least three meaningful steps, cross-component \
+                 changes, delegation, or multiple acceptance gates, keep the durable execution \
+                 plan current. Simple work needs no formal plan.",
+            );
+        }
+
+        let mut sections = vec![
+            RuntimePromptSection::new(
+                "runtime.intent",
+                "Use the current user request or delegated objective as the authority for this \
+                 turn. Re-evaluate intent when new input arrives. Do not infer permission for a \
+                 materially different action, and do not add ceremony to one clear isolated task. \
+                 Treat an explicit user- or delegation-supplied scope as closed: inspect outside it \
+                 only when required evidence cannot be obtained inside it, and explain that \
+                 expansion.",
+            ),
+            RuntimePromptSection::new("runtime.execution", execution),
+        ];
+        if can_edit {
+            sections.push(RuntimePromptSection::new(
+                "runtime.editing",
+                "Preserve unrelated changes. Modify the owning abstraction with the exposed \
+                 native editing surface, keep the patch scoped, and inspect authoritative state \
+                 before retrying any side effect whose outcome is uncertain.",
+            ));
+        }
+        sections.push(RuntimePromptSection::new(
+            "runtime.verification",
+            if tools.is_empty() {
+                "Do not declare completion from intent or plausibility. Report the evidence you \
+                 could inspect, identify what remains unverified, and state any blocker explicitly."
+            } else {
+                "Do not declare completion from intent, a plausible patch, a narrow green check, \
+                 or another Agent's claim. Verify the requested behavior and the most relevant \
+                 failure or recovery path, then report unknown or blocked evidence explicitly."
+            },
+        ));
+        if can_delegate {
+            let targets = self.delegation_targets.as_ref().map(|targets| {
+                format!(
+                    " Only these direct targets are valid: {}.",
+                    targets.join(", ")
+                )
+            });
+            let mut content = format!(
+                "Delegate only when bounded specialization or safe parallelism has clear value.{} \
+                 Give each child one objective, deliverable, scope, constraints, dependencies, \
+                 and success evidence. Do not duplicate live work. After dispatching background \
+                 work with nextStep delivery, yield to the host. Do not call job or run sleep \
+                 commands to wait; the host admits each report and wakes this session exactly \
+                 once. Reconcile the durable result before reuse.",
+                targets.as_deref().unwrap_or_default()
+            );
+            if let Some(guidance) = self.delegation_guidance.as_deref() {
+                content.push_str("\n\n");
+                content.push_str(guidance);
+            }
+            sections.push(RuntimePromptSection::new("runtime.delegation", content));
+        }
+        if has_durable_state {
+            sections.push(RuntimePromptSection::new(
+                "runtime.persistence",
+                "Durable Goal, Plan, Todo, inbox, and job state—not prose—controls continuation. \
+                 Text such as \"next I will\" is not progress. Continue active durable work until \
+                 it reaches a recorded terminal state, and never mechanically replay an uncertain \
+                 side effect.",
+            ));
+        }
+        sections
+    }
+}
+
+/// One runtime-owned developer instruction with stable provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePromptSection {
+    id: &'static str,
+    content: String,
+}
+
+impl RuntimePromptSection {
+    fn new(id: &'static str, content: impl Into<String>) -> Self {
+        Self {
+            id,
+            content: content.into(),
+        }
+    }
+
+    /// Stable section id.
+    #[must_use]
+    pub const fn id(&self) -> &'static str {
+        self.id
+    }
+
+    /// Stable host-owned source locator.
+    #[must_use]
+    pub fn source(&self) -> String {
+        format!("zuno-runtime:{}", self.id)
+    }
+
+    /// Exact developer instruction sent to the provider.
+    #[must_use]
+    pub fn content(&self) -> &str {
+        &self.content
+    }
 }
 
 /// Structured instruction context before any provider-specific mapping.
@@ -189,6 +357,42 @@ pub enum PromptAssemblyError {
     /// Stable ids are unique within one prompt.
     #[error("duplicate prompt section id `{id}`")]
     DuplicateId { id: String },
+    /// The complete provider-visible prompt cannot fit in the model context.
+    #[error(
+        "assembled prompt is estimated at {estimated_prompt_tokens} tokens, exceeding model context limit {context_limit}"
+    )]
+    ContextLimitExceeded {
+        /// Approximate input tokens after hooks, runtime context, history, and tools.
+        estimated_prompt_tokens: u64,
+        /// Model context ceiling supplied by the resolved turn plan.
+        context_limit: u64,
+    },
+}
+
+/// Reject a complete provider-visible prompt that cannot fit in the model context.
+///
+/// This validates the aggregate estimate produced after hooks and runtime context
+/// have been applied. It deliberately does not trim sections: instructions,
+/// selected Skills, history, and tool schemas remain exact or the turn fails before
+/// provider I/O. An unknown context limit leaves enforcement to the provider.
+///
+/// # Errors
+///
+/// Returns [`PromptAssemblyError::ContextLimitExceeded`] when a known context
+/// ceiling is smaller than the complete prompt estimate.
+pub fn ensure_prompt_context_budget(
+    estimated_prompt_tokens: u64,
+    context_limit: Option<u64>,
+) -> Result<(), PromptAssemblyError> {
+    if let Some(context_limit) = context_limit
+        && estimated_prompt_tokens > context_limit
+    {
+        return Err(PromptAssemblyError::ContextLimitExceeded {
+            estimated_prompt_tokens,
+            context_limit,
+        });
+    }
+    Ok(())
 }
 
 /// Ordered system-prompt sections.
@@ -238,6 +442,8 @@ impl PromptAssembly {
             content,
             selected_skill_name: None,
         });
+        self.sections
+            .sort_by_key(|section| canonical_section_rank(section.semantics().role));
         Ok(())
     }
 
@@ -269,6 +475,8 @@ impl PromptAssembly {
             content,
             selected_skill_name: Some(name),
         });
+        self.sections
+            .sort_by_key(|section| canonical_section_rank(section.semantics().role));
         Ok(())
     }
 
@@ -317,32 +525,37 @@ impl PromptAssembly {
 
     /// Durable properties for `session.prompt.assembled`.
     ///
-    /// The ordered section contents reconstruct the pre-hook prompt. When hooks
-    /// changed it, `actualSystemPrompt` stores the exact post-hook value as well.
+    /// The ordered section contents retain source provenance while the two typed
+    /// projections preserve the exact system/developer boundaries before and after
+    /// hooks. A runtime section can therefore move independently of the cacheable
+    /// static prefix without disappearing from replay or diagnostics.
     #[must_use]
     pub fn event_properties(
         &self,
         agent: &str,
         step: u32,
-        actual_system_prompt: &str,
+        assembled: PromptProviderProjection<'_>,
+        actual: PromptProviderProjection<'_>,
     ) -> Map<String, Value> {
-        let assembled = self.provider_projection();
+        let assembly_sha256 = assembled.sha256();
+        let actual_sha256 = actual.sha256();
         let mut properties = Map::from_iter([
             ("agent".to_owned(), Value::String(agent.to_owned())),
             ("step".to_owned(), Value::from(step)),
-            ("schemaVersion".to_owned(), Value::from(2)),
+            ("schemaVersion".to_owned(), Value::from(3)),
             (
                 "assemblySha256".to_owned(),
-                Value::String(sha256(&assembled)),
+                Value::String(assembly_sha256.clone()),
             ),
             (
                 "actualSha256".to_owned(),
-                Value::String(sha256(actual_system_prompt)),
+                Value::String(actual_sha256.clone()),
             ),
             (
                 "hookTransformed".to_owned(),
-                Value::Bool(assembled != actual_system_prompt),
+                Value::Bool(assembly_sha256 != actual_sha256),
             ),
+            ("providerProjection".to_owned(), assembled.value()),
             (
                 "sections".to_owned(),
                 Value::Array(
@@ -354,23 +567,50 @@ impl PromptAssembly {
                 ),
             ),
         ]);
-        if assembled != actual_system_prompt {
+        if assembly_sha256 != actual_sha256 {
             properties.insert(
                 "actualSystemPrompt".to_owned(),
-                Value::String(actual_system_prompt.to_owned()),
+                Value::String(actual.system_messages.join("\n\n")),
             );
+            properties.insert("actualProviderProjection".to_owned(), actual.value());
         }
         properties
     }
 }
 
+/// Exact provider-neutral system and developer lanes for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptProviderProjection<'a> {
+    /// Ordered system messages after their respective assembly or hook stage.
+    pub system_messages: &'a [String],
+    /// Ordered volatile developer contexts after their respective assembly or hook stage.
+    pub developer_context: &'a [String],
+}
+
+impl PromptProviderProjection<'_> {
+    /// Stable digest that preserves system/developer boundaries.
+    #[must_use]
+    pub fn sha256(&self) -> String {
+        let value = self.value();
+        let bytes = serde_json::to_vec(&value).expect("prompt projection is serializable");
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn value(&self) -> Value {
+        json!({
+            "system": self.system_messages,
+            "developer": self.developer_context,
+        })
+    }
+}
+
 fn semantics(id: &str) -> PromptSemantics {
-    let (role, trust, priority) = if id == "agent.policy" {
-        ("kernel", "native", 1_000)
-    } else if id == "collaboration.mode" {
+    let (role, trust, priority) = if id == "collaboration.mode" {
         ("collaboration_mode", "runtime", 975)
     } else if id.starts_with("agent.") {
         ("agent_role", "configured", 950)
+    } else if id.starts_with("runtime.") {
+        ("runtime_policy", "runtime", 925)
     } else if id.starts_with("instructions.global") {
         ("global_instructions", "user", 800)
     } else if id.starts_with("instructions.project")
@@ -402,16 +642,43 @@ fn semantics(id: &str) -> PromptSemantics {
     }
 }
 
-/// Track which actual prompts have already been persisted in one turn.
+fn canonical_section_rank(role: &str) -> u8 {
+    match role {
+        "kernel" => 0,
+        "agent_role" => 1,
+        "collaboration_mode" => 2,
+        "runtime_policy" => 3,
+        "global_instructions" => 4,
+        "project_instructions" => 5,
+        "work_state" => 6,
+        "routing" => 7,
+        "selected_skill" => 8,
+        "skill_index" => 9,
+        "memory" => 10,
+        _ => 11,
+    }
+}
+
+/// Track durable receipt ids for exact provider projections within one turn.
 #[derive(Debug, Default)]
 pub struct PromptTraceSet {
-    digests: BTreeSet<String>,
+    receipts: BTreeMap<String, String>,
 }
 
 impl PromptTraceSet {
-    /// Whether this exact post-hook prompt needs a new durable snapshot.
-    pub fn insert(&mut self, actual_system_prompt: &str) -> bool {
-        self.digests.insert(sha256(actual_system_prompt))
+    /// Previously persisted receipt for this exact post-hook provider projection.
+    #[must_use]
+    pub fn receipt_id(&self, actual: PromptProviderProjection<'_>) -> Option<&str> {
+        self.receipts.get(&actual.sha256()).map(String::as_str)
+    }
+
+    /// Remember the receipt written for one exact post-hook provider projection.
+    pub fn remember(
+        &mut self,
+        actual: PromptProviderProjection<'_>,
+        receipt_id: impl Into<String>,
+    ) {
+        self.receipts.insert(actual.sha256(), receipt_id.into());
     }
 }
 
@@ -432,7 +699,7 @@ mod tests {
             .push("agent.base", "native:build", "BASE")
             .expect("base");
         prompt
-            .push("instructions.0", "/repo/AGENTS.md", "RULES")
+            .push("instructions.project.0", "/repo/AGENTS.md", "RULES")
             .expect("instructions");
 
         assert_eq!(prompt.render(), "BASE\n\nRULES");
@@ -447,14 +714,26 @@ mod tests {
     }
 
     #[test]
-    fn envelope_preserves_sources_and_splits_native_from_developer_context() {
+    fn envelope_preserves_sources_and_uses_canonical_semantic_order() {
         let mut prompt = PromptAssembly::new();
         prompt
-            .push("agent.base", "native:build", "BUILD ROLE")
-            .expect("agent role");
+            .push("instructions.project.1", "/repo/AGENTS.md", "PROJECT")
+            .expect("project instructions");
         prompt
-            .push("agent.policy", "zuno-agent::builtin:build", "KERNEL")
-            .expect("kernel");
+            .push("memory.session", "sqlite:memory", "MEMORY")
+            .expect("memory");
+        prompt
+            .push_selected_skill("codegraph", "/skills/codegraph/SKILL.md", "FULL SKILL")
+            .expect("selected skill");
+        prompt
+            .push("runtime.intent", "zuno-runtime:runtime.intent", "INTENT")
+            .expect("runtime");
+        prompt
+            .push("instructions.global.0", "/config/zuno/AGENTS.md", "GLOBAL")
+            .expect("global instructions");
+        prompt
+            .push("skills.index", "discovered skill index", "SKILLS")
+            .expect("skill index");
         prompt
             .push(
                 "collaboration.mode",
@@ -463,22 +742,13 @@ mod tests {
             )
             .expect("collaboration mode");
         prompt
-            .push("instructions.global.0", "/config/zuno/AGENTS.md", "GLOBAL")
-            .expect("global instructions");
-        prompt
-            .push("instructions.project.1", "/repo/AGENTS.md", "PROJECT")
-            .expect("project instructions");
-        prompt
-            .push_selected_skill("codegraph", "/skills/codegraph/SKILL.md", "FULL SKILL")
-            .expect("selected skill");
-        prompt
-            .push("skills.index", "discovered skill index", "SKILLS")
-            .expect("skill index");
+            .push("agent.base", "native:build", "BUILD ROLE")
+            .expect("agent role");
 
         let envelope = prompt.envelope();
         assert_eq!(envelope.agent_role[0].content(), "BUILD ROLE");
-        assert_eq!(envelope.kernel[0].content(), "KERNEL");
         assert_eq!(envelope.collaboration_mode[0].content(), "PLAN MODE");
+        assert_eq!(envelope.runtime_policy[0].content(), "INTENT");
         assert_eq!(envelope.global_instructions[0].content(), "GLOBAL");
         assert_eq!(envelope.project_instructions[0].content(), "PROJECT");
         assert_eq!(envelope.selected_skills[0].content(), "FULL SKILL");
@@ -490,17 +760,19 @@ mod tests {
         assert_eq!(
             envelope.system_messages(),
             vec![
-                "KERNEL\n\nBUILD ROLE",
+                "BUILD ROLE",
                 "PLAN MODE",
+                "INTENT",
                 "GLOBAL",
                 "PROJECT",
                 "FULL SKILL",
-                "SKILLS"
+                "SKILLS",
+                "MEMORY",
             ]
         );
         assert_eq!(
             prompt.provider_projection(),
-            "KERNEL\n\nBUILD ROLE\n\nPLAN MODE\n\nGLOBAL\n\nPROJECT\n\nFULL SKILL\n\nSKILLS"
+            "BUILD ROLE\n\nPLAN MODE\n\nINTENT\n\nGLOBAL\n\nPROJECT\n\nFULL SKILL\n\nSKILLS\n\nMEMORY"
         );
     }
 
@@ -525,21 +797,172 @@ mod tests {
     }
 
     #[test]
+    fn runtime_policy_sections_remain_independent_developer_contexts() {
+        let mut prompt = PromptAssembly::new();
+        prompt
+            .push("agent.base", "native:build", "BUILD ROLE")
+            .expect("agent role");
+        for (id, content) in [
+            ("runtime.intent", "CURRENT INTENT"),
+            ("runtime.execution", "EXECUTION"),
+            ("runtime.editing", "EDITING"),
+            ("runtime.verification", "VERIFICATION"),
+            ("runtime.delegation", "DELEGATION"),
+            ("runtime.persistence", "PERSISTENCE"),
+        ] {
+            prompt
+                .push(id, format!("zuno-agent::profile:build:{id}"), content)
+                .expect("runtime policy");
+        }
+
+        let envelope = prompt.envelope();
+        assert_eq!(envelope.agent_role.len(), 1);
+        assert_eq!(envelope.runtime_policy.len(), 6);
+        assert_eq!(
+            envelope
+                .runtime_policy
+                .iter()
+                .map(PromptSection::id)
+                .collect::<Vec<_>>(),
+            [
+                "runtime.intent",
+                "runtime.execution",
+                "runtime.editing",
+                "runtime.verification",
+                "runtime.delegation",
+                "runtime.persistence",
+            ]
+        );
+        assert_eq!(
+            envelope.system_messages(),
+            [
+                "BUILD ROLE",
+                "CURRENT INTENT",
+                "EXECUTION",
+                "EDITING",
+                "VERIFICATION",
+                "DELEGATION",
+                "PERSISTENCE",
+            ]
+        );
+        assert_eq!(
+            envelope.runtime_policy[0].semantics().role,
+            "runtime_policy"
+        );
+        assert_eq!(envelope.runtime_policy[0].semantics().trust, "runtime");
+    }
+
+    #[test]
+    fn runtime_policy_uses_only_the_final_tool_snapshot_and_stays_within_budget() {
+        let policy = RuntimePromptPolicy::new(
+            Some(vec!["explorer".to_owned(), "oracle".to_owned()]),
+            Some("Do not delegate a decision the current Agent already owns.".to_owned()),
+            true,
+        );
+        let sections = policy.sections(
+            ["read", "shell", "plan_update", "task", "goal_get", "job"],
+            true,
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(RuntimePromptSection::id)
+                .collect::<Vec<_>>(),
+            [
+                "runtime.intent",
+                "runtime.execution",
+                "runtime.editing",
+                "runtime.verification",
+                "runtime.delegation",
+                "runtime.persistence",
+            ]
+        );
+        let text = sections
+            .iter()
+            .map(RuntimePromptSection::content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("explorer, oracle"));
+        assert!(
+            text.contains("Treat an explicit user- or delegation-supplied scope as closed"),
+            "runtime intent must prevent speculative exploration outside a bounded task"
+        );
+        assert!(!text.contains("web_search"));
+        assert!(!text.contains("unavailable"));
+        let estimated_tokens = sections
+            .iter()
+            .map(|section| section.content().len().div_ceil(4))
+            .sum::<usize>();
+        assert!(
+            estimated_tokens <= 700,
+            "runtime policy consumed {estimated_tokens} estimated tokens"
+        );
+
+        let read_only = policy.sections(["read"], false);
+        assert!(
+            read_only
+                .iter()
+                .all(|section| section.id() != "runtime.editing")
+        );
+        assert!(
+            read_only
+                .iter()
+                .all(|section| section.id() != "runtime.delegation")
+        );
+        assert!(
+            read_only
+                .iter()
+                .all(|section| section.id() != "runtime.persistence")
+        );
+    }
+
+    #[test]
+    fn next_step_delegation_yields_to_the_host_instead_of_polling_or_sleeping() {
+        let policy = RuntimePromptPolicy::new(Some(vec!["explorer".to_owned()]), None, false);
+        let sections = policy.sections(["task", "job"], true);
+        let delegation = sections
+            .iter()
+            .find(|section| section.id() == "runtime.delegation")
+            .expect("delegation section");
+
+        assert!(delegation.content().contains(
+            "After dispatching background work with nextStep delivery, yield to the host"
+        ));
+        assert!(
+            delegation
+                .content()
+                .contains("Do not call job or run sleep commands to wait")
+        );
+        assert!(
+            delegation
+                .content()
+                .contains("the host admits each report and wakes this session exactly once")
+        );
+    }
+
+    #[test]
     fn event_properties_reconstruct_untransformed_and_transformed_prompts() {
         let mut prompt = PromptAssembly::new();
         prompt
             .push("agent.base", "native:build", "BASE")
             .expect("base");
-        let unchanged = prompt.event_properties("build", 1, "BASE");
+        let system = vec!["BASE".to_owned()];
+        let developer = vec!["RUNTIME".to_owned()];
+        let projection = PromptProviderProjection {
+            system_messages: &system,
+            developer_context: &developer,
+        };
+        let unchanged = prompt.event_properties("build", 1, projection, projection);
         assert_eq!(unchanged["hookTransformed"], false);
         assert!(unchanged.get("actualSystemPrompt").is_none());
         assert_eq!(unchanged["sections"][0]["content"], "BASE");
         assert!(unchanged["sections"][0].get("skillName").is_none());
+        assert_eq!(unchanged["providerProjection"]["developer"][0], "RUNTIME");
 
         prompt
             .push_selected_skill("release", "/skills/release/SKILL.md", "SHIP")
             .expect("selected skill");
-        let selected = prompt.event_properties("build", 2, "BASE\n\nSHIP");
+        let selected = prompt.event_properties("build", 2, projection, projection);
         assert_eq!(selected["sections"][1]["role"], "selected_skill");
         assert_eq!(selected["sections"][1]["skillName"], "release");
         assert_eq!(
@@ -547,17 +970,45 @@ mod tests {
             "/skills/release/SKILL.md"
         );
 
-        let transformed = prompt.event_properties("build", 3, "BASE\nHOOK");
+        let actual_system = vec!["BASE\nHOOK".to_owned()];
+        let actual_developer = vec!["RUNTIME".to_owned(), "HOOK CONTEXT".to_owned()];
+        let transformed = prompt.event_properties(
+            "build",
+            3,
+            projection,
+            PromptProviderProjection {
+                system_messages: &actual_system,
+                developer_context: &actual_developer,
+            },
+        );
         assert_eq!(transformed["hookTransformed"], true);
         assert_eq!(transformed["actualSystemPrompt"], "BASE\nHOOK");
+        assert_eq!(
+            transformed["actualProviderProjection"]["developer"][1],
+            "HOOK CONTEXT"
+        );
         assert_ne!(transformed["assemblySha256"], transformed["actualSha256"]);
     }
 
     #[test]
-    fn trace_set_deduplicates_only_identical_actual_prompts() {
+    fn trace_set_recovers_the_receipt_for_a_repeated_projection() {
         let mut seen = PromptTraceSet::default();
-        assert!(seen.insert("one"));
-        assert!(!seen.insert("one"));
-        assert!(seen.insert("two"));
+        let system_a = vec!["A".to_owned()];
+        let system_b = vec!["B".to_owned()];
+        let developer = Vec::new();
+        let a = PromptProviderProjection {
+            system_messages: &system_a,
+            developer_context: &developer,
+        };
+        let b = PromptProviderProjection {
+            system_messages: &system_b,
+            developer_context: &developer,
+        };
+
+        assert_eq!(seen.receipt_id(a), None);
+        seen.remember(a, "evt_a");
+        seen.remember(b, "evt_b");
+        assert_eq!(seen.receipt_id(a), Some("evt_a"));
+        assert_eq!(seen.receipt_id(b), Some("evt_b"));
     }
 }

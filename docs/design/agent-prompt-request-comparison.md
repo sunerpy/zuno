@@ -1,15 +1,41 @@
-# Build-agent prompt and request comparison
+# Agent prompt and request comparison
 
-Status: current implementation plus a pinned historical capture, 2026-08-24.
+Status: implemented design audit for Prompt and Workflow Generation 2,
+2026-08-28; real-provider E2E status is recorded separately.
 
-The first section describes the current structured-prompt implementation. The
-later capture answers a separate historical question: what did an older Zuno
-build present to the model when the `build` agent received this user request?
+This document has three deliberately separate evidence layers:
+
+1. the current Zuno implementation at the audited repository revision;
+2. the implemented Generation 2 contract and its remaining external validation;
+3. a pinned historical capture of what an older Zuno `build` turn presented to
+   the model.
+
+The detailed Chinese audit and implementation contract is
+[prompt-workflow-v2.zh-CN.md](prompt-workflow-v2.zh-CN.md).
+
+## Pinned design sources
+
+The Generation 2 audit uses immutable public revisions:
+
+| project | revision used | public source |
+| --- | --- | --- |
+| Zuno | `b1429cd54f38475f6f1ff74f7adb2fe6dcb586ec` plus the Generation 2 implementation worktree | this repository |
+| Codex | `a73bf25d17805b4169ba2a2dc4329a010a3bb120` | [commit](https://github.com/openai/codex/commit/a73bf25d17805b4169ba2a2dc4329a010a3bb120) |
+| OpenCode | `1be9fd55a9326d5e7b09786195e5669e311e61b4` | [commit](https://github.com/anomalyco/opencode/commit/1be9fd55a9326d5e7b09786195e5669e311e61b4) |
+| oh-my-opencode-slim | `9dbf2de015aec093e44273e6411c1392705b2f4d` | [commit](https://github.com/alvinunreal/oh-my-opencode-slim/commit/9dbf2de015aec093e44273e6411c1392705b2f4d) |
+| oh-my-openagent | `64d89819ef1fde81712630f8e5d798be9e4e8867` | [commit](https://github.com/code-yeongyu/oh-my-openagent/commit/64d89819ef1fde81712630f8e5d798be9e4e8867) |
+
+The upstream repositories are design evidence, not compatibility targets. Zuno
+does not copy their hidden identity, product branding, complete role prompts, or
+project-specific workflows.
+
+The later historical capture answers a separate question: what did an older
+Zuno build present to the model when the `build` agent received this user
+request?
 
 > 按照skill指导 对本项目进行完整的优化设计，即将发布到github公开仓库了
 
-It then compares that request architecture with OpenAI Codex and
-oh-my-openagent (OMO). The comparison is pinned to source revisions:
+That historical reconstruction remains pinned to these older source revisions:
 
 | project | revision used |
 | --- | --- |
@@ -36,9 +62,9 @@ The complete 55,314-byte local export is intentionally gitignored at
 machine-level instruction path and complete installed-skill inventory, so it
 must not be published with the repository.
 
-## Current implementation after the upgrade
+## Current implementation and Generation 2 boundary
 
-Zuno now carries prompt provenance in a provider-neutral `PromptEnvelope`
+Zuno already carries prompt provenance in a provider-neutral `PromptEnvelope`
 instead of treating the model prompt as one anonymous system string. It groups
 ordered `PromptBlock` values into:
 
@@ -55,6 +81,27 @@ SHA-256 digest, byte count, local token estimate, and model-visible content in
 the durable prompt receipt. The exact user message remains a normal user
 message rather than being copied into an instruction block.
 
+The Generation 2 worktree introduces six stable runtime policy identifiers:
+
+- `runtime.intent`;
+- `runtime.execution`;
+- `runtime.editing`;
+- `runtime.verification`;
+- `runtime.delegation`;
+- `runtime.persistence`.
+
+The Generation 2 implementation now renders these sections after the registry tool
+snapshot is locked and after `prepare_request` has reduced it to the final
+provider-visible subset. The sections are carried as volatile developer
+contexts, so capability changes do not mutate the cacheable static role and
+instruction prefix. The durable receipt records both the typed section
+provenance and exact pre-/post-hook system/developer projections.
+
+`PromptAssembly::push` rejects duplicate ids and performs a stable canonical
+semantic sort. `render` joins that stored canonical vector. Equal-lane sections
+retain producer order, while runtime sections inserted at the provider boundary
+still sort ahead of user instructions, work state, routing, Skills, and memory.
+
 ### Provider mapping
 
 The provider-neutral mapping is:
@@ -63,7 +110,7 @@ The provider-neutral mapping is:
 | --- | --- |
 | Kernel + selected agent role | top-level `instructions` |
 | Collaboration mode (`Plan` or `Work`) | independent `developer` input |
-| Runtime policy | independent `developer` input |
+| Enabled runtime policy section | one independent `developer` input per stable section id |
 | Global `AGENTS.md` | independent `developer` input |
 | Project `AGENTS.md` chain | one independent `developer` input per source |
 | Goal, plan, todo, routing, and memory context | independent dynamic `developer` inputs |
@@ -84,7 +131,12 @@ The current Responses request therefore has this shape:
   "instructions": "<kernel + agent role>",
   "input": [
     {"role": "developer", "content": "<collaboration mode>"},
-    {"role": "developer", "content": "<runtime policy>"},
+    {"role": "developer", "content": "<runtime.intent>"},
+    {"role": "developer", "content": "<runtime.execution>"},
+    {"role": "developer", "content": "<runtime.editing when applicable>"},
+    {"role": "developer", "content": "<runtime.verification>"},
+    {"role": "developer", "content": "<runtime.delegation when applicable>"},
+    {"role": "developer", "content": "<runtime.persistence when applicable>"},
     {"role": "developer", "content": "<global AGENTS.md>"},
     {"role": "developer", "content": "<project AGENTS.md>"},
     {"role": "developer", "content": "<selected Skill or Skill index>"},
@@ -101,8 +153,9 @@ The current Responses request therefore has this shape:
 
 Empty or disabled blocks are omitted. Configured reasoning, output, storage,
 and include options remain provider fields rather than prompt prose. Prompt
-receipt schema version 2 records `collaboration.mode` as a distinct runtime-trust
-block instead of merging it into an agent role or user message.
+receipt schema version 3 records `collaboration.mode` and each runtime policy
+section as distinct typed blocks, together with the actual provider projection
+and post-hook digest.
 
 ### Current Plan and Work behavior
 
@@ -172,20 +225,33 @@ available when compatibility is intentional.
 
 ### Prompt diagnostics
 
+The CLI accepts:
+
 ```sh
 zuno debug prompt
-zuno debug prompt <session>
-zuno debug prompt <session> <turn>
-zuno debug prompt <session> <turn> --show-sensitive
+zuno debug prompt --session <session>
+zuno debug prompt --session <session> --step <non-zero>
+zuno debug prompt --show-sensitive
+zuno debug agent <name>
 ```
 
-The command defaults to the latest durable prompt receipt and redacts
-model-visible bodies. `--show-sensitive` reveals instruction, AGENTS, Skill,
-memory, and post-hook prompt content, so its output must be handled as a secret.
+Model-visible bodies are redacted unless `--show-sensitive` is present.
+`debug prompt` resolves a requested step through
+`session.provider.request.1.promptReceiptID` and then loads that exact durable
+receipt. The trace map stores `projection digest → receipt event id`, so prompt
+sequence A → B → A correctly reuses and references A's receipt.
 
-One audit gap remains: the receipt records the structured prompt and post-hook
-system content, but it does not yet persist a complete redacted manifest of the
-final provider HTTP body and tool-schema wire order.
+`debug agent` uses the same read-only config, extension, model, reasoning,
+permission, Skill, delegation, parent-authority, and sandbox-policy resolution
+as a real `TurnPlan`. It does not create a session, start a provider, connect
+MCP, or reveal credentials. Configured MCP servers are therefore reported as
+`not-connected`; inheritance remains unresolved until concrete tool ids exist,
+so diagnostics never probe an exact allowlist or parent authority with a
+fabricated id. Historical final tool schemas must be read from the matching
+provider request/receipt rather than inferred from current configuration.
+
+The receipt also does not yet persist a complete redacted manifest of the final
+provider HTTP body and tool-schema wire order.
 
 ## Historical observed Zuno turn
 
@@ -212,8 +278,12 @@ historical JSON array was not persisted.
 
 ### Exact system assembly
 
-`PromptAssembly::render` sorts by `order` and joins section contents with exactly
-two LF bytes (`\n\n`). The resulting system string was 49,419 bytes.
+At the historical revision, `PromptAssembly::render` preserved insertion order
+and joined section contents with exactly two LF bytes (`\n\n`). The `order`
+values below were assigned from that stored order when the durable receipt was
+emitted; that historical render did not sort them. The resulting system string
+was 49,419 bytes. Current Generation 2 code instead applies the stable
+canonical semantic sort described above.
 
 | order | id | source | bytes | SHA-256 |
 | ---: | --- | --- | ---: | --- |
@@ -371,20 +441,32 @@ The important difference is not simply prompt length: base policy, developer
 context, user-scoped project guidance, selected skills, tools, and the actual
 user message remain distinguishable typed items.
 
-## DSH and OpenCode design influence
+## OpenCode comparison
 
-DSH contributes the durable control-plane rule rather than another monolithic
-prompt: Goal, Plan, Todo, Job, background execution, and queue state are typed
-runtime records, and prompt blocks are projections of that state. A model's prose
-cannot complete a work item, change a mode, or erase an uncertain side effect.
-This keeps restart, cancellation, delegation, and client rendering independent
-from model wording.
+OpenCode's public session layer makes commands, Skills, MCP instructions, model
+environment, attachments, compaction, and tool discovery visible from one
+runtime. Its current `SystemPrompt.provider` also selects complete prompt files
+from model identifiers, while Skill and MCP text are assembled as strings after
+permission filtering.
 
-OpenCode contributes the discoverable command-and-Skill interaction: slash
-entries are catalog data, real commands win collisions, and a selected Skill is
-loaded before it is used. Zuno keeps those interactions typed through the TUI,
-durable queue, and runtime host rather than expanding them into an anonymous
-prompt string.
+Zuno adopts capability discoverability and explicit compaction recovery. It
+adapts those features into native components, typed prompt sections, durable
+events, and a locked effective capability snapshot. It rejects model-name
+switching of the complete role prompt and does not pursue OpenCode wire,
+configuration, hook, or database compatibility.
+
+## oh-my-opencode-slim comparison
+
+Slim makes specialist responsibilities, task rejection, task status, wake
+gates, and result coordination explicit. That is useful evidence for bounded
+delegation and parent/child ownership. Its dedicated `designer` role and
+hook-managed task-session board remain product choices, not defaults Zuno needs
+to copy.
+
+Zuno adopts the explicit task contract and role boundaries. It adapts result
+coordination to SQLite-backed jobs, inbox admission, and one durable wake rather
+than plugin hooks or polling. It rejects a default built-in Designer route:
+`ui-design` remains a Skill that a configured Agent may load.
 
 ## oh-my-openagent comparison
 
@@ -412,28 +494,36 @@ loosely matching skill immediately, and apply category/delegation rules. Zuno
 reached the same relevant skill with a smaller native contract plus a much
 larger generic catalog.
 
+## Adopt, adapt, reject
+
+| source | adopt | adapt | reject |
+| --- | --- | --- | --- |
+| Codex | small role prompts, layered instructions, runtime sandbox and approvals, on-demand planning, configurable subagents | retain Zuno section provenance and durable receipts while mapping to provider-native roles | hidden identity, complete copied prompt text, product-private workflow |
+| OpenCode | discoverable commands, Skills, MCP, model environment, attachments, compaction recovery | expose them through typed components and the final capability snapshot | model-name replacement of the whole prompt; string assembly as runtime authority |
+| oh-my-opencode-slim | bounded task protocol, explicit specialist boundaries, parent/result coordination | use durable JobStore and FIFO inbox instead of hook-owned boards | forced Designer routing, long orchestrator policy, default polling |
+| oh-my-openagent | model-capability matching, goal persistence, current-intent reclassification | use short verified capability fragments and typed continuation state | thousand-line model-family prompts, repeated hook continuation, Markdown state as authority |
+
+DeepSeek Harness remains a separate control-plane influence: Goal, Plan, Todo,
+Job, background execution, and queue state are typed runtime records, and prompt
+sections are projections of that state. Adopting new DSH behavior still requires
+the repository's dedicated upstream-sync review.
+
 ## Architecture differences
 
-| concern | Zuno historical capture | Codex | oh-my-openagent |
-| --- | --- | --- | --- |
-| Base behavior | concise native `build` text | model/session base instructions | long model-family Sisyphus prompt |
-| Role split | static sections flattened into one `system` | top-level instructions plus typed developer/user items | plugin replaces system text; OpenCode owns the rest |
-| Project guidance | copied into joined system | marked user context from an `AGENTS.md` chain | OpenCode guidance plus OMO additions |
-| Skill catalog | full XML-like index in system | developer catalog with aliases and budget | compact names/source labels in Sisyphus |
-| Selected body | `skill` tool result enters history | user `<skill>` context | `skill`, then delegation `load_skills` |
-| Name collision | advertised exact source passed to tool | plain names must be unambiguous; paths supported | OMO/OpenCode registry owns resolution |
-| Model specialization | shared concise contract | model base plus capability context | whole prompt rebuilt per model family |
-| Dynamic state | optional trailing reminder | typed context/world-state fragments | reminder and continuation hooks |
-| Tool schemas | separate, but not historically persisted | separate typed `ToolSpec` serialization | OpenCode registry plus OMO tools |
-| Audit | exact system sections and hashes | prompt-debug/input plus rollout state | plugin prompt inspectable; complete wire outside OMO |
-| Main weakness | role collapse and missing final manifest | many contextual item types | prompt inflation and duplicated model prose |
+| concern | Zuno Generation 2 target | Codex | OpenCode | Slim | OMO |
+| --- | --- | --- | --- | --- | --- |
+| Prompt core | concise role plus stable typed runtime sections | compact base plus layered context | complete model-selected prompt files plus assembled context | role prompts plus plugin policy | large model-family orchestrator prompts |
+| Capability truth | locked runtime snapshot and receipts | runtime tools, sandbox, approvals | runtime registry with permission-filtered Skill/MCP text | configured agents and hook-managed task state | dynamically rendered agents, categories, tools, and Skills |
+| Delegation | typed `DelegationContract`, durable report metadata, completion barrier | configurable subagents and runtime lifecycle | task/subtask parts in session runtime | explicit task tools and wake gates | category routing and delegated Skill selection |
+| Persistence | SQLite Goal, Plan, Todo, Job, inbox, prompt receipts | rollout/session state | session messages and compaction | plugin task-session board | OpenCode state plus continuation hooks |
+| Model specialization | small fragments only after capability verification | model/session instructions | entire provider prompt selected by model name | configurable role model | complete prompt family selected by model |
+| Designer | `ui-design` Skill, no mandatory built-in Agent | optional user customization | user/plugin Agent | built-in Designer | category/Agent routing |
+| Audit | section source, digest, effective capabilities, provider projection | prompt/input and rollout diagnostics | inspectable assembled runtime | plugin task/status inspection | plugin prompt inspectable; final wire remains OpenCode-owned |
 
-The current Zuno implementation no longer matches the historical Zuno column:
-it has closed role collapse, cross-product instruction fallback, collaboration
-mode ambiguity, and named-Skill preload gaps. Its production contract combines
-Codex-like typed request boundaries, OpenCode-like discoverable Skill commands,
-DSH-like durable work-state authority, and concise OMO-inspired role guidance.
-The final provider-manifest gap remains.
+Generation 2 therefore combines Codex-like typed request boundaries,
+OpenCode-like discovery, Slim-like bounded delegation, DSH-like durable
+work-state authority, and selected OMO model-fit lessons without becoming
+compatible with any of those products.
 
 ## Historical assessment and current disposition
 
@@ -455,8 +545,9 @@ Disposition of the historical recommendations:
    for another product's instruction file.
 4. **Completed:** reduce initial catalog weight while keeping source identities
    and complete search/list escalation.
-5. **Completed with native syntax:** `zuno debug prompt [session] [turn]`
-   exposes the durable receipt and defaults to redaction.
+5. **Completed:** `zuno debug prompt --session <id> [--step <non-zero>]`
+   defaults to redaction and resolves each step through
+   `session.provider.request.1.promptReceiptID`.
 6. **Completed as an architectural rule:** model-aware corrections remain small
    capability fragments rather than duplicated full prompt families.
 7. **Completed:** Plan and Work are first-class collaboration blocks and
@@ -469,6 +560,13 @@ The historical matching-Skill path worked in that run. Current host-side preload
 is additionally covered by exact-name, ambiguity, Chinese-boundary, direct-slash,
 and resume regression tests.
 
+Generation 2 now has the typed `DelegationContract`, host-generated
+`TaskReportMetadata`, logical-task deduplication, evidenced uncertain-Job
+reconciliation, one completion barrier, bounded same-snapshot
+`runtime.work_state`, and both debug commands. The remaining acceptance boundary
+is the final workspace gates and the recorded real-provider E2E matrix described
+in the Chinese audit.
+
 ## Source map
 
 Zuno:
@@ -480,6 +578,7 @@ Zuno:
 
 Codex:
 
+- `codex-rs/core/prompt_with_apply_patch_instructions.md`
 - `codex-rs/core/src/client_common.rs`
 - `codex-rs/core/src/client.rs`
 - `codex-rs/core/src/agents_md.rs`
@@ -489,8 +588,25 @@ Codex:
 - `codex-rs/ext/skills/src/host_prompt.rs`
 - `codex-rs/skills/src/selection.rs`
 
+OpenCode:
+
+- `packages/opencode/src/session/prompt.ts`
+- `packages/opencode/src/session/system.ts`
+- `packages/opencode/src/session/compaction.ts`
+- `packages/opencode/src/tool/task.ts`
+
+oh-my-opencode-slim:
+
+- `src/agents/orchestrator.ts`
+- `src/agents/designer.ts`
+- `src/agents/task-rejection.ts`
+- `src/hooks/task-session-manager/`
+- `src/tools/task-status.ts`
+- `src/tools/task-result.ts`
+
 oh-my-openagent:
 
+- `docs/guide/agent-model-matching.md`
 - `packages/omo-opencode/src/agents/sisyphus-agent-factory.ts`
 - `packages/omo-opencode/src/agents/sisyphus/claude-opus-5.ts`
 - `packages/omo-opencode/src/agents/dynamic-agent-category-skills-guide.ts`
