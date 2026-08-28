@@ -5,7 +5,7 @@ use std::sync::Arc;
 const TEST_CONFIG: &str = r#"{"formatter":false,"lsp":false,"model":"test/test-model","provider":{"test":{"name":"test","id":"test","env":[],"transport":"openai-compatible","models":{"test-model":{"id":"test-model","name":"Test model","attachment":false,"reasoning":false,"temperature":false,"tool_call":true,"release_date":"2025-01-01","limit":{"context":100000,"output":10000},"cost":{"input":0,"output":0},"options":{}}},"options":{"apiKey":"acp-probe","baseURL":"https://example.invalid/v1"}}}}"#;
 
 use serde_json::{Value, json};
-use wiremock::matchers::method;
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn binary() -> Command {
@@ -59,6 +59,70 @@ fn strict_config(base_url: &str) -> String {
         serde_json::from_str(&config_with_second_model(base_url)).expect("test config JSON");
     config["permission"] = json!({"mode":"strict","rules":{}});
     serde_json::to_string(&config).expect("encode strict test config")
+}
+
+fn config_with_remote_mcp(mcp_url: &str, provider_url: &str) -> String {
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model(provider_url)).expect("test config JSON");
+    config["mcp"] = json!({
+        "lifecycle": {
+            "type": "remote",
+            "url": mcp_url,
+            "oauth": false
+        }
+    });
+    serde_json::to_string(&config).expect("encode remote MCP test config")
+}
+
+async fn mount_remote_mcp_fixture(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("initialize body");
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .insert_header("mcp-session-id", "acp-lifecycle-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "acp-lifecycle-fixture", "version": "1.0.0"}
+                    }
+                }))
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("tools/list body");
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"tools": []}
+                }))
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
 }
 
 fn put_durable_message(
@@ -165,7 +229,11 @@ fn seed_durable_replay(root: &std::path::Path, session_id: &str) {
         200,
         json!({"type":"reasoning","text":"inspect durable state"}),
     );
-    let edited_path = root.join("src/lib.rs").to_string_lossy().into_owned();
+    let edited_path = root.join("src/lib.rs");
+    std::fs::create_dir_all(edited_path.parent().expect("edited path parent"))
+        .expect("create replay source directory");
+    std::fs::write(&edited_path, "new\n").expect("write replay source file");
+    let edited_path = edited_path.to_string_lossy().into_owned();
     put_durable_part(
         &connection,
         session_id,
@@ -235,6 +303,27 @@ fn seed_durable_replay(root: &std::path::Path, session_id: &str) {
             },
         )
         .expect("persist ACP work plan");
+}
+
+fn seed_durable_text_replay(root: &std::path::Path, session_id: &str) {
+    let location = zuno_paths::DbLocation::File(root.join("zuno-acp.db"));
+    let connection = zuno_db::open::open(&location).expect("open ACP database");
+    put_durable_message(
+        &connection,
+        session_id,
+        "msg_acp_cold_load",
+        "user",
+        100,
+        Value::Null,
+    );
+    put_durable_part(
+        &connection,
+        session_id,
+        "msg_acp_cold_load",
+        "prt_acp_cold_load",
+        100,
+        json!({"type":"text","text":"cold-load durable history"}),
+    );
 }
 
 #[test]
@@ -340,6 +429,38 @@ fn request(
         "ACP request {method} failed: {response}"
     );
     response["result"].clone()
+}
+
+fn request_failure(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::to_string(&frame).expect("encode ACP request")
+    )
+    .expect("write ACP request");
+    stdin.flush().expect("flush ACP request");
+
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read ACP response");
+    assert!(!line.is_empty(), "ACP closed before responding to {method}");
+    let response: Value = serde_json::from_str(&line).expect("ACP response JSON");
+    assert_eq!(response["id"], id, "unexpected ACP response: {response}");
+    response
+        .get("error")
+        .cloned()
+        .unwrap_or_else(|| panic!("ACP request {method} unexpectedly succeeded: {response}"))
 }
 
 fn request_with_updates(
@@ -859,6 +980,277 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_load_is_cold_and_duplicate_load_does_not_replay_again() {
+    let mcp = MockServer::start().await;
+    mount_remote_mcp_fixture(&mcp).await;
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TextTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = config_with_remote_mcp(&format!("{}/mcp", mcp.uri()), &provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    seed_durable_text_replay(root.path(), &session_id);
+
+    let (_loaded, first_replay) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/load",
+        json!({
+            "sessionId": &session_id,
+            "cwd": root.path(),
+            "mcpServers": []
+        }),
+    );
+    let initialize_after_load = mcp
+        .received_requests()
+        .await
+        .expect("remote MCP requests")
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST"
+                && serde_json::from_slice::<Value>(&request.body)
+                    .ok()
+                    .and_then(|body| body["method"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("initialize")
+        })
+        .count();
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/set_mode",
+        json!({"sessionId": &session_id, "modeId": "plan"}),
+    );
+    request(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/set_mode",
+        json!({"sessionId": &session_id, "modeId": "build"}),
+    );
+    let initialize_after_reconfiguration = mcp
+        .received_requests()
+        .await
+        .expect("remote MCP requests after reconfiguration")
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST"
+                && serde_json::from_slice::<Value>(&request.body)
+                    .ok()
+                    .and_then(|body| body["method"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("initialize")
+        })
+        .count();
+
+    let (_loaded_again, second_replay) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/load",
+        json!({
+            "sessionId": &session_id,
+            "cwd": root.path(),
+            "mcpServers": []
+        }),
+    );
+    let (prompted, prompt_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        8,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"Activate the loaded ACP session."}]
+        }),
+    );
+    let initialize_after_prompt = mcp
+        .received_requests()
+        .await
+        .expect("remote MCP requests after prompt")
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST"
+                && serde_json::from_slice::<Value>(&request.body)
+                    .ok()
+                    .and_then(|body| body["method"].as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("initialize")
+        })
+        .count();
+    request(
+        &mut stdin,
+        &mut stdout,
+        9,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP cold-load process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP cold-load process failed: {stderr}");
+    }
+
+    assert!(
+        !first_replay.is_empty(),
+        "the first session/load must reconstruct durable history"
+    );
+    assert!(
+        second_replay.is_empty(),
+        "a duplicate session/load on the same ACP connection must be idempotent: \
+         {second_replay:#?}"
+    );
+    assert_eq!(
+        initialize_after_load, 1,
+        "loading durable history must not reconnect configured MCP servers"
+    );
+    assert_eq!(
+        initialize_after_reconfiguration, 1,
+        "restored-session mode changes must remain dormant until a real prompt"
+    );
+    assert_eq!(prompted["stopReason"], "end_turn");
+    assert!(
+        prompt_updates.iter().any(|update| {
+            update["sessionUpdate"] == "agent_message_chunk"
+                && update["content"]["text"] == "ACP reply"
+        }),
+        "the first prompt after a cold load did not activate and drive the session"
+    );
+    assert_eq!(
+        initialize_after_prompt, 2,
+        "the first real prompt must activate the dormant session and reconnect MCP exactly once"
+    );
+}
+
+#[test]
+fn acp_connection_bounds_open_sessions_and_releases_capacity_on_close() {
+    let root = tempfile::tempdir().expect("ACP test root");
+    let mut child = isolated_command(root.path())
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let mut sessions = Vec::new();
+    for index in 0_u64..32 {
+        let created = request(
+            &mut stdin,
+            &mut stdout,
+            index + 2,
+            "session/new",
+            json!({"cwd": root.path(), "mcpServers": []}),
+        );
+        sessions.push(
+            created["sessionId"]
+                .as_str()
+                .expect("session id")
+                .to_owned(),
+        );
+    }
+
+    let capacity = request_failure(
+        &mut stdin,
+        &mut stdout,
+        34,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    assert_eq!(capacity["code"], -32602);
+    assert!(
+        capacity["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("32 open sessions")),
+        "capacity failure must explain how to recover: {capacity}"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        35,
+        "session/close",
+        json!({"sessionId": &sessions[0]}),
+    );
+    let replacement = request(
+        &mut stdin,
+        &mut stdout,
+        36,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    assert!(replacement["sessionId"].as_str().is_some());
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP capacity process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP capacity process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
     let provider = MockServer::start().await;
     Mock::given(method("POST"))
@@ -913,7 +1305,9 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
             }),
         "model selection did not rebuild the ACP session: {configured}"
     );
-    let resource_uri = format!("file://{}/notes.md", root.path().display());
+    let resource_path = root.path().join("notes.md");
+    std::fs::write(&resource_path, "# Design notes\n").expect("write ACP resource link target");
+    let resource_uri = format!("file://{}", resource_path.display());
     let (completed, updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
@@ -1453,6 +1847,22 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
     assert!(
         resume_updates.is_empty(),
         "session/resume must not duplicate durable history: {resume_updates:#?}"
+    );
+    let (_loaded_after_resume, replay_after_resume) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "session/load",
+        json!({
+            "sessionId": &session_id,
+            "cwd": root.path(),
+            "mcpServers": []
+        }),
+    );
+    assert!(
+        replay_after_resume.is_empty(),
+        "a resumed client already owns the transcript and a later load must not duplicate it: \
+         {replay_after_resume:#?}"
     );
 
     drop(stdin);

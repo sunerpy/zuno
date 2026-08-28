@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -108,6 +109,14 @@ pub const OUTBOUND_FRAME_CHANNEL_CAPACITY: usize = 64;
 
 /// Maximum encoded JSON bytes accepted for one newline-delimited ACP frame.
 pub const MAX_INBOUND_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Grace for already accepted requests to publish a ready response at clean EOF.
+///
+/// Editors commonly close stdin immediately after writing their final request.
+/// A short drain keeps deterministic validation and lifecycle responses from
+/// being replaced by cancellation, while truly blocked requests are still
+/// cancelled promptly afterwards.
+const EOF_REQUEST_DRAIN_GRACE: Duration = Duration::from_millis(25);
 
 const UNINITIALIZED: u8 = 0;
 const INITIALIZING: u8 = 1;
@@ -301,11 +310,15 @@ where
     let in_flight = Arc::new(Mutex::new(InFlight::new()));
     let mut reader = BufReader::new(input);
     let mut requests = JoinSet::new();
+    let mut clean_eof = false;
 
     let loop_result = async {
         loop {
             let frame = match read_frame(&mut reader, MAX_INBOUND_FRAME_BYTES).await? {
-                FrameRead::Eof => break,
+                FrameRead::Eof => {
+                    clean_eof = true;
+                    break;
+                }
                 FrameRead::Oversized => {
                     client
                         .response(
@@ -476,6 +489,9 @@ where
     }
     .await;
 
+    if clean_eof && loop_result.is_ok() {
+        drain_accepted_requests_at_eof(&mut requests).await;
+    }
     let cancellations = lock(&in_flight)
         .drain()
         .map(|(_, cancel)| cancel)
@@ -493,6 +509,20 @@ where
     close_output.map_err(|_| ServeError::WriterClosed)?;
     writer_result?;
     Ok(())
+}
+
+async fn drain_accepted_requests_at_eof(requests: &mut JoinSet<()>) {
+    let deadline = tokio::time::Instant::now() + EOF_REQUEST_DRAIN_GRACE;
+    while !requests.is_empty() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, requests.join_next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 enum FrameRead {
@@ -915,6 +945,64 @@ mod tests {
             .expect("server task joins")
             .expect("server exits cleanly");
         assert!(dropped.load(AtomicOrdering::SeqCst));
+    }
+
+    #[derive(Debug)]
+    struct YieldingInvalidParamsAgent;
+
+    #[async_trait]
+    impl Agent for YieldingInvalidParamsAgent {
+        async fn request(
+            &self,
+            _method: &str,
+            _params: Value,
+            _client: ClientConnection,
+        ) -> Result<Value, RpcError> {
+            tokio::task::yield_now().await;
+            Err(RpcError::invalid_params("invalid fixture parameters"))
+        }
+
+        async fn notification(
+            &self,
+            method: &str,
+            _params: Value,
+            _client: ClientConnection,
+        ) -> Result<(), RpcError> {
+            Err(RpcError::method_not_found(method))
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_eof_drains_an_already_accepted_ready_response_before_cancelling() {
+        let (mut input_writer, input_reader) = tokio::io::duplex(4096);
+        let (output_writer, output_reader) = tokio::io::duplex(4096);
+        let mut output = BufReader::new(output_reader);
+        let server = tokio::spawn(serve(
+            YieldingInvalidParamsAgent,
+            input_reader,
+            output_writer,
+        ));
+
+        input_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("write final request");
+        input_writer.shutdown().await.expect("close ACP input");
+
+        let mut line = String::new();
+        timeout(Duration::from_secs(1), output.read_line(&mut line))
+            .await
+            .expect("ready response survives clean EOF")
+            .expect("read ready response");
+        let response: Value = serde_json::from_str(&line).expect("ACP response is JSON");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["error"]["code"], -32602);
+
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server exits after draining ready response")
+            .expect("server task joins")
+            .expect("server exits cleanly");
     }
 
     #[derive(Debug)]

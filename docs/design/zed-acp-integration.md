@@ -104,15 +104,15 @@ loop.
 | Area | Production behavior |
 | --- | --- |
 | Initialization | Negotiates stable protocol V1 and reports schema `1.21.0`. Authentication methods are empty because Zuno uses its own configured provider credentials and has no ACP login handler. |
-| Session lifecycle | Implements `session/new`, `load`, `resume`, `list`, `delete`, and `close`. Loading replays durable client-visible history; resuming continues without duplicating that replay. |
+| Session lifecycle | Implements `session/new`, `load`, `resume`, `list`, `delete`, and `close`. Loading and resuming create a dormant session without constructing a `TurnHost` or connecting configured MCP servers; the first prompt activates it. Loading replays once while that in-process session remains open, while new and resumed sessions treat the client transcript as already owned. |
 | Session configuration | Implements build/plan modes and transactional agent or model replacement through stable config options. Reconfiguration is rejected while a prompt is active and rolls back on failure. |
 | Prompt execution | Admits input through the durable Zuno turn path, streams projections while the turn runs, and projects the final durable plan before returning. Concurrent prompts for one session are rejected. |
-| Prompt content | Accepts text and native `resource_link` blocks. Every resource-link field is persisted and replayed; providers without a native link type receive one stable text projection. Prompt image, audio, and embedded-resource capabilities remain `false`. |
+| Prompt content | Accepts text and native `resource_link` blocks. Every resource-link field is persisted. On replay, remote links remain typed, while a local file link remains actionable only when it still resolves to a regular file inside the active worktree; stale or external links become explanatory text. Providers without a native link type receive one stable text projection. Prompt image, audio, and embedded-resource capabilities remain `false`. |
 | Assistant and tool projection | Streams assistant text and reasoning, tool start/update/completion, accumulated raw input, raw output, JSON/text content, written-file locations, and usage. |
 | File edits and diffs | Zuno's native file tools produce stable ACP `diff` content with an absolute path and exact `oldText`/`newText`. A unified-diff text fallback remains only for tools that cannot provide typed file state. |
 | Human input | Routes tool permission through `session/request_permission` and the question tool through stable form elicitation when the client advertises it. Unknown, malformed, declined, and cancelled outcomes fail closed. |
-| Cancellation | `session/cancel`, request cancellation, stdin EOF, and process shutdown abort active work and settle pending agent-to-client requests instead of leaving the transport hung. |
-| Durable load replay | Reconstructs user/assistant content, reasoning, tools, raw input/output, typed diffs, locations, resource links and image output, plan, and latest-context usage from durable session state. |
+| Cancellation | `session/cancel`, request cancellation, stdin EOF, and process shutdown abort active work and settle pending agent-to-client requests instead of leaving the transport hung. A clean stdin EOF gives already accepted, ready-to-complete requests a bounded 25 ms drain before cancelling the remainder. Session close covers the prompt-to-run handoff without leaving an interrupt armed for a later mount. |
+| Durable load replay | Reconstructs a bounded retained suffix of user/assistant content, reasoning, tools, raw input/output, safe typed diffs and locations, resource links and image output, followed by the current plan and latest-context usage. Omitted history is reported explicitly. |
 | ACP-provided MCP | HTTP and SSE MCP capabilities remain `false`. Zuno may still mount MCP servers from its own validated native configuration. |
 | Client filesystem RPC | Not advertised. Agent file reads and writes use Zuno tools, sandbox/permission policy, and durable events; they do not masquerade as ACP client filesystem handlers. |
 | Terminal RPC | Not advertised. Zuno will not emit terminal references until create/output/wait/kill/release ownership and cancellation are implemented as one lifecycle. |
@@ -120,7 +120,47 @@ loop.
 `resource_link` remains typed through ingress, SQLite, compaction, goal
 continuation, steering, and load replay. Text-only provider protocols lower it
 only at the provider boundary. This prevents Zed from reopening a thread with
-lossy prose in place of the original URI metadata.
+lossy prose in place of the original URI metadata. The replay safety filter is
+separate: it prevents historical local URIs from remaining actionable after a
+workspace moves, a file disappears, or the restored thread belongs to another
+worktree.
+
+## Restore and teardown safety
+
+Zed may retain an external-Agent process and its last selected thread after the
+Agent panel is hidden. Hiding the panel is therefore not treated as
+`session/close`. Zuno contains that client behavior at the ACP boundary:
+
+- `session/load` and `session/resume` resolve validated session configuration
+  but keep the session dormant. They do not create a `TurnHost` or connect
+  configured MCP servers until the first `session/prompt`.
+- A second `session/load` for the same open ACP session is idempotent. A
+  `session/resume` also marks replay as already satisfied, so a later load
+  cannot duplicate a transcript the client already owns.
+- One stdio connection retains at most 32 open ACP sessions. A request that
+  would exceed the bound fails explicitly instead of growing an unbounded host
+  and MCP registry.
+- Transcript hydration starts after the durable compaction boundary and keeps
+  at most the newest 512 retained messages. Transcript projection is limited to
+  4 MiB total and 1 MiB per update; an explicit `replay_omission` message
+  reports how many durable messages were left out. SQLite sizes stored part
+  blobs before Rust JSON hydration, so an oversized newest message is omitted
+  without first allocating its tool output or attachment payload.
+- Replayed diff paths, written-file locations, and local file links are
+  canonicalized. Only existing regular files inside the active worktree remain
+  actionable. Missing files, external paths, and symlink escapes are filtered;
+  omitted local resource links become non-actionable text.
+- `session/close` first makes the in-process session terminal, stops any active
+  or just-admitted prompt, serializes against replay and activation, then shuts
+  down the host and MCP runtime. A teardown-only pending interrupt is cleared
+  so reopening the same durable session is not immediately cancelled.
+
+These controls prevent a restored thread from eagerly recreating every runtime
+or replaying an unbounded set of stale actionable paths. They do not mutate
+Zed's workspace database, clear Zed's `last_active_thread`, or remove watchers
+that Zed created independently. An activated idle session currently remains
+mounted until Zed sends `session/close` or the stdio process ends; there is no
+timer-based idle demotion.
 
 ## Zed setup and verification
 

@@ -11,7 +11,10 @@ pub mod conformance;
 pub use permission::AcpPermissionAsker;
 pub use projection::{TurnEventProjector, turn_event_update};
 pub use question::AcpQuestionAsker;
-pub use replay::{durable_plan_update, durable_updates, durable_usage_update};
+pub use replay::{
+    DurableReplay, REPLAY_MESSAGE_CAP, REPLAY_TRANSCRIPT_BYTE_CAP, ReplayPolicy,
+    durable_plan_update, durable_updates, durable_usage_update,
+};
 pub use transport::{Agent, ClientConnection, RpcError, ServeError, serve_stdio};
 
 pub const IMPLEMENTED_METHODS: [&str; 11] = [

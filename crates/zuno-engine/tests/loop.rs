@@ -15,8 +15,8 @@ use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterrup
 use zuno_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, PreparedToolDispatch, ResolvedAgent,
     ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError,
-    TurnEvent, TurnOutcome, event_channel, hydrate_retained_history, project_history,
-    project_history_owned, retained_history, run_turn,
+    TurnEvent, TurnOutcome, event_channel, hydrate_retained_history, hydrate_retained_history_tail,
+    project_history, project_history_owned, retained_history, run_turn,
 };
 use zuno_engine::prompt::PromptAssembly;
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
@@ -2640,6 +2640,60 @@ fn loop_without_compaction_marker_is_byte_identical_to_full_history() {
     put_user(&connection, "msg_current_user", 30, "current request");
 
     assert_loader_projection_matches_full_reference(&connection);
+}
+
+#[test]
+fn retained_history_tail_hydrates_only_the_bounded_suffix() {
+    let connection = seeded();
+    for index in 0..5 {
+        put_user(
+            &connection,
+            &format!("msg_tail_{index}"),
+            10 + index,
+            &format!("request {index}"),
+        );
+    }
+
+    let retained = hydrate_retained_history_tail(&connection, SESSION_ID, 2, u64::MAX)
+        .expect("bounded history");
+
+    assert_eq!(retained.omitted, 3);
+    assert_eq!(
+        retained
+            .messages
+            .iter()
+            .map(|message| message.info.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["msg_tail_3", "msg_tail_4"]
+    );
+}
+
+#[test]
+fn retained_history_byte_bound_rejects_an_oversized_tail_before_json_hydration() {
+    let connection = seeded();
+    put_user(
+        &connection,
+        "msg_oversized_tail",
+        10,
+        "temporary valid payload",
+    );
+    let oversized = serde_json::to_string(&json!({
+        "type": "unknown-future-part",
+        "payload": "x".repeat(4_096),
+    }))
+    .expect("encode oversized corrupt fixture");
+    connection
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = ?2",
+            [oversized.as_str(), "prt_msg_oversized_tail"],
+        )
+        .expect("replace part with oversized undecodable JSON");
+
+    let retained = hydrate_retained_history_tail(&connection, SESSION_ID, 8, 1_024)
+        .expect("oversized tail must be omitted before part decoding");
+
+    assert!(retained.messages.is_empty());
+    assert_eq!(retained.omitted, 1);
 }
 
 async fn collect_and_interrupt(

@@ -829,6 +829,52 @@ impl<'conn> MessageStore<'conn> {
         Ok(grouped)
     }
 
+    /// Stored `part.data` bytes belonging to each of `message_ids`.
+    ///
+    /// This is the allocation-free sizing phase for bounded hydration. SQLite
+    /// computes byte lengths from the text blobs without decoding their JSON
+    /// into Rust values. Messages with no parts are absent from the result and
+    /// therefore have a size of zero.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn part_data_bytes_by_message(
+        &self,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, u64>, DbError> {
+        let mut sizes = HashMap::new();
+        for chunk in message_ids.chunks(HYDRATION_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT message_id, SUM(length(CAST(data AS BLOB))) FROM part \
+                 WHERE message_id IN ({placeholders}) GROUP BY message_id"
+            );
+            let mut statement = self.prepare(&sql)?;
+            let rows = statement
+                .query_map(params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(map_error)?;
+            for row in rows {
+                let (message_id, bytes) = row.map_err(map_error)?;
+                let bytes = u64::try_from(bytes).map_err(|_| DbError::Conflict {
+                    table: PART_TABLE.to_owned(),
+                    id: message_id.clone(),
+                    detail: format!("stored part byte count is negative: {bytes}"),
+                })?;
+                sizes.insert(message_id, bytes);
+            }
+        }
+        Ok(sizes)
+    }
+
     /// Parts of one kind belonging to any of `message_ids`, grouped by message id.
     ///
     /// This is the metadata phase of retained-history hydration: callers can inspect

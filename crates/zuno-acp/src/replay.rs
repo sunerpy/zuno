@@ -1,6 +1,9 @@
 //! Project durable Zuno messages onto ACP `session/update` notifications.
 
+use std::path::{Path, PathBuf};
+
 use serde_json::{Map, Value, json};
+use url::Url;
 use zuno_db::message::{MessageRole, MessageWithParts, PartKind, PartRecord};
 use zuno_db::session::{MessageUsage, TokenAccounting};
 use zuno_engine::r#loop::ToolDiff;
@@ -9,9 +12,129 @@ use zuno_types::WorkStateProjection;
 
 use crate::projection::{completed_tool_update, tool_call};
 
+/// Maximum retained durable messages hydrated for one ACP load.
+pub const REPLAY_MESSAGE_CAP: usize = 512;
+/// Maximum stored part-data bytes hydrated for one ACP load.
+pub const REPLAY_TRANSCRIPT_BYTE_CAP: u64 = 4 * 1_024 * 1_024;
+
+const DEFAULT_REPLAY_TOTAL_BYTES: usize = REPLAY_TRANSCRIPT_BYTE_CAP as usize;
+const DEFAULT_REPLAY_FRAME_BYTES: usize = 1_024 * 1_024;
+const REPLAY_NOTICE_RESERVE_BYTES: usize = 512;
+
+/// Bounded and path-aware projection policy for one ACP restore.
+#[derive(Debug, Clone)]
+pub struct ReplayPolicy {
+    workspace_root: PathBuf,
+    max_total_bytes: usize,
+    max_frame_bytes: usize,
+}
+
+impl ReplayPolicy {
+    #[must_use]
+    pub fn for_workspace(workspace_root: &Path) -> Self {
+        Self::with_limits(
+            workspace_root,
+            DEFAULT_REPLAY_TOTAL_BYTES,
+            DEFAULT_REPLAY_FRAME_BYTES,
+        )
+    }
+
+    #[must_use]
+    pub fn with_limits(
+        workspace_root: &Path,
+        max_total_bytes: usize,
+        max_frame_bytes: usize,
+    ) -> Self {
+        Self {
+            workspace_root: std::fs::canonicalize(workspace_root)
+                .unwrap_or_else(|_| workspace_root.to_path_buf()),
+            max_total_bytes,
+            max_frame_bytes,
+        }
+    }
+
+    fn actionable_path(&self, path: &Path) -> bool {
+        if !path.is_absolute() {
+            return false;
+        }
+        std::fs::canonicalize(path).is_ok_and(|canonical| {
+            canonical.is_file() && canonical.starts_with(&self.workspace_root)
+        })
+    }
+}
+
+/// One bounded replay projection plus its explicit omission count.
+#[derive(Debug)]
+pub struct DurableReplay {
+    pub updates: Vec<Value>,
+    pub omitted_messages: usize,
+}
+
 #[must_use]
-pub fn durable_updates(history: &[MessageWithParts]) -> Vec<Value> {
-    history.iter().flat_map(message_updates).collect::<Vec<_>>()
+pub fn durable_updates(
+    history: &[MessageWithParts],
+    policy: &ReplayPolicy,
+    previously_omitted: usize,
+) -> DurableReplay {
+    let payload_budget = policy
+        .max_total_bytes
+        .saturating_sub(REPLAY_NOTICE_RESERVE_BYTES);
+    let mut groups = Vec::new();
+    let mut encoded_bytes = 0_usize;
+    let mut omitted_messages = previously_omitted;
+
+    for (reverse_index, stored) in history.iter().rev().enumerate() {
+        let updates = message_updates(stored, policy);
+        let sizes = updates
+            .iter()
+            .map(|update| serde_json::to_vec(update).map(|encoded| encoded.len()))
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(sizes) = sizes else {
+            omitted_messages = omitted_messages.saturating_add(1);
+            continue;
+        };
+        if sizes.iter().any(|size| *size > policy.max_frame_bytes) {
+            omitted_messages = omitted_messages.saturating_add(1);
+            continue;
+        }
+        let group_bytes = sizes.into_iter().sum::<usize>();
+        if encoded_bytes.saturating_add(group_bytes) > payload_budget {
+            omitted_messages =
+                omitted_messages.saturating_add(history.len().saturating_sub(reverse_index));
+            break;
+        }
+        encoded_bytes = encoded_bytes.saturating_add(group_bytes);
+        groups.push(updates);
+    }
+
+    groups.reverse();
+    let mut updates = groups.into_iter().flatten().collect::<Vec<_>>();
+    if omitted_messages > 0 {
+        updates.insert(0, replay_omission_update(omitted_messages));
+    }
+    DurableReplay {
+        updates,
+        omitted_messages,
+    }
+}
+
+fn replay_omission_update(omitted_messages: usize) -> Value {
+    json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": {
+            "type": "text",
+            "text": format!(
+                "Earlier durable ACP history was omitted from this restore to keep replay bounded \
+                 ({omitted_messages} messages)."
+            ),
+        },
+        "_meta": {
+            "zuno": {
+                "kind": "replay_omission",
+                "omittedMessages": omitted_messages,
+            }
+        },
+    })
 }
 
 /// Replays the last provider-confirmed context usage, never cumulative session tokens.
@@ -99,7 +222,7 @@ fn plan_step_priority<'a>(work: &'a WorkStateProjection, step_id: &str) -> &'a s
     resolved.unwrap_or("medium")
 }
 
-fn message_updates(stored: &MessageWithParts) -> Vec<Value> {
+fn message_updates(stored: &MessageWithParts, policy: &ReplayPolicy) -> Vec<Value> {
     let mut updates = Vec::new();
     for part in &stored.parts {
         match part.kind {
@@ -122,7 +245,7 @@ fn message_updates(stored: &MessageWithParts) -> Vec<Value> {
                 }
             }
             PartKind::File => {
-                if let Some(content) = stored_file_content(&part.data) {
+                if let Some(content) = stored_file_content(&part.data, policy) {
                     updates.push(message_content_update(
                         message_kind(stored.info.role),
                         content,
@@ -130,7 +253,7 @@ fn message_updates(stored: &MessageWithParts) -> Vec<Value> {
                     ));
                 }
             }
-            PartKind::Tool => updates.extend(tool_updates(part)),
+            PartKind::Tool => updates.extend(tool_updates(part, policy)),
             PartKind::StepStart
             | PartKind::StepFinish
             | PartKind::Snapshot
@@ -159,7 +282,7 @@ fn message_content_update(kind: &str, content: Value, message_id: &str) -> Value
     })
 }
 
-fn tool_updates(part: &PartRecord) -> Vec<Value> {
+fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
     let Some(call_id) = non_empty_string(&part.data, "callID") else {
         return Vec::new();
     };
@@ -211,9 +334,12 @@ fn tool_updates(part: &PartRecord) -> Vec<Value> {
     let written_paths = durable_output
         .written_paths()
         .into_iter()
+        .filter(|path| policy.actionable_path(Path::new(path)))
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let diff = ToolDiff::from_output(&durable_output);
+    let diff = ToolDiff::from_output(&durable_output)
+        .as_ref()
+        .and_then(|diff| replay_diff(diff, policy));
     let mut completed = completed_tool_update(
         call_id,
         display_name,
@@ -230,7 +356,7 @@ fn tool_updates(part: &PartRecord) -> Vec<Value> {
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(tool_attachment_content),
+                .filter_map(|value| tool_attachment_content(value, policy)),
         );
     }
     if state
@@ -248,7 +374,22 @@ fn tool_updates(part: &PartRecord) -> Vec<Value> {
     updates
 }
 
-fn stored_file_content(data: &Map<String, Value>) -> Option<Value> {
+fn replay_diff(diff: &ToolDiff, policy: &ReplayPolicy) -> Option<ToolDiff> {
+    let files = diff
+        .files()
+        .iter()
+        .filter(|file| policy.actionable_path(Path::new(file.path())))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unified = diff
+        .files()
+        .is_empty()
+        .then(|| diff.unified().map(str::to_owned))
+        .flatten();
+    ToolDiff::new(unified, files)
+}
+
+fn stored_file_content(data: &Map<String, Value>, policy: &ReplayPolicy) -> Option<Value> {
     let mime = non_empty_string(data, "mime");
     let url = non_empty_string(data, "url");
     if mime.is_some_and(|mime| mime.starts_with("image/")) {
@@ -260,7 +401,7 @@ fn stored_file_content(data: &Map<String, Value>) -> Option<Value> {
             content.insert("type".to_owned(), json!("image"));
             content.insert("data".to_owned(), json!(payload));
             content.insert("mimeType".to_owned(), json!(mime));
-            if let Some(url) = url {
+            if let Some(url) = url.filter(|url| resource_link_is_actionable(url, policy)) {
                 content.insert("uri".to_owned(), json!(url));
             }
             return Some(Value::Object(content));
@@ -270,6 +411,20 @@ fn stored_file_content(data: &Map<String, Value>) -> Option<Value> {
     let name = non_empty_string(data, "filename")
         .or_else(|| uri.rsplit('/').next().filter(|name| !name.is_empty()))
         .unwrap_or("attachment");
+    if !resource_link_is_actionable(uri, policy) {
+        return Some(json!({
+            "type": "text",
+            "text": format!(
+                "Historical local resource `{name}` was omitted because it is outside the active \
+                 worktree or no longer exists."
+            ),
+            "_meta": {
+                "zuno": {
+                    "kind": "omitted_local_resource",
+                }
+            },
+        }));
+    }
     let mut content = Map::new();
     content.insert("type".to_owned(), json!("resource_link"));
     content.insert("name".to_owned(), json!(name));
@@ -289,8 +444,20 @@ fn stored_file_content(data: &Map<String, Value>) -> Option<Value> {
     Some(Value::Object(content))
 }
 
-fn tool_attachment_content(value: &Value) -> Option<Value> {
-    let content = stored_file_content(value.as_object()?)?;
+fn resource_link_is_actionable(uri: &str, policy: &ReplayPolicy) -> bool {
+    let Ok(uri) = Url::parse(uri) else {
+        return !uri.starts_with("file:");
+    };
+    if uri.scheme() != "file" {
+        return true;
+    }
+    uri.to_file_path()
+        .ok()
+        .is_some_and(|path| policy.actionable_path(&path))
+}
+
+fn tool_attachment_content(value: &Value, policy: &ReplayPolicy) -> Option<Value> {
+    let content = stored_file_content(value.as_object()?, policy)?;
     Some(json!({ "type": "content", "content": content }))
 }
 
@@ -339,6 +506,10 @@ mod tests {
 
     #[test]
     fn replay_preserves_content_tools_typed_diffs_attachments_and_order() {
+        let root = tempfile::tempdir().expect("replay root");
+        let edited = root.path().join("demo.rs");
+        std::fs::write(&edited, "new\n").expect("write replay target");
+        let edited = edited.to_string_lossy().into_owned();
         let user = message(
             "msg-user",
             "user",
@@ -376,18 +547,19 @@ mod tests {
                         "displayName": "Edit file",
                         "state": {
                             "status": "completed",
-                            "raw": "{\"filePath\":\"/work/demo.rs\"}",
-                            "input": {"filePath":"/work/demo.rs"},
+                            "raw": serde_json::to_string(&json!({"filePath": edited}))
+                                .expect("raw input"),
+                            "input": {"filePath": edited},
                             "title": "Updated demo.rs",
                             "output": "ok",
                             "metadata": {
                                 "diff": "@@ -1 +1 @@\n-old\n+new\n",
                                 "fileDiffs": [{
-                                    "path": "/work/demo.rs",
+                                    "path": edited,
                                     "oldText": "old\n",
                                     "newText": "new\n"
                                 }],
-                                "writtenPaths": ["/work/demo.rs"]
+                                "writtenPaths": [edited]
                             },
                             "attachments": [{
                                 "type": "file",
@@ -406,7 +578,12 @@ mod tests {
             ],
         );
 
-        let updates = durable_updates(&[user, assistant]);
+        let replay = durable_updates(
+            &[user, assistant],
+            &ReplayPolicy::for_workspace(root.path()),
+            0,
+        );
+        let updates = replay.updates;
         assert_eq!(updates.len(), 6, "every durable visible part is replayed");
         assert_eq!(updates[0]["sessionUpdate"], "user_message_chunk");
         assert_eq!(updates[0]["messageId"], "msg-user");
@@ -416,14 +593,197 @@ mod tests {
         assert_eq!(updates[2]["sessionUpdate"], "agent_thought_chunk");
         assert_eq!(updates[2]["messageId"], "msg-assistant");
         assert_eq!(updates[3]["sessionUpdate"], "tool_call");
-        assert_eq!(updates[3]["rawInput"]["filePath"], "/work/demo.rs");
+        assert_eq!(updates[3]["rawInput"]["filePath"], edited);
         assert_eq!(updates[4]["sessionUpdate"], "tool_call_update");
         assert_eq!(updates[4]["status"], "completed");
         assert_eq!(updates[4]["content"][1]["type"], "diff");
         assert_eq!(updates[4]["content"][2]["content"]["type"], "image");
-        assert_eq!(updates[4]["locations"], json!([{"path":"/work/demo.rs"}]));
+        assert_eq!(updates[4]["locations"], json!([{"path":edited}]));
         assert_eq!(updates[5]["content"]["text"], "done");
         assert_eq!(updates[5]["messageId"], "msg-assistant");
+    }
+
+    #[test]
+    fn replay_filters_stale_and_external_actionable_paths() {
+        let root = tempfile::tempdir().expect("replay root");
+        let inside = root.path().join("inside.rs");
+        std::fs::write(&inside, "inside\n").expect("write inside path");
+        let outside_root = tempfile::tempdir().expect("outside root");
+        let outside = outside_root.path().join("outside.rs");
+        std::fs::write(&outside, "outside\n").expect("write outside path");
+        let missing = root.path().join("missing.rs");
+        let inside = inside.to_string_lossy().into_owned();
+        let outside = outside.to_string_lossy().into_owned();
+        let missing = missing.to_string_lossy().into_owned();
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-tool",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-edit",
+                    "tool": "edit",
+                    "displayName": "Edit files",
+                    "state": {
+                        "status": "completed",
+                        "title": "Edited files",
+                        "output": "ok",
+                        "metadata": {
+                            "fileDiffs": [
+                                {"path": inside, "oldText": "old\n", "newText": "inside\n"},
+                                {"path": outside, "oldText": "old\n", "newText": "outside\n"},
+                                {"path": missing, "oldText": "old\n", "newText": "missing\n"}
+                            ],
+                            "writtenPaths": [inside, outside, missing]
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+        let completed = &replay.updates[1];
+
+        assert_eq!(completed["locations"], json!([{"path":inside}]));
+        let diffs = completed["content"]
+            .as_array()
+            .expect("tool content")
+            .iter()
+            .filter(|item| item["type"] == "diff")
+            .collect::<Vec<_>>();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0]["path"], inside);
+    }
+
+    #[test]
+    fn replay_downgrades_stale_and_external_file_links_to_non_actionable_text() {
+        let root = tempfile::tempdir().expect("replay root");
+        let outside_root = tempfile::tempdir().expect("outside root");
+        let outside = outside_root.path().join("outside.md");
+        std::fs::write(&outside, "outside\n").expect("write outside resource");
+        let missing = root.path().join("missing.md");
+        let outside_uri = Url::from_file_path(&outside)
+            .expect("outside file URL")
+            .to_string();
+        let missing_uri = Url::from_file_path(&missing)
+            .expect("missing file URL")
+            .to_string();
+        let user = message(
+            "msg-user",
+            "user",
+            vec![
+                part(
+                    "p-outside",
+                    "msg-user",
+                    json!({
+                        "type": "file",
+                        "filename": "outside.md",
+                        "mime": "text/markdown",
+                        "url": outside_uri,
+                    }),
+                ),
+                part(
+                    "p-missing",
+                    "msg-user",
+                    json!({
+                        "type": "file",
+                        "filename": "missing.md",
+                        "mime": "text/markdown",
+                        "url": missing_uri,
+                    }),
+                ),
+            ],
+        );
+
+        let replay = durable_updates(&[user], &ReplayPolicy::for_workspace(root.path()), 0);
+
+        assert_eq!(replay.updates.len(), 2);
+        for update in replay.updates {
+            assert_eq!(update["content"]["type"], "text");
+            assert_eq!(
+                update["content"]["_meta"]["zuno"]["kind"],
+                "omitted_local_resource"
+            );
+            assert!(
+                update["content"].get("uri").is_none(),
+                "a stale local URI must not remain actionable: {update}"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_keeps_embedded_image_data_but_removes_an_external_local_uri() {
+        let root = tempfile::tempdir().expect("replay root");
+        let outside_root = tempfile::tempdir().expect("outside root");
+        let outside = outside_root.path().join("outside.png");
+        std::fs::write(&outside, b"png").expect("write outside image");
+        let outside_uri = Url::from_file_path(&outside)
+            .expect("outside image URL")
+            .to_string();
+        let user = message(
+            "msg-user",
+            "user",
+            vec![part(
+                "p-image",
+                "msg-user",
+                json!({
+                    "type": "file",
+                    "filename": "outside.png",
+                    "mime": "image/png",
+                    "data": "cG5n",
+                    "url": outside_uri,
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[user], &ReplayPolicy::for_workspace(root.path()), 0);
+        let content = &replay.updates[0]["content"];
+
+        assert_eq!(content["type"], "image");
+        assert_eq!(content["data"], "cG5n");
+        assert!(
+            content.get("uri").is_none(),
+            "embedded bytes are safe, but the external local URI must not remain actionable"
+        );
+    }
+
+    #[test]
+    fn replay_budget_keeps_memory_bounded_and_reports_omitted_messages() {
+        let root = tempfile::tempdir().expect("replay root");
+        let history = (0..6)
+            .map(|index| {
+                message(
+                    &format!("msg-{index}"),
+                    "assistant",
+                    vec![part(
+                        &format!("part-{index}"),
+                        &format!("msg-{index}"),
+                        json!({"type":"text","text":"x".repeat(300)}),
+                    )],
+                )
+            })
+            .collect::<Vec<_>>();
+        let policy = ReplayPolicy::with_limits(root.path(), 1_024, 512);
+
+        let replay = durable_updates(&history, &policy, 4);
+        let encoded = replay
+            .updates
+            .iter()
+            .map(|update| {
+                serde_json::to_vec(update)
+                    .expect("encode replay update")
+                    .len()
+            })
+            .sum::<usize>();
+
+        assert!(replay.omitted_messages >= 4);
+        assert!(encoded <= 1_024, "bounded replay encoded {encoded} bytes");
+        assert_eq!(
+            replay.updates[0]["_meta"]["zuno"]["kind"],
+            "replay_omission"
+        );
     }
 
     #[test]
