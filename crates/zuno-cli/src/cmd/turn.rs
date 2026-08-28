@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,12 +38,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use rusqlite::OptionalExtension as _;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument as _;
 use uuid::Uuid;
 use zuno_agent::model_policy::{AnyModel, ModelChoice, ModelPolicy, PresetLibrary};
-use zuno_agent::profile::AgentProfile;
+use zuno_agent::profile::{AgentProfile, ShellFilesystemAccess};
 use zuno_agent::reflection::{
     CommandOutcome, ReflectionError, ReflectionFork, ReflectionMemoryEntry, ReflectionMemoryScope,
     ReflectionRequest, ReflectionRunner, ReflectionTools, ReflectionTurn, TranscriptEvent,
@@ -65,7 +67,7 @@ use zuno_engine::prelude::{
     CompactionSkipped, InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome,
     compact_requested, run_prelude,
 };
-use zuno_engine::prompt::PromptAssembly;
+use zuno_engine::prompt::{PromptAssembly, RuntimePromptPolicy};
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_error::{DbError, ProviderError, Recovery};
@@ -92,8 +94,8 @@ use zuno_orchestration::{
     AgentAttemptIdentity, AttemptSeed, AttemptSnapshot, CapabilityContents, CapabilitySnapshot,
     CouncilPresetDescriptor, CouncilRetryPolicyDescriptor, CouncilSeatDescriptor,
     CouncilSynthesisPolicyDescriptor, PackIdentity, PresetDescriptor, PresetRouteDescriptor,
-    PresetSelection, ProfileDescriptor, SkillCapabilityDescriptor, ToolSchemaIdentity,
-    WorkflowNodeDescriptor, WorkflowTemplateDescriptor, sha256_json, sha256_text,
+    PresetSelection, ProfileDescriptor, SandboxCapabilityDescriptor, SkillCapabilityDescriptor,
+    ToolSchemaIdentity, WorkflowNodeDescriptor, WorkflowTemplateDescriptor, sha256_json,
 };
 use zuno_provider_compatible::{ReqwestTransport, Transport};
 use zuno_runtime::HarnessRuntime;
@@ -104,13 +106,21 @@ use zuno_tool::{
 use crate::environment::StartupEnvironment;
 
 const REFLECTION_LEASE_MILLIS: i64 = 60 * 60 * 1_000;
+const DURABLE_WORK_CONTEXT_SCHEMA_VERSION: u32 = 1;
+const DURABLE_WORK_CONTEXT_MAX_ENTRIES: usize = 64;
+const DURABLE_WORK_CONTEXT_MAX_BYTES: usize = 16 * 1024;
+const DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES: usize = 512;
+const DURABLE_WORK_CONTEXT_FINAL_TEXT_MAX_BYTES: usize = 1_024;
+const DURABLE_WORK_CONTEXT_HEADER: &str = "runtime.work_state\n\
+This is an authoritative SQLite snapshot regenerated after compaction or restart. \
+Preserve these identities, reconcile uncertain work before retrying side effects, and \
+do not complete the parent while active jobs or unconsumed reports remain.\n";
 
 const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 
 /// The agent every surface falls back to.
 pub(crate) const DEFAULT_AGENT: &str = "orchestrator";
 
-const DEFAULT_MAX_STEPS: u32 = 100;
 const ZUNO_ENABLE_EXPERIMENTAL_MODELS: &str = "ZUNO_ENABLE_EXPERIMENTAL_MODELS";
 
 /// Which session a surface wants to talk in.
@@ -305,12 +315,14 @@ pub(crate) struct TurnPlan {
     profile: zuno_runtime::HarnessProfile,
     directory: PathBuf,
     project: zuno_paths::project::ResolvedProject,
+    env: zuno_paths::Env,
     config: zuno_config::schema::Config,
     agents: Vec<zuno_catalog::agent::Agent>,
     agent: AgentProfile,
     capability: Arc<CapabilitySnapshot>,
     tool_authority: Option<Arc<[ToolSchemaIdentity]>>,
     extensions: zuno_extension::ResolvedExtensions,
+    configured_extension_tool_ids: Vec<String>,
     extension_scope: zuno_extension::Scope,
     extension_revision: u64,
     extension_transaction: Option<zuno_extension::ExtensionTransaction>,
@@ -606,15 +618,6 @@ impl TurnPlan {
                 definition.prompt.clone().unwrap_or_default(),
             )
             .map_err(to_string)?;
-        if !agent.prompt_policy().is_empty() {
-            prompt_assembly
-                .push(
-                    "agent.policy",
-                    format!("zuno-agent::profile:{}", agent.name()),
-                    agent.prompt_policy(),
-                )
-                .map_err(to_string)?;
-        }
         if let Some(mode) = collaboration_mode_prompt(agent.name()) {
             prompt_assembly
                 .push(
@@ -628,9 +631,16 @@ impl TurnPlan {
             requested_agent: agent.name().to_owned(),
             system_prompt: prompt_assembly.render(),
             prompt_assembly: Some(prompt_assembly),
-            max_steps: definition
-                .steps
-                .map_or(DEFAULT_MAX_STEPS, std::num::NonZeroU32::get),
+            runtime_prompt_policy: RuntimePromptPolicy::new(
+                agent
+                    .capabilities()
+                    .delegation_targets()
+                    .map(<[String]>::to_vec),
+                agent.delegation_guidance(),
+                agent.capabilities().shell_filesystem_access()
+                    == ShellFilesystemAccess::WorkspaceWrite,
+            ),
+            max_steps: definition.steps,
             requested_provider: provider_id.clone(),
             requested_model: model_id.clone(),
             wire_model: catalog_model.api.id.clone(),
@@ -714,6 +724,11 @@ impl TurnPlan {
         extension_tools.extend(runtime_surface.tools().iter().cloned());
         let extension_contributions =
             zuno_harness::ToolContributions::new(extension_tools).map_err(to_string)?;
+        let configured_extension_tool_ids = extension_contributions
+            .tools()
+            .iter()
+            .map(|tool| tool.id().to_owned())
+            .collect();
         let mut profile = zuno_harness::default_profile_with_tools(extension_contributions)
             .with_bundle(zuno_harness::orchestration_capabilities_bundle(Arc::clone(
                 &capability,
@@ -734,12 +749,14 @@ impl TurnPlan {
             profile,
             directory,
             project,
+            env: env.clone(),
             config,
             agents,
             agent,
             capability,
             tool_authority: options.tool_authority.clone(),
             extensions,
+            configured_extension_tool_ids,
             extension_scope,
             extension_revision,
             extension_transaction,
@@ -963,6 +980,18 @@ impl TurnPlan {
         self.effort
     }
 
+    /// Use the exact provider request parameters resolved by the parent delegation.
+    ///
+    /// Child configuration still resolves the provider, model, credentials, and static
+    /// [`Spec`], but it must not reinterpret or drop a model variant after the parent
+    /// already fixed its provider-visible request shape.
+    pub(crate) fn inherit_request_parameters(
+        &mut self,
+        parameters: serde_json::Map<String, serde_json::Value>,
+    ) {
+        self.resolver.reasoning_options = parameters;
+    }
+
     /// Explicit surface-level reasoning override, excluding configured defaults.
     pub(crate) const fn effort_override(&self) -> Option<zuno_llm::effort::ReasoningEffort> {
         self.effort_override
@@ -971,6 +1000,285 @@ impl TurnPlan {
     /// The model's context ceiling, or zero when the catalog declares none.
     pub(crate) const fn context_window(&self) -> u64 {
         self.window.context
+    }
+
+    /// Resolve the same model, role, policy, Skill, MCP, and sandbox facts a live host
+    /// would use, without opening a session or connecting external servers.
+    pub(crate) fn debug_agent_snapshot(&self) -> Value {
+        let definition = self.agent.definition();
+        let dynamic_tool_ids = self
+            .configured_extension_tool_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let rules = self.agent.rules_with_extension_tools(&dynamic_tool_ids);
+        let allowlist = definition
+            .tools
+            .as_ref()
+            .map(|tools| tools.iter().map(String::as_str).collect::<BTreeSet<_>>());
+        let parent_authority = self
+            .agent
+            .capabilities()
+            .tool_authority()
+            .map(|tools| tools.iter().cloned().collect::<Vec<_>>());
+
+        let mut candidates = BTreeMap::<String, String>::new();
+        for slot in zuno_tools::registry::DEFAULT_BUILTINS {
+            candidates.insert(slot.wire_id().to_owned(), "zuno.core".to_owned());
+        }
+        for id in [
+            zuno_tools::JOB_CANCEL_WIRE_ID,
+            zuno_tools::JOB_RECONCILE_WIRE_ID,
+            zuno_goal::GET_GOAL_TOOL_ID,
+            zuno_goal::CREATE_GOAL_TOOL_ID,
+            zuno_goal::UPDATE_GOAL_TOOL_ID,
+            zuno_tools::PLAN_GET_TOOL_ID,
+            zuno_tools::PLAN_UPDATE_TOOL_ID,
+            zuno_tools::TODO_GET_TOOL_ID,
+            zuno_tools::TODO_UPDATE_TOOL_ID,
+        ] {
+            candidates.insert(id.to_owned(), "zuno.runtime".to_owned());
+        }
+        if !self.capability.workflows.is_empty() {
+            candidates.insert(
+                zuno_tools::WORKFLOW_WIRE_ID.to_owned(),
+                "configuration.workflows".to_owned(),
+            );
+        }
+        if !self.capability.councils.is_empty() {
+            candidates.insert(
+                zuno_tools::COUNCIL_WIRE_ID.to_owned(),
+                "zuno.orchestration.councils".to_owned(),
+            );
+        }
+        let memory = self.config.resolved_memory();
+        if memory.enabled && memory.tool {
+            candidates.insert(
+                zuno_tools::memory::MEMORY_TOOL_ID.to_owned(),
+                "configuration.memory".to_owned(),
+            );
+        }
+        for (instance, product) in self.config.product_agent.iter().flatten() {
+            if product.is_enabled() {
+                candidates.insert(
+                    product.resolved_tool_name().to_owned(),
+                    format!("configuration.productAgent.{instance}"),
+                );
+            }
+        }
+        for id in &self.configured_extension_tool_ids {
+            candidates.insert(id.clone(), "active.extension".to_owned());
+        }
+
+        let can_delegate = self.agent.capabilities().can_delegate();
+        let product_tool_ids = self
+            .config
+            .product_agent
+            .iter()
+            .flatten()
+            .filter(|(_, product)| product.is_enabled())
+            .map(|(_, product)| product.resolved_tool_name())
+            .collect::<BTreeSet<_>>();
+        let search = zuno_tools::websearch::gating::SearchConfig::from_profile(
+            |key| self.configured_env_value(key),
+            self.config.web_search.as_ref(),
+        );
+        let search_blocker = if !search.enabled {
+            Some("web search is disabled by the effective profile".to_owned())
+        } else {
+            zuno_tools::websearch::gating::require_provider(&search)
+                .err()
+                .map(|error| error.to_string())
+        };
+
+        let mut policy_visible = Vec::new();
+        let mut unavailable = Vec::new();
+        for (id, source) in candidates {
+            let hidden_by_role = zuno_permission::visibility::is_tool_hidden(&id, &rules);
+            let outside_parent_authority = !self.agent.capabilities().within_tool_authority(&id);
+            let outside_allowlist = allowlist
+                .as_ref()
+                .is_some_and(|allowlist| !allowlist.contains(id.as_str()));
+            let subagent_tool_without_delegation = !can_delegate
+                && (id == zuno_tools::TASK_WIRE_ID
+                    || id == zuno_tools::WORKFLOW_WIRE_ID
+                    || id == zuno_tools::COUNCIL_WIRE_ID
+                    || product_tool_ids.contains(id.as_str()));
+            let reason = if hidden_by_role {
+                Some("hidden by the effective permission rules")
+            } else if outside_parent_authority {
+                Some("not present in the parent attempt tool authority")
+            } else if outside_allowlist {
+                Some("not present in the Agent tool allowlist")
+            } else if subagent_tool_without_delegation {
+                Some("the Agent cannot delegate")
+            } else if id == zuno_tools::websearch::ID && search_blocker.is_some() {
+                Some("the configured web-search provider is unavailable")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                unavailable.push(json!({
+                    "id": id,
+                    "source": source,
+                    "reason": if id == zuno_tools::websearch::ID {
+                        search_blocker.as_deref().unwrap_or(reason)
+                    } else {
+                        reason
+                    },
+                }));
+            } else {
+                policy_visible.push(json!({"id": id, "source": source}));
+            }
+        }
+
+        let sandbox = match super::tool_runtime::sandbox_policy(
+            &self.directory,
+            &self.config,
+            &self.agent,
+            &rules,
+        ) {
+            Ok(policy) => match zuno_sandbox::system_backend(&self.directory, policy.mode()) {
+                Ok(backend) => {
+                    let capabilities = backend.capabilities();
+                    let support_error = capabilities
+                        .supports(&policy)
+                        .err()
+                        .map(|error| error.to_string());
+                    json!({
+                        "configuredMode": self.config.sandbox_mode(),
+                        "effectiveMode": policy.mode(),
+                        "network": policy.network(),
+                        "workspace": policy.workspace(),
+                        "backend": capabilities,
+                        "ready": support_error.is_none(),
+                        "error": support_error,
+                    })
+                }
+                Err(error) => json!({
+                    "configuredMode": self.config.sandbox_mode(),
+                    "effectiveMode": policy.mode(),
+                    "network": policy.network(),
+                    "workspace": policy.workspace(),
+                    "ready": false,
+                    "error": error.to_string(),
+                }),
+            },
+            Err(error) => json!({
+                "configuredMode": self.config.sandbox_mode(),
+                "ready": false,
+                "error": error,
+            }),
+        };
+
+        let mcp = self
+            .config
+            .mcp
+            .iter()
+            .flat_map(|servers| servers.iter())
+            .map(|(name, server)| {
+                let kind = match server {
+                    zuno_config::schema::mcp::McpServerConfig::Local(_) => "local",
+                    zuno_config::schema::mcp::McpServerConfig::Remote(_) => "remote",
+                    zuno_config::schema::mcp::McpServerConfig::Toggle(_) => "toggle",
+                };
+                json!({
+                    "name": name,
+                    "kind": kind,
+                    "enabled": super::mcp_runtime::enabled(server),
+                    "state": "not-connected",
+                })
+            })
+            .collect::<Vec<_>>();
+        let required_skills = self
+            .required_skills
+            .iter()
+            .map(|skill| json!({"name": skill.name, "source": skill.source}))
+            .collect::<Vec<_>>();
+        let skills = self
+            .skills
+            .all()
+            .iter()
+            .map(|skill| {
+                json!({
+                    "name": skill.name,
+                    "source": skill.location,
+                    "required": self.required_skills.iter().any(|required| {
+                        required.name == skill.name && required.source == skill.location
+                    }),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut policy_sources = vec![agent_prompt_source(definition)];
+        if self.config.permission.is_some() {
+            policy_sources.push("configuration.permission".to_owned());
+        }
+        if definition.permission.is_some() {
+            policy_sources.push(format!(
+                "configuration.agent.{}.permission",
+                definition.name
+            ));
+        }
+        if self.tool_authority.is_some() {
+            policy_sources.push("parentAttempt.toolAuthority".to_owned());
+        }
+        policy_sources.push("zuno.runtime.tool-registry".to_owned());
+        policy_sources.push("configuration.sandbox".to_owned());
+
+        json!({
+            "schemaVersion": 2,
+            "agent": {
+                "name": definition.name,
+                "mode": zuno_catalog::agent::mode_label(definition.mode),
+                "source": definition.source,
+                "description": definition.description,
+                "stepLimit": definition.steps,
+            },
+            "model": {
+                "effective": self.qualified_model(),
+                "reasoningSupported": self.reasoning_supported,
+                "reasoning": self.effort,
+                "resolutionInputs": {
+                    "explicitModel": self.model_override,
+                    "agentModel": definition.model,
+                    "sessionModel": self.config.model,
+                    "preset": self.presets.selected(),
+                    "explicitReasoning": self.effort_override,
+                    "agentReasoning": definition.reasoning,
+                    "agentVariant": definition.variant,
+                },
+            },
+            "tools": {
+                "policyVisible": policy_visible,
+                "unavailable": unavailable,
+                "surfaceConditions": {
+                    "question": "requires an interactive QuestionAsker",
+                    "mcp": "tool ids are discovered only after a live MCP connection",
+                },
+                "parentAuthority": parent_authority,
+            },
+            "mcp": {
+                "inheritance": {
+                    "state": "not-connected",
+                    "reason": "MCP tool ids are known only after a live connection; configured allowlists and parent authority are evaluated per discovered tool",
+                },
+                "servers": mcp,
+            },
+            "skills": {
+                "required": required_skills,
+                "available": skills,
+                "parentExpandedBodiesInherited": false,
+                "configurationInheritedByChildren": true,
+            },
+            "delegates": self.agent.capabilities().delegation_targets(),
+            "sandbox": sandbox,
+            "policySources": policy_sources,
+            "notes": self.notes,
+        })
+    }
+
+    fn configured_env_value(&self, key: &str) -> Option<String> {
+        self.env.value(key).map(str::to_owned)
     }
 }
 
@@ -1328,6 +1636,7 @@ pub(crate) struct TurnHost {
     resolver: Resolver,
     skills: Arc<zuno_catalog::skill::Skills>,
     selected_skills: BTreeSet<SelectedSkillIdentity>,
+    selected_skill_prompt_budget: usize,
     required_skills: Vec<SelectedSkillIdentity>,
     council_presets: Vec<String>,
     dispatcher: ToolRegistryDispatcher,
@@ -1784,6 +2093,12 @@ fn job_result_text(value: &Value) -> Option<String> {
     value
         .as_str()
         .map(str::to_owned)
+        .or_else(|| {
+            value
+                .get("finalText")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .or_else(|| value.get("text").and_then(Value::as_str).map(str::to_owned))
         .or_else(|| (!value.is_null()).then(|| value.to_string()))
 }
@@ -2141,6 +2456,8 @@ impl TurnHost {
         };
         let skill_context_window = plan.window.context;
         let skill_config = plan.config.skills.clone();
+        let selected_skill_prompt_budget =
+            selected_skill_prompt_budget(skill_context_window, skill_config.as_ref());
         let commands = plan.command_registry(env, mcp.as_ref());
         let profile_runtime = HarnessRuntime::new("profile");
         let profile = plan.profile;
@@ -2294,7 +2611,12 @@ impl TurnHost {
                 skill_config.as_ref(),
             )?;
             let selected_skills = if prepared.identity.is_materialized() {
-                restore_selected_skills(&connection, prepared.identity.id(), &mut plan.resolver)?
+                restore_selected_skills(
+                    &connection,
+                    prepared.identity.id(),
+                    &mut plan.resolver,
+                    selected_skill_prompt_budget,
+                )?
             } else {
                 BTreeSet::new()
             };
@@ -2430,6 +2752,7 @@ impl TurnHost {
                 resolver: plan.resolver,
                 skills: plan.skills,
                 selected_skills,
+                selected_skill_prompt_budget,
                 required_skills: plan.required_skills,
                 council_presets,
                 dispatcher,
@@ -2749,29 +3072,43 @@ impl TurnHost {
                 changed = true;
                 serde_json::to_value(goal).map_err(to_string)?
             }
-            "block" | "complete" => {
-                if action == "block" && value.is_empty() {
+            "block" => {
+                if value.is_empty() {
                     return Err("usage: /goal block <reason>".to_owned());
                 }
-                let status = if action == "block" {
-                    zuno_goal::ModelStatus::Blocked
-                } else {
-                    zuno_goal::ModelStatus::Complete
-                };
                 let expected_revision = self
                     .goal_store
                     .goal(&self.session_id)
                     .map_err(to_string)?
                     .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
                     .revision;
-                if action == "block" {
-                    self.goal_store
-                        .record_failure_signal(&self.session_id, Some(value))
-                        .map_err(to_string)?;
-                }
+                self.goal_store
+                    .record_failure_signal(&self.session_id, Some(value))
+                    .map_err(to_string)?;
                 let goal = self
                     .goal_store
-                    .update_status_as_model_checked(&self.session_id, status, expected_revision)
+                    .update_status_as_model_checked(
+                        &self.session_id,
+                        zuno_goal::ModelStatus::Blocked,
+                        expected_revision,
+                    )
+                    .map_err(to_string)?
+                    .ok_or_else(|| {
+                        "no goal exists; run /goal create <objective> first".to_owned()
+                    })?;
+                changed = true;
+                serde_json::to_value(goal).map_err(to_string)?
+            }
+            "complete" => {
+                let expected_revision = self
+                    .goal_store
+                    .goal(&self.session_id)
+                    .map_err(to_string)?
+                    .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
+                    .revision;
+                let goal = self
+                    .goal_store
+                    .complete_checked(&self.session_id, expected_revision)
                     .map_err(to_string)?
                     .ok_or_else(|| {
                         "no goal exists; run /goal create <objective> first".to_owned()
@@ -3521,6 +3858,25 @@ impl TurnHost {
         .await
     }
 
+    /// Drive an already-promoted durable input while using a lease acquired by the caller.
+    pub(crate) async fn drive_promoted_with_guard(
+        &mut self,
+        prompt: &str,
+        message_id: &str,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        self.drive_input(
+            prompt,
+            Some(message_id),
+            None,
+            UserInputPersistence::AlreadyPromoted,
+            &guard,
+            events,
+        )
+        .await
+    }
+
     /// Drive an input whose durable inbox row was already promoted by the caller.
     pub(crate) async fn drive_promoted(
         &mut self,
@@ -3730,6 +4086,7 @@ impl TurnHost {
             &mut self.selected_skills,
             name,
             source,
+            self.selected_skill_prompt_budget,
         )
         .await?
         {
@@ -3780,6 +4137,7 @@ impl TurnHost {
             &self.skills,
             &mut self.selected_skills,
             &self.required_skills,
+            self.selected_skill_prompt_budget,
         )
         .await?;
         for skill in required {
@@ -3796,6 +4154,7 @@ impl TurnHost {
             &self.skills,
             &mut self.selected_skills,
             prompt,
+            self.selected_skill_prompt_budget,
         )
         .await?;
         for skill in newly_loaded {
@@ -3939,7 +4298,9 @@ impl TurnHost {
         }
         let transaction =
             zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
-        persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
+        let mut message = message.clone();
+        attach_promoted_task_report_metadata(&transaction, &mut message).map_err(to_string)?;
+        persist_prepared_user_message(&transaction, &message, parts).map_err(to_string)?;
         consume_promoted_input(&transaction, &self.session_id, &message.id)?;
         transaction.commit().map_err(to_string)
     }
@@ -4137,14 +4498,19 @@ impl TurnHost {
     }
 
     fn goal_dynamic_context(&self) -> Result<DynamicContext, String> {
-        self.goal_continuation
+        let mut context = self
+            .goal_continuation
             .injection(&self.session_id)
             .map_err(to_string)
             .map(|entry| {
                 entry.map_or_else(DynamicContext::default, |entry| {
                     dynamic_context_from_goal_entry(&entry)
                 })
-            })
+            })?;
+        if let Some(work) = durable_work_context(&self.connection, &self.session_id)? {
+            context = context.with_runtime_instruction(work);
+        }
+        Ok(context)
     }
 
     fn finish_goal_turn(
@@ -4589,6 +4955,303 @@ fn goal_tool_failure(recoveries: &[ToolFailureRecovery]) -> Option<GoalTerminalF
     })
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableWorkContextSnapshot {
+    schema_version: u32,
+    plan: Option<DurablePlanContext>,
+    todos: Vec<DurableTodoContext>,
+    jobs: Vec<DurableJobContext>,
+    pending_reports: Vec<DurableReportContext>,
+    latest_prior_prompt_receipt_id: Option<String>,
+    omitted_todos: usize,
+    omitted_jobs: usize,
+    omitted_pending_reports: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurablePlanContext {
+    id: String,
+    goal_id: Option<String>,
+    revision: i64,
+    title: String,
+    steps: Vec<DurablePlanStepContext>,
+    omitted_steps: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurablePlanStepContext {
+    id: String,
+    title: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableTodoContext {
+    id: String,
+    goal_id: Option<String>,
+    plan_step_id: Option<String>,
+    subject: String,
+    status: String,
+    priority: String,
+    dependencies: Vec<String>,
+    owner: Option<String>,
+    revision: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableJobContext {
+    id: String,
+    subject: Value,
+    status: String,
+    report_delivery: String,
+    report_input_id: Option<String>,
+    final_text: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableReportContext {
+    id: String,
+    job_id: Option<String>,
+    child_session_id: Option<String>,
+    status: Option<String>,
+    state: String,
+    revision: i64,
+}
+
+fn capped<T>(values: Vec<T>) -> (Vec<T>, usize) {
+    let omitted = values
+        .len()
+        .saturating_sub(DURABLE_WORK_CONTEXT_MAX_ENTRIES);
+    (
+        values
+            .into_iter()
+            .take(DURABLE_WORK_CONTEXT_MAX_ENTRIES)
+            .collect(),
+        omitted,
+    )
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let content_limit = max_bytes.saturating_sub('…'.len_utf8());
+    let mut end = content_limit.min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value.truncate(end);
+    value.push('…');
+}
+
+fn render_durable_work_context(mut snapshot: DurableWorkContextSnapshot) -> Result<String, String> {
+    if let Some(plan) = snapshot.plan.as_mut() {
+        truncate_utf8(&mut plan.title, DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES);
+        for step in &mut plan.steps {
+            truncate_utf8(&mut step.title, DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES);
+        }
+    }
+    for todo in &mut snapshot.todos {
+        truncate_utf8(&mut todo.subject, DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES);
+    }
+    for job in &mut snapshot.jobs {
+        if let Some(final_text) = job.final_text.as_mut() {
+            truncate_utf8(final_text, DURABLE_WORK_CONTEXT_FINAL_TEXT_MAX_BYTES);
+        }
+        if let Some(error) = job.error.as_mut() {
+            truncate_utf8(error, DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES);
+        }
+    }
+
+    loop {
+        let encoded = serde_json::to_string(&snapshot).map_err(to_string)?;
+        let rendered = format!("{DURABLE_WORK_CONTEXT_HEADER}{encoded}");
+        if rendered.len() <= DURABLE_WORK_CONTEXT_MAX_BYTES {
+            return Ok(rendered);
+        }
+        if let Some(job) = snapshot
+            .jobs
+            .iter_mut()
+            .rev()
+            .find(|job| job.final_text.is_some() || job.error.is_some())
+        {
+            job.final_text = None;
+            job.error = None;
+            continue;
+        }
+        if snapshot.todos.pop().is_some() {
+            snapshot.omitted_todos = snapshot.omitted_todos.saturating_add(1);
+            continue;
+        }
+        if let Some(plan) = snapshot.plan.as_mut()
+            && plan.steps.pop().is_some()
+        {
+            plan.omitted_steps = plan.omitted_steps.saturating_add(1);
+            continue;
+        }
+        if snapshot.pending_reports.pop().is_some() {
+            snapshot.omitted_pending_reports = snapshot.omitted_pending_reports.saturating_add(1);
+            continue;
+        }
+        if snapshot.jobs.pop().is_some() {
+            snapshot.omitted_jobs = snapshot.omitted_jobs.saturating_add(1);
+            continue;
+        }
+        if snapshot.latest_prior_prompt_receipt_id.take().is_some() {
+            continue;
+        }
+        return Err(format!(
+            "runtime.work_state cannot fit its authoritative identity fields within the \
+             {DURABLE_WORK_CONTEXT_MAX_BYTES}-byte prompt budget"
+        ));
+    }
+}
+
+fn durable_work_context(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(zuno_db::open::map_error)
+        .map_err(to_string)?;
+    let work =
+        zuno_tools::WorkStateStore::snapshot_in(&transaction, session_id).map_err(to_string)?;
+    let plan = work.plan.map(|plan| {
+        let (steps, omitted_steps) = capped(
+            plan.steps
+                .into_iter()
+                .map(|step| DurablePlanStepContext {
+                    id: step.id,
+                    title: step.title,
+                    status: step.status.as_str().to_owned(),
+                })
+                .collect(),
+        );
+        DurablePlanContext {
+            id: plan.id,
+            goal_id: plan.goal_id,
+            revision: plan.revision,
+            title: plan.title,
+            steps,
+            omitted_steps,
+        }
+    });
+    let (todos, omitted_todos) = capped(
+        work.items
+            .into_iter()
+            .map(|item| DurableTodoContext {
+                id: item.id,
+                goal_id: item.goal_id,
+                plan_step_id: item.plan_step_id,
+                subject: item.subject,
+                status: item.status.as_str().to_owned(),
+                priority: item.priority.as_str().to_owned(),
+                dependencies: item.dependencies,
+                owner: item.owner,
+                revision: item.revision,
+            })
+            .collect(),
+    );
+
+    let pending = zuno_db::inbox::pending_in(&transaction, session_id)
+        .map_err(to_string)?
+        .into_iter()
+        .filter(|input| input.prompt.get("kind").and_then(Value::as_str) == Some("subagentReport"))
+        .collect::<Vec<_>>();
+    let pending_report_ids = pending
+        .iter()
+        .map(|input| input.id.clone())
+        .collect::<BTreeSet<_>>();
+    let (pending_reports, omitted_pending_reports) = capped(
+        pending
+            .into_iter()
+            .map(|input| DurableReportContext {
+                id: input.id,
+                job_id: input
+                    .prompt
+                    .get("jobID")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                child_session_id: input
+                    .prompt
+                    .get("childSessionID")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                status: input
+                    .prompt
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                state: input.state.as_str().to_owned(),
+                revision: input.revision,
+            })
+            .collect(),
+    );
+
+    let relevant_jobs = zuno_db::job::list_for_parent_in(&transaction, session_id)
+        .map_err(to_string)?
+        .into_iter()
+        .filter(|job| {
+            matches!(
+                job.status,
+                zuno_db::job::JobStatus::Queued
+                    | zuno_db::job::JobStatus::Running
+                    | zuno_db::job::JobStatus::Uncertain
+            ) || job
+                .report_input_id
+                .as_deref()
+                .is_some_and(|id| pending_report_ids.contains(id))
+        })
+        .map(|job| DurableJobContext {
+            id: job.id,
+            subject: job.subject.as_json(),
+            status: job.status.as_str().to_owned(),
+            report_delivery: job.report_delivery.as_str().to_owned(),
+            report_input_id: job.report_input_id,
+            final_text: job.result.as_ref().and_then(job_result_text),
+            error: job.error,
+        })
+        .collect::<Vec<_>>();
+    let (jobs, omitted_jobs) = capped(relevant_jobs);
+
+    if plan.is_none() && todos.is_empty() && jobs.is_empty() && pending_reports.is_empty() {
+        transaction.commit().map_err(to_string)?;
+        return Ok(None);
+    }
+
+    let latest_prior_prompt_receipt_id = transaction
+        .query_row(
+            "SELECT id FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.prompt.assembled.1' \
+             ORDER BY seq DESC LIMIT 1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_string)?;
+    let snapshot = DurableWorkContextSnapshot {
+        schema_version: DURABLE_WORK_CONTEXT_SCHEMA_VERSION,
+        plan,
+        todos,
+        jobs,
+        pending_reports,
+        latest_prior_prompt_receipt_id,
+        omitted_todos,
+        omitted_jobs,
+        omitted_pending_reports,
+    };
+    transaction.commit().map_err(to_string)?;
+    render_durable_work_context(snapshot).map(Some)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct GoalUsage {
     tokens: i64,
@@ -4716,6 +5379,7 @@ fn restore_selected_skills(
     connection: &rusqlite::Connection,
     session_id: &str,
     resolver: &mut Resolver,
+    prompt_budget: usize,
 ) -> Result<BTreeSet<SelectedSkillIdentity>, String> {
     let receipt = connection
         .query_row(
@@ -4737,6 +5401,13 @@ fn restore_selected_skills(
         {
             continue;
         }
+        ensure_selected_skill_prompt_budget(
+            resolver,
+            &selected.identity.name,
+            &selected.identity.source,
+            selected.content.len(),
+            prompt_budget,
+        )?;
         resolver.append_selected_skill(
             &selected.identity.name,
             &selected.identity.source,
@@ -4785,11 +5456,19 @@ async fn preload_required_skills(
     skills: &zuno_catalog::skill::Skills,
     loaded: &mut BTreeSet<SelectedSkillIdentity>,
     required: &[SelectedSkillIdentity],
+    prompt_budget: usize,
 ) -> Result<Vec<SelectedSkillIdentity>, String> {
     let mut selected = Vec::new();
     for skill in required {
-        if let Some(identity) =
-            preload_selected_skill(resolver, skills, loaded, &skill.name, &skill.source).await?
+        if let Some(identity) = preload_selected_skill(
+            resolver,
+            skills,
+            loaded,
+            &skill.name,
+            &skill.source,
+            prompt_budget,
+        )
+        .await?
         {
             selected.push(identity);
         }
@@ -4803,6 +5482,7 @@ async fn preload_selected_skill(
     loaded: &mut BTreeSet<SelectedSkillIdentity>,
     name: &str,
     source: &str,
+    prompt_budget: usize,
 ) -> Result<Option<SelectedSkillIdentity>, String> {
     if loaded.iter().any(|identity| identity.source == source) {
         return Ok(None);
@@ -4810,6 +5490,13 @@ async fn preload_selected_skill(
     let document = zuno_tools::load_skill_document(skills, name, Some(source))
         .await
         .map_err(to_string)?;
+    ensure_selected_skill_prompt_budget(
+        resolver,
+        &document.name,
+        &document.source,
+        document.content.len(),
+        prompt_budget,
+    )?;
     resolver.append_selected_skill(&document.name, &document.source, document.content)?;
     let identity = SelectedSkillIdentity {
         name: document.name,
@@ -4824,6 +5511,7 @@ async fn preload_explicit_skills(
     skills: &zuno_catalog::skill::Skills,
     loaded: &mut BTreeSet<SelectedSkillIdentity>,
     prompt: &str,
+    prompt_budget: usize,
 ) -> Result<Vec<SelectedSkillIdentity>, String> {
     let mut mentioned = skills
         .all()
@@ -4843,8 +5531,15 @@ async fn preload_explicit_skills(
         let [skill] = matches.as_slice() else {
             continue;
         };
-        if let Some(identity) =
-            preload_selected_skill(resolver, skills, loaded, &skill.name, &skill.location).await?
+        if let Some(identity) = preload_selected_skill(
+            resolver,
+            skills,
+            loaded,
+            &skill.name,
+            &skill.location,
+            prompt_budget,
+        )
+        .await?
         {
             selected.push(identity);
         }
@@ -4884,6 +5579,12 @@ const DEFAULT_SKILL_METADATA_CHAR_BUDGET: usize = 8_000;
 const MAX_SKILL_METADATA_TOKEN_BUDGET: usize = 10_000;
 const SKILL_METADATA_CONTEXT_PERCENT: u64 = 2;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
+const DEFAULT_SELECTED_SKILL_TOKEN_BUDGET: usize = 8_000;
+const MIN_SELECTED_SKILL_TOKEN_BUDGET: usize = 2_000;
+const MAX_SELECTED_SKILL_TOKEN_BUDGET: usize = 32_000;
+const SELECTED_SKILL_CONTEXT_PERCENT: u64 = 10;
+const SELECTED_SKILL_PROMPT_MAX_BYTES: usize =
+    MAX_SELECTED_SKILL_TOKEN_BUDGET * APPROX_BYTES_PER_TOKEN;
 
 /// System-level trigger rules for progressive skill discovery.
 const SKILL_USAGE_POLICY: &str = "\
@@ -4896,7 +5597,9 @@ every selected SKILL.md completely, following `next_cursor` until complete, then
 referenced resources required for the task with action `read_resource` and the same name/source. \
 Do not delegate reading or interpreting skill instructions. Prefer bundled scripts, assets, and \
 templates over recreating them. Announce the minimal skill set and order you will use. Never use \
-shell, find, glob, or a broad filesystem scan to rediscover an advertised or loaded skill.";
+shell, find, glob, or a broad filesystem scan to rediscover an advertised or loaded skill. A \
+Skill does not grant tools, permissions, filesystem access, network access, or environment access; \
+the active runtime capability snapshot remains authoritative.";
 
 /// Put a compact discovered-skill index in the system prompt.
 ///
@@ -4975,6 +5678,73 @@ fn skill_metadata_budget(
             .min(MAX_SKILL_METADATA_TOKEN_BUDGET)
             .saturating_mul(APPROX_BYTES_PER_TOKEN)
     })
+}
+
+/// Aggregate prompt budget for fully selected Skill bodies.
+///
+/// The catalog has its own small discovery budget. Selected bodies are more
+/// valuable, but they still cannot grow without bound as a session loads Skills.
+/// With a known model window the default is ten percent, with a 2,000-token floor
+/// and a 32,000-token ceiling. An explicit `maxSelectedContextTokens` replaces the
+/// derived value but remains subject to the same ceiling. Unknown model windows use
+/// 8,000 approximate tokens.
+fn selected_skill_prompt_budget(
+    context_window: u64,
+    config: Option<&zuno_config::schema::SkillsConfig>,
+) -> usize {
+    let configured = config
+        .and_then(|settings| settings.max_selected_context_tokens)
+        .map(|tokens| usize::try_from(tokens.get()).unwrap_or(usize::MAX));
+    let tokens = configured.unwrap_or_else(|| {
+        if context_window == 0 {
+            DEFAULT_SELECTED_SKILL_TOKEN_BUDGET
+        } else {
+            usize::try_from(
+                context_window
+                    .saturating_mul(SELECTED_SKILL_CONTEXT_PERCENT)
+                    .saturating_div(100)
+                    .max(MIN_SELECTED_SKILL_TOKEN_BUDGET as u64),
+            )
+            .unwrap_or(usize::MAX)
+        }
+    });
+    tokens
+        .saturating_mul(APPROX_BYTES_PER_TOKEN)
+        .min(SELECTED_SKILL_PROMPT_MAX_BYTES)
+}
+
+fn selected_skill_prompt_bytes(resolver: &Resolver) -> Result<usize, String> {
+    let assembly = resolver
+        .prompt_assembly
+        .as_ref()
+        .ok_or_else(|| "selected Skills require a typed PromptAssembly".to_owned())?;
+    Ok(assembly
+        .sections()
+        .iter()
+        .filter(|section| section.selected_skill_name().is_some())
+        .map(|section| section.content().len())
+        .sum())
+}
+
+fn ensure_selected_skill_prompt_budget(
+    resolver: &Resolver,
+    name: &str,
+    source: &str,
+    incoming_bytes: usize,
+    prompt_budget: usize,
+) -> Result<(), String> {
+    let used = selected_skill_prompt_bytes(resolver)?;
+    let projected = used.checked_add(incoming_bytes).ok_or_else(|| {
+        format!("selected Skill `{name}` from `{source}` is too large to account for in the prompt")
+    })?;
+    if projected > prompt_budget {
+        return Err(format!(
+            "selected Skill `{name}` from `{source}` ({incoming_bytes} bytes) would raise selected \
+             Skill bodies to {projected} bytes, exceeding the {prompt_budget}-byte aggregate \
+             prompt budget"
+        ));
+    }
+    Ok(())
 }
 
 /// How many bytes of instruction files may enter the system prompt.
@@ -6192,7 +6962,8 @@ struct Resolver {
     requested_agent: String,
     system_prompt: String,
     prompt_assembly: Option<PromptAssembly>,
-    max_steps: u32,
+    runtime_prompt_policy: RuntimePromptPolicy,
+    max_steps: Option<NonZeroU32>,
     requested_provider: String,
     requested_model: String,
     wire_model: String,
@@ -6204,15 +6975,16 @@ struct Resolver {
 impl AgentModelResolver for Resolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
         (requested == self.requested_agent).then(|| {
-            let agent = ResolvedAgent::new(
-                self.requested_agent.clone(),
-                self.system_prompt.clone(),
-                self.max_steps,
-            );
+            let mut agent =
+                ResolvedAgent::new(self.requested_agent.clone(), self.system_prompt.clone());
+            if let Some(max_steps) = self.max_steps {
+                agent = agent.with_max_steps(max_steps);
+            }
             let agent = match &self.prompt_assembly {
                 Some(assembly) => agent.with_prompt_assembly(assembly.clone()),
                 None => agent,
             };
+            let agent = agent.with_runtime_prompt_policy(self.runtime_prompt_policy.clone());
             match &self.orchestration_seed {
                 Some(seed) => agent.with_orchestration_seed(Arc::clone(seed)),
                 None => agent,
@@ -6256,17 +7028,14 @@ impl Resolver {
             return Ok(());
         }
         let source = source.into();
-        if let Some(assembly) = &mut self.prompt_assembly {
-            assembly
-                .push_selected_skill(name, source, content)
-                .map_err(to_string)?;
-            self.system_prompt = assembly.render();
-        } else if self.system_prompt.is_empty() {
-            self.system_prompt = content;
-        } else {
-            self.system_prompt.push_str("\n\n");
-            self.system_prompt.push_str(&content);
-        }
+        let assembly = self
+            .prompt_assembly
+            .as_mut()
+            .ok_or_else(|| "selected Skills require a typed PromptAssembly".to_owned())?;
+        assembly
+            .push_selected_skill(name, source, content)
+            .map_err(to_string)?;
+        self.system_prompt = assembly.render();
         Ok(())
     }
 
@@ -6326,6 +7095,7 @@ fn orchestration_capability(
         extension_revision,
         permission_policy_sha256,
         CapabilityContents {
+            sandbox: sandbox_capability_descriptor(config),
             profiles,
             presets: preset_descriptors(presets),
             councils: council_descriptors(),
@@ -6333,6 +7103,32 @@ fn orchestration_capability(
             skills: skill_descriptors(skills),
         },
     ))
+}
+
+fn sandbox_capability_descriptor(
+    config: &zuno_config::schema::Config,
+) -> SandboxCapabilityDescriptor {
+    let sandbox = config.sandbox.as_ref();
+    let mut writable_roots = sandbox
+        .and_then(|sandbox| sandbox.writable_roots.clone())
+        .unwrap_or_default();
+    writable_roots.sort();
+    writable_roots.dedup();
+    let mut protected_paths = sandbox
+        .and_then(|sandbox| sandbox.protected_paths.clone())
+        .unwrap_or_default();
+    protected_paths.sort();
+    protected_paths.dedup();
+    SandboxCapabilityDescriptor {
+        mode: config.sandbox_mode().as_str().to_owned(),
+        network: match config.sandbox_network() {
+            zuno_config::schema::sandbox::SandboxNetworkMode::Deny => "deny",
+            zuno_config::schema::sandbox::SandboxNetworkMode::Allow => "allow",
+        }
+        .to_owned(),
+        writable_roots,
+        protected_paths,
+    }
 }
 
 fn profile_descriptor(profile: &AgentProfile) -> Result<ProfileDescriptor, String> {
@@ -6365,7 +7161,14 @@ fn agent_attempt_identity(
             "rules": profile.capabilities().rules(),
             "parentToolAuthority": tool_authority,
         })),
-        prompt_policy_sha256: sha256_text(profile.prompt_policy()),
+        prompt_policy_sha256: sha256_json(&serde_json::json!({
+            "delegationTargets": profile.capabilities().delegation_targets(),
+            "delegationGuidance": profile.delegation_guidance(),
+            "shellFilesystemAccess": format!(
+                "{:?}",
+                profile.capabilities().shell_filesystem_access()
+            ),
+        })),
     })
 }
 
@@ -6840,6 +7643,26 @@ fn persist_prepared_user_message(
     for part in parts {
         store.put_part_at(part, part.time_created)?;
     }
+    Ok(())
+}
+
+fn attach_promoted_task_report_metadata(
+    connection: &rusqlite::Connection,
+    message: &mut zuno_db::message::MessageRecord,
+) -> Result<(), DbError> {
+    let Some(input) = zuno_db::inbox::read_in(connection, &message.session_id, &message.id)? else {
+        return Ok(());
+    };
+    if input.prompt.get("kind").and_then(Value::as_str) != Some("subagentReport") {
+        return Ok(());
+    }
+    let Some(metadata) = input.prompt.get("metadata") else {
+        return Ok(());
+    };
+    message.data.insert(
+        zuno_db::message::TASK_REPORT_METADATA_KEY.to_owned(),
+        metadata.clone(),
+    );
     Ok(())
 }
 

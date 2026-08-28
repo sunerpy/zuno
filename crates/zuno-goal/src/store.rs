@@ -548,10 +548,11 @@ impl GoalStore {
         )
     }
 
-    /// Complete a goal only when all durable plan steps, work items, and jobs are terminal.
+    /// Complete a goal only when all durable work and next-step reports are reconciled.
     ///
     /// The completion audit and status update share one `IMMEDIATE` transaction, so a
-    /// concurrent writer cannot add unfinished work between the check and the update.
+    /// concurrent writer cannot add unfinished work or consume a report between the
+    /// check and the update.
     pub fn complete_checked(
         &self,
         session_id: &str,
@@ -1352,8 +1353,33 @@ fn completion_blockers(
         0
     };
     let jobs = if table_exists(tx, "agent_job")? {
+        // Session ancestry is durable in `session.parent_id`. `UNION` deliberately
+        // de-duplicates each reachable id, so even a corrupt parent cycle reaches
+        // a fixed point instead of recursing forever.
         tx.query_row(
-            "SELECT COUNT(*) FROM agent_job              WHERE parent_session_id = ?1 AND status NOT IN ('completed','cancelled')",
+            "WITH RECURSIVE descendant_session(session_id) AS ( \
+               VALUES (?1) \
+               UNION \
+               SELECT s.id \
+               FROM session AS s \
+               JOIN descendant_session AS d ON s.parent_id = d.session_id \
+             ) \
+             SELECT COUNT(*) \
+             FROM agent_job AS j \
+             JOIN descendant_session AS d ON d.session_id = j.parent_session_id \
+             WHERE ( \
+                 j.status IN ('queued', 'running', 'uncertain') \
+                 OR ( \
+                   j.report_delivery = 'next-step' \
+                   AND j.status IN ('completed', 'failed', 'cancelled') \
+                   AND EXISTS ( \
+                     SELECT 1 FROM session_input AS i \
+                     WHERE i.id = j.report_input_id \
+                       AND i.session_id = j.parent_session_id \
+                       AND i.state IN ('queued', 'steering', 'promoted') \
+                   ) \
+                 ) \
+               )",
             params![session_id],
             |row| row.get::<_, i64>(0),
         )

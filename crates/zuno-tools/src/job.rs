@@ -89,6 +89,7 @@ fn render(job: AgentJob) -> Result<ToolOutput, ToolError> {
     let body = json!({
         "jobID": job.id,
         "parentSessionID": job.parent_session_id,
+        "logicalKey": job.logical_key,
         "subject": job.subject.as_json(),
         "status": status,
         "reportDelivery": delivery_name(job.report_delivery),

@@ -7,6 +7,7 @@ use zuno_paths::DbLocation;
 use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext, ToolReplayPolicy, erase};
 use zuno_tools::job::JobTool;
 use zuno_tools::job_cancel::{CancelOutcome, JobCancelTool, JobController};
+use zuno_tools::job_reconcile::JobReconcileTool;
 
 const PARENT: &str = "ses_parent";
 const OTHER_PARENT: &str = "ses_other";
@@ -90,6 +91,10 @@ fn cancel_tool(pool: Arc<Pool>, controller: Arc<RecordingController>) -> Arc<dyn
         pool,
         controller as Arc<dyn JobController>,
     ))
+}
+
+fn reconcile_tool(pool: Arc<Pool>) -> Arc<dyn Tool> {
+    erase(JobReconcileTool::new(pool))
 }
 
 fn output_json(output: &zuno_tool::ToolOutput) -> Value {
@@ -207,6 +212,81 @@ fn cancellation_is_explicitly_non_replayable_and_uses_job_id_wire_casing() {
     let schema = erased.definition().parameters;
     assert!(schema["properties"].get("jobID").is_some(), "{schema}");
     assert!(schema["properties"].get("job_id").is_none(), "{schema}");
+}
+
+#[test]
+fn reconciliation_is_non_replayable_and_requires_authoritative_evidence() {
+    let erased = reconcile_tool(initialized());
+
+    assert_eq!(erased.id(), "job_reconcile");
+    assert_eq!(erased.replay_policy(), ToolReplayPolicy::Never);
+    let schema = erased.definition().parameters;
+    assert!(schema["properties"].get("jobID").is_some(), "{schema}");
+    assert!(schema["properties"].get("authority").is_some(), "{schema}");
+    assert!(schema["properties"].get("evidence").is_some(), "{schema}");
+}
+
+#[tokio::test]
+async fn an_owned_uncertain_job_is_reconciled_and_reports_the_authoritative_outcome() {
+    let pool = initialized();
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    store
+        .create(NewAgentJob::new(
+            "job_uncertain",
+            PARENT,
+            JobSubject::child_session(CHILD),
+            ReportDelivery::NextStep,
+            10,
+        ))
+        .expect("create job");
+    store
+        .settle(
+            "job_uncertain",
+            JobSettlement::uncertain(
+                "transport closed after dispatch",
+                20,
+                Some(zuno_db::inbox::NewSessionInput::new(
+                    "input_uncertain",
+                    PARENT,
+                    json!({"kind":"subagentReport","jobID":"job_uncertain","text":"uncertain"}),
+                    zuno_db::inbox::InputDelivery::Queue,
+                    20,
+                )),
+            ),
+        )
+        .expect("mark uncertain");
+
+    let output = reconcile_tool(Arc::clone(&pool))
+        .invoke(
+            json!({
+                "jobID":"job_uncertain",
+                "outcome":"completed",
+                "finalText":"artifact 42 exists",
+                "authority":"release API",
+                "evidence":"GET /releases/42 returned healthy"
+            }),
+            context(PARENT),
+        )
+        .await
+        .expect("reconcile job");
+    let body = output_json(&output);
+
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["authority"], "release API");
+    assert_eq!(body["evidence"], "GET /releases/42 returned healthy");
+    assert_eq!(
+        store.get("job_uncertain").expect("reconciled job").status,
+        zuno_db::job::JobStatus::Completed
+    );
+    let pending = zuno_db::inbox::SessionInbox::new(pool)
+        .pending(PARENT)
+        .expect("pending reconciliation report");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].prompt["status"], "completed");
+    assert_eq!(
+        pending[0].prompt["metadata"]["finalText"],
+        "artifact 42 exists"
+    );
 }
 
 #[tokio::test]

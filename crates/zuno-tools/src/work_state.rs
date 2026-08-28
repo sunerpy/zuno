@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use zuno_db::Pool;
@@ -23,6 +24,15 @@ pub const PLAN_GET_DESCRIPTION: &str = include_str!("description/plan-get.txt");
 pub const PLAN_UPDATE_DESCRIPTION: &str = include_str!("description/plan-update.txt");
 pub const TODO_GET_DESCRIPTION: &str = include_str!("description/todo-get.txt");
 pub const TODO_UPDATE_DESCRIPTION: &str = include_str!("description/todo-update.txt");
+
+// Runtime work-state projections have a 16 KiB total envelope. Generated Zuno
+// identifiers are much smaller; this ceiling admits external Unicode ids while
+// ensuring one non-droppable identity cannot consume the whole envelope.
+const MAX_DURABLE_IDENTIFIER_BYTES: usize = 512;
+// Projection diagnostics occupy the goal_id slot so existing consumers cannot
+// mistake a truncated value for the durable identity. The reserved prefix keeps
+// user-written ids disjoint from host-generated omission/error markers.
+const INVALID_DURABLE_IDENTIFIER_PREFIX: &str = "zuno.invalid-id/v1;";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -189,9 +199,21 @@ impl WorkStateStore {
 
     pub fn snapshot(&self, session_id: &str) -> Result<WorkStateSnapshot, WorkStateError> {
         let connection = self.pool.get()?;
+        Self::snapshot_in(&connection, session_id)
+    }
+
+    /// Read one complete plan/todo snapshot through a caller-owned SQLite snapshot.
+    ///
+    /// Runtime prompt assembly uses this together with jobs, inbox reports, and
+    /// prompt receipts inside one deferred transaction so compaction cannot combine
+    /// state from different commits.
+    pub fn snapshot_in(
+        connection: &zuno_db::Connection,
+        session_id: &str,
+    ) -> Result<WorkStateSnapshot, WorkStateError> {
         Ok(WorkStateSnapshot {
-            plan: plan_in(&connection, session_id)?,
-            items: list_items_in(&connection, session_id)?,
+            plan: plan_in(connection, session_id)?.map(project_plan_for_snapshot),
+            items: list_items_in(connection, session_id)?,
         })
     }
 
@@ -481,6 +503,9 @@ fn validate_plan(params: &PlanUpdateParams) -> Result<(), WorkStateError> {
             "plan title must not be empty".to_owned(),
         ));
     }
+    if let Some(goal_id) = params.goal_id.as_deref() {
+        validate_durable_identifier("plan goal_id", goal_id)?;
+    }
     if params
         .expected_revision
         .is_some_and(|revision| revision <= 0)
@@ -521,6 +546,87 @@ fn validate_plan(params: &PlanUpdateParams) -> Result<(), WorkStateError> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvalidIdentifierReason {
+    Empty,
+    TooLong,
+    SurroundingWhitespace,
+    ControlCharacter,
+    ReservedPrefix,
+}
+
+impl InvalidIdentifierReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::TooLong => "too_long",
+            Self::SurroundingWhitespace => "surrounding_whitespace",
+            Self::ControlCharacter => "control_character",
+            Self::ReservedPrefix => "reserved_prefix",
+        }
+    }
+}
+
+fn invalid_identifier_reason(value: &str) -> Option<InvalidIdentifierReason> {
+    if value.is_empty() {
+        return Some(InvalidIdentifierReason::Empty);
+    }
+    if value.len() > MAX_DURABLE_IDENTIFIER_BYTES {
+        return Some(InvalidIdentifierReason::TooLong);
+    }
+    if value.starts_with(INVALID_DURABLE_IDENTIFIER_PREFIX) {
+        return Some(InvalidIdentifierReason::ReservedPrefix);
+    }
+    if value.trim() != value {
+        return Some(InvalidIdentifierReason::SurroundingWhitespace);
+    }
+    value
+        .chars()
+        .any(char::is_control)
+        .then_some(InvalidIdentifierReason::ControlCharacter)
+}
+
+fn validate_durable_identifier(field: &str, value: &str) -> Result<(), WorkStateError> {
+    let Some(reason) = invalid_identifier_reason(value) else {
+        return Ok(());
+    };
+    Err(WorkStateError::Invalid(format!(
+        "{field} is invalid ({reason}); identifiers must be non-empty, contain no surrounding \
+         whitespace or control characters, avoid the reserved \
+         `{INVALID_DURABLE_IDENTIFIER_PREFIX}` prefix, and use at most \
+         {MAX_DURABLE_IDENTIFIER_BYTES} bytes; received {} bytes",
+        value.len(),
+        reason = reason.as_str()
+    )))
+}
+
+fn project_plan_for_snapshot(mut plan: WorkPlan) -> WorkPlan {
+    if let Some(goal_id) = plan.goal_id.as_mut()
+        && let Some(reason) = invalid_identifier_reason(goal_id)
+    {
+        *goal_id = invalid_durable_identifier_projection("plan.goal_id", reason, goal_id);
+    }
+    plan
+}
+
+fn invalid_durable_identifier_projection(
+    field: &str,
+    reason: InvalidIdentifierReason,
+    value: &str,
+) -> String {
+    // Preserve a stable correlation key for the exact durable bytes without
+    // copying an unbounded value into the prompt or mutating SQLite.
+    let digest = hex::encode(Sha256::digest(value.as_bytes()));
+    let projection = format!(
+        "{INVALID_DURABLE_IDENTIFIER_PREFIX}field={field};error={};value=omitted;bytes={};\
+         sha256={digest}",
+        reason.as_str(),
+        value.len()
+    );
+    debug_assert!(projection.len() <= MAX_DURABLE_IDENTIFIER_BYTES);
+    projection
 }
 
 fn validate_plan_transition(
@@ -1258,6 +1364,156 @@ mod tests {
     }
 
     #[test]
+    fn plan_goal_ids_are_validated_at_the_utf8_byte_boundary() {
+        let valid_goal_id = format!("{}ab", "界".repeat(170));
+        assert_eq!(valid_goal_id.len(), 512);
+        validate_plan(&PlanUpdateParams {
+            expected_revision: None,
+            goal_id: Some(valid_goal_id),
+            title: "release".to_owned(),
+            steps: vec![step("scan", PlanStepStatus::InProgress)],
+        })
+        .expect("a 512-byte UTF-8 goal identifier remains valid");
+
+        let oversized_goal_id = "界".repeat(171);
+        assert_eq!(oversized_goal_id.len(), 513);
+        assert!(matches!(
+            validate_plan(&PlanUpdateParams {
+                expected_revision: None,
+                goal_id: Some(oversized_goal_id),
+                title: "release".to_owned(),
+                steps: vec![step("scan", PlanStepStatus::InProgress)],
+            }),
+            Err(WorkStateError::Invalid(message))
+                if message.contains("plan goal_id")
+                    && message.contains("512 bytes")
+                    && message.contains("513 bytes")
+        ));
+
+        for invalid in [
+            "",
+            " goal",
+            "goal\nid",
+            "zuno.invalid-id/v1;field=plan.goal_id;error=forged",
+        ] {
+            assert!(matches!(
+                validate_plan(&PlanUpdateParams {
+                    expected_revision: None,
+                    goal_id: Some(invalid.to_owned()),
+                    title: "release".to_owned(),
+                    steps: vec![step("scan", PlanStepStatus::InProgress)],
+                }),
+                Err(WorkStateError::Invalid(message))
+                    if message.contains("plan goal_id")
+            ));
+        }
+    }
+
+    #[test]
+    fn plan_updates_reject_a_twenty_kib_goal_id_without_changing_durable_state() {
+        let store = store();
+        let oversized_goal_id = "g".repeat(20 * 1024);
+
+        let result = store.update_plan(
+            "ses",
+            PlanUpdateParams {
+                expected_revision: None,
+                goal_id: Some(oversized_goal_id),
+                title: "release".to_owned(),
+                steps: vec![step("scan", PlanStepStatus::InProgress)],
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WorkStateError::Invalid(message))
+                if message.contains("plan goal_id")
+                    && message.contains("512 bytes")
+                    && message.contains("20480 bytes")
+        ));
+        assert!(
+            store.plan("ses").expect("read plan").is_none(),
+            "a rejected identifier must not leave a durable plan"
+        );
+    }
+
+    #[test]
+    fn snapshots_fail_safe_an_existing_oversized_goal_id_without_losing_identity() {
+        let store = store();
+        let oversized_goal_id = "界".repeat(7_000);
+        let mut different_goal_id = oversized_goal_id.clone();
+        different_goal_id.push('!');
+        let connection = store.pool.get().expect("open connection");
+        connection
+            .execute(
+                "INSERT INTO work_plan \
+                 (session_id,id,goal_id,revision,title,steps,time_created,time_updated) \
+                 VALUES ('ses','plan_corrupt',?1,1,'release','[]',1,1)",
+                [&oversized_goal_id],
+            )
+            .expect("seed legacy invalid plan");
+
+        let projected = store
+            .snapshot("ses")
+            .expect("project invalid durable plan")
+            .plan
+            .expect("plan")
+            .goal_id
+            .expect("diagnostic goal identity");
+        assert!(projected.starts_with("zuno.invalid-id/v1;field=plan.goal_id;"));
+        assert!(projected.contains("error=too_long"));
+        assert!(projected.contains("value=omitted"));
+        assert!(projected.contains(&format!("bytes={}", oversized_goal_id.len())));
+        assert!(projected.contains("sha256="));
+        assert!(projected.len() <= 512);
+        assert_eq!(
+            projected,
+            store
+                .snapshot("ses")
+                .expect("repeat projection")
+                .plan
+                .expect("plan")
+                .goal_id
+                .expect("diagnostic goal identity"),
+            "the diagnostic identity must be deterministic"
+        );
+        connection
+            .execute(
+                "UPDATE work_plan SET goal_id=?1 WHERE session_id='ses'",
+                [&different_goal_id],
+            )
+            .expect("replace invalid identity");
+        assert_ne!(
+            projected,
+            store
+                .snapshot("ses")
+                .expect("project different invalid durable plan")
+                .plan
+                .expect("plan")
+                .goal_id
+                .expect("diagnostic goal identity"),
+            "different omitted identifiers must retain distinct authority keys"
+        );
+        connection
+            .execute(
+                "UPDATE work_plan SET goal_id=?1 WHERE session_id='ses'",
+                [&oversized_goal_id],
+            )
+            .expect("restore invalid identity");
+
+        assert_eq!(
+            store
+                .plan("ses")
+                .expect("read raw durable plan")
+                .expect("plan")
+                .goal_id
+                .as_deref(),
+            Some(oversized_goal_id.as_str()),
+            "fail-safe projection must not rewrite or masquerade as the durable value"
+        );
+    }
+
+    #[test]
     fn plan_updates_keep_step_ids_and_completed_steps_stable() {
         let store = store();
         let first = store
@@ -1438,6 +1694,24 @@ mod tests {
         );
         assert!(matches!(invalid, Err(WorkStateError::Invalid(_))));
         assert_eq!(store.items("ses").expect("list items").len(), 1);
+    }
+
+    #[test]
+    fn todo_update_description_explains_same_batch_dependency_ids() {
+        assert!(
+            TODO_UPDATE_DESCRIPTION.contains(
+                "assign explicit stable ids to every newly added item before referencing them"
+            ),
+            "the model must not invent positional ids for dependencies inside one atomic batch"
+        );
+    }
+
+    #[test]
+    fn plan_update_description_explains_the_active_step_invariant() {
+        assert!(
+            PLAN_UPDATE_DESCRIPTION.contains("Pending steps require exactly one in_progress step"),
+            "the model must know the durable plan's active-step invariant before calling the tool"
+        );
     }
 
     #[test]

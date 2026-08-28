@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,7 @@ use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use zuno_db::Pool;
-use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
 use zuno_db::{Connection, migration, open};
 use zuno_engine::hooks::TurnHooks;
@@ -15,10 +16,11 @@ use zuno_engine::interrupt::{InterruptSignal, SoftInterruptMessage, SoftInterrup
 use zuno_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, PreparedToolDispatch, ResolvedAgent,
     ResolvedModel, RunTurnRequest, ToolDispatchResult, ToolDispatcher, TurnContext, TurnError,
-    TurnEvent, TurnOutcome, event_channel, hydrate_retained_history, hydrate_retained_history_tail,
-    project_history, project_history_owned, retained_history, run_turn,
+    TurnEvent, TurnOutcome, TurnRecovery, event_channel, hydrate_retained_history,
+    hydrate_retained_history_tail, project_history, project_history_owned, retained_history,
+    run_turn,
 };
-use zuno_engine::prompt::PromptAssembly;
+use zuno_engine::prompt::{PromptAssembly, PromptAssemblyError, RuntimePromptPolicy};
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_error::ProviderError;
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
@@ -120,12 +122,68 @@ struct FakeResolver;
 impl AgentModelResolver for FakeResolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
         (requested == "build")
-            .then(|| ResolvedAgent::new("build", "You are a deterministic test agent.", 8))
+            .then(|| ResolvedAgent::new("build", "You are a deterministic test agent."))
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
         (provider_id == "fake" && model_id == "fake-model")
             .then(|| ResolvedModel::new(Spec::new("fake"), "fake-model", ApiSurface::Default))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OversizedPromptResolver;
+
+impl AgentModelResolver for OversizedPromptResolver {
+    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+        (requested == "build").then(|| {
+            let mut prompt = PromptAssembly::new();
+            prompt
+                .push(
+                    "instructions.global",
+                    "/config/.config/zuno/AGENTS.md",
+                    "A".repeat(64 * 1024),
+                )
+                .expect("large AGENTS section is structurally valid");
+            prompt
+                .push_selected_skill(
+                    "selected-test-skill",
+                    "/workspace/.zuno/skills/selected-test-skill/SKILL.md",
+                    "S".repeat(1024),
+                )
+                .expect("selected Skill section is structurally valid");
+            ResolvedAgent::new("build", "").with_prompt_assembly(prompt)
+        })
+    }
+
+    fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
+        FakeResolver.resolve_model(provider_id, model_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LimitedResolver {
+    max_steps: NonZeroU32,
+}
+
+impl LimitedResolver {
+    fn new(max_steps: u32) -> Self {
+        Self {
+            max_steps: NonZeroU32::new(max_steps).expect("test step limit is non-zero"),
+        }
+    }
+}
+
+impl AgentModelResolver for LimitedResolver {
+    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+        (requested == "build").then(|| {
+            ResolvedAgent::new("build", "You are a deterministic test agent.")
+                .with_max_steps(self.max_steps)
+        })
+    }
+
+    fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
+        FakeResolver.resolve_model(provider_id, model_id)
     }
 }
 
@@ -166,11 +224,33 @@ impl AgentModelResolver for TraceResolver {
                 .push("agent.base", "native:build", "BASE")
                 .expect("base section");
             assembly
-                .push("instructions.0", "/workspace/AGENTS.md", "RULES")
+                .push("instructions.project.0", "/workspace/AGENTS.md", "RULES")
                 .expect("instruction section");
-            ResolvedAgent::new("build", assembly.render(), 8)
+            ResolvedAgent::new("build", assembly.render())
                 .with_prompt_assembly(assembly)
                 .with_orchestration_seed(trace_seed())
+        })
+    }
+
+    fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
+        (provider_id == "fake" && model_id == "fake-model")
+            .then(|| ResolvedModel::new(Spec::new("fake"), "fake-model", ApiSurface::Default))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PolicyResolver;
+
+impl AgentModelResolver for PolicyResolver {
+    fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
+        (requested == "build").then(|| {
+            ResolvedAgent::new("build", "BUILD").with_runtime_prompt_policy(
+                RuntimePromptPolicy::new(
+                    Some(vec!["explorer".to_owned()]),
+                    Some("Delegate only bounded read-only exploration.".to_owned()),
+                    true,
+                ),
+            )
         })
     }
 
@@ -215,9 +295,40 @@ impl TurnHooks for ExpandingToolsHook {
     }
 }
 
+#[derive(Debug)]
+struct PlanOnlyRequestHook;
+
+#[async_trait]
+impl TurnHooks for PlanOnlyRequestHook {
+    async fn prepare_request(
+        &self,
+        _input: zuno_engine::hooks::RequestHookInput<'_>,
+        request: &mut CompletionRequest,
+    ) -> Result<(), String> {
+        request.tools.retain(|tool| tool.name == "plan_update");
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 struct FakeDispatcher {
     calls: Mutex<Vec<DispatchRequest>>,
+}
+
+#[derive(Debug)]
+struct SnapshotDispatcher {
+    definitions: Vec<ToolDefinition>,
+}
+
+#[async_trait]
+impl ToolDispatcher for SnapshotDispatcher {
+    fn available_tools(&self) -> AvailableTools {
+        AvailableTools::new(self.definitions.clone(), McpToolStatus::Ready)
+    }
+
+    async fn prepare(&self, _request: DispatchRequest) -> PreparedToolDispatch {
+        panic!("snapshot-only test must not dispatch a tool")
+    }
 }
 
 impl FakeDispatcher {
@@ -270,6 +381,290 @@ fn seeded() -> Connection {
         ))
         .expect("seed project and session");
     connection
+}
+
+fn seeded_shared_pool_with_goal_schema() -> Arc<Pool> {
+    let pool =
+        Arc::new(Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared memory database"));
+    let mut connection = pool
+        .open_connection()
+        .expect("open shared schema connection");
+    migration::apply(&mut connection).expect("apply shared schema");
+    connection
+        .execute_batch(&format!(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+             VALUES ('project-loop', '/workspace', 1, 1, '[]');
+             INSERT INTO session \
+               (id, project_id, slug, directory, title, version, time_created, time_updated) \
+             VALUES ('{SESSION_ID}', 'project-loop', 'loop', '/workspace', 'loop', '1', 1, 1);"
+        ))
+        .expect("seed shared project and session");
+    connection
+        .execute_batch(
+            "CREATE TABLE goal (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                goal_id TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision >= 1),
+                objective TEXT NOT NULL,
+                success_criteria TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'active',
+                    'paused',
+                    'blocked',
+                    'usage_limited',
+                    'budget_limited',
+                    'complete',
+                    'cancelled'
+                )),
+                blocked_reason TEXT,
+                token_budget INTEGER,
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                usage_known INTEGER NOT NULL DEFAULT 1 CHECK(usage_known IN (0, 1)),
+                time_used_seconds INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            )",
+        )
+        .expect("install the canonical Goal table");
+    drop(connection);
+    pool
+}
+
+fn seed_durable_compaction_state(pool: Arc<Pool>) {
+    let connection = pool
+        .open_connection()
+        .expect("open durable state connection");
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO goal (
+                session_id, goal_id, revision, objective, success_criteria, status,
+                blocked_reason, token_budget, tokens_used, usage_known,
+                time_used_seconds, created_at_ms, updated_at_ms
+            ) VALUES (
+                'ses_loop_test', 'goal_compaction', 3,
+                'preserve durable state across compaction',
+                '["goal remains","report recovers once"]', 'active',
+                NULL, 100000, 321, 1, 9, 100, 101
+            );
+            INSERT INTO work_plan (
+                session_id, id, goal_id, revision, title, steps, time_created, time_updated
+            ) VALUES (
+                'ses_loop_test', 'plan_compaction', 'goal_compaction', 2,
+                'Durable compaction plan',
+                '[{"id":"inspect","title":"Inspect durable state","status":"in_progress"}]',
+                102, 103
+            );
+            INSERT INTO work_item (
+                id, session_id, goal_id, plan_step_id, parent_id, subject, description,
+                active_form, status, priority, dependencies, owner, revision,
+                tokens_used, usage_known, time_used_ms, time_created, time_updated
+            ) VALUES (
+                'todo_compaction', 'ses_loop_test', 'goal_compaction', 'inspect', NULL,
+                'Inspect durable state', 'Verify Goal, Plan, Job, report, and receipt',
+                'Inspecting durable state', 'in_progress', 'high', '[]', 'build', 4,
+                55, 1, 700, 104, 105
+            );
+            "#,
+        )
+        .expect("seed Goal, Plan, and WorkItem");
+    drop(connection);
+
+    let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
+    jobs.create(zuno_db::job::NewAgentJob::new(
+        "job_compaction",
+        SESSION_ID,
+        zuno_db::job::JobSubject::child_session("ses_child_compaction"),
+        zuno_db::job::ReportDelivery::NextStep,
+        106,
+    ))
+    .expect("create durable child Job");
+    jobs.settle(
+        "job_compaction",
+        zuno_db::job::JobSettlement::completed(
+            json!({
+                "finalText": "child completed durable inspection",
+                "goalID": "goal_compaction",
+                "planID": "plan_compaction",
+                "workItemID": "todo_compaction"
+            }),
+            107,
+            Some(NewSessionInput::new(
+                "input_compaction_report",
+                SESSION_ID,
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": "job_compaction",
+                    "text": "durable report",
+                    "references": {
+                        "goalID": "goal_compaction",
+                        "planID": "plan_compaction",
+                        "workItemID": "todo_compaction"
+                    }
+                }),
+                InputDelivery::Queue,
+                107,
+            )),
+        ),
+    )
+    .expect("settle Job with one next-step report");
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DurableCompactionSnapshot {
+    goal: Value,
+    plan: Value,
+    work_items: Vec<Value>,
+    job: zuno_db::job::AgentJob,
+    report: zuno_db::inbox::SessionInput,
+    prompt_receipts: Vec<(String, String)>,
+}
+
+fn json_row(connection: &Connection, sql: &str) -> Value {
+    let encoded: String = connection
+        .query_row(sql, [], |row| row.get(0))
+        .expect("read durable JSON row");
+    serde_json::from_str(&encoded).expect("decode durable JSON row")
+}
+
+fn json_rows(connection: &Connection, sql: &str) -> Vec<Value> {
+    let mut statement = connection.prepare(sql).expect("prepare durable JSON rows");
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query durable JSON rows")
+        .map(|row| {
+            let encoded = row.expect("read durable JSON row");
+            serde_json::from_str(&encoded).expect("decode durable JSON row")
+        })
+        .collect()
+}
+
+fn prompt_receipts(connection: &Connection) -> Vec<(String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.prompt.assembled.1' \
+             ORDER BY seq",
+        )
+        .expect("prepare Prompt receipt query");
+    statement
+        .query_map([SESSION_ID], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query Prompt receipts")
+        .map(|row| row.expect("read Prompt receipt"))
+        .collect()
+}
+
+fn latest_prompt_receipt_id(connection: &Connection) -> String {
+    prompt_receipts(connection)
+        .last()
+        .expect("at least one Prompt receipt")
+        .0
+        .clone()
+}
+
+fn durable_compaction_snapshot(
+    connection: &Connection,
+    pool: Arc<Pool>,
+) -> DurableCompactionSnapshot {
+    let goal = json_row(
+        connection,
+        "SELECT json_object(
+            'sessionID', session_id,
+            'goalID', goal_id,
+            'revision', revision,
+            'objective', objective,
+            'successCriteria', json(success_criteria),
+            'status', status,
+            'blockedReason', blocked_reason,
+            'tokenBudget', token_budget,
+            'tokensUsed', tokens_used,
+            'usageKnown', usage_known,
+            'timeUsedSeconds', time_used_seconds,
+            'createdAtMs', created_at_ms,
+            'updatedAtMs', updated_at_ms
+         ) FROM goal WHERE session_id = 'ses_loop_test'",
+    );
+    let plan = json_row(
+        connection,
+        "SELECT json_object(
+            'sessionID', session_id,
+            'id', id,
+            'goalID', goal_id,
+            'revision', revision,
+            'title', title,
+            'steps', json(steps),
+            'timeCreated', time_created,
+            'timeUpdated', time_updated
+         ) FROM work_plan WHERE session_id = 'ses_loop_test'",
+    );
+    let work_items = json_rows(
+        connection,
+        "SELECT json_object(
+            'id', id,
+            'sessionID', session_id,
+            'goalID', goal_id,
+            'planStepID', plan_step_id,
+            'parentID', parent_id,
+            'subject', subject,
+            'description', description,
+            'activeForm', active_form,
+            'status', status,
+            'priority', priority,
+            'dependencies', json(dependencies),
+            'owner', owner,
+            'revision', revision,
+            'tokensUsed', tokens_used,
+            'usageKnown', usage_known,
+            'timeUsedMs', time_used_ms,
+            'timeCreated', time_created,
+            'timeUpdated', time_updated
+         ) FROM work_item WHERE session_id = 'ses_loop_test' ORDER BY id",
+    );
+    let job = zuno_db::job::AgentJobStore::new(Arc::clone(&pool))
+        .get("job_compaction")
+        .expect("read durable Job");
+    let report = SessionInbox::new(pool)
+        .get(SESSION_ID, "input_compaction_report")
+        .expect("read durable report")
+        .expect("durable report exists");
+    DurableCompactionSnapshot {
+        goal,
+        plan,
+        work_items,
+        job,
+        report,
+        prompt_receipts: prompt_receipts(connection),
+    }
+}
+
+fn durable_compaction_context(
+    connection: &Connection,
+    pool: Arc<Pool>,
+    original_receipt_id: &str,
+) -> String {
+    let snapshot = durable_compaction_snapshot(connection, pool);
+    format!(
+        "Durable execution references recovered from SQLite after compaction:\n\
+         - Goal: {}\n\
+         - Plan: {}\n\
+         - Todo/WorkItem: {}\n\
+         - Job: {}\n\
+         - Unconsumed report: {}\n\
+         - Prior Prompt receipt: {original_receipt_id}",
+        snapshot.goal["goalID"].as_str().expect("Goal reference"),
+        snapshot.plan["id"].as_str().expect("Plan reference"),
+        snapshot.work_items[0]["id"]
+            .as_str()
+            .expect("WorkItem reference"),
+        snapshot.job.id,
+        snapshot.report.id,
+    )
+}
+
+fn scalar_count(connection: &Connection, sql: &str) -> i64 {
+    connection
+        .query_row(sql, [], |row| row.get(0))
+        .expect("read scalar count")
 }
 
 fn put_user(connection: &Connection, id: &str, created: i64, text: &str) {
@@ -683,6 +1078,36 @@ async fn collect_events(mut receiver: mpsc::Receiver<TurnEvent>) -> Vec<TurnEven
     events
 }
 
+async fn run_single_text_turn(
+    connection: &mut Connection,
+    turn_id: &str,
+    dynamic_context: DynamicContext,
+    response: &str,
+) -> Arc<FakeProvider> {
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta(response.to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(SESSION_ID, turn_id, dynamic_context),
+        TurnContext::new(connection, &providers, &resolver, &dispatcher, &interrupt),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 1, .. })
+    ));
+    provider
+}
+
 fn full_turn_responses() -> Vec<ScriptedResponse> {
     vec![
         ScriptedResponse::complete(vec![
@@ -709,6 +1134,149 @@ fn full_turn_responses() -> Vec<ScriptedResponse> {
             },
         ]),
     ]
+}
+
+fn echo_tool_response(call: usize) -> ScriptedResponse {
+    let call_id = format!("call-{call}");
+    ScriptedResponse::complete(vec![
+        StreamEvent::ToolUseStart {
+            id: call_id.clone(),
+            name: "echo".to_owned(),
+        },
+        StreamEvent::ToolInputDelta {
+            id: call_id.clone(),
+            delta: format!(r#"{{"text":"round-{call}"}}"#),
+        },
+        StreamEvent::ToolUseEnd { id: call_id },
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::ToolCalls),
+        },
+    ])
+}
+
+#[tokio::test]
+async fn an_unconfigured_agent_has_no_implicit_step_limit() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_unbounded",
+        10,
+        "keep using the tool until done",
+    );
+    let mut responses = (1..=101).map(echo_tool_response).collect::<Vec<_>>();
+    responses.push(ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("finished after one hundred and one tool rounds".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ]));
+    let provider = Arc::new(FakeProvider::new(responses));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-unbounded"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 102, .. })
+    ));
+    assert_eq!(provider.requests().len(), 102);
+    assert_eq!(dispatcher.calls().len(), 101);
+}
+
+#[tokio::test]
+async fn an_explicit_step_limit_adds_one_tool_free_text_finalization() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_limited",
+        10,
+        "use one tool then summarize",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        echo_tool_response(1),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("completed the tool call; nothing remains".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = LimitedResolver::new(1);
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-limited"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 2, .. })
+    ));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].tools.len(), 1);
+    assert!(
+        requests[1].tools.is_empty(),
+        "the configured limit must close tool authority before finalization"
+    );
+    assert!(
+        requests[1]
+            .developer_context
+            .iter()
+            .any(|section| section.contains("user-configured tool-step limit")),
+        "the final request must explain why only a text response is allowed"
+    );
+
+    let finalization: String = connection
+        .query_row(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 \
+               AND type = 'session.provider.request.1' \
+               AND json_extract(data, '$.step') = 2",
+            [SESSION_ID],
+            |row| row.get(0),
+        )
+        .expect("finalization provider request event");
+    let finalization: Value = serde_json::from_str(&finalization).expect("finalization event JSON");
+    assert_eq!(
+        finalization["stepLimitFinalization"]["maxToolSteps"],
+        json!(1)
+    );
+    assert_eq!(
+        finalization["stepLimitFinalization"]["instructionSha256"],
+        json!(sha256_text(
+            finalization["stepLimitFinalization"]["instruction"]
+                .as_str()
+                .expect("instruction text")
+        ))
+    );
 }
 
 async fn run_full_turn_once() -> (Vec<TurnEvent>, Vec<CompletionRequest>, Vec<DispatchRequest>) {
@@ -889,16 +1457,37 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
     assert_eq!(trace["hookTransformed"], true);
     assert_eq!(trace["actualSystemPrompt"], "BASE\n\nRULES\n\nHOOK");
     assert_eq!(
+        trace["providerProjection"]["developer"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        trace["actualProviderProjection"]["developer"],
+        trace["providerProjection"]["developer"]
+    );
+    assert_eq!(
         trace["sections"]
             .as_array()
             .expect("section array")
             .iter()
             .map(|section| section["id"].as_str().expect("section id"))
             .collect::<Vec<_>>(),
-        vec!["agent.base", "instructions.0"]
+        vec![
+            "agent.base",
+            "runtime.intent",
+            "runtime.execution",
+            "runtime.verification",
+            "instructions.project.0",
+        ]
     );
     assert_eq!(trace["sections"][0]["source"], "native:build");
-    assert_eq!(trace["sections"][1]["source"], "/workspace/AGENTS.md");
+    assert_eq!(
+        trace["sections"][1]["source"],
+        "zuno-runtime:runtime.intent"
+    );
+    assert_eq!(trace["sections"][4]["source"], "/workspace/AGENTS.md");
     let seed = trace_seed();
     assert_eq!(
         trace["capabilitySnapshot"],
@@ -943,10 +1532,8 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
         snapshot.prompt.event_id.as_deref(),
         Some(prompt_event_id.as_str())
     );
-    assert_eq!(
-        snapshot.prompt.actual_sha256,
-        sha256_text("BASE\n\nRULES\n\nHOOK")
-    );
+    assert_eq!(snapshot.prompt.actual_sha256, trace["actualSha256"]);
+    assert_eq!(snapshot.prompt.assembly_sha256, trace["assemblySha256"]);
     assert_eq!(
         lifecycle[0]["orchestrationSnapshotID"],
         serde_json::to_value(snapshot.identity().expect("attempt identity"))
@@ -970,6 +1557,155 @@ async fn loop_persists_ordered_prompt_provenance_and_the_post_hook_prompt() {
             zuno_llm::event::Message::new(Role::System, "HOOK"),
         ],
         "kernel, developer rules, and hook output must keep separate provider messages"
+    );
+}
+
+#[tokio::test]
+async fn loop_rejects_an_oversized_complete_prompt_before_calling_the_provider() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_oversized_prompt",
+        10,
+        "answer without trimming any instructions",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("provider must not be called".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = OversizedPromptResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-oversized-prompt").with_context_limit(8 * 1024),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+    let error = outcome.expect_err("the complete prompt must exceed the 8K context window");
+
+    assert!(matches!(
+        error,
+        TurnError::PromptAssembly(PromptAssemblyError::ContextLimitExceeded {
+            estimated_prompt_tokens,
+            context_limit: 8192,
+        }) if estimated_prompt_tokens > 8192
+    ));
+    assert_eq!(error.recovery(), TurnRecovery::Fail);
+    assert!(
+        provider.requests().is_empty(),
+        "an impossible prompt entered the provider retry path"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, TurnEvent::ProviderRequestStarted { .. })),
+        "an impossible prompt emitted a provider request start event"
+    );
+}
+
+#[tokio::test]
+async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_runtime_policy_snapshot",
+        10,
+        "use the effective capabilities",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![ScriptedResponse::complete(vec![
+        StreamEvent::TextDelta("done".to_owned()),
+        StreamEvent::MessageEnd {
+            stop_reason: Some(FinishReason::Stop),
+        },
+    ])]));
+    let providers = registry(&provider);
+    let resolver = PolicyResolver;
+    let definition = |id: &str| ToolDefinition {
+        id: id.to_owned(),
+        display_name: id.to_owned(),
+        description: format!("{id} test tool"),
+        parameters: json!({"type": "object"}),
+        ui_intent: ToolUiIntent::Generic,
+    };
+    let dispatcher = SnapshotDispatcher {
+        definitions: vec![
+            definition("apply_patch"),
+            definition("task"),
+            definition("plan_update"),
+        ],
+    };
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-runtime-policy-snapshot"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        )
+        .with_hooks(Arc::new(PlanOnlyRequestHook)),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(
+        outcome,
+        Ok(TurnOutcome::Completed { steps: 1, .. })
+    ));
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["plan_update"]
+    );
+    let runtime = requests[0].developer_context.join("\n");
+    assert!(runtime.contains("keep the durable execution plan current"));
+    assert!(runtime.contains("Durable Goal, Plan, Todo"));
+    assert!(!runtime.contains("explorer"));
+    assert!(!runtime.contains("editing surface"));
+    assert!(!runtime.contains("Delegate only"));
+
+    let trace: String = connection
+        .query_row(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.prompt.assembled.1'",
+            [SESSION_ID],
+            |row| row.get(0),
+        )
+        .expect("prompt receipt");
+    let trace: Value = serde_json::from_str(&trace).expect("prompt receipt JSON");
+    assert_eq!(
+        trace["sections"]
+            .as_array()
+            .expect("sections")
+            .iter()
+            .filter_map(|section| section["id"].as_str())
+            .filter(|id| id.starts_with("runtime."))
+            .collect::<Vec<_>>(),
+        [
+            "runtime.intent",
+            "runtime.execution",
+            "runtime.verification",
+            "runtime.persistence",
+        ]
     );
 }
 
@@ -1052,8 +1788,14 @@ async fn loop_routes_dynamic_goal_and_memory_outside_user_history() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(
-        requests[0].developer_context,
-        vec!["ACTIVE GOAL".to_owned(), "RESIDENT MEMORY".to_owned()]
+        &requests[0].developer_context[requests[0].developer_context.len() - 2..],
+        ["ACTIVE GOAL", "RESIDENT MEMORY"]
+    );
+    assert!(
+        requests[0]
+            .developer_context
+            .iter()
+            .any(|context| context.contains("Durable Goal, Plan, Todo"))
     );
     let dynamic_text_leaked = requests[0].messages.iter().any(|message| {
         message.content.iter().any(|block| {
@@ -1071,7 +1813,7 @@ async fn loop_routes_dynamic_goal_and_memory_outside_user_history() {
 }
 
 #[tokio::test]
-async fn loop_injects_a_durable_steer_at_the_tool_safe_point() {
+async fn loop_injects_a_durable_background_report_at_the_tool_safe_point() {
     let pool = Arc::new(
         Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared in-memory loop pool"),
     );
@@ -1095,7 +1837,18 @@ async fn loop_injects_a_durable_steer_at_the_tool_safe_point() {
         .admit(NewSessionInput::new(
             "msg_steer",
             SESSION_ID,
-            json!({"kind": "user", "prompt": {"text": "include benchmark"}}),
+            json!({
+                "kind": "subagentReport",
+                "jobID": "job_report",
+                "childSessionID": "ses_child",
+                "status": "completed",
+                "text": "include benchmark",
+                "metadata": {
+                    "schemaVersion": 1,
+                    "agent": "explorer",
+                    "finalText": "include benchmark"
+                }
+            }),
             InputDelivery::Steer,
             11,
         ))
@@ -1110,7 +1863,7 @@ async fn loop_injects_a_durable_steer_at_the_tool_safe_point() {
                 content: "include benchmark".to_owned(),
                 images: Vec::new(),
                 urgent: false,
-                source: SoftInterruptSource::User,
+                source: SoftInterruptSource::BackgroundTask,
             },
         )
         .expect("queue steer");
@@ -1147,7 +1900,97 @@ async fn loop_injects_a_durable_steer_at_the_tool_safe_point() {
         .find(|message| message.info.id == "msg_steer")
         .expect("steer became a logged user message");
     assert_eq!(steer.parts[0].data["text"], "include benchmark");
+    assert_eq!(steer.info.data["taskReport"]["agent"], "explorer");
+    assert_eq!(
+        steer.info.data["taskReport"]["finalText"],
+        "include benchmark"
+    );
     assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn live_input_persistence_failure_rolls_back_without_losing_the_promoted_input() {
+    let pool = Arc::new(
+        Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared in-memory loop pool"),
+    );
+    {
+        let mut connection = pool.get().expect("seed connection");
+        migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-loop', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('{SESSION_ID}', 'project-loop', 'loop', '/workspace', 'loop', '1', 1, 1);
+                 CREATE TRIGGER reject_live_input_part \
+                   BEFORE INSERT ON part \
+                   WHEN NEW.message_id = 'msg_atomic_steer' \
+                 BEGIN \
+                   SELECT RAISE(ABORT, 'injected live-input persistence failure'); \
+                 END;"
+            ))
+            .expect("seed project, session, and failure trigger");
+    }
+    let mut connection = pool.get().expect("turn connection");
+    put_user(&connection, "msg_user", 10, "echo hello");
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    inbox
+        .admit(NewSessionInput::new(
+            "msg_atomic_steer",
+            SESSION_ID,
+            json!({"kind": "user", "prompt": {"text": "recover this input"}}),
+            InputDelivery::Steer,
+            11,
+        ))
+        .expect("admit steer");
+    let run_registry = SessionRunRegistry::new();
+    let guard = run_registry.begin_turn(SESSION_ID).expect("live turn");
+    run_registry
+        .queue_soft_interrupt(
+            SESSION_ID,
+            SoftInterruptMessage {
+                input_id: Some("msg_atomic_steer".to_owned()),
+                content: "recover this input".to_owned(),
+                images: Vec::new(),
+                urgent: false,
+                source: SoftInterruptSource::User,
+            },
+        )
+        .expect("queue steer");
+
+    let provider = Arc::new(FakeProvider::new(full_turn_responses()));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        request("turn-atomic-steer"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            guard.interrupt_signal(),
+        )
+        .with_live_inputs(&guard, &inbox),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    outcome.expect_err("the injected persistence failure must stop the turn");
+    let stored = inbox
+        .get(SESSION_ID, "msg_atomic_steer")
+        .expect("read inbox row")
+        .expect("promoted input remains durable");
+    assert_eq!(stored.state, SubmissionState::Promoted);
+    assert_eq!(stored.error, None);
+    assert!(
+        MessageStore::new(&connection)
+            .message("msg_atomic_steer")
+            .is_err(),
+        "the user message insert must roll back with the failed part"
+    );
 }
 
 async fn collect_and_steer_hanging_provider(
@@ -1540,7 +2383,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
         },
         TurnEvent::ProviderRequestStarted {
             step: 1,
-            message_count: 2,
+            message_count: 5,
             estimated_prompt_tokens: 0,
         },
         TurnEvent::Provider {
@@ -1632,7 +2475,7 @@ fn expected_full_turn_events() -> Vec<TurnEvent> {
         },
         TurnEvent::ProviderRequestStarted {
             step: 2,
-            message_count: 4,
+            message_count: 7,
             estimated_prompt_tokens: 0,
         },
         TurnEvent::Provider {
@@ -2537,6 +3380,167 @@ async fn loop_compacted_prefix_is_byte_identical_without_decoding_the_discarded_
     assert_eq!(
         repaired.data["state"]["status"], "error",
         "tool repair stopped at the compaction boundary"
+    );
+}
+
+#[tokio::test]
+async fn compaction_preserves_durable_execution_state_and_restart_recovery_is_idempotent() {
+    let pool = seeded_shared_pool_with_goal_schema();
+    let mut connection = pool
+        .open_connection()
+        .expect("open first process connection");
+    put_user(&connection, "msg_discarded_user", 10, "discarded request");
+    put_assistant_text(
+        &connection,
+        "msg_discarded_assistant",
+        20,
+        "msg_discarded_user",
+        "discarded answer",
+    );
+    put_user(
+        &connection,
+        "msg_before_compaction",
+        30,
+        "create the durable execution state",
+    );
+
+    let first_provider = run_single_text_turn(
+        &mut connection,
+        "turn-before-durable-compaction",
+        DynamicContext::default(),
+        "durable state created",
+    )
+    .await;
+    assert_eq!(first_provider.requests().len(), 1);
+    let original_receipt_id = latest_prompt_receipt_id(&connection);
+
+    seed_durable_compaction_state(Arc::clone(&pool));
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    inbox
+        .promote_id(SESSION_ID, "input_compaction_report")
+        .expect("promote the report before simulated process loss")
+        .expect("the report is queued");
+    let before = durable_compaction_snapshot(&connection, Arc::clone(&pool));
+    assert_eq!(before.report.state.as_str(), "promoted");
+    assert_eq!(before.prompt_receipts.len(), 1);
+    assert_eq!(before.prompt_receipts[0].0, original_receipt_id);
+
+    let compaction_time = zuno_db::message::now_millis().saturating_add(100);
+    put_successful_compaction(
+        &connection,
+        "msg_durable_compaction_marker",
+        "msg_durable_compaction_summary",
+        "msg_before_compaction",
+        compaction_time,
+    );
+    put_user(
+        &connection,
+        "msg_after_compaction",
+        compaction_time.saturating_add(10),
+        "resume from durable state",
+    );
+    drop(connection);
+
+    let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
+    let first_recovery = jobs
+        .pending_reports_for(SESSION_ID)
+        .expect("recover pending report after restart");
+    let second_recovery = jobs
+        .pending_reports_for(SESSION_ID)
+        .expect("repeat recovery idempotently");
+    assert_eq!(
+        first_recovery, second_recovery,
+        "recovery must reuse the same durable Job and report reference"
+    );
+    assert_eq!(first_recovery.len(), 1);
+    assert_eq!(first_recovery[0].id, "job_compaction");
+    assert_eq!(
+        first_recovery[0].report_input_id.as_deref(),
+        Some("input_compaction_report")
+    );
+
+    let mut restarted = pool
+        .open_connection()
+        .expect("open restarted process connection");
+    let recovered_context =
+        durable_compaction_context(&restarted, Arc::clone(&pool), &original_receipt_id);
+    let second_provider = run_single_text_turn(
+        &mut restarted,
+        "turn-after-durable-compaction",
+        DynamicContext::new(recovered_context.clone()),
+        "resumed from durable state",
+    )
+    .await;
+
+    let after = durable_compaction_snapshot(&restarted, Arc::clone(&pool));
+    assert_eq!(after.goal, before.goal, "compaction changed the Goal row");
+    assert_eq!(after.plan, before.plan, "compaction changed the Plan row");
+    assert_eq!(
+        after.work_items, before.work_items,
+        "compaction changed the Todo/WorkItem rows"
+    );
+    assert_eq!(after.job, before.job, "compaction changed the settled Job");
+    assert_eq!(after.report.id, before.report.id);
+    assert_eq!(after.report.prompt, before.report.prompt);
+    assert_eq!(
+        after.report.admitted_sequence, before.report.admitted_sequence,
+        "restart recovery admitted a duplicate report"
+    );
+    assert_eq!(after.report.state.as_str(), "queued");
+    assert_eq!(
+        after.report.revision,
+        before.report.revision.saturating_add(1),
+        "the promoted report must be recovered exactly once"
+    );
+
+    assert_eq!(second_provider.requests().len(), 1);
+    assert_eq!(
+        second_provider.requests()[0].developer_context.last(),
+        Some(&recovered_context),
+        "the restarted request did not receive the durable references"
+    );
+    assert_eq!(after.prompt_receipts.len(), 2);
+    assert_eq!(
+        after
+            .prompt_receipts
+            .iter()
+            .filter(|(id, _)| id == &original_receipt_id)
+            .count(),
+        1,
+        "the pre-compaction Prompt receipt was deleted or duplicated"
+    );
+    let latest_receipt: Value =
+        serde_json::from_str(&after.prompt_receipts[1].1).expect("latest prompt receipt JSON");
+    let persisted_projection = latest_receipt
+        .get("actualProviderProjection")
+        .unwrap_or(&latest_receipt["providerProjection"]);
+    assert_eq!(
+        persisted_projection["developer"]
+            .as_array()
+            .and_then(|sections| sections.last())
+            .and_then(Value::as_str),
+        Some(recovered_context.as_str()),
+        "the durable recovery projection was not captured by the new Prompt receipt"
+    );
+
+    assert_eq!(
+        scalar_count(
+            &restarted,
+            "SELECT COUNT(*) FROM session_input \
+             WHERE session_id = 'ses_loop_test' AND id = 'input_compaction_report'",
+        ),
+        1,
+        "restart recovery duplicated the report input"
+    );
+    assert_eq!(
+        scalar_count(
+            &restarted,
+            "SELECT COUNT(*) FROM event \
+             WHERE aggregate_id = 'ses_loop_test' \
+               AND type = 'session.input.recovered.1'",
+        ),
+        1,
+        "repeated recovery must not emit a second recovery transition"
     );
 }
 

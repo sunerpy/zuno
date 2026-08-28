@@ -8,17 +8,18 @@
 //! Parent wake-up happens after that commit, so a process loss can delay delivery but
 //! cannot erase the report.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -52,10 +53,110 @@ use crate::environment::StartupEnvironment;
 /// `subagent_depth`, which is single digits.
 const MAX_ANCESTRY_WALK: u32 = 64;
 const CHILD_SESSION_METADATA_KIND: &str = "zuno.child";
-const CHILD_SESSION_METADATA_SCHEMA_VERSION: u32 = 1;
+const CHILD_SESSION_METADATA_SCHEMA_VERSION: u32 = 2;
 const CHILD_SESSION_METADATA_MAX_ATTEMPTS: u32 = 3;
 const CHILD_SESSION_METADATA_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const CHILD_SESSION_METADATA_MAX_DELAY: Duration = Duration::from_millis(250);
+const PARENT_WAKE_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const PARENT_WAKE_MAX_DELAY: Duration = Duration::from_secs(5);
+const TASK_REPORT_METADATA_SCHEMA_VERSION: u32 = 1;
+const TASK_VERIFICATION_METADATA_KEY: &str = "taskVerification";
+const UNCERTAIN_SIDE_EFFECTS_METADATA_KEY: &str = "uncertainSideEffects";
+
+/// Host-generated terminal metadata for one native delegated task.
+///
+/// The child model supplies only its final text. Durable identity, usage, changed
+/// paths, verification evidence, and uncertain side effects are reconstructed from
+/// the child session and its typed tool results after execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TaskReportMetadata {
+    schema_version: u32,
+    job_id: Option<String>,
+    session_id: String,
+    parent_session_id: String,
+    agent: String,
+    status: String,
+    final_text: String,
+    usage: TaskReportUsage,
+    changed_paths: Vec<String>,
+    verification_records: Vec<TaskVerificationRecord>,
+    uncertain_side_effects: Vec<String>,
+    evidence_errors: Vec<String>,
+}
+
+struct TaskReportBuild<'a> {
+    job_id: Option<&'a str>,
+    child_session_id: &'a str,
+    evidence_start_rowid: i64,
+    status: &'a str,
+    final_text: &'a str,
+    uncertain_side_effects: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskReportUsage {
+    confirmed: TaskReportTokenUsage,
+    last_prompt_tokens: Option<u64>,
+    estimated_pending_prompt_tokens: Option<u64>,
+    context_limit: Option<u64>,
+    accounting: Option<String>,
+    confirmed_known: bool,
+    last_confirmed_at: Option<i64>,
+    failed_turns: u64,
+    last_failed_at: Option<i64>,
+}
+
+impl From<zuno_types::UsageSnapshot> for TaskReportUsage {
+    fn from(snapshot: zuno_types::UsageSnapshot) -> Self {
+        Self {
+            confirmed: snapshot.confirmed.into(),
+            last_prompt_tokens: snapshot.last_prompt_tokens,
+            estimated_pending_prompt_tokens: snapshot.estimated_pending_prompt_tokens,
+            context_limit: snapshot.context_limit,
+            accounting: snapshot.accounting.as_str().map(str::to_owned),
+            confirmed_known: snapshot.confirmed_known,
+            last_confirmed_at: snapshot.last_confirmed_at,
+            failed_turns: snapshot.failed_turns,
+            last_failed_at: snapshot.last_failed_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskReportTokenUsage {
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cache_read: u64,
+    cache_write: u64,
+    unclassified: u64,
+}
+
+impl From<zuno_types::TokenUsage> for TaskReportTokenUsage {
+    fn from(usage: zuno_types::TokenUsage) -> Self {
+        Self {
+            input: usage.input,
+            output: usage.output,
+            reasoning: usage.reasoning,
+            cache_read: usage.cache_read,
+            cache_write: usage.cache_write,
+            unclassified: usage.unclassified,
+        }
+    }
+}
+
+/// Verification evidence emitted by a host tool, never parsed from child prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TaskVerificationRecord {
+    name: String,
+    status: String,
+    #[serde(default)]
+    evidence: Option<String>,
+}
 
 /// One process-local generation shared by every host observing the same work.
 #[derive(Debug, Clone)]
@@ -126,6 +227,7 @@ struct ChildSessionSpec {
     agent: String,
     model: String,
     effort: Option<zuno_llm::effort::ReasoningEffort>,
+    provider_options: Map<String, Value>,
 }
 
 impl ChildSessionSpec {
@@ -144,8 +246,65 @@ impl ChildSessionSpec {
             agent: agent.to_owned(),
             model: model.to_owned(),
             effort,
+            provider_options: request.provider_options.clone(),
         }
     }
+
+    fn validate_continuation(&self, candidate: &Self) -> Result<(), String> {
+        if self.parent_session_id != candidate.parent_session_id {
+            return Err("child continuation `parent` identity changed".to_owned());
+        }
+        if self.agent != candidate.agent {
+            return Err("child continuation `agent` identity changed".to_owned());
+        }
+        if self.model != candidate.model {
+            return Err(
+                "child continuation `effective provider/model` identity changed".to_owned(),
+            );
+        }
+        if self.effort != candidate.effort {
+            return Err("child continuation `reasoning` identity changed".to_owned());
+        }
+        if self.provider_options != candidate.provider_options {
+            return Err("child continuation provider options changed".to_owned());
+        }
+        if self.workflow != candidate.workflow || self.workflow_node != candidate.workflow_node {
+            return Err("child continuation workflow identity changed".to_owned());
+        }
+        validate_parent_attempt_authority(
+            self.parent_attempt.as_ref(),
+            candidate.parent_attempt.as_ref(),
+        )
+    }
+}
+
+fn validate_parent_attempt_authority(
+    stored: Option<&AttemptSnapshot>,
+    candidate: Option<&AttemptSnapshot>,
+) -> Result<(), String> {
+    let (Some(stored), Some(candidate)) = (stored, candidate) else {
+        return if stored.is_none() && candidate.is_none() {
+            Ok(())
+        } else {
+            Err("child continuation parent Attempt identity changed".to_owned())
+        };
+    };
+    let stored_capability = stored.capability.identity().map_err(to_string)?;
+    let candidate_capability = candidate.capability.identity().map_err(to_string)?;
+    if stored_capability != candidate_capability {
+        return Err("child continuation parent capability generation changed".to_owned());
+    }
+    if stored.schema_version != candidate.schema_version
+        || stored.owner.session_id != candidate.owner.session_id
+        || stored.owner.parent_session_id != candidate.owner.parent_session_id
+        || stored.owner.parent_attempt != candidate.owner.parent_attempt
+        || stored.agent != candidate.agent
+        || stored.model != candidate.model
+        || stored.tools != candidate.tools
+    {
+        return Err("child continuation parent Attempt authority changed".to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,9 +364,31 @@ impl ChildSessionSpecs {
                 "child session `{session_id}` continuation identity does not match its durable parent"
             ));
         }
+        if session.agent.as_deref() != Some(metadata.continuation.agent.as_str()) {
+            return Err(format!(
+                "child session `{session_id}` continuation identity does not match its durable agent"
+            ));
+        }
         self.remember(session_id, metadata.continuation.clone());
         Ok(metadata.continuation)
     }
+}
+
+async fn checkpoint_child_session_spec(
+    database: &Arc<zuno_db::pool::Pool>,
+    children: &ChildSessionSpecs,
+    session_id: &str,
+    spec: &ChildSessionSpec,
+    resumed: bool,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    if resumed {
+        let stored = children.get_or_restore(database, session_id)?;
+        return stored.validate_continuation(spec);
+    }
+    persist_child_session_spec(database, session_id, spec, cancellation).await?;
+    children.remember(session_id, spec.clone());
+    Ok(())
 }
 
 async fn persist_child_session_spec(
@@ -274,6 +455,70 @@ struct ManagedJob {
     task: Option<JoinHandle<()>>,
 }
 
+/// Cross-process ownership for one native child job.
+///
+/// The lock is acquired before the durable job row is inserted and held for the
+/// complete executor future. OS file locks disappear when a process exits, so a
+/// peer can distinguish a live executor from a genuinely abandoned job without a
+/// timeout that could expire during legitimate long-running work.
+#[derive(Debug)]
+struct ChildJobLease {
+    _file: Option<File>,
+}
+
+impl ChildJobLease {
+    fn try_acquire(database: &zuno_db::pool::Pool, job_id: &str) -> Result<Option<Self>, String> {
+        let Some(path) = child_job_lease_path(database, job_id) else {
+            // An in-memory database cannot be shared by another process.
+            return Ok(Some(Self { _file: None }));
+        };
+        let parent = path.parent().ok_or_else(|| {
+            format!(
+                "child job lease `{}` has no parent directory",
+                path.display()
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "create child job lease directory `{}`: {error}",
+                parent.display()
+            )
+        })?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| format!("open child job lease `{}`: {error}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: Some(file) })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(format!(
+                "acquire child job lease `{}`: {error}",
+                path.display()
+            )),
+        }
+    }
+}
+
+fn child_job_lease_path(database: &zuno_db::pool::Pool, job_id: &str) -> Option<PathBuf> {
+    let database_path = database.path()?;
+    let resolved_path =
+        fs::canonicalize(database_path).unwrap_or_else(|_| database_path.to_path_buf());
+    let database_path = resolved_path.as_path();
+    let parent = database_path.parent().unwrap_or_else(|| Path::new("."));
+    let database_name = database_path
+        .file_name()
+        .map_or_else(|| "zuno.db".into(), |name| name.to_string_lossy());
+    let digest = zuno_orchestration::sha256_text(job_id);
+    Some(
+        parent
+            .join(format!(".{database_name}.child-job-leases"))
+            .join(format!("{digest}.lock")),
+    )
+}
+
 impl BackgroundJobSupervisor {
     /// Return the workspace-wide delegation budget after applying current config.
     pub(crate) fn delegation_limiter(&self, limit: NonZeroUsize) -> DelegationLimiter {
@@ -312,6 +557,43 @@ impl BackgroundJobSupervisor {
                 })),
             });
         self.notify_changed();
+    }
+
+    fn spawn_unique(
+        &self,
+        id: impl Into<String>,
+        parent_session_id: impl Into<String>,
+        cancellation: CancellationToken,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) -> bool {
+        let id = id.into();
+        let parent_session_id = parent_session_id.into();
+        let internal_id = self.next_task.fetch_add(1, Ordering::Relaxed);
+        let changed = self.changed.clone();
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tasks.iter().any(|job| {
+            job.id == id
+                && job.parent_session_id == parent_session_id
+                && job.task.as_ref().is_none_or(|task| !task.is_finished())
+        }) {
+            return false;
+        }
+        tasks.push(ManagedJob {
+            internal_id,
+            id,
+            parent_session_id,
+            cancellation,
+            task: Some(tokio::spawn(async move {
+                task.await;
+                changed.changed();
+            })),
+        });
+        drop(tasks);
+        self.notify_changed();
+        true
     }
 
     /// Adopt an already-spawned task and make cancellation abort-and-join it.
@@ -377,6 +659,18 @@ impl BackgroundJobSupervisor {
             .iter()
             .filter(|job| job.parent_session_id == parent_session_id)
             .any(|job| job.task.as_ref().is_none_or(|task| !task.is_finished()))
+    }
+
+    fn owns_running_task(&self, parent_session_id: &str, job_id: &str) -> bool {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|job| {
+                job.id == job_id
+                    && job.parent_session_id == parent_session_id
+                    && job.task.as_ref().is_none_or(|task| !task.is_finished())
+            })
     }
 
     /// Wait for every task this supervisor owns.
@@ -495,6 +789,13 @@ pub(crate) struct InteractiveChildInputContext {
     pub(crate) supervisor: BackgroundJobSupervisor,
 }
 
+#[derive(Debug)]
+struct ChildSessionAdmission {
+    session_id: String,
+    create: Option<zuno_db::session::SessionCreate>,
+    evidence_start_rowid: i64,
+}
+
 /// Delegation backed by a real child session and a real turn.
 #[derive(Clone)]
 pub(crate) struct ChildSessionHost {
@@ -591,10 +892,46 @@ impl ChildSessionHost {
             let Some(report) = pending.iter().find(|input| input.id == input_id).cloned() else {
                 continue;
             };
-            self.wake.wake(report).await?;
+            if let Err(error) = self.wake.wake(report.clone()).await {
+                self.schedule_parent_report_retry(report, error);
+            }
             recovered = recovered.saturating_add(1);
         }
         Ok(recovered)
+    }
+
+    fn schedule_parent_report_retry(&self, report: SessionInput, first_error: String) {
+        let wake = Arc::clone(&self.wake);
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let parent_session_id = report.session_id.clone();
+        let input_id = report.id.clone();
+        let retry_input_id = input_id.clone();
+        let retry_id = format!("report-wake:{input_id}");
+        let spawned =
+            self.supervisor
+                .spawn_unique(retry_id, parent_session_id, cancellation, async move {
+                    if let Err(error) = retry_parent_report_after_failure(
+                        wake.as_ref(),
+                        report,
+                        first_error,
+                        task_cancellation,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            input_id = retry_input_id,
+                            %error,
+                            "durable parent report remains pending after wake retry stopped"
+                        );
+                    }
+                });
+        if !spawned {
+            tracing::debug!(
+                input_id,
+                "durable parent report already has a process-local wake retry"
+            );
+        }
     }
 
     /// Reconcile process-owned native child jobs without replaying their work.
@@ -605,6 +942,25 @@ impl ChildSessionHost {
             .map_err(to_string)?;
         let mut recovered = 0_usize;
         for job in active {
+            if self
+                .supervisor
+                .owns_running_task(parent_session_id, &job.id)
+            {
+                continue;
+            }
+            let Some(_recovery_lease) =
+                ChildJobLease::try_acquire(self.database.as_ref(), &job.id)?
+            else {
+                tracing::debug!(
+                    job_id = %job.id,
+                    "another process still owns the native child executor"
+                );
+                continue;
+            };
+            let job = self.job_store.get(&job.id).map_err(to_string)?;
+            if !matches!(job.status, JobStatus::Queued | JobStatus::Running) {
+                continue;
+            }
             let completed = zuno_db::message::now_millis();
             let (status, message, settlement) = match job.status {
                 JobStatus::Queued => {
@@ -613,11 +969,25 @@ impl ChildSessionHost {
                          restarted before execution capacity was admitted; no child turn was run",
                         job.id
                     );
-                    let report = report_for_job(&job, "cancelled", &message, completed);
+                    let metadata = task_report_metadata_for_job(
+                        &self.database,
+                        &job,
+                        "cancelled",
+                        &message,
+                        Vec::new(),
+                    );
+                    let report =
+                        report_for_job(&job, "cancelled", &message, metadata.as_ref(), completed);
+                    let settlement = JobSettlement::cancelled(message.clone(), completed, report);
                     (
                         "cancelled",
                         message.clone(),
-                        JobSettlement::cancelled(message, completed, report),
+                        metadata.map_or(settlement.clone(), |metadata| {
+                            settlement.with_result(
+                                serde_json::to_value(metadata)
+                                    .expect("task report metadata is serializable"),
+                            )
+                        }),
                     )
                 }
                 JobStatus::Running => {
@@ -626,11 +996,29 @@ impl ChildSessionHost {
                          process lost its child-turn executor; completed side effects are not replayed",
                         job.id
                     );
-                    let report = report_for_job(&job, "uncertain", &message, completed);
+                    let metadata = task_report_metadata_for_job(
+                        &self.database,
+                        &job,
+                        "uncertain",
+                        &message,
+                        vec![
+                            "The process lost the child-turn executor before an authoritative \
+                             terminal acknowledgement; inspect durable state before retrying."
+                                .to_owned(),
+                        ],
+                    );
+                    let report =
+                        report_for_job(&job, "uncertain", &message, metadata.as_ref(), completed);
+                    let settlement = JobSettlement::uncertain(message.clone(), completed, report);
                     (
                         "uncertain",
                         message.clone(),
-                        JobSettlement::uncertain(message, completed, report),
+                        metadata.map_or(settlement.clone(), |metadata| {
+                            settlement.with_result(
+                                serde_json::to_value(metadata)
+                                    .expect("task report metadata is serializable"),
+                            )
+                        }),
                     )
                 }
                 JobStatus::Completed
@@ -668,7 +1056,10 @@ impl ChildSessionHost {
     /// would let one delegation continue another session's child, which is both a
     /// confusing transcript and a way to write into a session the caller was never
     /// given.
-    fn session_for(&self, request: &ChildTurnRequest) -> Result<String, ChildTurnError> {
+    fn session_admission_for(
+        &self,
+        request: &ChildTurnRequest,
+    ) -> Result<ChildSessionAdmission, ChildTurnError> {
         if let Some(resume) = &request.resume_session_id {
             let connection = self.connect()?;
             let existing = zuno_db::session::get(&connection, resume)
@@ -676,7 +1067,14 @@ impl ChildSessionHost {
             if existing.parent_id.as_deref() != Some(request.parent_session_id.as_str()) {
                 return Err(ChildTurnError::UnknownSession(resume.clone()));
             }
-            return Ok(existing.id);
+            let evidence_start_rowid = zuno_db::message::MessageStore::new(&connection)
+                .latest_part_rowid_for_session(&existing.id)
+                .map_err(|error| ChildTurnError::Host(zuno_error::source::describe(&error)))?;
+            return Ok(ChildSessionAdmission {
+                session_id: existing.id,
+                create: None,
+                evidence_start_rowid,
+            });
         }
 
         let child_id = crate::cmd::turn::prefixed_id("ses");
@@ -684,28 +1082,59 @@ impl ChildSessionHost {
             .description
             .clone()
             .unwrap_or_else(|| format!("Delegated to {}", request.agent));
-        self.database
-            .transaction(|transaction| {
-                let parent = zuno_db::session::get(transaction, &request.parent_session_id)?;
-                let mut input = zuno_db::session::SessionCreate::new(
-                    &child_id,
-                    Uuid::new_v4().simple().to_string(),
-                    &parent.project_id,
-                    parent.directory.clone(),
-                    parent.directory.clone(),
-                    title,
-                    crate::RUST_PACKAGE_VERSION,
-                )
-                .with_parent(&request.parent_session_id);
-                input.agent = Some(request.agent.clone());
-                if let Some(workspace) = parent.workspace_id {
-                    input = input.with_workspace(workspace);
-                }
-                zuno_db::session::create(transaction, &input)?;
-                Ok(())
-            })
-            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
-        Ok(child_id)
+        let connection = self.connect()?;
+        let parent = zuno_db::session::get(&connection, &request.parent_session_id)
+            .map_err(|error| ChildTurnError::Host(zuno_error::source::describe(&error)))?;
+        let mut input = zuno_db::session::SessionCreate::new(
+            &child_id,
+            Uuid::new_v4().simple().to_string(),
+            &parent.project_id,
+            parent.directory.clone(),
+            parent.directory.clone(),
+            title,
+            crate::RUST_PACKAGE_VERSION,
+        )
+        .with_parent(&request.parent_session_id);
+        input.agent = Some(request.agent.clone());
+        if let Some(workspace) = parent.workspace_id {
+            input = input.with_workspace(workspace);
+        }
+        Ok(ChildSessionAdmission {
+            session_id: child_id,
+            create: Some(input),
+            evidence_start_rowid: 0,
+        })
+    }
+
+    fn admit_child_job(
+        &self,
+        request: &ChildTurnRequest,
+        job_id: String,
+        delivery: DbReportDelivery,
+        queued: bool,
+    ) -> Result<zuno_db::job::AgentJob, ChildTurnError> {
+        let admission = self.session_admission_for(request)?;
+        let mut job = NewAgentJob::new(
+            job_id,
+            request.parent_session_id.clone(),
+            JobSubject::child_session(admission.session_id),
+            delivery,
+            zuno_db::message::now_millis(),
+        )
+        .with_logical_key(request.logical_key.clone())
+        .with_orchestration_snapshot(request.parent_attempt.as_deref().cloned())
+        .with_evidence_start_rowid(admission.evidence_start_rowid);
+        if queued {
+            job = job.queued();
+        }
+        let admitted = match admission.create {
+            Some(child) => self
+                .job_store
+                .create_child_session_if_reconciled(child, job),
+            None => self.job_store.create_child_if_reconciled(job),
+        }
+        .map_err(|error| ChildTurnError::Host(zuno_error::source::describe(&error)))?;
+        Ok(admitted)
     }
 
     /// Drive one child turn with cancellation owned by a larger orchestration.
@@ -724,17 +1153,57 @@ impl ChildSessionHost {
             .acquire(&cancellation)
             .await
             .map_err(|error| ChildTurnError::Host(error.to_string()))?;
-        let session_id = self.session_for(&request)?;
-        let output = self
+        let job_id = crate::cmd::turn::prefixed_id("job");
+        let admitted =
+            self.admit_child_job(&request, job_id.clone(), DbReportDelivery::Quiet, false)?;
+        let JobSubject::ChildSession { session_id } = &admitted.subject else {
+            unreachable!("native child admission always stores a child-session subject")
+        };
+        let session_id = session_id.clone();
+        let outcome = self
             .runner
-            .run(&session_id, &request, cancellation)
-            .await
-            .map_err(ChildTurnError::Host)?;
-        Ok(ChildTurn {
-            session_id,
-            job_id: None,
-            output,
-        })
+            .run(&session_id, &request, cancellation.clone())
+            .await;
+        let completed = zuno_db::message::now_millis();
+        let (status, final_text) = match &outcome {
+            Ok(output) => ("completed", output.as_str()),
+            Err(error) if cancellation.is_cancelled() => ("cancelled", error.as_str()),
+            Err(error) => ("failed", error.as_str()),
+        };
+        let report_metadata = serde_json::to_value(task_report_metadata(
+            &self.database,
+            &request,
+            TaskReportBuild {
+                job_id: Some(&job_id),
+                child_session_id: &session_id,
+                evidence_start_rowid: admitted.evidence_start_rowid,
+                status,
+                final_text,
+                uncertain_side_effects: Vec::new(),
+            },
+        ))
+        .map_err(|error| ChildTurnError::Host(error.to_string()))?;
+        let settlement = match &outcome {
+            Ok(_) => JobSettlement::completed(report_metadata.clone(), completed, None),
+            Err(error) if cancellation.is_cancelled() => {
+                JobSettlement::cancelled(error.clone(), completed, None)
+                    .with_result(report_metadata.clone())
+            }
+            Err(error) => JobSettlement::failed(error.clone(), completed, None)
+                .with_result(report_metadata.clone()),
+        };
+        self.job_store
+            .settle(&job_id, settlement)
+            .map_err(|error| ChildTurnError::Host(zuno_error::source::describe(&error)))?;
+        match outcome {
+            Ok(output) => Ok(ChildTurn {
+                session_id,
+                job_id: None,
+                output,
+                report_metadata: Some(report_metadata),
+            }),
+            Err(error) => Err(ChildTurnError::Host(error)),
+        }
     }
 }
 
@@ -776,19 +1245,41 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
+        plan.inherit_request_parameters(request.provider_options.clone());
         let spec = ChildSessionSpec::resolved(
             request,
             plan.agent_name(),
             &plan.qualified_model(),
             plan.effort(),
         );
-        persist_child_session_spec(&self.database, session_id, &spec, &cancellation).await?;
-        self.children.remember(session_id, spec.clone());
+        let resumed = request.resume_session_id.is_some();
+        if resumed {
+            checkpoint_child_session_spec(
+                &self.database,
+                &self.children,
+                session_id,
+                &spec,
+                true,
+                &cancellation,
+            )
+            .await?;
+        }
         plan.inherit_orchestration(
             parent_attempt,
             spec.workflow.as_deref(),
             spec.workflow_node.as_deref(),
         )?;
+        if !resumed {
+            checkpoint_child_session_spec(
+                &self.database,
+                &self.children,
+                session_id,
+                &spec,
+                false,
+                &cancellation,
+            )
+            .await?;
+        }
         let mut host = TurnHost::open_with_dependencies(
             plan,
             &self.environment,
@@ -1062,6 +1553,7 @@ impl PendingInputDriver for InteractiveChildInputDriver {
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
+        plan.inherit_request_parameters(spec.provider_options.clone());
         plan.inherit_orchestration(
             parent_attempt,
             spec.workflow.as_deref(),
@@ -1244,6 +1736,67 @@ impl ParentReportWake for CoordinatedParentWake {
     }
 }
 
+async fn wake_parent_report(
+    wake: &dyn ParentReportWake,
+    report: SessionInput,
+    cancellation: CancellationToken,
+) -> Result<(), String> {
+    let mut delay = PARENT_WAKE_INITIAL_DELAY;
+    let mut attempt = 1_usize;
+    loop {
+        match wake.wake(report.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if should_log_wake_retry(attempt) {
+                    tracing::warn!(
+                        input_id = %report.id,
+                        attempt,
+                        ?delay,
+                        %error,
+                        "retrying durable parent report wake"
+                    );
+                }
+                tokio::select! {
+                    () = cancellation.cancelled() => {
+                        return Err(format!(
+                            "parent report wake stopped after {attempt} attempt(s): {error}"
+                        ));
+                    }
+                    () = tokio::time::sleep(delay) => {}
+                }
+                delay = delay.saturating_mul(2).min(PARENT_WAKE_MAX_DELAY);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+async fn retry_parent_report_after_failure(
+    wake: &dyn ParentReportWake,
+    report: SessionInput,
+    first_error: String,
+    cancellation: CancellationToken,
+) -> Result<(), String> {
+    tracing::warn!(
+        input_id = %report.id,
+        attempt = 1,
+        delay = ?PARENT_WAKE_INITIAL_DELAY,
+        error = %first_error,
+        "retrying durable parent report wake"
+    );
+    tokio::select! {
+        () = cancellation.cancelled() => {
+            return Err(format!("parent report wake stopped after 1 attempt: {first_error}"));
+        }
+        () = tokio::time::sleep(PARENT_WAKE_INITIAL_DELAY) => {}
+    }
+    wake_parent_report(wake, report, cancellation).await
+}
+
+fn should_log_wake_retry(attempt: usize) -> bool {
+    attempt <= 3 || attempt.is_power_of_two()
+}
+
 async fn drive_and_drain(
     host: &mut TurnHost,
     prompt: &str,
@@ -1254,13 +1807,21 @@ async fn drive_and_drain(
 ) -> Result<(), String> {
     let (sender, receiver) = event_channel();
     let drive = async {
-        let outcome = match guard {
-            Some(guard) => {
-                host.drive_with_message_id_and_guard(prompt, message_id, guard, sender.clone())
+        let outcome = match (guard, message_id) {
+            (Some(guard), Some(message_id)) => {
+                host.drive_promoted_with_guard(prompt, message_id, guard, sender.clone())
                     .await
             }
-            None => {
-                host.drive_with_message_id(prompt, message_id, sender.clone())
+            (Some(guard), None) => {
+                host.drive_with_message_id_and_guard(prompt, None, guard, sender.clone())
+                    .await
+            }
+            (None, Some(message_id)) => {
+                host.drive_promoted(prompt, message_id, sender.clone())
+                    .await
+            }
+            (None, None) => {
+                host.drive_with_message_id(prompt, None, sender.clone())
                     .await
             }
         };
@@ -1313,6 +1874,168 @@ fn child_answer(database: &zuno_db::pool::Pool, session_id: &str) -> Result<Stri
         .unwrap_or_default())
 }
 
+fn task_report_metadata(
+    database: &zuno_db::pool::Pool,
+    request: &ChildTurnRequest,
+    build: TaskReportBuild<'_>,
+) -> TaskReportMetadata {
+    let TaskReportBuild {
+        job_id,
+        child_session_id,
+        evidence_start_rowid,
+        status,
+        final_text,
+        mut uncertain_side_effects,
+    } = build;
+    let mut evidence_errors = Vec::new();
+    let mut usage = TaskReportUsage::default();
+    let mut changed_paths = Vec::new();
+    let mut verification_records = Vec::new();
+
+    match database.open_connection() {
+        Ok(connection) => {
+            match zuno_db::session::get(&connection, child_session_id) {
+                Ok(session) => usage = session.usage.snapshot().into(),
+                Err(error) => evidence_errors.push(format!("usage: {error}")),
+            }
+            let store = zuno_db::message::MessageStore::new(&connection);
+            match store.parts_for_session_by_kind_after_rowid(
+                child_session_id,
+                zuno_db::message::PartKind::Tool,
+                evidence_start_rowid,
+            ) {
+                Ok(parts) => {
+                    let mut paths = BTreeSet::new();
+                    for part in parts {
+                        let metadata = part
+                            .data
+                            .get("state")
+                            .and_then(Value::as_object)
+                            .and_then(|state| state.get("metadata"))
+                            .and_then(Value::as_object);
+                        let Some(metadata) = metadata else {
+                            continue;
+                        };
+                        paths.extend(
+                            metadata
+                                .get(zuno_tool::METADATA_WRITTEN_PATHS_KEY)
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .filter(|path| !path.is_empty())
+                                .map(str::to_owned),
+                        );
+                        collect_verification_records(
+                            metadata.get(TASK_VERIFICATION_METADATA_KEY),
+                            &mut verification_records,
+                            &mut evidence_errors,
+                        );
+                        uncertain_side_effects.extend(
+                            metadata
+                                .get(UNCERTAIN_SIDE_EFFECTS_METADATA_KEY)
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .filter(|detail| !detail.is_empty())
+                                .map(str::to_owned),
+                        );
+                    }
+                    changed_paths = paths.into_iter().collect();
+                }
+                Err(error) => evidence_errors.push(format!("tool evidence: {error}")),
+            }
+        }
+        Err(error) => evidence_errors.push(format!("session evidence: {error}")),
+    }
+    uncertain_side_effects.sort();
+    uncertain_side_effects.dedup();
+
+    TaskReportMetadata {
+        schema_version: TASK_REPORT_METADATA_SCHEMA_VERSION,
+        job_id: job_id.map(str::to_owned),
+        session_id: child_session_id.to_owned(),
+        parent_session_id: request.parent_session_id.clone(),
+        agent: request.agent.clone(),
+        status: status.to_owned(),
+        final_text: final_text.to_owned(),
+        usage,
+        changed_paths,
+        verification_records,
+        uncertain_side_effects,
+        evidence_errors,
+    }
+}
+
+fn task_report_metadata_for_job(
+    database: &zuno_db::pool::Pool,
+    job: &AgentJob,
+    status: &str,
+    final_text: &str,
+    uncertain_side_effects: Vec<String>,
+) -> Option<TaskReportMetadata> {
+    let JobSubject::ChildSession { session_id } = &job.subject else {
+        return None;
+    };
+    let agent = database
+        .open_connection()
+        .ok()
+        .and_then(|connection| zuno_db::session::get(&connection, session_id).ok())
+        .and_then(|session| session.agent)
+        .unwrap_or_else(|| "subagent".to_owned());
+    let request = ChildTurnRequest {
+        parent_session_id: job.parent_session_id.clone(),
+        parent_attempt: job.orchestration_snapshot.clone().map(Arc::new),
+        workflow: None,
+        workflow_node: None,
+        resume_session_id: Some(session_id.clone()),
+        logical_key: job.logical_key.clone(),
+        agent,
+        description: None,
+        prompt: String::new(),
+        model: None,
+        effort: None,
+        provider_options: Map::new(),
+        background: true,
+        report_delivery: match job.report_delivery {
+            DbReportDelivery::NextStep => ToolReportDelivery::NextStep,
+            DbReportDelivery::Quiet => ToolReportDelivery::Quiet,
+        },
+    };
+    Some(task_report_metadata(
+        database,
+        &request,
+        TaskReportBuild {
+            job_id: Some(&job.id),
+            child_session_id: session_id,
+            evidence_start_rowid: job.evidence_start_rowid,
+            status,
+            final_text,
+            uncertain_side_effects,
+        },
+    ))
+}
+
+fn collect_verification_records(
+    value: Option<&Value>,
+    records: &mut Vec<TaskVerificationRecord>,
+    errors: &mut Vec<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let values = value
+        .as_array()
+        .map_or_else(|| vec![value.clone()], |values| values.clone());
+    for value in values {
+        match serde_json::from_value(value) {
+            Ok(record) => records.push(record),
+            Err(error) => errors.push(format!("verification record: {error}")),
+        }
+    }
+}
+
 #[async_trait]
 impl ChildTurnHost for ChildSessionHost {
     async fn delegation_depth(&self, session_id: &str) -> Result<u32, ChildTurnError> {
@@ -1363,31 +2086,30 @@ impl ChildTurnHost for ChildSessionHost {
                 "background child was cancelled before admission".to_owned(),
             ));
         }
-        let session_id = self.session_for(&request)?;
-
         let job_id = crate::cmd::turn::prefixed_id("job");
+        let execution_lease = ChildJobLease::try_acquire(self.database.as_ref(), &job_id)
+            .map_err(ChildTurnError::Host)?
+            .ok_or_else(|| {
+                ChildTurnError::Host(format!(
+                    "new background job `{job_id}` unexpectedly already has a live executor"
+                ))
+            })?;
         let delivery = match request.report_delivery {
             ToolReportDelivery::NextStep => DbReportDelivery::NextStep,
             ToolReportDelivery::Quiet => DbReportDelivery::Quiet,
         };
-        self.job_store
-            .create(
-                NewAgentJob::new(
-                    job_id.clone(),
-                    request.parent_session_id.clone(),
-                    JobSubject::child_session(session_id.clone()),
-                    delivery,
-                    zuno_db::message::now_millis(),
-                )
-                .queued()
-                .with_orchestration_snapshot(request.parent_attempt.as_deref().cloned()),
-            )
-            .map_err(|error| ChildTurnError::Host(error.to_string()))?;
+        let admitted = self.admit_child_job(&request, job_id.clone(), delivery, true)?;
+        let JobSubject::ChildSession { session_id } = &admitted.subject else {
+            unreachable!("native child admission always stores a child-session subject")
+        };
+        let session_id = session_id.clone();
+        let evidence_start_rowid = admitted.evidence_start_rowid;
 
         let runner = Arc::clone(&self.runner);
         let wake = Arc::clone(&self.wake);
         let delegation_limiter = self.delegation_limiter.clone();
         let job_store = self.job_store.clone();
+        let database = Arc::clone(&self.database);
         let background_job_id = job_id.clone();
         let background_session_id = session_id.clone();
         let parent_session_id = request.parent_session_id.clone();
@@ -1398,6 +2120,7 @@ impl ChildTurnHost for ChildSessionHost {
             parent_session_id,
             cancellation,
             async move {
+                let _execution_lease = execution_lease;
                 let outcome = match delegation_limiter.acquire(&task_cancellation).await {
                     Ok(_permit) => {
                         match job_store.start(&background_job_id, zuno_db::message::now_millis()) {
@@ -1421,6 +2144,18 @@ impl ChildTurnHost for ChildSessionHost {
                         "Background subagent `{background_session_id}` cancelled job \
                      `{background_job_id}`."
                     );
+                    let metadata = task_report_metadata(
+                        &database,
+                        &request,
+                        TaskReportBuild {
+                            job_id: Some(&background_job_id),
+                            child_session_id: &background_session_id,
+                            evidence_start_rowid,
+                            status: "cancelled",
+                            final_text: &text,
+                            uncertain_side_effects: Vec::new(),
+                        },
+                    );
                     (
                         JobSettlement::cancelled(
                             "cancelled by user",
@@ -1431,8 +2166,13 @@ impl ChildTurnHost for ChildSessionHost {
                                 &background_session_id,
                                 "cancelled",
                                 &text,
+                                &metadata,
                                 completed,
                             ),
+                        )
+                        .with_result(
+                            serde_json::to_value(metadata)
+                                .expect("task report metadata is serializable"),
                         ),
                         text,
                     )
@@ -1443,9 +2183,22 @@ impl ChildTurnHost for ChildSessionHost {
                                 "Background subagent `{background_session_id}` completed job \
                          `{background_job_id}`.\n\n{output}"
                             );
+                            let metadata = task_report_metadata(
+                                &database,
+                                &request,
+                                TaskReportBuild {
+                                    job_id: Some(&background_job_id),
+                                    child_session_id: &background_session_id,
+                                    evidence_start_rowid,
+                                    status: "completed",
+                                    final_text: &output,
+                                    uncertain_side_effects: Vec::new(),
+                                },
+                            );
                             (
                                 JobSettlement::completed(
-                                    json!({"text": output}),
+                                    serde_json::to_value(&metadata)
+                                        .expect("task report metadata is serializable"),
                                     completed,
                                     report_input(
                                         &request,
@@ -1453,6 +2206,7 @@ impl ChildTurnHost for ChildSessionHost {
                                         &background_session_id,
                                         "completed",
                                         &text,
+                                        &metadata,
                                         completed,
                                     ),
                                 ),
@@ -1464,9 +2218,21 @@ impl ChildTurnHost for ChildSessionHost {
                                 "Background subagent `{background_session_id}` failed job \
                          `{background_job_id}`: {error}"
                             );
+                            let metadata = task_report_metadata(
+                                &database,
+                                &request,
+                                TaskReportBuild {
+                                    job_id: Some(&background_job_id),
+                                    child_session_id: &background_session_id,
+                                    evidence_start_rowid,
+                                    status: "failed",
+                                    final_text: &error,
+                                    uncertain_side_effects: Vec::new(),
+                                },
+                            );
                             (
                                 JobSettlement::failed(
-                                    error,
+                                    error.clone(),
                                     completed,
                                     report_input(
                                         &request,
@@ -1474,8 +2240,13 @@ impl ChildTurnHost for ChildSessionHost {
                                         &background_session_id,
                                         "failed",
                                         &text,
+                                        &metadata,
                                         completed,
                                     ),
+                                )
+                                .with_result(
+                                    serde_json::to_value(metadata)
+                                        .expect("task report metadata is serializable"),
                                 ),
                                 text,
                             )
@@ -1485,7 +2256,9 @@ impl ChildTurnHost for ChildSessionHost {
                 match job_store.settle(&background_job_id, settlement) {
                     Ok(settled) => {
                         if let Some(report) = settled.report
-                            && let Err(error) = wake.wake(report).await
+                            && let Err(error) =
+                                wake_parent_report(wake.as_ref(), report, task_cancellation.clone())
+                                    .await
                         {
                             tracing::error!(
                                 job_id = %background_job_id,
@@ -1510,6 +2283,7 @@ impl ChildTurnHost for ChildSessionHost {
             output: "Background subagent started. Its terminal state will be delivered according \
                      to `reportDelivery`."
                 .to_owned(),
+            report_metadata: None,
         })
     }
 }
@@ -1520,6 +2294,7 @@ fn report_input(
     child_session_id: &str,
     status: &str,
     text: &str,
+    metadata: &TaskReportMetadata,
     created: i64,
 ) -> Option<NewSessionInput> {
     (request.report_delivery == ToolReportDelivery::NextStep).then(|| {
@@ -1532,6 +2307,7 @@ fn report_input(
                 "childSessionID": child_session_id,
                 "status": status,
                 "text": text,
+                "metadata": metadata,
             }),
             InputDelivery::Queue,
             created,
@@ -1543,6 +2319,7 @@ fn report_for_job(
     job: &AgentJob,
     status: &str,
     text: &str,
+    metadata: Option<&TaskReportMetadata>,
     created: i64,
 ) -> Option<NewSessionInput> {
     if job.report_delivery != DbReportDelivery::NextStep {
@@ -1551,16 +2328,21 @@ fn report_for_job(
     let JobSubject::ChildSession { session_id } = &job.subject else {
         return None;
     };
+    let mut prompt = json!({
+        "kind": "subagentReport",
+        "jobID": job.id,
+        "childSessionID": session_id,
+        "status": status,
+        "text": text,
+    });
+    if let Some(metadata) = metadata {
+        prompt["metadata"] =
+            serde_json::to_value(metadata).expect("task report metadata is serializable");
+    }
     Some(NewSessionInput::new(
         crate::cmd::turn::prefixed_id("input"),
         job.parent_session_id.clone(),
-        json!({
-            "kind": "subagentReport",
-            "jobID": job.id,
-            "childSessionID": session_id,
-            "status": status,
-            "text": text,
-        }),
+        prompt,
         InputDelivery::Queue,
         created,
     ))

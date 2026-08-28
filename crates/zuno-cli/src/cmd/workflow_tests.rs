@@ -285,6 +285,7 @@ impl WorkflowNodeRunner for RecordingRunner {
             session_id: format!("ses_{label}_{attempt}"),
             job_id: None,
             output,
+            report_metadata: None,
         })
     }
 }
@@ -298,6 +299,7 @@ fn council_seat(id: &str, agent: &str, prompt: &str) -> CouncilSeatRequest {
             workflow: Some("council:balanced-review".to_owned()),
             workflow_node: Some(id.to_owned()),
             resume_session_id: None,
+            logical_key: format!("council:v1:{id}"),
             agent: agent.to_owned(),
             description: Some(id.to_owned()),
             prompt: prompt.to_owned(),
@@ -347,6 +349,7 @@ fn node(id: &str, depends_on: &[&str], prompt: &str) -> WorkflowNodeRequest {
             workflow: None,
             workflow_node: None,
             resume_session_id: None,
+            logical_key: format!("workflow:v1:{id}"),
             agent: format!("agent-{id}"),
             description: Some(id.to_owned()),
             prompt: prompt.to_owned(),

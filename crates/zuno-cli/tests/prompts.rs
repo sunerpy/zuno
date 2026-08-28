@@ -122,6 +122,11 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::job::DESCRIPTION,
         },
         Description {
+            wire_id: zuno_tools::JOB_RECONCILE_WIRE_ID,
+            file: "crates/zuno-tools/src/description/job_reconcile.txt",
+            text: zuno_tools::job_reconcile::DESCRIPTION,
+        },
+        Description {
             wire_id: "memory_propose",
             file: "crates/zuno-tools/src/description/memory-propose.txt",
             text: zuno_tools::memory::DESCRIPTION,

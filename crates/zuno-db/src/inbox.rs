@@ -239,20 +239,7 @@ impl SessionInbox {
     /// Returns a database error when rows cannot be queried or decoded.
     pub fn pending(&self, session_id: &str) -> Result<Vec<SessionInput>, DbError> {
         let connection = self.pool.get()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
-                        promoted_seq, error, time_created, time_updated \
-                 FROM session_input \
-                 WHERE session_id = ?1 AND state IN ('queued', 'steering') \
-                 ORDER BY admitted_seq",
-            )
-            .map_err(open::map_error)?;
-        let rows = statement
-            .query_map([session_id], decode_stored_input)
-            .map_err(open::map_error)?;
-        rows.map(|row| row.map_err(open::map_error).and_then(decode_input))
-            .collect()
+        pending_in(&connection, session_id)
     }
 
     /// Read one input regardless of lifecycle state.
@@ -623,6 +610,40 @@ fn select_by_id(
         .transpose()
 }
 
+/// Read one input through a caller-owned SQLite connection or transaction.
+///
+/// This is the transactional counterpart to [`SessionInbox::get`]. It lets a
+/// driver persist the model-visible message and settle the matching inbox row
+/// against the exact same database snapshot.
+pub fn read_in(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    input_id: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    select_by_id(connection, session_id, input_id)
+}
+
+/// Read pending inputs through a caller-owned SQLite connection or transaction.
+pub fn pending_in(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<SessionInput>, DbError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, session_id, prompt, delivery, state, revision, admitted_seq, \
+                    promoted_seq, error, time_created, time_updated \
+             FROM session_input \
+             WHERE session_id = ?1 AND state IN ('queued', 'steering') \
+             ORDER BY admitted_seq",
+        )
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map([session_id], decode_stored_input)
+        .map_err(open::map_error)?;
+    rows.map(|row| row.map_err(open::map_error).and_then(decode_input))
+        .collect()
+}
+
 fn edit_pending_in(
     transaction: &Transaction<'_>,
     session_id: &str,
@@ -783,6 +804,82 @@ pub fn mark_consumed_in(
         None,
         "session.input.consumed",
     )
+}
+
+/// Supersede an unconsumed input inside the caller transaction.
+///
+/// Reconciliation uses this to retire an uncertain report before atomically
+/// admitting the authoritative replacement. A consumed report remains immutable
+/// history and therefore returns `None`.
+pub(crate) fn supersede_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    transition_in(
+        transaction,
+        session_id,
+        input_id,
+        &[
+            SubmissionState::Queued,
+            SubmissionState::Steering,
+            SubmissionState::Promoted,
+        ],
+        SubmissionState::Cancelled,
+        None,
+        "session.input.superseded",
+    )
+}
+
+/// Return an orphaned promoted input to its admitted delivery lane.
+///
+/// Recovery reuses the original row and admission event. Repeating it after the
+/// first successful transition is a no-op, so a process restart cannot create a
+/// second report or a second recovery event.
+pub(crate) fn recover_promoted_in(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    input_id: &str,
+) -> Result<Option<SessionInput>, DbError> {
+    let Some(mut input) = select_by_id(transaction, session_id, input_id)? else {
+        return Ok(None);
+    };
+    match input.state {
+        SubmissionState::Queued | SubmissionState::Steering => return Ok(Some(input)),
+        SubmissionState::Promoted => {}
+        SubmissionState::Admitting
+        | SubmissionState::Consumed
+        | SubmissionState::Cancelled
+        | SubmissionState::Failed => return Ok(None),
+    }
+
+    let previous_revision = input.revision;
+    input.state = input.delivery.admitted_state();
+    input.revision = input.revision.saturating_add(1);
+    input.promoted_sequence = None;
+    input.time_updated = crate::message::now_millis().max(input.time_updated);
+    append_in(
+        transaction,
+        session_id,
+        NewSessionEvent::new("session.input.recovered", event_properties(&input, false))?,
+    )?;
+    let changed = transaction
+        .execute(
+            "UPDATE session_input \
+             SET state = ?1, revision = ?2, promoted_seq = NULL, time_updated = ?3 \
+             WHERE session_id = ?4 AND id = ?5 AND revision = ?6 AND state = 'promoted'",
+            params![
+                input.state.as_str(),
+                input.revision,
+                input.time_updated,
+                session_id,
+                input_id,
+                previous_revision,
+            ],
+        )
+        .map_err(open::map_error)?;
+    require_changed(input_id, changed)?;
+    Ok(Some(input))
 }
 
 fn require_changed(input_id: &str, changed: usize) -> Result<(), DbError> {

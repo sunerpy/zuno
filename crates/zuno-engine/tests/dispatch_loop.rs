@@ -23,7 +23,10 @@ use zuno_llm::registry::{
     ApiSurface, Capabilities, CompletionRequest, Provider, ProviderRegistry, ProviderStream, Spec,
 };
 use zuno_permission::{PermissionAction, Rule};
-use zuno_tool::{AllowAll, Tool, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy};
+use zuno_tool::{
+    AllowAll, Tool, ToolConcurrencyPolicy, ToolContext, ToolContinuation, ToolOutput,
+    ToolReplayPolicy,
+};
 
 const SESSION_ID: &str = "ses_dispatch_loop";
 
@@ -67,7 +70,7 @@ struct Resolver;
 
 impl AgentModelResolver for Resolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-        (requested == "build").then(|| ResolvedAgent::new("build", "dispatch test", 4))
+        (requested == "build").then(|| ResolvedAgent::new("build", "dispatch test"))
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {
@@ -175,6 +178,39 @@ impl Tool for ParallelTool {
             .push(command.to_owned());
         self.state.active.fetch_sub(1, Ordering::SeqCst);
         Ok(ToolOutput::text("parallel", format!("completed {command}")))
+    }
+}
+
+struct YieldingTaskTool;
+
+#[async_trait]
+impl Tool for YieldingTaskTool {
+    fn id(&self) -> &str {
+        "task"
+    }
+
+    fn description(&self) -> &str {
+        "Start background work whose durable report will resume the parent."
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::IsolatedBackground
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(
+            "background task",
+            "The durable nextStep report will resume this session.",
+        )
+        .with_continuation(ToolContinuation::YieldUntilInput))
     }
 }
 
@@ -561,6 +597,59 @@ async fn run_scenario(
         execution_order,
         pending,
     )
+}
+
+#[tokio::test]
+async fn a_next_step_tool_yields_without_spending_a_second_provider_request() {
+    let mut connection = seeded();
+    let mut responses = named_provider_events("task", &[("call-task", "inspect")]);
+    responses.truncate(1);
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let providers = registry(provider);
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(YieldingTaskTool)],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        RunTurnRequest::new(
+            SESSION_ID,
+            "turn-next-step-yield",
+            DynamicContext::default(),
+        ),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    let TurnOutcome::Completed { steps, .. } = outcome.expect("turn yields successfully") else {
+        panic!("turn was interrupted");
+    };
+    assert_eq!(steps, 1);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::ProviderRequestStarted { .. }))
+            .count(),
+        1,
+        "the host must wait for the durable report instead of asking the model to say it is waiting"
+    );
 }
 
 #[tokio::test]

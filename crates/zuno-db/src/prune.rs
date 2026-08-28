@@ -671,8 +671,10 @@ const TABLE_SPECS: [TableSpec; 14] = [
         columns: &[
             "id",
             "parent_session_id",
+            "logical_key",
             "subject_kind",
             "subject_payload",
+            "orchestration_snapshot",
             "status",
             "report_delivery",
             "result",

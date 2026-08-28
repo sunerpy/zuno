@@ -1,5 +1,6 @@
 Create or update the durable plan for the current session.
 When a plan already exists, expected_revision is required and must equal the revision returned by plan_get. A stale revision is rejected without changing the plan.
 Keep every step id stable across updates. Step ids and titles must be non-empty and unique.
+Pending steps require exactly one in_progress step. A fully completed plan has no in_progress step.
 Link the plan to the active goal with goal_id when one exists. Do not rewrite the user's goal or success criteria through this tool.
 This tool changes durable state and is never replayed implicitly after an uncertain failure.

@@ -82,7 +82,7 @@ struct ReasoningResolver(serde_json::Map<String, Value>);
 
 impl AgentModelResolver for ReasoningResolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-        (requested == "build").then(|| ResolvedAgent::new("build", "You are a test agent.", 4))
+        (requested == "build").then(|| ResolvedAgent::new("build", "You are a test agent."))
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {

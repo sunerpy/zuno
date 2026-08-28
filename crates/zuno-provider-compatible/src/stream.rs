@@ -392,7 +392,17 @@ impl ResponsesTranslator {
             ResponsesEvent::Incomplete { response } => {
                 Ok(self.terminal(response, FinishReason::Length))
             }
-            ResponsesEvent::Failed { response } => Ok(self.terminal(response, FinishReason::Error)),
+            ResponsesEvent::Failed { response } => Err(classify(
+                &self.provider,
+                &response.error.unwrap_or_else(|| WireError {
+                    message: Some(
+                        "Responses stream ended with response.failed without an error body"
+                            .to_owned(),
+                    ),
+                    code: None,
+                    kind: Some("response_failed".to_owned()),
+                }),
+            )),
             ResponsesEvent::Error { error } => Err(classify(&self.provider, &error)),
             ResponsesEvent::Other => Ok(Vec::new()),
         }
@@ -590,6 +600,8 @@ struct SummaryPart {
 struct ResponseEnvelope {
     #[serde(default)]
     usage: Option<ResponseUsage>,
+    #[serde(default)]
+    error: Option<WireError>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -649,8 +661,8 @@ pub fn finish_reason(wire: &str) -> FinishReason {
 
 /// Classify a structured error body into the typed taxonomy.
 ///
-/// Reads, in order: the numeric status the body may carry, then the string code,
-/// then the error class. Every one of those is a field on the wire.
+/// Reads the structured string code, error class, and numeric status carried by
+/// the body. Every one of those is a field on the wire.
 /// [`WireError::message`] is attached as payload and never examined.
 #[must_use]
 pub fn classify(provider: &str, error: &WireError) -> ProviderError {
@@ -672,20 +684,69 @@ pub fn classify(provider: &str, error: &WireError) -> ProviderError {
             provider_text: error.message.clone(),
         };
     }
+    if matches!(
+        error.kind.as_deref(),
+        Some("authentication_error" | "permission_error")
+    ) {
+        return ProviderError::Auth {
+            provider: provider.to_owned(),
+            source: Some(Box::new(ReportedWireError::new(provider, error))),
+        };
+    }
+    if error.kind.as_deref() == Some("rate_limit_error") {
+        return ProviderError::RateLimited { retry_after: None };
+    }
+    if error.kind.as_deref() == Some("server_error") {
+        return ProviderError::Transient {
+            status: None,
+            source: Some(Box::new(ReportedWireError::new(provider, error))),
+        };
+    }
     if let Some(status) = error.status() {
         return ProviderError::from_status(provider, status);
     }
     if error.kind.as_deref() == Some("insufficient_quota") {
-        return ProviderError::Fatal {
-            status: None,
-            source: None,
-        };
+        return ProviderError::fatal(ReportedWireError::new(provider, error));
     }
-    ProviderError::Fatal {
-        status: None,
-        source: None,
+    ProviderError::fatal(ReportedWireError::new(provider, error))
+}
+
+#[derive(Debug)]
+struct ReportedWireError {
+    provider: String,
+    message: Option<String>,
+    code: Option<serde_json::Value>,
+    kind: Option<String>,
+}
+
+impl ReportedWireError {
+    fn new(provider: &str, error: &WireError) -> Self {
+        Self {
+            provider: provider.to_owned(),
+            message: error.message.clone(),
+            code: error.code.clone(),
+            kind: error.kind.clone(),
+        }
     }
 }
+
+impl std::fmt::Display for ReportedWireError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "provider `{}` reported an error", self.provider)?;
+        if let Some(kind) = self.kind.as_deref() {
+            write!(formatter, " type={kind}")?;
+        }
+        if let Some(code) = self.code.as_ref() {
+            write!(formatter, " code={code}")?;
+        }
+        if let Some(message) = self.message.as_deref() {
+            write!(formatter, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ReportedWireError {}
 
 /// Parse a `Retry-After` header value into a delay.
 ///
@@ -794,6 +855,86 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn responses_failed_preserves_the_structured_provider_error() {
+        let mut translator =
+            SurfaceTranslator::new("kiro-local", "claude-opus-5", ApiSurface::Responses);
+        let error = translator
+            .frame(
+                r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"tool projection was rejected","type":"invalid_request_error","code":"unsupported_tool_projection"}}}"#,
+            )
+            .expect_err("response.failed must not become an ordinary message end");
+
+        let ProviderError::Fatal {
+            status: None,
+            source: Some(source),
+        } = error
+        else {
+            panic!("structured failed response must remain a fatal provider error");
+        };
+        let rendered = source.to_string();
+        assert!(rendered.contains("invalid_request_error"));
+        assert!(rendered.contains("unsupported_tool_projection"));
+        assert!(rendered.contains("tool projection was rejected"));
+    }
+
+    #[test]
+    fn responses_failed_server_error_without_status_is_transient() {
+        let mut translator =
+            SurfaceTranslator::new("kiro-local", "gpt-5.6-sol", ApiSurface::Responses);
+        let error = translator
+            .frame(
+                r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"upstream temporarily unavailable","type":"server_error","code":null}}}"#,
+            )
+            .expect_err("response.failed must remain a typed provider error");
+
+        let ProviderError::Transient {
+            status: None,
+            source: Some(source),
+        } = error
+        else {
+            panic!("type-only server_error must be transient");
+        };
+        assert!(source.to_string().contains("server_error"));
+    }
+
+    #[test]
+    fn responses_failed_rate_limit_error_without_status_is_rate_limited() {
+        let mut translator =
+            SurfaceTranslator::new("kiro-local", "gpt-5.6-sol", ApiSurface::Responses);
+        let error = translator
+            .frame(
+                r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"slow down","type":"rate_limit_error","code":null}}}"#,
+            )
+            .expect_err("response.failed must remain a typed provider error");
+
+        assert!(matches!(
+            error,
+            ProviderError::RateLimited { retry_after: None }
+        ));
+    }
+
+    #[test]
+    fn responses_failed_authentication_error_without_status_is_auth() {
+        let mut translator =
+            SurfaceTranslator::new("kiro-local", "gpt-5.6-sol", ApiSurface::Responses);
+        let error = translator
+            .frame(
+                r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"token expired","type":"authentication_error","code":null}}}"#,
+            )
+            .expect_err("response.failed must remain a typed provider error");
+
+        let ProviderError::Auth {
+            provider,
+            source: Some(source),
+        } = error
+        else {
+            panic!("type-only authentication_error must be an auth failure");
+        };
+        assert_eq!(provider, "kiro-local");
+        assert!(source.to_string().contains("authentication_error"));
     }
 
     #[test]

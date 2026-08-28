@@ -319,6 +319,9 @@ pub(crate) fn assemble(
             Arc::clone(&selection.todo_store),
             Arc::clone(&selection.job_controller),
         )));
+        builder.register_configured_builtin(erase(
+            zuno_tools::job_reconcile::JobReconcileTool::new(Arc::clone(&selection.todo_store)),
+        ));
     }
     for (slot, tool) in [
         (
@@ -447,7 +450,7 @@ fn shell_visible(
             .is_none_or(|tools| tools.iter().any(|tool| tool == "shell"))
 }
 
-fn sandbox_policy(
+pub(crate) fn sandbox_policy(
     directory: &Path,
     config: &Config,
     selected_profile: &AgentProfile,
@@ -523,6 +526,7 @@ fn native_tool_name(name: &str, harness_tool_names: &BTreeSet<String>) -> bool {
         .any(|slot| slot.wire_id() == name)
         || [
             zuno_tools::JOB_CANCEL_WIRE_ID,
+            zuno_tools::JOB_RECONCILE_WIRE_ID,
             zuno_tools::memory::MEMORY_TOOL_ID,
             zuno_goal::GET_GOAL_TOOL_ID,
             zuno_goal::CREATE_GOAL_TOOL_ID,
@@ -589,6 +593,7 @@ mod tests {
         for name in [
             "task",
             "job_cancel",
+            "job_reconcile",
             "memory_propose",
             "goal_get",
             "goal_propose",

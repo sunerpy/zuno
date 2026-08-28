@@ -25,10 +25,10 @@ use tokio::sync::mpsc;
 use tracing::Instrument as _;
 use uuid::Uuid;
 use zuno_db::event_log::{NewSessionEvent, append_with_connection};
-use zuno_db::inbox::SessionInbox;
+use zuno_db::inbox::{SessionInbox, mark_consumed_in, read_in};
 use zuno_db::message::{
     MessageRecord, MessageRole, MessageStore, MessageWithParts, PartKind, PartRecord,
-    created_after, now_millis,
+    TASK_REPORT_METADATA_KEY, created_after, now_millis,
 };
 use zuno_db::{Connection, open, session};
 use zuno_error::{DbError, ProviderError};
@@ -48,12 +48,16 @@ use zuno_orchestration::{
     SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity, sha256_json, sha256_text,
 };
 use zuno_tool::{
-    FileDiff, ToolConcurrencyPolicy, ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
+    FileDiff, ToolConcurrencyPolicy, ToolContinuation, ToolDefinition, ToolOutput,
+    ToolReplayPolicy, ToolUiIntent,
 };
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
 use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
-use crate::prompt::{PromptAssembly, PromptTraceSet};
+use crate::prompt::{
+    PromptAssembly, PromptAssemblyError, PromptProviderProjection, PromptTraceSet,
+    RuntimePromptPolicy, ensure_prompt_context_budget,
+};
 use crate::retry::{
     PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, retry_provider_with_wake,
 };
@@ -73,6 +77,10 @@ pub const INTERRUPTED_TOOL_RESULT: &str = "[Tool execution was interrupted]";
 /// value prevents a resumed transcript from describing the same interruption
 /// differently from the screen that observed it.
 pub const INTERRUPTED_TURN_NOTICE: &str = "Conversation interrupted by user.";
+
+const STEP_LIMIT_FINALIZATION_INSTRUCTION: &str = "You have reached the user-configured tool-step \
+limit for this turn. Do not call tools. Give a concise final response that states what was \
+completed, what remains, and any evidence or blocker the user needs.";
 
 /// Producer half of the engine's bounded event channel.
 ///
@@ -425,6 +433,8 @@ pub enum TurnError {
     Database(#[from] DbError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error(transparent)]
+    PromptAssembly(#[from] PromptAssemblyError),
     #[error("provider retry deadline exceeded on attempt {attempt} after {elapsed:?}")]
     ProviderRetryDeadlineExceeded { attempt: u32, elapsed: Duration },
     #[error(transparent)]
@@ -444,7 +454,7 @@ pub enum TurnRetryReason {
     ProviderRetryDeadline,
     /// SQLite reported another active writer.
     DatabaseBusy,
-    /// One turn reached its step ceiling while the larger goal may continue.
+    /// A configured text-only finalization still attempted to continue with tools.
     StepLimit,
     /// The provider returned no assistant content.
     EmptyAssistantMessage,
@@ -489,6 +499,7 @@ impl TurnError {
             Self::Hook(_) => "hook",
             Self::Database(_) => "database",
             Self::Provider(_) => "provider",
+            Self::PromptAssembly(_) => "prompt_assembly",
             Self::ProviderRetryDeadlineExceeded { .. } => "provider_retry_deadline",
             Self::Cache(_) => "cache",
         }
@@ -578,6 +589,7 @@ impl TurnError {
             | Self::ToolSignatureWithoutStart { .. }
             | Self::InvalidToolCalls { .. }
             | Self::Hook(_)
+            | Self::PromptAssembly(_)
             | Self::Cache(_) => TurnRecovery::Fail,
             Self::ProviderRetryDeadlineExceeded { .. } => TurnRecovery::Retry {
                 reason: TurnRetryReason::ProviderRetryDeadline,
@@ -594,14 +606,17 @@ pub struct ResolvedAgent {
     pub system_prompt: String,
     /// Ordered provenance for [`Self::system_prompt`].
     pub prompt_assembly: PromptAssembly,
-    pub max_steps: u32,
+    /// Stable facts rendered against each final provider-visible tool snapshot.
+    pub runtime_prompt_policy: RuntimePromptPolicy,
+    /// Optional maximum number of tool-capable provider iterations.
+    pub max_steps: Option<NonZeroU32>,
     /// Composition-root identity finalized at the provider request boundary.
     pub orchestration_seed: Option<Arc<AttemptSeed>>,
 }
 
 impl ResolvedAgent {
     #[must_use]
-    pub fn new(name: impl Into<String>, system_prompt: impl Into<String>, max_steps: u32) -> Self {
+    pub fn new(name: impl Into<String>, system_prompt: impl Into<String>) -> Self {
         let system_prompt = system_prompt.into();
         let mut prompt_assembly = PromptAssembly::new();
         prompt_assembly
@@ -615,9 +630,17 @@ impl ResolvedAgent {
             name: name.into(),
             system_prompt,
             prompt_assembly,
-            max_steps,
+            runtime_prompt_policy: RuntimePromptPolicy::default(),
+            max_steps: None,
             orchestration_seed: None,
         }
+    }
+
+    /// Limit tool-capable iterations and permit one final text-only request.
+    #[must_use]
+    pub fn with_max_steps(mut self, max_steps: NonZeroU32) -> Self {
+        self.max_steps = Some(max_steps);
+        self
     }
 
     /// Replace the opaque prompt with its ordered assembly.
@@ -625,6 +648,13 @@ impl ResolvedAgent {
     pub fn with_prompt_assembly(mut self, prompt_assembly: PromptAssembly) -> Self {
         self.system_prompt = prompt_assembly.render();
         self.prompt_assembly = prompt_assembly;
+        self
+    }
+
+    /// Attach host-owned policy facts for late provider-step rendering.
+    #[must_use]
+    pub fn with_runtime_prompt_policy(mut self, policy: RuntimePromptPolicy) -> Self {
+        self.runtime_prompt_policy = policy;
         self
     }
 
@@ -1295,9 +1325,9 @@ async fn run_turn_in_span(
     let mut last_assistant_id = None;
     let mut prompt_cache: Option<PromptCache<ToolDefinition>> = None;
     let mut prompt_traces = PromptTraceSet::default();
-    let mut last_prompt_receipt_id = None::<String>;
     let mut unresolved_tool_failures = BTreeMap::<String, ToolFailureRecovery>::new();
     let mut consecutive_invalid_tool_calls = 0_u8;
+    let mut step_limit_finalization_attempted = false;
 
     loop {
         if context.interrupt.is_set() {
@@ -1348,13 +1378,17 @@ async fn run_turn_in_span(
             &model.catalog_model_id,
         );
 
-        let step = steps.saturating_add(1);
-        if step > agent.max_steps {
-            return Err(TurnError::StepLimit {
-                agent: agent.name,
-                max_steps: agent.max_steps,
-            });
+        let step_limit_finalization = agent.max_steps.filter(|max_steps| steps >= max_steps.get());
+        if let Some(max_steps) = step_limit_finalization {
+            if step_limit_finalization_attempted {
+                return Err(TurnError::StepLimit {
+                    agent: agent.name,
+                    max_steps: max_steps.get(),
+                });
+            }
+            step_limit_finalization_attempted = true;
         }
+        let step = steps.saturating_add(1);
         steps = step;
         events
             .send(TurnEvent::AgentResolved {
@@ -1378,39 +1412,14 @@ async fn run_turn_in_span(
         let mut assistant = assistant_message(
             &request, &session, &requested, &agent, &model, step, &history,
         )?;
-        let mut system = agent.prompt_assembly.system_messages();
+        let assembled_system = agent.prompt_assembly.system_messages();
+        let mut system = assembled_system.clone();
         context
             .hooks
             .transform_system(&request.session_id, &model, &mut system)
             .await
             .map_err(TurnError::Hook)?;
         let system_prompt = system.join("\n\n");
-        if prompt_traces.insert(&system_prompt) {
-            let mut properties =
-                agent
-                    .prompt_assembly
-                    .event_properties(&agent.name, step, &system_prompt);
-            properties.insert("turnId".to_owned(), Value::String(request.turn_id.clone()));
-            if let Some(seed) = &agent.orchestration_seed {
-                let identity = seed
-                    .capability
-                    .identity()
-                    .expect("capability snapshot contains only serializable identity data");
-                properties.insert(
-                    "capabilitySnapshotID".to_owned(),
-                    serde_json::to_value(identity)
-                        .expect("capability snapshot identity is serializable"),
-                );
-                properties.insert(
-                    "capabilitySnapshot".to_owned(),
-                    serde_json::to_value(&seed.capability)
-                        .expect("capability snapshot is serializable"),
-                );
-            }
-            let event = NewSessionEvent::new("session.prompt.assembled", properties)?;
-            let receipt = append_with_connection(context.connection, &request.session_id, event)?;
-            last_prompt_receipt_id = Some(receipt.id);
-        }
         let stable_history = if context.hooks.enabled() {
             let mut transformed = hook_messages(&history);
             context
@@ -1454,23 +1463,33 @@ async fn run_turn_in_span(
                 .map_err(TurnError::Hook)?;
         }
         let cache = prompt_cache.get_or_insert_with(|| PromptCache::new(system_prompt.clone()));
+        let dynamic_context = if step_limit_finalization.is_some() {
+            request
+                .dynamic_context
+                .clone()
+                .with_runtime_instruction(STEP_LIMIT_FINALIZATION_INSTRUCTION)
+        } else {
+            request.dynamic_context.clone()
+        };
         let prepared = cache.prepare_turn_owned(
             stable_history,
-            request.dynamic_context.clone(),
+            dynamic_context,
             &definitions,
             available.mcp_status,
         )?;
-        let message_count = prepared
-            .messages()
-            .len()
-            .saturating_add(prepared.developer_context().len());
-        let estimated_prompt_tokens = estimate_prepared_prompt_tokens(&prepared);
+        let prepared = if step_limit_finalization.is_some() {
+            prepared.without_tools()
+        } else {
+            prepared
+        };
+        let assembled_dynamic_context = prepared.developer_context().to_vec();
         let locked_tools: Arc<[ToolDefinition]> = Arc::from(prepared.tools().to_vec());
+        let rebuilt_for_late_mcp = prepared.rebuilt_tools();
         events
             .send(TurnEvent::ToolSnapshotLocked {
                 step,
                 tool_ids: locked_tools.iter().map(|tool| tool.id.clone()).collect(),
-                rebuilt_for_late_mcp: prepared.rebuilt_tools(),
+                rebuilt_for_late_mcp,
             })
             .await?;
 
@@ -1496,17 +1515,91 @@ async fn run_turn_in_span(
             .map_err(TurnError::Hook)?;
         ensure_prepare_request_tool_subset(&hook_tool_authority, &completion.tools)
             .map_err(TurnError::Hook)?;
+        let runtime_sections = agent.runtime_prompt_policy.sections(
+            completion.tools.iter().map(|tool| tool.name.as_str()),
+            !request.dynamic_context.is_empty(),
+        );
+        let runtime_context = runtime_sections
+            .iter()
+            .map(|section| section.content().to_owned())
+            .collect::<Vec<_>>();
+        let mut assembled_developer_context =
+            Vec::with_capacity(runtime_context.len() + assembled_dynamic_context.len());
+        assembled_developer_context.extend(runtime_context.iter().cloned());
+        assembled_developer_context.extend(assembled_dynamic_context);
+        let hook_developer_context = std::mem::take(&mut completion.developer_context);
+        completion
+            .developer_context
+            .reserve(runtime_context.len() + hook_developer_context.len());
+        completion
+            .developer_context
+            .extend(runtime_context.iter().cloned());
+        completion.developer_context.extend(hook_developer_context);
         completion
             .validate_tool_arguments()
             .map_err(ProviderError::fatal)?;
+        let mut receipt_assembly = agent.prompt_assembly.clone();
+        for section in &runtime_sections {
+            receipt_assembly
+                .push(section.id(), section.source(), section.content())
+                .expect("runtime policy section ids are unique and valid");
+        }
+        let assembled_projection = PromptProviderProjection {
+            system_messages: &assembled_system,
+            developer_context: &assembled_developer_context,
+        };
+        let actual_projection = PromptProviderProjection {
+            system_messages: &system,
+            developer_context: &completion.developer_context,
+        };
+        let estimated_prompt_tokens = estimate_completion_prompt_tokens(&completion);
+        ensure_prompt_context_budget(estimated_prompt_tokens, request.context_limit)?;
+        let prompt_receipt_id = if let Some(receipt_id) =
+            prompt_traces.receipt_id(actual_projection)
+        {
+            receipt_id.to_owned()
+        } else {
+            let mut properties = receipt_assembly.event_properties(
+                &agent.name,
+                step,
+                assembled_projection,
+                actual_projection,
+            );
+            properties.insert("turnId".to_owned(), Value::String(request.turn_id.clone()));
+            if let Some(seed) = &agent.orchestration_seed {
+                let identity = seed
+                    .capability
+                    .identity()
+                    .expect("capability snapshot contains only serializable identity data");
+                properties.insert(
+                    "capabilitySnapshotID".to_owned(),
+                    serde_json::to_value(identity)
+                        .expect("capability snapshot identity is serializable"),
+                );
+                properties.insert(
+                    "capabilitySnapshot".to_owned(),
+                    serde_json::to_value(&seed.capability)
+                        .expect("capability snapshot is serializable"),
+                );
+            }
+            let event = NewSessionEvent::new("session.prompt.assembled", properties)?;
+            let receipt = append_with_connection(context.connection, &request.session_id, event)?;
+            prompt_traces.remember(actual_projection, receipt.id.clone());
+            receipt.id
+        };
+        let message_count = completion
+            .messages
+            .len()
+            .saturating_add(completion.developer_context.len());
         let orchestration_snapshot = Arc::new(attempt_snapshot(AttemptSnapshotInput {
             request: &request,
             session: &session,
             agent: &agent,
             model: &model,
             step,
-            prompt_receipt_id: last_prompt_receipt_id.as_deref(),
-            actual_system_prompt: &system_prompt,
+            prompt_receipt_id: Some(&prompt_receipt_id),
+            prompt_assembly_sha256: assembled_projection.sha256(),
+            prompt_actual_sha256: actual_projection.sha256(),
             tools: &completion.tools,
             locked_tools: &locked_tools,
         }));
@@ -1523,7 +1616,7 @@ async fn run_turn_in_span(
             ProviderRequestStart {
                 step,
                 request_id: &request_id,
-                prompt_receipt_id: last_prompt_receipt_id.as_deref(),
+                prompt_receipt_id: Some(&prompt_receipt_id),
                 message_count,
                 estimated_prompt_tokens,
                 assistant_message_id: &assistant_id,
@@ -1531,6 +1624,7 @@ async fn run_turn_in_span(
                 request_context: completion
                     .request_context()
                     .expect("foreground completion always has provider routing context"),
+                step_limit_finalization,
             },
         )?;
         events
@@ -1947,6 +2041,14 @@ async fn run_turn_in_span(
             .await?;
 
         let calls = accumulator.calls.values().cloned().collect::<Vec<_>>();
+        if !calls.is_empty()
+            && let Some(max_steps) = step_limit_finalization
+        {
+            return Err(TurnError::StepLimit {
+                agent: agent.name,
+                max_steps: max_steps.get(),
+            });
+        }
         let invalid_calls = calls
             .iter()
             .filter(|call| call.input_error.is_some())
@@ -1969,6 +2071,7 @@ async fn run_turn_in_span(
             }
         }
         let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
+        let mut yield_until_input = false;
         if !injected.skip_remaining_tools {
             let mut next_call = 0;
             while next_call < calls.len() && !injected.skip_remaining_tools {
@@ -2068,6 +2171,11 @@ async fn run_turn_in_span(
                 // execution result is appended in model order before an urgent inbox
                 // item may prevent the next group from starting.
                 for (call_index, call, display_name, ui_intent, dispatch) in completed {
+                    if !dispatch.is_error
+                        && dispatch.output.continuation == ToolContinuation::YieldUntilInput
+                    {
+                        yield_until_input = true;
+                    }
                     if let Some(recovery) = dispatch.recovery.clone() {
                         unresolved_tool_failures.insert(recovery.tool.clone(), recovery);
                     } else {
@@ -2134,7 +2242,25 @@ async fn run_turn_in_span(
             })
             .await?;
 
-        if !calls.is_empty() || injected.count > 0 {
+        if injected.count > 0 {
+            continue;
+        }
+
+        if yield_until_input {
+            events
+                .send(TurnEvent::TurnCompleted {
+                    assistant_message_id: assistant_id.clone(),
+                    steps,
+                })
+                .await?;
+            return Ok(TurnOutcome::Completed {
+                assistant_message_id: assistant_id,
+                steps,
+                unresolved_tool_failures: unresolved_tool_failures.into_values().collect(),
+            });
+        }
+
+        if !calls.is_empty() {
             continue;
         }
 
@@ -2278,27 +2404,7 @@ fn inject_live_inputs(
         {
             continue;
         }
-        if let Err(error) = persist_live_input(context.connection, request, requested, &message) {
-            if let Some(input_id) = message.input_id.as_deref() {
-                let _settled =
-                    live.inbox
-                        .mark_failed(&request.session_id, input_id, error.to_string());
-            }
-            return Err(error);
-        }
-        if let Some(input_id) = message.input_id.as_deref()
-            && live
-                .inbox
-                .mark_consumed(&request.session_id, input_id)?
-                .is_none()
-        {
-            return Err(DbError::Conflict {
-                table: "session_input".to_owned(),
-                id: input_id.to_owned(),
-                detail: "promoted live input was not available for consumed settlement".to_owned(),
-            }
-            .into());
-        }
+        persist_live_input(context.connection, request, requested, &message)?;
         injected.count = injected.count.saturating_add(1);
         injected.skip_remaining_tools |= message.urgent;
     }
@@ -2306,19 +2412,19 @@ fn inject_live_inputs(
 }
 
 fn persist_live_input(
-    connection: &Connection,
+    connection: &mut Connection,
     request: &RunTurnRequest,
     requested: &RequestedTurn,
     input: &SoftInterruptMessage,
 ) -> Result<(), TurnError> {
-    let store = MessageStore::new(connection);
-    let latest = store.latest_time_created(&request.session_id)?;
+    let transaction = open::immediate_transaction(connection)?;
+    let latest = MessageStore::new(&transaction).latest_time_created(&request.session_id)?;
     let created = created_after(now_millis(), latest);
     let message_id = input
         .input_id
         .clone()
         .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
-    let message = MessageRecord::from_json(json!({
+    let mut message = MessageRecord::from_json(json!({
         "id": message_id,
         "sessionID": request.session_id,
         "role": "user",
@@ -2329,6 +2435,15 @@ fn persist_live_input(
             "modelID": requested.model_id
         }
     }))?;
+    if let Some(input_id) = input.input_id.as_deref()
+        && let Some(stored) = read_in(&transaction, &request.session_id, input_id)?
+        && stored.prompt.get("kind").and_then(Value::as_str) == Some("subagentReport")
+        && let Some(metadata) = stored.prompt.get("metadata")
+    {
+        message
+            .data
+            .insert(TASK_REPORT_METADATA_KEY.to_owned(), metadata.clone());
+    }
     let mut parts = Vec::with_capacity(input.images.len().saturating_add(1));
     parts.push(PartRecord::from_json(
         json!({
@@ -2354,10 +2469,24 @@ fn persist_live_input(
             created.saturating_add(i64::try_from(offset).unwrap_or(i64::MAX).saturating_add(1)),
         )?);
     }
-    store.put_message_at(&message, created)?;
-    for part in parts {
-        store.put_part_at(&part, part.time_created)?;
+    {
+        let store = MessageStore::new(&transaction);
+        store.put_message_at(&message, created)?;
+        for part in parts {
+            store.put_part_at(&part, part.time_created)?;
+        }
     }
+    if let Some(input_id) = input.input_id.as_deref()
+        && mark_consumed_in(&transaction, &request.session_id, input_id)?.is_none()
+    {
+        return Err(DbError::Conflict {
+            table: "session_input".to_owned(),
+            id: input_id.to_owned(),
+            detail: "promoted live input was not available for consumed settlement".to_owned(),
+        }
+        .into());
+    }
+    transaction.commit().map_err(open::map_error)?;
     Ok(())
 }
 
@@ -3296,6 +3425,7 @@ struct ProviderRequestStart<'a> {
     assistant_message_id: &'a str,
     orchestration_snapshot: &'a AttemptSnapshot,
     request_context: &'a ProviderRequestContext,
+    step_limit_finalization: Option<NonZeroU32>,
 }
 
 fn append_provider_request_started(
@@ -3341,6 +3471,16 @@ fn append_provider_request_started(
             Value::String(prompt_receipt_id.to_owned()),
         );
     }
+    if let Some(max_steps) = start.step_limit_finalization {
+        properties.insert(
+            "stepLimitFinalization".to_owned(),
+            json!({
+                "maxToolSteps": max_steps.get(),
+                "instruction": STEP_LIMIT_FINALIZATION_INSTRUCTION,
+                "instructionSha256": sha256_text(STEP_LIMIT_FINALIZATION_INSTRUCTION),
+            }),
+        );
+    }
     let snapshot_identity = start
         .orchestration_snapshot
         .identity()
@@ -3371,7 +3511,8 @@ struct AttemptSnapshotInput<'a> {
     model: &'a ResolvedModel,
     step: u32,
     prompt_receipt_id: Option<&'a str>,
-    actual_system_prompt: &'a str,
+    prompt_assembly_sha256: String,
+    prompt_actual_sha256: String,
     tools: &'a [zuno_llm::registry::ToolSchema],
     locked_tools: &'a [ToolDefinition],
 }
@@ -3384,7 +3525,8 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
         model,
         step,
         prompt_receipt_id,
-        actual_system_prompt,
+        prompt_assembly_sha256,
+        prompt_actual_sha256,
         tools,
         locked_tools,
     } = input;
@@ -3485,8 +3627,8 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
         selected_skills,
         prompt: PromptReceiptIdentity {
             event_id: prompt_receipt_id.map(str::to_owned),
-            assembly_sha256: sha256_text(&agent.prompt_assembly.provider_projection()),
-            actual_sha256: sha256_text(actual_system_prompt),
+            assembly_sha256: prompt_assembly_sha256,
+            actual_sha256: prompt_actual_sha256,
         },
         tools,
     }
@@ -3526,24 +3668,21 @@ fn append_provider_request_terminal(
     Ok(())
 }
 
-fn estimate_prepared_prompt_tokens(prepared: &PreparedTurn<ToolDefinition>) -> u64 {
-    let message_bytes = serde_json::to_vec(prepared.messages()).map_or(0, |value| value.len());
-    let developer_bytes = prepared
-        .developer_context()
+fn estimate_completion_prompt_tokens(completion: &zuno_llm::registry::CompletionRequest) -> u64 {
+    let message_bytes = serde_json::to_vec(&completion.messages).map_or(0, |value| value.len());
+    let developer_bytes = completion
+        .developer_context
         .iter()
         .fold(0_usize, |bytes, context| {
             bytes.saturating_add(context.len())
         });
-    let tool_bytes = prepared.tools().iter().fold(0_usize, |bytes, tool| {
+    let tool_bytes = completion.tools.iter().fold(0_usize, |bytes, tool| {
         bytes
-            .saturating_add(tool.id.len())
+            .saturating_add(tool.name.len())
             .saturating_add(tool.description.len())
             .saturating_add(tool.parameters.to_string().len())
     });
-    let bytes = prepared
-        .system_static()
-        .len()
-        .saturating_add(message_bytes)
+    let bytes = message_bytes
         .saturating_add(developer_bytes)
         .saturating_add(tool_bytes);
     u64::try_from(bytes).unwrap_or(u64::MAX).div_ceil(4)

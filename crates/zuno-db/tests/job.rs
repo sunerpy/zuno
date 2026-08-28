@@ -1,9 +1,10 @@
 use serde_json::json;
 use std::sync::Arc;
 use zuno_db::event_log::SessionEventLog;
-use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
+use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::job::{
-    AgentJobStore, JobSettlement, JobStatus, JobSubject, NewAgentJob, ReportDelivery,
+    AgentJobStore, JobReconciliation, JobSettlement, JobStatus, JobSubject, NewAgentJob,
+    ReportDelivery,
 };
 use zuno_db::{Pool, migration, session};
 use zuno_orchestration::AttemptSnapshot;
@@ -81,14 +82,20 @@ fn report(id: &str) -> NewSessionInput {
 
 fn orchestration_snapshot() -> AttemptSnapshot {
     serde_json::from_value(json!({
-        "schemaVersion": 2,
+        "schemaVersion": 4,
         "turnId": "turn-parent",
         "step": 1,
         "capability": {
-            "schemaVersion": 2,
+            "schemaVersion": 4,
             "pack": {"id":"test","version":"1","upstreamRevision":"test"},
             "extensionRevision": 0,
             "permissionPolicySha256": "policy",
+            "sandbox": {
+                "mode": "workspace-write",
+                "network": "deny",
+                "writableRoots": [],
+                "protectedPaths": []
+            },
             "profiles": [], "presets": [], "councils": [], "workflows": [], "skills": []
         },
         "owner": {
@@ -247,12 +254,12 @@ fn durable_product_subjects_reject_blank_identifiers() {
     let error = connection
         .execute(
             r#"INSERT INTO agent_job (
-               id, parent_session_id, subject_kind, subject_payload, status, report_delivery,
-               created_seq, time_created, time_updated
+               id, parent_session_id, logical_key, subject_kind, subject_payload, status,
+               report_delivery, evidence_start_rowid, created_seq, time_created, time_updated
              ) VALUES (
-               'job_blank_product', ?1, 'product-agent',
+               'job_blank_product', ?1, 'job_blank_product', 'product-agent',
                '{"kind":"productAgent","runID":"   ","product":"codex","instance":"reviewer","tool":"subagent_codex"}',
-               'running', 'quiet', 0, 1, 1
+               'running', 'quiet', 0, 0, 1, 1
              )"#,
             [PARENT],
         )
@@ -394,6 +401,143 @@ fn failed_cancelled_and_uncertain_settlements_can_retain_structured_results() {
 }
 
 #[test]
+fn uncertain_next_step_job_requires_evidenced_reconciliation_and_replaces_its_report() {
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    store
+        .create(running("job_1", ReportDelivery::NextStep).with_logical_key("logical-deploy"))
+        .expect("create job");
+    store
+        .settle(
+            "job_1",
+            JobSettlement::uncertain(
+                "connection dropped after dispatch",
+                20,
+                Some(report("input_uncertain")),
+            ),
+        )
+        .expect("mark uncertain");
+
+    let reconciled = store
+        .reconcile_uncertain(
+            "job_1",
+            JobReconciliation::completed(
+                json!({"finalText":"deployment exists"}),
+                "deployment API",
+                "release 42 is present and healthy",
+                30,
+                Some(report("input_reconciled")),
+            ),
+        )
+        .expect("reconcile from authoritative state");
+
+    assert_eq!(reconciled.job.status, JobStatus::Completed);
+    assert_eq!(
+        reconciled.job.report_input_id.as_deref(),
+        Some("input_reconciled")
+    );
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    assert_eq!(
+        inbox
+            .get(PARENT, "input_uncertain")
+            .expect("read old report")
+            .expect("old report")
+            .state,
+        SubmissionState::Cancelled
+    );
+    assert_eq!(
+        inbox
+            .pending(PARENT)
+            .expect("pending reports")
+            .into_iter()
+            .map(|input| input.id)
+            .collect::<Vec<_>>(),
+        ["input_reconciled"]
+    );
+    let events = SessionEventLog::new(pool)
+        .read_after(PARENT, None)
+        .expect("parent events");
+    assert!(events.iter().any(|event| {
+        event.event_type == "agent.job.reconciled"
+            && event.properties["authority"] == "deployment API"
+            && event.properties["evidence"] == "release 42 is present and healthy"
+    }));
+
+    store
+        .reconcile_uncertain(
+            "job_1",
+            JobReconciliation::completed(
+                json!({"finalText":"duplicate"}),
+                "deployment API",
+                "duplicate evidence",
+                40,
+                Some(report("input_duplicate")),
+            ),
+        )
+        .expect_err("reconciliation is at most once");
+}
+
+#[test]
+fn quiet_uncertain_job_releases_only_after_evidenced_reconciliation() {
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    store
+        .create_child_if_reconciled(
+            running("job_1", ReportDelivery::Quiet).with_logical_key("logical-review"),
+        )
+        .expect("create job");
+    store
+        .settle(
+            "job_1",
+            JobSettlement::uncertain("review process vanished", 20, None),
+        )
+        .expect("mark uncertain");
+
+    let blank = store
+        .reconcile_uncertain(
+            "job_1",
+            JobReconciliation::failed(
+                "review did not complete",
+                " ",
+                "process table contains no matching execution",
+                30,
+                None,
+            ),
+        )
+        .expect_err("blank authority is not evidence");
+    assert!(
+        std::error::Error::source(&blank)
+            .is_some_and(|source| source.to_string().contains("authority")),
+        "{blank:?}"
+    );
+
+    store
+        .reconcile_uncertain(
+            "job_1",
+            JobReconciliation::failed(
+                "review did not complete",
+                "process supervisor",
+                "the owned process tree exited without an artifact",
+                31,
+                None,
+            ),
+        )
+        .expect("reconcile quiet job");
+    store
+        .create_child_if_reconciled(
+            NewAgentJob::new(
+                "job_2",
+                PARENT,
+                JobSubject::child_session(CHILD),
+                ReportDelivery::Quiet,
+                40,
+            )
+            .with_logical_key("logical-review"),
+        )
+        .expect("a reconciled quiet job releases its logical task");
+}
+
+#[test]
 fn structured_results_do_not_weaken_terminal_settlement_invariants() {
     let pool = initialized(&DbLocation::Memory);
     let store = AgentJobStore::new(Arc::clone(&pool));
@@ -512,13 +656,236 @@ fn a_second_settlement_cannot_duplicate_the_parent_report() {
 }
 
 #[test]
-fn pending_reports_survive_pool_reconstruction_until_promoted() {
+fn the_same_child_cannot_be_redispatched_until_its_job_is_reconciled() {
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    store
+        .create_child_if_reconciled(running("job_1", ReportDelivery::NextStep))
+        .expect("create first child job");
+
+    let active = store
+        .create_child_if_reconciled(running("job_duplicate_active", ReportDelivery::NextStep))
+        .expect_err("an active child job blocks duplicate dispatch");
+    assert!(
+        std::error::Error::source(&active)
+            .is_some_and(|source| source.to_string().contains("unreconciled job `job_1`")),
+        "{active:?}"
+    );
+
+    store
+        .settle(
+            "job_1",
+            JobSettlement::completed(json!({"finalText": "done"}), 20, Some(report("input_1"))),
+        )
+        .expect("settle first job with report");
+    let unconsumed = store
+        .create_child_if_reconciled(running("job_duplicate_report", ReportDelivery::NextStep))
+        .expect_err("an unconsumed report blocks duplicate dispatch");
+    assert!(
+        std::error::Error::source(&unconsumed)
+            .is_some_and(|source| source.to_string().contains("unreconciled job `job_1`")),
+        "{unconsumed:?}"
+    );
+
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    inbox
+        .promote_id(PARENT, "input_1")
+        .expect("promote report")
+        .expect("queued report");
+    inbox
+        .mark_consumed(PARENT, "input_1")
+        .expect("consume report")
+        .expect("promoted report");
+    store
+        .create_child_if_reconciled(running("job_2", ReportDelivery::Quiet))
+        .expect("consumed terminal report releases the child");
+    store
+        .settle(
+            "job_2",
+            JobSettlement::uncertain("lost acknowledgement", 30, None),
+        )
+        .expect("settle uncertain job");
+
+    let uncertain = store
+        .create_child_if_reconciled(running("job_duplicate_uncertain", ReportDelivery::Quiet))
+        .expect_err("an uncertain child remains unreconciled");
+    assert!(
+        std::error::Error::source(&uncertain)
+            .is_some_and(|source| source.to_string().contains("unreconciled job `job_2`")),
+        "{uncertain:?}"
+    );
+}
+
+#[test]
+fn the_same_logical_task_cannot_be_dispatched_to_a_fresh_child_until_reconciled() {
+    const OTHER_CHILD: &str = "ses_other_child";
+    let pool = initialized(&DbLocation::Memory);
+    pool.transaction(|transaction| {
+        session::create(
+            transaction,
+            &session::SessionCreate::new(
+                OTHER_CHILD,
+                "other-child",
+                "project",
+                "/workspace",
+                "/workspace",
+                "Other child",
+                "zuno",
+            )
+            .with_parent(PARENT)
+            .at(3),
+        )
+        .map(|_| ())
+    })
+    .expect("create other child");
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    store
+        .create_child_if_reconciled(
+            running("job_1", ReportDelivery::NextStep).with_logical_key("logical-review"),
+        )
+        .expect("create first logical task");
+
+    let duplicate = store
+        .create_child_if_reconciled(
+            NewAgentJob::new(
+                "job_duplicate",
+                PARENT,
+                JobSubject::child_session(OTHER_CHILD),
+                ReportDelivery::NextStep,
+                11,
+            )
+            .with_logical_key("logical-review"),
+        )
+        .expect_err("a fresh child must not bypass logical task reconciliation");
+    assert!(
+        std::error::Error::source(&duplicate)
+            .is_some_and(|source| source.to_string().contains("logical task `logical-review`")),
+        "{duplicate:?}"
+    );
+
+    store
+        .settle(
+            "job_1",
+            JobSettlement::completed(json!({"finalText": "done"}), 20, Some(report("input_1"))),
+        )
+        .expect("settle first task");
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    inbox
+        .promote_id(PARENT, "input_1")
+        .expect("promote report")
+        .expect("queued report");
+    inbox
+        .mark_consumed(PARENT, "input_1")
+        .expect("consume report")
+        .expect("promoted report");
+
+    store
+        .create_child_if_reconciled(
+            NewAgentJob::new(
+                "job_2",
+                PARENT,
+                JobSubject::child_session(OTHER_CHILD),
+                ReportDelivery::Quiet,
+                30,
+            )
+            .with_logical_key("logical-review"),
+        )
+        .expect("consumption reconciles the prior logical task");
+}
+
+#[test]
+fn fresh_child_and_logical_job_admission_are_one_transaction() {
+    const SPECULATIVE_CHILD: &str = "ses_speculative_child";
+    let pool = initialized(&DbLocation::Memory);
+    let store = AgentJobStore::new(Arc::clone(&pool));
+    store
+        .create_child_if_reconciled(
+            running("job_existing", ReportDelivery::Quiet).with_logical_key("logical-review"),
+        )
+        .expect("seed active logical task");
+
+    let duplicate = store
+        .create_child_session_if_reconciled(
+            session::SessionCreate::new(
+                SPECULATIVE_CHILD,
+                "speculative-child",
+                "project",
+                "/workspace",
+                "/workspace",
+                "Speculative child",
+                "zuno",
+            )
+            .with_parent(PARENT)
+            .at(11),
+            NewAgentJob::new(
+                "job_duplicate",
+                PARENT,
+                JobSubject::child_session(SPECULATIVE_CHILD),
+                ReportDelivery::Quiet,
+                11,
+            )
+            .with_logical_key("logical-review")
+            .with_evidence_start_rowid(17),
+        )
+        .expect_err("the existing logical task blocks the fresh child and job");
+    assert!(
+        std::error::Error::source(&duplicate)
+            .is_some_and(|source| source.to_string().contains("logical task `logical-review`")),
+        "{duplicate:?}"
+    );
+    assert!(
+        session::get(&pool.get().expect("connection"), SPECULATIVE_CHILD).is_err(),
+        "the rejected admission must roll back its child session"
+    );
+
+    store
+        .settle(
+            "job_existing",
+            JobSettlement::completed(json!({"finalText": "done"}), 20, None),
+        )
+        .expect("quiet completion reconciles the prior task");
+    let admitted = store
+        .create_child_session_if_reconciled(
+            session::SessionCreate::new(
+                SPECULATIVE_CHILD,
+                "speculative-child",
+                "project",
+                "/workspace",
+                "/workspace",
+                "Speculative child",
+                "zuno",
+            )
+            .with_parent(PARENT)
+            .at(21),
+            NewAgentJob::new(
+                "job_fresh",
+                PARENT,
+                JobSubject::child_session(SPECULATIVE_CHILD),
+                ReportDelivery::Quiet,
+                21,
+            )
+            .with_logical_key("logical-review")
+            .with_evidence_start_rowid(17),
+        )
+        .expect("reconciled logical task admits the child and job atomically");
+    assert_eq!(admitted.evidence_start_rowid, 17);
+    assert_eq!(
+        session::get(&pool.get().expect("connection"), SPECULATIVE_CHILD)
+            .expect("child committed with job")
+            .parent_id
+            .as_deref(),
+        Some(PARENT)
+    );
+}
+
+#[test]
+fn promoted_but_unconsumed_reports_are_recovered_once_after_restart() {
     let directory = tempfile::tempdir().expect("temporary database directory");
     let location = DbLocation::File(directory.path().join("zuno.db"));
     let snapshot = orchestration_snapshot();
     {
         let pool = initialized(&location);
-        let store = AgentJobStore::new(pool);
+        let store = AgentJobStore::new(Arc::clone(&pool));
         store
             .create(
                 running("job_1", ReportDelivery::NextStep)
@@ -531,10 +898,16 @@ fn pending_reports_survive_pool_reconstruction_until_promoted() {
                 JobSettlement::completed(json!({"text": "recover"}), 20, Some(report("input_1"))),
             )
             .expect("settle job");
+        let promoted = SessionInbox::new(pool)
+            .promote_id(PARENT, "input_1")
+            .expect("promote report before process loss")
+            .expect("pending report");
+        assert_eq!(promoted.state, SubmissionState::Promoted);
     }
 
     let pool = initialized(&location);
     let store = AgentJobStore::new(Arc::clone(&pool));
+    let inbox = SessionInbox::new(Arc::clone(&pool));
     assert_eq!(
         store
             .get("job_1")
@@ -552,14 +925,56 @@ fn pending_reports_survive_pool_reconstruction_until_promoted() {
             .collect::<Vec<_>>(),
         ["job_1"]
     );
-    SessionInbox::new(Arc::clone(&pool))
+    let recovered = inbox.pending(PARENT).expect("recovered report input");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, "input_1");
+    assert_eq!(recovered[0].state, SubmissionState::Queued);
+    assert_eq!(recovered[0].promoted_sequence, None);
+
+    assert_eq!(
+        store
+            .pending_reports()
+            .expect("repeat recovery is idempotent")
+            .into_iter()
+            .map(|job| job.id)
+            .collect::<Vec<_>>(),
+        ["job_1"]
+    );
+    let event_types = SessionEventLog::new(Arc::clone(&pool))
+        .read_after(PARENT, None)
+        .expect("parent events")
+        .into_iter()
+        .map(|event| event.event_type)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| event_type.as_str() == "session.input.admitted")
+            .count(),
+        1,
+        "recovery must reuse the admitted input"
+    );
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| event_type.as_str() == "session.input.recovered")
+            .count(),
+        1,
+        "repeat recovery must not append another recovery transition"
+    );
+
+    inbox
         .promote_id(PARENT, "input_1")
-        .expect("promote report")
-        .expect("pending report");
+        .expect("promote recovered report")
+        .expect("requeued report");
+    inbox
+        .mark_consumed(PARENT, "input_1")
+        .expect("consume recovered report")
+        .expect("promoted report");
     assert!(
         store
             .pending_reports()
-            .expect("pending report jobs")
+            .expect("consumed reports are reconciled")
             .is_empty()
     );
 }

@@ -316,7 +316,7 @@ struct SoakResolver;
 
 impl AgentModelResolver for SoakResolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-        (requested == "build").then(|| ResolvedAgent::new("build", SYSTEM_PROMPT, 4))
+        (requested == "build").then(|| ResolvedAgent::new("build", SYSTEM_PROMPT))
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {

@@ -1,7 +1,8 @@
 //! Durable input delivery across active and idle session turns.
 
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use zuno_db::inbox::{SessionInbox, SessionInput};
 
 use crate::interrupt::SoftInterruptMessage;
@@ -17,6 +18,8 @@ pub trait PendingInputDriver: Send + Sync + 'static {
 /// How one durable wake request reached the parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
+    /// Another process-local delivery already owns this exact durable input.
+    AlreadyInFlight,
     /// The active turn claimed the input at a safe point.
     ClaimedByActiveTurn,
     /// This coordinator acquired an idle lease and drove the input.
@@ -29,6 +32,7 @@ pub struct SessionWakeCoordinator {
     inbox: SessionInbox,
     runs: SessionRunRegistry,
     driver: Arc<dyn PendingInputDriver>,
+    in_flight: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 impl SessionWakeCoordinator {
@@ -43,6 +47,7 @@ impl SessionWakeCoordinator {
             inbox,
             runs,
             driver,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -58,6 +63,13 @@ impl SessionWakeCoordinator {
                 "wake message input id does not match durable input `{input_id}`"
             ));
         }
+        let Some(_lease) = WakeLease::acquire(
+            Arc::clone(&self.in_flight),
+            session_id.to_owned(),
+            input_id.to_owned(),
+        ) else {
+            return Ok(WakeOutcome::AlreadyInFlight);
+        };
 
         loop {
             let Some(input) = self.pending_input(session_id, input_id)? else {
@@ -90,5 +102,34 @@ impl SessionWakeCoordinator {
             .pending(session_id)
             .map_err(|error| error.to_string())
             .map(|pending| pending.into_iter().find(|input| input.id == input_id))
+    }
+}
+
+struct WakeLease {
+    in_flight: Arc<Mutex<HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl WakeLease {
+    fn acquire(
+        in_flight: Arc<Mutex<HashSet<(String, String)>>>,
+        session_id: String,
+        input_id: String,
+    ) -> Option<Self> {
+        let key = (session_id, input_id);
+        let inserted = in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.clone());
+        inserted.then_some(Self { in_flight, key })
+    }
+}
+
+impl Drop for WakeLease {
+    fn drop(&mut self) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
     }
 }

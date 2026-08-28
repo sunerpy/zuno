@@ -106,11 +106,11 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
                (session_id, id, secret, url, time_created, time_updated) \
              VALUES ('session-1', 'share-1', 'secret', 'https://example.invalid', 1, 1);
              INSERT INTO agent_job \
-               (id, parent_session_id, subject_kind, subject_payload, status, report_delivery, \
-                created_seq, time_created, time_updated) \
-             VALUES ('job-1', 'session-1', 'child-session', \
+               (id, parent_session_id, logical_key, subject_kind, subject_payload, status, \
+                report_delivery, evidence_start_rowid, created_seq, time_created, time_updated) \
+             VALUES ('job-1', 'session-1', 'job-1', 'child-session', \
                      json_object('kind', 'childSession', 'sessionID', 'session-child'), \
-                     'running', 'next-step', 1, 1, 1);",
+                     'running', 'next-step', 0, 1, 1, 1);",
         )
         .expect("seed a complete session graph");
 

@@ -68,14 +68,10 @@
 //!
 //! # Delegation
 //!
-//! [`task`] hands a bounded unit of work to a child session. Its five refusals —
-//! no target, two targets, a coordinator as target, the depth bound, and a
-//! permission denial — each carry a message that names the fix, because a
-//! delegation refusal is read by a model and `oh-my-opencode-slim` pays for the
-//! absence of that property with a nine-pattern recovery hook. There is
-//! deliberately **no** `load_skills` argument: skills are permission-gated per
-//! agent, so nothing about them is a property of the call. Targets come from
-//! [`zuno_agent::builtin::delegable`] and the child's model from
+//! [`task`] hands a bounded unit of work to a child session. A typed
+//! [`task::DelegationContract`] makes the objective, deliverable, instructions,
+//! success evidence, scope, constraints, and dependencies explicit before a child
+//! exists. Targets come from [`zuno_agent::builtin::delegable`] and the child's model from
 //! [`zuno_agent::model_policy`], with this call's own `model`/`effort` as a fourth,
 //! highest rung on that ladder.
 //!
@@ -197,6 +193,7 @@ pub mod exposure;
 pub mod invalid;
 pub mod job;
 pub mod job_cancel;
+pub mod job_reconcile;
 pub mod plan_exit;
 pub mod product_agent;
 pub mod question;
@@ -216,6 +213,9 @@ pub use crate::invalid::{InvalidParams, InvalidTool};
 pub use crate::job::{DESCRIPTION as JOB_DESCRIPTION, JobParams, JobTool, WIRE_ID as JOB_WIRE_ID};
 pub use crate::job_cancel::{
     CancelOutcome, JobCancelParams, JobCancelTool, JobController, WIRE_ID as JOB_CANCEL_WIRE_ID,
+};
+pub use crate::job_reconcile::{
+    JobReconcileParams, JobReconcileTool, ReconciledOutcome, WIRE_ID as JOB_RECONCILE_WIRE_ID,
 };
 pub use crate::plan_exit::{PlanExitHost, PlanExitParams, PlanExitTool, RecordingHost};
 pub use crate::product_agent::{
@@ -252,10 +252,11 @@ pub use crate::skill::{
 
 pub use crate::task::{
     ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, DEFAULT_SUBAGENT_DEPTH,
-    DESCRIPTION as TASK_DESCRIPTION, DelegationLimits, DelegationPlan, FixedFacts,
-    GENERIC_EXECUTOR, GUIDANCE_KEY, ModelFacts, NoProviders, PERMISSION_KEY as TASK_PERMISSION_KEY,
-    ProviderFacts, RecordingHost as RecordingChildTurnHost, ReportDelivery, TaskParams,
-    TaskRejection, TaskTool, WIRE_ID as TASK_WIRE_ID, denial_guidance, valid_targets,
+    DESCRIPTION as TASK_DESCRIPTION, DelegationConstraints, DelegationContract, DelegationLimits,
+    DelegationPlan, DelegationScope, FixedFacts, GENERIC_EXECUTOR, GUIDANCE_KEY, ModelFacts,
+    NoProviders, PERMISSION_KEY as TASK_PERMISSION_KEY, ProviderFacts,
+    RecordingHost as RecordingChildTurnHost, ReportDelivery, TaskParams, TaskRejection, TaskTool,
+    WIRE_ID as TASK_WIRE_ID, denial_guidance, valid_targets,
 };
 
 pub use crate::memory::{

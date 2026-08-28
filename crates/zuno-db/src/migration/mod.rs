@@ -13,7 +13,7 @@ use zuno_error::DbError;
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly. There is no upgrade
 /// path between values before Zuno's first release.
-pub const CURRENT_FORMAT: u32 = 3;
+pub const CURRENT_FORMAT: u32 = 4;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "

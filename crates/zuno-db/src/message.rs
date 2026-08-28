@@ -102,6 +102,13 @@ const MESSAGE_TABLE: &str = "message";
 /// The `part` table, named once.
 const PART_TABLE: &str = "part";
 
+/// Top-level message-data key carrying host-generated delegated-task evidence.
+///
+/// The text remains the model-visible report. This sibling field preserves the
+/// typed report for replay and client projection without asking the child model
+/// to serialize a machine protocol.
+pub const TASK_REPORT_METADATA_KEY: &str = "taskReport";
+
 /// How many message ids go into a single `IN (...)` part lookup.
 ///
 /// SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 32766 on the amalgamation
@@ -1063,6 +1070,41 @@ impl<'conn> MessageStore<'conn> {
         )?;
         let rows = statement
             .query_map((session_id, kind.as_str()), |row| {
+                Ok(PartRecord::from_row(row))
+            })
+            .map_err(map_error)?;
+        let mut parts = Vec::new();
+        for row in rows {
+            parts.push(row.map_err(map_error)??);
+        }
+        Ok(parts)
+    }
+
+    /// Return the insertion cursor after every part currently owned by one session.
+    ///
+    /// The cursor is local durable storage state, not a model-facing identifier. It
+    /// lets a long-lived child session attribute tool evidence to one delegation
+    /// without relying on timestamps or re-reading evidence from earlier turns.
+    pub fn latest_part_rowid_for_session(&self, session_id: &str) -> Result<i64, DbError> {
+        self.prepare("SELECT coalesce(max(rowid), 0) FROM part WHERE session_id = ?1")?
+            .query_row([session_id], |row| row.get(0))
+            .map_err(map_error)
+    }
+
+    /// Read parts of one kind inserted strictly after a durable session cursor.
+    pub fn parts_for_session_by_kind_after_rowid(
+        &self,
+        session_id: &str,
+        kind: PartKind,
+        after_rowid: i64,
+    ) -> Result<Vec<PartRecord>, DbError> {
+        let mut statement = self.prepare(
+            "SELECT id, message_id, session_id, time_created, time_updated, data FROM part \
+             WHERE session_id = ?1 AND rowid > ?2 AND json_extract(data, '$.type') = ?3 \
+             ORDER BY rowid ASC",
+        )?;
+        let rows = statement
+            .query_map((session_id, after_rowid, kind.as_str()), |row| {
                 Ok(PartRecord::from_row(row))
             })
             .map_err(map_error)?;

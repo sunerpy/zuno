@@ -501,7 +501,7 @@ mod production_round_trip {
 
     impl AgentModelResolver for Resolver {
         fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-            (requested == "build").then(|| ResolvedAgent::new("build", SYSTEM, 4))
+            (requested == "build").then(|| ResolvedAgent::new("build", SYSTEM))
         }
 
         fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {

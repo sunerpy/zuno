@@ -172,6 +172,7 @@ impl Fixture {
             workflow: None,
             workflow_node: None,
             resume_session_id: None,
+            logical_key: "delegation:v1:test".to_owned(),
             agent: "worker".to_owned(),
             description: Some("a delegated unit".to_owned()),
             prompt: "do the thing".to_owned(),
@@ -182,6 +183,94 @@ impl Fixture {
             report_delivery: ReportDelivery::NextStep,
         }
     }
+
+    fn persist_child_for_request(&self, request: &ChildTurnRequest) -> String {
+        let admission = self
+            .host
+            .session_admission_for(request)
+            .expect("resolve child session admission");
+        if let Some(child) = admission.create {
+            self.host
+                .database
+                .transaction(|transaction| {
+                    zuno_db::session::create(transaction, &child).map(|_| ())
+                })
+                .expect("persist child session");
+        }
+        admission.session_id
+    }
+}
+
+fn parent_attempt(turn_id: &str, extension_revision: u64) -> AttemptSnapshot {
+    serde_json::from_value(json!({
+        "schemaVersion": 4,
+        "turnId": turn_id,
+        "step": 1,
+        "capability": {
+            "schemaVersion": 4,
+            "pack": {"id":"test","version":"1","upstreamRevision":"test"},
+            "extensionRevision": extension_revision,
+            "permissionPolicySha256": "policy",
+            "sandbox": {
+                "mode": "workspace-write",
+                "network": "deny",
+                "writableRoots": [],
+                "protectedPaths": []
+            },
+            "profiles": [], "presets": [], "councils": [], "workflows": [], "skills": []
+        },
+        "owner": {
+            "sessionId":"ses_owner", "parentSessionId":null, "parentAttempt":null,
+            "workflow":null, "workflowNode":null
+        },
+        "agent": {
+            "name":"orchestrator", "sourceId":"test://orchestrator",
+            "definitionSha256":"definition", "permissionSha256":"permission",
+            "promptPolicySha256":"prompt"
+        },
+        "model": {
+            "providerId":"fake", "modelId":"fake-model", "wireModelId":"fake-model",
+            "surface":"responses", "reasoningSha256":"reasoning", "preset":null
+        },
+        "selectedSkills": [],
+        "prompt": {"eventId":"evt-parent","assemblySha256":"assembly","actualSha256":"actual"},
+        "tools": []
+    }))
+    .expect("parent attempt snapshot")
+}
+
+#[test]
+fn child_continuation_preserves_exact_provider_options() {
+    let fixture = Fixture::new();
+    let mut request = fixture.request("ses_owner");
+    request.provider_options = serde_json::from_value(json!({
+        "thinking": {"mode": "enabled", "budget": 8192},
+        "vendorExtension": {"nested": ["kept", 7]}
+    }))
+    .expect("provider options object");
+
+    let spec = ChildSessionSpec::resolved(
+        &request,
+        "worker",
+        "provider/model",
+        zuno_llm::effort::ReasoningEffort::High.into(),
+    );
+
+    assert_eq!(spec.provider_options, request.provider_options);
+    let encoded = serde_json::to_value(ChildSessionMetadata {
+        kind: CHILD_SESSION_METADATA_KIND.to_owned(),
+        schema_version: CHILD_SESSION_METADATA_SCHEMA_VERSION,
+        continuation: spec,
+    })
+    .expect("serialize child continuation");
+    assert_eq!(
+        encoded["continuation"]["providerOptions"]["thinking"]["budget"],
+        8192
+    );
+    assert_eq!(
+        encoded["continuation"]["providerOptions"]["vendorExtension"]["nested"][0],
+        "kept"
+    );
 }
 
 #[derive(Default)]
@@ -232,10 +321,235 @@ impl DelegatedTurnRunner for RecordingRunner {
     }
 }
 
+#[test]
+fn task_report_metadata_collects_only_typed_durable_evidence() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.session("ses_child", Some("ses_owner"));
+    let connection = fixture.connection();
+    let store = zuno_db::message::MessageStore::new(&connection);
+    let historical_assistant = zuno_db::message::MessageRecord::from_json(json!({
+        "id": "msg_child_historical",
+        "sessionID": "ses_child",
+        "role": "assistant",
+        "time": {"created": 8, "completed": 9},
+        "parentID": "msg_parent",
+        "modelID": "model",
+        "providerID": "provider",
+        "mode": "worker",
+        "agent": "worker",
+        "path": {"cwd": "/tmp/proj", "root": "/tmp/proj"},
+        "cost": 0,
+        "tokens": {
+            "input": 1,
+            "output": 1,
+            "reasoning": 0,
+            "cache": {"read": 0, "write": 0}
+        },
+        "finish": "stop"
+    }))
+    .expect("historical assistant message");
+    let historical_tool = zuno_db::message::PartRecord::from_json(
+        json!({
+            "id": "prt_child_historical",
+            "sessionID": "ses_child",
+            "messageID": historical_assistant.id,
+            "type": "tool",
+            "callID": "call_historical",
+            "tool": "shell",
+            "state": {
+                "status": "completed",
+                "input": {"command": "cargo test -p previous"},
+                "output": "ok",
+                "metadata": {
+                    "writtenPaths": ["/tmp/proj/src/previous.rs"],
+                    "taskVerification": {
+                        "name": "previous tests",
+                        "status": "passed",
+                        "evidence": "cargo test -p previous"
+                    },
+                    "uncertainSideEffects": ["historical uncertainty"]
+                }
+            }
+        }),
+        9,
+    )
+    .expect("historical tool part");
+    store
+        .put_message(&historical_assistant)
+        .expect("persist historical assistant");
+    store
+        .put_part_at(&historical_tool, 9)
+        .expect("persist historical tool part");
+    let evidence_start_rowid = store
+        .latest_part_rowid_for_session("ses_child")
+        .expect("capture delegation evidence boundary");
+
+    let assistant = zuno_db::message::MessageRecord::from_json(json!({
+        "id": "msg_child_report",
+        "sessionID": "ses_child",
+        "role": "assistant",
+        "time": {"created": 10, "completed": 11},
+        "parentID": "msg_parent",
+        "modelID": "model",
+        "providerID": "provider",
+        "mode": "worker",
+        "agent": "worker",
+        "path": {"cwd": "/tmp/proj", "root": "/tmp/proj"},
+        "cost": 0,
+        "tokens": {
+            "input": 3,
+            "output": 2,
+            "reasoning": 1,
+            "cache": {"read": 0, "write": 0}
+        },
+        "finish": "stop"
+    }))
+    .expect("assistant message");
+    let tool = zuno_db::message::PartRecord::from_json(
+        json!({
+            "id": "prt_child_report",
+            "sessionID": "ses_child",
+            "messageID": assistant.id,
+            "type": "tool",
+            "callID": "call_verify",
+            "tool": "shell",
+            "state": {
+                "status": "completed",
+                "input": {"command": "cargo test -p changed"},
+                "output": "ok",
+                "metadata": {
+                    "writtenPaths": ["/tmp/proj/src/b.rs", "/tmp/proj/src/a.rs"],
+                    "taskVerification": {
+                        "name": "changed-crate tests",
+                        "status": "passed",
+                        "evidence": "cargo test -p changed"
+                    },
+                    "uncertainSideEffects": ["remote acknowledgement was not observed"]
+                }
+            }
+        }),
+        11,
+    )
+    .expect("tool part");
+    store.put_message(&assistant).expect("persist assistant");
+    store.put_part_at(&tool, 11).expect("persist tool part");
+
+    let metadata = task_report_metadata(
+        fixture.host.database.as_ref(),
+        &fixture.request("ses_owner"),
+        TaskReportBuild {
+            job_id: Some("job_report"),
+            child_session_id: "ses_child",
+            evidence_start_rowid,
+            status: "completed",
+            final_text: "done",
+            uncertain_side_effects: Vec::new(),
+        },
+    );
+    let metadata = serde_json::to_value(metadata).expect("serialize report metadata");
+
+    assert_eq!(metadata["jobId"], "job_report");
+    assert_eq!(
+        metadata["changedPaths"],
+        json!(["/tmp/proj/src/a.rs", "/tmp/proj/src/b.rs"])
+    );
+    assert_eq!(
+        metadata["verificationRecords"],
+        json!([{
+            "name": "changed-crate tests",
+            "status": "passed",
+            "evidence": "cargo test -p changed"
+        }])
+    );
+    assert_eq!(
+        metadata["uncertainSideEffects"],
+        json!(["remote acknowledgement was not observed"])
+    );
+    assert_eq!(metadata["evidenceErrors"], json!([]));
+}
+
+#[test]
+fn recovered_task_report_uses_the_child_agent_not_the_parent_attempt_agent() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.session("ses_child", Some("ses_owner"));
+    fixture
+        .connection()
+        .execute(
+            "UPDATE session SET agent = 'deep' WHERE id = 'ses_child'",
+            (),
+        )
+        .expect("record the effective child agent");
+    let parent_attempt: AttemptSnapshot = serde_json::from_value(json!({
+        "schemaVersion": 4,
+        "turnId": "turn-parent",
+        "step": 1,
+        "capability": {
+            "schemaVersion": 4,
+            "pack": {"id":"test","version":"1","upstreamRevision":"test"},
+            "extensionRevision": 0,
+            "permissionPolicySha256": "policy",
+            "sandbox": {
+                "mode": "workspace-write",
+                "network": "deny",
+                "writableRoots": [],
+                "protectedPaths": []
+            },
+            "profiles": [], "presets": [], "councils": [], "workflows": [], "skills": []
+        },
+        "owner": {
+            "sessionId":"ses_owner", "parentSessionId":null, "parentAttempt":null,
+            "workflow":null, "workflowNode":null
+        },
+        "agent": {
+            "name":"orchestrator", "sourceId":"test://orchestrator",
+            "definitionSha256":"definition", "permissionSha256":"permission",
+            "promptPolicySha256":"prompt"
+        },
+        "model": {
+            "providerId":"fake", "modelId":"fake-model", "wireModelId":"fake-model",
+            "surface":"responses", "reasoningSha256":"reasoning", "preset":null
+        },
+        "selectedSkills": [],
+        "prompt": {"eventId":"evt-parent","assemblySha256":"assembly","actualSha256":"actual"},
+        "tools": []
+    }))
+    .expect("parent attempt snapshot");
+    let job = fixture
+        .host
+        .job_store
+        .create(
+            NewAgentJob::new(
+                "job_recovered_agent",
+                "ses_owner",
+                JobSubject::child_session("ses_child"),
+                DbReportDelivery::NextStep,
+                10,
+            )
+            .queued()
+            .with_orchestration_snapshot(Some(parent_attempt)),
+        )
+        .expect("create child job");
+
+    let metadata = task_report_metadata_for_job(
+        fixture.host.database.as_ref(),
+        &job,
+        "cancelled",
+        "recovered",
+        Vec::new(),
+    )
+    .expect("child report metadata");
+
+    assert_eq!(metadata.agent, "deep");
+}
+
 #[derive(Default)]
 struct RecordingWake {
     reports: Mutex<Vec<zuno_db::inbox::SessionInput>>,
     failure: Mutex<Option<String>>,
+    transient_failures: Mutex<Vec<String>>,
+    attempts: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -401,11 +715,41 @@ impl RecordingWake {
     fn fail_with(&self, error: &str) {
         *self.failure.lock().expect("wake failure lock") = Some(error.to_owned());
     }
+
+    fn fail_once_with(&self, error: &str) {
+        self.transient_failures
+            .lock()
+            .expect("transient wake failure lock")
+            .push(error.to_owned());
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_attempts(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while self.attempts() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("parent wake reached the expected attempt count");
+    }
 }
 
 #[async_trait]
 impl ParentReportWake for RecordingWake {
     async fn wake(&self, report: zuno_db::inbox::SessionInput) -> Result<(), String> {
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+        if let Some(error) = self
+            .transient_failures
+            .lock()
+            .expect("transient wake failure lock")
+            .pop()
+        {
+            return Err(error);
+        }
         if let Some(error) = self.failure.lock().expect("wake failure lock").clone() {
             return Err(error);
         }
@@ -470,11 +814,14 @@ async fn a_cyclic_parent_chain_is_refused_rather_than_walked_forever() {
 async fn a_fresh_delegation_creates_a_child_session_owned_by_its_parent() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);
+    fixture.runner.complete_with(Ok("done"));
 
     let child = fixture
         .host
-        .session_for(&fixture.request("ses_owner"))
-        .expect("a fresh delegation creates a child");
+        .dispatch(fixture.request("ses_owner"), no_interrupt())
+        .await
+        .expect("a fresh delegation creates a child")
+        .session_id;
 
     let stored = zuno_db::session::get(&fixture.connection(), &child).expect("the child persisted");
     assert_eq!(stored.parent_id.as_deref(), Some("ses_owner"));
@@ -496,10 +843,7 @@ async fn a_child_continuation_identity_survives_process_local_cache_loss() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);
     let request = fixture.request("ses_owner");
-    let child = fixture
-        .host
-        .session_for(&request)
-        .expect("a fresh delegation creates a child");
+    let child = fixture.persist_child_for_request(&request);
     let spec = ChildSessionSpec::resolved(
         &request,
         "worker",
@@ -524,6 +868,90 @@ async fn a_child_continuation_identity_survives_process_local_cache_loss() {
     assert_eq!(restored.parent_session_id, "ses_owner");
     assert_eq!(restored.agent, "worker");
     assert_eq!(restored.model, "test-provider/test-model");
+}
+
+#[tokio::test]
+async fn resumed_child_rejects_identity_drift_without_rewriting_durable_metadata() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let mut request = fixture.request("ses_owner");
+    request.parent_attempt = Some(Arc::new(parent_attempt("turn-original", 7)));
+    request.effort = Some(zuno_llm::effort::ReasoningEffort::High);
+    request.provider_options = serde_json::from_value(json!({
+        "vendor": {"mode": "stable"}
+    }))
+    .expect("provider options");
+    let child = fixture.persist_child_for_request(&request);
+    let original = ChildSessionSpec::resolved(
+        &request,
+        "worker",
+        "provider-a/model-a",
+        Some(zuno_llm::effort::ReasoningEffort::High),
+    );
+    persist_child_session_spec(
+        &fixture.host.database,
+        &child,
+        &original,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("persist the original continuation identity");
+    let baseline = zuno_db::session::get(&fixture.connection(), &child)
+        .expect("stored child")
+        .metadata
+        .expect("continuation metadata");
+
+    let mut candidates = Vec::new();
+    let mut changed_parent = original.clone();
+    changed_parent.parent_session_id = "ses_other".to_owned();
+    candidates.push(("parent", changed_parent));
+    let mut changed_agent = original.clone();
+    changed_agent.agent = "deep".to_owned();
+    candidates.push(("agent", changed_agent));
+    let mut changed_model = original.clone();
+    changed_model.model = "provider-b/model-b".to_owned();
+    candidates.push(("effective provider/model", changed_model));
+    let mut changed_reasoning = original.clone();
+    changed_reasoning.effort = Some(zuno_llm::effort::ReasoningEffort::Low);
+    candidates.push(("reasoning", changed_reasoning));
+    let mut changed_capability = original.clone();
+    changed_capability
+        .parent_attempt
+        .as_mut()
+        .expect("parent attempt")
+        .capability
+        .extension_revision = 8;
+    candidates.push(("parent capability generation", changed_capability));
+    let mut changed_parent_attempt = original.clone();
+    changed_parent_attempt
+        .parent_attempt
+        .as_mut()
+        .expect("parent attempt")
+        .agent
+        .permission_sha256 = "changed-parent-authority".to_owned();
+    candidates.push(("parent Attempt", changed_parent_attempt));
+
+    for (field, candidate) in candidates {
+        let error = checkpoint_child_session_spec(
+            &fixture.host.database,
+            &fixture.host.supervisor.children,
+            &child,
+            &candidate,
+            true,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("identity drift must be rejected");
+        assert!(error.contains(field), "{field}: {error}");
+
+        let stored = zuno_db::session::get(&fixture.connection(), &child).expect("stored child");
+        assert_eq!(
+            stored.metadata.as_deref(),
+            Some(baseline.as_str()),
+            "{field} drift must not rewrite durable metadata"
+        );
+        assert_eq!(stored.agent.as_deref(), Some("worker"));
+    }
 }
 
 #[test]
@@ -570,7 +998,7 @@ fn resuming_another_parents_child_is_refused_by_name() {
     request.resume_session_id = Some("ses_their_child".to_owned());
     let error = fixture
         .host
-        .session_for(&request)
+        .session_admission_for(&request)
         .expect_err("another parent's child is not resumable here");
 
     assert!(
@@ -592,7 +1020,7 @@ fn resuming_an_absent_session_is_refused_rather_than_silently_creating_one() {
     request.resume_session_id = Some("ses_never_existed".to_owned());
     let error = fixture
         .host
-        .session_for(&request)
+        .session_admission_for(&request)
         .expect_err("an absent session is not resumable");
 
     assert!(
@@ -613,9 +1041,151 @@ fn resuming_this_parents_own_child_reuses_it_rather_than_forking() {
     assert_eq!(
         fixture
             .host
-            .session_for(&request)
-            .expect("this parent's own child resumes"),
+            .session_admission_for(&request)
+            .expect("this parent's own child resumes")
+            .session_id,
         "ses_my_child"
+    );
+}
+
+#[tokio::test]
+async fn foreground_resume_refuses_a_child_with_an_unreconciled_background_job() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.session("ses_child", Some("ses_owner"));
+    fixture
+        .host
+        .job_store
+        .create_child_if_reconciled(NewAgentJob::new(
+            "job_live",
+            "ses_owner",
+            JobSubject::child_session("ses_child"),
+            DbReportDelivery::NextStep,
+            1,
+        ))
+        .expect("create live child job");
+    let mut request = fixture.request("ses_owner");
+    request.resume_session_id = Some("ses_child".to_owned());
+    fixture.runner.complete_with(Ok("must not run"));
+
+    let error = fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect_err("the same child cannot run before reconciliation");
+
+    assert!(format!("{error}").contains("job_live"), "{error}");
+    assert_eq!(fixture.runner.started(), 0);
+}
+
+#[tokio::test]
+async fn foreground_dispatch_returns_the_same_host_generated_report_shape_as_background() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.runner.complete_with(Ok("foreground answer"));
+
+    let turn = fixture
+        .host
+        .dispatch(fixture.request("ses_owner"), no_interrupt())
+        .await
+        .expect("foreground delegation completes");
+    let report = turn
+        .report_metadata
+        .expect("foreground terminal report metadata");
+
+    assert_eq!(turn.job_id, None);
+    assert_eq!(turn.output, "foreground answer");
+    assert_eq!(report["schemaVersion"], 1);
+    assert!(
+        report["jobId"]
+            .as_str()
+            .is_some_and(|job_id| job_id.starts_with("job_")),
+        "{report}"
+    );
+    assert_eq!(report["sessionId"], turn.session_id);
+    assert_eq!(report["parentSessionId"], "ses_owner");
+    assert_eq!(report["agent"], "worker");
+    assert_eq!(report["status"], "completed");
+    assert_eq!(report["finalText"], "foreground answer");
+    assert_eq!(report["changedPaths"], json!([]));
+    assert_eq!(report["verificationRecords"], json!([]));
+    assert_eq!(report["uncertainSideEffects"], json!([]));
+}
+
+#[tokio::test]
+async fn identical_foreground_delegations_run_once_and_create_one_child_session() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+
+    let first_host = fixture.host.clone();
+    let first_request = fixture.request("ses_owner");
+    let first =
+        tokio::spawn(async move { first_host.dispatch(first_request, no_interrupt()).await });
+    fixture.runner.wait_for_starts(1).await;
+
+    let duplicate = tokio::time::timeout(
+        Duration::from_millis(100),
+        fixture
+            .host
+            .dispatch(fixture.request("ses_owner"), no_interrupt()),
+    )
+    .await
+    .expect("an active logical duplicate must be rejected without starting a child")
+    .expect_err("the second foreground delegation is the same logical task");
+    assert!(
+        duplicate
+            .to_string()
+            .contains("logical task `delegation:v1:test`"),
+        "{duplicate}"
+    );
+    assert_eq!(fixture.runner.started(), 1);
+    assert_eq!(
+        zuno_db::session::children(&fixture.connection(), "ses_owner")
+            .expect("read children")
+            .len(),
+        1
+    );
+
+    fixture.runner.complete_with(Ok("foreground answer"));
+    first
+        .await
+        .expect("foreground task joined")
+        .expect("first logical delegation completes");
+}
+
+#[tokio::test]
+async fn sequential_foreground_duplicates_in_one_provider_attempt_run_once() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let attempt = Arc::new(parent_attempt("turn-one-provider-response", 7));
+    let mut request = fixture.request("ses_owner");
+    request.parent_attempt = Some(Arc::clone(&attempt));
+
+    fixture.runner.complete_with(Ok("foreground answer"));
+    fixture
+        .host
+        .dispatch(request.clone(), no_interrupt())
+        .await
+        .expect("the first foreground delegation completes");
+
+    fixture.runner.complete_with(Ok("must not run twice"));
+    let duplicate = fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect_err("the same provider attempt cannot repeat a completed logical task");
+    assert!(
+        duplicate
+            .to_string()
+            .contains("logical task `delegation:v1:test`"),
+        "{duplicate}"
+    );
+    assert_eq!(fixture.runner.started(), 1);
+    assert_eq!(
+        zuno_db::session::children(&fixture.connection(), "ses_owner")
+            .expect("read children")
+            .len(),
+        1
     );
 }
 
@@ -767,10 +1337,23 @@ async fn background_dispatch_returns_a_durable_active_job_before_the_child_finis
         settled
             .result
             .as_ref()
-            .and_then(|value| value["text"].as_str()),
+            .and_then(|value| value["finalText"].as_str()),
         Some("child answer")
     );
-    assert_eq!(fixture.wake.reports.lock().expect("wake reports").len(), 1);
+    let result = settled.result.as_ref().expect("task report metadata");
+    assert_eq!(result["schemaVersion"], 1);
+    assert_eq!(result["jobId"], job_id);
+    assert_eq!(result["sessionId"], turn.session_id);
+    assert_eq!(result["parentSessionId"], "ses_owner");
+    assert_eq!(result["agent"], "worker");
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["changedPaths"], json!([]));
+    assert_eq!(result["verificationRecords"], json!([]));
+    assert_eq!(result["uncertainSideEffects"], json!([]));
+    let reports = fixture.wake.reports.lock().expect("wake reports");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].prompt["metadata"], *result);
+    drop(reports);
     assert!(
         fixture
             .host
@@ -783,6 +1366,52 @@ async fn background_dispatch_returns_a_durable_active_job_before_the_child_finis
 }
 
 #[tokio::test]
+async fn rejected_background_logical_duplicate_leaves_no_orphan_child_session() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.session("ses_existing_child", Some("ses_owner"));
+    fixture
+        .host
+        .job_store
+        .create_child_if_reconciled(
+            zuno_db::job::NewAgentJob::new(
+                "job_existing",
+                "ses_owner",
+                zuno_db::job::JobSubject::child_session("ses_existing_child"),
+                zuno_db::job::ReportDelivery::NextStep,
+                10,
+            )
+            .with_logical_key("delegation:v1:test"),
+        )
+        .expect("seed active logical task");
+    let before = zuno_db::session::children(&fixture.connection(), "ses_owner")
+        .expect("read children before duplicate")
+        .len();
+
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+    let duplicate = fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect_err("the active logical task blocks a fresh background child");
+    assert!(
+        duplicate
+            .to_string()
+            .contains("logical task `delegation:v1:test`"),
+        "{duplicate}"
+    );
+    assert_eq!(
+        zuno_db::session::children(&fixture.connection(), "ses_owner")
+            .expect("read children after duplicate")
+            .len(),
+        before,
+        "a rejected admission must roll back its speculative child session"
+    );
+    assert_eq!(fixture.runner.started(), 0);
+}
+
+#[tokio::test]
 async fn background_children_share_the_workspace_delegation_bound() {
     let fixture = Fixture::with_limit(1);
     fixture.session("ses_owner", None);
@@ -790,6 +1419,7 @@ async fn background_children_share_the_workspace_delegation_bound() {
     first.background = true;
     first.report_delivery = ReportDelivery::Quiet;
     let mut second = fixture.request("ses_owner");
+    second.logical_key = "delegation:v1:test-second".to_owned();
     second.background = true;
     second.report_delivery = ReportDelivery::Quiet;
 
@@ -852,6 +1482,7 @@ async fn a_queued_background_child_can_be_cancelled_without_starting() {
     first.background = true;
     first.report_delivery = ReportDelivery::Quiet;
     let mut queued = fixture.request("ses_owner");
+    queued.logical_key = "delegation:v1:test-queued".to_owned();
     queued.background = true;
 
     let first = fixture
@@ -998,6 +1629,53 @@ async fn a_failed_background_child_is_persisted_and_reported() {
 }
 
 #[tokio::test]
+async fn a_transient_parent_wake_failure_is_retried_in_the_same_process() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    fixture.wake.fail_once_with("temporary run-registry race");
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+
+    fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect("dispatch");
+    fixture.runner.complete_with(Ok("child answer"));
+    fixture.jobs.wait_all().await;
+
+    assert_eq!(fixture.wake.attempts(), 2);
+    assert_eq!(fixture.wake.reports.lock().expect("wake reports").len(), 1);
+}
+
+#[tokio::test]
+async fn parent_wake_retries_past_the_initial_window_without_duplicate_delivery() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let initial_failures = 3;
+    for _ in 0..initial_failures {
+        fixture.wake.fail_once_with("temporary parent wake outage");
+    }
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+
+    fixture
+        .host
+        .dispatch(request, no_interrupt())
+        .await
+        .expect("dispatch");
+    fixture.runner.complete_with(Ok("child answer"));
+    fixture.jobs.wait_all().await;
+
+    assert_eq!(fixture.wake.attempts(), initial_failures + 1);
+    assert_eq!(
+        fixture.wake.reports.lock().expect("wake reports").len(),
+        1,
+        "the durable report id must be delivered only once"
+    );
+}
+
+#[tokio::test]
 async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reopens() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);
@@ -1011,7 +1689,21 @@ async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reop
         .await
         .expect("dispatch");
     fixture.runner.complete_with(Ok("survives restart"));
-    fixture.jobs.wait_all().await;
+    fixture.wake.wait_for_attempts(1).await;
+    let task = {
+        let mut tasks = fixture
+            .jobs
+            .tasks
+            .lock()
+            .expect("background supervisor tasks");
+        tasks
+            .iter_mut()
+            .find(|job| job.id == turn.job_id.as_deref().expect("job id"))
+            .and_then(|job| job.task.take())
+            .expect("live wake retry task")
+    };
+    task.abort();
+    let _ = task.await;
     let job = fixture
         .host
         .job_store
@@ -1043,6 +1735,108 @@ async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reop
             .expect("recovered reports")
             .len(),
         1
+    );
+}
+
+#[tokio::test]
+async fn recovery_keeps_a_process_owned_background_child_running() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+
+    let turn = ChildTurnHost::dispatch(&fixture.host, request, no_interrupt())
+        .await
+        .expect("dispatch background child");
+    let job_id = turn.job_id.expect("background child job");
+    fixture.runner.wait_for_starts(1).await;
+
+    assert_eq!(
+        fixture
+            .host
+            .recover_interrupted("ses_owner")
+            .expect("inspect process-owned child jobs"),
+        0
+    );
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(&job_id)
+            .expect("running job")
+            .status,
+        zuno_db::job::JobStatus::Running
+    );
+
+    fixture.jobs.cancel_all();
+    fixture.jobs.wait_all().await;
+}
+
+#[tokio::test]
+async fn peer_recovery_respects_a_live_owner_and_recovers_after_owner_loss() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+
+    let turn = ChildTurnHost::dispatch(&fixture.host, request, no_interrupt())
+        .await
+        .expect("dispatch background child");
+    let job_id = turn.job_id.expect("background child job");
+    fixture.runner.wait_for_starts(1).await;
+
+    let peer_jobs = BackgroundJobSupervisor::default();
+    let peer_host = ChildSessionHost::with_components(
+        fixture.database.clone(),
+        Arc::new(RecordingRunner::default()),
+        Arc::new(RecordingWake::default()),
+        peer_jobs
+            .delegation_limiter(NonZeroUsize::new(8).expect("peer delegation limit is non-zero")),
+        peer_jobs,
+    )
+    .expect("open a second process-equivalent child host");
+
+    assert_eq!(
+        peer_host
+            .recover_interrupted("ses_owner")
+            .expect("a peer inspects active child jobs"),
+        0,
+        "a peer process must not reconcile work still owned by a live executor"
+    );
+    assert_eq!(
+        peer_host.job_store.get(&job_id).expect("live job").status,
+        zuno_db::job::JobStatus::Running
+    );
+
+    let task = {
+        let mut tasks = fixture
+            .jobs
+            .tasks
+            .lock()
+            .expect("background supervisor tasks");
+        tasks
+            .iter_mut()
+            .find(|job| job.id == job_id)
+            .and_then(|job| job.task.take())
+            .expect("live executor task")
+    };
+    task.abort();
+    let _ = task.await;
+
+    assert_eq!(
+        peer_host
+            .recover_interrupted("ses_owner")
+            .expect("recover after the owning executor disappears"),
+        1,
+        "process loss must release ownership so durable recovery can settle the job"
+    );
+    assert_eq!(
+        peer_host
+            .job_store
+            .get(&job_id)
+            .expect("recovered job")
+            .status,
+        zuno_db::job::JobStatus::Uncertain
     );
 }
 

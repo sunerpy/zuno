@@ -380,9 +380,17 @@ impl ResponsesDecoder {
             ResponsesEvent::Incomplete { response } => {
                 Ok(self.terminal_response(response, FinishReason::Length))
             }
-            ResponsesEvent::Failed { response } => {
-                Ok(self.terminal_response(response, FinishReason::Error))
-            }
+            ResponsesEvent::Failed { response } => Err(map_stream_error(
+                &self.provider,
+                response.error.unwrap_or_else(|| OpenAiErrorBody {
+                    message: Some(
+                        "Responses stream ended with response.failed without an error body"
+                            .to_owned(),
+                    ),
+                    kind: Some("response_failed".to_owned()),
+                    code: None,
+                }),
+            )),
             ResponsesEvent::Error { error } => Err(map_stream_error(&self.provider, error)),
             ResponsesEvent::Other => Ok(Vec::new()),
         }
@@ -656,6 +664,8 @@ struct SummaryPart {
 struct ResponseEnvelope {
     #[serde(default)]
     usage: Option<ResponseUsage>,
+    #[serde(default)]
+    error: Option<OpenAiErrorBody>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -709,4 +719,49 @@ struct ToolInputError {
     tool_use_id: String,
     #[source]
     source: serde_json::Error,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn responses_failed_preserves_the_structured_provider_error() {
+        let mut decoder = OpenAiDecoder::new("kiro-local", "claude-opus-5", ApiSurface::Responses);
+        let frame = format!(
+            "event: response.failed\ndata: {}\n\n",
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "message": "tool projection was rejected",
+                        "type": "invalid_request_error",
+                        "code": "unsupported_tool_projection"
+                    }
+                }
+            })
+        );
+
+        let mut output = decoder.push(frame.as_bytes());
+        output.extend(decoder.finish());
+        let error = output
+            .into_iter()
+            .next()
+            .expect("one terminal error")
+            .expect_err("response.failed must not become an ordinary message end");
+
+        let ProviderError::Fatal {
+            status: None,
+            source: Some(source),
+        } = error
+        else {
+            panic!("structured failed response must remain a fatal provider error");
+        };
+        let rendered = source.to_string();
+        assert!(rendered.contains("invalid_request_error"));
+        assert!(rendered.contains("unsupported_tool_projection"));
+        assert!(rendered.contains("tool projection was rejected"));
+    }
 }

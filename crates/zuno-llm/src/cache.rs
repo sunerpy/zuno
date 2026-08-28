@@ -64,6 +64,7 @@ impl StaticSystemPrompt {
 pub struct DynamicContext {
     turn_context: String,
     memory: Option<String>,
+    runtime_instructions: Vec<String>,
 }
 
 impl DynamicContext {
@@ -73,6 +74,7 @@ impl DynamicContext {
         Self {
             turn_context: turn_context.into(),
             memory: None,
+            runtime_instructions: Vec::new(),
         }
     }
 
@@ -83,7 +85,14 @@ impl DynamicContext {
         self
     }
 
-    /// Whether neither dynamic source contains non-whitespace text.
+    /// Append an engine-owned instruction that applies only to this request.
+    #[must_use]
+    pub fn with_runtime_instruction(mut self, instruction: impl Into<String>) -> Self {
+        self.runtime_instructions.push(instruction.into());
+        self
+    }
+
+    /// Whether none of the dynamic sources contains non-whitespace text.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.turn_context.trim().is_empty()
@@ -91,10 +100,14 @@ impl DynamicContext {
                 .memory
                 .as_deref()
                 .is_none_or(|memory| memory.trim().is_empty())
+            && self
+                .runtime_instructions
+                .iter()
+                .all(|instruction| instruction.trim().is_empty())
     }
 
     fn into_developer_context(self) -> Vec<String> {
-        let mut sections = Vec::with_capacity(2);
+        let mut sections = Vec::with_capacity(2 + self.runtime_instructions.len());
         let turn_context = self.turn_context.trim();
         if !turn_context.is_empty() {
             sections.push(turn_context.to_owned());
@@ -104,6 +117,14 @@ impl DynamicContext {
         {
             sections.push(memory.to_owned());
         }
+        sections.extend(
+            self.runtime_instructions
+                .into_iter()
+                .filter_map(|instruction| {
+                    let instruction = instruction.trim();
+                    (!instruction.is_empty()).then(|| instruction.to_owned())
+                }),
+        );
         sections
     }
 }
@@ -389,6 +410,16 @@ impl<T> PreparedTurn<T> {
     #[must_use]
     pub const fn rebuilt_tools(&self) -> bool {
         self.rebuilt_tools
+    }
+
+    /// Remove tool authority from this request without changing the session lock.
+    ///
+    /// This is used for an engine-owned text-only finalization request. A later
+    /// turn may still reuse the stable locked tool snapshot.
+    #[must_use]
+    pub fn without_tools(mut self) -> Self {
+        self.tools.clear();
+        self
     }
 
     /// Consume the prepared snapshot without cloning its potentially large history.
@@ -732,5 +763,37 @@ mod tests {
             .unwrap();
         assert_eq!(turn.messages(), history);
         assert!(turn.developer_context().is_empty());
+    }
+
+    #[test]
+    fn runtime_instructions_are_last_and_can_close_tool_authority_for_one_request() {
+        let mut cache = PromptCache::new("stable");
+        let history = [message(Role::User, "question")];
+        let turn = cache
+            .prepare_turn(
+                &history,
+                DynamicContext::new("clock=10:00")
+                    .with_memory("remember this")
+                    .with_runtime_instruction("Respond without tools."),
+                &["shell"],
+                McpToolStatus::Ready,
+            )
+            .unwrap()
+            .without_tools();
+
+        assert_eq!(
+            turn.developer_context(),
+            ["clock=10:00", "remember this", "Respond without tools."]
+        );
+        assert!(turn.tools().is_empty());
+        let next = cache
+            .prepare_turn(
+                &history,
+                DynamicContext::default(),
+                &[],
+                McpToolStatus::Ready,
+            )
+            .unwrap();
+        assert_eq!(next.tools(), ["shell"]);
     }
 }

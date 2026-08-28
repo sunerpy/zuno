@@ -418,7 +418,7 @@ struct FakeResolver;
 
 impl AgentModelResolver for FakeResolver {
     fn resolve_agent(&self, requested: &str) -> Option<ResolvedAgent> {
-        (requested == "build").then(|| ResolvedAgent::new("build", "status test", 2))
+        (requested == "build").then(|| ResolvedAgent::new("build", "status test"))
     }
 
     fn resolve_model(&self, provider_id: &str, model_id: &str) -> Option<ResolvedModel> {

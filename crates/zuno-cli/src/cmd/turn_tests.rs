@@ -9,6 +9,7 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use zuno_catalog::agent::{Agent, AgentMode, AgentSource};
 use zuno_llm::sse::StreamIdleTimeout;
+use zuno_orchestration::sha256_text;
 use zuno_paths::Env;
 
 #[derive(Debug)]
@@ -142,7 +143,8 @@ fn traced_resolver(prompt: &str) -> Resolver {
         requested_agent: "build".to_owned(),
         system_prompt: assembly.render(),
         prompt_assembly: Some(assembly),
-        max_steps: DEFAULT_MAX_STEPS,
+        runtime_prompt_policy: RuntimePromptPolicy::default(),
+        max_steps: None,
         requested_provider: "provider".to_owned(),
         requested_model: "model".to_owned(),
         wire_model: "model".to_owned(),
@@ -150,6 +152,98 @@ fn traced_resolver(prompt: &str) -> Resolver {
         reasoning_options: serde_json::Map::new(),
         orchestration_seed: None,
     }
+}
+
+#[test]
+fn resolver_step_limit_is_opt_in() {
+    let unlimited = traced_resolver("AGENT")
+        .resolve_agent("build")
+        .expect("configured agent");
+    assert_eq!(unlimited.max_steps, None);
+
+    let mut resolver = traced_resolver("AGENT");
+    resolver.max_steps = std::num::NonZeroU32::new(17);
+    let limited = resolver.resolve_agent("build").expect("configured agent");
+    assert_eq!(limited.max_steps, std::num::NonZeroU32::new(17));
+}
+
+#[test]
+fn promoted_subagent_report_persists_host_metadata_on_the_user_message() {
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    {
+        let mut connection = pool.get().expect("schema connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-report', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES \
+                   ('ses-report', 'project-report', 'report', '/workspace', 'report', '1', 1, 1);",
+            )
+            .expect("seed report session");
+    }
+    let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&pool));
+    inbox
+        .admit(zuno_db::inbox::NewSessionInput::new(
+            "input-report",
+            "ses-report",
+            json!({
+                "kind": "subagentReport",
+                "jobID": "job-report",
+                "childSessionID": "ses-child",
+                "status": "completed",
+                "text": "background result",
+                "metadata": {
+                    "schemaVersion": 1,
+                    "agent": "explorer",
+                    "finalText": "background result"
+                }
+            }),
+            zuno_db::inbox::InputDelivery::Queue,
+            2,
+        ))
+        .expect("admit report");
+    inbox
+        .promote_id("ses-report", "input-report")
+        .expect("promote report")
+        .expect("queued report");
+    let connection = pool.get().expect("persistence connection");
+    let mut message = zuno_db::message::MessageRecord::from_json(json!({
+        "id": "input-report",
+        "sessionID": "ses-report",
+        "role": "user",
+        "time": {"created": 3},
+        "agent": "orchestrator",
+        "model": {"providerID": "fake", "modelID": "fake-model"}
+    }))
+    .expect("user message");
+    let part = zuno_db::message::PartRecord::from_json(
+        json!({
+            "id": "part-report",
+            "sessionID": "ses-report",
+            "messageID": "input-report",
+            "type": "text",
+            "text": "background result"
+        }),
+        3,
+    )
+    .expect("report text part");
+    let transaction = zuno_db::open::immediate_transaction(&connection).expect("begin transaction");
+    attach_promoted_task_report_metadata(&transaction, &mut message)
+        .expect("attach task report metadata");
+    persist_prepared_user_message(&transaction, &message, &[part]).expect("persist report message");
+    consume_promoted_input(&transaction, "ses-report", "input-report").expect("consume report");
+    transaction.commit().expect("commit report");
+
+    let stored = zuno_db::message::MessageStore::new(&connection)
+        .message("input-report")
+        .expect("stored report message");
+    assert_eq!(stored.data["taskReport"]["agent"], "explorer");
+    assert_eq!(stored.data["taskReport"]["finalText"], "background result");
 }
 
 fn test_capability() -> Arc<CapabilitySnapshot> {
@@ -400,7 +494,8 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
             requested_agent: agent.name.clone(),
             system_prompt: String::new(),
             prompt_assembly: None,
-            max_steps: DEFAULT_MAX_STEPS,
+            runtime_prompt_policy: RuntimePromptPolicy::default(),
+            max_steps: None,
             requested_provider: "provider".to_owned(),
             requested_model: "model".to_owned(),
             wire_model: "model".to_owned(),
@@ -416,6 +511,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         tool_authority: None,
         agents: vec![agent.clone()],
         extensions: zuno_extension::ResolvedExtensions::default(),
+        configured_extension_tool_ids: Vec::new(),
         extension_scope,
         extension_revision: 0,
         extension_transaction: None,
@@ -429,6 +525,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         goal_retry_policy: GoalRetryPolicy::default(),
         directory,
         project,
+        env: zuno_paths::Env::empty(),
         config,
         agent: profile,
         provider_id: "provider".to_owned(),
@@ -447,6 +544,68 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         },
         notes: Vec::new(),
     }
+}
+
+#[test]
+fn debug_agent_snapshot_reports_the_effective_runtime_dimensions() {
+    let plan = plan("/tmp", SessionChoice::New);
+    let snapshot = plan.debug_agent_snapshot();
+
+    assert_eq!(snapshot["schemaVersion"], 2);
+    assert_eq!(snapshot["agent"]["name"], "build");
+    assert_eq!(snapshot["model"]["effective"], "provider/model");
+    assert!(snapshot["model"].get("reasoningSupported").is_some());
+    assert!(snapshot["tools"]["policyVisible"].is_array());
+    assert!(snapshot["tools"]["unavailable"].is_array());
+    assert!(
+        snapshot["tools"]["policyVisible"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(
+                snapshot["tools"]["unavailable"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            )
+            .any(|tool| tool["id"] == zuno_tools::JOB_RECONCILE_WIRE_ID),
+        "debug output must account for the registered uncertain-job reconciliation tool"
+    );
+    assert!(snapshot["mcp"]["servers"].is_array());
+    assert!(snapshot["skills"]["required"].is_array());
+    assert_eq!(snapshot["skills"]["parentExpandedBodiesInherited"], false);
+    assert!(snapshot.get("delegates").is_some());
+    assert!(snapshot["sandbox"].get("configuredMode").is_some());
+    assert!(
+        snapshot["policySources"]
+            .as_array()
+            .is_some_and(|sources| !sources.is_empty())
+    );
+}
+
+#[test]
+fn debug_agent_reports_mcp_inheritance_as_unresolved_until_tools_are_connected() {
+    let mut plan = plan("/tmp", SessionChoice::New);
+    let mut definition = plan.agent.definition().clone();
+    definition.name = "exact".to_owned();
+    definition.tools = Some(vec!["known_mcp_tool".to_owned()]);
+    plan.agent = zuno_agent::profile::AgentProfile::resolve(
+        definition,
+        plan.agent.capabilities().rules().to_vec(),
+        false,
+    );
+
+    let snapshot = plan.debug_agent_snapshot();
+
+    assert_eq!(snapshot["mcp"]["inheritance"]["state"], "not-connected");
+    assert_eq!(
+        snapshot["mcp"]["inheritance"]["reason"],
+        "MCP tool ids are known only after a live connection; configured allowlists and parent authority are evaluated per discovered tool"
+    );
+    assert!(
+        snapshot["mcp"].get("inheritsConnectedTools").is_none(),
+        "a synthetic probe must not claim that an exact allowlist accepts or rejects unknown MCP ids"
+    );
 }
 
 fn orchestration_seed(capability: &CapabilitySnapshot) -> Arc<AttemptSeed> {
@@ -570,6 +729,23 @@ fn delegated_turn_rejects_a_drifted_capability_generation() {
     let error = delegated
         .inherit_orchestration(&parent, None, None)
         .expect_err("drifted capability generation must not execute");
+
+    assert!(error.contains("stale or mismatched"), "{error}");
+    assert!(error.contains("refresh the parent turn"), "{error}");
+}
+
+#[test]
+fn delegated_turn_rejects_broader_sandbox_authority_than_the_parent_attempt() {
+    let mut delegated = plan("/workspace", SessionChoice::New);
+    delegated.resolver.orchestration_seed = Some(orchestration_seed(delegated.capability.as_ref()));
+    let mut parent_capability = delegated.capability.as_ref().clone();
+    parent_capability.sandbox.mode = "read-only".to_owned();
+    parent_capability.sandbox.network = "deny".to_owned();
+    let parent = parent_attempt(parent_capability);
+
+    let error = delegated
+        .inherit_orchestration(&parent, None, None)
+        .expect_err("a child must not re-resolve broader sandbox authority");
 
     assert!(error.contains("stale or mismatched"), "{error}");
     assert!(error.contains("refresh the parent turn"), "{error}");
@@ -892,7 +1068,6 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
         )]);
     let mut resolver = traced_resolver("AGENT");
     let mut notes = Vec::new();
-
     configure_resident_memory(
         &mut resolver,
         &zuno_config::schema::Config::default(),
@@ -921,32 +1096,32 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
             .collect::<Vec<_>>(),
         vec![
             "agent.base",
-            "memory.global",
-            "memory.project",
-            "extensions",
             "instructions.project.0",
+            "extensions",
             "skills.policy",
             "skills.index",
+            "memory.global",
+            "memory.project",
         ]
     );
     assert_eq!(
-        assembly.sections()[1].source(),
+        assembly.sections()[5].source(),
         root.path().join("global/MEMORY.md").display().to_string()
     );
     assert_eq!(
-        assembly.sections()[2].source(),
+        assembly.sections()[6].source(),
         repo.join(".zuno/RULES.md").display().to_string()
     );
     assert_eq!(
-        assembly.sections()[3].source(),
+        assembly.sections()[2].source(),
         "zuno-extension::active-packages"
     );
     assert_eq!(
-        assembly.sections()[4].source(),
+        assembly.sections()[1].source(),
         repo.join("AGENTS.md").display().to_string()
     );
-    assert_eq!(assembly.sections()[5].source(), "zuno skill trigger policy");
-    assert_eq!(assembly.sections()[6].source(), "discovered skill index");
+    assert_eq!(assembly.sections()[3].source(), "zuno skill trigger policy");
+    assert_eq!(assembly.sections()[4].source(), "discovered skill index");
     assert_eq!(resolver.system_prompt, assembly.render());
     assert!(notes.is_empty(), "{notes:?}");
 }
@@ -3727,6 +3902,249 @@ fn goal_dynamic_context_is_rebuilt_from_authoritative_sql_for_each_request() {
 }
 
 #[test]
+fn durable_work_context_projects_plan_todos_jobs_reports_and_prior_receipt_from_sql() {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+    let mut connection = pool.open_connection().expect("open connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+             VALUES ('project_work_context', '/workspace', 1, 1, '[]');
+             INSERT INTO session (
+                 id, project_id, slug, directory, title, version, time_created, time_updated
+             ) VALUES (
+                 'ses_work_context', 'project_work_context', 'work-context', '/workspace',
+                 'Work context', 'zuno', 1, 1
+             );
+             INSERT INTO work_plan (
+                 session_id, id, goal_id, revision, title, steps, time_created, time_updated
+             ) VALUES (
+                 'ses_work_context', 'plan_durable', 'goal_durable', 2, 'Durable plan',
+                 '[{\"id\":\"inspect\",\"title\":\"Inspect state\",\"status\":\"in_progress\"}]',
+                 2, 3
+             );
+             INSERT INTO work_item (
+                 id, session_id, goal_id, plan_step_id, parent_id, subject, description,
+                 active_form, status, priority, dependencies, owner, revision,
+                 tokens_used, usage_known, time_used_ms, time_created, time_updated
+             ) VALUES (
+                 'todo_durable', 'ses_work_context', 'goal_durable', 'inspect', NULL,
+                 'Inspect state', 'Inspect durable state', 'Inspecting durable state',
+                 'in_progress', 'high', '[]', 'build', 4, 0, 1, 0, 4, 5
+             );",
+        )
+        .expect("seed session work state");
+    let receipt = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool))
+        .append(
+            "ses_work_context",
+            zuno_db::event_log::NewSessionEvent::new(
+                "session.prompt.assembled",
+                serde_json::Map::new(),
+            )
+            .expect("prompt event"),
+        )
+        .expect("append prompt receipt");
+
+    let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
+    jobs.create(zuno_db::job::NewAgentJob::new(
+        "job_active",
+        "ses_work_context",
+        zuno_db::job::JobSubject::child_session("ses_child_active"),
+        zuno_db::job::ReportDelivery::NextStep,
+        6,
+    ))
+    .expect("create active job");
+    jobs.create(zuno_db::job::NewAgentJob::new(
+        "job_report",
+        "ses_work_context",
+        zuno_db::job::JobSubject::child_session("ses_child_report"),
+        zuno_db::job::ReportDelivery::NextStep,
+        7,
+    ))
+    .expect("create reported job");
+    jobs.settle(
+        "job_report",
+        zuno_db::job::JobSettlement::completed(
+            json!({"finalText": "report answer"}),
+            8,
+            Some(zuno_db::inbox::NewSessionInput::new(
+                "input_report",
+                "ses_work_context",
+                json!({
+                    "kind": "subagentReport",
+                    "jobID": "job_report",
+                    "childSessionID": "ses_child_report",
+                    "status": "completed",
+                    "text": "report answer"
+                }),
+                zuno_db::inbox::InputDelivery::Queue,
+                8,
+            )),
+        ),
+    )
+    .expect("settle reported job");
+    jobs.create(zuno_db::job::NewAgentJob::new(
+        "job_reconciled",
+        "ses_work_context",
+        zuno_db::job::JobSubject::child_session("ses_child_reconciled"),
+        zuno_db::job::ReportDelivery::Quiet,
+        9,
+    ))
+    .expect("create reconciled job");
+    jobs.settle(
+        "job_reconciled",
+        zuno_db::job::JobSettlement::completed(json!({"finalText": "done"}), 10, None),
+    )
+    .expect("settle reconciled job");
+
+    let context = durable_work_context(&connection, "ses_work_context")
+        .expect("project durable work context")
+        .expect("durable work exists");
+    assert!(context.starts_with("runtime.work_state\n"));
+    let snapshot: Value = serde_json::from_str(
+        context
+            .lines()
+            .last()
+            .expect("context ends with the typed snapshot"),
+    )
+    .expect("decode durable work context");
+
+    assert_eq!(snapshot["schemaVersion"], 1);
+    assert_eq!(snapshot["plan"]["id"], "plan_durable");
+    assert_eq!(snapshot["plan"]["revision"], 2);
+    assert_eq!(snapshot["todos"][0]["id"], "todo_durable");
+    assert_eq!(snapshot["todos"][0]["status"], "in_progress");
+    assert_eq!(snapshot["pendingReports"][0]["id"], "input_report");
+    assert_eq!(snapshot["latestPriorPromptReceiptId"], receipt.id.as_str());
+    let job_ids = snapshot["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .filter_map(|job| job["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(job_ids, ["job_active", "job_report"]);
+    assert!(
+        !context.contains("job_reconciled"),
+        "a quiet reconciled terminal must not pollute continuation context"
+    );
+}
+
+#[test]
+fn durable_work_context_has_a_deterministic_total_prompt_budget() {
+    let snapshot = DurableWorkContextSnapshot {
+        schema_version: DURABLE_WORK_CONTEXT_SCHEMA_VERSION,
+        plan: None,
+        todos: (0..DURABLE_WORK_CONTEXT_MAX_ENTRIES)
+            .map(|index| DurableTodoContext {
+                id: format!("todo-{index:02}"),
+                goal_id: Some("goal-budget".to_owned()),
+                plan_step_id: None,
+                subject: format!("todo {index}: {}", "界".repeat(2_000)),
+                status: "pending".to_owned(),
+                priority: "medium".to_owned(),
+                dependencies: Vec::new(),
+                owner: Some("build".to_owned()),
+                revision: 1,
+            })
+            .collect(),
+        jobs: Vec::new(),
+        pending_reports: Vec::new(),
+        latest_prior_prompt_receipt_id: Some("evt-budget".to_owned()),
+        omitted_todos: 0,
+        omitted_jobs: 0,
+        omitted_pending_reports: 0,
+    };
+
+    let rendered = render_durable_work_context(snapshot).expect("bounded work context");
+
+    assert!(
+        rendered.len() <= DURABLE_WORK_CONTEXT_MAX_BYTES,
+        "runtime work context used {} bytes",
+        rendered.len()
+    );
+    let decoded: Value = serde_json::from_str(
+        rendered
+            .lines()
+            .last()
+            .expect("context ends with a JSON snapshot"),
+    )
+    .expect("decode bounded snapshot");
+    assert!(
+        decoded["omittedTodos"].as_u64().unwrap_or_default() > 0,
+        "the byte cap must report structural omission"
+    );
+    assert!(
+        decoded["todos"]
+            .as_array()
+            .is_some_and(|todos| !todos.is_empty()),
+        "the bounded snapshot should retain as much current state as fits"
+    );
+    assert!(
+        decoded["todos"][0]["subject"]
+            .as_str()
+            .is_some_and(|subject| subject.len() <= DURABLE_WORK_CONTEXT_TEXT_MAX_BYTES)
+    );
+}
+
+#[test]
+fn durable_work_context_fail_safes_an_existing_twenty_kib_plan_goal_id() {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+    let mut connection = pool.open_connection().expect("open connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+             VALUES ('project_oversized_goal', '/workspace', 1, 1, '[]');
+             INSERT INTO session (
+                 id, project_id, slug, directory, title, version, time_created, time_updated
+             ) VALUES (
+                 'ses_oversized_goal', 'project_oversized_goal', 'oversized-goal', '/workspace',
+                 'Oversized goal', 'zuno', 1, 1
+             );",
+        )
+        .expect("seed session");
+    let oversized_goal_id = "g".repeat(20 * 1024);
+    connection
+        .execute(
+            "INSERT INTO work_plan (
+                 session_id, id, goal_id, revision, title, steps, time_created, time_updated
+             ) VALUES (
+                 'ses_oversized_goal', 'plan_oversized_goal', ?1, 1, 'Durable plan', '[]', 2, 2
+             )",
+            [&oversized_goal_id],
+        )
+        .expect("seed existing invalid durable plan");
+
+    let rendered = durable_work_context(&connection, "ses_oversized_goal")
+        .expect("invalid durable identity must not block the next turn")
+        .expect("durable work exists");
+
+    assert!(
+        rendered.len() <= DURABLE_WORK_CONTEXT_MAX_BYTES,
+        "runtime work context used {} bytes",
+        rendered.len()
+    );
+    let decoded: Value = serde_json::from_str(
+        rendered
+            .lines()
+            .last()
+            .expect("context ends with a JSON snapshot"),
+    )
+    .expect("decode bounded snapshot");
+    let projected = decoded["plan"]["goalId"]
+        .as_str()
+        .expect("explicit invalid identity marker");
+    assert!(projected.starts_with("zuno.invalid-id/v1;field=plan.goal_id;"));
+    assert!(projected.contains("error=too_long"));
+    assert!(projected.contains("value=omitted"));
+    assert!(projected.contains("bytes=20480"));
+    assert!(projected.contains("sha256="));
+    assert_ne!(projected, oversized_goal_id);
+}
+
+#[test]
 fn goal_usage_delta_includes_every_confirmed_assistant_step_and_token_bucket() {
     fn checkpoint(connection: &mut rusqlite::Connection, record: &zuno_db::message::MessageRecord) {
         let transaction = connection.transaction().expect("start checkpoint");
@@ -4003,6 +4421,12 @@ fn every_turn_error() -> Vec<TurnError> {
             status: Some(400),
             source: None,
         }),
+        TurnError::PromptAssembly(
+            zuno_engine::prompt::PromptAssemblyError::ContextLimitExceeded {
+                estimated_prompt_tokens: 16_384,
+                context_limit: 8_192,
+            },
+        ),
         TurnError::ProviderRetryDeadlineExceeded {
             attempt: 2,
             elapsed: std::time::Duration::from_secs(180),
@@ -4059,6 +4483,7 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::Hook(_) => "Hook",
             TurnError::Database(_) => "Database",
             TurnError::Provider(_) => "Provider",
+            TurnError::PromptAssembly(_) => "PromptAssembly",
             TurnError::ProviderRetryDeadlineExceeded { .. } => "ProviderRetryDeadlineExceeded",
             TurnError::Cache(_) => "Cache",
         };
@@ -4067,7 +4492,7 @@ fn the_variant_table_covers_the_whole_enum() {
 
     assert_eq!(
         named.len(),
-        18,
+        19,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
@@ -4331,7 +4756,8 @@ async fn run_compatible_turn(
         requested_agent: "build".to_owned(),
         system_prompt: String::new(),
         prompt_assembly: None,
-        max_steps: DEFAULT_MAX_STEPS,
+        runtime_prompt_policy: RuntimePromptPolicy::default(),
+        max_steps: None,
         requested_provider: "provider".to_owned(),
         requested_model: "model".to_owned(),
         wire_model: "model".to_owned(),
@@ -5302,14 +5728,21 @@ mod skill_prompt {
         let mut resolver = resolver();
         let mut loaded = BTreeSet::new();
 
-        let first = preload_required_skills(&mut resolver, &skills, &mut loaded, &required)
-            .await
-            .expect("required Skill preloads");
+        let first = preload_required_skills(
+            &mut resolver,
+            &skills,
+            &mut loaded,
+            &required,
+            SELECTED_SKILL_PROMPT_MAX_BYTES,
+        )
+        .await
+        .expect("required Skill preloads");
         let explicit = preload_explicit_skills(
             &mut resolver,
             &skills,
             &mut loaded,
             "use codegraph for this task",
+            SELECTED_SKILL_PROMPT_MAX_BYTES,
         )
         .await
         .expect("explicit Skill scan");
@@ -5347,6 +5780,7 @@ mod skill_prompt {
             &skills,
             &mut loaded,
             "请按照codegraph指导分析本项目",
+            SELECTED_SKILL_PROMPT_MAX_BYTES,
         )
         .await
         .expect("preload explicit skill");
@@ -5406,6 +5840,7 @@ mod skill_prompt {
             &skills,
             &mut loaded,
             "review the github project",
+            SELECTED_SKILL_PROMPT_MAX_BYTES,
         )
         .await
         .expect("ambiguous names are deferred to source-aware tool loading");
@@ -5435,11 +5870,15 @@ mod skill_prompt {
         recorded
             .push_selected_skill("release", "/skills/release/SKILL.md", "RELEASE BODY")
             .expect("selected skill");
-        let data = serde_json::to_string(&Value::Object(recorded.event_properties(
-            "build",
-            1,
-            &recorded.provider_projection(),
-        )))
+        let system = recorded.system_messages();
+        let developer = Vec::new();
+        let projection = zuno_engine::prompt::PromptProviderProjection {
+            system_messages: &system,
+            developer_context: &developer,
+        };
+        let data = serde_json::to_string(&Value::Object(
+            recorded.event_properties("build", 1, projection, projection),
+        ))
         .expect("encode receipt");
         connection
             .execute(
@@ -5456,8 +5895,13 @@ mod skill_prompt {
             .expect("prompt receipt");
         let mut restored_prompt = resolver();
 
-        let restored = restore_selected_skills(&connection, "ses_restore", &mut restored_prompt)
-            .expect("restore selected Skill");
+        let restored = restore_selected_skills(
+            &connection,
+            "ses_restore",
+            &mut restored_prompt,
+            SELECTED_SKILL_PROMPT_MAX_BYTES,
+        )
+        .expect("restore selected Skill");
 
         assert!(restored.contains(&SelectedSkillIdentity {
             name: "release".to_owned(),
@@ -5475,6 +5919,130 @@ mod skill_prompt {
         );
     }
 
+    #[tokio::test]
+    async fn selected_skill_bodies_share_one_aggregate_prompt_budget() {
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "first",
+                Some("First".to_owned()),
+                PathBuf::from("/skills/first/SKILL.md"),
+                "123456",
+            ),
+            zuno_catalog::skill::Skill::embedded_at_path(
+                "second",
+                Some("Second".to_owned()),
+                PathBuf::from("/skills/second/SKILL.md"),
+                "abcdef",
+            ),
+        ]);
+        let mut resolver = resolver();
+        let mut loaded = BTreeSet::new();
+
+        preload_selected_skill(
+            &mut resolver,
+            &skills,
+            &mut loaded,
+            "first",
+            "/skills/first/SKILL.md",
+            10,
+        )
+        .await
+        .expect("first body fits");
+        let error = preload_selected_skill(
+            &mut resolver,
+            &skills,
+            &mut loaded,
+            "second",
+            "/skills/second/SKILL.md",
+            10,
+        )
+        .await
+        .expect_err("the second body exceeds the aggregate budget");
+
+        assert!(error.contains("selected Skill `second`"), "{error}");
+        assert!(error.contains("10-byte aggregate prompt budget"), "{error}");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            resolver
+                .prompt_assembly
+                .as_ref()
+                .expect("prompt")
+                .envelope()
+                .selected_skills
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn selected_skill_prompt_budget_is_separate_from_the_metadata_budget() {
+        let config = zuno_config::schema::SkillsConfig {
+            max_context_tokens: Some(std::num::NonZeroU32::new(1).expect("non-zero")),
+            max_selected_context_tokens: Some(std::num::NonZeroU32::new(3_000).expect("non-zero")),
+            ..zuno_config::schema::SkillsConfig::default()
+        };
+
+        assert_eq!(
+            selected_skill_prompt_budget(1_000_000, Some(&config)),
+            3_000 * APPROX_BYTES_PER_TOKEN
+        );
+        assert_eq!(
+            skill_metadata_budget(1_000_000, Some(&config)),
+            APPROX_BYTES_PER_TOKEN
+        );
+    }
+
+    #[test]
+    fn restored_selected_skills_fail_closed_when_the_current_model_budget_is_smaller() {
+        let mut connection =
+            zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        let mut recorded = PromptAssembly::new();
+        recorded
+            .push_selected_skill("large", "/skills/large/SKILL.md", "body larger than budget")
+            .expect("selected skill");
+        let system = recorded.system_messages();
+        let developer = Vec::new();
+        let projection = zuno_engine::prompt::PromptProviderProjection {
+            system_messages: &system,
+            developer_context: &developer,
+        };
+        let data = serde_json::to_string(&Value::Object(
+            recorded.event_properties("build", 1, projection, projection),
+        ))
+        .expect("encode receipt");
+        connection
+            .execute(
+                "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_restore_budget', 0)",
+                [],
+            )
+            .expect("event sequence");
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) \
+                 VALUES ('evt_restore_budget', 'ses_restore_budget', 0, \
+                 'session.prompt.assembled.1', ?1)",
+                [data],
+            )
+            .expect("prompt receipt");
+        let mut restored_prompt = resolver();
+
+        let error =
+            restore_selected_skills(&connection, "ses_restore_budget", &mut restored_prompt, 4)
+                .expect_err("a model switch must not silently restore an over-budget body");
+
+        assert!(error.contains("selected Skill `large`"), "{error}");
+        assert!(
+            restored_prompt
+                .prompt_assembly
+                .as_ref()
+                .expect("prompt")
+                .envelope()
+                .selected_skills
+                .is_empty()
+        );
+    }
+
     #[test]
     fn an_empty_catalogue_leaves_the_prompt_byte_identical() {
         let mut resolver = resolver();
@@ -5488,6 +6056,23 @@ mod skill_prompt {
         .expect("empty catalogue");
 
         assert_eq!(resolver.system_prompt.as_bytes(), before.as_bytes());
+    }
+
+    #[test]
+    fn skill_policy_owns_the_runtime_authority_guard_once() {
+        let skills =
+            zuno_catalog::skill::Skills::from_loaded([skill("release", "release workflow")]);
+        let mut resolver = resolver();
+
+        announce_skills(&mut resolver, &skills, 1_000_000, None).expect("announce skill index");
+
+        assert_eq!(
+            resolver
+                .system_prompt
+                .matches("A Skill does not grant tools, permissions")
+                .count(),
+            1
+        );
     }
 
     /// Large descriptions must not make any skill name undiscoverable.

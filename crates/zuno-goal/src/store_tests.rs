@@ -1127,8 +1127,7 @@ fn goal_history_keeps_every_revision_across_cancel_and_replacement() {
     );
 }
 
-#[test]
-fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
+fn shared_completion_fixture() -> (TempDir, Arc<zuno_db::Pool>, GoalStore, Goal) {
     let spill = tempfile::tempdir().expect("create spill directory");
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
@@ -1159,6 +1158,114 @@ fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
     let goal = store
         .create_goal(SESSION, "ship safely", None)
         .expect("create goal");
+    (spill, pool, store, goal)
+}
+
+fn completion_job(id: &str, delivery: zuno_db::job::ReportDelivery) -> zuno_db::job::NewAgentJob {
+    completion_job_for(SESSION, id, delivery)
+}
+
+fn completion_job_for(
+    parent_session_id: &str,
+    id: &str,
+    delivery: zuno_db::job::ReportDelivery,
+) -> zuno_db::job::NewAgentJob {
+    zuno_db::job::NewAgentJob::new(
+        id,
+        parent_session_id,
+        zuno_db::job::JobSubject::product_agent(
+            format!("run-{id}"),
+            "codex",
+            "release-review",
+            "subagent_codex",
+        ),
+        delivery,
+        1,
+    )
+}
+
+fn completion_report(id: &str, job_id: &str) -> zuno_db::inbox::NewSessionInput {
+    completion_report_for(SESSION, id, job_id)
+}
+
+fn completion_report_for(
+    session_id: &str,
+    id: &str,
+    job_id: &str,
+) -> zuno_db::inbox::NewSessionInput {
+    zuno_db::inbox::NewSessionInput::new(
+        id,
+        session_id,
+        serde_json::json!({
+            "kind": "subagentReport",
+            "jobID": job_id,
+            "text": "durable report"
+        }),
+        zuno_db::inbox::InputDelivery::Queue,
+        2,
+    )
+}
+
+fn insert_child_session(pool: &zuno_db::Pool, session_id: &str, parent_id: &str) {
+    let connection = pool.get().expect("check out connection");
+    connection
+        .execute(
+            "INSERT INTO session \
+             (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated) \
+             VALUES (?1,'prj',?2,?1,'/tmp',?1,'test',1,1)",
+            params![session_id, parent_id],
+        )
+        .expect("insert child session");
+}
+
+fn insert_grandchild_sessions(pool: &zuno_db::Pool) {
+    insert_child_session(pool, "child-session", SESSION);
+    insert_child_session(pool, "grandchild-session", "child-session");
+}
+
+fn terminal_settlement(
+    status: zuno_db::job::JobStatus,
+    report: Option<zuno_db::inbox::NewSessionInput>,
+) -> zuno_db::job::JobSettlement {
+    match status {
+        zuno_db::job::JobStatus::Completed => {
+            zuno_db::job::JobSettlement::completed(serde_json::json!({"ok": true}), 2, report)
+        }
+        zuno_db::job::JobStatus::Failed => zuno_db::job::JobSettlement::failed("failed", 2, report),
+        zuno_db::job::JobStatus::Cancelled => {
+            zuno_db::job::JobSettlement::cancelled("cancelled", 2, report)
+        }
+        zuno_db::job::JobStatus::Uncertain => {
+            zuno_db::job::JobSettlement::uncertain("uncertain", 2, report)
+        }
+        zuno_db::job::JobStatus::Queued | zuno_db::job::JobStatus::Running => {
+            panic!("terminal settlement helper received an active status")
+        }
+    }
+}
+
+fn assert_job_completion_blocked(store: &GoalStore, goal: &Goal) {
+    let blocked = store
+        .complete_checked(SESSION, goal.revision)
+        .expect_err("durable job state must block completion");
+    assert!(matches!(
+        blocked,
+        GoalError::CompletionBlocked {
+            plan_steps: 0,
+            work_items: 0,
+            jobs: 1
+        }
+    ));
+    assert_eq!(
+        store.goal(SESSION).expect("read goal"),
+        Some(goal.clone()),
+        "a blocked completion must not advance the goal revision"
+    );
+}
+
+#[test]
+fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
+    let (_spill, pool, store, goal) = shared_completion_fixture();
     let steps = serde_json::json!([
         {"id":"scan","title":"Scan","status":"pending"},
         {"id":"ship","title":"Ship","status":"completed"}
@@ -1186,14 +1293,8 @@ fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
     drop(connection);
 
     let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
-    jobs.create(zuno_db::job::NewAgentJob::new(
-        "job",
-        SESSION,
-        zuno_db::job::JobSubject::product_agent("run", "codex", "release-review", "subagent_codex"),
-        zuno_db::job::ReportDelivery::Quiet,
-        1,
-    ))
-    .expect("insert running job");
+    jobs.create(completion_job("job", zuno_db::job::ReportDelivery::Quiet))
+        .expect("insert running job");
 
     let blocked = store
         .complete_checked(SESSION, goal.revision)
@@ -1237,4 +1338,362 @@ fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
         .expect("complete goal")
         .expect("goal exists");
     assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+fn assert_job_completion_allowed(store: &GoalStore, goal: &Goal, reason: &str) {
+    let completed = store
+        .complete_checked(SESSION, goal.revision)
+        .unwrap_or_else(|error| panic!("{reason}: {error}"))
+        .expect("goal exists");
+    assert_eq!(completed.status, GoalStatus::Complete);
+}
+
+#[test]
+fn completion_blocks_queued_and_running_jobs() {
+    for status in [
+        zuno_db::job::JobStatus::Queued,
+        zuno_db::job::JobStatus::Running,
+    ] {
+        let (_spill, pool, store, goal) = shared_completion_fixture();
+        let jobs = zuno_db::job::AgentJobStore::new(pool);
+        let job = completion_job("active", zuno_db::job::ReportDelivery::Quiet);
+        jobs.create(if status == zuno_db::job::JobStatus::Queued {
+            job.queued()
+        } else {
+            job
+        })
+        .expect("create active job");
+        assert_job_completion_blocked(&store, &goal);
+    }
+}
+
+#[test]
+fn completion_blocks_active_and_uncertain_jobs_in_grandchild_sessions_until_reconciled() {
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    insert_grandchild_sessions(&pool);
+    let jobs = zuno_db::job::AgentJobStore::new(pool);
+    let job_id = "grandchild-active";
+    jobs.create(completion_job_for(
+        "grandchild-session",
+        job_id,
+        zuno_db::job::ReportDelivery::Quiet,
+    ))
+    .expect("create grandchild job");
+
+    assert_job_completion_blocked(&store, &goal);
+    jobs.settle(
+        job_id,
+        terminal_settlement(zuno_db::job::JobStatus::Uncertain, None),
+    )
+    .expect("mark grandchild job uncertain");
+    assert_job_completion_blocked(&store, &goal);
+
+    jobs.reconcile_uncertain(
+        job_id,
+        zuno_db::job::JobReconciliation::completed(
+            serde_json::json!({"finalText": "confirmed complete"}),
+            "authoritative remote status",
+            "grandchild operation completed exactly once",
+            3,
+            None,
+        ),
+    )
+    .expect("reconcile grandchild job");
+
+    assert_job_completion_allowed(
+        &store,
+        &goal,
+        "an authoritatively reconciled grandchild job must release root completion",
+    );
+}
+
+#[test]
+fn completion_blocks_unconsumed_grandchild_reports_and_preserves_cancel_semantics() {
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    insert_grandchild_sessions(&pool);
+    let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
+    let inbox = zuno_db::inbox::SessionInbox::new(pool);
+    let job_id = "grandchild-cancelled";
+    let input_id = "grandchild-cancelled-report";
+    jobs.create(completion_job_for(
+        "grandchild-session",
+        job_id,
+        zuno_db::job::ReportDelivery::NextStep,
+    ))
+    .expect("create grandchild next-step job");
+    jobs.settle(
+        job_id,
+        terminal_settlement(
+            zuno_db::job::JobStatus::Cancelled,
+            Some(completion_report_for(
+                "grandchild-session",
+                input_id,
+                job_id,
+            )),
+        ),
+    )
+    .expect("cancel grandchild job with a report");
+
+    assert_job_completion_blocked(&store, &goal);
+    inbox
+        .promote_id("grandchild-session", input_id)
+        .expect("promote grandchild report")
+        .expect("queued grandchild report");
+    assert_job_completion_blocked(&store, &goal);
+    inbox
+        .mark_consumed("grandchild-session", input_id)
+        .expect("consume grandchild report")
+        .expect("promoted grandchild report");
+    assert_job_completion_allowed(
+        &store,
+        &goal,
+        "a cancelled grandchild job is reconciled after its next-step report is consumed",
+    );
+
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    insert_grandchild_sessions(&pool);
+    let jobs = zuno_db::job::AgentJobStore::new(pool);
+    jobs.create(completion_job_for(
+        "grandchild-session",
+        "grandchild-quiet-cancelled",
+        zuno_db::job::ReportDelivery::Quiet,
+    ))
+    .expect("create quiet grandchild job");
+    jobs.settle(
+        "grandchild-quiet-cancelled",
+        terminal_settlement(zuno_db::job::JobStatus::Cancelled, None),
+    )
+    .expect("cancel quiet grandchild job");
+    assert_job_completion_allowed(
+        &store,
+        &goal,
+        "a quiet cancelled grandchild job must not block completion",
+    );
+}
+
+#[test]
+fn descendant_job_walk_terminates_when_session_parent_links_form_a_cycle() {
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    insert_grandchild_sessions(&pool);
+    let connection = pool.get().expect("check out connection");
+    connection
+        .execute(
+            "UPDATE session SET parent_id='grandchild-session' WHERE id=?1",
+            params![SESSION],
+        )
+        .expect("close the session cycle");
+    drop(connection);
+
+    let jobs = zuno_db::job::AgentJobStore::new(pool);
+    jobs.create(completion_job_for(
+        "grandchild-session",
+        "grandchild-cycle-active",
+        zuno_db::job::ReportDelivery::Quiet,
+    ))
+    .expect("create a blocker inside the cycle");
+
+    assert_job_completion_blocked(&store, &goal);
+}
+
+#[test]
+fn completion_blocks_unconsumed_next_step_reports_then_releases_consumed_reports() {
+    for status in [
+        zuno_db::job::JobStatus::Completed,
+        zuno_db::job::JobStatus::Failed,
+        zuno_db::job::JobStatus::Cancelled,
+    ] {
+        let (_spill, pool, store, goal) = shared_completion_fixture();
+        let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
+        let inbox = zuno_db::inbox::SessionInbox::new(pool);
+        let job_id = format!("reported-{}", status.as_str());
+        let input_id = format!("input-{}", status.as_str());
+        jobs.create(completion_job(
+            &job_id,
+            zuno_db::job::ReportDelivery::NextStep,
+        ))
+        .expect("create reported job");
+        jobs.settle(
+            &job_id,
+            terminal_settlement(status, Some(completion_report(&input_id, &job_id))),
+        )
+        .expect("settle reported job");
+
+        assert_job_completion_blocked(&store, &goal);
+        inbox
+            .promote_id(SESSION, &input_id)
+            .expect("promote report")
+            .expect("queued report");
+        assert_job_completion_blocked(&store, &goal);
+        inbox
+            .mark_consumed(SESSION, &input_id)
+            .expect("consume report")
+            .expect("promoted report");
+
+        assert_job_completion_allowed(
+            &store,
+            &goal,
+            "a consumed next-step report must release a reconciled terminal job",
+        );
+    }
+}
+
+#[test]
+fn completion_allows_quiet_completed_failed_and_cancelled_jobs() {
+    for status in [
+        zuno_db::job::JobStatus::Completed,
+        zuno_db::job::JobStatus::Failed,
+        zuno_db::job::JobStatus::Cancelled,
+    ] {
+        let (_spill, pool, store, goal) = shared_completion_fixture();
+        let jobs = zuno_db::job::AgentJobStore::new(pool);
+        let job_id = format!("quiet-{}", status.as_str());
+        jobs.create(completion_job(&job_id, zuno_db::job::ReportDelivery::Quiet))
+            .expect("create quiet job");
+        jobs.settle(&job_id, terminal_settlement(status, None))
+            .expect("settle quiet job");
+
+        assert_job_completion_allowed(
+            &store,
+            &goal,
+            "a quiet completed, failed, or cancelled job is terminal and reconciled",
+        );
+    }
+}
+
+#[test]
+fn completion_blocks_uncertain_jobs_even_after_report_consumption_or_quiet_delivery() {
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
+    let inbox = zuno_db::inbox::SessionInbox::new(pool);
+    let job_id = "reported-uncertain";
+    let input_id = "input-uncertain";
+    jobs.create(completion_job(
+        job_id,
+        zuno_db::job::ReportDelivery::NextStep,
+    ))
+    .expect("create uncertain reported job");
+    jobs.settle(
+        job_id,
+        terminal_settlement(
+            zuno_db::job::JobStatus::Uncertain,
+            Some(completion_report(input_id, job_id)),
+        ),
+    )
+    .expect("settle uncertain reported job");
+
+    assert_job_completion_blocked(&store, &goal);
+    inbox
+        .promote_id(SESSION, input_id)
+        .expect("promote uncertain report")
+        .expect("queued uncertain report");
+    assert_job_completion_blocked(&store, &goal);
+    inbox
+        .mark_consumed(SESSION, input_id)
+        .expect("consume uncertain report")
+        .expect("promoted uncertain report");
+    assert_job_completion_blocked(&store, &goal);
+
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    let jobs = zuno_db::job::AgentJobStore::new(pool);
+    jobs.create(completion_job(
+        "quiet-uncertain",
+        zuno_db::job::ReportDelivery::Quiet,
+    ))
+    .expect("create quiet uncertain job");
+    jobs.settle(
+        "quiet-uncertain",
+        terminal_settlement(zuno_db::job::JobStatus::Uncertain, None),
+    )
+    .expect("settle quiet uncertain job");
+    assert_job_completion_blocked(&store, &goal);
+}
+
+#[test]
+fn authoritative_quiet_reconciliation_releases_goal_completion() {
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    let jobs = zuno_db::job::AgentJobStore::new(pool);
+    jobs.create(completion_job(
+        "quiet-reconciled",
+        zuno_db::job::ReportDelivery::Quiet,
+    ))
+    .expect("create quiet uncertain job");
+    jobs.settle(
+        "quiet-reconciled",
+        terminal_settlement(zuno_db::job::JobStatus::Uncertain, None),
+    )
+    .expect("settle quiet uncertain job");
+    assert_job_completion_blocked(&store, &goal);
+
+    jobs.reconcile_uncertain(
+        "quiet-reconciled",
+        zuno_db::job::JobReconciliation::completed(
+            serde_json::json!({"finalText": "confirmed complete"}),
+            "authoritative remote status",
+            "remote operation op-42 completed exactly once",
+            3,
+            None,
+        ),
+    )
+    .expect("reconcile quiet job");
+
+    assert_job_completion_allowed(
+        &store,
+        &goal,
+        "authoritatively reconciled quiet work must release completion",
+    );
+}
+
+#[test]
+fn next_step_reconciliation_blocks_until_the_replacement_report_is_consumed() {
+    let (_spill, pool, store, goal) = shared_completion_fixture();
+    let jobs = zuno_db::job::AgentJobStore::new(Arc::clone(&pool));
+    let inbox = zuno_db::inbox::SessionInbox::new(pool);
+    jobs.create(completion_job(
+        "reported-reconciled",
+        zuno_db::job::ReportDelivery::NextStep,
+    ))
+    .expect("create reported uncertain job");
+    jobs.settle(
+        "reported-reconciled",
+        terminal_settlement(
+            zuno_db::job::JobStatus::Uncertain,
+            Some(completion_report(
+                "input-uncertain-original",
+                "reported-reconciled",
+            )),
+        ),
+    )
+    .expect("settle reported uncertain job");
+
+    jobs.reconcile_uncertain(
+        "reported-reconciled",
+        zuno_db::job::JobReconciliation::completed(
+            serde_json::json!({"finalText": "confirmed complete"}),
+            "authoritative remote status",
+            "remote operation op-43 completed exactly once",
+            3,
+            Some(completion_report(
+                "input-uncertain-replacement",
+                "reported-reconciled",
+            )),
+        ),
+    )
+    .expect("reconcile reported job");
+
+    assert_job_completion_blocked(&store, &goal);
+    inbox
+        .promote_id(SESSION, "input-uncertain-replacement")
+        .expect("promote replacement report")
+        .expect("queued replacement report");
+    assert_job_completion_blocked(&store, &goal);
+    inbox
+        .mark_consumed(SESSION, "input-uncertain-replacement")
+        .expect("consume replacement report")
+        .expect("promoted replacement report");
+
+    assert_job_completion_allowed(
+        &store,
+        &goal,
+        "a reconciled next-step job must remain blocked only until its replacement report is consumed",
+    );
 }

@@ -174,9 +174,10 @@ fn seed(connection: &Connection) {
         connection
             .execute(
                 "INSERT INTO agent_job
-                   (id, parent_session_id, subject_kind, subject_payload, status,
-                    report_delivery, report_input_id, created_seq, time_created, time_updated)
-                 VALUES (?1, ?2, 'product-agent', ?3, 'completed', 'quiet', ?4, ?5, 1, 1)",
+                   (id, parent_session_id, logical_key, subject_kind, subject_payload, status,
+                    report_delivery, evidence_start_rowid, report_input_id, created_seq,
+                    time_created, time_updated)
+                 VALUES (?1, ?2, ?1, 'product-agent', ?3, 'completed', 'quiet', 0, ?4, ?5, 1, 1)",
                 rusqlite::params![
                     format!("job_{session_id}"),
                     session_id,

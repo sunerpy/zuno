@@ -197,9 +197,11 @@ CREATE TABLE `session` (
 CREATE TABLE `agent_job` (
   `id` text PRIMARY KEY,
   `parent_session_id` text NOT NULL,
+  `logical_key` text NOT NULL CHECK (length(trim(`logical_key`)) > 0),
   `subject_kind` text NOT NULL,
   `subject_payload` text NOT NULL,
   `orchestration_snapshot` text,
+  `evidence_start_rowid` integer NOT NULL CHECK (`evidence_start_rowid` >= 0),
   `status` text NOT NULL,
   `report_delivery` text NOT NULL,
   `result` text,
@@ -358,6 +360,7 @@ CREATE UNIQUE INDEX `agent_job_workflow_run_idx`
   ON `agent_job` (json_extract(`subject_payload`, '$.runID'))
   WHERE `subject_kind` = 'workflow';
 CREATE INDEX `agent_job_parent_status_created_idx` ON `agent_job` (`parent_session_id`,`status`,`time_created`);
+CREATE INDEX `agent_job_parent_logical_created_idx` ON `agent_job` (`parent_session_id`,`logical_key`,`time_created`);
 CREATE INDEX `session_project_idx` ON `session` (`project_id`);
 CREATE INDEX `session_workspace_idx` ON `session` (`workspace_id`);
 CREATE INDEX `session_parent_idx` ON `session` (`parent_id`);

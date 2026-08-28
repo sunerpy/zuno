@@ -193,3 +193,49 @@ async fn a_report_queued_after_the_last_safe_point_starts_the_next_turn() {
     assert_eq!(driver.calls(), ["input_1"]);
     assert!(inbox.pending(SESSION).expect("pending").is_empty());
 }
+
+#[tokio::test]
+async fn concurrent_wakes_for_one_report_queue_only_one_parent_delivery() {
+    let (_pool, inbox) = initialized();
+    admit(&inbox, "input_1");
+    let runs = SessionRunRegistry::new();
+    let guard = runs.begin_turn(SESSION).expect("active parent");
+    let driver = Arc::new(RecordingDriver::new(inbox.clone()));
+    let coordinator = SessionWakeCoordinator::new(inbox.clone(), runs, driver.clone());
+
+    let first_coordinator = coordinator.clone();
+    let first = tokio::spawn(async move {
+        first_coordinator
+            .deliver(SESSION, "input_1", message("input_1"))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !guard.soft_interrupt_signal().is_set() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first wake is queued");
+
+    assert_eq!(
+        coordinator
+            .deliver(SESSION, "input_1", message("input_1"))
+            .await
+            .expect("duplicate wake is idempotent"),
+        WakeOutcome::AlreadyInFlight
+    );
+    let delivery = guard.take_soft_interrupts_at_safe_point();
+    assert_eq!(delivery.messages.len(), 1);
+    assert_eq!(delivery.messages[0].input_id.as_deref(), Some("input_1"));
+    inbox
+        .promote_id(SESSION, "input_1")
+        .expect("promote report")
+        .expect("pending report");
+    drop(guard);
+
+    assert_eq!(
+        first.await.expect("first wake task").expect("first wake"),
+        WakeOutcome::ClaimedByActiveTurn
+    );
+    assert!(driver.calls().is_empty());
+}
