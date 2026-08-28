@@ -285,12 +285,11 @@ impl ShellTool {
 
         if params.background {
             lease.disarm();
-            return Ok(
-                background_started_output(self.display_command(&command), &execution)
-                    .with_metadata("sandboxBackend", execution.authority.backend.clone())
-                    .with_metadata("sandboxMode", json!(execution.authority.mode))
-                    .with_metadata("sandboxNetwork", json!(execution.authority.network)),
-            );
+            return Ok(background_started_output(command.clone(), &execution)
+                .with_metadata("shell", self.shell.name())
+                .with_metadata("sandboxBackend", execution.authority.backend.clone())
+                .with_metadata("sandboxMode", json!(execution.authority.mode))
+                .with_metadata("sandboxNetwork", json!(execution.authority.network)));
         }
 
         let foreground_timeout = Duration::from_millis(foreground_timeout_ms);
@@ -319,14 +318,13 @@ impl ShellTool {
                 .promote(&execution.id)
                 .map_err(failed)?;
             lease.disarm();
-            return Ok(timeout_promoted_output(
-                self.display_command(&command),
-                foreground_timeout_ms,
-                &promoted,
-            )
-            .with_metadata("sandboxBackend", promoted.authority.backend.clone())
-            .with_metadata("sandboxMode", json!(promoted.authority.mode))
-            .with_metadata("sandboxNetwork", json!(promoted.authority.network)));
+            return Ok(
+                timeout_promoted_output(command.clone(), foreground_timeout_ms, &promoted)
+                    .with_metadata("shell", self.shell.name())
+                    .with_metadata("sandboxBackend", promoted.authority.backend.clone())
+                    .with_metadata("sandboxMode", json!(promoted.authority.mode))
+                    .with_metadata("sandboxNetwork", json!(promoted.authority.network)),
+            );
         }
         let full = self
             .background_executions
@@ -348,10 +346,6 @@ impl ShellTool {
             CommandShellKind::PowerShell => ShellSyntax::PowerShell,
             CommandShellKind::Posix => ShellSyntax::Bash,
         }
-    }
-
-    fn display_command(&self, command: &str) -> String {
-        format!("{} {command}", self.shell.name())
     }
 
     fn resolve_workdir(&self, requested: Option<&str>) -> Result<PathBuf, ToolError> {
@@ -551,7 +545,7 @@ impl ShellTool {
         Ok(BackgroundExecutionInput {
             prepared,
             session_id: ctx.session_id.clone(),
-            title: self.display_command(command),
+            title: command.to_owned(),
             command: command.to_owned(),
             hard_ceiling: self.hard_ceiling,
             retention,
@@ -599,7 +593,7 @@ impl ShellTool {
         if full.is_empty() {
             full = "(no output)".to_owned();
         }
-        let output = ToolOutput::text(self.display_command(command), full)
+        let output = ToolOutput::text(command, full)
             .with_metadata("exit", json!(execution.exit_code))
             .with_metadata("truncated", false)
             .with_metadata("background", false)

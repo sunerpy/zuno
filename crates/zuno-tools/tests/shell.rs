@@ -230,7 +230,7 @@ async fn shell_env_hook_injects_call_scoped_environment() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn configured_shell_is_named_in_the_durable_output() {
+async fn configured_shell_identity_is_metadata_not_part_of_the_copyable_title() {
     let dir = tempfile::tempdir().expect("temp dir");
     let tool = support::sandbox::configured_shell_tool(dir.path(), Some("/bin/sh"));
     let definition = tool.definition();
@@ -245,7 +245,7 @@ async fn configured_shell_is_named_in_the_durable_output() {
         .await
         .expect("command succeeds");
 
-    assert_eq!(output.title, "sh printf configured-shell");
+    assert_eq!(output.title, "printf configured-shell");
     assert_eq!(output.metadata["shell"], "sh");
     assert_eq!(output.output, "configured-shell");
 }
@@ -255,9 +255,10 @@ async fn configured_shell_is_named_in_the_durable_output() {
 async fn shell_background_mode_returns_before_the_command_finishes() {
     let dir = tempfile::tempdir().expect("temp dir");
     let marker = dir.path().join("background-finished");
-    let mut input = params(format!("sleep 0.1; touch '{}'", marker.display()));
+    let command = format!("sleep 0.1; touch '{}'", marker.display());
+    let mut input = params(command.clone());
     input.background = true;
-    let tool = support::sandbox::shell_tool(dir.path());
+    let tool = support::sandbox::configured_shell_tool(dir.path(), Some("/bin/sh"));
     let started = Instant::now();
 
     let output = tool
@@ -266,6 +267,8 @@ async fn shell_background_mode_returns_before_the_command_finishes() {
         .expect("background command starts");
 
     assert!(started.elapsed() < Duration::from_millis(100));
+    assert_eq!(output.title, command);
+    assert_eq!(output.metadata["shell"], "sh");
     assert_eq!(output.metadata["background"], true);
     wait_for_file(&marker).await;
 }

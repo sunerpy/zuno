@@ -23,7 +23,7 @@ pub fn normalize_foreground_timeout(requested_ms: Option<u64>) -> u64 {
 
 #[must_use]
 pub fn timeout_promoted_output(
-    display_name: String,
+    command: String,
     timeout_ms: u64,
     execution: &BackgroundExecutionInfo,
 ) -> ToolOutput {
@@ -31,7 +31,7 @@ pub fn timeout_promoted_output(
         "Command exceeded the foreground timeout after {:.1}s and is continuing in background \
          (not killed).\n\n\
          Task ID: {}\n\
-         Name: {}\n\
+         Command: {}\n\
          Output file: {}\n\
          Status file: {}\n\n\
          The command is still running; do not rerun it unless you intentionally want a second \
@@ -43,17 +43,17 @@ pub fn timeout_promoted_output(
          MILLISECONDS; pass a larger value or omit it.",
         timeout_ms as f64 / 1000.0,
         execution.id,
-        display_name,
+        command,
         execution.output_file.display(),
         execution.status_file.display(),
         execution.id,
         execution.id,
     );
 
-    ToolOutput::text(format!("{display_name} running in background"), output)
+    ToolOutput::text(command.clone(), output)
         .with_metadata("background", true)
         .with_metadata("task_id", execution.id.as_str())
-        .with_metadata("display_name", display_name)
+        .with_metadata("command", command)
         .with_metadata(
             "output_file",
             execution.output_file.to_string_lossy().into_owned(),
@@ -68,29 +68,29 @@ pub fn timeout_promoted_output(
 
 #[must_use]
 pub fn background_started_output(
-    display_name: String,
+    command: String,
     execution: &BackgroundExecutionInfo,
 ) -> ToolOutput {
     let output = format!(
         "Command is running in the background{}.\n\n\
          Task ID: {}\n\
-         Name: {}\n\
+         Command: {}\n\
          Output file: {}\n\
          Status file: {}",
         execution
             .pid
             .map_or_else(String::new, |pid| format!(" with process id {pid}")),
         execution.id,
-        display_name,
+        command,
         execution.output_file.display(),
         execution.status_file.display(),
     );
 
-    ToolOutput::text(format!("{display_name} running in background"), output)
+    ToolOutput::text(command.clone(), output)
         .with_metadata("background", true)
         .with_metadata("pid", json!(execution.pid))
         .with_metadata("task_id", execution.id.as_str())
-        .with_metadata("display_name", display_name)
+        .with_metadata("command", command)
         .with_metadata(
             "output_file",
             execution.output_file.to_string_lossy().into_owned(),

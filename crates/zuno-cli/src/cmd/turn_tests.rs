@@ -3364,7 +3364,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
         .await
         .expect("the configured shell executes");
 
-    assert_eq!(output.title, "sh printf configured-shell");
+    assert_eq!(output.title, "printf configured-shell");
     assert_eq!(output.metadata["shell"], "sh");
 }
 

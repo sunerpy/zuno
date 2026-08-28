@@ -1968,7 +1968,6 @@ impl TranscriptView {
         match part {
             MessagePart::Tool {
                 name,
-                display_name,
                 arguments,
                 title,
                 ..
@@ -1991,16 +1990,7 @@ impl TranscriptView {
                     .saturating_sub(display_width(&prefix))
                     .saturating_sub(display_width(separator));
                 let detail = crate::views::tool::summary(name, arguments)
-                    .map(|summary| {
-                        if activity == zuno_types::ActivityKind::Command && display_name != name {
-                            let command_room = detail_room
-                                .saturating_sub(display_width(display_name))
-                                .saturating_sub(1);
-                            format!("{display_name} {}", summary.fit(command_room))
-                        } else {
-                            summary.fit(detail_room)
-                        }
-                    })
+                    .map(|summary| summary.fit(detail_room))
                     .or_else(|| {
                         title
                             .as_deref()
@@ -2578,41 +2568,53 @@ impl TranscriptView {
                     status.glyph()
                 };
                 let display = self.tool_display(call_id);
-                // The disclosure is part of the header rather than an overflow notice:
-                // clicking this exact row changes this exact call and leaves every sibling
-                // alone.
-                let head = format!(" {} {glyph} Tool · {icon} {display_name}", display.glyph());
-                // The tool's wire name plus the argument that matters, which is the whole of
-                // §7.5. `title` is no longer preferred over the arguments: a completed
-                // `read` reported `Read diff.rs`, which names the kind of work and drops the
-                // path, so six reads in one turn produced six rows a reader could not tell
-                // apart. The name stays beside the summary because the summary alone is
-                // ambiguous — `crates/…/diff.rs` could be a read, a write or a patch — and
-                // one icon does not carry that much resolution.
+                // The argument that matters is the whole of §7.5. `title` is no longer
+                // preferred over the arguments: a completed `read` reported `Read
+                // diff.rs`, which names the kind of work and drops the path, so six reads
+                // in one turn produced six rows a reader could not tell apart. Non-command
+                // tools retain their display identity beside the summary because a path
+                // alone is ambiguous. Commands are different: the summary is the exact
+                // submitted command, so prepending the interpreter would fabricate a
+                // different command when the row is copied.
                 //
                 // `title` remains the fallback for a completed call whose arguments never
                 // parsed, because a provider's own sentence beats a bare wire name.
                 let summary = crate::views::tool::summary(name, arguments);
                 let has_summary = summary.is_some();
-                // Measured against what the head actually spent, not against a constant:
-                // the name's width runs from `read` to `goal_update`, and the summary has to
-                // be fitted to what is left after it. One more column is charged for the
-                // space that joins them.
+                let activity = compact_activity(part);
+                let command = activity == Some(zuno_types::ActivityKind::Command);
+                let prefix = format!(" {} {glyph} Tool · {icon} ", display.glyph());
+                let identity = if command {
+                    summary
+                        .as_ref()
+                        .map(|summary| {
+                            summary
+                                .fit(usize::from(body_width).saturating_sub(display_width(&prefix)))
+                        })
+                        .filter(|summary| !summary.is_empty())
+                        .or_else(|| title.clone().filter(|title| !title.is_empty()))
+                        .unwrap_or_else(|| display_name.clone())
+                } else if has_summary {
+                    display_name.clone()
+                } else if let Some(title) = title.as_deref() {
+                    title.to_owned()
+                } else if *status == ToolStatus::Pending {
+                    placeholder.to_owned()
+                } else {
+                    name.clone()
+                };
+                // Measured against what the header actually spent, not against a
+                // constant. Commands already use their submitted text as the identity,
+                // so they must not receive a second, interpreter-prefixed detail.
                 let room = usize::from(body_width)
-                    .saturating_sub(display_width(&head))
+                    .saturating_sub(display_width(&prefix))
+                    .saturating_sub(display_width(&identity))
                     .saturating_sub(1);
-                let detail = summary
+                let detail = (!command)
+                    .then_some(summary.as_ref())
+                    .flatten()
                     .map(|summary| summary.fit(room))
                     .filter(|summary| !summary.is_empty());
-                let identity = if has_summary {
-                    display_name
-                } else if let Some(title) = title.as_deref() {
-                    title
-                } else if *status == ToolStatus::Pending {
-                    placeholder
-                } else {
-                    name.as_str()
-                };
                 let styles = crate::views::tool::header_styles(*status, *ui_intent, &self.context);
                 let mut spans = vec![
                     Span::styled(String::from(" "), self.context.surface()),
@@ -2624,7 +2626,7 @@ impl TranscriptView {
                     Span::styled(String::from(" · "), styles.chrome),
                     Span::styled(icon.to_owned(), styles.chrome),
                     Span::styled(String::from(" "), self.context.surface()),
-                    Span::styled(identity.to_owned(), styles.title),
+                    Span::styled(identity, styles.title),
                 ];
                 if let Some(detail) = detail {
                     spans.push(Span::styled(String::from(" "), self.context.surface()));

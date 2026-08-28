@@ -2458,7 +2458,7 @@ fn views_tool_row_names_the_argument_and_not_only_the_kind_of_work() {
 }
 
 #[test]
-fn views_shell_row_uses_the_real_interpreter_instead_of_the_wire_id() {
+fn views_shell_row_keeps_the_submitted_command_copyable() {
     let mut view = view();
     view.handle_event(&AppEvent::Engine(started()));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseStart {
@@ -2483,12 +2483,12 @@ fn views_shell_row_uses_the_real_interpreter_instead_of_the_wire_id() {
 
     let joined = draw(&mut view, 80, 12).join("\n");
     assert!(
-        joined.contains("Tool · $ zsh cargo test"),
-        "the completed shell call did not use its actual interpreter:\n{joined}"
+        joined.contains("Tool · $ cargo test"),
+        "the completed shell call did not render the submitted command verbatim:\n{joined}"
     );
     assert!(
-        !joined.contains("Tool · $ shell"),
-        "the provider-facing wire id leaked into the user-facing shell label:\n{joined}"
+        !joined.contains("Tool · $ zsh cargo test"),
+        "the interpreter label was prepended into a command the user may copy:\n{joined}"
     );
 }
 
@@ -2597,7 +2597,7 @@ fn views_tool_row_of_each_tool_is_distinguishable_from_the_others() {
     for expected in [
         "read src/a.rs",
         "grep \"fn main\"",
-        "shell cargo build",
+        "$ cargo build",
         "web_search ratatui spans",
         "todo_update 1 changes · ship it",
         "memory_propose add project: run cargo fmt",
