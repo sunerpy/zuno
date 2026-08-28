@@ -146,7 +146,8 @@
       "surface": "responses",
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
-        "maxTokens": null
+        "maxTokens": null,
+        "responsesTextBlocks": "single"
       },
       "models": {
         "claude-opus-5": {

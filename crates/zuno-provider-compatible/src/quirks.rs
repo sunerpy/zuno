@@ -53,6 +53,22 @@ pub const REASONING_CONTENT_OPTION: &str = "reasoningContent";
 /// is matched.
 pub const REASONING_CONTENT_MODELS_OPTION: &str = "reasoningContentModels";
 
+/// The `provider.*.options` key describing how one Responses message accepts text.
+///
+/// `multiple` is the OpenAI-compatible default. `single` is an explicit endpoint
+/// capability for gateways that project all text onto one upstream field.
+pub const RESPONSES_TEXT_BLOCKS_OPTION: &str = "responsesTextBlocks";
+
+/// Resolved text-block shape for a Responses request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResponsesTextBlocks {
+    /// Preserve every typed fragment as a separate `input_text` block.
+    #[default]
+    Multiple,
+    /// Coalesce projected text into one `input_text` block per message.
+    Single,
+}
+
 /// A model-id rule, matched against the canonical id.
 ///
 /// One field today, but a struct rather than a bare `&str` so a second protocol
@@ -95,6 +111,8 @@ pub struct Quirks {
     pub reasoning_protocol: bool,
     /// This vendor reports the upstream it routed to.
     pub routes_upstreams: bool,
+    /// How this endpoint accepts projected Responses text blocks.
+    pub responses_text_blocks: ResponsesTextBlocks,
 }
 
 impl Quirks {
@@ -112,6 +130,7 @@ impl Quirks {
             capabilities,
             reasoning_protocol: reasoning_protocol(spec, model_id),
             routes_upstreams: profile.routes_upstreams,
+            responses_text_blocks: responses_text_blocks(spec),
         }
     }
 
@@ -134,6 +153,25 @@ impl Quirks {
     #[must_use]
     pub const fn accepts_attachments(&self) -> bool {
         self.capabilities.attachments
+    }
+
+    /// Whether one Responses message must contain at most one `input_text` block.
+    #[must_use]
+    pub const fn requires_single_response_text_block(&self) -> bool {
+        matches!(self.responses_text_blocks, ResponsesTextBlocks::Single)
+    }
+}
+
+/// Resolve the endpoint's declared Responses text-block capability.
+#[must_use]
+pub fn responses_text_blocks(spec: &Spec) -> ResponsesTextBlocks {
+    match spec
+        .options
+        .get(RESPONSES_TEXT_BLOCKS_OPTION)
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("single") => ResponsesTextBlocks::Single,
+        _ => ResponsesTextBlocks::Multiple,
     }
 }
 

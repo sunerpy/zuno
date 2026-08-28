@@ -926,6 +926,11 @@ impl TurnPlan {
         self.effort
     }
 
+    /// Explicit surface-level reasoning override, excluding configured defaults.
+    pub(crate) const fn effort_override(&self) -> Option<zuno_llm::effort::ReasoningEffort> {
+        self.effort_override
+    }
+
     /// The model's context ceiling, or zero when the catalog declares none.
     pub(crate) const fn context_window(&self) -> u64 {
         self.window.context

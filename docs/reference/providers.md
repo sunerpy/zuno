@@ -188,7 +188,16 @@ Important options include:
 | `headerTimeout` | response-header timeout in milliseconds, or `false` |
 | `chunkTimeout` | maximum gap between streamed chunks in milliseconds |
 | `maxTokens`, `temperature`, `topP`, `toolChoice` | generation controls forwarded by the native provider |
+| `responsesTextBlocks` | Responses text projection: `multiple` by default, or `single` for gateways that expose only one upstream text field |
 | `extraBody` | additional request fields after protected fields are assembled |
+
+`responsesTextBlocks: "single"` is a compatibility declaration, not a model
+capability inferred from a provider id. It keeps Zuno's durable prompt parts
+typed, but joins their text projections with one blank line immediately before
+building the compatible Responses request. Inline images remain separate
+content blocks. Use it only when the target endpoint rejects more than one
+`input_text` block for a message; standards-compatible endpoints should keep
+the default `multiple` behavior.
 
 Model `options.reasoningEffort` is the default when neither the live session nor
 the selected agent chooses a level. On the Responses surface,

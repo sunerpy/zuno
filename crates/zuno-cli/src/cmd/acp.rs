@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
@@ -23,6 +24,10 @@ use crate::environment::StartupEnvironment;
 
 const ACP_PROTOCOL_VERSION: u64 = 1;
 const ACP_SCHEMA_VERSION: &str = "1.21.0";
+const ACP_TEXT_RESOURCE_MAX_BYTES: usize = 50 * 1_024;
+const ACP_TEXT_RESOURCE_MAX_LINES: usize = 2_000;
+const ACP_IMAGE_MAX_BYTES: usize = 5 * 1_024 * 1_024;
+const ACP_IMAGE_MAX_BASE64_BYTES: usize = (ACP_IMAGE_MAX_BYTES / 3 + 1) * 4;
 
 pub(super) fn execute(args: &AcpArgs, environment: &StartupEnvironment) -> Result<(), String> {
     if args.check {
@@ -102,6 +107,19 @@ impl zuno_acp::Agent for ProductionAcpAgent {
         session.cancel();
         Ok(())
     }
+
+    async fn request_cancelled(&self, method: &str, params: &Value) {
+        if method != "session/prompt" {
+            return;
+        }
+        let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let session = self.state.sessions.lock().await.get(session_id).cloned();
+        if let Some(session) = session {
+            session.cancel();
+        }
+    }
 }
 
 fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
@@ -119,9 +137,9 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
         "agentCapabilities": {
             "loadSession": true,
             "promptCapabilities": {
-                "image": false,
+                "image": true,
                 "audio": false,
-                "embeddedContext": false,
+                "embeddedContext": true,
             },
             "mcpCapabilities": {
                 "http": false,
@@ -186,7 +204,7 @@ impl ProductionAcpAgent {
             tool_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
-        let session = self.open_session(options, client).await?;
+        let session = self.open_session(options, client.clone()).await?;
         let session_id = session.id.clone();
         let response = session.lifecycle_response().await?;
         let previous = self
@@ -203,6 +221,11 @@ impl ProductionAcpAgent {
             return Err(zuno_acp::RpcError::internal(
                 "generated duplicate ACP session id",
             ));
+        }
+        if let Err(error) = session.defer_available_commands(&client).await {
+            self.state.sessions.lock().await.remove(&session_id);
+            let _shutdown = session.shutdown().await;
+            return Err(error);
         }
         Ok(with_session_id(response, &session_id))
     }
@@ -255,6 +278,7 @@ impl ProductionAcpAgent {
         if replay {
             session.replay(&client).await?;
         }
+        session.defer_available_commands(&client).await?;
         session.lifecycle_response().await
     }
 
@@ -331,6 +355,7 @@ impl ProductionAcpAgent {
         let change = match config_id.as_str() {
             "agent" => SessionReconfiguration::Agent(value),
             "model" => SessionReconfiguration::Model(value),
+            "reasoning_effort" => SessionReconfiguration::Reasoning(value),
             other => {
                 return Err(zuno_acp::RpcError::invalid_params(format!(
                     "unknown ACP session config option {other}"
@@ -444,10 +469,12 @@ enum SessionReconfiguration {
     Mode(String),
     Agent(String),
     Model(String),
+    Reasoning(String),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ConfigurationPersistence {
+    None,
     Agent,
     Model,
 }
@@ -596,6 +623,20 @@ impl AcpSession {
         Ok(resources.configuration.lifecycle_response())
     }
 
+    async fn defer_available_commands(
+        &self,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<(), zuno_acp::RpcError> {
+        let update = {
+            let resources = self.resources.lock().await;
+            let resources = resources.as_ref().ok_or_else(|| {
+                zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
+            })?;
+            available_commands_update(resources.host.commands(), resources.host.slash_skills())
+        };
+        client.session_update_after_response(&self.id, update)
+    }
+
     async fn reconfigure(
         &self,
         change: SessionReconfiguration,
@@ -691,6 +732,7 @@ impl AcpSession {
             .await);
         }
         let persistence = match prepared.persistence {
+            ConfigurationPersistence::None => Ok(()),
             ConfigurationPersistence::Agent => candidate.host.persist_active_agent(),
             ConfigurationPersistence::Model => candidate.host.persist_active_model(),
         };
@@ -715,6 +757,8 @@ impl AcpSession {
         }
         let configuration = candidate.configuration.clone();
         *slot = Some(candidate);
+        drop(slot);
+        self.defer_available_commands(&client).await?;
         Ok(configuration)
     }
 
@@ -724,26 +768,54 @@ impl AcpSession {
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
         let _active = ActivePrompt::begin(&self.prompt_active)?;
-        let context_size = {
+        let (context_size, invocation) = {
             let resources = self.resources.lock().await;
-            resources
-                .as_ref()
-                .ok_or_else(|| {
-                    zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
-                })?
-                .configuration
-                .context_size
+            let resources = resources.as_ref().ok_or_else(|| {
+                zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
+            })?;
+            let invocation = prompt.slash_text().and_then(|text| {
+                resolve_slash_prompt(
+                    text,
+                    resources.host.commands(),
+                    &resources.host.slash_skills(),
+                )
+            });
+            (resources.configuration.context_size, invocation)
         };
+        let skill_selection_only = matches!(
+            &invocation,
+            Some(SlashInvocation::Skill { arguments, .. }) if arguments.is_empty()
+        );
         let (events, receiver) = event_channel();
         let drive = async {
             let mut resources = self.resources.lock().await;
             let resources = resources.as_mut().ok_or_else(|| {
                 zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
             })?;
-            let outcome = resources
-                .host
-                .drive_content(&prompt.text, &prompt.content, events.clone())
-                .await;
+            let outcome = match &invocation {
+                Some(SlashInvocation::Command { name, arguments }) => {
+                    resources
+                        .host
+                        .drive_command(name, arguments, events.clone())
+                        .await
+                }
+                Some(SlashInvocation::Skill {
+                    name,
+                    source,
+                    arguments,
+                }) => {
+                    resources
+                        .host
+                        .drive_skill(name, source, arguments, events.clone())
+                        .await
+                }
+                None => {
+                    resources
+                        .host
+                        .drive_content(&prompt.text, &prompt.content, events.clone())
+                        .await
+                }
+            };
             drop(events);
             outcome.map_err(zuno_acp::RpcError::internal)
         };
@@ -762,6 +834,7 @@ impl AcpSession {
                 Err(zuno_acp::RpcError::internal(error))
             }
             ProjectedTurn::Missing => match driven {
+                Ok(()) if skill_selection_only => Ok(json!({ "stopReason": "end_turn" })),
                 Ok(()) => Err(zuno_acp::RpcError::internal(
                     "turn ended without a terminal durable event",
                 )),
@@ -877,6 +950,9 @@ struct SessionConfiguration {
     agents: Vec<AgentChoice>,
     model: String,
     models: Vec<CatalogModelChoice>,
+    effective_effort: Option<zuno_llm::effort::ReasoningEffort>,
+    effort_override: Option<zuno_llm::effort::ReasoningEffort>,
+    reasoning_efforts: HashMap<String, Vec<zuno_llm::effort::ReasoningEffort>>,
 }
 
 #[derive(Clone)]
@@ -917,14 +993,23 @@ impl SessionConfiguration {
                 .or_else(|| agents.first().map(|agent| agent.name.clone()))
                 .unwrap_or_else(|| active_agent.clone())
         };
+        let model = plan.qualified_model();
+        let reasoning_efforts = plan
+            .catalog_models()
+            .iter()
+            .map(|choice| (choice.id.clone(), plan.model_reasoning_efforts(&choice.id)))
+            .collect();
         Self {
             mode,
             context_size: plan.context_window(),
             active_agent,
             build_agent,
             agents,
-            model: plan.qualified_model(),
+            model,
             models: plan.catalog_models(),
+            effective_effort: plan.effort(),
+            effort_override: plan.effort_override(),
+            reasoning_efforts,
         }
     }
 
@@ -983,8 +1068,49 @@ impl SessionConfiguration {
                 if self.model == model {
                     return Ok(None);
                 }
+                if options.effort.is_some_and(|effort| {
+                    !self
+                        .reasoning_efforts
+                        .get(&model)
+                        .is_some_and(|efforts| efforts.contains(&effort))
+                }) {
+                    options.effort = None;
+                }
                 options.model = Some(model);
                 ConfigurationPersistence::Model
+            }
+            SessionReconfiguration::Reasoning(value) => {
+                let effort = if value == "default" {
+                    None
+                } else {
+                    let effort = value.parse().map_err(|error| {
+                        zuno_acp::RpcError::invalid_params(format!(
+                            "invalid ACP thought level {value}: {error}"
+                        ))
+                    })?;
+                    let available = self
+                        .reasoning_efforts
+                        .get(&self.model)
+                        .cloned()
+                        .unwrap_or_default();
+                    if !available.contains(&effort) {
+                        return Err(zuno_acp::RpcError::invalid_params(format!(
+                            "thought level {value} is not available for {}; expected one of: {}",
+                            self.model,
+                            available
+                                .iter()
+                                .map(|effort| effort.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                    Some(effort)
+                };
+                if host.effort_override() == effort {
+                    return Ok(None);
+                }
+                options.effort = effort;
+                ConfigurationPersistence::None
             }
         };
         Ok(Some(PreparedReconfiguration {
@@ -1015,7 +1141,7 @@ impl SessionConfiguration {
     }
 
     fn config_options(&self) -> Vec<Value> {
-        vec![
+        let mut options = vec![
             json!({
                 "id": "model",
                 "name": "Model",
@@ -1040,7 +1166,73 @@ impl SessionConfiguration {
                     "description": agent.description,
                 })).collect::<Vec<_>>(),
             }),
-        ]
+        ];
+        let efforts = self
+            .reasoning_efforts
+            .get(&self.model)
+            .cloned()
+            .unwrap_or_default();
+        if !efforts.is_empty() {
+            let default_description = self.effective_effort.map_or_else(
+                || "Use the selected Agent and model defaults.".to_owned(),
+                |effort| {
+                    format!(
+                        "Use the selected Agent and model defaults (currently {}).",
+                        reasoning_effort_name(effort)
+                    )
+                },
+            );
+            let mut effort_options = vec![json!({
+                "value": "default",
+                "name": "Configured default",
+                "description": default_description,
+            })];
+            effort_options.extend(efforts.iter().map(|effort| {
+                json!({
+                    "value": effort.as_str(),
+                    "name": reasoning_effort_name(*effort),
+                })
+            }));
+            let current = self
+                .effort_override
+                .filter(|effort| efforts.contains(effort))
+                .map_or("default", zuno_llm::effort::ReasoningEffort::as_str);
+            options.push(json!({
+                "id": "reasoning_effort",
+                "name": "Reasoning",
+                "description": "Choose the reasoning effort supported by the active model.",
+                "category": "thought_level",
+                "type": "select",
+                "currentValue": current,
+                "options": effort_options,
+            }));
+        }
+        options
+    }
+
+    #[cfg(test)]
+    fn for_model(
+        &self,
+        model: &str,
+        effective_effort: Option<zuno_llm::effort::ReasoningEffort>,
+    ) -> Self {
+        Self {
+            model: model.to_owned(),
+            effective_effort,
+            effort_override: None,
+            ..self.clone()
+        }
+    }
+}
+
+const fn reasoning_effort_name(effort: zuno_llm::effort::ReasoningEffort) -> &'static str {
+    match effort {
+        zuno_llm::effort::ReasoningEffort::Off => "Off",
+        zuno_llm::effort::ReasoningEffort::Low => "Low",
+        zuno_llm::effort::ReasoningEffort::Medium => "Medium",
+        zuno_llm::effort::ReasoningEffort::High => "High",
+        zuno_llm::effort::ReasoningEffort::Xhigh => "Extra High",
+        zuno_llm::effort::ReasoningEffort::Max => "Maximum",
     }
 }
 
@@ -1067,9 +1259,19 @@ impl Drop for ActivePrompt<'_> {
     }
 }
 
+#[derive(Debug)]
 struct AcpPrompt {
     text: String,
     content: Vec<RequestContentBlock>,
+}
+
+impl AcpPrompt {
+    fn slash_text(&self) -> Option<&str> {
+        match self.content.as_slice() {
+            [RequestContentBlock::Text { text }] => Some(text),
+            _ => None,
+        }
+    }
 }
 
 fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
@@ -1095,6 +1297,7 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
                     })?
                     .to_owned(),
             },
+            "image" => parse_image_block(block)?,
             "resource_link" => {
                 let name = block
                     .get("name")
@@ -1123,6 +1326,7 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
                     size: optional_u64(block, "size")?,
                 }
             }
+            "resource" => parse_embedded_resource(block)?,
             other => {
                 return Err(zuno_acp::RpcError::invalid_params(format!(
                     "prompt block type {other} is not advertised by this ACP adapter"
@@ -1133,16 +1337,271 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
         if let Some(text) = text.filter(|text| !text.is_empty()) {
             rendered.push(text);
             content.push(resolved);
+        } else if let RequestContentBlock::Image {
+            filename,
+            media_type,
+            ..
+        } = &resolved
+        {
+            rendered.push(filename.as_ref().map_or_else(
+                || format!("Attached image ({media_type})"),
+                |filename| format!("Attached image: {filename} ({media_type})"),
+            ));
+            content.push(resolved);
         }
     }
     if content.is_empty() {
         return Err(zuno_acp::RpcError::invalid_params(
-            "prompt must contain text or a resource link",
+            "prompt must contain text, an image, or a resource",
         ));
     }
     Ok(AcpPrompt {
         text: rendered.join("\n\n"),
         content,
+    })
+}
+
+fn parse_image_block(block: &Value) -> Result<RequestContentBlock, zuno_acp::RpcError> {
+    let media_type = required_non_empty_string(block, "mimeType", "image")?;
+    let data = required_non_empty_string(block, "data", "image")?;
+    let uri = optional_string(block, "uri")?;
+    validated_image(uri.as_deref(), &media_type, data)
+}
+
+fn parse_embedded_resource(block: &Value) -> Result<RequestContentBlock, zuno_acp::RpcError> {
+    let resource = block
+        .get("resource")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            zuno_acp::RpcError::invalid_params(
+                "resource prompt blocks must contain a resource object",
+            )
+        })?;
+    let resource = Value::Object(resource.clone());
+    let uri = required_non_empty_string(&resource, "uri", "embedded resource")?;
+    let media_type = optional_string(&resource, "mimeType")?;
+    if let Some(text) = resource.get("text").and_then(Value::as_str) {
+        validate_text_resource(&uri, text)?;
+        let mut rendered = format!("Embedded resource `{uri}`");
+        if let Some(media_type) = media_type.as_deref().filter(|value| !value.is_empty()) {
+            rendered.push_str(" (");
+            rendered.push_str(media_type);
+            rendered.push(')');
+        }
+        rendered.push_str(":\n--- BEGIN EMBEDDED RESOURCE ---\n");
+        rendered.push_str(text);
+        rendered.push_str("\n--- END EMBEDDED RESOURCE ---");
+        return Ok(RequestContentBlock::Text { text: rendered });
+    }
+    if let Some(blob) = resource.get("blob").and_then(Value::as_str) {
+        let media_type = media_type
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                zuno_acp::RpcError::invalid_params(
+                    "binary embedded resources must contain a non-empty mimeType",
+                )
+            })?;
+        if !media_type.starts_with("image/") {
+            return Err(zuno_acp::RpcError::invalid_params(format!(
+                "binary embedded resource {uri} uses unsupported MIME type {media_type}; only images are accepted"
+            )));
+        }
+        return validated_image(Some(&uri), &media_type, blob.to_owned());
+    }
+    Err(zuno_acp::RpcError::invalid_params(
+        "embedded resources must contain either string text or base64 blob content",
+    ))
+}
+
+fn required_non_empty_string(
+    value: &Value,
+    field: &str,
+    label: &str,
+) -> Result<String, zuno_acp::RpcError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            zuno_acp::RpcError::invalid_params(format!(
+                "{label} blocks must contain a non-empty {field}"
+            ))
+        })
+}
+
+fn validate_text_resource(uri: &str, text: &str) -> Result<(), zuno_acp::RpcError> {
+    if text.len() > ACP_TEXT_RESOURCE_MAX_BYTES {
+        return Err(zuno_acp::RpcError::invalid_params(format!(
+            "embedded text resource {uri} exceeds the {ACP_TEXT_RESOURCE_MAX_BYTES}-byte limit"
+        )));
+    }
+    let lines = text.lines().count();
+    if lines > ACP_TEXT_RESOURCE_MAX_LINES {
+        return Err(zuno_acp::RpcError::invalid_params(format!(
+            "embedded text resource {uri} has {lines} lines, exceeding the {ACP_TEXT_RESOURCE_MAX_LINES}-line limit"
+        )));
+    }
+    Ok(())
+}
+
+fn validated_image(
+    uri: Option<&str>,
+    media_type: &str,
+    data: String,
+) -> Result<RequestContentBlock, zuno_acp::RpcError> {
+    if !media_type.starts_with("image/") {
+        return Err(zuno_acp::RpcError::invalid_params(format!(
+            "image block MIME type must start with image/, got {media_type}"
+        )));
+    }
+    if data.len() > ACP_IMAGE_MAX_BASE64_BYTES {
+        return Err(zuno_acp::RpcError::invalid_params(format!(
+            "image exceeds the {} MiB limit",
+            ACP_IMAGE_MAX_BYTES / (1024 * 1024)
+        )));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data)
+        .map_err(|error| {
+            zuno_acp::RpcError::invalid_params(format!("image data is not valid base64: {error}"))
+        })?;
+    if bytes.len() > ACP_IMAGE_MAX_BYTES {
+        return Err(zuno_acp::RpcError::invalid_params(format!(
+            "image exceeds the {} MiB limit",
+            ACP_IMAGE_MAX_BYTES / (1024 * 1024)
+        )));
+    }
+    let detected = image_media_type(&bytes).ok_or_else(|| {
+        zuno_acp::RpcError::invalid_params(
+            "image data is not a supported PNG, JPEG, GIF, or WebP payload",
+        )
+    })?;
+    if detected != media_type {
+        return Err(zuno_acp::RpcError::invalid_params(format!(
+            "image MIME {media_type} does not match detected {detected}"
+        )));
+    }
+    Ok(RequestContentBlock::Image {
+        filename: uri.and_then(filename_from_uri),
+        media_type: media_type.to_owned(),
+        data,
+    })
+}
+
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn filename_from_uri(uri: &str) -> Option<String> {
+    url::Url::parse(uri)
+        .ok()
+        .and_then(|uri| {
+            uri.path_segments()
+                .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            PathBuf::from(uri)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlashInvocation {
+    Command {
+        name: String,
+        arguments: String,
+    },
+    Skill {
+        name: String,
+        source: String,
+        arguments: String,
+    },
+}
+
+fn resolve_slash_prompt<'a>(
+    text: &str,
+    commands: impl IntoIterator<Item = &'a zuno_catalog::command::Info>,
+    skills: &[zuno_catalog::skill::Skill],
+) -> Option<SlashInvocation> {
+    let invocation = text.strip_prefix('/')?;
+    let name_end = invocation
+        .find(char::is_whitespace)
+        .unwrap_or(invocation.len());
+    let name = &invocation[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    let arguments = invocation[name_end..].trim_start().to_owned();
+    if commands
+        .into_iter()
+        .any(|command| executable_command(command) && command.name == name)
+    {
+        return Some(SlashInvocation::Command {
+            name: name.to_owned(),
+            arguments,
+        });
+    }
+    skills
+        .iter()
+        .find(|skill| skill.name == name)
+        .map(|skill| SlashInvocation::Skill {
+            name: skill.name.clone(),
+            source: skill.location.clone(),
+            arguments,
+        })
+}
+
+fn executable_command(command: &zuno_catalog::command::Info) -> bool {
+    command.subtask != Some(true)
+        && matches!(command.template, zuno_catalog::command::Template::Text(_))
+}
+
+fn available_commands_update<'a>(
+    commands: impl IntoIterator<Item = &'a zuno_catalog::command::Info>,
+    skills: impl IntoIterator<Item = zuno_catalog::skill::Skill>,
+) -> Value {
+    let mut available = commands
+        .into_iter()
+        .filter(|command| executable_command(command))
+        .map(|command| {
+            let mut advertised = json!({
+                "name": command.name,
+                "description": command.description.clone().unwrap_or_else(|| {
+                    format!("Run the /{} Zuno command.", command.name)
+                }),
+            });
+            if !command.hints.is_empty() {
+                advertised["input"] = json!({ "hint": command.hints.join(" ") });
+            }
+            advertised
+        })
+        .collect::<Vec<_>>();
+    available.extend(skills.into_iter().map(|skill| {
+        json!({
+            "name": skill.name,
+            "description": skill.description.unwrap_or_else(|| {
+                "Load this Skill for the current session.".to_owned()
+            }),
+            "input": { "hint": "arguments" },
+        })
+    }));
+    json!({
+        "sessionUpdate": "available_commands_update",
+        "availableCommands": available,
     })
 }
 
@@ -1293,5 +1752,266 @@ fn optional_string(params: &Value, field: &str) -> Result<Option<String>, zuno_a
         Some(_) => Err(zuno_acp::RpcError::invalid_params(format!(
             "{field} must be a string"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zuno_catalog::command::{Info, Source, Template};
+    use zuno_llm::effort::ReasoningEffort;
+
+    fn configuration() -> SessionConfiguration {
+        SessionConfiguration {
+            mode: "build",
+            context_size: 100_000,
+            active_agent: "build".to_owned(),
+            build_agent: "build".to_owned(),
+            agents: vec![AgentChoice {
+                name: "build".to_owned(),
+                description: Some("Build".to_owned()),
+            }],
+            model: "test/reasoning".to_owned(),
+            models: vec![
+                CatalogModelChoice {
+                    id: "test/reasoning".to_owned(),
+                    name: "Reasoning".to_owned(),
+                    provider: "Test".to_owned(),
+                },
+                CatalogModelChoice {
+                    id: "test/plain".to_owned(),
+                    name: "Plain".to_owned(),
+                    provider: "Test".to_owned(),
+                },
+            ],
+            effective_effort: Some(ReasoningEffort::Xhigh),
+            effort_override: Some(ReasoningEffort::Xhigh),
+            reasoning_efforts: HashMap::from([
+                (
+                    "test/reasoning".to_owned(),
+                    vec![
+                        ReasoningEffort::Low,
+                        ReasoningEffort::High,
+                        ReasoningEffort::Xhigh,
+                        ReasoningEffort::Max,
+                    ],
+                ),
+                ("test/plain".to_owned(), Vec::new()),
+            ]),
+        }
+    }
+
+    fn command(
+        name: &str,
+        description: Option<&str>,
+        template: Template,
+        subtask: Option<bool>,
+    ) -> Info {
+        Info {
+            name: name.to_owned(),
+            description: description.map(str::to_owned),
+            agent: None,
+            model: None,
+            source: Source::Command,
+            template,
+            subtask,
+            hints: vec!["question".to_owned()],
+        }
+    }
+
+    #[test]
+    fn initialize_advertises_only_the_rich_prompt_handlers_it_implements() {
+        let response = initialize(&json!({"protocolVersion": 1})).expect("initialize");
+        let capabilities = &response["agentCapabilities"]["promptCapabilities"];
+        assert_eq!(capabilities["image"], true);
+        assert_eq!(capabilities["embeddedContext"], true);
+        assert_eq!(capabilities["audio"], false);
+    }
+
+    #[test]
+    fn thought_level_selector_uses_the_current_models_dynamic_efforts() {
+        let configuration = configuration();
+        let options = configuration.config_options();
+        let thought = options
+            .iter()
+            .find(|option| option["id"] == "reasoning_effort")
+            .expect("thought level option");
+        assert_eq!(thought["category"], "thought_level");
+        assert_eq!(thought["currentValue"], "xhigh");
+        assert_eq!(
+            thought["options"]
+                .as_array()
+                .expect("thought options")
+                .iter()
+                .filter_map(|option| option["value"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["default", "low", "high", "xhigh", "max"]
+        );
+
+        let plain = configuration.for_model("test/plain", None);
+        assert!(
+            plain
+                .config_options()
+                .iter()
+                .all(|option| option["id"] != "reasoning_effort"),
+            "a non-reasoning model must remove the stale selector"
+        );
+    }
+
+    #[test]
+    fn available_commands_exclude_unhandled_sources_and_include_slash_skills() {
+        let commands = [
+            command(
+                "review",
+                Some("Review the change"),
+                Template::Text("Review $ARGUMENTS".to_owned()),
+                None,
+            ),
+            command(
+                "remote",
+                Some("Remote prompt"),
+                Template::Mcp(zuno_catalog::command::McpTemplate {
+                    client: "server".to_owned(),
+                    prompt: "remote".to_owned(),
+                    arguments: Vec::new(),
+                }),
+                None,
+            ),
+            command(
+                "delegated",
+                Some("Delegated prompt"),
+                Template::Text("Delegate".to_owned()),
+                Some(true),
+            ),
+        ];
+        let skills = vec![zuno_catalog::skill::Skill::embedded(
+            "codegraph",
+            Some("Navigate code structurally".to_owned()),
+            "builtin://codegraph",
+            "Use CodeGraph.",
+        )];
+
+        let update = available_commands_update(commands.iter(), skills);
+        let advertised = update["availableCommands"]
+            .as_array()
+            .expect("available commands");
+        assert_eq!(
+            advertised
+                .iter()
+                .filter_map(|command| command["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["review", "codegraph"]
+        );
+        assert_eq!(advertised[0]["input"]["hint"], "question");
+    }
+
+    #[test]
+    fn slash_prompt_resolution_prefers_commands_and_preserves_arguments() {
+        let commands = [command(
+            "review",
+            Some("Review"),
+            Template::Text("Review $ARGUMENTS".to_owned()),
+            None,
+        )];
+        let skills = vec![zuno_catalog::skill::Skill::embedded(
+            "codegraph",
+            Some("Navigate code".to_owned()),
+            "builtin://codegraph",
+            "Use CodeGraph.",
+        )];
+
+        assert_eq!(
+            resolve_slash_prompt("/review src/lib.rs", commands.iter(), &skills),
+            Some(SlashInvocation::Command {
+                name: "review".to_owned(),
+                arguments: "src/lib.rs".to_owned(),
+            })
+        );
+        assert_eq!(
+            resolve_slash_prompt("/codegraph trace calls", commands.iter(), &skills),
+            Some(SlashInvocation::Skill {
+                name: "codegraph".to_owned(),
+                source: "builtin://codegraph".to_owned(),
+                arguments: "trace calls".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_parser_accepts_images_and_embedded_text_resources() {
+        let parsed = parse_prompt(&json!({
+            "prompt": [
+                {
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": "iVBORw0KGgo=",
+                    "uri": "file:///tmp/screenshot.png"
+                },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///workspace/src/lib.rs",
+                        "mimeType": "text/rust",
+                        "text": "fn main() {}"
+                    }
+                },
+                {"type": "text", "text": "Review this selection"}
+            ]
+        }))
+        .expect("rich ACP prompt");
+        assert!(matches!(
+            &parsed.content[0],
+            RequestContentBlock::Image {
+                filename: Some(filename),
+                media_type,
+                ..
+            } if filename == "screenshot.png" && media_type == "image/png"
+        ));
+        assert!(matches!(
+            &parsed.content[1],
+            RequestContentBlock::Text { text }
+                if text.contains("file:///workspace/src/lib.rs")
+                    && text.contains("fn main() {}")
+        ));
+        assert_eq!(
+            parsed.content[2],
+            RequestContentBlock::Text {
+                text: "Review this selection".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_parser_accepts_embedded_image_blobs_and_rejects_oversized_images() {
+        let parsed = parse_prompt(&json!({
+            "prompt": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///tmp/pixel.png",
+                    "mimeType": "image/png",
+                    "blob": "iVBORw0KGgo="
+                }
+            }]
+        }))
+        .expect("embedded image resource");
+        assert!(matches!(
+            &parsed.content[0],
+            RequestContentBlock::Image {
+                filename: Some(filename),
+                media_type,
+                ..
+            } if filename == "pixel.png" && media_type == "image/png"
+        ));
+
+        let oversized = "A".repeat(ACP_IMAGE_MAX_BASE64_BYTES + 1);
+        let error = parse_prompt(&json!({
+            "prompt": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": oversized
+            }]
+        }))
+        .expect_err("oversized image must be rejected");
+        assert!(error.message.contains("exceeds"));
     }
 }

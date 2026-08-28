@@ -1200,13 +1200,18 @@ mod tests {
     fn provider_options_survive_the_round_trip_including_untyped_keys() {
         let mut outcome = MergeOutcome::default();
         let config = provider_config(
-            r#"{"options":{"apiKey":"sk-x","baseURL":"https://x/v1","customThing":{"a":1}}}"#,
+            r#"{"options":{"apiKey":"sk-x","baseURL":"https://x/v1","responsesTextBlocks":"single","customThing":{"a":1}}}"#,
         );
         let resolved = apply_config("acme", &config, None, None, &mut outcome);
         assert_eq!(resolved.options["apiKey"], serde_json::json!("sk-x"));
         assert_eq!(
             resolved.options["baseURL"],
             serde_json::json!("https://x/v1")
+        );
+        assert_eq!(
+            resolved.options["responsesTextBlocks"],
+            serde_json::json!("single"),
+            "typed native request-shape options must reach the provider Spec"
         );
         assert_eq!(
             resolved.options["customThing"],

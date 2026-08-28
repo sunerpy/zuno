@@ -120,13 +120,21 @@ Set the provider options to:
 ```json
 {
   "baseURL": "http://127.0.0.1:8787/v1",
-  "maxTokens": null
+  "maxTokens": null,
+  "responsesTextBlocks": "single"
 }
 ```
 
 The null output default prevents Zuno's generic provider layer from injecting
 an unsupported 32,000-token cap. Declare each model's real `limit.output`
-instead. Current Zuno sends native Responses `instructions`, so the verified
+instead. The single-text declaration matches the gateway's current Responses
+projection: each message maps to one upstream text field. It joins text and
+resource-link projections only at the provider boundary, so a Zed attachment
+does not produce multiple `input_text` blocks while durable Zuno history keeps
+the original typed parts. This is an explicit compatible-endpoint rule, not
+behavior inferred from the `kiro-local` id.
+
+Current Zuno sends native Responses `instructions`, so the verified
 functional deployment uses kiro-provider's explicit
 `protocol_projection_mode: "legacy-user-prefix"` migration mode. The
 provider's default `safe` mode correctly rejects that request rather than

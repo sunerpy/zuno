@@ -484,6 +484,9 @@ fn translate_response_tool_results(message: &Message, quirks: &Quirks) -> Vec<Va
 }
 
 fn response_content(message: &Message, quirks: &Quirks) -> Vec<Value> {
+    if quirks.requires_single_response_text_block() {
+        return single_text_response_content(message, quirks);
+    }
     message
         .content
         .iter()
@@ -501,6 +504,47 @@ fn response_content(message: &Message, quirks: &Quirks) -> Vec<Value> {
             _ => None,
         })
         .collect()
+}
+
+const RESPONSE_TEXT_BLOCK_SEPARATOR: &str = concat!("\n", "\n");
+
+/// Lower one typed message for an endpoint exposing only one upstream text field.
+///
+/// Typed blocks remain unchanged in durable history. Only the provider boundary
+/// joins their text projections, using a stable blank-line delimiter. Images stay
+/// separate and the joined text occupies the position of the first text fragment.
+fn single_text_response_content(message: &Message, quirks: &Quirks) -> Vec<Value> {
+    let mut content = Vec::new();
+    let mut text = Vec::new();
+    let mut text_position = None;
+    for block in &message.content {
+        match block {
+            RequestContentBlock::Text { .. } | RequestContentBlock::ResourceLink { .. } => {
+                let Some(fragment) = block.provider_text() else {
+                    unreachable!("text and resource links always have a text projection")
+                };
+                if fragment.is_empty() {
+                    continue;
+                }
+                text_position.get_or_insert(content.len());
+                text.push(fragment.into_owned());
+            }
+            RequestContentBlock::Image {
+                media_type, data, ..
+            } if quirks.accepts_attachments() => content.push(json!({
+                "type": "input_image",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            })),
+            _ => {}
+        }
+    }
+    if !text.is_empty() {
+        content.insert(
+            text_position.unwrap_or_default(),
+            json!({"type": "input_text", "text": text.join(RESPONSE_TEXT_BLOCK_SEPARATOR)}),
+        );
+    }
+    content
 }
 
 fn joined_text(message: &Message) -> String {
@@ -688,6 +732,7 @@ mod tests {
             },
             reasoning_protocol,
             routes_upstreams: false,
+            responses_text_blocks: crate::quirks::ResponsesTextBlocks::Multiple,
         }
     }
 

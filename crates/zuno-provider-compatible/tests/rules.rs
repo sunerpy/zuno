@@ -46,6 +46,73 @@ fn provider(spec: Spec) -> CompatibleProvider {
 const AZURE_BASE: &str = "https://my-resource.openai.azure.com/openai/v1";
 const COPILOT_BASE: &str = "https://api.githubcopilot.com";
 
+fn resource_link_prompt() -> Vec<Message> {
+    vec![Message::from_content(
+        Role::User,
+        vec![
+            RequestContentBlock::ResourceLink {
+                name: "faq.md".to_owned(),
+                uri: "file:///workspace/docs/faq.md".to_owned(),
+                title: None,
+                description: None,
+                media_type: Some("text/markdown".to_owned()),
+                size: Some(512),
+            },
+            RequestContentBlock::Text {
+                text: "简单优化下".to_owned(),
+            },
+        ],
+    )]
+}
+
+#[test]
+fn responses_preserve_multiple_text_blocks_by_default() {
+    let built = provider(
+        Spec::new("openrouter")
+            .with_base_url("https://example.invalid/v1")
+            .with_surface(ApiSurface::Responses),
+    );
+    let body = built.body_for(
+        &CompletionRequest::new("gpt-5.6-sol", resource_link_prompt())
+            .on_surface(ApiSurface::Responses),
+    );
+
+    assert_eq!(
+        body["input"][0]["content"],
+        json!([
+            {
+                "type": "input_text",
+                "text": "Referenced resource `faq.md`: file:///workspace/docs/faq.md\nMedia type: text/markdown\nSize: 512 bytes"
+            },
+            {"type": "input_text", "text": "简单优化下"}
+        ]),
+        "standards-compatible Responses endpoints retain the typed block boundary"
+    );
+}
+
+#[test]
+fn a_declared_single_text_responses_endpoint_coalesces_projected_text() {
+    let built = provider(
+        Spec::new("openrouter")
+            .with_base_url("https://example.invalid/v1")
+            .with_surface(ApiSurface::Responses)
+            .with_option("responsesTextBlocks", json!("single")),
+    );
+    let body = built.body_for(
+        &CompletionRequest::new("gpt-5.6-sol", resource_link_prompt())
+            .on_surface(ApiSurface::Responses),
+    );
+
+    assert_eq!(
+        body["input"][0]["content"],
+        json!([{
+            "type": "input_text",
+            "text": "Referenced resource `faq.md`: file:///workspace/docs/faq.md\nMedia type: text/markdown\nSize: 512 bytes\n\n简单优化下"
+        }]),
+        "a provider declaring one text field must receive one stable input_text block"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Azure — `packages/opencode/src/provider/provider.ts:154-160`
 // ---------------------------------------------------------------------------

@@ -2161,6 +2161,17 @@
           ],
           "description": "Response-header timeout in milliseconds, or `false` for none."
         },
+        "responsesTextBlocks": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResponsesTextBlocks"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How a Responses-compatible endpoint accepts text content inside one message.\n\nStandards-compatible endpoints accept multiple `input_text` blocks. Some\ngateways project a message onto one upstream text field and therefore need\nZuno to coalesce those blocks at the provider boundary."
+        },
         "setCacheKey": {
           "description": "Send `promptCacheKey` for this provider (default false).",
           "type": [
@@ -2275,6 +2286,21 @@
         {
           "const": "remote",
           "description": "A server reached over HTTP.",
+          "type": "string"
+        }
+      ]
+    },
+    "ResponsesTextBlocks": {
+      "description": "Text-block shape accepted by an OpenAI Responses-compatible endpoint.",
+      "oneOf": [
+        {
+          "const": "multiple",
+          "description": "Preserve each typed text or resource projection as its own `input_text`.",
+          "type": "string"
+        },
+        {
+          "const": "single",
+          "description": "Join every projected text fragment into one stable `input_text` block.",
           "type": "string"
         }
       ]

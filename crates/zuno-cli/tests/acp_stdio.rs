@@ -61,6 +61,32 @@ fn strict_config(base_url: &str) -> String {
     serde_json::to_string(&config).expect("encode strict test config")
 }
 
+fn reasoning_config() -> String {
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model("https://example.invalid"))
+            .expect("test config JSON");
+    let model = &mut config["provider"]["test"]["models"]["test-model"];
+    model["reasoning"] = json!(true);
+    model["variants"] = json!({
+        "low": {"reasoningEffort": "low"},
+        "xhigh": {"reasoningEffort": "xhigh"},
+        "max": {"reasoningEffort": "max"}
+    });
+    serde_json::to_string(&config).expect("encode reasoning test config")
+}
+
+fn rich_prompt_config(base_url: &str) -> String {
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model(base_url)).expect("test config JSON");
+    let model = &mut config["provider"]["test"]["models"]["test-model"];
+    model["attachment"] = json!(true);
+    model["modalities"] = json!({
+        "input": ["text", "image"],
+        "output": ["text"]
+    });
+    serde_json::to_string(&config).expect("encode rich prompt test config")
+}
+
 fn put_durable_message(
     connection: &zuno_db::Connection,
     session_id: &str,
@@ -304,8 +330,12 @@ fn acp_initialize_uses_stable_v1_without_fake_authentication() {
     assert!(response["result"]["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
     assert!(response["result"]["agentCapabilities"]["sessionCapabilities"]["resume"].is_object());
     assert_eq!(
-        response["result"]["agentCapabilities"]["promptCapabilities"]["image"], false,
-        "image input must stay disabled until the ACP adapter stores and forwards it"
+        response["result"]["agentCapabilities"]["promptCapabilities"]["image"],
+        true
+    );
+    assert_eq!(
+        response["result"]["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
+        true
     );
 }
 
@@ -330,16 +360,42 @@ fn request(
     .expect("write ACP request");
     stdin.flush().expect("flush ACP request");
 
+    loop {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read ACP response");
+        assert!(!line.is_empty(), "ACP closed before responding to {method}");
+        let response: Value = serde_json::from_str(&line).expect("ACP response JSON");
+        if response.get("id") == Some(&json!(id)) {
+            assert!(
+                response.get("error").is_none(),
+                "ACP request {method} failed: {response}"
+            );
+            return response["result"].clone();
+        }
+        assert_eq!(
+            response.get("method").and_then(Value::as_str),
+            Some("session/update"),
+            "unexpected ACP frame while waiting for {method}: {response}"
+        );
+    }
+}
+
+fn read_session_update(stdout: &mut BufReader<ChildStdout>) -> Value {
     let mut line = String::new();
-    stdout.read_line(&mut line).expect("read ACP response");
-    assert!(!line.is_empty(), "ACP closed before responding to {method}");
-    let response: Value = serde_json::from_str(&line).expect("ACP response JSON");
-    assert_eq!(response["id"], id, "unexpected ACP response: {response}");
+    stdout
+        .read_line(&mut line)
+        .expect("read ACP session update");
     assert!(
-        response.get("error").is_none(),
-        "ACP request {method} failed: {response}"
+        !line.is_empty(),
+        "ACP closed before publishing a session update"
     );
-    response["result"].clone()
+    let frame: Value = serde_json::from_str(&line).expect("ACP session update JSON");
+    assert_eq!(
+        frame.get("method").and_then(Value::as_str),
+        Some("session/update"),
+        "expected an ACP session update: {frame}"
+    );
+    frame["params"].clone()
 }
 
 fn request_with_updates(
@@ -381,7 +437,10 @@ fn request_with_updates(
             Some("session/update"),
             "unexpected frame while waiting for {method}: {response}"
         );
-        updates.push(response["params"]["update"].clone());
+        let update = response["params"]["update"].clone();
+        if update["sessionUpdate"] != "available_commands_update" {
+            updates.push(update);
+        }
     }
 }
 
@@ -718,6 +777,13 @@ impl Respond for WriteTurnResponder {
 #[test]
 fn acp_session_lifecycle_uses_the_durable_zuno_store() {
     let root = tempfile::tempdir().expect("ACP test root");
+    let command_dir = root.path().join(".zuno/command");
+    std::fs::create_dir_all(&command_dir).expect("create project command directory");
+    std::fs::write(
+        command_dir.join("acp-check.md"),
+        "Inspect the ACP integration for $ARGUMENTS.",
+    )
+    .expect("write project command");
     let mut child = isolated_command(root.path())
         .arg("acp")
         .stdin(Stdio::piped())
@@ -753,6 +819,18 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
             .as_array()
             .is_some_and(|options| options.iter().any(|option| option["id"] == "model")),
         "new session must expose its resolved model selector: {created}"
+    );
+    let commands = read_session_update(&mut stdout);
+    assert_eq!(commands["sessionId"], session_id);
+    let command_update = &commands["update"];
+    assert_eq!(command_update["sessionUpdate"], "available_commands_update");
+    assert!(
+        command_update["availableCommands"]
+            .as_array()
+            .is_some_and(|commands| commands
+                .iter()
+                .any(|command| command["name"] == "acp-check")),
+        "project commands must be published after session/new: {command_update}"
     );
     let planned = request(
         &mut stdin,
@@ -858,6 +936,115 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
     }
 }
 
+#[test]
+fn acp_reasoning_levels_follow_the_active_models_declared_variants() {
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = reasoning_config();
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("new session id")
+        .to_owned();
+    let reasoning = created["configOptions"]
+        .as_array()
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|option| option["id"] == "reasoning_effort")
+        })
+        .expect("reasoning selector");
+    assert_eq!(reasoning["category"], "thought_level");
+    assert_eq!(
+        reasoning["options"]
+            .as_array()
+            .expect("reasoning options")
+            .iter()
+            .filter_map(|option| option["value"].as_str())
+            .collect::<Vec<_>>(),
+        vec!["default", "low", "xhigh", "max"]
+    );
+
+    let selected = request(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/set_config_option",
+        json!({
+            "sessionId": &session_id,
+            "configId": "reasoning_effort",
+            "value": "xhigh"
+        }),
+    );
+    assert!(selected["configOptions"].as_array().is_some_and(|options| {
+        options
+            .iter()
+            .any(|option| option["id"] == "reasoning_effort" && option["currentValue"] == "xhigh")
+    }));
+
+    let plain = request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/set_config_option",
+        json!({
+            "sessionId": &session_id,
+            "configId": "model",
+            "value": "test/test-model-2"
+        }),
+    );
+    assert!(
+        plain["configOptions"].as_array().is_some_and(|options| {
+            options
+                .iter()
+                .all(|option| option["id"] != "reasoning_effort")
+        }),
+        "a non-reasoning model must remove the stale thought-level selector: {plain}"
+    );
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/close",
+        json!({"sessionId": session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP reasoning process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP reasoning process failed: {stderr}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
     let provider = MockServer::start().await;
@@ -866,6 +1053,13 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
         .mount(&provider)
         .await;
     let root = tempfile::tempdir().expect("ACP test root");
+    let command_dir = root.path().join(".zuno/command");
+    std::fs::create_dir_all(&command_dir).expect("create project command directory");
+    std::fs::write(
+        command_dir.join("acp-check.md"),
+        "Inspect the ACP integration for $ARGUMENTS.",
+    )
+    .expect("write project command");
     let config = config_with_second_model(&provider.uri());
     let mut child = isolated_command_with_config(root.path(), &config)
         .arg("acp")
@@ -913,11 +1107,29 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
             }),
         "model selection did not rebuild the ACP session: {configured}"
     );
+    let (command_completed, command_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "/acp-check src/lib.rs"}]
+        }),
+    );
+    assert_eq!(command_completed["stopReason"], "end_turn");
+    assert!(
+        command_updates.iter().any(|update| {
+            update["sessionUpdate"] == "agent_message_chunk"
+                && update["content"]["text"] == "ACP reply"
+        }),
+        "configured slash command did not execute a real turn: {command_updates:?}"
+    );
     let resource_uri = format!("file://{}/notes.md", root.path().display());
     let (completed, updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
-        4,
+        5,
         "session/prompt",
         json!({
             "sessionId": session_id,
@@ -964,6 +1176,13 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
     );
     assert!(
         received.iter().any(|request| {
+            String::from_utf8_lossy(&request.body)
+                .contains("Inspect the ACP integration for src/lib.rs.")
+        }),
+        "configured slash command was not expanded through the shared command driver"
+    );
+    assert!(
+        received.iter().any(|request| {
             let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
             body["model"] == "test-model-2"
         }),
@@ -973,14 +1192,14 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
     request(
         &mut stdin,
         &mut stdout,
-        5,
+        6,
         "session/close",
         json!({"sessionId": session_id}),
     );
     let (_loaded, replay) = request_with_updates(
         &mut stdin,
         &mut stdout,
-        6,
+        7,
         "session/load",
         json!({
             "sessionId": session_id,
@@ -1013,6 +1232,131 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
             .read_to_string(&mut stderr)
             .expect("read ACP stderr");
         panic!("ACP prompt process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_images_and_embedded_context_reach_the_provider_and_durable_replay() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(TextTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let config = rich_prompt_config(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let selection_uri = "zed://selection/src/lib.rs#L1-L3";
+    let (completed, updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [
+                {
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": "iVBORw0KGgo=",
+                    "uri": "file:///tmp/screenshot.png"
+                },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": selection_uri,
+                        "mimeType": "text/rust",
+                        "text": "fn selected() {}"
+                    }
+                },
+                {"type": "text", "text": "Review this context."}
+            ]
+        }),
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+    assert!(updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk" && update["content"]["text"] == "ACP reply"
+    }));
+
+    let received = provider
+        .received_requests()
+        .await
+        .expect("provider requests");
+    assert!(received.iter().any(|request| {
+        let body = String::from_utf8_lossy(&request.body);
+        body.contains("data:image/png;base64,iVBORw0KGgo=")
+            && body.contains(selection_uri)
+            && body.contains("fn selected() {}")
+    }));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": &session_id}),
+    );
+    let (_loaded, replay) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/load",
+        json!({
+            "sessionId": &session_id,
+            "cwd": root.path(),
+            "mcpServers": []
+        }),
+    );
+    assert!(replay.iter().any(|update| {
+        update["sessionUpdate"] == "user_message_chunk"
+            && update["content"]["type"] == "image"
+            && update["content"]["mimeType"] == "image/png"
+    }));
+    assert!(replay.iter().any(|update| {
+        update["sessionUpdate"] == "user_message_chunk"
+            && update["content"]["type"] == "text"
+            && update["content"]["text"].as_str().is_some_and(|text| {
+                text.contains(selection_uri) && text.contains("fn selected() {}")
+            })
+    }));
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP rich prompt process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP rich prompt process failed: {stderr}");
     }
 }
 

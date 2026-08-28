@@ -160,6 +160,36 @@ WSL1 must be rejected as unsupported. WSL2 is a Linux VM and may use the Linux
 backend only when the same user, mount, PID, network, filesystem, and seccomp
 probes pass.
 
+## Why does a Zed attachment fail through Kiro with `unsupported_content_block_projection`?
+
+Zed can send one ACP prompt as separate typed blocks, for example a
+`resource_link` followed by the user's text. A standards-compatible Responses
+endpoint accepts both as separate `input_text` blocks. The current Kiro gateway
+projects one message onto one upstream text field and rejects that standard
+shape with HTTP 400.
+
+Declare the limitation explicitly on that compatible provider:
+
+```json
+{
+  "provider": {
+    "kiro-local": {
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "maxTokens": null,
+        "responsesTextBlocks": "single"
+      }
+    }
+  }
+}
+```
+
+Zuno then joins only the provider-bound text projections with one blank line.
+The durable message still stores the resource link and user text as separate
+typed parts, and inline image blocks remain separate. The setting is generic
+and opt-in; do not apply it to an endpoint that supports normal multi-block
+Responses input.
+
 ### Upstream references
 
 - [Bubblewrap project and security model](https://github.com/containers/bubblewrap)

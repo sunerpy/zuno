@@ -199,6 +199,32 @@ current Responses protocol rejects file inputs, remote image URLs, stateful
 response fields, structured output, and native Web Search. Zuno must not turn
 catalog metadata into unsupported wire fields.
 
+The gateway also exposes one upstream text field for each projected input
+message. A Zed prompt containing a `resource_link` plus user text therefore
+needs an explicit compatible-provider projection rule:
+
+```json
+{
+  "provider": {
+    "kiro-local": {
+      "transport": "openai",
+      "surface": "responses",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "maxTokens": null,
+        "responsesTextBlocks": "single"
+      }
+    }
+  }
+}
+```
+
+This setting is generic and opt-in. Zuno preserves the resource link and user
+text as separate durable prompt parts, then joins only their text projections
+with one blank line at the compatible Responses boundary. It does not key
+behavior on `kiro-local`, alter OpenAI's default request shape, flatten images,
+or make the gateway limitation part of the core agent loop.
+
 ## TDD evidence
 
 - `zuno-llm` tests cover typed purpose, identity validation, and inaccessible

@@ -12,7 +12,7 @@ use crate::schema::mcp::{McpOauth, McpServerConfig};
 use crate::schema::ordered::False;
 use crate::schema::permission::{PermissionAction, PermissionMode, PermissionRule};
 use crate::schema::product_agent::{ProductAgentKind, ProductAgentPermissionMode};
-use crate::schema::provider::Timeout;
+use crate::schema::provider::{ResponsesTextBlocks, Timeout};
 use crate::schema::reference::ReferenceEntry;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -991,6 +991,34 @@ fn unknown_provider_options_are_kept_for_the_sdk() {
         .expect("options present");
     assert_eq!(options.api_key.as_deref(), Some("k"));
     assert_eq!(options.extra["customKnob"], json!({ "deep": 1 }));
+}
+
+#[test]
+fn responses_text_blocks_is_typed_and_rejects_unknown_modes() {
+    let config = parse_value(json!({
+        "provider": { "p": { "options": { "responsesTextBlocks": "single" } } }
+    }))
+    .expect("single-text Responses projection is valid");
+    let options = config
+        .provider
+        .as_ref()
+        .and_then(|providers| providers.get("p"))
+        .and_then(|provider| provider.options.as_ref())
+        .expect("options present");
+    assert_eq!(
+        options.responses_text_blocks,
+        Some(ResponsesTextBlocks::Single)
+    );
+    assert!(
+        !options.extra.contains_key("responsesTextBlocks"),
+        "the native request-shape option must not be an unvalidated SDK extra"
+    );
+
+    let error = parse_value(json!({
+        "provider": { "p": { "options": { "responsesTextBlocks": "merge-sometimes" } } }
+    }))
+    .expect_err("unknown projection modes must fail validation");
+    assert_eq!(issue_path(&error), "provider.p.options.responsesTextBlocks");
 }
 
 #[test]

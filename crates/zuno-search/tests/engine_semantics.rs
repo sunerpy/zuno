@@ -77,6 +77,36 @@ fn matched(root: &Path, pattern: &str, include: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+fn tempdir_without_git_ancestor() -> TempDir {
+    let default = tempfile::tempdir().expect("a temporary directory");
+    if !default
+        .path()
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+    {
+        return default;
+    }
+
+    #[cfg(unix)]
+    for base in ["/var/tmp", "/dev/shm"] {
+        let base = Path::new(base);
+        if base
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists())
+        {
+            continue;
+        }
+        if let Ok(dir) = tempfile::Builder::new()
+            .prefix("zuno-search-")
+            .tempdir_in(base)
+        {
+            return dir;
+        }
+    }
+
+    panic!("the test environment has no writable temporary root outside a .git ancestor");
+}
+
 #[test]
 fn a_star_glob_whitelists_everything_including_ignored_and_hidden_paths() {
     // Recorded from `opencode debug rg files`, which passes `--glob=**/*`: all ten
@@ -441,7 +471,7 @@ fn a_nested_gitignore_is_honoured() {
 fn a_gitignore_outside_a_repository_is_not_applied() {
     // Ripgrep applies repository ignore files only when it discovers repository
     // context. With no `.git` anywhere, both files remain visible.
-    let dir = tempfile::tempdir().expect("a temporary directory");
+    let dir = tempdir_without_git_ancestor();
     write(dir.path(), ".gitignore", "secret.ts\n");
     write(dir.path(), "secret.ts", "needle\n");
     write(dir.path(), "public.ts", "needle\n");

@@ -28,7 +28,7 @@ are not wire-contract authorities and Zuno does not copy their implementation:
 
 | Adapter | Reviewed commit | What Zuno reviews |
 | --- | --- | --- |
-| [`agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp) | [`50f69e57ca761ccafd2ca29de7fb591068277516`](https://github.com/agentclientprotocol/codex-acp/commit/50f69e57ca761ccafd2ca29de7fb591068277516) | Capability negotiation, model/approval/sandbox configuration, tool and subagent projection, file changes, terminal events, usage, and durable thread loading |
+| [`agentclientprotocol/codex-acp`](https://github.com/agentclientprotocol/codex-acp) | [`2b48e9822330fc09f3a94a81563e5c4bb779601a`](https://github.com/agentclientprotocol/codex-acp/commit/2b48e9822330fc09f3a94a81563e5c4bb779601a) | Capability negotiation, `thought_level` configuration, command publication, rich prompt conversion, cancellation, tool and subagent projection, file changes, usage, and durable thread loading |
 | [`agentclientprotocol/claude-agent-acp`](https://github.com/agentclientprotocol/claude-agent-acp) | [`8710ce1cbccf562cb04b4bcc30e053e960aee05f`](https://github.com/agentclientprotocol/claude-agent-acp/commit/8710ce1cbccf562cb04b4bcc30e053e960aee05f) | Permission and elicitation lifecycle, edit review, TODO projection, client MCP, terminal ownership, and cancellation races while user input is pending |
 
 For every ACP change, review the stable schema first, then compare the same
@@ -105,13 +105,14 @@ loop.
 | --- | --- |
 | Initialization | Negotiates stable protocol V1 and reports schema `1.21.0`. Authentication methods are empty because Zuno uses its own configured provider credentials and has no ACP login handler. |
 | Session lifecycle | Implements `session/new`, `load`, `resume`, `list`, `delete`, and `close`. Loading replays durable client-visible history; resuming continues without duplicating that replay. |
-| Session configuration | Implements build/plan modes and transactional agent or model replacement through stable config options. Reconfiguration is rejected while a prompt is active and rolls back on failure. |
+| Session configuration | Implements build/plan modes plus transactional Agent, model, and `reasoning_effort` replacement. The reasoning selector uses ACP category `thought_level` and only publishes levels supported by the active catalog model. Reconfiguration is rejected while a prompt is active and rolls back on failure. |
+| Commands and Skills | Publishes executable Catalog commands and unambiguous slash-invokable Skills through `available_commands_update` after new/load/resume and successful reconfiguration. `/name arguments` reuses the same command or Skill driver as other Zuno surfaces; adapter-specific commands are not invented. |
 | Prompt execution | Admits input through the durable Zuno turn path, streams projections while the turn runs, and projects the final durable plan before returning. Concurrent prompts for one session are rejected. |
-| Prompt content | Accepts text and native `resource_link` blocks. Every resource-link field is persisted and replayed; providers without a native link type receive one stable text projection. Prompt image, audio, and embedded-resource capabilities remain `false`. |
+| Prompt content | Advertises and accepts text, inline image, native `resource_link`, embedded text resource, and embedded image resource content. Audio remains `false`. Resource links stay typed; images use typed durable file parts; embedded text keeps URI, MIME, and body in one stable persisted envelope. Selection, diagnostics, fetched context, and branch diff use the generic embedded-resource path rather than Zed-specific prompt branches. |
 | Assistant and tool projection | Streams assistant text and reasoning, tool start/update/completion, accumulated raw input, raw output, JSON/text content, written-file locations, and usage. |
 | File edits and diffs | Zuno's native file tools produce stable ACP `diff` content with an absolute path and exact `oldText`/`newText`. A unified-diff text fallback remains only for tools that cannot provide typed file state. |
 | Human input | Routes tool permission through `session/request_permission` and the question tool through stable form elicitation when the client advertises it. Unknown, malformed, declined, and cancelled outcomes fail closed. |
-| Cancellation | `session/cancel`, request cancellation, stdin EOF, and process shutdown abort active work and settle pending agent-to-client requests instead of leaving the transport hung. |
+| Cancellation | `session/cancel`, JSON-RPC `$/cancel_request`, stdin EOF, and process shutdown abort active work and settle pending agent-to-client requests instead of leaving the transport hung. Request-id cancellation calls back into the Agent with the original method and params before dropping the handler future, allowing Zuno to abort the matching session process tree. |
 | Durable load replay | Reconstructs user/assistant content, reasoning, tools, raw input/output, typed diffs, locations, resource links and image output, plan, and latest-context usage from durable session state. |
 | ACP-provided MCP | HTTP and SSE MCP capabilities remain `false`. Zuno may still mount MCP servers from its own validated native configuration. |
 | Client filesystem RPC | Not advertised. Agent file reads and writes use Zuno tools, sandbox/permission policy, and durable events; they do not masquerade as ACP client filesystem handlers. |
@@ -121,6 +122,12 @@ loop.
 continuation, steering, and load replay. Text-only provider protocols lower it
 only at the provider boundary. This prevents Zed from reopening a thread with
 lossy prose in place of the original URI metadata.
+
+Embedded text is bounded to 50 KiB and 2,000 lines per resource. Inline or
+embedded images must be valid base64 PNG, JPEG, GIF, or WebP payloads no larger
+than 5 MiB; the ACP transport also enforces its 8 MiB frame ceiling. Binary
+embedded resources other than images are rejected instead of injecting opaque
+base64 into model context.
 
 ## Zed setup and verification
 
@@ -136,16 +143,20 @@ MCP configuration remain Zuno-owned rather than Zed-owned.
 
 Run this acceptance sequence from a Zed External Agent thread:
 
-1. Start a Zuno thread and confirm the mode, agent, and model selectors are
-   populated from Zuno.
-2. Ask for a read-only inspection and verify reasoning and tool details stream
+1. Start a Zuno thread and confirm the mode, Agent, model, and reasoning
+   selectors are populated from Zuno.
+2. Open `/` completion and verify configured commands and unambiguous Skills
+   appear, then execute one command.
+3. Add an image, selection, and branch diff; verify the selected model receives
+   the supported content without a protocol error.
+4. Ask for a read-only inspection and verify reasoning and tool details stream
    without corrupting stdout JSON-RPC.
-3. Request a file creation under strict permission policy, answer the Zed
+5. Request a file creation under strict permission policy, answer the Zed
    permission card, and verify the native creation diff has `oldText: null`.
-4. Ask a structured question and verify the elicitation form returns the answer
+6. Ask a structured question and verify the elicitation form returns the answer
    to the same turn.
-5. Cancel a running prompt and verify the thread returns to an idle state.
-6. Close and reopen or import the thread, then verify content, tools, diff,
+7. Cancel a running prompt and verify the thread returns to an idle state.
+8. Close and reopen or import the thread, then verify content, tools, diff,
    plan, resource link, and usage are replayed once.
 
 Use Zed's `dev: open acp logs` command when diagnosing framing, ordering, or
@@ -160,11 +171,13 @@ cargo test -p zuno-acp
 cargo test -p zuno-cli --test acp_stdio
 ```
 
-Those tests drive initialization, lifecycle, mode/model replacement, prompt
+Those tests drive initialization, lifecycle, dynamic reasoning configuration,
+command publication, mode/model replacement, rich prompt parsing, prompt
 streaming, strict permission, form elicitation, typed creation diff,
-resource-link roundtrip, cancellation transport, durable load replay, plan,
-and usage. A release is not allowed to claim Zed UI acceptance until the manual
-sequence above has also been run against the intended Zed build and platform.
+resource-link roundtrip, request-to-session cancellation, durable load replay,
+plan, and usage. A release is not allowed to claim Zed UI acceptance until the
+manual sequence above has also been run against the intended Zed build and
+platform.
 
 ## Audited snapshot
 

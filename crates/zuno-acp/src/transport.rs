@@ -87,6 +87,14 @@ pub trait Agent: Send + Sync + 'static {
         params: Value,
         client: ClientConnection,
     ) -> Result<(), RpcError>;
+
+    /// Notify the Agent before an in-flight client request future is dropped.
+    ///
+    /// The transport owns JSON-RPC request ids, while the Agent owns session and
+    /// process-tree cancellation. Passing the original method and params lets the
+    /// Agent abort that durable operation without teaching the transport about
+    /// product-specific session fields.
+    async fn request_cancelled(&self, _method: &str, _params: &Value) {}
 }
 
 enum Outbound {
@@ -114,7 +122,14 @@ const INITIALIZING: u8 = 1;
 const INITIALIZED: u8 = 2;
 
 type Pending = HashMap<String, oneshot::Sender<Result<Value, RpcError>>>;
-type InFlight = HashMap<String, oneshot::Sender<()>>;
+
+struct InFlightRequest {
+    cancel: oneshot::Sender<()>,
+    method: String,
+    params: Value,
+}
+
+type InFlight = HashMap<String, InFlightRequest>;
 
 #[derive(Default)]
 struct PendingState {
@@ -122,11 +137,18 @@ struct PendingState {
     waiters: Pending,
 }
 
+#[derive(Default)]
+struct DeferredState {
+    response_sent: bool,
+    notifications: Vec<(String, Value)>,
+}
+
 #[derive(Clone)]
 pub struct ClientConnection {
     output: mpsc::Sender<Outbound>,
     pending: Arc<Mutex<PendingState>>,
     next_id: Arc<AtomicU64>,
+    deferred: Option<Arc<Mutex<DeferredState>>>,
 }
 
 impl ClientConnection {
@@ -136,6 +158,27 @@ impl ClientConnection {
             json!({ "sessionId": session_id, "update": update }),
         )
         .await
+    }
+
+    pub fn session_update_after_response(
+        &self,
+        session_id: &str,
+        update: Value,
+    ) -> Result<(), RpcError> {
+        let deferred = self.deferred.as_ref().ok_or_else(|| {
+            RpcError::internal("deferred ACP updates require a request-scoped client connection")
+        })?;
+        let mut deferred = lock(deferred);
+        if deferred.response_sent {
+            return Err(RpcError::internal(
+                "ACP response was already sent before the deferred update was registered",
+            ));
+        }
+        deferred.notifications.push((
+            "session/update".to_owned(),
+            json!({ "sessionId": session_id, "update": update }),
+        ));
+        Ok(())
     }
 
     pub async fn request_permission(&self, params: Value) -> Result<Value, RpcError> {
@@ -214,6 +257,31 @@ impl ClientConnection {
             .await
             .map_err(|_| RpcError::internal("ACP writer stopped before closing"))
     }
+
+    fn request_scoped(&self) -> Self {
+        Self {
+            output: self.output.clone(),
+            pending: Arc::clone(&self.pending),
+            next_id: Arc::clone(&self.next_id),
+            deferred: Some(Arc::new(Mutex::new(DeferredState::default()))),
+        }
+    }
+
+    async fn flush_after_response(&self) -> Result<(), RpcError> {
+        let Some(deferred) = &self.deferred else {
+            return Ok(());
+        };
+        let notifications = {
+            let mut deferred = lock(deferred);
+            deferred.response_sent = true;
+            std::mem::take(&mut deferred.notifications)
+        };
+        for (method, params) in notifications {
+            self.notify(&method, params).await?;
+        }
+        Ok(())
+    }
+
     fn resolve_response(&self, frame: &Value) {
         let Some(id) = frame.get("id").and_then(id_key) else {
             return;
@@ -272,6 +340,7 @@ impl std::fmt::Debug for ClientConnection {
             .debug_struct("ClientConnection")
             .field("pending", &pending.waiters.len())
             .field("closed", &pending.closed)
+            .field("request_scoped", &self.deferred.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -295,6 +364,7 @@ where
         output: output_tx,
         pending: Arc::new(Mutex::new(PendingState::default())),
         next_id: Arc::new(AtomicU64::new(1)),
+        deferred: None,
     };
     let agent = Arc::new(agent);
     let initialized = Arc::new(AtomicU8::new(UNINITIALIZED));
@@ -357,7 +427,12 @@ where
 
             if method == "$/cancel_request" {
                 if let Some(request_id) = params.get("requestId") {
-                    cancel_in_flight(&in_flight, request_id);
+                    if let Some(request) = take_in_flight(&in_flight, request_id) {
+                        agent
+                            .request_cancelled(&request.method, &request.params)
+                            .await;
+                        let _ignored = request.cancel.send(());
+                    }
                     client.cancel_pending(request_id);
                 }
                 continue;
@@ -412,13 +487,21 @@ where
                     continue;
                 }
 
+                let request_method = method.to_owned();
                 let (cancel_tx, cancel_rx) = oneshot::channel();
                 let duplicate = {
                     let mut active = lock(&in_flight);
                     if active.contains_key(&request_key) {
                         true
                     } else {
-                        active.insert(request_key.clone(), cancel_tx);
+                        active.insert(
+                            request_key.clone(),
+                            InFlightRequest {
+                                cancel: cancel_tx,
+                                method: request_method.clone(),
+                                params: params.clone(),
+                            },
+                        );
                         false
                     }
                 };
@@ -437,10 +520,11 @@ where
                 let client = client.clone();
                 let initialized = Arc::clone(&initialized);
                 let in_flight = Arc::clone(&in_flight);
-                let method = method.to_owned();
+                let method = request_method;
                 requests.spawn(async move {
+                    let request_client = client.request_scoped();
                     let result = tokio::select! {
-                        result = agent.request(&method, params, client.clone()) => result,
+                        result = agent.request(&method, params, request_client.clone()) => result,
                         _ = cancel_rx => Err(RpcError::cancelled("request cancelled")),
                     };
                     if method == "initialize" {
@@ -454,8 +538,13 @@ where
                         );
                     }
                     lock(&in_flight).remove(&request_key);
+                    let succeeded = result.is_ok();
                     if let Err(error) = client.response(id, result).await {
                         eprintln!("ACP response failed: {error}");
+                    } else if succeeded
+                        && let Err(error) = request_client.flush_after_response().await
+                    {
+                        eprintln!("ACP deferred notification failed: {error}");
                     }
                 });
             } else {
@@ -478,10 +567,13 @@ where
 
     let cancellations = lock(&in_flight)
         .drain()
-        .map(|(_, cancel)| cancel)
+        .map(|(_, request)| request)
         .collect::<Vec<_>>();
-    for cancel in cancellations {
-        let _ignored = cancel.send(());
+    for request in cancellations {
+        agent
+            .request_cancelled(&request.method, &request.params)
+            .await;
+        let _ignored = request.cancel.send(());
     }
     client.close_pending(RpcError::internal("ACP connection closed"));
     while requests.join_next().await.is_some() {}
@@ -546,13 +638,9 @@ where
     }
 }
 
-fn cancel_in_flight(in_flight: &Mutex<InFlight>, request_id: &Value) {
-    let Some(request_key) = id_key(request_id) else {
-        return;
-    };
-    if let Some(cancel) = lock(in_flight).remove(&request_key) {
-        let _ignored = cancel.send(());
-    }
+fn take_in_flight(in_flight: &Mutex<InFlight>, request_id: &Value) -> Option<InFlightRequest> {
+    let request_key = id_key(request_id)?;
+    lock(in_flight).remove(&request_key)
 }
 
 async fn write_frames<W>(
@@ -639,6 +727,56 @@ mod tests {
             lock(&self.notifications).push(method.to_owned());
             Ok(())
         }
+    }
+
+    #[derive(Debug)]
+    struct DeferredUpdateAgent;
+
+    #[async_trait]
+    impl Agent for DeferredUpdateAgent {
+        async fn request(
+            &self,
+            _method: &str,
+            _params: Value,
+            client: ClientConnection,
+        ) -> Result<Value, RpcError> {
+            client.session_update_after_response(
+                "ses_deferred",
+                json!({
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [],
+                }),
+            )?;
+            Ok(json!({"ready": true}))
+        }
+
+        async fn notification(
+            &self,
+            method: &str,
+            _params: Value,
+            _client: ClientConnection,
+        ) -> Result<(), RpcError> {
+            Err(RpcError::method_not_found(method))
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_session_updates_are_written_after_the_request_response() {
+        let frames = run_to_eof(
+            DeferredUpdateAgent,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n".to_vec(),
+            2,
+        )
+        .await;
+
+        assert_eq!(frames[0]["id"], 1);
+        assert_eq!(frames[0]["result"]["ready"], true);
+        assert_eq!(frames[1]["method"], "session/update");
+        assert_eq!(frames[1]["params"]["sessionId"], "ses_deferred");
+        assert_eq!(
+            frames[1]["params"]["update"]["sessionUpdate"],
+            "available_commands_update"
+        );
     }
 
     #[derive(Debug, Default)]
@@ -781,6 +919,7 @@ mod tests {
     struct BlockingAgent {
         started: Arc<Notify>,
         dropped: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
     }
 
     struct DropSignal(Arc<AtomicBool>);
@@ -816,15 +955,23 @@ mod tests {
         ) -> Result<(), RpcError> {
             Err(RpcError::method_not_found(method))
         }
+
+        async fn request_cancelled(&self, method: &str, params: &Value) {
+            if method == "session/prompt" && params["sessionId"] == "ses_cancel" {
+                self.cancelled.store(true, AtomicOrdering::SeqCst);
+            }
+        }
     }
 
     #[tokio::test]
     async fn cancel_request_aborts_the_matching_in_flight_request() {
         let started = Arc::new(Notify::new());
         let dropped = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let agent = BlockingAgent {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
+            cancelled: Arc::clone(&cancelled),
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(4096);
         let (output_writer, output_reader) = tokio::io::duplex(4096);
@@ -847,7 +994,7 @@ mod tests {
 
         input_writer
             .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{}}\n",
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"ses_cancel\"}}\n",
             )
             .await
             .expect("write prompt");
@@ -867,6 +1014,7 @@ mod tests {
         let response: Value = serde_json::from_str(&line).expect("cancellation response");
         assert_eq!(response["id"], 2);
         assert_eq!(response["error"]["code"], -32800);
+        assert!(cancelled.load(AtomicOrdering::SeqCst));
         assert!(dropped.load(AtomicOrdering::SeqCst));
 
         input_writer.shutdown().await.expect("close ACP input");
@@ -881,9 +1029,11 @@ mod tests {
     async fn clean_eof_aborts_in_flight_requests_before_joining() {
         let started = Arc::new(Notify::new());
         let dropped = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let agent = BlockingAgent {
             started: Arc::clone(&started),
             dropped: Arc::clone(&dropped),
+            cancelled: Arc::clone(&cancelled),
         };
         let (mut input_writer, input_reader) = tokio::io::duplex(4096);
         let (output_writer, output_reader) = tokio::io::duplex(4096);
@@ -902,7 +1052,7 @@ mod tests {
 
         input_writer
             .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{}}\n",
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"ses_cancel\"}}\n",
             )
             .await
             .expect("write prompt");
@@ -914,6 +1064,7 @@ mod tests {
             .expect("clean EOF cancels active requests")
             .expect("server task joins")
             .expect("server exits cleanly");
+        assert!(cancelled.load(AtomicOrdering::SeqCst));
         assert!(dropped.load(AtomicOrdering::SeqCst));
     }
 

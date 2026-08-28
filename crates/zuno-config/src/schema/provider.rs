@@ -144,9 +144,29 @@ pub struct ProviderOptions {
     /// Maximum gap between streamed SSE chunks, in milliseconds.
     #[serde(rename = "chunkTimeout", skip_serializing_if = "Option::is_none")]
     pub chunk_timeout: Option<NonZeroU32>,
+    /// How a Responses-compatible endpoint accepts text content inside one message.
+    ///
+    /// Standards-compatible endpoints accept multiple `input_text` blocks. Some
+    /// gateways project a message onto one upstream text field and therefore need
+    /// Zuno to coalesce those blocks at the provider boundary.
+    #[serde(
+        rename = "responsesTextBlocks",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub responses_text_blocks: Option<ResponsesTextBlocks>,
     /// Every other option, passed through to the provider SDK.
     #[serde(flatten)]
     pub extra: JsonMap,
+}
+
+/// Text-block shape accepted by an OpenAI Responses-compatible endpoint.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponsesTextBlocks {
+    /// Preserve each typed text or resource projection as its own `input_text`.
+    Multiple,
+    /// Join every projected text fragment into one stable `input_text` block.
+    Single,
 }
 
 /// A timeout in milliseconds, or `false` to disable it
