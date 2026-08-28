@@ -16,12 +16,27 @@ const QUESTION_TOOL: &str = "question";
 #[derive(Debug, Clone)]
 pub struct AcpQuestionAsker {
     client: ClientConnection,
+    route: Option<std::sync::Arc<crate::AcpSessionRoute>>,
 }
 
 impl AcpQuestionAsker {
     #[must_use]
     pub fn new(client: ClientConnection) -> Self {
-        Self { client }
+        Self {
+            client,
+            route: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_route(
+        client: ClientConnection,
+        route: std::sync::Arc<crate::AcpSessionRoute>,
+    ) -> Self {
+        Self {
+            client,
+            route: Some(route),
+        }
     }
 }
 
@@ -33,7 +48,18 @@ impl QuestionAsker for AcpQuestionAsker {
         questions: &[QuestionRequest],
         call: Option<(&str, &str)>,
     ) -> Result<QuestionOutcome, ToolError> {
-        let request = elicitation_request(session_id, questions, call)?;
+        let routed = self.route.as_ref().map_or_else(
+            || crate::RoutedSession::direct(session_id),
+            |route| route.resolve(session_id),
+        );
+        let mut request = elicitation_request(routed.wire_session_id(), questions, call)?;
+        if let Some(child_session_id) = routed.child_session_id() {
+            request["_meta"] = json!({
+                "zuno": {
+                    "childSessionId": child_session_id,
+                },
+            });
+        }
         let response = match self.client.request("elicitation/create", request).await {
             Ok(response) => response,
             Err(_) => return Ok(QuestionOutcome::Failed),
@@ -47,25 +73,30 @@ fn elicitation_request(
     questions: &[QuestionRequest],
     call: Option<(&str, &str)>,
 ) -> Result<Value, ToolError> {
-    let properties = questions
-        .iter()
-        .enumerate()
-        .map(|(index, question)| Ok((format!("q{index}"), property_schema(question)?)))
-        .collect::<Result<Map<String, Value>, ToolError>>()?;
-    let required = (0..questions.len())
-        .map(|index| format!("q{index}"))
-        .collect::<Vec<_>>();
+    let mut properties = Map::new();
+    let mut required = Vec::new();
+    for (index, question) in questions.iter().enumerate() {
+        for field in property_schemas(index, question)? {
+            if field.required {
+                required.push(field.name.clone());
+            }
+            properties.insert(field.name, field.schema);
+        }
+    }
+    let mut requested_schema = json!({
+        "type": "object",
+        "title": "Questions",
+        "description": "Answer each question in order.",
+        "properties": properties,
+    });
+    if !required.is_empty() {
+        requested_schema["required"] = json!(required);
+    }
     let mut request = json!({
         "mode": "form",
         "message": request_message(questions),
         "sessionId": session_id,
-        "requestedSchema": {
-            "type": "object",
-            "title": "Questions",
-            "description": "Answer each question in order.",
-            "properties": properties,
-            "required": required,
-        },
+        "requestedSchema": requested_schema,
     });
     if let Some((_, tool_call_id)) = call {
         request["toolCallId"] = Value::String(tool_call_id.to_owned());
@@ -80,17 +111,75 @@ fn request_message(questions: &[QuestionRequest]) -> String {
     }
 }
 
-fn property_schema(question: &QuestionRequest) -> Result<Value, ToolError> {
-    if allows_custom(question) {
-        return Ok(json!({
-            "type": "string",
-            "title": question.header,
-            "description": custom_description(question),
-            "minLength": 1,
-        }));
+struct FormField {
+    name: String,
+    schema: Value,
+    required: bool,
+}
+
+fn property_schemas(index: usize, question: &QuestionRequest) -> Result<Vec<FormField>, ToolError> {
+    let base_name = format!("q{index}");
+    let custom = allows_custom(question);
+    if question.options.is_empty() {
+        if !custom {
+            return Err(invalid_request(
+                "a question with custom answers disabled must offer at least one option",
+            ));
+        }
+        return Ok(vec![FormField {
+            name: base_name,
+            schema: custom_schema(question, false),
+            required: true,
+        }]);
     }
 
-    validate_strict_options(question)?;
+    validate_options(question)?;
+    let choice = choice_schema(question);
+    if custom {
+        Ok(vec![
+            FormField {
+                name: format!("{base_name}_choice"),
+                schema: choice,
+                required: false,
+            },
+            FormField {
+                name: format!("{base_name}_custom"),
+                schema: custom_schema(question, true),
+                required: false,
+            },
+        ])
+    } else {
+        Ok(vec![FormField {
+            name: base_name,
+            schema: choice,
+            required: true,
+        }])
+    }
+}
+
+fn custom_schema(question: &QuestionRequest, alongside_choices: bool) -> Value {
+    let title = if alongside_choices {
+        format!("{} — Other", question.header)
+    } else {
+        question.header.clone()
+    };
+    let description = if alongside_choices {
+        format!(
+            "{}\n\nType a custom answer instead of the listed choices.",
+            question.question
+        )
+    } else {
+        question.question.clone()
+    };
+    json!({
+            "type": "string",
+            "title": title,
+            "description": description,
+            "minLength": 1,
+    })
+}
+
+fn choice_schema(question: &QuestionRequest) -> Value {
     let choices = question
         .options
         .iter()
@@ -103,7 +192,7 @@ fn property_schema(question: &QuestionRequest) -> Result<Value, ToolError> {
         })
         .collect::<Vec<_>>();
     if is_multiple(question) {
-        Ok(json!({
+        json!({
             "type": "array",
             "title": question.header,
             "description": question.question,
@@ -111,48 +200,18 @@ fn property_schema(question: &QuestionRequest) -> Result<Value, ToolError> {
             "items": {
                 "anyOf": choices,
             },
-        }))
+        })
     } else {
-        Ok(json!({
+        json!({
             "type": "string",
             "title": question.header,
             "description": question.question,
             "oneOf": choices,
-        }))
+        })
     }
 }
 
-fn custom_description(question: &QuestionRequest) -> String {
-    let mut description = question.question.clone();
-    if !question.options.is_empty() {
-        description.push_str("\n\nSuggested choices:");
-        for option in &question.options {
-            description.push_str("\n- ");
-            description.push_str(&option.label);
-            if !option.description.is_empty() {
-                description.push_str(": ");
-                description.push_str(&option.description);
-            }
-        }
-    }
-    if is_multiple(question) {
-        description.push_str(
-            "\n\nEnter the answer as free text. ACP v1.21 cannot combine a native multi-select \
-             enum with arbitrary custom entries in one field, so the complete text is returned \
-             as one answer.",
-        );
-    } else {
-        description.push_str("\n\nYou may enter a suggested choice or any custom answer.");
-    }
-    description
-}
-
-fn validate_strict_options(question: &QuestionRequest) -> Result<(), ToolError> {
-    if question.options.is_empty() {
-        return Err(invalid_request(
-            "a question with custom answers disabled must offer at least one option",
-        ));
-    }
+fn validate_options(question: &QuestionRequest) -> Result<(), ToolError> {
     let mut labels = HashSet::with_capacity(question.options.len());
     for option in &question.options {
         if !labels.insert(option.label.as_str()) {
@@ -193,23 +252,42 @@ fn accepted_answers(response: &Value, questions: &[QuestionRequest]) -> Option<V
     questions
         .iter()
         .enumerate()
-        .map(|(index, question)| {
-            let value = content.get(&format!("q{index}"))?;
-            accepted_answer(question, value)
-        })
+        .map(|(index, question)| accepted_answer(index, question, content))
         .collect()
 }
 
-fn accepted_answer(question: &QuestionRequest, value: &Value) -> Option<Answer> {
-    if allows_custom(question) {
-        let answer = value.as_str()?;
+fn accepted_answer(
+    index: usize,
+    question: &QuestionRequest,
+    content: &Map<String, Value>,
+) -> Option<Answer> {
+    let base_name = format!("q{index}");
+    if question.options.is_empty() {
+        let answer = content.get(&base_name)?.as_str()?;
         return (!answer.is_empty()).then(|| vec![answer.to_owned()]);
     }
 
+    if allows_custom(question) {
+        if let Some(custom) = content.get(&format!("{base_name}_custom")) {
+            let custom = custom.as_str()?;
+            if !custom.is_empty() {
+                return Some(vec![custom.to_owned()]);
+            }
+        }
+        return content.get(&format!("{base_name}_choice")).map_or_else(
+            || Some(Vec::new()),
+            |value| accepted_choice(question, value, true),
+        );
+    }
+
+    accepted_choice(question, content.get(&base_name)?, false)
+}
+
+fn accepted_choice(question: &QuestionRequest, value: &Value, optional: bool) -> Option<Answer> {
     if is_multiple(question) {
         let values = value.as_array()?;
         if values.is_empty() {
-            return None;
+            return optional.then(Vec::new);
         }
         values
             .iter()
@@ -331,20 +409,31 @@ mod tests {
     }
 
     #[test]
-    fn custom_answers_use_the_conservative_free_text_mapping() {
+    fn custom_answers_keep_native_choices_and_add_an_other_field() {
         let mut question = strict_multiple();
         question.custom = None;
         let request =
             elicitation_request("ses-1", &[question], None).expect("valid custom request");
-        let property = &request["requestedSchema"]["properties"]["q0"];
+        let schema = &request["requestedSchema"];
+        assert!(schema.get("required").is_none());
+        let properties = schema["properties"].as_object().expect("form properties");
+        assert_eq!(properties.len(), 2);
 
-        assert_eq!(property["type"], "string");
-        assert_eq!(property["minLength"], 1);
-        assert!(property.get("items").is_none());
-        assert!(property.get("oneOf").is_none());
-        let description = property["description"].as_str().expect("description");
-        assert!(description.contains("Linux"));
-        assert!(description.contains("complete text is returned as one answer"));
+        let choices = &properties["q0_choice"];
+        assert_eq!(choices["type"], "array");
+        assert_eq!(choices["title"], "Platforms");
+        assert_eq!(choices["minItems"], 1);
+        assert_eq!(choices["items"]["anyOf"][0]["const"], "Linux");
+        assert_eq!(choices["items"]["anyOf"][1]["const"], "Windows");
+
+        let custom = &properties["q0_custom"];
+        assert_eq!(custom["type"], "string");
+        assert_eq!(custom["title"], "Platforms — Other");
+        assert_eq!(custom["minLength"], 1);
+        assert_eq!(
+            custom["description"],
+            "Choose target platforms.\n\nType a custom answer instead of the listed choices."
+        );
         assert!(request.get("toolCallId").is_none());
     }
 
@@ -373,6 +462,100 @@ mod tests {
                 &[strict_multiple()],
             ),
             QuestionOutcome::Answered(vec![vec!["Linux".to_owned(), "Windows".to_owned(),]])
+        );
+    }
+
+    #[test]
+    fn custom_question_accepts_a_native_choice() {
+        let mut question = strict_single();
+        question.custom = None;
+        assert_eq!(
+            elicitation_outcome(
+                &json!({
+                    "action": "accept",
+                    "content": { "q0_choice": "Preview" },
+                }),
+                &[question],
+            ),
+            QuestionOutcome::Answered(vec![vec!["Preview".to_owned()]])
+        );
+    }
+
+    #[test]
+    fn custom_multi_select_question_accepts_native_choices() {
+        let mut question = strict_multiple();
+        question.custom = None;
+        assert_eq!(
+            elicitation_outcome(
+                &json!({
+                    "action": "accept",
+                    "content": { "q0_choice": ["Linux", "Windows"] },
+                }),
+                &[question],
+            ),
+            QuestionOutcome::Answered(vec![vec!["Linux".to_owned(), "Windows".to_owned()]])
+        );
+    }
+
+    #[test]
+    fn custom_answer_takes_precedence_over_a_native_choice() {
+        let mut question = strict_single();
+        question.custom = None;
+        assert_eq!(
+            elicitation_outcome(
+                &json!({
+                    "action": "accept",
+                    "content": {
+                        "q0_choice": "Preview",
+                        "q0_custom": "Nightly",
+                    },
+                }),
+                &[question],
+            ),
+            QuestionOutcome::Answered(vec![vec!["Nightly".to_owned()]])
+        );
+    }
+
+    #[test]
+    fn free_text_only_question_uses_one_required_field() {
+        let question = QuestionRequest {
+            question: "Name the release.".to_owned(),
+            header: "Release".to_owned(),
+            options: Vec::new(),
+            multiple: None,
+            custom: None,
+        };
+        let request =
+            elicitation_request("ses-1", std::slice::from_ref(&question), None).expect("request");
+        let schema = &request["requestedSchema"];
+        assert_eq!(schema["required"], json!(["q0"]));
+        assert_eq!(schema["properties"]["q0"]["type"], "string");
+        assert_eq!(schema["properties"]["q0"]["title"], "Release");
+        assert_eq!(
+            elicitation_outcome(
+                &json!({
+                    "action": "accept",
+                    "content": { "q0": "Canary" },
+                }),
+                &[question],
+            ),
+            QuestionOutcome::Answered(vec![vec!["Canary".to_owned()]])
+        );
+    }
+
+    #[test]
+    fn custom_question_may_be_submitted_unanswered() {
+        let mut question = strict_single();
+        question.custom = None;
+        assert_eq!(
+            elicitation_outcome(
+                &json!({
+                    "action": "accept",
+                    "content": {},
+                }),
+                &[question],
+            ),
+            QuestionOutcome::Answered(vec![Vec::new()])
         );
     }
 
@@ -408,6 +591,16 @@ mod tests {
     #[test]
     fn duplicate_strict_labels_are_rejected_before_delivery() {
         let mut question = strict_single();
+        question.options.push(option("Stable", "Duplicate label."));
+        let error = elicitation_request("ses-1", &[question], None)
+            .expect_err("duplicate enum labels make oneOf ambiguous");
+        assert_eq!(error.tool(), QUESTION_TOOL);
+    }
+
+    #[test]
+    fn duplicate_custom_labels_are_rejected_before_delivery() {
+        let mut question = strict_single();
+        question.custom = None;
         question.options.push(option("Stable", "Duplicate label."));
         let error = elicitation_request("ses-1", &[question], None)
             .expect_err("duplicate enum labels make oneOf ambiguous");

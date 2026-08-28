@@ -10,7 +10,7 @@ use zuno_engine::r#loop::ToolDiff;
 use zuno_tool::ToolOutput;
 use zuno_types::WorkStateProjection;
 
-use crate::projection::{completed_tool_update, tool_call};
+use crate::projection::{CompletedToolUpdate, completed_tool_update, tool_call};
 
 /// Maximum retained durable messages hydrated for one ACP load.
 pub const REPLAY_MESSAGE_CAP: usize = 512;
@@ -315,7 +315,7 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
         display_name,
         name,
         initial_status,
-        raw_input,
+        raw_input.clone(),
     )];
     if !matches!(status, "completed" | "error") {
         return updates;
@@ -335,7 +335,7 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
         .cloned()
         .unwrap_or_default();
     let mut durable_output = ToolOutput::text(title, output);
-    durable_output.metadata = metadata;
+    durable_output.metadata = metadata.clone();
     let written_paths = durable_output
         .written_paths()
         .into_iter()
@@ -345,15 +345,18 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
     let diff = ToolDiff::from_output(&durable_output)
         .as_ref()
         .and_then(|diff| replay_diff(diff, policy));
-    let mut completed = completed_tool_update(
+    let mut completed = completed_tool_update(CompletedToolUpdate {
         call_id,
         display_name,
+        name,
         title,
+        raw_input: raw_input.as_ref(),
         output,
-        diff.as_ref(),
-        &written_paths,
-        status == "error",
-    );
+        diff: diff.as_ref(),
+        written_paths: &written_paths,
+        is_error: status == "error",
+        metadata: Some(&metadata),
+    });
     if let Some(content) = completed.get_mut("content").and_then(Value::as_array_mut) {
         content.extend(
             state
@@ -606,6 +609,243 @@ mod tests {
         assert_eq!(updates[4]["locations"], json!([{"path":edited}]));
         assert_eq!(updates[5]["content"]["text"], "done");
         assert_eq!(updates[5]["messageId"], "msg-assistant");
+    }
+
+    #[test]
+    fn replay_keeps_shell_commands_copyable_and_interpreters_separate() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-shell",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-shell",
+                    "tool": "shell",
+                    "displayName": "zsh",
+                    "state": {
+                        "status": "completed",
+                        "raw": r#"{"command":"git diff --check"}"#,
+                        "title": "zsh git diff --check",
+                        "output": "(no output)",
+                        "metadata": {
+                            "shell": "zsh"
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+
+        assert_eq!(replay.updates[0]["title"], "git diff --check");
+        assert_eq!(replay.updates[0]["_meta"]["zuno"]["interpreter"], "zsh");
+        assert_eq!(replay.updates[1]["title"], "git diff --check");
+        assert_eq!(replay.updates[1]["_meta"]["zuno"]["interpreter"], "zsh");
+    }
+
+    #[test]
+    fn replay_renders_a_completed_question_as_a_static_answer_card() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-question",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-question",
+                    "tool": "question",
+                    "displayName": "Question",
+                    "state": {
+                        "status": "completed",
+                        "raw": serde_json::to_string(&json!({
+                            "questions": [{
+                                "header": "Database",
+                                "question": "Which database?",
+                                "options": [
+                                    {"label": "Postgres", "description": "Relational"},
+                                    {"label": "SQLite", "description": "Embedded"}
+                                ]
+                            }]
+                        }))
+                        .expect("raw input"),
+                        "title": "Answered · 1 question · 15s",
+                        "output": "User has answered your questions.",
+                        "metadata": {
+                            "answers": [["SQLite"]],
+                            "questionStatus": "answered",
+                            "questionCount": 1,
+                            "elapsedMs": 15_000
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+
+        assert_eq!(replay.updates.len(), 2);
+        let started = &replay.updates[0];
+        assert_eq!(started["title"], "Question · Database");
+        assert_eq!(
+            started["rawInput"]["questions"][0]["question"],
+            "Which database?"
+        );
+        assert_eq!(started["_meta"]["zuno"]["question"]["status"], "pending");
+        let prompt = started["content"][0]["content"]["text"]
+            .as_str()
+            .expect("static question prompt");
+        assert!(prompt.contains("Which database?"), "{prompt}");
+        assert!(prompt.contains("Postgres"), "{prompt}");
+        assert!(prompt.contains("SQLite"), "{prompt}");
+
+        let completed = &replay.updates[1];
+        assert_eq!(completed["title"], "Answered · 1 question · 15s");
+        assert_eq!(
+            completed["_meta"]["zuno"]["question"]["answers"],
+            json!([["SQLite"]])
+        );
+        assert_eq!(completed["_meta"]["zuno"]["question"]["status"], "answered");
+        let card = completed["content"][0]["content"]["text"]
+            .as_str()
+            .expect("static answered question card");
+        assert!(card.contains("Which database?"), "{card}");
+        assert!(card.contains("Selected: SQLite"), "{card}");
+        assert!(card.contains("Status: answered"), "{card}");
+    }
+
+    #[test]
+    fn replay_renders_an_unfinished_question_without_reopening_elicitation() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-question",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-question",
+                    "tool": "question",
+                    "displayName": "Question",
+                    "state": {
+                        "status": "running",
+                        "input": {
+                            "questions": [{
+                                "header": "Scope",
+                                "question": "How deep?",
+                                "multiple": true,
+                                "options": [
+                                    {"label": "Focused", "description": "One surface"},
+                                    {"label": "Complete", "description": "All ACP surfaces"}
+                                ]
+                            }]
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+
+        assert_eq!(replay.updates.len(), 1);
+        assert_eq!(replay.updates[0]["sessionUpdate"], "tool_call");
+        assert_eq!(replay.updates[0]["status"], "in_progress");
+        assert_eq!(
+            replay.updates[0]["_meta"]["zuno"]["question"]["status"],
+            "pending"
+        );
+        assert!(
+            replay.updates[0]["content"][0]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("How deep?") && text.contains("Complete"))
+        );
+    }
+
+    #[test]
+    fn replay_renders_a_delegation_as_a_typed_subagent_card() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-task",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-task",
+                    "tool": "task",
+                    "displayName": "Delegate",
+                    "state": {
+                        "status": "completed",
+                        "raw": serde_json::to_string(&json!({
+                            "description": "Inspect tree",
+                            "prompt": "Inspect the ACP child-session call chain.",
+                            "subagent_type": "explorer",
+                            "background": false
+                        }))
+                        .expect("raw input"),
+                        "title": "Inspect tree",
+                        "output": "<task id=\"ses-child\" state=\"completed\">done</task>",
+                        "metadata": {
+                            "subagent": {
+                                "sessionId": "ses-child",
+                                "jobId": null,
+                                "agent": "explorer",
+                                "description": "Inspect tree",
+                                "objective": "Inspect the ACP child-session call chain.",
+                                "state": "completed",
+                                "background": false,
+                                "reportDelivery": "foreground",
+                                "model": "test/test-model",
+                                "effort": "high"
+                            }
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+
+        assert_eq!(replay.updates.len(), 2);
+        assert_eq!(
+            replay.updates[0]["title"],
+            "Delegate · explorer · Inspect tree"
+        );
+        assert!(
+            replay.updates[0]["content"][0]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Inspect the ACP child-session call chain."))
+        );
+        assert_eq!(
+            replay.updates[1]["_meta"]["zuno"]["subagent"]["sessionId"],
+            "ses-child"
+        );
+        assert_eq!(
+            replay.updates[1]["_meta"]["zuno"]["subagent"]["state"],
+            "completed"
+        );
+        let card = replay.updates[1]["content"][0]["content"]["text"]
+            .as_str()
+            .expect("subagent card");
+        assert!(card.contains("Agent: explorer"), "{card}");
+        assert!(card.contains("Session: ses-child"), "{card}");
+        assert!(card.contains("State: completed"), "{card}");
+        assert!(
+            replay.updates[1]["content"]
+                .as_array()
+                .is_some_and(|content| content.iter().any(|item| {
+                    item["content"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("<task id=\"ses-child\""))
+                })),
+            "the model-visible task result remains available beside the presentation card"
+        );
     }
 
     #[test]

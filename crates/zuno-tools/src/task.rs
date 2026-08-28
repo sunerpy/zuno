@@ -54,7 +54,7 @@
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -81,6 +81,9 @@ pub const WIRE_ID: &str = "task";
 /// (`task.ts:118-127`), so a rule may permit delegation to one agent and refuse
 /// another rather than treating delegation as one all-or-nothing capability.
 pub const PERMISSION_KEY: &str = "task";
+
+/// Durable metadata key for client-facing child-session identity and state.
+pub const METADATA_SUBAGENT_KEY: &str = "subagent";
 
 /// The delegation hop budget when config declares no `subagent_depth`.
 ///
@@ -926,7 +929,30 @@ fn render(
         .description
         .clone()
         .unwrap_or_else(|| format!("Delegated to {}", plan.agent));
-    ToolOutput::text(title, lines.join("\n"))
+    let report_delivery = if background {
+        match params.report_delivery.unwrap_or_default() {
+            ReportDelivery::NextStep => "nextStep",
+            ReportDelivery::Quiet => "quiet",
+        }
+    } else {
+        "foreground"
+    };
+    ToolOutput::text(title, lines.join("\n")).with_metadata(
+        METADATA_SUBAGENT_KEY,
+        json!({
+            "sessionId": turn.session_id,
+            "jobId": turn.job_id,
+            "agent": plan.agent,
+            "category": plan.category,
+            "description": params.description,
+            "objective": params.prompt,
+            "state": state,
+            "background": background,
+            "reportDelivery": report_delivery,
+            "model": plan.model.as_ref().map(|model| model.model.as_str()),
+            "effort": plan.effort.map(ReasoningEffort::as_str),
+        }),
+    )
 }
 
 /// Catalog facts stated by hand, for a test or an unconfigured install.

@@ -4,10 +4,13 @@ use serde_json::{Value, json};
 use zuno_engine::r#loop::{ToolDiff, TurnEvent};
 use zuno_llm::event::StreamEvent;
 
+use crate::presentation::{decorate_completed_tool_update, decorate_tool_call};
+
 #[derive(Debug, Default)]
 pub struct TurnEventProjector {
     context_size: Option<u64>,
     raw_inputs: HashMap<String, String>,
+    tool_names: HashMap<String, String>,
     visible_tools: HashSet<String>,
 }
 
@@ -49,10 +52,11 @@ impl TurnEventProjector {
                 Some(content_update("agent_message_chunk", content))
             }
             TurnEvent::Provider {
-                event: StreamEvent::ToolUseStart { id, .. },
+                event: StreamEvent::ToolUseStart { id, name },
                 ..
             } => {
                 self.raw_inputs.entry(id.clone()).or_default();
+                self.tool_names.insert(id.clone(), name.clone());
                 None
             }
             TurnEvent::Provider {
@@ -60,14 +64,29 @@ impl TurnEventProjector {
                 ..
             } => {
                 let visible = self.visible_tools.contains(id);
-                let raw_input = self.raw_inputs.entry(id.clone()).or_default();
-                raw_input.push_str(delta);
+                let raw_input = {
+                    let raw_input = self.raw_inputs.entry(id.clone()).or_default();
+                    raw_input.push_str(delta);
+                    json_or_string(raw_input)
+                };
                 visible.then(|| {
-                    json!({
+                    let name = self.tool_names.get(id).map(String::as_str);
+                    let command = name
+                        .and_then(|name| shell_command(name, Some(&raw_input)))
+                        .map(str::to_owned);
+                    let mut update = json!({
                         "sessionUpdate": "tool_call_update",
                         "toolCallId": id,
-                        "rawInput": json_or_string(raw_input),
-                    })
+                        "rawInput": raw_input,
+                    });
+                    if let Some(command) = command {
+                        update["title"] = Value::String(command);
+                    }
+                    if let Some(name) = name {
+                        let presentation_input = update.get("rawInput").cloned();
+                        decorate_tool_call(&mut update, name, presentation_input.as_ref());
+                    }
+                    update
                 })
             }
             TurnEvent::ToolCallStarted {
@@ -77,6 +96,7 @@ impl TurnEventProjector {
                 ..
             } => {
                 self.visible_tools.insert(call_id.clone());
+                self.tool_names.insert(call_id.clone(), name.clone());
                 Some(tool_call(
                     call_id,
                     display_name,
@@ -94,10 +114,22 @@ impl TurnEventProjector {
                 ..
             } => {
                 self.visible_tools.insert(call_id.clone());
-                Some(tool_call(call_id, display_name, name, "in_progress", None))
+                self.tool_names.insert(call_id.clone(), name.clone());
+                let mut update = tool_call(
+                    call_id,
+                    display_name,
+                    name,
+                    "in_progress",
+                    self.raw_inputs
+                        .get(call_id)
+                        .map(|value| json_or_string(value)),
+                );
+                update["sessionUpdate"] = json!("tool_call_update");
+                Some(update)
             }
             TurnEvent::ToolDispatchBlocked { call_id, kind, .. } => {
                 self.raw_inputs.remove(call_id);
+                self.tool_names.remove(call_id);
                 self.visible_tools.remove(call_id);
                 let kind = kind.as_str();
                 Some(json!({
@@ -116,6 +148,7 @@ impl TurnEventProjector {
             TurnEvent::ToolDispatchCompleted {
                 call_id,
                 display_name,
+                name,
                 title,
                 output,
                 diff,
@@ -123,17 +156,24 @@ impl TurnEventProjector {
                 is_error,
                 ..
             } => {
-                self.raw_inputs.remove(call_id);
+                let raw_input = self
+                    .raw_inputs
+                    .remove(call_id)
+                    .map(|value| json_or_string(&value));
+                self.tool_names.remove(call_id);
                 self.visible_tools.remove(call_id);
-                Some(completed_tool_update(
+                Some(completed_tool_update(CompletedToolUpdate {
                     call_id,
                     display_name,
+                    name,
                     title,
+                    raw_input: raw_input.as_ref(),
                     output,
-                    diff.as_ref(),
+                    diff: diff.as_ref(),
                     written_paths,
-                    *is_error,
-                ))
+                    is_error: *is_error,
+                    metadata: None,
+                }))
             }
             TurnEvent::Provider {
                 event:
@@ -145,6 +185,7 @@ impl TurnEventProjector {
                 ..
             } => {
                 self.raw_inputs.remove(tool_use_id);
+                self.tool_names.remove(tool_use_id);
                 self.visible_tools.remove(tool_use_id);
                 Some(json!({
                     "sessionUpdate": "tool_call_update",
@@ -175,16 +216,13 @@ impl TurnEventProjector {
                 json!({ "sessionUpdate": "usage_update", "used": used, "size": size })
             }),
             TurnEvent::Provider {
-                event: StreamEvent::StatusDetail { detail },
+                event: StreamEvent::StatusDetail { .. },
                 ..
-            }
-            | TurnEvent::Provider {
-                event:
-                    StreamEvent::Error {
-                        message: detail, ..
-                    },
+            } => None,
+            TurnEvent::Provider {
+                event: StreamEvent::Error { .. },
                 ..
-            } => Some(content_update("agent_thought_chunk", detail)),
+            } => None,
             _ => None,
         }
     }
@@ -198,11 +236,13 @@ pub fn turn_event_update(event: &TurnEvent) -> Option<Value> {
 #[must_use]
 pub fn tool_call(
     call_id: &str,
-    title: &str,
+    display_name: &str,
     name: &str,
     status: &str,
     raw_input: Option<Value>,
 ) -> Value {
+    let presentation_input = raw_input.clone();
+    let title = shell_command(name, raw_input.as_ref()).unwrap_or(display_name);
     let mut update = json!({
         "sessionUpdate": "tool_call",
         "toolCallId": call_id,
@@ -213,19 +253,45 @@ pub fn tool_call(
     if let Some(raw_input) = raw_input {
         update["rawInput"] = raw_input;
     }
+    add_shell_interpreter(&mut update, name, display_name);
+    decorate_tool_call(&mut update, name, presentation_input.as_ref());
     update
 }
 
+pub(crate) struct CompletedToolUpdate<'a> {
+    pub call_id: &'a str,
+    pub display_name: &'a str,
+    pub name: &'a str,
+    pub title: &'a str,
+    pub raw_input: Option<&'a Value>,
+    pub output: &'a str,
+    pub diff: Option<&'a ToolDiff>,
+    pub written_paths: &'a [String],
+    pub is_error: bool,
+    pub metadata: Option<&'a serde_json::Map<String, Value>>,
+}
+
 #[must_use]
-pub fn completed_tool_update(
-    call_id: &str,
-    display_name: &str,
-    title: &str,
-    output: &str,
-    diff: Option<&ToolDiff>,
-    written_paths: &[String],
-    is_error: bool,
-) -> Value {
+pub(crate) fn completed_tool_update(input: CompletedToolUpdate<'_>) -> Value {
+    let CompletedToolUpdate {
+        call_id,
+        display_name,
+        name,
+        title,
+        raw_input,
+        output,
+        diff,
+        written_paths,
+        is_error,
+        metadata,
+    } = input;
+    let title = shell_command(name, raw_input).unwrap_or({
+        if title.is_empty() {
+            display_name
+        } else {
+            title
+        }
+    });
     let mut content = vec![text_content(output)];
     if let Some(diff) = diff {
         if diff.files().is_empty() {
@@ -240,7 +306,7 @@ pub fn completed_tool_update(
     let mut update = json!({
         "sessionUpdate": "tool_call_update",
         "toolCallId": call_id,
-        "title": if title.is_empty() { display_name } else { title },
+        "title": title,
         "status": if is_error { "failed" } else { "completed" },
         "rawOutput": json_or_string(output),
         "content": content,
@@ -248,7 +314,30 @@ pub fn completed_tool_update(
     if !locations.is_empty() {
         update["locations"] = Value::Array(locations);
     }
+    add_shell_interpreter(&mut update, name, display_name);
+    decorate_completed_tool_update(&mut update, name, raw_input, metadata, output, is_error);
     update
+}
+
+fn shell_command<'a>(name: &str, raw_input: Option<&'a Value>) -> Option<&'a str> {
+    if name != "shell" {
+        return None;
+    }
+    raw_input?
+        .as_object()?
+        .get("command")?
+        .as_str()
+        .filter(|command| !command.is_empty())
+}
+
+fn add_shell_interpreter(update: &mut Value, name: &str, display_name: &str) {
+    if name == "shell" {
+        update["_meta"] = json!({
+            "zuno": {
+                "interpreter": display_name,
+            },
+        });
+    }
 }
 
 fn content_update(kind: &str, text: &str) -> Value {

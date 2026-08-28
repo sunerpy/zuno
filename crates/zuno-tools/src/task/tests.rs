@@ -761,6 +761,12 @@ async fn a_foreground_delegation_returns_the_child_session_id_and_no_job_id() {
     assert!(output.output.contains(&format!("<task id=\"{child}\"")));
     assert!(output.output.contains("state=\"completed\""));
     assert!(!output.output.contains("background="));
+    assert_eq!(output.metadata["subagent"]["sessionId"], child);
+    assert_eq!(output.metadata["subagent"]["agent"], "explorer");
+    assert_eq!(output.metadata["subagent"]["objective"], "look around");
+    assert_eq!(output.metadata["subagent"]["state"], "completed");
+    assert_eq!(output.metadata["subagent"]["background"], false);
+    assert_eq!(output.metadata["subagent"]["reportDelivery"], "foreground");
     assert_eq!(host.dispatched()[0].parent_session_id, PARENT);
     assert!(!host.dispatched()[0].background);
 }
@@ -784,6 +790,15 @@ async fn a_background_dispatch_reports_a_job_id_distinct_from_the_session_id() {
     assert!(output.output.contains("job=\"job_"));
     assert!(output.output.contains("reportDelivery=\"nextStep\""));
     assert!(output.output.contains("state=\"running\""));
+    assert_eq!(output.metadata["subagent"]["sessionId"], child);
+    assert!(
+        output.metadata["subagent"]["jobId"]
+            .as_str()
+            .is_some_and(|job| job.starts_with("job_"))
+    );
+    assert_eq!(output.metadata["subagent"]["state"], "running");
+    assert_eq!(output.metadata["subagent"]["background"], true);
+    assert_eq!(output.metadata["subagent"]["reportDelivery"], "nextStep");
     assert!(host.dispatched()[0].background);
     assert_eq!(
         host.dispatched()[0].report_delivery,

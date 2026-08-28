@@ -1,6 +1,7 @@
 //! Agent Client Protocol adapter for external editor clients.
 
 mod permission;
+mod presentation;
 mod projection;
 mod question;
 mod replay;

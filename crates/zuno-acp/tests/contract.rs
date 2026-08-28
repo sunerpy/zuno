@@ -78,7 +78,7 @@ fn engine_stream_events_project_to_protocol_updates() {
         ui_intent: ToolUiIntent::Generic,
     })
     .expect("tool start is client-visible");
-    assert_eq!(started["sessionUpdate"], "tool_call");
+    assert_eq!(started["sessionUpdate"], "tool_call_update");
     assert_eq!(started["toolCallId"], "call-1");
     assert_eq!(started["status"], "in_progress");
 
@@ -97,6 +97,46 @@ fn engine_stream_events_project_to_protocol_updates() {
     assert_eq!(completed["sessionUpdate"], "tool_call_update");
     assert_eq!(completed["status"], "completed");
     assert_eq!(completed["content"][0]["content"]["text"], "ok");
+}
+
+#[test]
+fn operational_status_is_not_projected_as_agent_thought() {
+    let reasoning = turn_event_update(&TurnEvent::Provider {
+        step: 1,
+        event: StreamEvent::ReasoningDelta("real reasoning".to_owned()),
+    })
+    .expect("real reasoning remains client-visible");
+    assert_eq!(reasoning["sessionUpdate"], "agent_thought_chunk");
+    assert_eq!(reasoning["content"]["text"], "real reasoning");
+
+    let title = turn_event_update(&TurnEvent::SessionTitleUpdated {
+        title: "优化 FAQ 中 Shell 沙箱说明".to_owned(),
+    })
+    .expect("a generated title is a typed session metadata update");
+    assert_eq!(title["sessionUpdate"], "session_info_update");
+    assert_eq!(title["title"], "优化 FAQ 中 Shell 沙箱说明");
+
+    assert!(
+        turn_event_update(&TurnEvent::Provider {
+            step: 0,
+            event: StreamEvent::StatusDetail {
+                detail: "history compacted before this turn".to_owned(),
+            },
+        })
+        .is_none(),
+        "operational status has no ACP v1 thought semantics"
+    );
+    assert!(
+        turn_event_update(&TurnEvent::Provider {
+            step: 1,
+            event: StreamEvent::Error {
+                message: "provider retrying".to_owned(),
+                retry_after: None,
+            },
+        })
+        .is_none(),
+        "provider status errors must not masquerade as model reasoning"
+    );
 }
 
 #[test]
@@ -138,6 +178,144 @@ fn stateful_projection_accumulates_tool_input_without_emitting_invalid_json() {
     assert_eq!(completed_input["sessionUpdate"], "tool_call_update");
     assert_eq!(completed_input["toolCallId"], "call-1");
     assert_eq!(completed_input["rawInput"], json!({ "path": "src/lib.rs" }));
+}
+
+#[test]
+fn shell_tool_projects_a_copyable_command_and_separate_interpreter_identity() {
+    let mut projector = TurnEventProjector::new();
+    let _ = projector.project(&TurnEvent::Provider {
+        step: 1,
+        event: StreamEvent::ToolUseStart {
+            id: "call-shell".to_owned(),
+            name: "shell".to_owned(),
+        },
+    });
+    let _ = projector.project(&TurnEvent::Provider {
+        step: 1,
+        event: StreamEvent::ToolInputDelta {
+            id: "call-shell".to_owned(),
+            delta: r#"{"command":"git diff --check"}"#.to_owned(),
+        },
+    });
+
+    let pending = projector
+        .project(&TurnEvent::ToolCallStarted {
+            step: 1,
+            call_id: "call-shell".to_owned(),
+            display_name: "zsh".to_owned(),
+            name: "shell".to_owned(),
+            ui_intent: ToolUiIntent::Generic,
+        })
+        .expect("the pending shell call is projected");
+    assert_eq!(pending["title"], "git diff --check");
+    assert_eq!(pending["rawInput"]["command"], "git diff --check");
+    assert_eq!(pending["_meta"]["zuno"]["interpreter"], "zsh");
+
+    let running = projector
+        .project(&TurnEvent::ToolDispatchStarted {
+            step: 1,
+            call_id: "call-shell".to_owned(),
+            display_name: "zsh".to_owned(),
+            name: "shell".to_owned(),
+            ui_intent: ToolUiIntent::Generic,
+        })
+        .expect("the running shell call is projected");
+    assert_eq!(running["title"], "git diff --check");
+    assert_eq!(running["_meta"]["zuno"]["interpreter"], "zsh");
+
+    let completed = projector
+        .project(&TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: "call-shell".to_owned(),
+            display_name: "zsh".to_owned(),
+            name: "shell".to_owned(),
+            title: "zsh git diff --check".to_owned(),
+            output: "(no output)".to_owned(),
+            diff: None,
+            written_paths: Vec::new(),
+            is_error: false,
+        })
+        .expect("the completed shell call is projected");
+    assert_eq!(completed["title"], "git diff --check");
+    assert_eq!(completed["_meta"]["zuno"]["interpreter"], "zsh");
+}
+
+#[test]
+fn live_question_completion_keeps_the_authoritative_answer_text_until_replay() {
+    let mut projector = TurnEventProjector::new();
+    let _ = projector.project(&TurnEvent::Provider {
+        step: 1,
+        event: StreamEvent::ToolUseStart {
+            id: "call-question".to_owned(),
+            name: "question".to_owned(),
+        },
+    });
+    let _ = projector.project(&TurnEvent::Provider {
+        step: 1,
+        event: StreamEvent::ToolInputDelta {
+            id: "call-question".to_owned(),
+            delta: serde_json::to_string(&json!({
+                "questions": [{
+                    "header": "Database",
+                    "question": "Which database?",
+                    "options": [
+                        {"label": "Postgres", "description": "Relational"},
+                        {"label": "SQLite", "description": "Embedded"}
+                    ]
+                }]
+            }))
+            .expect("question input"),
+        },
+    });
+    let _ = projector.project(&TurnEvent::ToolCallStarted {
+        step: 1,
+        call_id: "call-question".to_owned(),
+        display_name: "Question".to_owned(),
+        name: "question".to_owned(),
+        ui_intent: ToolUiIntent::Generic,
+    });
+
+    let completed = projector
+        .project(&TurnEvent::ToolDispatchCompleted {
+            step: 1,
+            call_id: "call-question".to_owned(),
+            display_name: "Question".to_owned(),
+            name: "question".to_owned(),
+            title: "Answered · 1 question · <1s".to_owned(),
+            output: concat!(
+                "User has answered your questions: ",
+                "\"Which database?\"=\"SQLite\". ",
+                "You can now continue with the user's answers in mind."
+            )
+            .to_owned(),
+            diff: None,
+            written_paths: Vec::new(),
+            is_error: false,
+        })
+        .expect("completed question projection");
+
+    assert_eq!(completed["title"], "Answered · 1 question · <1s");
+    assert_eq!(
+        completed["_meta"]["zuno"]["question"]["status"],
+        "completed"
+    );
+    let content = completed["content"]
+        .as_array()
+        .expect("question completion content");
+    assert_eq!(content.len(), 2);
+    let card = content[0]["content"]["text"]
+        .as_str()
+        .expect("question card");
+    assert!(card.contains("Which database?"), "{card}");
+    assert!(
+        !card.contains("Selected: none"),
+        "live events cannot claim an answer was absent without durable metadata: {card}"
+    );
+    assert!(
+        content[1]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("\"Which database?\"=\"SQLite\""))
+    );
 }
 
 #[test]
