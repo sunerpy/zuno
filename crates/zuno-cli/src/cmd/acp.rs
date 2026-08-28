@@ -222,6 +222,8 @@ impl ProductionAcpAgent {
             session: SessionChoice::New,
             title: None,
             effort: None,
+            variant: None,
+            thinking: false,
             tool_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
@@ -291,6 +293,8 @@ impl ProductionAcpAgent {
                 session: choice,
                 title: None,
                 effort: None,
+                variant: None,
+                thinking: false,
                 tool_authority: None,
                 extension_composition: ExtensionComposition::Active,
             };
@@ -1662,6 +1666,8 @@ fn host_options(host: &TurnHost, model: Option<String>) -> TurnOptions {
         session: host.rebuild_session_choice(),
         title: None,
         effort: host.effort_override(),
+        variant: None,
+        thinking: false,
         tool_authority: None,
         extension_composition: ExtensionComposition::Active,
     }

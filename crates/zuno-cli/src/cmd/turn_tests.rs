@@ -168,6 +168,209 @@ fn resolver_step_limit_is_opt_in() {
 }
 
 #[test]
+fn host_planning_classifier_persists_multi_stage_work_before_the_provider() {
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    {
+        let mut connection = pool.get().expect("schema connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-plan-policy', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES \
+                   ('ses-plan-policy', 'project-plan-policy', 'plan', '/workspace', 'plan', '1', 1, 1),
+                   ('ses-atomic-policy', 'project-plan-policy', 'atomic', '/workspace', 'atomic', '1', 1, 1);",
+            )
+            .expect("seed planning sessions");
+    }
+
+    let decision = ensure_host_plan(
+        &pool,
+        HostPlanningRequest {
+            session_id: "ses-plan-policy",
+            agent: "build",
+            prompt: "Investigate the bug, implement the fix, and run the focused tests.",
+            source: PlanningInputSource::User,
+            content: PlanningContentFacts::empty(),
+            plan_available: true,
+            goal_id: None,
+        },
+    )
+    .expect("classify and persist multi-stage work");
+    assert!(matches!(decision, PlanningDecision::Create(_)));
+    let plan = zuno_tools::WorkStateStore::new(Arc::clone(&pool))
+        .plan("ses-plan-policy")
+        .expect("read plan")
+        .expect("host-created plan");
+    assert_eq!(
+        plan.steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        ["investigate", "implement", "verify"]
+    );
+    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::InProgress);
+
+    let atomic = ensure_host_plan(
+        &pool,
+        HostPlanningRequest {
+            session_id: "ses-atomic-policy",
+            agent: "build",
+            prompt: "Commit the current staged changes.",
+            source: PlanningInputSource::User,
+            content: PlanningContentFacts::empty(),
+            plan_available: true,
+            goal_id: None,
+        },
+    )
+    .expect("classify atomic work");
+    assert!(matches!(atomic, PlanningDecision::Atomic(_)));
+    assert!(
+        zuno_tools::WorkStateStore::new(pool)
+            .plan("ses-atomic-policy")
+            .expect("read atomic plan")
+            .is_none()
+    );
+}
+
+#[test]
+fn host_planning_classifier_appends_a_new_epoch_after_terminal_work() {
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    {
+        let mut connection = pool.get().expect("schema connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-plan-epoch', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES \
+                   ('ses-plan-epoch', 'project-plan-epoch', 'plan', '/workspace', 'plan', '1', 1, 1);",
+            )
+            .expect("seed planning session");
+    }
+    let store = zuno_tools::WorkStateStore::new(Arc::clone(&pool));
+    let first = store
+        .update_plan(
+            "ses-plan-epoch",
+            zuno_tools::PlanUpdateParams {
+                expected_revision: None,
+                goal_id: None,
+                title: "Finished work".to_owned(),
+                steps: vec![zuno_tools::PlanStep {
+                    id: "verify".to_owned(),
+                    title: "Verify".to_owned(),
+                    status: zuno_tools::PlanStepStatus::Completed,
+                }],
+            },
+        )
+        .expect("seed terminal plan");
+
+    let decision = ensure_host_plan(
+        &pool,
+        HostPlanningRequest {
+            session_id: "ses-plan-epoch",
+            agent: "build",
+            prompt: "Investigate the new bug, implement the fix, and verify it.",
+            source: PlanningInputSource::User,
+            content: PlanningContentFacts::empty(),
+            plan_available: true,
+            goal_id: None,
+        },
+    )
+    .expect("append new epoch");
+
+    assert!(matches!(decision, PlanningDecision::Create(_)));
+    let updated = store
+        .plan("ses-plan-epoch")
+        .expect("read plan")
+        .expect("updated plan");
+    assert_eq!(updated.revision, first.revision + 1);
+    assert_eq!(updated.steps[0].id, "verify");
+    assert_eq!(
+        updated
+            .steps
+            .iter()
+            .skip(1)
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        ["epoch-2-investigate", "epoch-2-implement", "epoch-2-verify"]
+    );
+}
+
+#[test]
+fn child_report_does_not_seed_a_plan_for_an_atomic_parent_session() {
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
+    );
+    {
+        let mut connection = pool.get().expect("schema connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-report-plan', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES \
+                   ('ses-report-plan', 'project-report-plan', 'report', '/workspace', 'report', '1', 1, 1);",
+            )
+            .expect("seed report session");
+    }
+
+    let decision = ensure_host_plan(
+        &pool,
+        HostPlanningRequest {
+            session_id: "ses-report-plan",
+            agent: "orchestrator",
+            prompt: "Implemented the fix and verified the tests.",
+            source: PlanningInputSource::ChildReport,
+            content: PlanningContentFacts::empty(),
+            plan_available: true,
+            goal_id: None,
+        },
+    )
+    .expect("classify child report");
+
+    assert!(matches!(decision, PlanningDecision::Atomic(_)));
+    assert!(
+        zuno_tools::WorkStateStore::new(pool)
+            .plan("ses-report-plan")
+            .expect("read plan")
+            .is_none()
+    );
+}
+
+#[test]
+fn production_turn_runs_the_host_planning_classifier_after_input_is_durable() {
+    let turn = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+    )
+    .expect("turn.rs is readable");
+    let persisted = turn
+        .find("self.persist_user_input(&message, &parts)?")
+        .expect("input persistence call");
+    let classified = turn
+        .find("self.ensure_durable_plan(prompt, options.planning_source, options.content)?;")
+        .expect("host planning classifier call");
+    let provider = turn
+        .find(".drive_input_unaccounted(guard, options.routing.as_ref(), events.clone())")
+        .expect("provider turn call");
+
+    assert!(
+        persisted < classified && classified < provider,
+        "the host must classify only after the user input is durable and before the provider call"
+    );
+}
+
+#[test]
 fn promoted_subagent_report_persists_host_metadata_on_the_user_message() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
@@ -521,7 +724,10 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         vision_available: false,
         reasoning_supported: false,
         effort: None,
+        effective_variant: None,
         effort_override: None,
+        variant_override: None,
+        thinking_override: false,
         goal_retry_policy: GoalRetryPolicy::default(),
         directory,
         project,
@@ -600,11 +806,114 @@ fn debug_agent_reports_mcp_inheritance_as_unresolved_until_tools_are_connected()
     assert_eq!(snapshot["mcp"]["inheritance"]["state"], "not-connected");
     assert_eq!(
         snapshot["mcp"]["inheritance"]["reason"],
-        "MCP tool ids are known only after a live connection; configured allowlists and parent authority are evaluated per discovered tool"
+        "MCP tool ids are known only after a live connection; role rules and the Agent allowlist are evaluated per discovered tool, and no parent Attempt authority applies to this root diagnostic"
     );
     assert!(
         snapshot["mcp"].get("inheritsConnectedTools").is_none(),
         "a synthetic probe must not claim that an exact allowlist accepts or rejects unknown MCP ids"
+    );
+}
+
+#[test]
+fn debug_agent_evaluates_live_mcp_tools_and_exact_parent_schema_authority() {
+    let mut plan = plan("/tmp", SessionChoice::New);
+    let tool = ToolSchemaIdentity {
+        name: "known_mcp_tool".to_owned(),
+        description_sha256: sha256_text("connected description"),
+        schema_sha256: sha256_text("connected schema"),
+        ui_intent: "generic".to_owned(),
+    };
+    let parent = ToolSchemaIdentity {
+        description_sha256: sha256_text("parent description"),
+        ..tool.clone()
+    };
+    plan.tool_authority = Some(Arc::from([parent]));
+    plan.agent = plan
+        .agent
+        .clone()
+        .with_tool_authority(["known_mcp_tool".to_owned()]);
+    let diagnostics = crate::cmd::mcp_runtime::McpRuntimeDiagnostics {
+        discovery_status: "ready".to_owned(),
+        servers: vec![crate::cmd::mcp_runtime::McpServerDiagnostic {
+            name: "codegraph".to_owned(),
+            desired_enabled: true,
+            state: "connected".to_owned(),
+            error: None,
+        }],
+        connected_servers: vec!["codegraph".to_owned()],
+        tools: vec![tool],
+        warnings: Vec::new(),
+        cleanup_warnings: Vec::new(),
+    };
+
+    let snapshot = plan.debug_agent_snapshot_with_mcp(Some(&diagnostics));
+
+    assert_eq!(snapshot["mcp"]["inheritance"]["state"], "evaluated");
+    assert_eq!(
+        snapshot["mcp"]["inheritance"]["reason"],
+        "connected MCP tool ids and exact schemas were evaluated against role rules, the Agent allowlist, and parent Attempt authority"
+    );
+    assert_eq!(snapshot["mcp"]["discoveryStatus"], "ready");
+    assert_eq!(snapshot["mcp"]["connectedServers"][0], "codegraph");
+    assert!(
+        snapshot["tools"]["unavailable"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|entry| {
+                entry["id"] == "known_mcp_tool"
+                    && entry["reason"] == "schema differs from the parent attempt tool authority"
+            }))
+    );
+    assert!(snapshot["skills"]["summary"]["metadataBudgetBytes"].is_number());
+    assert!(
+        snapshot["skills"]["summary"]["previewOmitted"]
+            .as_u64()
+            .is_some()
+    );
+}
+
+#[test]
+fn debug_agent_live_root_mcp_does_not_claim_parent_attempt_authority() {
+    let plan = plan("/tmp", SessionChoice::New);
+    let diagnostics = crate::cmd::mcp_runtime::McpRuntimeDiagnostics {
+        discovery_status: "ready".to_owned(),
+        servers: vec![crate::cmd::mcp_runtime::McpServerDiagnostic {
+            name: "codegraph".to_owned(),
+            desired_enabled: true,
+            state: "connected".to_owned(),
+            error: None,
+        }],
+        connected_servers: vec!["codegraph".to_owned()],
+        tools: Vec::new(),
+        warnings: Vec::new(),
+        cleanup_warnings: Vec::new(),
+    };
+
+    let snapshot = plan.debug_agent_snapshot_with_mcp(Some(&diagnostics));
+
+    assert!(snapshot["tools"]["parentAuthority"].is_null());
+    assert_eq!(
+        snapshot["mcp"]["inheritance"]["reason"],
+        "connected MCP tool ids and exact schemas were evaluated against role rules and the Agent allowlist; no parent Attempt authority applies to this root diagnostic"
+    );
+}
+
+#[test]
+fn debug_agent_marks_skill_prompt_metadata_disabled_without_hiding_tool_budgets() {
+    let mut plan = plan("/tmp", SessionChoice::New);
+    plan.config.skills = Some(zuno_config::schema::SkillsConfig {
+        include_instructions: Some(false),
+        ..zuno_config::schema::SkillsConfig::default()
+    });
+
+    let snapshot = plan.debug_agent_snapshot();
+
+    assert_eq!(snapshot["skills"]["summary"]["metadataEnabled"], false);
+    assert!(snapshot["skills"]["summary"]["metadataBudgetBytes"].is_null());
+    assert!(snapshot["skills"]["summary"]["metadataBudgetApproxTokens"].is_null());
+    assert!(snapshot["skills"]["summary"]["metadataCoverage"].is_null());
+    assert!(
+        snapshot["skills"]["summary"]["selectedBodyBudgetBytes"].is_number(),
+        "includeInstructions only removes automatic prompt metadata; selected bodies remain bounded"
     );
 }
 
@@ -7177,6 +7486,252 @@ fn a_session_chosen_effort_outranks_the_agents_variant() {
          default, so the picker must win"
     );
     let _ = catalog;
+}
+
+#[test]
+fn explicit_cli_variant_selects_the_models_exact_declared_options() {
+    let catalog = generation_catalog(
+        "reasoner",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let model = catalog
+        .model("stub", "reasoner")
+        .expect("fixture model resolves");
+    let agent = configured_agent(serde_json::json!({
+        "model": "stub/reasoner"
+    }));
+
+    let resolved = resolve_turn_reasoning(
+        TurnReasoningSelection {
+            session: None,
+            explicit_variant: Some("high"),
+            thinking: false,
+        },
+        &agent,
+        "stub",
+        "reasoner",
+        None,
+        model,
+    )
+    .expect("declared variant resolves");
+
+    assert_eq!(
+        resolved.effort,
+        Some(zuno_llm::effort::ReasoningEffort::High)
+    );
+    assert_eq!(
+        resolved.options.get("reasoningEffort"),
+        Some(&serde_json::json!("high"))
+    );
+    assert_eq!(resolved.variant.as_deref(), Some("high"));
+}
+
+#[test]
+fn explicit_named_cli_variant_preserves_the_complete_declared_option_object() {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "stub": {
+                "transport": "openai-compatible",
+                "options": {"baseURL": "https://example.invalid/v1"},
+                "models": {
+                    "reasoner": {
+                        "reasoning": true,
+                        "variants": {
+                            "deliberate": {
+                                "reasoningEffort": "max",
+                                "reasoningSummary": "detailed",
+                                "vendorMode": "deep"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }))
+    .expect("named variant config");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let model = catalog
+        .model("stub", "reasoner")
+        .expect("fixture model resolves");
+    let agent = configured_agent(serde_json::json!({
+        "model": "stub/reasoner"
+    }));
+
+    let resolved = resolve_turn_reasoning(
+        TurnReasoningSelection {
+            session: None,
+            explicit_variant: Some("deliberate"),
+            thinking: false,
+        },
+        &agent,
+        "stub",
+        "reasoner",
+        None,
+        model,
+    )
+    .expect("named variant resolves");
+
+    assert_eq!(resolved.effort, None);
+    assert_eq!(resolved.variant.as_deref(), Some("deliberate"));
+    assert_eq!(
+        resolved.options,
+        serde_json::Map::from_iter([
+            ("reasoningEffort".to_owned(), serde_json::json!("max")),
+            ("reasoningSummary".to_owned(), serde_json::json!("detailed")),
+            ("vendorMode".to_owned(), serde_json::json!("deep")),
+        ])
+    );
+}
+
+#[test]
+fn named_only_variant_models_reject_canonical_cli_reasoning_controls() {
+    let config: zuno_config::schema::Config = serde_json::from_value(serde_json::json!({
+        "provider": {
+            "stub": {
+                "transport": "openai-compatible",
+                "options": {"baseURL": "https://example.invalid/v1"},
+                "models": {
+                    "reasoner": {
+                        "reasoning": true,
+                        "variants": {
+                            "deliberate": {
+                                "reasoningEffort": "max",
+                                "vendorMode": "deep"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }))
+    .expect("named-only variant config");
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+    let model = catalog
+        .model("stub", "reasoner")
+        .expect("fixture model resolves");
+    let agent = configured_agent(serde_json::json!({
+        "model": "stub/reasoner"
+    }));
+
+    let variant_error = resolve_turn_reasoning(
+        TurnReasoningSelection {
+            session: None,
+            explicit_variant: Some("max"),
+            thinking: false,
+        },
+        &agent,
+        "stub",
+        "reasoner",
+        None,
+        model,
+    )
+    .expect_err("canonical variant must be explicitly declared");
+    assert!(variant_error.contains("available variants: deliberate"));
+
+    let thinking_error = resolve_turn_reasoning(
+        TurnReasoningSelection {
+            session: None,
+            explicit_variant: None,
+            thinking: true,
+        },
+        &agent,
+        "stub",
+        "reasoner",
+        None,
+        model,
+    )
+    .expect_err("--thinking must not synthesize a generic scale");
+    assert!(thinking_error.contains("declares no enabled reasoning level"));
+    assert!(selectable_reasoning_efforts(model).is_empty());
+    assert!(
+        session_reasoning_options(
+            Some(zuno_llm::effort::ReasoningEffort::Max),
+            model,
+            &agent.options,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn cli_thinking_chooses_high_or_the_strongest_declared_non_off_level() {
+    let catalog = generation_catalog(
+        "reasoner",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let model = catalog
+        .model("stub", "reasoner")
+        .expect("fixture model resolves");
+    let agent = configured_agent(serde_json::json!({
+        "model": "stub/reasoner"
+    }));
+
+    let resolved = resolve_turn_reasoning(
+        TurnReasoningSelection {
+            session: None,
+            explicit_variant: None,
+            thinking: true,
+        },
+        &agent,
+        "stub",
+        "reasoner",
+        None,
+        model,
+    )
+    .expect("thinking resolves");
+
+    assert_eq!(
+        resolved.effort,
+        Some(zuno_llm::effort::ReasoningEffort::High)
+    );
+    assert_eq!(resolved.variant.as_deref(), Some("high"));
+}
+
+#[test]
+fn an_unknown_explicit_variant_is_rejected_before_the_provider_request() {
+    let catalog = generation_catalog(
+        "reasoner",
+        Some(16_384),
+        serde_json::json!({
+            "baseURL": "https://example.invalid/v1"
+        }),
+    );
+    let model = catalog
+        .model("stub", "reasoner")
+        .expect("fixture model resolves");
+    let agent = configured_agent(serde_json::json!({
+        "model": "stub/reasoner"
+    }));
+
+    let error = resolve_turn_reasoning(
+        TurnReasoningSelection {
+            session: None,
+            explicit_variant: Some("unavailable"),
+            thinking: false,
+        },
+        &agent,
+        "stub",
+        "reasoner",
+        None,
+        model,
+    )
+    .expect_err("unknown variant must fail before HTTP");
+
+    assert!(error.contains("unavailable"), "{error}");
+    assert!(error.contains("high"), "{error}");
+    assert!(error.contains("low"), "{error}");
 }
 
 #[test]

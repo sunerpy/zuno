@@ -51,15 +51,22 @@ provider 请求前以 typed error 失败；不会静默截断 AGENTS、历史、
 
 ## 3. 什么时候需要 Plan
 
-存在 `plan_update` 时，以下任一条件成立就应维护 durable Plan：
+存在 `plan_update` 时，宿主在第一次 provider request 之前运行确定性分类器：
 
-- 至少三个相互依赖的有意义步骤；
-- 跨 crate 或跨组件修改；
-- 包含委派；
-- 有多个验收阶段；
-- 用户明确要求 Plan。
+- session 已有 active Plan：保持并继续维护，不用通用模板覆盖；
+- completed Plan 遇到新的多阶段用户目标：保留已完成步骤并追加新的 epoch；
+- child report、steering、retry 不会自行创建 Plan；
+- 直接回答、一次有界读取、对已经准备好的修改执行一次短小 commit：可作为原子操作；
+- 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
+  输入：默认进入 planned path；
+- 其他普通工程任务：宿主先写入 Agent 对应的轻量 durable Plan，再把请求交给模型。
 
-直接回答、一个独立动作、小型局部修复或简单诊断不强制建 Plan。这个阈值目前是 runtime developer instruction，不是宿主自动分类器；Zuno 不会替 Agent 自动创建 Plan。
+因此“调研 → 修改 → 验证”通常会有 Plan；跨组件、委派、多个验收 gate，
+以及可能经历压缩或重启恢复的工作必须持续维护 Plan。模型可以通过
+`plan_update` 精炼宿主 seed，但不能决定是否完全跳过 durable execution state。
+Todo 是 Plan step 下可选的具体工作，用于更细的所有权、依赖或恢复跟踪，不要求
+和 Plan step 机械地一一对应。精炼时必须保留宿主已有 step id 和已完成状态；
+可以修改标题/状态或追加新 step，不能把 seed 当成无状态草稿整体替换。
 
 Plan collaboration mode 与“工作任务是否值得维护 Plan”是两件事。`plan` Agent 是只读模式；`build`、`deep` 或 `orchestrator` 也可以在复杂实现中通过 typed Plan 工具维护执行状态。
 
@@ -356,13 +363,17 @@ zuno debug agent deep
 - effective provider/model、reasoning support 和 reasoning resolution inputs；
 - policy-visible 与 unavailable tools，以及原因；
 - parent tool authority；
-- MCP 配置、server 类型和 enabled 状态；
-- required/available Skills；
+- MCP server 的实时生命周期、discovery、连接结果、精确 tool schema 和清理结果；
+- required Skills，以及 available Skill 的数量、歧义、预算、覆盖率和有界预览；
 - delegates；
 - Sandbox mode、backend readiness、network/workspace policy；
 - policy sources 和 resolution notes。
 
-该命令不会创建 session，也不会连接 provider 或 MCP。MCP server 显示为 `not-connected`，真实 MCP tool ids 只能在 live connection 后确定。它可能执行本地只读 Sandbox readiness 检查。
+该命令不会创建 session 或连接 provider，但会复用正式 `McpRuntime` 连接所有
+enabled server，获取真实 tool ids/schema，逐个与角色权限、Agent allowlist 和
+parent Attempt authority 取交集，然后等待 transport 清理完成。连接、授权、初始化
+或清理失败都会进入结构化诊断，而不是被伪装成可用。它也会执行本地只读 Sandbox
+readiness 检查。
 
 当前限制：输出尚未包含设计目标中的 capability snapshot identity、extension revision、Prompt policy digest、完整 permission rule 展开和历史 request 的最终工具 schema。它是 configuration-time diagnostic，不是某个历史 provider request 的法证快照。
 
@@ -504,15 +515,15 @@ zuno db --format json \
 
 截至本指南对应代码状态，以下边界仍需在验收报告中明确：
 
-1. Plan 阈值是 Prompt policy，宿主不会仅按步骤数强制创建空洞 Plan；是否按合同维护
-   Plan 已通过真实 Agent E2E 验证，但 GPT/Opus 的复杂 Plan 仍分别使用 6/8 个
-   provider calls，后续可继续以遥测优化成本和延迟。
-2. `debug agent` 展示当前配置解析和 parent authority 条件，但不会启动 MCP；因此
-   它把服务器及继承判断标为 `not-connected`，不会用虚构 tool id 推断精确
-   allowlist 或 parent authority 是否允许未知 MCP 工具。历史最终 MCP tool schema
-   仍应从对应 provider request/receipt 取证。
+1. 宿主分类器负责创建或维持 Plan；模型仍可能把 Plan 或 Todo 精炼得过细，因此
+   GPT/Opus 的 provider call 成本仍应通过真实遥测持续观察。
+2. `debug agent` 现在会主动连接当前配置的 MCP，并检查实时 schema；历史 request
+   当时真正发送的最终 schema 仍应从对应 provider request/receipt 取证，不能用
+   当前服务器状态代替历史证据。
 3. `TaskReportMetadata.changedPaths` 和 `verificationRecords` 只接受 typed tool
    metadata。未提供这些 metadata 的自定义工具或原生 Shell side effect 不会被
    猜测为已记录证据。
-4. CLI request facade 仍拒绝 `--variant` 和 `--thinking`；真实 E2E 使用 preset/Agent
-   reasoning 配置。这是独立 CLI 缺口，不影响本指南描述的 Prompt/Workflow 合同。
+4. `zuno run --variant <name>` 会选择模型声明的精确 variant；canonical
+   `low|medium|high|xhigh|max` 会在 provider I/O 前校验。`--thinking` 自动选择
+   可用的 `high`，否则选择最强的非 `off` 等级。两者互斥；需要精确 `max`/`xhigh`
+   时应使用 `--variant`。

@@ -31,6 +31,7 @@ use zuno_db::job::{
 };
 use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
+use zuno_engine::planning::PlanningInputSource;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_engine::wake::{PendingInputDriver, SessionWakeCoordinator};
 use zuno_orchestration::AttemptSnapshot;
@@ -1288,6 +1289,8 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             session: SessionChoice::Existing(session_id.to_owned()),
             title: request.description.clone(),
             effort: request.effort,
+            variant: None,
+            thinking: false,
             tool_authority: Some(Arc::from(parent_attempt.tools.clone())),
             extension_composition: super::turn::ExtensionComposition::Active,
         };
@@ -1385,6 +1388,7 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
                 &request.prompt,
                 None,
                 Some(guard),
+                PlanningInputSource::User,
                 session_id,
                 self.observer.clone(),
             );
@@ -1598,6 +1602,8 @@ impl PendingInputDriver for InteractiveChildInputDriver {
             session: SessionChoice::Existing(input.session_id.clone()),
             title: spec.description.clone(),
             effort: spec.effort,
+            variant: None,
+            thinking: false,
             tool_authority: Some(Arc::from(parent_attempt.tools.clone())),
             extension_composition: super::turn::ExtensionComposition::Active,
         };
@@ -1667,6 +1673,7 @@ impl PendingInputDriver for InteractiveChildInputDriver {
             &text,
             Some(input.id.as_str()),
             Some(guard),
+            PlanningInputSource::User,
             input.session_id.as_str(),
             self.observer.clone(),
         )
@@ -1713,6 +1720,8 @@ impl PendingInputDriver for ParentReportDriver {
             session: SessionChoice::Existing(input.session_id.clone()),
             title: None,
             effort: self.effort,
+            variant: None,
+            thinking: false,
             tool_authority: None,
             extension_composition: super::turn::ExtensionComposition::Active,
         };
@@ -1743,6 +1752,7 @@ impl PendingInputDriver for ParentReportDriver {
             &text,
             Some(input.id.as_str()),
             Some(guard),
+            PlanningInputSource::ChildReport,
             input.session_id.as_str(),
             self.observer.clone(),
         )
@@ -1853,25 +1863,34 @@ async fn drive_and_drain(
     prompt: &str,
     message_id: Option<&str>,
     guard: Option<SessionRunGuard>,
+    planning_source: PlanningInputSource,
     session_id: &str,
     observer: Option<Arc<dyn ChildTurnObserver>>,
 ) -> Result<(), String> {
     let (sender, receiver) = event_channel();
     let drive = async {
-        let outcome = match (guard, message_id) {
-            (Some(guard), Some(message_id)) => {
+        let outcome = match (guard, message_id, planning_source) {
+            (Some(guard), Some(message_id), PlanningInputSource::ChildReport) => {
+                host.drive_promoted_report_with_guard(prompt, message_id, guard, sender.clone())
+                    .await
+            }
+            (None, Some(message_id), PlanningInputSource::ChildReport) => {
+                host.drive_promoted_report(prompt, message_id, sender.clone())
+                    .await
+            }
+            (Some(guard), Some(message_id), _) => {
                 host.drive_promoted_with_guard(prompt, message_id, guard, sender.clone())
                     .await
             }
-            (Some(guard), None) => {
+            (Some(guard), None, _) => {
                 host.drive_with_message_id_and_guard(prompt, None, guard, sender.clone())
                     .await
             }
-            (None, Some(message_id)) => {
+            (None, Some(message_id), _) => {
                 host.drive_promoted(prompt, message_id, sender.clone())
                     .await
             }
-            (None, None) => {
+            (None, None, _) => {
                 host.drive_with_message_id(prompt, None, sender.clone())
                     .await
             }

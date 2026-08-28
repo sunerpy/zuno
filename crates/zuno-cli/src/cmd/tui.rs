@@ -243,6 +243,8 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
         session,
         title: None,
         effort: None,
+        variant: None,
+        thinking: false,
         tool_authority: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
@@ -1832,7 +1834,7 @@ where
 
 enum SelectionOutcome {
     Rebuilt(TurnEventSender),
-    Remount(RemountRequest),
+    Remount(Box<RemountRequest>),
     Shutdown(String),
     Unchanged,
 }
@@ -1877,7 +1879,7 @@ async fn apply_selection(
             next.directory = Some(PathBuf::from(host.session_directory()));
             next.session = SessionChoice::New;
             next.title = None;
-            return SelectionOutcome::Remount(RemountRequest::fresh_conversation(next));
+            return SelectionOutcome::Remount(Box::new(RemountRequest::fresh_conversation(next)));
         }
         zuno_tui::views::session::Selection::Session(session_id) => {
             if session_id == host.session_id() {
@@ -1919,7 +1921,7 @@ async fn apply_selection(
             }
             next.directory = Some(PathBuf::from(target.directory));
             next.session = SessionChoice::Existing(target.id);
-            return SelectionOutcome::Remount(RemountRequest::plain(next));
+            return SelectionOutcome::Remount(Box::new(RemountRequest::plain(next)));
         }
         zuno_tui::views::session::Selection::SessionRename { id, title } => {
             let title = title.trim();
@@ -1977,7 +1979,7 @@ async fn apply_selection(
                 return SelectionOutcome::Unchanged;
             }
             next.directory = Some(PathBuf::from(target.directory));
-            return SelectionOutcome::Remount(RemountRequest::plain(next));
+            return SelectionOutcome::Remount(Box::new(RemountRequest::plain(next)));
         }
         zuno_tui::views::session::Selection::SessionDelete(id) => {
             let target = match host.switchable_session(&id) {
@@ -2073,7 +2075,7 @@ async fn apply_selection(
                 }
                 next.title = None;
             }
-            return SelectionOutcome::Remount(RemountRequest::reopening_sessions(next));
+            return SelectionOutcome::Remount(Box::new(RemountRequest::reopening_sessions(next)));
         }
         zuno_tui::views::session::Selection::JobCancel(job_id) => {
             let detail = match host.cancel_job(&job_id).await {
@@ -2690,7 +2692,7 @@ async fn drive_turns(
                             work_changes = driver.host.work_state_changes();
                         }
                         SelectionOutcome::Remount(request) => {
-                            driver.remount.request(request);
+                            driver.remount.request(*request);
                             let _stopping = driver.shutdown.send(TerminalEvent::Shutdown).await;
                             break 'driver;
                         }

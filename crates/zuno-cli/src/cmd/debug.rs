@@ -11,8 +11,8 @@ use zuno_search::{GlobRequest, GrepRequest, NeverCancelled, Ripgrep};
 use zuno_snapshot::{Location, Store};
 
 use crate::command::{
-    DebugAgentArgs, DebugArgs, DebugCommand, DebugLspCommand, DebugPromptArgs, DebugRgCommand,
-    DebugSnapshotCommand,
+    CliSandboxMode, DebugAgentArgs, DebugArgs, DebugCommand, DebugLspCommand, DebugPromptArgs,
+    DebugRgCommand, DebugSandboxArgs, DebugSandboxNetwork, DebugSnapshotCommand,
 };
 use crate::environment::StartupEnvironment;
 
@@ -39,6 +39,10 @@ pub(super) fn execute(args: &DebugArgs, environment: &StartupEnvironment) -> Res
         DebugCommand::Skill => {
             let context = Context::resolve(environment)?;
             skill(&context)
+        }
+        DebugCommand::Sandbox(args) => {
+            let context = Context::resolve(environment)?;
+            sandbox(args, &context)
         }
         DebugCommand::Rg(args) => {
             let context = Context::resolve(environment)?;
@@ -434,7 +438,8 @@ fn agent(
     context: &Context,
     environment: &StartupEnvironment,
 ) -> Result<(), String> {
-    let plan = runtime()?.block_on(super::turn::TurnPlan::resolve(
+    let runtime = runtime()?;
+    let plan = runtime.block_on(super::turn::TurnPlan::resolve(
         &super::turn::TurnOptions {
             directory: Some(context.directory.clone()),
             agent: Some(args.name.clone()),
@@ -442,7 +447,15 @@ fn agent(
         },
         environment,
     ))?;
-    print_json(&plan.debug_agent_snapshot())
+    let mcp_workspace = plan.runtime_workspace().to_owned();
+    let mcp = runtime.block_on(async {
+        let runtime = super::mcp_runtime::McpRuntime::from_config(plan.config(), &mcp_workspace)?;
+        let warnings = runtime.connect().await;
+        let mut diagnostics = runtime.diagnostics(warnings);
+        diagnostics.cleanup_warnings = runtime.shutdown_with_diagnostics().await;
+        Some(diagnostics)
+    });
+    print_json(&plan.debug_agent_snapshot_with_mcp(mcp.as_ref()))
 }
 
 fn skill(context: &Context) -> Result<(), String> {
@@ -454,14 +467,86 @@ fn skill(context: &Context) -> Result<(), String> {
     );
     let runtime = runtime()?;
     let skills = runtime.block_on(zuno_catalog::skill::load(&options));
-    let mut output = serde_json::Map::new();
+    let described = skills
+        .all()
+        .iter()
+        .filter(|skill| skill.description.is_some())
+        .count();
+    let mut names = std::collections::BTreeMap::<&str, usize>::new();
     for entry in skills.all() {
-        output.insert(
-            entry.name.clone(),
-            serde_json::to_value(entry).map_err(to_string)?,
-        );
+        *names.entry(&entry.name).or_default() += 1;
     }
+    let warnings = skills
+        .warnings()
+        .iter()
+        .map(|warning| {
+            serde_json::json!({
+                "source": warning.source(),
+                "message": warning.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let output = serde_json::json!({
+        "view": {
+            "kind": "raw_discovery",
+            "agentFiltered": false,
+            "extensionOverlayApplied": false,
+            "effectiveViewCommand": "zuno debug agent <name>",
+        },
+        "summary": {
+            "sourceCount": skills.all().len(),
+            "describedSourceCount": described,
+            "uniqueNameCount": names.len(),
+            "promptMetadataEnabled": context
+                .config
+                .skills
+                .as_ref()
+                .and_then(|settings| settings.include_instructions)
+                != Some(false),
+            "warningCount": warnings.len(),
+            "ambiguousNames": names
+                .into_iter()
+                .filter_map(|(name, sources)| (sources > 1).then_some(serde_json::json!({
+                    "name": name,
+                    "sources": sources,
+                })))
+                .collect::<Vec<_>>(),
+        },
+        "warnings": warnings,
+        "skills": skills.all(),
+    });
     print_json(&output)
+}
+
+fn sandbox(args: &DebugSandboxArgs, context: &Context) -> Result<(), String> {
+    let mode = match args.mode {
+        CliSandboxMode::ReadOnly => zuno_sandbox::SandboxMode::ReadOnly,
+        CliSandboxMode::WorkspaceWrite => zuno_sandbox::SandboxMode::WorkspaceWrite,
+        CliSandboxMode::DangerFullAccess => zuno_sandbox::SandboxMode::DangerFullAccess,
+    };
+    let network = sandbox_network(mode, args.network);
+    let report = zuno_sandbox::deployment_report(&context.directory, mode, network);
+    print_json(&report)?;
+    if args.check && !report.ready {
+        return Err(report
+            .error
+            .unwrap_or_else(|| "requested sandbox policy is not deployable".to_owned()));
+    }
+    Ok(())
+}
+
+fn sandbox_network(
+    mode: zuno_sandbox::SandboxMode,
+    requested: Option<DebugSandboxNetwork>,
+) -> zuno_sandbox::NetworkAccess {
+    match requested {
+        Some(DebugSandboxNetwork::Deny) => zuno_sandbox::NetworkAccess::Denied,
+        Some(DebugSandboxNetwork::Allow) => zuno_sandbox::NetworkAccess::Allowed,
+        None if mode == zuno_sandbox::SandboxMode::DangerFullAccess => {
+            zuno_sandbox::NetworkAccess::Allowed
+        }
+        None => zuno_sandbox::NetworkAccess::Denied,
+    }
 }
 
 fn rg(command: &DebugRgCommand, context: &Context) -> Result<(), String> {
@@ -616,6 +701,29 @@ mod tests {
         assert_eq!(
             combined_glob(&["*.rs".to_owned(), "*.toml".to_owned()]).as_deref(),
             Some("{*.rs,*.toml}")
+        );
+    }
+
+    #[test]
+    fn sandbox_network_defaults_match_the_execution_mode() {
+        assert_eq!(
+            sandbox_network(zuno_sandbox::SandboxMode::WorkspaceWrite, None),
+            zuno_sandbox::NetworkAccess::Denied
+        );
+        assert_eq!(
+            sandbox_network(zuno_sandbox::SandboxMode::ReadOnly, None),
+            zuno_sandbox::NetworkAccess::Denied
+        );
+        assert_eq!(
+            sandbox_network(zuno_sandbox::SandboxMode::DangerFullAccess, None),
+            zuno_sandbox::NetworkAccess::Allowed
+        );
+        assert_eq!(
+            sandbox_network(
+                zuno_sandbox::SandboxMode::DangerFullAccess,
+                Some(DebugSandboxNetwork::Deny),
+            ),
+            zuno_sandbox::NetworkAccess::Denied
         );
     }
 

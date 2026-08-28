@@ -22,6 +22,22 @@ On supported Linux hosts, Zuno locates a fixed, root-owned system `bwrap` at
 effective Agent policy, and passes only an opaque `PreparedCommand` to the
 process layer.
 
+Verify a deployment with the same backend used by Shell:
+
+```sh
+zuno debug sandbox --mode workspace-write --network deny --check
+```
+
+The JSON report includes staged checks, canonical launcher path,
+UID/GID/mode/device/inode, root ownership, group/world writability, special-bit
+and file-capability trust, backend capabilities, and the exact probe failure.
+It checks every launcher ancestor, then executes `/usr/bin/true` through the
+same bubblewrap, capability-drop, `PR_SET_NO_NEW_PRIVS`, and seccomp path used by
+Shell. `--check` exits unsuccessfully when the requested policy is not
+deployable. Do not use `danger-full-access` for deployment verification: that
+mode is reported as a native-execution bypass and intentionally skips both
+launcher trust and the confinement self-test.
+
 The Linux backend:
 
 - mounts the host root read-only and overlays only the exact writable roots;
@@ -105,6 +121,13 @@ After loading the dedicated profile and correcting its ownership to `root:root`,
 both probes and Zuno's real backend E2E pass on this host. A Zuno process already
 running inside another restricted sandbox can still be unable to create nested
 namespaces; that outer runtime must allow the complete probe.
+
+An outer user namespace may also show the host's root-owned `/usr/bin/bwrap` as
+`uid=65534` (`nobody`). In that execution context Zuno correctly fails closed,
+because it cannot prove the launcher is root-owned from its own authority view.
+Run `zuno debug sandbox ... --check` directly on the intended host service
+context to establish deployment readiness; do not reinterpret the mapped UID or
+weaken the trust check.
 
 ### Recommended Ubuntu 24.04 repair
 

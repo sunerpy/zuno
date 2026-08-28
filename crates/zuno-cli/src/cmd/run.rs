@@ -48,6 +48,8 @@ pub(super) fn execute(
         session,
         title: args.title.clone(),
         effort: None,
+        variant: args.variant.clone(),
+        thinking: args.thinking,
         tool_authority: None,
         extension_composition: super::turn::ExtensionComposition::Active,
     };
@@ -58,10 +60,7 @@ pub(super) fn execute(
     // Before the host, not after: the registry reads the MCP loader once while it is
     // being assembled, and this surface has no second turn for a late connection to
     // appear in. See `super::mcp_runtime`.
-    let mcp = super::mcp_runtime::McpRuntime::from_config(
-        plan.config(),
-        plan.worktree().unwrap_or_else(|| plan.directory()),
-    );
+    let mcp = super::mcp_runtime::McpRuntime::from_config(plan.config(), plan.runtime_workspace());
     report_progress(progress);
     let mcp_notes = match mcp.as_ref() {
         Some(mcp) => runtime.block_on(mcp.connect()),
@@ -137,12 +136,6 @@ fn validate_flags(args: &RunArgs) -> Result<(), String> {
         || args.password.is_some()
     {
         return Err("--attach/--port/--username/--password require the remote SDK client, which is not available yet".to_owned());
-    }
-    if args.variant.is_some() || args.thinking {
-        return Err(
-            "--variant and --thinking are not available in the current provider request facade"
-                .to_owned(),
-        );
     }
     // Both are interactive-surface flags, and the interactive surface now honours
     // them: `--auto` is `tui --auto`. Refusing here rather than quietly ignoring them
@@ -693,6 +686,17 @@ mod tests {
         args.r#continue = true;
         args.session = Some("ses_x".to_owned());
         assert!(validate_flags(&args).is_err());
+    }
+
+    #[test]
+    fn reasoning_flags_are_accepted_by_the_headless_surface() {
+        let mut args = run_args();
+        args.variant = Some("max".to_owned());
+        validate_flags(&args).expect("--variant reaches turn resolution");
+
+        args.variant = None;
+        args.thinking = true;
+        validate_flags(&args).expect("--thinking reaches turn resolution");
     }
 
     #[test]

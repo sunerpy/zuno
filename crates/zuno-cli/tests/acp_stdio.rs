@@ -1298,9 +1298,12 @@ impl Respond for PlanTurnResponder {
                 "call_plan",
                 "plan_update",
                 json!({
+                    "expected_revision": 1,
                     "title": "Verify ACP projection",
                     "steps": [
-                        {"id":"implement","title":"Implement plan projection","status":"in_progress"},
+                        {"id":"investigate","title":"Inspect ACP plan projection","status":"completed"},
+                        {"id":"execute","title":"Implement plan projection","status":"in_progress"},
+                        {"id":"integrate","title":"Integrate the durable update","status":"pending"},
                         {"id":"verify","title":"Verify Zed update","status":"pending"}
                     ]
                 }),
@@ -3088,12 +3091,19 @@ async fn acp_prompt_projects_the_final_durable_plan_before_responding() {
     );
     let plan = updates
         .iter()
-        .find(|update| update["sessionUpdate"] == "plan")
-        .expect("session/prompt returned without the durable plan snapshot");
-    assert_eq!(plan["entries"].as_array().map(Vec::len), Some(2));
-    assert_eq!(plan["entries"][0]["content"], "Implement plan projection");
-    assert_eq!(plan["entries"][0]["status"], "in_progress");
-    assert_eq!(plan["entries"][1]["status"], "pending");
+        .rfind(|update| update["sessionUpdate"] == "plan")
+        .expect("session/prompt returned without the final durable plan snapshot");
+    assert_eq!(
+        plan["entries"].as_array().map(Vec::len),
+        Some(4),
+        "final projected plan did not reflect the successful model refinement: {updates:#?}"
+    );
+    assert_eq!(plan["entries"][0]["content"], "Inspect ACP plan projection");
+    assert_eq!(plan["entries"][0]["status"], "completed");
+    assert_eq!(plan["entries"][1]["content"], "Implement plan projection");
+    assert_eq!(plan["entries"][1]["status"], "in_progress");
+    assert_eq!(plan["entries"][2]["status"], "pending");
+    assert_eq!(plan["entries"][3]["status"], "pending");
     assert_eq!(plan["_meta"]["zuno"]["title"], "Verify ACP projection");
 
     let received = provider

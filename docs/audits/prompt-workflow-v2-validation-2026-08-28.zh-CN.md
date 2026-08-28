@@ -265,19 +265,29 @@ cargo test -p zuno-cli --test docs --test prompts
 loopback 的宿主权限下执行。端口占用会返回 `Address already in use`，本次沙箱错误为
 `Operation not permitted`；宿主完整重跑通过，因此没有终止任何进程。
 
-## 7. 剩余风险
+## 7. 后续修复状态
 
-1. Plan policy 是 developer instruction，不是宿主自动分类器。模型仍可能为复杂
-   Plan 生成较细的 Todo 或多次精炼；真实 GPT/Opus Plan 分别用了 6/8 个 provider
-   calls。不存在隐式 step 上限，但成本和延迟仍需后续基于真实遥测优化。
-2. CLI request facade 仍拒绝 `--variant` 和 `--thinking`；E2E 使用 preset/Agent
-   reasoning 配置。这不影响本轮 Prompt/Workflow 合同，但仍是独立 CLI 缺口。
-3. `debug agent` 是配置时诊断，不连接 MCP；历史 request 的精确 MCP tool schema
-   仍需从 prompt receipt/provider request 取证。
-4. Codex 执行沙箱内看到的 `/usr/bin/bwrap` owner 不是 root，因此
-   `debug agent` 的 sandbox readiness 会正确降级并报告错误；宿主真实部署需单独
-   验证 root-owned `bwrap`。
-5. 全局 Skill discovery 可能发现大量目录，但 selected Skill body 有独立聚合预算，
-   不会无条件加载进子 Agent。
+同日后续增量已处理上述五项：
 
-这些风险均已与已完成行为分开记录；没有以文档声明替代运行时证据。
+1. 宿主在首个 provider request 前创建或维持 durable Plan；仅用户输入和已解析
+   command 可以创建，child report、steering、retry 不会误建 Plan。active Plan
+   继续维护；completed Plan 遇到新目标会保留旧 step 并追加新 epoch。仅直接回答、
+   一次有界读取和一次短小的既有变更 commit 走原子路径；typed 附件、selection、
+   branch diff 和大型多块文本进入 planned path。Todo 明确为可选细化。
+2. CLI 接受并在 provider I/O 前校验 `--variant` 与 `--thinking`，两者互斥。
+3. `debug agent` 复用正式 `McpRuntime`，连接 enabled servers、读取精确当前
+   schema、评估权限并等待清理；连接后的 discovery 失败、取消和超时同样有界
+   close。根诊断不伪造 parent Attempt authority。
+4. 新增 `zuno debug sandbox --mode workspace-write --network deny --check`。宿主实测
+   `/usr/bin/bwrap` 为 `uid=0/gid=0`、不可被 group/world 写入，core/network
+   namespace 与 seccomp 探测通过，并实际通过 bubblewrap、capability drop、
+   `PR_SET_NO_NEW_PRIVS`、seccomp 执行 no-op。外层 Codex 沙箱中的 `uid=65534`
+   是 user namespace 映射视图，不再被误报为宿主部署结论。
+5. `debug agent` 输出 Skill source/description/unique/ambiguous 数量、metadata 与
+   selected-body budget、rendered/omitted/truncated 覆盖率和最多 50 项预览；
+   `debug skill` 输出显式标记为 `raw_discovery` 的对象，其 `skills` 数组保留同名
+   不同 source 的条目；effective Agent view 由 `debug agent <name>` 提供。
+
+历史 provider request 的最终 MCP schema 仍必须从当时的 receipt/request 取证；
+当前实时诊断不能替代历史法证。模型可能把宿主 seed Plan 精炼得过细，成本和延迟
+仍需以后续真实遥测观察。

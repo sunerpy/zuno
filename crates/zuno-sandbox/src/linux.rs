@@ -35,6 +35,30 @@ const REQUIRED_BWRAP_OPTIONS: &[&str] = &[
     "--unshare-uts",
 ];
 
+#[derive(Debug, Clone)]
+struct TrustedExecutable {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    require_root_owner: bool,
+}
+
+impl TrustedExecutable {
+    fn revalidate(&self, workspace: &Path) -> Result<(), SandboxError> {
+        let current = inspect_trusted_executable(&self.path, workspace, self.require_root_owner)?;
+        if current.device != self.device || current.inode != self.inode {
+            return Err(SandboxError::UntrustedBubblewrap {
+                path: self.path.clone(),
+                reason: format!(
+                    "device/inode changed after discovery ({}:{}, now {}:{})",
+                    self.device, self.inode, current.device, current.inode
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Linux bubblewrap plus in-sandbox seccomp backend.
 #[derive(Debug)]
 pub struct LinuxBubblewrapSandbox {
@@ -42,6 +66,8 @@ pub struct LinuxBubblewrapSandbox {
     current_exe: PathBuf,
     capabilities: SandboxCapabilities,
     network_probe_error: Option<String>,
+    launcher: Option<TrustedExecutable>,
+    true_executable: Option<TrustedExecutable>,
 }
 
 impl LinuxBubblewrapSandbox {
@@ -64,15 +90,17 @@ impl LinuxBubblewrapSandbox {
         let _architecture = target_arch()?;
         let workspace = canonical_directory(workspace, "workspace")?;
         let bwrap = trusted_executable(TRUSTED_BWRAP_CANDIDATES, &workspace, true)?;
-        require_bwrap_options(&bwrap)?;
-        let true_executable = trusted_executable(TRUSTED_TRUE_CANDIDATES, &workspace, false)?;
+        require_bwrap_options(&bwrap.path)?;
+        let true_executable = trusted_executable(TRUSTED_TRUE_CANDIDATES, &workspace, true)?;
         let current_exe = validated_helper(helper_executable)?;
 
-        run_probe(&bwrap, &true_executable, false).map_err(|detail| SandboxError::ProbeFailed {
-            capability: "user, mount, PID, UTS, and IPC namespaces",
-            detail,
+        run_probe(&bwrap.path, &true_executable.path, false).map_err(|detail| {
+            SandboxError::ProbeFailed {
+                capability: "user, mount, PID, UTS, and IPC namespaces",
+                detail,
+            }
         })?;
-        let network_probe_error = run_probe(&bwrap, &true_executable, true).err();
+        let network_probe_error = run_probe(&bwrap.path, &true_executable.path, true).err();
         compile_seccomp(NetworkAccess::Allowed)?;
 
         Ok(Self {
@@ -80,13 +108,15 @@ impl LinuxBubblewrapSandbox {
             current_exe,
             capabilities: SandboxCapabilities {
                 backend: BACKEND_NAME.to_owned(),
-                executable: Some(bwrap),
+                executable: Some(bwrap.path.clone()),
                 read_only: true,
                 workspace_write: true,
                 danger_full_access: false,
                 network_isolation: network_probe_error.is_none(),
             },
             network_probe_error,
+            launcher: Some(bwrap),
+            true_executable: Some(true_executable),
         })
     }
 
@@ -105,6 +135,9 @@ impl LinuxBubblewrapSandbox {
                 capability: "network namespace",
                 detail: detail.clone(),
             });
+        }
+        if let Some(launcher) = &self.launcher {
+            launcher.revalidate(&self.workspace)?;
         }
         self.capabilities.supports(&request.policy)?;
         compile_seccomp(request.policy.network())?;
@@ -162,6 +195,26 @@ impl SandboxBackend for LinuxBubblewrapSandbox {
 
     fn prepare(&self, request: PrepareRequest) -> Result<PreparedCommand, SandboxError> {
         self.prepare_inner(request)
+    }
+
+    fn verify_deployment(&self, policy: &crate::SandboxPolicy) -> Result<(), SandboxError> {
+        self.capabilities.supports(policy)?;
+        let executable =
+            self.true_executable
+                .as_ref()
+                .ok_or_else(|| SandboxError::ProbeFailed {
+                    capability: "prepared sandbox helper execution",
+                    detail: "the backend did not retain its trusted no-op executable".to_owned(),
+                })?;
+        executable.revalidate(&self.workspace)?;
+        let prepared = self.prepare_inner(PrepareRequest {
+            program: executable.path.as_os_str().to_owned(),
+            arguments: Vec::new(),
+            cwd: policy.workspace().to_owned(),
+            environment: BTreeMap::new(),
+            policy: policy.clone(),
+        })?;
+        run_prepared_probe(prepared)
     }
 }
 
@@ -439,11 +492,15 @@ fn extend<const N: usize>(target: &mut Vec<OsString>, values: [&str; N]) {
     target.extend(values.into_iter().map(OsString::from));
 }
 
+pub(crate) fn trusted_bubblewrap_path(workspace: &Path) -> Result<PathBuf, SandboxError> {
+    trusted_executable(TRUSTED_BWRAP_CANDIDATES, workspace, true).map(|trusted| trusted.path)
+}
+
 fn trusted_executable(
     candidates: &[&str],
     workspace: &Path,
     require_root_owner: bool,
-) -> Result<PathBuf, SandboxError> {
+) -> Result<TrustedExecutable, SandboxError> {
     let mut rejection = None;
     for candidate in candidates {
         let path = PathBuf::from(candidate);
@@ -451,37 +508,106 @@ fn trusted_executable(
             Ok(path) => path,
             Err(_) => continue,
         };
-        let metadata = match fs::metadata(&canonical) {
-            Ok(metadata) => metadata,
+        match inspect_trusted_executable(&canonical, workspace, require_root_owner) {
+            Ok(trusted) => return Ok(trusted),
             Err(error) => {
-                rejection = Some(SandboxError::UntrustedBubblewrap {
-                    path: canonical,
-                    reason: error.to_string(),
-                });
-                continue;
+                rejection = Some(error);
             }
-        };
-        let reason = if canonical.starts_with(workspace) {
-            Some("resolved inside the writable workspace".to_owned())
-        } else if !metadata.is_file() {
-            Some("not a regular file".to_owned())
-        } else if metadata.permissions().mode() & 0o111 == 0 {
-            Some("not executable".to_owned())
-        } else if require_root_owner && metadata.uid() != 0 {
-            Some(format!("owned by uid {}, expected root", metadata.uid()))
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            rejection = Some(SandboxError::UntrustedBubblewrap {
-                path: canonical,
-                reason,
-            });
-            continue;
         }
-        return Ok(canonical);
     }
     Err(rejection.unwrap_or(SandboxError::BubblewrapNotFound))
+}
+
+fn inspect_trusted_executable(
+    canonical: &Path,
+    workspace: &Path,
+    require_root_owner: bool,
+) -> Result<TrustedExecutable, SandboxError> {
+    let metadata = fs::metadata(canonical).map_err(|error| SandboxError::UntrustedBubblewrap {
+        path: canonical.to_owned(),
+        reason: error.to_string(),
+    })?;
+    let mode = metadata.permissions().mode();
+    let reason = if canonical.starts_with(workspace) {
+        Some("resolved inside the writable workspace".to_owned())
+    } else if !metadata.is_file() {
+        Some("not a regular file".to_owned())
+    } else if mode & 0o111 == 0 {
+        Some("not executable".to_owned())
+    } else if mode & 0o022 != 0 {
+        Some("group- or world-writable".to_owned())
+    } else if mode & 0o7000 != 0 {
+        Some("setuid, setgid, or sticky permission bits are present".to_owned())
+    } else if require_root_owner && metadata.uid() != 0 {
+        Some(format!("owned by uid {}, expected root", metadata.uid()))
+    } else {
+        match has_file_capabilities(canonical) {
+            Ok(true) => Some("security.capability is present".to_owned()),
+            Ok(false) => validate_trusted_ancestors(canonical, require_root_owner).err(),
+            Err(reason) => Some(reason),
+        }
+    };
+    if let Some(reason) = reason {
+        return Err(SandboxError::UntrustedBubblewrap {
+            path: canonical.to_owned(),
+            reason,
+        });
+    }
+    Ok(TrustedExecutable {
+        path: canonical.to_owned(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        require_root_owner,
+    })
+}
+
+fn has_file_capabilities(path: &Path) -> Result<bool, String> {
+    let mut value = [0_u8; 64];
+    match rustix::fs::getxattr(path, "security.capability", &mut value) {
+        Ok(length) => Ok(length > 0),
+        Err(rustix::io::Errno::NODATA) => Ok(false),
+        Err(error) => Err(format!("could not inspect security.capability: {error}")),
+    }
+}
+
+fn validate_trusted_ancestors(path: &Path, require_root_owner: bool) -> Result<(), String> {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        let metadata = fs::symlink_metadata(directory).map_err(|error| {
+            format!(
+                "could not inspect ancestor `{}`: {error}",
+                directory.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "ancestor `{}` is a symbolic link after canonicalization",
+                directory.display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(format!(
+                "ancestor `{}` is not a directory",
+                directory.display()
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "ancestor `{}` is group- or world-writable",
+                directory.display()
+            ));
+        }
+        if require_root_owner && metadata.uid() != 0 {
+            return Err(format!(
+                "ancestor `{}` is owned by uid {}, expected root",
+                directory.display(),
+                metadata.uid()
+            ));
+        }
+        current = directory.parent();
+    }
+    Ok(())
 }
 
 fn require_bwrap_options(bwrap: &Path) -> Result<(), SandboxError> {
@@ -501,6 +627,69 @@ fn require_bwrap_options(bwrap: &Path) -> Result<(), SandboxError> {
         }
     }
     Ok(())
+}
+
+fn run_prepared_probe(prepared: PreparedCommand) -> Result<(), SandboxError> {
+    let parts = prepared.into_parts();
+    let mut command = Command::new(&parts.program);
+    command
+        .args(&parts.arguments)
+        .current_dir(&parts.cwd)
+        .env_clear()
+        .envs(&parts.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| SandboxError::ProbeFailed {
+        capability: "prepared sandbox helper execution",
+        detail: error.to_string(),
+    })?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output =
+                    child
+                        .wait_with_output()
+                        .map_err(|error| SandboxError::ProbeFailed {
+                            capability: "prepared sandbox helper execution",
+                            detail: error.to_string(),
+                        })?;
+                if output.status.success() {
+                    return Ok(());
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                return Err(SandboxError::ProbeFailed {
+                    capability: "prepared sandbox helper execution",
+                    detail: if stderr.is_empty() {
+                        format!("sandbox helper exited with {}", output.status)
+                    } else {
+                        stderr
+                    },
+                });
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SandboxError::ProbeFailed {
+                    capability: "prepared sandbox helper execution",
+                    detail: format!(
+                        "sandbox helper exceeded {:.1}s",
+                        PROBE_TIMEOUT.as_secs_f64()
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(SandboxError::ProbeFailed {
+                    capability: "prepared sandbox helper execution",
+                    detail: error.to_string(),
+                });
+            }
+        }
+    }
 }
 
 fn run_probe(bwrap: &Path, true_executable: &Path, network: bool) -> Result<(), String> {
@@ -755,7 +944,73 @@ mod tests {
                 network_isolation,
             },
             network_probe_error: (!network_isolation).then(|| "network probe failed".to_owned()),
+            launcher: None,
+            true_executable: None,
         }
+    }
+
+    #[test]
+    fn trusted_bubblewrap_rejects_a_group_or_world_writable_launcher() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let candidate_root = tempfile::tempdir().expect("candidate root");
+        let candidate = candidate_root.path().join("bwrap");
+        fs::write(&candidate, b"binary").expect("candidate");
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o777))
+            .expect("candidate permissions");
+        let candidate_text = candidate.to_string_lossy().into_owned();
+
+        let error = trusted_executable(&[candidate_text.as_str()], workspace.path(), true)
+            .expect_err("writable launcher must be rejected");
+
+        assert!(matches!(
+            error,
+            SandboxError::UntrustedBubblewrap { reason, .. }
+                if reason == "group- or world-writable"
+        ));
+    }
+
+    #[test]
+    fn trusted_bubblewrap_rejects_special_permission_bits() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let candidate_root = tempfile::tempdir().expect("candidate root");
+        let candidate = candidate_root.path().join("bwrap");
+        fs::write(&candidate, b"binary").expect("candidate");
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o4755))
+            .expect("candidate permissions");
+        let candidate_text = candidate.to_string_lossy().into_owned();
+
+        let error = trusted_executable(&[candidate_text.as_str()], workspace.path(), false)
+            .expect_err("setuid launcher must be rejected");
+
+        assert!(matches!(
+            error,
+            SandboxError::UntrustedBubblewrap { reason, .. }
+                if reason == "setuid, setgid, or sticky permission bits are present"
+        ));
+    }
+
+    #[test]
+    fn trusted_bubblewrap_rejects_a_writable_ancestor() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let candidate_root = tempfile::tempdir().expect("candidate root");
+        let candidate = candidate_root.path().join("bwrap");
+        fs::write(&candidate, b"binary").expect("candidate");
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
+            .expect("candidate permissions");
+        let candidate_text = candidate.to_string_lossy().into_owned();
+
+        let error = trusted_executable(&[candidate_text.as_str()], workspace.path(), false)
+            .expect_err("launcher below /tmp must be rejected");
+
+        assert!(
+            matches!(
+                &error,
+                SandboxError::UntrustedBubblewrap { reason, .. }
+                    if reason.contains("ancestor `")
+                        && reason.contains("is group- or world-writable")
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]

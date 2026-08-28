@@ -212,9 +212,9 @@ pub struct RunArgs {
     pub dir: Option<String>,
     #[arg(long)]
     pub port: Option<u16>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "thinking")]
     pub variant: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "variant")]
     pub thinking: bool,
     #[arg(short = 'i', long, default_value_t = false)]
     pub interactive: bool,
@@ -605,6 +605,7 @@ pub enum DebugCommand {
     Prompt(DebugPromptArgs),
     Permissions,
     Skill,
+    Sandbox(DebugSandboxArgs),
     Rg(DebugRgArgs),
     Lsp(DebugLspArgs),
     Snapshot(DebugSnapshotArgs),
@@ -613,6 +614,26 @@ pub enum DebugCommand {
 #[derive(Debug, Clone, Args)]
 pub struct DebugAgentArgs {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DebugSandboxArgs {
+    /// Sandbox policy to probe; restricted mode verifies bubblewrap deployment.
+    #[arg(long, value_enum, default_value_t = CliSandboxMode::WorkspaceWrite)]
+    pub mode: CliSandboxMode,
+    /// Network authority to verify. Defaults to deny for confined modes and allow
+    /// for danger-full-access.
+    #[arg(long, value_enum)]
+    pub network: Option<DebugSandboxNetwork>,
+    /// Exit unsuccessfully when the requested policy is not deployable.
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DebugSandboxNetwork {
+    Deny,
+    Allow,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1345,6 +1366,84 @@ mod tests {
         assert!(
             Cli::try_parse_from(["zuno", "debug", "agent", "deep", "--params", "{}",]).is_err(),
             "the removed catalog-only params flag must not remain on the wire"
+        );
+    }
+
+    #[test]
+    fn debug_sandbox_defaults_to_restricted_network_denied_deployment_check() {
+        let cli = Cli::try_parse_from(["zuno", "debug", "sandbox"]).expect("debug sandbox parses");
+        let Some(Command::Debug(DebugArgs {
+            command: Some(DebugCommand::Sandbox(args)),
+        })) = cli.command
+        else {
+            panic!("expected debug sandbox");
+        };
+        assert_eq!(args.mode, CliSandboxMode::WorkspaceWrite);
+        assert_eq!(args.network, None);
+        assert!(!args.check);
+
+        let cli = Cli::try_parse_from([
+            "zuno",
+            "debug",
+            "sandbox",
+            "--mode",
+            "read-only",
+            "--network",
+            "allow",
+            "--check",
+        ])
+        .expect("explicit debug sandbox parses");
+        let Some(Command::Debug(DebugArgs {
+            command: Some(DebugCommand::Sandbox(args)),
+        })) = cli.command
+        else {
+            panic!("expected explicit debug sandbox");
+        };
+        assert_eq!(args.mode, CliSandboxMode::ReadOnly);
+        assert_eq!(args.network, Some(DebugSandboxNetwork::Allow));
+        assert!(args.check);
+
+        let cli = Cli::try_parse_from(["zuno", "debug", "sandbox", "--mode", "danger-full-access"])
+            .expect("full access debug sandbox parses");
+        let Some(Command::Debug(DebugArgs {
+            command: Some(DebugCommand::Sandbox(args)),
+        })) = cli.command
+        else {
+            panic!("expected full access debug sandbox");
+        };
+        assert_eq!(args.mode, CliSandboxMode::DangerFullAccess);
+        assert_eq!(args.network, None);
+    }
+
+    #[test]
+    fn run_reasoning_flags_parse_and_conflict_explicitly() {
+        let variant = Cli::try_parse_from(["zuno", "run", "--variant", "max", "solve this"])
+            .expect("--variant parses");
+        let Some(Command::Run(args)) = variant.command else {
+            panic!("expected run");
+        };
+        assert_eq!(args.variant.as_deref(), Some("max"));
+        assert!(!args.thinking);
+
+        let thinking = Cli::try_parse_from(["zuno", "run", "--thinking", "solve this"])
+            .expect("--thinking parses");
+        let Some(Command::Run(args)) = thinking.command else {
+            panic!("expected run");
+        };
+        assert!(args.thinking);
+        assert!(args.variant.is_none());
+
+        assert!(
+            Cli::try_parse_from([
+                "zuno",
+                "run",
+                "--thinking",
+                "--variant",
+                "max",
+                "solve this",
+            ])
+            .is_err(),
+            "automatic thinking and an exact variant are mutually exclusive"
         );
     }
 

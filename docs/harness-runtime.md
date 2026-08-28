@@ -86,12 +86,28 @@ The built-in role prompts remain intentionally small:
   `Outcome`, `Evidence`, `Inspected/Changed`, and `Risks/Blocker`; the model is
   not required to invent a JSON or XML report protocol.
 
-The durable Plan threshold is policy rather than ceremony. When `plan_update` is
-available, the runtime asks the Agent to maintain a Plan for at least three
-dependent meaningful steps, cross-component changes, delegation, or multiple
-acceptance gates. A direct answer, one isolated action, or a small local fix does
-not require a Plan. The host does not automatically manufacture a Plan from this
-classification; the Agent updates the typed store through its effective tools.
+Durable planning is host policy rather than model ceremony. Before the first
+provider request for a user or resolved-command input, the host applies one
+deterministic classifier shared by CLI, TUI, ACP, server, and child turns. An
+active Plan is retained. A completed Plan does not suppress later work: a new
+multi-stage user objective appends a new epoch while preserving prior completed
+steps. Child reports, steering, and retry continuations never manufacture a new
+Plan.
+
+A direct answer, one bounded read, or one short commit of already-prepared
+changes may proceed atomically. Other ordinary engineering work receives an
+Agent-specific seed Plan before the model sees the request. Typed image,
+resource, selection, or branch-diff context also selects the planned path, as
+does sufficiently large multi-block text. This makes research → modification →
+verification visible by default and guarantees a Plan for cross-component work,
+delegation, multiple gates, or work that may need compaction or restart recovery.
+
+The model may refine the seed through `plan_update`; it does not decide whether
+the request receives durable execution state. Todo items are optional concrete
+detail beneath Plan steps for ownership, dependency, or recovery tracking. They
+must not mechanically mirror every Plan step. Refinement preserves existing
+step ids and completed states while updating titles/statuses or appending new
+steps, so concurrent clients and recovery snapshots retain stable identities.
 
 Plan and Work are also typed collaboration contracts. `collaboration.mode` is a
 runtime-trust prompt block, separate from the native kernel, agent role, project
@@ -499,15 +515,23 @@ Inspect current configuration-time resolution for one Agent:
 zuno debug agent deep
 ```
 
-The command uses the real `TurnPlan` resolver without creating a session or
-connecting providers or MCP servers. It reports effective model and reasoning,
-policy-visible and unavailable tools, configured MCP servers as
-`not-connected`, required and available Skills, delegates, sandbox readiness,
-policy sources, and diagnostics. This is a pre-runtime view: MCP tool ids are
-known only after a live connection, so the command reports MCP inheritance as
-unresolved instead of testing a fabricated tool id against exact allowlists or
-parent authority. Interactive `question` still requires a client asker, and a
-later request hook may only narrow the final tool set.
+The command uses the real `TurnPlan` and `McpRuntime` resolvers without creating
+a session or contacting the model provider. It connects every enabled MCP
+server, records lifecycle state, discovery status, connected servers, exact
+current tool schema identities, warnings, and cleanup warnings, then closes
+every transport before returning. Discovery failure, cancellation, or timeout
+also runs bounded transport cleanup. Discovered tools are evaluated against the
+current role rules and Agent allowlist. A root diagnostic has no parent Attempt
+authority to invent; delegated historical authority must be read from that
+Attempt's persisted orchestration snapshot. If no MCP runtime exists,
+inheritance remains `not-connected` rather than being tested with fabricated
+ids.
+
+The output also reports effective model, reasoning and selected variant,
+policy-visible and unavailable tools, delegates, sandbox readiness, and Skill
+catalog counts, metadata/body budgets, bounded preview coverage, and ambiguous
+names. Interactive `question` still requires a client asker, and a later request
+hook may only narrow the final tool set.
 
 ### Provider request routing context
 
@@ -986,6 +1010,13 @@ roots, reapplies protected descendants, drops capabilities, sets `NoNewPrivs`,
 and installs seccomp in a first-party helper. Network is denied by default.
 The process layer accepts only `PreparedCommand`; it cannot spawn a
 confinement-required Shell call from raw argv.
+
+`zuno debug sandbox --mode workspace-write --network deny --check` verifies the
+same deployment path. It rejects a non-root-owned, writable, special-bit, or
+file-capability launcher; checks every launcher ancestor; revalidates device and
+inode before preparation; probes required namespaces; and executes
+`/usr/bin/true` through bubblewrap, capability dropping, `PR_SET_NO_NEW_PRIVS`,
+and seccomp. A metadata-only probe is not reported as deployment readiness.
 
 The public modes are `read-only`, `workspace-write`, and
 `danger-full-access`. `workspace-write` is the default. Trusted global, explicit,

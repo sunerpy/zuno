@@ -1677,7 +1677,8 @@ async fn runtime_policy_is_rendered_from_the_post_hook_tool_subset() {
         ["plan_update"]
     );
     let runtime = requests[0].developer_context.join("\n");
-    assert!(runtime.contains("keep the durable execution plan current"));
+    assert!(runtime.contains("Use a durable Plan whenever it improves progress visibility"));
+    assert!(runtime.contains("Todo items are optional concrete work beneath Plan steps"));
     assert!(runtime.contains("Durable Goal, Plan, Todo"));
     assert!(!runtime.contains("explorer"));
     assert!(!runtime.contains("editing surface"));

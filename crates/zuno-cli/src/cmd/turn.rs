@@ -63,6 +63,10 @@ use zuno_engine::r#loop::{
     ToolConcurrencyLimit, ToolFailureRecovery, TurnContext, TurnError, TurnEvent, TurnEventSender,
     TurnOutcome, TurnRecovery,
 };
+use zuno_engine::planning::{
+    ExistingPlanState, PlanningContentFacts, PlanningDecision, PlanningInput, PlanningInputSource,
+    PlanningPolicy,
+};
 use zuno_engine::prelude::{
     CompactionSkipped, InternalAgent, InternalProviders, Internals, PreludeContext, PreludeOutcome,
     compact_requested, run_prelude,
@@ -276,6 +280,10 @@ pub(crate) struct TurnOptions {
     /// default in place and keeps the request byte-identical to a build without this
     /// field.
     pub(crate) effort: Option<zuno_llm::effort::ReasoningEffort>,
+    /// Exact canonical or model-declared variant selected by a surface.
+    pub(crate) variant: Option<String>,
+    /// Ask the host to select a strong available reasoning level.
+    pub(crate) thinking: bool,
     /// Exact provider-visible tools from the parent Attempt for a delegated turn.
     pub(crate) tool_authority: Option<Arc<[ToolSchemaIdentity]>>,
     /// Whether this host consumes the committed extension composition or the one
@@ -391,8 +399,14 @@ pub(crate) struct TurnPlan {
     reasoning_supported: bool,
     /// The reasoning level this plan resolved with, echoed back for display.
     effort: Option<zuno_llm::effort::ReasoningEffort>,
+    /// Exact canonical or model-declared variant whose request options were selected.
+    effective_variant: Option<String>,
     /// An explicit surface-level reasoning choice, distinct from a preset variant.
     effort_override: Option<zuno_llm::effort::ReasoningEffort>,
+    /// An exact surface-level canonical or model-declared variant.
+    variant_override: Option<String>,
+    /// Whether the surface requested automatic reasoning selection.
+    thinking_override: bool,
     /// Fully validated automatic recovery policy for active goals.
     goal_retry_policy: GoalRetryPolicy,
 }
@@ -603,13 +617,20 @@ impl TurnPlan {
             .is_none()
             .then(|| routed_model.model.as_ref()?.variant.as_deref())
             .flatten();
-        let effort = turn_effort(
-            options.effort,
+        let reasoning = resolve_turn_reasoning(
+            TurnReasoningSelection {
+                session: options.effort,
+                explicit_variant: options.variant.as_deref(),
+                thinking: options.thinking,
+            },
             definition,
             &provider_id,
             &model_id,
             routed_variant,
-        );
+            catalog_model,
+        )?;
+        let effort = reasoning.effort;
+        let effective_variant = reasoning.variant.clone();
         let mut prompt_assembly = PromptAssembly::new();
         prompt_assembly
             .push(
@@ -644,11 +665,7 @@ impl TurnPlan {
             requested_provider: provider_id.clone(),
             requested_model: model_id.clone(),
             wire_model: catalog_model.api.id.clone(),
-            reasoning_options: session_reasoning_options(
-                effort,
-                catalog_model,
-                &definition.options,
-            ),
+            reasoning_options: reasoning.options,
             spec: with_agent_options(
                 model_spec(&catalog, catalog_model, env)?,
                 definition,
@@ -787,7 +804,17 @@ impl TurnPlan {
             vision_available,
             reasoning_supported,
             effort,
-            effort_override: options.effort,
+            effective_variant,
+            effort_override: if options.effort.is_some()
+                || options.variant.is_some()
+                || options.thinking
+            {
+                effort
+            } else {
+                None
+            },
+            variant_override: options.variant.clone(),
+            thinking_override: options.thinking,
             goal_retry_policy,
         })
     }
@@ -836,6 +863,11 @@ impl TurnPlan {
             .vcs
             .as_ref()
             .map(|_| self.project.directory.as_path())
+    }
+
+    /// Runtime workspace used by MCP and other project-scoped resident services.
+    pub(crate) fn runtime_workspace(&self) -> &std::path::Path {
+        self.worktree().unwrap_or_else(|| self.directory())
     }
 
     /// The merged configuration this turn resolved against.
@@ -1003,14 +1035,28 @@ impl TurnPlan {
     }
 
     /// Resolve the same model, role, policy, Skill, MCP, and sandbox facts a live host
-    /// would use, without opening a session or connecting external servers.
+    /// would use, without opening a session.
+    #[cfg(test)]
     pub(crate) fn debug_agent_snapshot(&self) -> Value {
+        self.debug_agent_snapshot_with_mcp(None)
+    }
+
+    /// Resolve an Agent diagnostic snapshot with optional live MCP discovery.
+    pub(crate) fn debug_agent_snapshot_with_mcp(
+        &self,
+        mcp: Option<&super::mcp_runtime::McpRuntimeDiagnostics>,
+    ) -> Value {
         let definition = self.agent.definition();
-        let dynamic_tool_ids = self
+        let mut dynamic_tool_ids = self
             .configured_extension_tool_ids
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
+        dynamic_tool_ids.extend(
+            mcp.into_iter()
+                .flat_map(|diagnostics| diagnostics.tools.iter())
+                .map(|tool| tool.name.as_str()),
+        );
         let rules = self.agent.rules_with_extension_tools(&dynamic_tool_ids);
         let allowlist = definition
             .tools
@@ -1069,6 +1115,14 @@ impl TurnPlan {
         for id in &self.configured_extension_tool_ids {
             candidates.insert(id.clone(), "active.extension".to_owned());
         }
+        let mcp_tool_identities = mcp
+            .into_iter()
+            .flat_map(|diagnostics| diagnostics.tools.iter())
+            .map(|tool| (tool.name.as_str(), tool))
+            .collect::<BTreeMap<_, _>>();
+        for tool in mcp_tool_identities.values() {
+            candidates.insert(tool.name.clone(), "mcp.connected".to_owned());
+        }
 
         let can_delegate = self.agent.capabilities().can_delegate();
         let product_tool_ids = self
@@ -1095,6 +1149,14 @@ impl TurnPlan {
         let mut unavailable = Vec::new();
         for (id, source) in candidates {
             let hidden_by_role = zuno_permission::visibility::is_tool_hidden(&id, &rules);
+            let parent_schema_mismatch = mcp_tool_identities.get(id.as_str()).and_then(|tool| {
+                self.tool_authority.as_deref().and_then(|authority| {
+                    authority
+                        .iter()
+                        .find(|allowed| allowed.name == id)
+                        .filter(|allowed| *allowed != *tool)
+                })
+            });
             let outside_parent_authority = !self.agent.capabilities().within_tool_authority(&id);
             let outside_allowlist = allowlist
                 .as_ref()
@@ -1108,6 +1170,8 @@ impl TurnPlan {
                 Some("hidden by the effective permission rules")
             } else if outside_parent_authority {
                 Some("not present in the parent attempt tool authority")
+            } else if parent_schema_mismatch.is_some() {
+                Some("schema differs from the parent attempt tool authority")
             } else if outside_allowlist {
                 Some("not present in the Agent tool allowlist")
             } else if subagent_tool_without_delegation {
@@ -1138,32 +1202,22 @@ impl TurnPlan {
             &self.agent,
             &rules,
         ) {
-            Ok(policy) => match zuno_sandbox::system_backend(&self.directory, policy.mode()) {
-                Ok(backend) => {
-                    let capabilities = backend.capabilities();
-                    let support_error = capabilities
-                        .supports(&policy)
-                        .err()
-                        .map(|error| error.to_string());
-                    json!({
-                        "configuredMode": self.config.sandbox_mode(),
-                        "effectiveMode": policy.mode(),
-                        "network": policy.network(),
-                        "workspace": policy.workspace(),
-                        "backend": capabilities,
-                        "ready": support_error.is_none(),
-                        "error": support_error,
-                    })
-                }
-                Err(error) => json!({
+            Ok(policy) => {
+                let deployment = zuno_sandbox::deployment_report(
+                    policy.workspace(),
+                    policy.mode(),
+                    policy.network(),
+                );
+                json!({
                     "configuredMode": self.config.sandbox_mode(),
                     "effectiveMode": policy.mode(),
                     "network": policy.network(),
                     "workspace": policy.workspace(),
-                    "ready": false,
-                    "error": error.to_string(),
-                }),
-            },
+                    "ready": deployment.ready,
+                    "error": deployment.error.clone(),
+                    "deployment": deployment,
+                })
+            }
             Err(error) => json!({
                 "configuredMode": self.config.sandbox_mode(),
                 "ready": false,
@@ -1171,7 +1225,12 @@ impl TurnPlan {
             }),
         };
 
-        let mcp = self
+        let runtime_servers = mcp
+            .into_iter()
+            .flat_map(|diagnostics| diagnostics.servers.iter())
+            .map(|server| (server.name.as_str(), server))
+            .collect::<BTreeMap<_, _>>();
+        let mcp_servers = self
             .config
             .mcp
             .iter()
@@ -1186,7 +1245,15 @@ impl TurnPlan {
                     "name": name,
                     "kind": kind,
                     "enabled": super::mcp_runtime::enabled(server),
-                    "state": "not-connected",
+                    "state": runtime_servers
+                        .get(name)
+                        .map_or("not-connected", |server| server.state.as_str()),
+                    "desiredEnabled": runtime_servers
+                        .get(name)
+                        .map(|server| server.desired_enabled),
+                    "error": runtime_servers
+                        .get(name)
+                        .and_then(|server| server.error.as_deref()),
                 })
             })
             .collect::<Vec<_>>();
@@ -1195,10 +1262,12 @@ impl TurnPlan {
             .iter()
             .map(|skill| json!({"name": skill.name, "source": skill.source}))
             .collect::<Vec<_>>();
+        const SKILL_PREVIEW_LIMIT: usize = 50;
         let skills = self
             .skills
             .all()
             .iter()
+            .take(SKILL_PREVIEW_LIMIT)
             .map(|skill| {
                 json!({
                     "name": skill.name,
@@ -1209,6 +1278,40 @@ impl TurnPlan {
                 })
             })
             .collect::<Vec<_>>();
+        let described_skill_count = self
+            .skills
+            .all()
+            .iter()
+            .filter(|skill| skill.description.is_some())
+            .count();
+        let mut skill_name_counts = BTreeMap::<&str, usize>::new();
+        for skill in self.skills.all() {
+            *skill_name_counts.entry(&skill.name).or_default() += 1;
+        }
+        let metadata_enabled = self
+            .config
+            .skills
+            .as_ref()
+            .and_then(|settings| settings.include_instructions)
+            != Some(false);
+        let (metadata_budget, metadata_coverage) = if metadata_enabled {
+            let budget = skill_metadata_budget(self.window.context, self.config.skills.as_ref());
+            let metadata = self
+                .skills
+                .render_within(zuno_catalog::skill::Form::Index, budget);
+            (
+                Some(budget),
+                Some(json!({
+                    "rendered": metadata.rendered,
+                    "omitted": metadata.omitted,
+                    "truncated": metadata.truncated,
+                })),
+            )
+        } else {
+            (None, None)
+        };
+        let selected_body_budget =
+            selected_skill_prompt_budget(self.window.context, self.config.skills.as_ref());
         let mut policy_sources = vec![agent_prompt_source(definition)];
         if self.config.permission.is_some() {
             policy_sources.push("configuration.permission".to_owned());
@@ -1238,12 +1341,15 @@ impl TurnPlan {
                 "effective": self.qualified_model(),
                 "reasoningSupported": self.reasoning_supported,
                 "reasoning": self.effort,
+                "variant": self.effective_variant,
                 "resolutionInputs": {
                     "explicitModel": self.model_override,
                     "agentModel": definition.model,
                     "sessionModel": self.config.model,
                     "preset": self.presets.selected(),
                     "explicitReasoning": self.effort_override,
+                    "explicitVariant": self.variant_override,
+                    "automaticThinking": self.thinking_override,
                     "agentReasoning": definition.reasoning,
                     "agentVariant": definition.variant,
                 },
@@ -1259,13 +1365,51 @@ impl TurnPlan {
             },
             "mcp": {
                 "inheritance": {
-                    "state": "not-connected",
-                    "reason": "MCP tool ids are known only after a live connection; configured allowlists and parent authority are evaluated per discovered tool",
+                    "state": if mcp.is_some() { "evaluated" } else { "not-connected" },
+                    "reason": match (mcp.is_some(), self.tool_authority.is_some()) {
+                        (true, true) => {
+                            "connected MCP tool ids and exact schemas were evaluated against role rules, the Agent allowlist, and parent Attempt authority"
+                        }
+                        (true, false) => {
+                            "connected MCP tool ids and exact schemas were evaluated against role rules and the Agent allowlist; no parent Attempt authority applies to this root diagnostic"
+                        }
+                        (false, true) => {
+                            "MCP tool ids are known only after a live connection; configured allowlists and parent Attempt authority are evaluated per discovered tool"
+                        }
+                        (false, false) => {
+                            "MCP tool ids are known only after a live connection; role rules and the Agent allowlist are evaluated per discovered tool, and no parent Attempt authority applies to this root diagnostic"
+                        }
+                    },
                 },
-                "servers": mcp,
+                "discoveryStatus": mcp.map(|diagnostics| diagnostics.discovery_status.as_str()),
+                "connectedServers": mcp
+                    .map(|diagnostics| diagnostics.connected_servers.as_slice())
+                    .unwrap_or_default(),
+                "servers": mcp_servers,
+                "warnings": mcp
+                    .map(|diagnostics| diagnostics.warnings.as_slice())
+                    .unwrap_or_default(),
+                "cleanupWarnings": mcp
+                    .map(|diagnostics| diagnostics.cleanup_warnings.as_slice())
+                    .unwrap_or_default(),
             },
             "skills": {
                 "required": required_skills,
+                "summary": {
+                    "sourceCount": self.skills.all().len(),
+                    "describedSourceCount": described_skill_count,
+                    "uniqueNameCount": skill_name_counts.len(),
+                    "ambiguousNameCount": skill_name_counts.values().filter(|count| **count > 1).count(),
+                    "metadataEnabled": metadata_enabled,
+                    "metadataBudgetBytes": metadata_budget,
+                    "metadataBudgetApproxTokens": metadata_budget
+                        .map(|budget| budget / APPROX_BYTES_PER_TOKEN),
+                    "metadataCoverage": metadata_coverage,
+                    "selectedBodyBudgetBytes": selected_body_budget,
+                    "selectedBodyBudgetApproxTokens": selected_body_budget / APPROX_BYTES_PER_TOKEN,
+                    "previewLimit": SKILL_PREVIEW_LIMIT,
+                    "previewOmitted": self.skills.all().len().saturating_sub(SKILL_PREVIEW_LIMIT),
+                },
                 "available": skills,
                 "parentExpandedBodiesInherited": false,
                 "configurationInheritedByChildren": true,
@@ -1600,7 +1744,25 @@ struct DriveInputOptions<'a> {
     message_id: Option<&'a str>,
     content: Option<&'a [RequestContentBlock]>,
     persistence: UserInputPersistence,
+    planning_source: PlanningInputSource,
     routing: Option<PromptRouting>,
+}
+
+impl<'a> DriveInputOptions<'a> {
+    const fn plain(
+        message_id: Option<&'a str>,
+        content: Option<&'a [RequestContentBlock]>,
+        persistence: UserInputPersistence,
+        planning_source: PlanningInputSource,
+    ) -> Self {
+        Self {
+            message_id,
+            content,
+            persistence,
+            planning_source,
+            routing: None,
+        }
+    }
 }
 
 /// Process-local services inherited by every host opened from one composition.
@@ -3707,9 +3869,12 @@ impl TurnHost {
             .map_err(to_string)?;
         self.drive_input(
             prompt,
-            None,
-            Some(content),
-            UserInputPersistence::AdmitAndPromote,
+            DriveInputOptions::plain(
+                None,
+                Some(content),
+                UserInputPersistence::AdmitAndPromote,
+                PlanningInputSource::User,
+            ),
             &guard,
             events,
         )
@@ -3735,9 +3900,12 @@ impl TurnHost {
         let prompt = format!("/{name} {arguments}");
         self.drive_input(
             &prompt,
-            None,
-            None,
-            UserInputPersistence::AdmitAndPromote,
+            DriveInputOptions::plain(
+                None,
+                None,
+                UserInputPersistence::AdmitAndPromote,
+                PlanningInputSource::Command,
+            ),
             &guard,
             events,
         )
@@ -3773,9 +3941,12 @@ impl TurnHost {
             .map_err(to_string)?;
         self.drive_input(
             &resolved.prompt,
-            None,
-            None,
-            UserInputPersistence::AdmitAndPromote,
+            DriveInputOptions::plain(
+                None,
+                None,
+                UserInputPersistence::AdmitAndPromote,
+                PlanningInputSource::Command,
+            ),
             &guard,
             events,
         )
@@ -3801,6 +3972,7 @@ impl TurnHost {
                 message_id: None,
                 content: None,
                 persistence: UserInputPersistence::AdmitAndPromote,
+                planning_source: PlanningInputSource::Command,
                 routing: Some(routing),
             },
             &guard,
@@ -3821,9 +3993,12 @@ impl TurnHost {
             .map_err(to_string)?;
         self.drive_input(
             prompt,
-            message_id,
-            None,
-            UserInputPersistence::AdmitAndPromote,
+            DriveInputOptions::plain(
+                message_id,
+                None,
+                UserInputPersistence::AdmitAndPromote,
+                PlanningInputSource::User,
+            ),
             &guard,
             events,
         )
@@ -3856,9 +4031,12 @@ impl TurnHost {
     ) -> Result<(), String> {
         self.drive_input(
             prompt,
-            message_id,
-            None,
-            UserInputPersistence::AdmitAndPromote,
+            DriveInputOptions::plain(
+                message_id,
+                None,
+                UserInputPersistence::AdmitAndPromote,
+                PlanningInputSource::User,
+            ),
             &guard,
             events,
         )
@@ -3875,9 +4053,34 @@ impl TurnHost {
     ) -> Result<(), String> {
         self.drive_input(
             prompt,
-            Some(message_id),
-            None,
-            UserInputPersistence::AlreadyPromoted,
+            DriveInputOptions::plain(
+                Some(message_id),
+                None,
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::User,
+            ),
+            &guard,
+            events,
+        )
+        .await
+    }
+
+    /// Drive a settled child report without allowing host-generated prose to seed a plan.
+    pub(crate) async fn drive_promoted_report_with_guard(
+        &mut self,
+        prompt: &str,
+        message_id: &str,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        self.drive_input(
+            prompt,
+            DriveInputOptions::plain(
+                Some(message_id),
+                None,
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::ChildReport,
+            ),
             &guard,
             events,
         )
@@ -3897,9 +4100,37 @@ impl TurnHost {
             .map_err(to_string)?;
         self.drive_input(
             prompt,
-            Some(message_id),
-            None,
-            UserInputPersistence::AlreadyPromoted,
+            DriveInputOptions::plain(
+                Some(message_id),
+                None,
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::User,
+            ),
+            &guard,
+            events,
+        )
+        .await
+    }
+
+    /// Drive a settled child report after acquiring the parent session lease.
+    pub(crate) async fn drive_promoted_report(
+        &mut self,
+        prompt: &str,
+        message_id: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.drive_input(
+            prompt,
+            DriveInputOptions::plain(
+                Some(message_id),
+                None,
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::ChildReport,
+            ),
             &guard,
             events,
         )
@@ -3920,9 +4151,12 @@ impl TurnHost {
             .map_err(to_string)?;
         self.drive_input(
             prompt,
-            Some(message_id),
-            Some(content),
-            UserInputPersistence::AlreadyPromoted,
+            DriveInputOptions::plain(
+                Some(message_id),
+                Some(content),
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::User,
+            ),
             &guard,
             events,
         )
@@ -3958,9 +4192,12 @@ impl TurnHost {
         let prompt = format!("/{name} {arguments}");
         self.drive_input(
             &prompt,
-            Some(message_id),
-            None,
-            UserInputPersistence::AlreadyPromoted,
+            DriveInputOptions::plain(
+                Some(message_id),
+                None,
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::Command,
+            ),
             &guard,
             events,
         )
@@ -3998,9 +4235,12 @@ impl TurnHost {
             .map_err(to_string)?;
         self.drive_input(
             &resolved.prompt,
-            Some(message_id),
-            None,
-            UserInputPersistence::AlreadyPromoted,
+            DriveInputOptions::plain(
+                Some(message_id),
+                None,
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::Command,
+            ),
             &guard,
             events,
         )
@@ -4027,6 +4267,7 @@ impl TurnHost {
                 message_id: Some(message_id),
                 content: None,
                 persistence: UserInputPersistence::AlreadyPromoted,
+                planning_source: PlanningInputSource::Command,
                 routing: Some(routing),
             },
             &guard,
@@ -4111,24 +4352,12 @@ impl TurnHost {
     async fn drive_input(
         &mut self,
         prompt: &str,
-        message_id: Option<&str>,
-        content: Option<&[RequestContentBlock]>,
-        persistence: UserInputPersistence,
+        options: DriveInputOptions<'_>,
         guard: &SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
-        self.drive_input_routed(
-            prompt,
-            DriveInputOptions {
-                message_id,
-                content,
-                persistence,
-                routing: None,
-            },
-            guard,
-            events,
-        )
-        .await
+        self.drive_input_routed(prompt, options, guard, events)
+            .await
     }
 
     async fn drive_input_routed(
@@ -4208,6 +4437,7 @@ impl TurnHost {
         self.goal_projection
             .ingest(&self.goal_store)
             .map_err(to_string)?;
+        self.ensure_durable_plan(prompt, options.planning_source, options.content)?;
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
         let result = self
@@ -4227,6 +4457,38 @@ impl TurnHost {
                 .await
                 .map(|_| ()),
         }
+    }
+
+    fn ensure_durable_plan(
+        &mut self,
+        prompt: &str,
+        source: PlanningInputSource,
+        content: Option<&[RequestContentBlock]>,
+    ) -> Result<(), String> {
+        let goal_id = self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(to_string)?
+            .filter(|goal| goal.status == zuno_goal::GoalStatus::Active)
+            .map(|goal| goal.goal_id);
+        let decision = ensure_host_plan(
+            &self.database,
+            HostPlanningRequest {
+                session_id: &self.session_id,
+                agent: &self.agent,
+                prompt,
+                source,
+                content: planning_content_facts(content),
+                plan_available: self
+                    .dispatcher
+                    .has_visible_tool(zuno_tools::PLAN_UPDATE_TOOL_ID),
+                goal_id,
+            },
+        )?;
+        if matches!(decision, PlanningDecision::Create(_)) {
+            self.work_changes.changed();
+        }
+        Ok(())
     }
 
     async fn drive_input_unaccounted(
@@ -5257,6 +5519,168 @@ fn durable_work_context(
     };
     transaction.commit().map_err(to_string)?;
     render_durable_work_context(snapshot).map(Some)
+}
+
+struct HostPlanningRequest<'a> {
+    session_id: &'a str,
+    agent: &'a str,
+    prompt: &'a str,
+    source: PlanningInputSource,
+    content: PlanningContentFacts,
+    plan_available: bool,
+    goal_id: Option<String>,
+}
+
+fn ensure_host_plan(
+    database: &Arc<zuno_db::pool::Pool>,
+    request: HostPlanningRequest<'_>,
+) -> Result<PlanningDecision, String> {
+    let HostPlanningRequest {
+        session_id,
+        agent,
+        prompt,
+        source,
+        content,
+        plan_available,
+        goal_id,
+    } = request;
+    let store = zuno_tools::WorkStateStore::new(Arc::clone(database));
+    let existing = store.plan(session_id).map_err(to_string)?;
+    let existing_state = existing.as_ref().map_or(ExistingPlanState::None, |plan| {
+        if plan
+            .steps
+            .iter()
+            .all(|step| step.status == zuno_tools::PlanStepStatus::Completed)
+        {
+            ExistingPlanState::Terminal
+        } else {
+            ExistingPlanState::Active
+        }
+    });
+    let decision = PlanningPolicy::classify(
+        PlanningInput::new(prompt, agent)
+            .with_source(source)
+            .with_existing_plan(existing_state)
+            .with_content(content)
+            .with_plan_available(plan_available),
+    );
+    let PlanningDecision::Create(seed) = &decision else {
+        return Ok(decision);
+    };
+    let epoch = existing
+        .as_ref()
+        .map_or(1_i64, |plan| plan.revision.saturating_add(1));
+    let mut steps = existing
+        .as_ref()
+        .map(|plan| plan.steps.clone())
+        .unwrap_or_default();
+    steps.extend(
+        seed.steps()
+            .iter()
+            .enumerate()
+            .map(|(index, step)| zuno_tools::PlanStep {
+                id: if existing.is_some() {
+                    format!("epoch-{epoch}-{}", step.id())
+                } else {
+                    step.id().to_owned()
+                },
+                title: step.title().to_owned(),
+                status: if index == 0 {
+                    zuno_tools::PlanStepStatus::InProgress
+                } else {
+                    zuno_tools::PlanStepStatus::Pending
+                },
+            }),
+    );
+    store
+        .update_plan(
+            session_id,
+            zuno_tools::PlanUpdateParams {
+                expected_revision: existing.as_ref().map(|plan| plan.revision),
+                goal_id,
+                title: seed.title().to_owned(),
+                steps,
+            },
+        )
+        .map_err(to_string)?;
+    Ok(decision)
+}
+
+fn planning_content_facts(content: Option<&[RequestContentBlock]>) -> PlanningContentFacts {
+    let Some(content) = content else {
+        return PlanningContentFacts::empty();
+    };
+    let mut contextual_blocks = 0_usize;
+    let mut text_blocks = 0_usize;
+    let mut total_bytes = 0_usize;
+    let mut branch_or_selection_context = false;
+    for block in content {
+        match block {
+            RequestContentBlock::Text { text } => {
+                text_blocks = text_blocks.saturating_add(1);
+                total_bytes = total_bytes.saturating_add(text.len());
+                branch_or_selection_context |= planning_context_marker(text);
+            }
+            RequestContentBlock::ResourceLink {
+                name,
+                uri,
+                title,
+                description,
+                media_type,
+                size,
+            } => {
+                contextual_blocks = contextual_blocks.saturating_add(1);
+                total_bytes = total_bytes
+                    .saturating_add(name.len())
+                    .saturating_add(uri.len())
+                    .saturating_add(title.as_deref().map_or(0, str::len))
+                    .saturating_add(description.as_deref().map_or(0, str::len))
+                    .saturating_add(media_type.as_deref().map_or(0, str::len))
+                    .saturating_add(
+                        size.and_then(|size| usize::try_from(size).ok())
+                            .unwrap_or_default(),
+                    );
+                branch_or_selection_context |= [
+                    name.as_str(),
+                    uri.as_str(),
+                    title.as_deref().unwrap_or_default(),
+                    description.as_deref().unwrap_or_default(),
+                ]
+                .iter()
+                .any(|value| planning_context_marker(value));
+            }
+            RequestContentBlock::Image { data, filename, .. } => {
+                contextual_blocks = contextual_blocks.saturating_add(1);
+                total_bytes = total_bytes
+                    .saturating_add(data.len())
+                    .saturating_add(filename.as_deref().map_or(0, str::len));
+            }
+            RequestContentBlock::SignedThinking { .. }
+            | RequestContentBlock::ProviderEncryptedReasoning { .. }
+            | RequestContentBlock::ToolUse { .. }
+            | RequestContentBlock::ToolResult { .. } => {}
+        }
+    }
+    PlanningContentFacts::new(
+        contextual_blocks,
+        text_blocks,
+        total_bytes,
+        branch_or_selection_context,
+    )
+}
+
+fn planning_context_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "zed://selection",
+        "zed://diff",
+        "branch diff",
+        "branch_diff",
+        "selection/",
+        "embedded resource `zed://",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -6869,6 +7293,127 @@ fn turn_effort(
         .or_else(|| configured_reasoning_effort(&agent.options))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ResolvedTurnReasoning {
+    effort: Option<zuno_llm::effort::ReasoningEffort>,
+    variant: Option<String>,
+    options: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnReasoningSelection<'a> {
+    session: Option<zuno_llm::effort::ReasoningEffort>,
+    explicit_variant: Option<&'a str>,
+    thinking: bool,
+}
+
+fn resolve_turn_reasoning(
+    selection: TurnReasoningSelection<'_>,
+    agent: &zuno_catalog::agent::Agent,
+    provider_id: &str,
+    model_id: &str,
+    routed_variant: Option<&str>,
+    model: &zuno_llm::catalog::ResolvedModel,
+) -> Result<ResolvedTurnReasoning, String> {
+    let TurnReasoningSelection {
+        session,
+        explicit_variant,
+        thinking,
+    } = selection;
+    if session.is_some() && (explicit_variant.is_some() || thinking) {
+        return Err(
+            "one surface cannot select both a reasoning effort and --variant/--thinking".to_owned(),
+        );
+    }
+    if explicit_variant.is_some() && thinking {
+        return Err("--variant and --thinking are mutually exclusive".to_owned());
+    }
+
+    if let Some(variant) = explicit_variant {
+        if let Ok(effort) = variant.parse::<zuno_llm::effort::ReasoningEffort>() {
+            if !selectable_reasoning_efforts(model).contains(&effort) {
+                return Err(unsupported_reasoning_variant(
+                    provider_id,
+                    model_id,
+                    variant,
+                    model,
+                ));
+            }
+            return Ok(ResolvedTurnReasoning {
+                effort: Some(effort),
+                variant: Some(variant.to_owned()),
+                options: session_reasoning_options(Some(effort), model, &agent.options),
+            });
+        }
+        let Some(options) = model.variants.get(variant) else {
+            return Err(unsupported_reasoning_variant(
+                provider_id,
+                model_id,
+                variant,
+                model,
+            ));
+        };
+        return Ok(ResolvedTurnReasoning {
+            effort: None,
+            variant: Some(variant.to_owned()),
+            options: options.clone(),
+        });
+    }
+
+    if thinking {
+        let available = selectable_reasoning_efforts(model);
+        let effort = if available.contains(&zuno_llm::effort::ReasoningEffort::High) {
+            zuno_llm::effort::ReasoningEffort::High
+        } else {
+            available
+                .iter()
+                .rev()
+                .copied()
+                .find(|effort| *effort != zuno_llm::effort::ReasoningEffort::Off)
+                .ok_or_else(|| {
+                    format!(
+                        "--thinking requires a reasoning-capable model, but \
+                         {provider_id}/{model_id} declares no enabled reasoning level"
+                    )
+                })?
+        };
+        return Ok(ResolvedTurnReasoning {
+            effort: Some(effort),
+            variant: Some(effort.as_str().to_owned()),
+            options: session_reasoning_options(Some(effort), model, &agent.options),
+        });
+    }
+
+    let effort = turn_effort(session, agent, provider_id, model_id, routed_variant);
+    Ok(ResolvedTurnReasoning {
+        effort,
+        variant: effort.map(|effort| effort.as_str().to_owned()),
+        options: session_reasoning_options(effort, model, &agent.options),
+    })
+}
+
+fn unsupported_reasoning_variant(
+    provider_id: &str,
+    model_id: &str,
+    variant: &str,
+    model: &zuno_llm::catalog::ResolvedModel,
+) -> String {
+    let available = model
+        .variants
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if available.is_empty() {
+        format!("model {provider_id}/{model_id} does not declare reasoning variant `{variant}`")
+    } else {
+        format!(
+            "model {provider_id}/{model_id} does not declare reasoning variant `{variant}`; \
+             available variants: {available}"
+        )
+    }
+}
+
 const REASONING_EFFORT_OPTION: &str = "reasoningEffort";
 const REASONING_SUMMARY_OPTION: &str = "reasoningSummary";
 
@@ -6900,7 +7445,7 @@ fn selectable_reasoning_efforts(
     model: &zuno_llm::catalog::ResolvedModel,
 ) -> Vec<zuno_llm::effort::ReasoningEffort> {
     let declared = declared_reasoning_efforts(model);
-    if declared.is_empty() && model.capabilities.reasoning {
+    if model.variants.is_empty() && model.capabilities.reasoning {
         zuno_llm::effort::ReasoningEffort::ALL.to_vec()
     } else {
         declared
@@ -6932,8 +7477,8 @@ fn session_reasoning_options(
 ) -> serde_json::Map<String, serde_json::Value> {
     let declared_efforts = declared_reasoning_efforts(model);
     let effort = effort.or_else(|| configured_reasoning_effort(&model.options));
-    let Some(effort) =
-        effort.filter(|effort| model.capabilities.reasoning || declared_efforts.contains(effort))
+    let generic_scale = model.variants.is_empty() && model.capabilities.reasoning;
+    let Some(effort) = effort.filter(|effort| generic_scale || declared_efforts.contains(effort))
     else {
         return serde_json::Map::new();
     };

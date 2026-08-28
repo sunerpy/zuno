@@ -161,9 +161,13 @@ impl RuntimePromptPolicy {
         );
         if has("plan_update") {
             execution.push_str(
-                " For dependent work with at least three meaningful steps, cross-component \
-                 changes, delegation, or multiple acceptance gates, keep the durable execution \
-                 plan current. Simple work needs no formal plan.",
+                " Use a durable Plan whenever it improves progress visibility, dependency \
+                 management, interruption recovery, or verification. Normal research-modify-verify \
+                 work should use one; cross-component changes, delegation, multiple acceptance \
+                 gates, and work likely to survive compaction or interruption must keep it current. \
+                 Only a direct answer, one bounded read, or a genuinely atomic operation should \
+                 proceed without one. Todo items are optional concrete work beneath Plan steps; do \
+                 not mirror every Plan step mechanically.",
             );
         }
 
@@ -889,6 +893,16 @@ mod tests {
         );
         assert!(!text.contains("web_search"));
         assert!(!text.contains("unavailable"));
+        assert!(text.contains(
+            "Use a durable Plan whenever it improves progress visibility, dependency \
+                 management, interruption recovery, or verification"
+        ));
+        assert!(text.contains(
+            "Todo items are optional concrete work beneath Plan steps; do not mirror every \
+                 Plan step mechanically"
+        ));
+        assert!(!text.contains("at least three meaningful steps"));
+        assert!(!text.contains("Simple work needs no formal plan"));
         let estimated_tokens = sections
             .iter()
             .map(|section| section.content().len().div_ceil(4))

@@ -463,6 +463,22 @@ through; Zuno never ships hidden model-id defaults. The selected preset is
 frozen with the turn plan, so editing configuration cannot mutate an in-flight
 attempt.
 
+For one headless invocation, `zuno run --variant <name>` overrides configured
+reasoning with the exact model-declared variant. Canonical names
+`off|low|medium|high|xhigh|max` are accepted only when the selected model
+declares them, or when the model exposes generic reasoning without declaring a
+named variant catalog. A non-canonical name copies that variant's complete
+provider option object. A model that declares only custom names such as
+`deliberate` does not silently acquire canonical variants. Unknown names fail
+before HTTP I/O and list the available variants.
+
+`zuno run --thinking` asks the host to select `high` when available, otherwise
+the strongest declared non-`off` canonical level. It fails for a non-reasoning
+model and for a named-only custom variant catalog whose semantics cannot be
+inferred. `--thinking` and `--variant` are mutually exclusive. Prefer
+`--variant max` or `--variant xhigh` when exact effort matters; `--thinking` is
+intentionally an automatic convenience.
+
 In the TUI, `/preset` opens the configured preset picker and
 `/preset <name>` selects one directly. The replacement is prepared and applied
 inside the current TUI; it does not restart the interface or interrupt an
@@ -760,8 +776,14 @@ overrides the derived value but remains capped at 32,000 tokens. If one or more
 selected bodies do not fit, loading or restoring the session fails before a
 provider request rather than silently dropping instructions.
 
-Use `zuno debug skill` after restarting to inspect the exact catalog and source
-locations visible to a session. A generic prompt such
+Use `zuno debug skill` after restarting to inspect raw discovery. Its object
+explicitly reports `view.kind: "raw_discovery"`,
+`agentFiltered: false`, and `extensionOverlayApplied: false`; the `skills` array
+preserves same-name entries from different sources, while `summary` reports
+source/described/unique counts and ambiguous names. Use
+`zuno debug agent <name>` for the effective Agent-filtered view, including
+metadata and selected-body budgets, rendered/omitted/truncated coverage, and a
+bounded 50-entry preview. A generic prompt such
 as "follow skill guidance" does not select every skill; a skill is loaded only
 when its name is explicit or its description clearly matches the request.
 

@@ -22,6 +22,14 @@ enum ConnectBehavior {
     Never,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscoveryBehavior {
+    Immediate,
+    FailTools,
+    BlockTools,
+    FailPrompts,
+}
+
 struct FakeConnector {
     behavior: ConnectBehavior,
     calls: AtomicUsize,
@@ -33,13 +41,17 @@ struct FakeConnector {
 
 impl FakeConnector {
     fn new(behavior: ConnectBehavior) -> Arc<Self> {
+        Self::with_discovery(behavior, DiscoveryBehavior::Immediate)
+    }
+
+    fn with_discovery(behavior: ConnectBehavior, discovery: DiscoveryBehavior) -> Arc<Self> {
         Arc::new(Self {
             behavior,
             calls: AtomicUsize::new(0),
             started: Notify::new(),
             release: Notify::new(),
             cancelled: Arc::new(AtomicBool::new(false)),
-            connection: Arc::new(FakeConnection::new()),
+            connection: Arc::new(FakeConnection::new(discovery)),
         })
     }
 
@@ -90,9 +102,14 @@ struct FakeConnection {
 }
 
 impl FakeConnection {
-    fn new() -> Self {
+    fn new(discovery: DiscoveryBehavior) -> Self {
         Self {
-            server: Arc::new(FakeServer),
+            server: Arc::new(FakeServer {
+                discovery,
+                calls: AtomicUsize::new(0),
+                started: Notify::new(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
             child_alive: AtomicBool::new(true),
             close_calls: AtomicUsize::new(0),
         }
@@ -111,7 +128,20 @@ impl McpConnection for FakeConnection {
     }
 }
 
-struct FakeServer;
+struct FakeServer {
+    discovery: DiscoveryBehavior,
+    calls: AtomicUsize,
+    started: Notify,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl FakeServer {
+    async fn wait_until_started(&self) {
+        while self.calls.load(Ordering::SeqCst) == 0 {
+            self.started.notified().await;
+        }
+    }
+}
 
 #[async_trait]
 impl ConnectedServer for FakeServer {
@@ -124,11 +154,23 @@ impl ConnectedServer for FakeServer {
     }
 
     fn supports_prompts(&self) -> bool {
-        false
+        self.discovery == DiscoveryBehavior::FailPrompts
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolDefinition>, McpError> {
-        Ok(Vec::new())
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_waiters();
+        match self.discovery {
+            DiscoveryBehavior::FailTools => Err(discovery_error("tools/list failed")),
+            DiscoveryBehavior::BlockTools => {
+                let _probe = CancelProbe {
+                    cancelled: Arc::clone(&self.cancelled),
+                    armed: true,
+                };
+                pending::<Result<Vec<ToolDefinition>, McpError>>().await
+            }
+            DiscoveryBehavior::Immediate | DiscoveryBehavior::FailPrompts => Ok(Vec::new()),
+        }
     }
 
     async fn call_tool(
@@ -152,7 +194,18 @@ impl ConnectedServer for FakeServer {
     }
 
     async fn list_prompts(&self) -> Result<Vec<PromptDefinition>, McpError> {
-        Ok(Vec::new())
+        if self.discovery == DiscoveryBehavior::FailPrompts {
+            Err(discovery_error("prompts/list failed"))
+        } else {
+            Ok(Vec::new())
+        }
+    }
+}
+
+fn discovery_error(message: &str) -> McpError {
+    McpError::Handshake {
+        server: SERVER.to_owned(),
+        source: Box::new(std::io::Error::other(message.to_owned())),
     }
 }
 
@@ -300,6 +353,80 @@ async fn disabling_a_local_connection_terminates_its_child() {
     controller.disable(SERVER).await.expect("disable");
 
     assert!(!connector.connection.child_alive.load(Ordering::SeqCst));
+    assert_eq!(connector.connection.close_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn initial_tools_failure_closes_the_connected_transport() {
+    let connector =
+        FakeConnector::with_discovery(ConnectBehavior::Immediate, DiscoveryBehavior::FailTools);
+    let controller = controller(connector.clone(), Duration::from_secs(1));
+
+    let snapshot = controller.enable(SERVER).await.expect("enable result");
+
+    assert!(matches!(
+        snapshot.state,
+        McpServerState::Failed { ref error } if error.contains("initial tools/list failed")
+    ));
+    assert_eq!(connector.connection.close_calls.load(Ordering::SeqCst), 1);
+    assert!(!connector.connection.child_alive.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn initial_prompts_failure_closes_the_connected_transport() {
+    let connector =
+        FakeConnector::with_discovery(ConnectBehavior::Immediate, DiscoveryBehavior::FailPrompts);
+    let controller = controller(connector.clone(), Duration::from_secs(1));
+
+    let snapshot = controller.enable(SERVER).await.expect("enable result");
+
+    assert!(matches!(
+        snapshot.state,
+        McpServerState::Failed { ref error } if error.contains("initial prompts/list failed")
+    ));
+    assert_eq!(connector.connection.close_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn disable_during_initial_discovery_closes_the_connected_transport() {
+    let connector =
+        FakeConnector::with_discovery(ConnectBehavior::Immediate, DiscoveryBehavior::BlockTools);
+    let controller = controller(connector.clone(), Duration::from_secs(1));
+    let enabling = tokio::spawn({
+        let controller = controller.clone();
+        async move { controller.enable(SERVER).await }
+    });
+    connector.connection.server.wait_until_started().await;
+
+    let disabled = controller.disable(SERVER).await.expect("disable");
+    let enabled = enabling.await.expect("enable task").expect("enable result");
+
+    assert_eq!(disabled.state, McpServerState::Disabled);
+    assert_eq!(enabled.state, McpServerState::Disabled);
+    assert!(connector.connection.server.cancelled.load(Ordering::SeqCst));
+    assert_eq!(connector.connection.close_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_discovery_timeout_closes_the_connected_transport() {
+    let connector =
+        FakeConnector::with_discovery(ConnectBehavior::Immediate, DiscoveryBehavior::BlockTools);
+    let controller = controller(connector.clone(), Duration::from_secs(5));
+    let enabling = tokio::spawn({
+        let controller = controller.clone();
+        async move { controller.enable(SERVER).await }
+    });
+    connector.connection.server.wait_until_started().await;
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    let snapshot = enabling.await.expect("enable task").expect("enable result");
+
+    assert!(matches!(
+        snapshot.state,
+        McpServerState::Failed { ref error } if error.contains("initial discovery timed out")
+    ));
+    assert!(connector.connection.server.cancelled.load(Ordering::SeqCst));
     assert_eq!(connector.connection.close_calls.load(Ordering::SeqCst), 1);
 }
 

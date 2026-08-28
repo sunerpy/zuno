@@ -105,6 +105,17 @@ impl ToolRegistryDispatcher {
         self
     }
 
+    /// Whether one tool is present after the effective permission visibility rules.
+    ///
+    /// Host policy uses this before a provider request to avoid promising durable
+    /// state the active Agent cannot actually update.
+    #[must_use]
+    pub fn has_visible_tool(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.id() == name && is_tool_visible(tool.id(), &self.rules))
+    }
+
     fn visible_definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()

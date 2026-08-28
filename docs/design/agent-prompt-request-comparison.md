@@ -233,6 +233,7 @@ zuno debug prompt --session <session>
 zuno debug prompt --session <session> --step <non-zero>
 zuno debug prompt --show-sensitive
 zuno debug agent <name>
+zuno debug sandbox --mode workspace-write --network deny --check
 ```
 
 Model-visible bodies are redacted unless `--show-sensitive` is present.
@@ -243,12 +244,12 @@ sequence A → B → A correctly reuses and references A's receipt.
 
 `debug agent` uses the same read-only config, extension, model, reasoning,
 permission, Skill, delegation, parent-authority, and sandbox-policy resolution
-as a real `TurnPlan`. It does not create a session, start a provider, connect
-MCP, or reveal credentials. Configured MCP servers are therefore reported as
-`not-connected`; inheritance remains unresolved until concrete tool ids exist,
-so diagnostics never probe an exact allowlist or parent authority with a
-fabricated id. Historical final tool schemas must be read from the matching
-provider request/receipt rather than inferred from current configuration.
+as a real `TurnPlan`. It does not create a session, start a provider, or reveal
+credentials. It does reuse the formal MCP runtime: enabled servers are connected,
+their exact provider-visible schemas are checked against role policy, allowlists,
+and parent schema authority, and every transport is closed before return.
+Historical final tool schemas must still be read from the matching provider
+request/receipt rather than inferred from current configuration.
 
 The receipt also does not yet persist a complete redacted manifest of the final
 provider HTTP body and tool-schema wire order.

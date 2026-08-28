@@ -199,6 +199,83 @@ pub struct SandboxCapabilities {
     pub network_isolation: bool,
 }
 
+/// Host executable identity used to decide whether a sandbox launcher is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxExecutableIdentity {
+    pub path: PathBuf,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub mode: Option<u32>,
+    pub device: Option<u64>,
+    pub inode: Option<u64>,
+    pub root_owned: Option<bool>,
+    pub group_or_world_writable: Option<bool>,
+    pub special_permissions: Option<bool>,
+}
+
+/// Result of one staged sandbox deployment check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxDeploymentCheck {
+    pub name: String,
+    pub status: SandboxDeploymentCheckStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl SandboxDeploymentCheck {
+    fn passed(name: impl Into<String>, detail: impl Into<Option<String>>) -> Self {
+        Self {
+            name: name.into(),
+            status: SandboxDeploymentCheckStatus::Passed,
+            detail: detail.into(),
+        }
+    }
+
+    fn failed(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: SandboxDeploymentCheckStatus::Failed,
+            detail: Some(detail.into()),
+        }
+    }
+
+    fn skipped(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: SandboxDeploymentCheckStatus::Skipped,
+            detail: Some(detail.into()),
+        }
+    }
+}
+
+/// Stable status spelling for one deployment check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxDeploymentCheckStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+/// Active deployment check for one requested sandbox policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxDeploymentReport {
+    pub platform: String,
+    pub architecture: String,
+    pub workspace: PathBuf,
+    pub requested_mode: SandboxMode,
+    pub network: NetworkAccess,
+    pub ready: bool,
+    pub native_execution_bypass: bool,
+    pub capabilities: Option<SandboxCapabilities>,
+    pub launcher: Option<SandboxExecutableIdentity>,
+    pub checks: Vec<SandboxDeploymentCheck>,
+    pub error: Option<String>,
+}
+
 impl SandboxCapabilities {
     /// Whether this backend can faithfully compile `policy`.
     pub fn supports(&self, policy: &SandboxPolicy) -> Result<(), SandboxError> {
@@ -345,6 +422,15 @@ pub trait SandboxBackend: Send + Sync {
 
     /// Compiles and validates one command. There is no unrestricted fallback.
     fn prepare(&self, request: PrepareRequest) -> Result<PreparedCommand, SandboxError>;
+
+    /// Proves that the requested policy reaches the backend's real execution boundary.
+    ///
+    /// Native full access has no confinement chain to exercise, so the default only
+    /// verifies capability support. Confining backends override this and execute a
+    /// bounded no-op through the same launcher and first-party helper used by commands.
+    fn verify_deployment(&self, policy: &SandboxPolicy) -> Result<(), SandboxError> {
+        self.capabilities().supports(policy)
+    }
 }
 
 /// Explicit unconfined backend used only for [`SandboxMode::DangerFullAccess`].
@@ -420,6 +506,188 @@ pub fn system_backend(
         Err(SandboxError::UnsupportedPlatform(
             std::env::consts::OS.to_owned(),
         ))
+    }
+}
+
+/// Probe the exact backend and policy a host deployment would use.
+///
+/// Restricted modes exercise launcher trust, required bubblewrap options,
+/// namespaces, and seccomp compilation through [`system_backend`]. The
+/// `danger-full-access` result is explicitly marked as a native-execution bypass;
+/// it is not evidence that bubblewrap is deployable.
+#[must_use]
+pub fn deployment_report(
+    workspace: &Path,
+    mode: SandboxMode,
+    network: NetworkAccess,
+) -> SandboxDeploymentReport {
+    let mut report = SandboxDeploymentReport {
+        platform: std::env::consts::OS.to_owned(),
+        architecture: std::env::consts::ARCH.to_owned(),
+        workspace: workspace.to_owned(),
+        requested_mode: mode,
+        network,
+        ready: false,
+        native_execution_bypass: mode == SandboxMode::DangerFullAccess,
+        capabilities: None,
+        launcher: None,
+        checks: Vec::new(),
+        error: None,
+    };
+    let policy = match SandboxPolicy::new(workspace, mode, network) {
+        Ok(policy) => {
+            report.checks.push(SandboxDeploymentCheck::passed(
+                "policy",
+                Some("the requested mode and network authority form a valid policy".to_owned()),
+            ));
+            policy
+        }
+        Err(error) => {
+            report
+                .checks
+                .push(SandboxDeploymentCheck::failed("policy", error.to_string()));
+            report.error = Some(error.to_string());
+            return report;
+        }
+    };
+    report.workspace = policy.workspace().to_owned();
+
+    #[cfg(target_os = "linux")]
+    if mode != SandboxMode::DangerFullAccess {
+        match linux::trusted_bubblewrap_path(policy.workspace()) {
+            Ok(path) => {
+                report.launcher = Some(executable_identity(&path));
+                report.checks.push(SandboxDeploymentCheck::passed(
+                    "launcher_trust",
+                    Some(format!(
+                        "`{}` is root-owned, immutable to non-root users, has no special bits or \
+                         file capabilities, and every ancestor is trusted",
+                        path.display()
+                    )),
+                ));
+            }
+            Err(error) => {
+                if let SandboxError::UntrustedBubblewrap { path, .. } = &error {
+                    report.launcher = Some(executable_identity(path));
+                }
+                report.checks.push(SandboxDeploymentCheck::failed(
+                    "launcher_trust",
+                    error.to_string(),
+                ));
+                report.error = Some(error.to_string());
+                return report;
+            }
+        }
+    }
+
+    if mode == SandboxMode::DangerFullAccess {
+        report.checks.push(SandboxDeploymentCheck::skipped(
+            "launcher_trust",
+            "danger-full-access intentionally bypasses OS confinement",
+        ));
+    }
+
+    match system_backend(policy.workspace(), mode) {
+        Ok(backend) => {
+            let capabilities = backend.capabilities();
+            if report.launcher.is_none() {
+                report.launcher = capabilities.executable.as_deref().map(executable_identity);
+            }
+            report.capabilities = Some(capabilities.clone());
+            report.checks.push(SandboxDeploymentCheck::passed(
+                "backend_discovery",
+                Some(format!("selected `{}`", capabilities.backend)),
+            ));
+            if let Err(error) = capabilities.supports(&policy) {
+                report.checks.push(SandboxDeploymentCheck::failed(
+                    "policy_support",
+                    error.to_string(),
+                ));
+                report.error = Some(error.to_string());
+                return report;
+            }
+            report.checks.push(SandboxDeploymentCheck::passed(
+                "policy_support",
+                Some("the backend advertises every requested capability".to_owned()),
+            ));
+            if let Err(error) = backend.verify_deployment(&policy) {
+                report.checks.push(SandboxDeploymentCheck::failed(
+                    "execution_self_test",
+                    error.to_string(),
+                ));
+                report.error = Some(error.to_string());
+                return report;
+            }
+            report
+                .checks
+                .push(if mode == SandboxMode::DangerFullAccess {
+                    SandboxDeploymentCheck::skipped(
+                        "execution_self_test",
+                        "native execution has no confinement helper to exercise",
+                    )
+                } else {
+                    SandboxDeploymentCheck::passed(
+                        "execution_self_test",
+                        Some(
+                            "a no-op completed through bubblewrap, capability drop, \
+                         PR_SET_NO_NEW_PRIVS, and seccomp"
+                                .to_owned(),
+                        ),
+                    )
+                });
+            report.ready = true;
+        }
+        Err(error) => {
+            report.checks.push(SandboxDeploymentCheck::failed(
+                "backend_discovery",
+                error.to_string(),
+            ));
+            report.error = Some(error.to_string());
+        }
+    }
+    report
+}
+
+fn executable_identity(path: &Path) -> SandboxExecutableIdentity {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let metadata = std::fs::metadata(&canonical).ok();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let uid = metadata.as_ref().map(std::fs::Metadata::uid);
+        let gid = metadata.as_ref().map(std::fs::Metadata::gid);
+        let device = metadata.as_ref().map(std::fs::Metadata::dev);
+        let inode = metadata.as_ref().map(std::fs::Metadata::ino);
+        let mode = metadata
+            .as_ref()
+            .map(|metadata| metadata.permissions().mode());
+        SandboxExecutableIdentity {
+            path: canonical,
+            uid,
+            gid,
+            mode,
+            device,
+            inode,
+            root_owned: uid.map(|uid| uid == 0),
+            group_or_world_writable: mode.map(|mode| mode & 0o022 != 0),
+            special_permissions: mode.map(|mode| mode & 0o7000 != 0),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _metadata = metadata;
+        SandboxExecutableIdentity {
+            path: canonical,
+            uid: None,
+            gid: None,
+            mode: None,
+            device: None,
+            inode: None,
+            root_owned: None,
+            group_or_world_writable: None,
+            special_permissions: None,
+        }
     }
 }
 
@@ -660,6 +928,29 @@ mod tests {
             .prepare(request)
             .expect_err("the unconfined backend must reject confined policy");
         assert!(matches!(error, SandboxError::UnsupportedPolicy { .. }));
+    }
+
+    #[test]
+    fn full_access_deployment_report_is_explicitly_marked_as_a_native_bypass() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let report = deployment_report(
+            workspace.path(),
+            SandboxMode::DangerFullAccess,
+            NetworkAccess::Allowed,
+        );
+
+        assert!(report.ready);
+        assert!(report.native_execution_bypass);
+        assert!(report.launcher.is_none());
+        assert!(report.error.is_none());
+        assert!(report.checks.iter().any(|check| {
+            check.name == "launcher_trust" && check.status == SandboxDeploymentCheckStatus::Skipped
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "execution_self_test"
+                && check.status == SandboxDeploymentCheckStatus::Skipped
+        }));
     }
 
     #[cfg(unix)]

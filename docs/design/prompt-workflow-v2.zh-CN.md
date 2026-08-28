@@ -563,15 +563,22 @@ side effect，并在同一事务内替换未消费的 uncertain report。
 
 ### 9.1 何时维护 Plan
 
-以下任一条件成立时维护 durable plan：
+宿主在第一次 provider request 之前执行统一分类：
 
-- 至少三个有依赖的有意义步骤；
-- 跨 crate / 跨组件修改；
-- 包含委派；
-- 多阶段验收；
-- 用户明确要求 Plan。
+- 用户输入或已解析 command 可以创建 Plan；child report、steering、retry 只能继续
+  既有状态，不能自行创建新 Plan；
+- 已有 active durable Plan：继续维护；
+- 已完成的 Plan 遇到新的多阶段用户目标：保留已完成 step，追加带新 epoch id 的
+  steps；
+- 直接回答、一次有界读取、一次短小的既有变更 commit：允许原子执行；
+- 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
+  输入：进入 planned path；
+- 其他工程请求：创建 Agent 对应的轻量 seed Plan。
 
-单一提交、单一局部修复、直接回答和简单诊断不强制创建 Plan。
+这使调研、修改、验证组成的普通多阶段工作默认可见，并确保跨组件、委派、多阶段
+验收及可能压缩/中断恢复的工作维护 durable Plan。模型负责精炼，不负责决定是否
+跳过 Plan。精炼必须保留已有 step id 和 completed 状态，可更新标题/状态或追加
+step。Todo 是 step 下的可选细化，不要求机械一一对应。
 
 ### 9.2 执行波次
 
@@ -668,14 +675,19 @@ zuno debug agent <name>
 - Prompt policy digest；
 - 所有 resolution diagnostics。
 
-由于该命令不连接 MCP，MCP 继承状态必须输出 `not-connected`/未解析，并说明实际
-tool id 会在实时连接后逐个与角色权限、Agent allowlist 和 parent authority 取交集。
-不得构造虚假 tool id 来输出一个看似确定的布尔值。
+该命令复用正式 `McpRuntime` 主动连接 enabled server，输出 lifecycle state、
+discovery status、connected servers、精确当前 tool schema、连接 warning 和
+cleanup warning。连接成功后的 discovery 失败、取消或超时也必须执行有界 close。
+当前根 Agent 诊断逐个应用角色权限和 Agent allowlist；根诊断没有 parent Attempt，
+不得构造虚假的 parent schema authority。委派历史的最终 authority 必须从对应
+Attempt 的持久化 orchestration snapshot 读取。未配置 MCP 时才输出
+`not-connected`，不得构造虚假 tool id。
 
 不得：
 
 - 创建 session；
-- 启动 provider、MCP 或 plugin process；
+- 启动 provider 或发出模型请求；
+- 把 MCP transport 留在后台；所有诊断连接必须在返回前清理；
 - 改变 sandbox 状态；允许无副作用的本地 readiness 检查；
 - 输出 credential、环境变量值或敏感 header；
 - 保留必然报错的 `--tool` / `--params`。
@@ -845,7 +857,8 @@ git diff --check
 5. typed `DelegationContract`、host-generated `TaskReportMetadata`、父子能力交集、
    前后台统一 logical task 去重、child+Job 原子 admission、每次委派 evidence
    游标、evidenced `job_reconcile`、Job/Goal barrier、同一 SQL snapshot 生成的
-   16 KiB `runtime.work_state`、无默认 step 上限和两个 debug 命令已落地。
+   16 KiB `runtime.work_state`、无默认 step 上限、宿主 Plan 分类器和两个 debug
+   命令已落地。
 6. GPT 5.6 Sol / Claude Opus 5 已分别完成原子任务、深度 Debug、并行委派和
    Plan-only E2E；最终 gate 结果和剩余风险以
    [验收审计](../audits/prompt-workflow-v2-validation-2026-08-28.zh-CN.md) 为准。
@@ -853,3 +866,8 @@ git diff --check
    child report 可从数据库一致回放到 TUI、ACP 与 CLI。
 8. 上游只作为 adopt/adapt/reject 的设计来源，不复制完整 Prompt 或专属工作流。
 9. `ui-design` 保持 Skill；`dual-review`、`auto-release` 保持用户自定义。
+10. `zuno run --variant`/`--thinking` 在 provider I/O 前解析并校验；
+    named-only variant catalog 不会获得推断出的 canonical effort；
+    `debug agent` 连接实时 MCP 并有界清理；
+    `debug sandbox --check` 通过真实 helper 执行验证宿主部署；大量全局 Skill
+    以 raw discovery、effective Agent view、预算、覆盖率、歧义统计和有界预览呈现。

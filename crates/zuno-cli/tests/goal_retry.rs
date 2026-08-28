@@ -136,6 +136,20 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
         .respond(transient_failure())
         .respond(transient_failure())
         .respond(tool_response(
+            "complete-plan",
+            "plan_update",
+            json!({
+                "expected_revision": 1,
+                "title": "Complete durable recovery probe",
+                "steps": [
+                    {"id":"investigate","title":"Inspect the recovery state","status":"completed"},
+                    {"id":"execute","title":"Run the recovery attempt","status":"completed"},
+                    {"id":"integrate","title":"Reconcile the durable state","status":"completed"},
+                    {"id":"verify","title":"Verify automatic completion","status":"completed"}
+                ]
+            }),
+        ))
+        .respond(tool_response(
             "complete-goal",
             "goal_update",
             json!({
@@ -207,8 +221,8 @@ async fn active_goal_survives_request_retry_exhaustion_and_completes_automatical
     assert!(stdout.contains("GOAL-RECOVERED"), "{stdout}");
     assert_eq!(
         provider.captured_count().await,
-        7,
-        "title, goal creation, three request attempts, completion, and final answer"
+        8,
+        "title, goal creation, three request attempts, plan completion, goal completion, and final answer"
     );
 
     let retry_request = provider

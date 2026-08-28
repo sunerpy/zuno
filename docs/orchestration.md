@@ -630,8 +630,11 @@ Useful inspection commands are:
 # Resolved Agent catalog and effective capability rules.
 zuno agent list
 
-# One Agent's catalog definition.
+# One Agent's resolved model, permissions, live MCP tools, Skill budgets, and sandbox.
 zuno debug agent orchestrator
+
+# Verify the restricted Linux sandbox deployment.
+zuno debug sandbox --mode workspace-write --network deny --check
 
 # Merged, validated configuration and source layers.
 zuno debug config

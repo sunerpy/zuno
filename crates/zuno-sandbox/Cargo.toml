@@ -17,7 +17,7 @@ thiserror = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
-rustix = { workspace = true, features = ["thread"] }
+rustix = { workspace = true, features = ["fs", "thread"] }
 seccompiler = { workspace = true }
 
 [dev-dependencies]

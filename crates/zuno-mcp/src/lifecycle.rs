@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{Notify, broadcast, watch};
+use tokio::time::Instant;
 use zuno_config::schema::mcp::McpServerConfig;
 
 use crate::{
@@ -437,39 +438,35 @@ impl McpServerController {
             .connector
             .connect_timeout(&server)
             .unwrap_or(self.inner.options.connect_timeout);
-        let activation = activate(Arc::clone(&self.inner.connector), &server);
+        let started = Instant::now();
+        let connection = self.inner.connector.connect(&server);
         let result = tokio::select! {
             biased;
             changed = cancel.changed() => {
                 let _closed = changed;
                 ConnectResult::Cancelled
             }
-            result = tokio::time::timeout(timeout, activation) => match result {
+            result = tokio::time::timeout(timeout, connection) => match result {
                 Ok(result) => ConnectResult::Completed(result),
                 Err(_) => ConnectResult::TimedOut(timeout),
             },
         };
 
         match result {
-            ConnectResult::Completed(Ok(Activated::Connected {
-                connection,
-                server: connected,
-                tools,
-                prompts,
-            })) => {
-                if self.should_install(&server, generation) {
-                    self.finish_connected(
-                        &server, generation, connection, connected, tools, prompts,
-                    );
-                } else {
-                    self.close_connection(connection).await;
-                    self.finish_state(&server, generation, McpServerState::Disabled);
-                }
+            ConnectResult::Completed(Ok(McpConnectOutcome::Connected(connection))) => {
+                self.run_discovery(
+                    server,
+                    generation,
+                    connection,
+                    cancel,
+                    timeout.saturating_sub(started.elapsed()),
+                )
+                .await;
             }
-            ConnectResult::Completed(Ok(Activated::NeedsAuth)) => {
+            ConnectResult::Completed(Ok(McpConnectOutcome::NeedsAuth)) => {
                 self.finish_state(&server, generation, McpServerState::NeedsAuth);
             }
-            ConnectResult::Completed(Ok(Activated::NeedsClientRegistration { error })) => {
+            ConnectResult::Completed(Ok(McpConnectOutcome::NeedsClientRegistration { error })) => {
                 self.finish_state(
                     &server,
                     generation,
@@ -489,6 +486,62 @@ impl McpServerController {
                 );
             }
             ConnectResult::Cancelled => {
+                self.finish_state(&server, generation, McpServerState::Disabled);
+            }
+        }
+    }
+
+    async fn run_discovery(
+        &self,
+        server: String,
+        generation: u64,
+        connection: Arc<dyn McpConnection>,
+        mut cancel: watch::Receiver<bool>,
+        timeout: Duration,
+    ) {
+        let activation = activate(Arc::clone(&connection), &server);
+        let result = tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                let _closed = changed;
+                ActivationResult::Cancelled
+            }
+            result = tokio::time::timeout(timeout, activation) => match result {
+                Ok(result) => ActivationResult::Completed(result),
+                Err(_) => ActivationResult::TimedOut(timeout),
+            },
+        };
+        match result {
+            ActivationResult::Completed(Ok(Activated {
+                server: connected,
+                tools,
+                prompts,
+            })) => {
+                if self.should_install(&server, generation) {
+                    self.finish_connected(
+                        &server, generation, connection, connected, tools, prompts,
+                    );
+                } else {
+                    self.close_connection(connection).await;
+                    self.finish_state(&server, generation, McpServerState::Disabled);
+                }
+            }
+            ActivationResult::Completed(Err(error)) => {
+                self.close_connection(connection).await;
+                self.finish_state(&server, generation, McpServerState::Failed { error });
+            }
+            ActivationResult::TimedOut(elapsed) => {
+                self.close_connection(connection).await;
+                self.finish_state(
+                    &server,
+                    generation,
+                    McpServerState::Failed {
+                        error: format!("initial discovery timed out after {elapsed:?}"),
+                    },
+                );
+            }
+            ActivationResult::Cancelled => {
+                self.close_connection(connection).await;
                 self.finish_state(&server, generation, McpServerState::Disabled);
             }
         }
@@ -662,63 +715,52 @@ fn target_reached(state: &McpServerState, enabled: bool) -> bool {
     }
 }
 
-enum Activated {
-    Connected {
-        connection: Arc<dyn McpConnection>,
-        server: Arc<dyn ConnectedServer>,
-        tools: Vec<ToolDefinition>,
-        prompts: Vec<PromptDefinition>,
-    },
-    NeedsAuth,
-    NeedsClientRegistration {
-        error: String,
-    },
+struct Activated {
+    server: Arc<dyn ConnectedServer>,
+    tools: Vec<ToolDefinition>,
+    prompts: Vec<PromptDefinition>,
 }
 
 enum ConnectResult {
+    Completed(Result<McpConnectOutcome, String>),
+    TimedOut(Duration),
+    Cancelled,
+}
+
+enum ActivationResult {
     Completed(Result<Activated, String>),
     TimedOut(Duration),
     Cancelled,
 }
 
 async fn activate(
-    connector: Arc<dyn McpConnector>,
+    connection: Arc<dyn McpConnection>,
     expected_server: &str,
 ) -> Result<Activated, String> {
-    match connector.connect(expected_server).await? {
-        McpConnectOutcome::Connected(connection) => {
-            let server = connection.server();
-            if server.server_name() != expected_server {
-                connection.close().await;
-                return Err(format!(
-                    "connector returned server {:?} for configured server {expected_server:?}",
-                    server.server_name()
-                ));
-            }
-            let tools = server
-                .list_tools()
-                .await
-                .map_err(|error| format!("initial tools/list failed: {error}"))?;
-            let prompts = if server.supports_prompts() {
-                server
-                    .list_prompts()
-                    .await
-                    .map_err(|error| format!("initial prompts/list failed: {error}"))?
-            } else {
-                Vec::new()
-            };
-            Ok(Activated::Connected {
-                connection,
-                server,
-                tools,
-                prompts,
-            })
-        }
-        McpConnectOutcome::NeedsAuth => Ok(Activated::NeedsAuth),
-        McpConnectOutcome::NeedsClientRegistration { error } => {
-            Ok(Activated::NeedsClientRegistration { error })
-        }
+    let server = connection.server();
+    if server.server_name() != expected_server {
+        return Err(format!(
+            "connector returned server {:?} for configured server {expected_server:?}",
+            server.server_name()
+        ));
     }
+    let tools = server
+        .list_tools()
+        .await
+        .map_err(|error| format!("initial tools/list failed: {error}"))?;
+    let prompts = if server.supports_prompts() {
+        server
+            .list_prompts()
+            .await
+            .map_err(|error| format!("initial prompts/list failed: {error}"))?
+    } else {
+        Vec::new()
+    };
+    Ok(Activated {
+        server,
+        tools,
+        prompts,
+    })
 }
 
 struct ConfiguredConnector {
