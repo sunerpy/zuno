@@ -159,6 +159,8 @@ fn risk_wrappers_and_shell_spelling_cannot_hide_a_catastrophic_command() {
         "'r''m' -rf /",
         "sudo -u root rm -rf /",
         "env SAFE=1 timeout 1s rm -rf /",
+        "env -S 'rm -rf /'",
+        "env --split-string='rm -rf /'",
         "timeout 1d rm -rf /",
         "chroot /mnt /bin/rm -rf /",
         "bash -lc 'rm -rf /'",
@@ -229,6 +231,25 @@ fn risk_benign_command_is_never_gated() {
         "cat ~/.ssh/id_rsa",
     ] {
         assert_eq!(risk_gate(command), GateOutcome::Allow);
+    }
+}
+
+#[test]
+fn risk_env_without_a_child_command_is_a_safe_environment_query() {
+    for command in [
+        "env",
+        "env -0",
+        "env --ignore-environment",
+        "env SAFE=1",
+        "env -i SAFE=1 OTHER=two",
+        "env --unset SECRET SAFE=1",
+        "env -u SECRET -- SAFE=1",
+    ] {
+        assert_eq!(
+            risk_gate(command),
+            GateOutcome::Allow,
+            "environment-only invocation must not be mistaken for an unknown child command: {command:?}"
+        );
     }
 }
 

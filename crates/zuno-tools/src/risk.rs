@@ -456,6 +456,12 @@ fn assess_resource(
     if program == "su" {
         return assess_su_script(tokens, syntax, context, depth, findings);
     }
+    if let Some(script) = env_split_script(tokens) {
+        return assess_embedded_script(&script, syntax, context, depth, "env -S", findings);
+    }
+    if env_without_child_command(tokens) {
+        return Ok(());
+    }
 
     let (tokens, wrapper) = unwrap_wrappers(tokens);
     let Some(program) = tokens.first().map(|token| command_name(token)) else {
@@ -510,6 +516,87 @@ fn assess_resource(
         assess_destructive_target(&target, context, absent_temp_file_cleanup, findings);
     }
     Ok(())
+}
+
+fn env_without_child_command(tokens: &[String]) -> bool {
+    if tokens
+        .first()
+        .is_none_or(|token| command_name(token) != "env")
+    {
+        return false;
+    }
+
+    let mut index = 1;
+    let mut options = true;
+    while let Some(token) = tokens.get(index) {
+        let token = unquote(token);
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && matches!(token.as_str(), "-S" | "--split-string") {
+            return false;
+        }
+        if options && token.starts_with("--split-string=") {
+            return false;
+        }
+        if options && token.starts_with('-') {
+            index += 1;
+            if wrapper_option_consumes_value(Some("env"), &token) && tokens.get(index).is_some() {
+                index += 1;
+            }
+            continue;
+        }
+        if token.contains('=') {
+            index += 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn env_split_script(tokens: &[String]) -> Option<Vec<String>> {
+    if tokens
+        .first()
+        .is_none_or(|token| command_name(token) != "env")
+    {
+        return None;
+    }
+
+    let mut index = 1;
+    while let Some(token) = tokens.get(index) {
+        let token = unquote(token);
+        let split = match token.as_str() {
+            "-S" | "--split-string" => tokens.get(index + 1).map(|value| (value.clone(), 2)),
+            _ => token
+                .strip_prefix("--split-string=")
+                .or_else(|| token.strip_prefix("-S").filter(|value| !value.is_empty()))
+                .map(|value| (value.to_owned(), 1)),
+        };
+        if let Some((script, consumed)) = split {
+            let mut embedded = vec![script];
+            embedded.extend_from_slice(&tokens[index + consumed..]);
+            return Some(embedded);
+        }
+        if token == "--" {
+            return None;
+        }
+        if token.starts_with('-') {
+            index += 1;
+            if wrapper_option_consumes_value(Some("env"), &token) && tokens.get(index).is_some() {
+                index += 1;
+            }
+            continue;
+        }
+        if token.contains('=') {
+            index += 1;
+            continue;
+        }
+        return None;
+    }
+    None
 }
 
 fn assess_shell_script(
