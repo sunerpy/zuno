@@ -672,6 +672,48 @@ fn hydrating_500_messages_costs_two_statements_not_501() {
     }
 }
 
+#[test]
+fn part_data_byte_sizes_are_grouped_without_hydrating_json() {
+    let connection = seeded();
+    let store = MessageStore::new(&connection);
+    let message =
+        MessageRecord::from_json(user_message(MESSAGE_ID, 10)).expect("split the message");
+    store
+        .put_message_at(&message, 10)
+        .expect("write the message");
+    for (index, text) in ["small", "a longer payload"].into_iter().enumerate() {
+        let part = PartRecord::from_json(
+            json!({
+                "id": format!("prt_size_{index}"),
+                "sessionID": SESSION_ID,
+                "messageID": MESSAGE_ID,
+                "type": "text",
+                "text": text,
+            }),
+            10 + i64::try_from(index).expect("index fits in i64"),
+        )
+        .expect("split size fixture");
+        store.put_part_at(&part, 10).expect("write size fixture");
+    }
+    let expected = connection
+        .query_row(
+            "SELECT SUM(length(CAST(data AS BLOB))) FROM part WHERE message_id = ?1",
+            [MESSAGE_ID],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query expected byte size");
+    let expected = u64::try_from(expected).expect("part byte size is nonnegative");
+
+    store.reset_query_count();
+    let sizes = store
+        .part_data_bytes_by_message(&[MESSAGE_ID.to_owned(), "msg_missing".to_owned()])
+        .expect("read grouped part sizes");
+
+    assert_eq!(sizes.get(MESSAGE_ID), Some(&expected));
+    assert!(!sizes.contains_key("msg_missing"));
+    assert_eq!(store.query_count(), 1);
+}
+
 /// A writer that must sort last cannot get there from the clock alone.
 ///
 /// `hydration_orders_messages_by_time_then_id_and_parts_by_id` below pins the tie

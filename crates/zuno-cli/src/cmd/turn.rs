@@ -887,6 +887,42 @@ impl TurnPlan {
         &self.skills
     }
 
+    /// Build the command catalogue this resolved plan exposes.
+    ///
+    /// ACP uses the no-MCP form while an existing session is dormant so loading
+    /// history does not connect external servers. A live host calls the same seam
+    /// with its connected MCP catalogue, keeping command precedence identical on
+    /// both sides of activation.
+    pub(crate) fn command_registry(
+        &self,
+        env: &zuno_paths::Env,
+        mcp: Option<&zuno_mcp::Catalog>,
+    ) -> Result<zuno_catalog::command::Registry, String> {
+        let worktree = self
+            .project
+            .vcs
+            .as_ref()
+            .map(|_| self.project.directory.as_path());
+        let command_root = worktree.unwrap_or(&self.directory).to_string_lossy();
+        let discovered =
+            zuno_catalog::command::load_map(&self.directory, worktree, env).map_err(to_string)?;
+        let configured = match self.config.command.as_ref() {
+            Some(config) => {
+                zuno_catalog::command::merge_command_maps(&discovered, config).map_err(to_string)?
+            }
+            None => discovered,
+        };
+        let extensions =
+            zuno_catalog::command::merge_command_maps(&configured, self.extensions.workflows())
+                .map_err(to_string)?;
+        let mcp_prompts = mcp.map_or_else(Vec::new, zuno_mcp::Catalog::prompts);
+        Ok(zuno_catalog::command::Registry::build(
+            &zuno_catalog::command::Sources::new(&command_root)
+                .with_config(Some(&extensions))
+                .with_mcp_prompts(&mcp_prompts),
+        ))
+    }
+
     /// Every model the catalog offers, in the order `zuno models` prints them.
     ///
     /// Kept from resolution rather than re-derived: rebuilding the catalog means reading
@@ -2104,6 +2140,7 @@ impl TurnHost {
         };
         let skill_context_window = plan.window.context;
         let skill_config = plan.config.skills.clone();
+        let commands = plan.command_registry(env, mcp.as_ref());
         let profile_runtime = HarnessRuntime::new("profile");
         let profile = plan.profile;
         if let Err(error) = profile_runtime.activate_profile(profile).await {
@@ -2168,30 +2205,7 @@ impl TurnHost {
             };
 
             let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
-            let command_worktree = memory_root.to_string_lossy();
-            let discovered_commands =
-                zuno_catalog::command::load_map(&plan.directory, worktree.as_deref(), env)
-                    .map_err(to_string)?;
-            let configured_commands = match plan.config.command.as_ref() {
-                Some(config) => {
-                    zuno_catalog::command::merge_command_maps(&discovered_commands, config)
-                        .map_err(to_string)?
-                }
-                None => discovered_commands,
-            };
-            let extension_commands = zuno_catalog::command::merge_command_maps(
-                &configured_commands,
-                plan.extensions.workflows(),
-            )
-            .map_err(to_string)?;
-            let mcp_prompts = mcp
-                .as_ref()
-                .map_or_else(Vec::new, zuno_mcp::Catalog::prompts);
-            let commands = zuno_catalog::command::Registry::build(
-                &zuno_catalog::command::Sources::new(&command_worktree)
-                    .with_config(Some(&extension_commands))
-                    .with_mcp_prompts(&mcp_prompts),
-            );
+            let commands = commands?;
             let memory_settings = plan.config.resolved_memory();
             let memory_paths = ScopePaths::discover(memory_root);
             configure_resident_memory(&mut plan.resolver, &plan.config, memory_paths.clone())?;

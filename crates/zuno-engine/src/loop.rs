@@ -2440,38 +2440,78 @@ pub fn hydrate_retained_history(
     connection: &Connection,
     session_id: &str,
 ) -> Result<Vec<MessageWithParts>, DbError> {
+    hydrate_retained_history_tail(connection, session_id, usize::MAX, u64::MAX)
+        .map(|history| history.messages)
+}
+
+/// A bounded suffix of the provider-retained durable history.
+///
+/// `omitted` counts messages discarded by the message or part-data byte bounds.
+/// Messages before a successful compaction boundary are already outside the
+/// retained conversation and therefore are not counted as a client-side
+/// omission.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HydratedHistoryTail {
+    pub messages: Vec<MessageWithParts>,
+    pub omitted: usize,
+}
+
+/// Hydrate a suffix bounded by message count and stored part-data bytes.
+///
+/// Message metadata and compaction markers are decoded first. Full part payloads
+/// are hydrated only after the compaction boundary and both caller bounds have
+/// been applied, preventing a replay client from making old or oversized tool
+/// outputs resident merely to discard them afterwards.
+pub fn hydrate_retained_history_tail(
+    connection: &Connection,
+    session_id: &str,
+    maximum_messages: usize,
+    maximum_part_bytes: u64,
+) -> Result<HydratedHistoryTail, DbError> {
     let store = MessageStore::new(connection);
-    let mut messages = store.messages_for_session(session_id)?;
-    if messages.is_empty() {
-        return Ok(Vec::new());
-    }
+    let inclusive_start =
+        if let Some(tail_start_id) = successful_compaction_tail_start(&store, session_id)? {
+            store
+                .find_message(&tail_start_id)?
+                .filter(|message| message.session_id == session_id)
+                .map(|message| (message.time_created, message.id))
+        } else {
+            None
+        };
+    let (messages, omitted) = store.messages_for_session_tail(
+        session_id,
+        inclusive_start
+            .as_ref()
+            .map(|(time_created, id)| (*time_created, id.as_str())),
+        maximum_messages,
+    )?;
+    hydrate_history_tail(&store, messages, omitted, maximum_part_bytes)
+}
 
-    let compaction_parts = store.parts_for_session_by_kind(session_id, PartKind::Compaction)?;
-    let marker = messages.iter().rev().find_map(|message| {
-        compaction_parts
-            .iter()
-            .filter(|part| part.message_id == message.id)
-            .find_map(|part| {
-                part.data
-                    .get("tail_start_id")
-                    .and_then(Value::as_str)
-                    .map(|tail_start_id| (message.id.clone(), tail_start_id.to_owned()))
-            })
-    });
-
-    let Some((marker_id, tail_start_id)) = marker else {
-        return store.hydrate(messages);
+fn successful_compaction_tail_start(
+    store: &MessageStore<'_>,
+    session_id: &str,
+) -> Result<Option<String>, DbError> {
+    let Some(marker) = store.latest_part_for_session_by_kind(session_id, PartKind::Compaction)?
+    else {
+        return Ok(None);
     };
-    let summary_ids = messages
-        .iter()
-        .filter(|message| {
-            message.data.get("parentID").and_then(Value::as_str) == Some(marker_id.as_str())
-                && !message.data.contains_key("error")
-        })
-        .map(|message| message.id.clone())
+    let Some(tail_start_id) = marker
+        .data
+        .get("tail_start_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    let summary_ids = store
+        .messages_for_session_parent(session_id, &marker.message_id)?
+        .into_iter()
+        .filter(|message| !message.data.contains_key("error"))
+        .map(|message| message.id)
         .collect::<Vec<_>>();
     let summary_text = store.parts_by_message_kind(&summary_ids, PartKind::Text)?;
-    let summary_succeeded = summary_ids.iter().any(|id| {
+    let succeeded = summary_ids.iter().any(|id| {
         summary_text.get(id).is_some_and(|parts| {
             parts.iter().any(|part| {
                 part.data
@@ -2481,18 +2521,40 @@ pub fn hydrate_retained_history(
             })
         })
     });
-    if !summary_succeeded {
-        return store.hydrate(messages);
-    }
-    let Some(tail_index) = messages
-        .iter()
-        .position(|message| message.id == tail_start_id)
-    else {
-        return store.hydrate(messages);
-    };
+    Ok(succeeded.then_some(tail_start_id))
+}
 
-    messages.drain(..tail_index);
-    store.hydrate(messages)
+fn hydrate_history_tail(
+    store: &MessageStore<'_>,
+    mut messages: Vec<MessageRecord>,
+    omitted_by_count: usize,
+    maximum_part_bytes: u64,
+) -> Result<HydratedHistoryTail, DbError> {
+    let omitted_by_bytes = if maximum_part_bytes == u64::MAX || messages.is_empty() {
+        0
+    } else {
+        let ids = messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        let sizes = store.part_data_bytes_by_message(&ids)?;
+        let mut bytes = 0_u64;
+        let mut retained_start = messages.len();
+        for (index, message) in messages.iter().enumerate().rev() {
+            let next = bytes.saturating_add(sizes.get(&message.id).copied().unwrap_or(0));
+            if next > maximum_part_bytes {
+                break;
+            }
+            bytes = next;
+            retained_start = index;
+        }
+        messages.drain(..retained_start);
+        retained_start
+    };
+    Ok(HydratedHistoryTail {
+        messages: store.hydrate(messages)?,
+        omitted: omitted_by_count.saturating_add(omitted_by_bytes),
+    })
 }
 
 /// One provider-bound message, and the stored message it was projected from.

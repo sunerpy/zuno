@@ -759,6 +759,121 @@ impl<'conn> MessageStore<'conn> {
         Ok(messages)
     }
 
+    /// A bounded newest suffix of a session, optionally starting at an inclusive cursor.
+    ///
+    /// The returned omission count is relative to the cursor, not the whole
+    /// session. This lets a replay client apply a successful compaction boundary
+    /// before imposing its own message cap without first allocating every message
+    /// metadata row.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Decode`] for a retained row that cannot be decoded;
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn messages_for_session_tail(
+        &self,
+        session_id: &str,
+        inclusive_start: Option<(i64, &str)>,
+        maximum_messages: usize,
+    ) -> Result<(Vec<MessageRecord>, usize), DbError> {
+        if maximum_messages == usize::MAX && inclusive_start.is_none() {
+            return self
+                .messages_for_session(session_id)
+                .map(|messages| (messages, 0));
+        }
+
+        let total = match inclusive_start {
+            Some((time_created, id)) => self
+                .prepare(
+                    "SELECT COUNT(*) FROM message WHERE session_id = ?1 \
+                     AND (time_created > ?2 OR (time_created = ?2 AND id >= ?3))",
+                )?
+                .query_row((session_id, time_created, id), |row| row.get::<_, i64>(0))
+                .map_err(map_error)?,
+            None => self
+                .prepare("SELECT COUNT(*) FROM message WHERE session_id = ?1")?
+                .query_row([session_id], |row| row.get::<_, i64>(0))
+                .map_err(map_error)?,
+        };
+        let total = usize::try_from(total).map_err(|_| DbError::Conflict {
+            table: MESSAGE_TABLE.to_owned(),
+            id: session_id.to_owned(),
+            detail: format!("message count cannot fit usize: {total}"),
+        })?;
+        if maximum_messages == 0 || total == 0 {
+            return Ok((Vec::new(), total));
+        }
+        let limit = i64::try_from(maximum_messages).unwrap_or(i64::MAX);
+        let mut messages = match inclusive_start {
+            Some((time_created, id)) => {
+                let mut statement = self.prepare(
+                    "SELECT id, session_id, time_created, time_updated, data FROM message \
+                     WHERE session_id = ?1 \
+                     AND (time_created > ?2 OR (time_created = ?2 AND id >= ?3)) \
+                     ORDER BY time_created DESC, id DESC LIMIT ?4",
+                )?;
+                let rows = statement
+                    .query_map((session_id, time_created, id, limit), |row| {
+                        Ok(MessageRecord::from_row(row))
+                    })
+                    .map_err(map_error)?;
+                let mut messages = Vec::with_capacity(maximum_messages.min(total));
+                for row in rows {
+                    messages.push(row.map_err(map_error)??);
+                }
+                messages
+            }
+            None => {
+                let mut statement = self.prepare(
+                    "SELECT id, session_id, time_created, time_updated, data FROM message \
+                     WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT ?2",
+                )?;
+                let rows = statement
+                    .query_map((session_id, limit), |row| Ok(MessageRecord::from_row(row)))
+                    .map_err(map_error)?;
+                let mut messages = Vec::with_capacity(maximum_messages.min(total));
+                for row in rows {
+                    messages.push(row.map_err(map_error)??);
+                }
+                messages
+            }
+        };
+        messages.reverse();
+        let omitted = total.saturating_sub(messages.len());
+        Ok((messages, omitted))
+    }
+
+    /// Messages whose durable `parentID` names `parent_id`, oldest first.
+    ///
+    /// JSON filtering stays inside SQLite so compaction validation does not scan
+    /// or decode unrelated session history.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Decode`] for a matching row that cannot be decoded;
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn messages_for_session_parent(
+        &self,
+        session_id: &str,
+        parent_id: &str,
+    ) -> Result<Vec<MessageRecord>, DbError> {
+        let mut statement = self.prepare(
+            "SELECT id, session_id, time_created, time_updated, data FROM message \
+             WHERE session_id = ?1 AND json_extract(data, '$.parentID') = ?2 \
+             ORDER BY time_created ASC, id ASC",
+        )?;
+        let rows = statement
+            .query_map((session_id, parent_id), |row| {
+                Ok(MessageRecord::from_row(row))
+            })
+            .map_err(map_error)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row.map_err(map_error)??);
+        }
+        Ok(messages)
+    }
+
     pub fn messages_by_id(&self, message_ids: &[String]) -> Result<Vec<MessageRecord>, DbError> {
         if message_ids.is_empty() {
             return Ok(Vec::new());
@@ -827,6 +942,52 @@ impl<'conn> MessageStore<'conn> {
             }
         }
         Ok(grouped)
+    }
+
+    /// Stored `part.data` bytes belonging to each of `message_ids`.
+    ///
+    /// This is the allocation-free sizing phase for bounded hydration. SQLite
+    /// computes byte lengths from the text blobs without decoding their JSON
+    /// into Rust values. Messages with no parts are absent from the result and
+    /// therefore have a size of zero.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Query`] or [`DbError::Busy`] from SQLite.
+    pub fn part_data_bytes_by_message(
+        &self,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, u64>, DbError> {
+        let mut sizes = HashMap::new();
+        for chunk in message_ids.chunks(HYDRATION_CHUNK) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT message_id, SUM(length(CAST(data AS BLOB))) FROM part \
+                 WHERE message_id IN ({placeholders}) GROUP BY message_id"
+            );
+            let mut statement = self.prepare(&sql)?;
+            let rows = statement
+                .query_map(params_from_iter(chunk.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(map_error)?;
+            for row in rows {
+                let (message_id, bytes) = row.map_err(map_error)?;
+                let bytes = u64::try_from(bytes).map_err(|_| DbError::Conflict {
+                    table: PART_TABLE.to_owned(),
+                    id: message_id.clone(),
+                    detail: format!("stored part byte count is negative: {bytes}"),
+                })?;
+                sizes.insert(message_id, bytes);
+            }
+        }
+        Ok(sizes)
     }
 
     /// Parts of one kind belonging to any of `message_ids`, grouped by message id.
@@ -910,6 +1071,37 @@ impl<'conn> MessageStore<'conn> {
             parts.push(row.map_err(map_error)??);
         }
         Ok(parts)
+    }
+
+    /// The latest part of `kind`, ordered by its owning message cursor.
+    ///
+    /// Compaction uses message ordering as its durable chronology. Joining the
+    /// owner here avoids allocating every historical compaction marker merely to
+    /// choose the newest one.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::Decode`] for the matching row; [`DbError::Query`] or
+    /// [`DbError::Busy`] from SQLite.
+    pub fn latest_part_for_session_by_kind(
+        &self,
+        session_id: &str,
+        kind: PartKind,
+    ) -> Result<Option<PartRecord>, DbError> {
+        self.prepare(
+            "SELECT part.id, part.message_id, part.session_id, part.time_created, \
+                    part.time_updated, part.data \
+             FROM part JOIN message ON message.id = part.message_id \
+             WHERE part.session_id = ?1 AND json_extract(part.data, '$.type') = ?2 \
+             ORDER BY message.time_created DESC, message.id DESC, \
+                      part.time_created DESC, part.id DESC LIMIT 1",
+        )?
+        .query_row((session_id, kind.as_str()), |row| {
+            Ok(PartRecord::from_row(row))
+        })
+        .optional()
+        .map_err(map_error)?
+        .transpose()
     }
 
     /// Tool parts whose state is neither `completed` nor `error`.

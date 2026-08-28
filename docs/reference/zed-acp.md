@@ -227,6 +227,24 @@ ACP-provided client MCP, client filesystem RPC, and terminal RPC are not
 advertised. Zuno handles file and Shell work through its own tools, permission
 policy, and sandbox rather than claiming Zed client RPC handlers.
 
+Restoring a thread is deliberately cold. `session/load` and `session/resume`
+validate the session, expose its selectors, and publish commands without
+starting a `TurnHost` or connecting configured MCP servers. The first prompt
+performs that activation. Load replay is sent once per open ACP session and is
+bounded to the newest 512 retained messages, a 16 MiB stored-part and total
+projection budget, and an 8 MiB per-update frame. Zuno emits an omission notice
+when history exceeds those bounds. Stored part blobs are sized in SQLite before
+JSON hydration, so an oversized tool output is not first loaded into process
+memory and then discarded.
+
+Historical file references are not trusted merely because they were durable.
+Only existing regular files that canonicalize inside the project worktree
+remain actionable as diff paths, locations, or local resource links. A missing,
+external, or symlink-escaped local resource is displayed as non-actionable
+explanatory text. One ACP stdio connection may retain at most 32 open sessions;
+`session/close` releases the slot and shuts down any activated host and MCP
+runtime.
+
 ## 8. Troubleshooting
 
 ### Agent fails to start
@@ -272,6 +290,35 @@ For temporary Zuno diagnostics, change the arguments to:
 `--print-logs` writes diagnostics to stderr. It does not place logs on ACP
 stdout. Remove verbose logging after diagnosis.
 
+### Opening a workspace repeatedly restores an old thread or consumes CPU
+
+Closing or hiding Zed's Agent panel does not necessarily send
+`session/close`. Zed may keep its external-Agent process and workspace thread
+selection alive in the background.
+
+Current Zuno versions make a restored session dormant until its first prompt,
+deduplicate repeated load replay, bound transcript replay, filter stale
+actionable file paths, and cap one ACP connection at 32 open sessions. These
+protections keep Zuno from eagerly reconnecting MCP servers or replaying an
+unbounded historical transcript merely because Zed restored a thread.
+
+If the problem persists:
+
+1. run `dev: open acp logs` and confirm whether Zed is repeatedly issuing
+   `session/load` or reopening the same session;
+2. close the external-Agent thread, not only the panel, or stop and restart the
+   configured Agent server so its stdio process reaches EOF;
+3. if Zed immediately selects the same known-bad thread after restart, clear
+   that workspace's last active Agent-thread association using the maintenance
+   procedure for the installed Zed version, after backing up Zed state;
+4. inspect Zed logs separately for repeated worktree, watcher, or
+   `OpenBufferByPath` activity. Zuno does not own or remove Zed-created
+   worktrees and filesystem watchers.
+
+An already activated but idle Zuno session remains mounted until Zed closes it
+or the ACP process exits. Zuno does not currently demote active sessions on an
+idle timer.
+
 ### Agent or model selector is absent
 
 Confirm Zed connected successfully, then create a new external-Agent thread.
@@ -311,7 +358,8 @@ After configuration:
    permission request and typed diff;
 7. cancel a running prompt and confirm the session returns to idle;
 8. close and reload the session and confirm content, tools, plan, and usage are
-   replayed once.
+   replayed once;
+9. load the same open session again and confirm the transcript is not duplicated.
 
 Repository-level ACP verification is:
 

@@ -218,6 +218,28 @@ impl SessionRunRegistry {
         }
     }
 
+    /// Abort only a currently live turn without arming a future one.
+    ///
+    /// Lifecycle teardown uses this variant: closing an already-idle surface must
+    /// not poison the next process-local mount of the same durable session.
+    pub fn abort_active(&self, session_id: &str) -> bool {
+        let state = self.lock_state();
+        state.active.get(session_id).is_some_and(|active| {
+            active.interrupt.fire();
+            true
+        })
+    }
+
+    /// Removes an interrupt armed for a future turn without touching a live turn.
+    ///
+    /// A surface that is permanently tearing down a session uses this after its
+    /// prompt handoff has settled. It prevents a cancellation accepted during
+    /// that handoff from leaking into a later, independent mount of the same
+    /// durable session.
+    pub fn clear_pending_abort(&self, session_id: &str) -> bool {
+        self.lock_state().pending_interrupts.remove(session_id)
+    }
+
     /// Queues a message for the live turn's next safe point without firing abort.
     pub fn queue_soft_interrupt(
         &self,
@@ -324,6 +346,18 @@ impl SessionControl {
     /// Aborts whichever turn is live now, not the turn that created this handle.
     pub fn abort(&self) -> AbortDisposition {
         self.registry.abort(&self.session_id)
+    }
+
+    /// Abort a live turn if one exists, without arming the next turn.
+    #[must_use]
+    pub fn abort_active(&self) -> bool {
+        self.registry.abort_active(&self.session_id)
+    }
+
+    /// Clears a cancellation armed for a future turn during lifecycle teardown.
+    #[must_use]
+    pub fn clear_pending_abort(&self) -> bool {
+        self.registry.clear_pending_abort(&self.session_id)
     }
 
     /// Queues a non-cancelling message for the live turn's next safe point.

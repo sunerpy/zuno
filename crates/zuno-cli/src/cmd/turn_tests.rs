@@ -5954,7 +5954,8 @@ fn every_extension_contribution_reaches_its_native_consumer() {
         "zuno_extension::lifecycle_tools",
         "default_profile_with_tools",
         "orchestration_capabilities_bundle",
-        "plan.extensions.workflows()",
+        "self.extensions.workflows()",
+        "plan.command_registry(env, mcp.as_ref())",
         "plan.extensions.prompt_section()",
     ] {
         assert!(

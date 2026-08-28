@@ -129,6 +129,44 @@ fn status_abort_during_an_idle_handoff_interrupts_the_next_accepted_turn() {
     );
 }
 
+#[test]
+fn status_abort_active_does_not_poison_the_next_idle_turn() {
+    let registry = SessionRunRegistry::new();
+    let control = registry.control(SESSION_ID);
+
+    assert!(!control.abort_active(), "idle teardown must be a no-op");
+    let next = registry
+        .begin_turn(SESSION_ID)
+        .expect("the next turn acquires its guard");
+    assert!(
+        !next.interrupt_signal().is_set(),
+        "idle teardown armed a cancellation for the next turn"
+    );
+}
+
+#[test]
+fn status_teardown_can_clear_an_abort_armed_during_prompt_handoff() {
+    let registry = SessionRunRegistry::new();
+    let control = registry.control(SESSION_ID);
+
+    assert_eq!(control.abort(), AbortDisposition::ArmedNext);
+    assert!(
+        control.clear_pending_abort(),
+        "teardown must remove the handoff cancellation"
+    );
+    assert!(
+        !control.clear_pending_abort(),
+        "clearing an already-settled teardown must be idempotent"
+    );
+    let next = registry
+        .begin_turn(SESSION_ID)
+        .expect("a later independent mount acquires its guard");
+    assert!(
+        !next.interrupt_signal().is_set(),
+        "teardown cancellation leaked into a later session mount"
+    );
+}
+
 #[tokio::test]
 async fn status_abort_through_stale_handle_interrupts_the_live_turn() {
     let registry = SessionRunRegistry::new();

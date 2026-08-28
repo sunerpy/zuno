@@ -6139,6 +6139,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "url",
  "uuid",
  "zuno-db",
  "zuno-engine",

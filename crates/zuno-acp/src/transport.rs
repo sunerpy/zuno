@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -117,6 +118,14 @@ pub const OUTBOUND_FRAME_CHANNEL_CAPACITY: usize = 64;
 /// Maximum encoded JSON bytes accepted for one newline-delimited ACP frame.
 pub const MAX_INBOUND_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// Grace for already accepted requests to publish a ready response at clean EOF.
+///
+/// Editors commonly close stdin immediately after writing their final request.
+/// A short drain keeps deterministic validation and lifecycle responses from
+/// being replaced by cancellation, while truly blocked requests are still
+/// cancelled promptly afterwards.
+const EOF_REQUEST_DRAIN_GRACE: Duration = Duration::from_millis(25);
+
 const UNINITIALIZED: u8 = 0;
 const INITIALIZING: u8 = 1;
 const INITIALIZED: u8 = 2;
@@ -127,6 +136,7 @@ struct InFlightRequest {
     cancel: oneshot::Sender<()>,
     method: String,
     params: Value,
+    response_ready: Arc<AtomicBool>,
 }
 
 type InFlight = HashMap<String, InFlightRequest>;
@@ -149,6 +159,31 @@ pub struct ClientConnection {
     pending: Arc<Mutex<PendingState>>,
     next_id: Arc<AtomicU64>,
     deferred: Option<Arc<Mutex<DeferredState>>>,
+    scoped_requests: Option<Arc<Mutex<HashMap<String, Value>>>>,
+}
+
+struct PendingRequestGuard {
+    pending: Arc<Mutex<PendingState>>,
+    scoped_requests: Option<Arc<Mutex<HashMap<String, Value>>>>,
+    pending_id: String,
+    completed: bool,
+}
+
+impl PendingRequestGuard {
+    fn complete(&mut self) {
+        self.completed = true;
+        if let Some(scoped) = &self.scoped_requests {
+            lock(scoped).remove(&self.pending_id);
+        }
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            lock(&self.pending).waiters.remove(&self.pending_id);
+        }
+    }
 }
 
 impl ClientConnection {
@@ -196,6 +231,15 @@ impl ClientConnection {
             }
             pending.waiters.insert(pending_id.clone(), response_tx);
         }
+        if let Some(scoped) = &self.scoped_requests {
+            lock(scoped).insert(pending_id.clone(), Value::String(id.clone()));
+        }
+        let mut guard = PendingRequestGuard {
+            pending: Arc::clone(&self.pending),
+            scoped_requests: self.scoped_requests.as_ref().map(Arc::clone),
+            pending_id: pending_id.clone(),
+            completed: false,
+        };
         if let Err(error) = self
             .send(json!({
                 "jsonrpc": "2.0",
@@ -206,11 +250,14 @@ impl ClientConnection {
             .await
         {
             lock(&self.pending).waiters.remove(&pending_id);
+            guard.complete();
             return Err(error);
         }
-        response_rx
+        let result = response_rx
             .await
-            .map_err(|_| RpcError::internal("ACP connection closed before client response"))?
+            .map_err(|_| RpcError::internal("ACP connection closed before client response"))?;
+        guard.complete();
+        result
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), RpcError> {
@@ -264,7 +311,35 @@ impl ClientConnection {
             pending: Arc::clone(&self.pending),
             next_id: Arc::clone(&self.next_id),
             deferred: Some(Arc::new(Mutex::new(DeferredState::default()))),
+            scoped_requests: Some(Arc::new(Mutex::new(HashMap::new()))),
         }
+    }
+
+    async fn cancel_scoped_requests(&self) -> Result<(), RpcError> {
+        let Some(scoped) = &self.scoped_requests else {
+            return Ok(());
+        };
+        let requests = lock(scoped).drain().collect::<Vec<_>>();
+        let mut failure = None;
+        for (pending_id, request_id) in requests {
+            if let Some(waiter) = lock(&self.pending).waiters.remove(&pending_id) {
+                let _ignored =
+                    waiter.send(Err(RpcError::cancelled("parent ACP request was cancelled")));
+            }
+            if let Err(error) = self
+                .notify(
+                    "$/cancel_request",
+                    json!({
+                        "requestId": request_id,
+                    }),
+                )
+                .await
+                && failure.is_none()
+            {
+                failure = Some(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     async fn flush_after_response(&self) -> Result<(), RpcError> {
@@ -341,6 +416,13 @@ impl std::fmt::Debug for ClientConnection {
             .field("pending", &pending.waiters.len())
             .field("closed", &pending.closed)
             .field("request_scoped", &self.deferred.is_some())
+            .field(
+                "scoped_requests",
+                &self
+                    .scoped_requests
+                    .as_ref()
+                    .map(|requests| lock(requests).len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -365,17 +447,22 @@ where
         pending: Arc::new(Mutex::new(PendingState::default())),
         next_id: Arc::new(AtomicU64::new(1)),
         deferred: None,
+        scoped_requests: None,
     };
     let agent = Arc::new(agent);
     let initialized = Arc::new(AtomicU8::new(UNINITIALIZED));
     let in_flight = Arc::new(Mutex::new(InFlight::new()));
     let mut reader = BufReader::new(input);
     let mut requests = JoinSet::new();
+    let mut clean_eof = false;
 
     let loop_result = async {
         loop {
             let frame = match read_frame(&mut reader, MAX_INBOUND_FRAME_BYTES).await? {
-                FrameRead::Eof => break,
+                FrameRead::Eof => {
+                    clean_eof = true;
+                    break;
+                }
                 FrameRead::Oversized => {
                     client
                         .response(
@@ -489,6 +576,7 @@ where
 
                 let request_method = method.to_owned();
                 let (cancel_tx, cancel_rx) = oneshot::channel();
+                let response_ready = Arc::new(AtomicBool::new(false));
                 let duplicate = {
                     let mut active = lock(&in_flight);
                     if active.contains_key(&request_key) {
@@ -500,6 +588,7 @@ where
                                 cancel: cancel_tx,
                                 method: request_method.clone(),
                                 params: params.clone(),
+                                response_ready: Arc::clone(&response_ready),
                             },
                         );
                         false
@@ -525,8 +614,17 @@ where
                     let request_client = client.request_scoped();
                     let result = tokio::select! {
                         result = agent.request(&method, params, request_client.clone()) => result,
-                        _ = cancel_rx => Err(RpcError::cancelled("request cancelled")),
+                        _ = cancel_rx => {
+                            if let Err(error) = request_client.cancel_scoped_requests().await {
+                                eprintln!("ACP child request cancellation failed: {error}");
+                            }
+                            Err(RpcError::cancelled("request cancelled"))
+                        },
                     };
+                    response_ready.store(true, Ordering::Release);
+                    if let Err(error) = request_client.cancel_scoped_requests().await {
+                        eprintln!("ACP child request cleanup failed: {error}");
+                    }
                     if method == "initialize" {
                         initialized.store(
                             if result.is_ok() {
@@ -565,10 +663,24 @@ where
     }
     .await;
 
-    let cancellations = lock(&in_flight)
-        .drain()
-        .map(|(_, request)| request)
-        .collect::<Vec<_>>();
+    if clean_eof && loop_result.is_ok() {
+        drain_accepted_requests_at_eof(&mut requests).await;
+    }
+    let cancellations = {
+        let mut active = lock(&in_flight);
+        let keys = active
+            .iter()
+            .filter(|(_, request)| {
+                !clean_eof
+                    || loop_result.is_err()
+                    || !request.response_ready.load(Ordering::Acquire)
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| active.remove(&key))
+            .collect::<Vec<_>>()
+    };
     for request in cancellations {
         agent
             .request_cancelled(&request.method, &request.params)
@@ -585,6 +697,20 @@ where
     close_output.map_err(|_| ServeError::WriterClosed)?;
     writer_result?;
     Ok(())
+}
+
+async fn drain_accepted_requests_at_eof(requests: &mut JoinSet<()>) {
+    let deadline = tokio::time::Instant::now() + EOF_REQUEST_DRAIN_GRACE;
+    while !requests.is_empty() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, requests.join_next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 enum FrameRead {
@@ -1069,6 +1195,64 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct YieldingInvalidParamsAgent;
+
+    #[async_trait]
+    impl Agent for YieldingInvalidParamsAgent {
+        async fn request(
+            &self,
+            _method: &str,
+            _params: Value,
+            _client: ClientConnection,
+        ) -> Result<Value, RpcError> {
+            tokio::task::yield_now().await;
+            Err(RpcError::invalid_params("invalid fixture parameters"))
+        }
+
+        async fn notification(
+            &self,
+            method: &str,
+            _params: Value,
+            _client: ClientConnection,
+        ) -> Result<(), RpcError> {
+            Err(RpcError::method_not_found(method))
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_eof_drains_an_already_accepted_ready_response_before_cancelling() {
+        let (mut input_writer, input_reader) = tokio::io::duplex(4096);
+        let (output_writer, output_reader) = tokio::io::duplex(4096);
+        let mut output = BufReader::new(output_reader);
+        let server = tokio::spawn(serve(
+            YieldingInvalidParamsAgent,
+            input_reader,
+            output_writer,
+        ));
+
+        input_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("write final request");
+        input_writer.shutdown().await.expect("close ACP input");
+
+        let mut line = String::new();
+        timeout(Duration::from_secs(1), output.read_line(&mut line))
+            .await
+            .expect("ready response survives clean EOF")
+            .expect("read ready response");
+        let response: Value = serde_json::from_str(&line).expect("ACP response is JSON");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["error"]["code"], -32602);
+
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server exits after draining ready response")
+            .expect("server task joins")
+            .expect("server exits cleanly");
+    }
+
+    #[derive(Debug)]
     struct ClientRequestAgent {
         request_started: Arc<Notify>,
     }
@@ -1201,6 +1385,76 @@ mod tests {
         let response: Value = serde_json::from_str(&line).expect("cancellation response");
         assert_eq!(response["id"], 2);
         assert_eq!(response["error"]["code"], -32800);
+
+        input_writer.shutdown().await.expect("close ACP input");
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server exits")
+            .expect("server task joins")
+            .expect("server exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn cancelling_parent_prompt_cancels_its_pending_agent_to_client_request() {
+        let request_started = Arc::new(Notify::new());
+        let agent = ClientRequestAgent {
+            request_started: Arc::clone(&request_started),
+        };
+        let (mut input_writer, input_reader) = tokio::io::duplex(4096);
+        let (output_writer, output_reader) = tokio::io::duplex(4096);
+        let mut output = BufReader::new(output_reader);
+        let server = tokio::spawn(serve(agent, input_reader, output_writer));
+
+        input_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("write initialize");
+        let mut line = String::new();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("read initialize response");
+
+        input_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{}}\n",
+            )
+            .await
+            .expect("write prompt");
+        request_started.notified().await;
+        line.clear();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("read agent-to-client request");
+        let client_request: Value =
+            serde_json::from_str(&line).expect("agent-to-client request is JSON");
+        let child_id = client_request["id"].clone();
+
+        input_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel_request\",\"params\":{\"requestId\":2}}\n",
+            )
+            .await
+            .expect("cancel parent prompt");
+
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            line.clear();
+            timeout(Duration::from_secs(1), output.read_line(&mut line))
+                .await
+                .expect("cancellation frames arrive")
+                .expect("read cancellation frame");
+            frames.push(serde_json::from_str::<Value>(&line).expect("cancellation frame is JSON"));
+        }
+        assert!(frames.iter().any(|frame| {
+            frame["method"] == "$/cancel_request" && frame["params"]["requestId"] == child_id
+        }));
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["id"] == 2 && frame["error"]["code"] == -32800)
+        );
 
         input_writer.shutdown().await.expect("close ACP input");
         timeout(Duration::from_secs(1), server)

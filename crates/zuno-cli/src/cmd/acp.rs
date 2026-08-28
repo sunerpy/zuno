@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_llm::event::{FinishReason, RequestContentBlock};
@@ -28,6 +28,7 @@ const ACP_TEXT_RESOURCE_MAX_BYTES: usize = 50 * 1_024;
 const ACP_TEXT_RESOURCE_MAX_LINES: usize = 2_000;
 const ACP_IMAGE_MAX_BYTES: usize = 5 * 1_024 * 1_024;
 const ACP_IMAGE_MAX_BASE64_BYTES: usize = (ACP_IMAGE_MAX_BYTES / 3 + 1) * 4;
+const MAX_OPEN_ACP_SESSIONS: usize = 32;
 
 pub(super) fn execute(args: &AcpArgs, environment: &StartupEnvironment) -> Result<(), String> {
     if args.check {
@@ -66,6 +67,7 @@ struct AcpState {
     environment: StartupEnvironment,
     runs: SessionRunRegistry,
     sessions: Mutex<HashMap<String, Arc<AcpSession>>>,
+    session_slots: Arc<Semaphore>,
     composition_gate: Mutex<()>,
     elicitation_form: AtomicBool,
 }
@@ -180,6 +182,7 @@ impl ProductionAcpAgent {
                 environment,
                 runs: SessionRunRegistry::new(),
                 sessions: Mutex::new(HashMap::new()),
+                session_slots: Arc::new(Semaphore::new(MAX_OPEN_ACP_SESSIONS)),
                 composition_gate: Mutex::new(()),
                 elicitation_form: AtomicBool::new(false),
             }),
@@ -204,16 +207,22 @@ impl ProductionAcpAgent {
             tool_authority: None,
             extension_composition: ExtensionComposition::Active,
         };
-        let session = self.open_session(options, client.clone()).await?;
+        let session_slot = self.reserve_session_slot()?;
+        let session = self
+            .open_session(options, client.clone(), session_slot)
+            .await?;
         let session_id = session.id.clone();
         let response = session.lifecycle_response().await?;
-        let previous = self
-            .state
-            .sessions
-            .lock()
-            .await
-            .insert(session_id.clone(), session.clone());
-        if previous.is_some() {
+        let mut sessions = self.state.sessions.lock().await;
+        let inserted = match sessions.entry(session_id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(session.clone());
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        };
+        drop(sessions);
+        if !inserted {
             session
                 .shutdown()
                 .await
@@ -267,16 +276,31 @@ impl ProductionAcpAgent {
                 tool_authority: None,
                 extension_composition: ExtensionComposition::Active,
             };
-            let session = self.open_session(options, client.clone()).await?;
-            self.state
-                .sessions
-                .lock()
-                .await
-                .insert(session_id.clone(), Arc::clone(&session));
-            session
+            match self.reserve_session_slot() {
+                Ok(session_slot) => {
+                    let session = self.open_dormant_session(options, session_slot).await?;
+                    let mut sessions = self.state.sessions.lock().await;
+                    if let Some(existing) = sessions.get(&session_id).cloned() {
+                        existing
+                    } else {
+                        sessions.insert(session_id.clone(), Arc::clone(&session));
+                        session
+                    }
+                }
+                Err(error) => self
+                    .state
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or(error)?,
+            }
         };
         if replay {
             session.replay(&client).await?;
+        } else {
+            session.mark_replay_satisfied().await?;
         }
         session.defer_available_commands(&client).await?;
         session.lifecycle_response().await
@@ -322,7 +346,7 @@ impl ProductionAcpAgent {
         let prompt = parse_prompt(params)?;
         self.session(&session_id)
             .await?
-            .prompt(prompt, client)
+            .prompt(prompt, self.state.as_ref(), client)
             .await
     }
 
@@ -372,13 +396,23 @@ impl ProductionAcpAgent {
 
     async fn close_session(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
-        let session = self.state.sessions.lock().await.remove(&session_id);
-        if let Some(session) = session {
-            session
-                .shutdown()
-                .await
-                .map_err(zuno_acp::RpcError::internal)?;
+        let session = self.state.sessions.lock().await.get(&session_id).cloned();
+        let shutdown = if let Some(session) = session.as_ref() {
+            session.shutdown().await
+        } else {
+            Ok(())
+        };
+        if let Some(session) = session.as_ref() {
+            let mut sessions = self.state.sessions.lock().await;
+            if sessions
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, session))
+            {
+                sessions.remove(&session_id);
+            }
         }
+        drop(session);
+        shutdown.map_err(zuno_acp::RpcError::internal)?;
         Ok(json!({}))
     }
 
@@ -406,15 +440,26 @@ impl ProductionAcpAgent {
             })
     }
 
+    fn reserve_session_slot(&self) -> Result<OwnedSemaphorePermit, zuno_acp::RpcError> {
+        Arc::clone(&self.state.session_slots)
+            .try_acquire_owned()
+            .map_err(|_| session_capacity_error())
+    }
+
     async fn open_session(
         &self,
         options: TurnOptions,
         client: zuno_acp::ClientConnection,
+        session_slot: OwnedSemaphorePermit,
     ) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
         let _composition = self.state.composition_gate.lock().await;
         let plan = TurnPlan::resolve(&options, &self.state.environment)
             .await
             .map_err(zuno_acp::RpcError::internal)?;
+        let replay_root = plan
+            .worktree()
+            .unwrap_or_else(|| plan.directory())
+            .to_path_buf();
         let resources = open_session_resources(
             plan,
             &self.state.environment,
@@ -431,7 +476,58 @@ impl ProductionAcpAgent {
             id,
             control,
             prompt_active: AtomicBool::new(false),
+            replayed: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+            replay_gate: Mutex::new(()),
+            mount_gate: Mutex::new(()),
+            replay_root,
+            _session_slot: session_slot,
+            dormant: Mutex::new(None),
             resources: Mutex::new(Some(resources)),
+        }))
+    }
+
+    async fn open_dormant_session(
+        &self,
+        options: TurnOptions,
+        session_slot: OwnedSemaphorePermit,
+    ) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
+        let session_id = match &options.session {
+            SessionChoice::Existing(session_id) => session_id.clone(),
+            _ => {
+                return Err(zuno_acp::RpcError::internal(
+                    "a dormant ACP session must reference an existing durable session",
+                ));
+            }
+        };
+        let _composition = self.state.composition_gate.lock().await;
+        let plan = TurnPlan::resolve(&options, &self.state.environment)
+            .await
+            .map_err(zuno_acp::RpcError::internal)?;
+        let replay_root = plan
+            .worktree()
+            .unwrap_or_else(|| plan.directory())
+            .to_path_buf();
+        let configuration = SessionConfiguration::from_plan(&plan, None);
+        let available_commands =
+            available_commands_for_plan(&plan, self.state.environment.resolved())
+                .map_err(zuno_acp::RpcError::internal)?;
+        Ok(Arc::new(AcpSession {
+            id: session_id.clone(),
+            control: self.state.runs.control(session_id),
+            prompt_active: AtomicBool::new(false),
+            replayed: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            replay_gate: Mutex::new(()),
+            mount_gate: Mutex::new(()),
+            replay_root,
+            _session_slot: session_slot,
+            dormant: Mutex::new(Some(DormantSession {
+                options,
+                configuration,
+                available_commands,
+            })),
+            resources: Mutex::new(None),
         }))
     }
 
@@ -455,7 +551,20 @@ struct AcpSession {
     id: String,
     control: SessionControl,
     prompt_active: AtomicBool,
+    replayed: AtomicBool,
+    closed: AtomicBool,
+    replay_gate: Mutex<()>,
+    mount_gate: Mutex<()>,
+    replay_root: PathBuf,
+    _session_slot: OwnedSemaphorePermit,
+    dormant: Mutex<Option<DormantSession>>,
     resources: Mutex<Option<SessionResources>>,
+}
+
+struct DormantSession {
+    options: TurnOptions,
+    configuration: SessionConfiguration,
+    available_commands: Value,
 }
 
 struct SessionResources {
@@ -614,13 +723,70 @@ async fn restore_session_after_failure(
     }
 }
 
+fn persist_dormant_configuration(
+    session_id: &str,
+    plan: &TurnPlan,
+    persistence: ConfigurationPersistence,
+) -> Result<(), zuno_acp::RpcError> {
+    if matches!(persistence, ConfigurationPersistence::None) {
+        return Ok(());
+    }
+    let pool = durable_pool()?;
+    let store = zuno_db::session::Store::new(&pool);
+    let message_id = match persistence {
+        ConfigurationPersistence::None => unreachable!("handled above"),
+        ConfigurationPersistence::Agent => format!("msg_agent_{}", uuid::Uuid::new_v4().simple()),
+        ConfigurationPersistence::Model => format!("msg_model_{}", uuid::Uuid::new_v4().simple()),
+    };
+    let now = zuno_db::message::now_millis();
+    match persistence {
+        ConfigurationPersistence::None => Ok(()),
+        ConfigurationPersistence::Agent => {
+            store.switch_agent_at(session_id, &message_id, plan.agent_name(), now)
+        }
+        ConfigurationPersistence::Model => {
+            let qualified = plan.qualified_model();
+            let (provider_id, model_id) = qualified.split_once('/').ok_or_else(|| {
+                zuno_acp::RpcError::internal(format!(
+                    "resolved model `{qualified}` is not provider-qualified"
+                ))
+            })?;
+            store.switch_model_at(
+                session_id,
+                &message_id,
+                &zuno_db::session::model_reference(provider_id, model_id),
+                now,
+            )
+        }
+    }
+    .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
+}
+
 impl AcpSession {
     async fn lifecycle_response(&self) -> Result<Value, zuno_acp::RpcError> {
+        Ok(self.current_configuration().await?.lifecycle_response())
+    }
+
+    fn closed_error(&self) -> zuno_acp::RpcError {
+        zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
+    }
+
+    async fn current_configuration(&self) -> Result<SessionConfiguration, zuno_acp::RpcError> {
+        let _mount = self.mount_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
         let resources = self.resources.lock().await;
-        let resources = resources.as_ref().ok_or_else(|| {
-            zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
-        })?;
-        Ok(resources.configuration.lifecycle_response())
+        if let Some(resources) = resources.as_ref() {
+            return Ok(resources.configuration.clone());
+        }
+        drop(resources);
+        self.dormant
+            .lock()
+            .await
+            .as_ref()
+            .map(|dormant| dormant.configuration.clone())
+            .ok_or_else(|| self.closed_error())
     }
 
     async fn defer_available_commands(
@@ -628,11 +794,22 @@ impl AcpSession {
         client: &zuno_acp::ClientConnection,
     ) -> Result<(), zuno_acp::RpcError> {
         let update = {
+            let _mount = self.mount_gate.lock().await;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(self.closed_error());
+            }
             let resources = self.resources.lock().await;
-            let resources = resources.as_ref().ok_or_else(|| {
-                zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
-            })?;
-            available_commands_update(resources.host.commands(), resources.host.slash_skills())
+            if let Some(resources) = resources.as_ref() {
+                available_commands_update(resources.host.commands(), resources.host.slash_skills())
+            } else {
+                drop(resources);
+                self.dormant
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|dormant| dormant.available_commands.clone())
+                    .ok_or_else(|| self.closed_error())?
+            }
         };
         client.session_update_after_response(&self.id, update)
     }
@@ -648,15 +825,28 @@ impl AcpSession {
                 "session configuration cannot change while a prompt is active",
             ));
         }
+        let mount = self.mount_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        let mut dormant = self.dormant.lock().await;
+        if let Some(current) = dormant.as_mut() {
+            let configuration = self.reconfigure_dormant(current, change, state).await?;
+            drop(dormant);
+            drop(mount);
+            self.defer_available_commands(&client).await?;
+            return Ok(configuration);
+        }
+        drop(dormant);
+
         let _composition = state.composition_gate.lock().await;
         let mut slot = self.resources.lock().await;
-        let current = slot.take().ok_or_else(|| {
-            zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
-        })?;
-        let prepared = match current
-            .configuration
-            .prepare_reconfiguration(&current.host, change)
-        {
+        let current = slot.take().ok_or_else(|| self.closed_error())?;
+        let prepared = match current.configuration.prepare_reconfiguration(
+            live_options(&current.host),
+            current.host.effort_override(),
+            change,
+        ) {
             Ok(Some(prepared)) => prepared,
             Ok(None) => {
                 let configuration = current.configuration.clone();
@@ -758,21 +948,58 @@ impl AcpSession {
         let configuration = candidate.configuration.clone();
         *slot = Some(candidate);
         drop(slot);
+        drop(_composition);
+        drop(mount);
         self.defer_available_commands(&client).await?;
+        Ok(configuration)
+    }
+
+    async fn reconfigure_dormant(
+        &self,
+        current: &mut DormantSession,
+        change: SessionReconfiguration,
+        state: &AcpState,
+    ) -> Result<SessionConfiguration, zuno_acp::RpcError> {
+        let Some(prepared) = current.configuration.prepare_reconfiguration(
+            current.options.clone(),
+            current.options.effort,
+            change,
+        )?
+        else {
+            return Ok(current.configuration.clone());
+        };
+        let _composition = state.composition_gate.lock().await;
+        let plan = TurnPlan::resolve(&prepared.options, &state.environment)
+            .await
+            .map_err(zuno_acp::RpcError::invalid_params)?;
+        let configuration =
+            SessionConfiguration::from_plan(&plan, Some(&current.configuration.build_agent));
+        let available_commands = available_commands_for_plan(&plan, state.environment.resolved())
+            .map_err(zuno_acp::RpcError::internal)?;
+        persist_dormant_configuration(&self.id, &plan, prepared.persistence)?;
+        current.options = prepared.options;
+        current.configuration = configuration.clone();
+        current.available_commands = available_commands;
         Ok(configuration)
     }
 
     async fn prompt(
         &self,
         prompt: AcpPrompt,
+        state: &AcpState,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
         let _active = ActivePrompt::begin(&self.prompt_active)?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        let activated = self.ensure_active(state, client.clone()).await?;
+        if activated {
+            self.defer_available_commands(&client).await?;
+        }
         let (context_size, invocation) = {
             let resources = self.resources.lock().await;
-            let resources = resources.as_ref().ok_or_else(|| {
-                zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
-            })?;
+            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let invocation = prompt.slash_text().and_then(|text| {
                 resolve_slash_prompt(
                     text,
@@ -789,9 +1016,7 @@ impl AcpSession {
         let (events, receiver) = event_channel();
         let drive = async {
             let mut resources = self.resources.lock().await;
-            let resources = resources.as_mut().ok_or_else(|| {
-                zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
-            })?;
+            let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
             let outcome = match &invocation {
                 Some(SlashInvocation::Command { name, arguments }) => {
                     resources
@@ -843,15 +1068,75 @@ impl AcpSession {
         }
     }
 
+    async fn ensure_active(
+        &self,
+        state: &AcpState,
+        client: zuno_acp::ClientConnection,
+    ) -> Result<bool, zuno_acp::RpcError> {
+        let _mount = self.mount_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        if self.resources.lock().await.is_some() {
+            return Ok(false);
+        }
+        let dormant = self
+            .dormant
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| self.closed_error())?;
+        let _composition = state.composition_gate.lock().await;
+        let plan = match TurnPlan::resolve(&dormant.options, &state.environment).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                *self.dormant.lock().await = Some(dormant);
+                return Err(zuno_acp::RpcError::internal(error));
+            }
+        };
+        let resources = match open_session_resources(
+            plan,
+            &state.environment,
+            state.runs.clone(),
+            client,
+            state.elicitation_form.load(Ordering::Acquire),
+            Some(&dormant.configuration.build_agent),
+        )
+        .await
+        {
+            Ok(resources) => resources,
+            Err(error) => {
+                *self.dormant.lock().await = Some(dormant);
+                return Err(zuno_acp::RpcError::internal(format!(
+                    "could not activate ACP session {}: {error}",
+                    self.id
+                )));
+            }
+        };
+        if resources.host.session_id() != self.id {
+            let actual = resources.host.session_id().to_owned();
+            let cleanup = shutdown_session_resources(resources).await;
+            *self.dormant.lock().await = Some(dormant);
+            let cleanup = cleanup
+                .err()
+                .map(|error| format!("; candidate cleanup failed: {error}"))
+                .unwrap_or_default();
+            return Err(zuno_acp::RpcError::internal(format!(
+                "activated ACP session {actual}, expected {}{cleanup}",
+                self.id
+            )));
+        }
+        *self.resources.lock().await = Some(resources);
+        Ok(true)
+    }
+
     async fn project_plan(
         &self,
         client: &zuno_acp::ClientConnection,
     ) -> Result<(), zuno_acp::RpcError> {
         let update = {
             let resources = self.resources.lock().await;
-            let resources = resources.as_ref().ok_or_else(|| {
-                zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
-            })?;
+            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
             let work = resources
                 .host
                 .work_state()
@@ -871,52 +1156,149 @@ impl AcpSession {
     }
 
     async fn replay(&self, client: &zuno_acp::ClientConnection) -> Result<(), zuno_acp::RpcError> {
-        let (history, work_state, context_size, cumulative_cost) = {
-            let resources = self.resources.lock().await;
-            let resources = resources.as_ref().ok_or_else(|| {
-                zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
-            })?;
-            let history = resources
-                .host
-                .resumed_history()
-                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
-            let work_state = resources
-                .host
-                .work_state()
-                .map_err(zuno_acp::RpcError::internal)?;
-            let usage = resources.host.session_usage();
-            let context_size = usage
-                .context_limit
-                .and_then(|limit| u64::try_from(limit).ok())
-                .filter(|limit| *limit > 0)
-                .unwrap_or(resources.configuration.context_size);
-            (history, work_state, context_size, usage.cost)
-        };
-        for update in zuno_acp::durable_updates(&history) {
+        let _replay = self.replay_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        if self.replayed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let configured_context_size = self.current_configuration().await?.context_size;
+        let pool = Arc::new(durable_pool()?);
+        let stored = zuno_db::session::Store::new(pool.as_ref())
+            .get(&self.id)
+            .map_err(|error| map_session_lookup(&self.id, error))?;
+        let connection = pool
+            .open_connection()
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        let history = zuno_engine::r#loop::hydrate_retained_history_tail(
+            &connection,
+            &self.id,
+            zuno_acp::REPLAY_MESSAGE_CAP,
+            zuno_acp::REPLAY_TRANSCRIPT_BYTE_CAP,
+        )
+        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        let work_state = replay_work_state(Arc::clone(&pool), &self.id)?;
+        let context_size = stored
+            .usage
+            .context_limit
+            .and_then(|limit| u64::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(configured_context_size);
+        let replay = zuno_acp::durable_updates(
+            &history.messages,
+            &zuno_acp::ReplayPolicy::for_workspace(&self.replay_root),
+            history.omitted,
+        );
+        for update in replay.updates {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(self.closed_error());
+            }
             client.session_update(&self.id, update).await?;
         }
         if let Some(update) = zuno_acp::durable_plan_update(&work_state) {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(self.closed_error());
+            }
             client.session_update(&self.id, update).await?;
         }
         if let Some(update) =
-            zuno_acp::durable_usage_update(&history, context_size, cumulative_cost)
+            zuno_acp::durable_usage_update(&history.messages, context_size, stored.usage.cost)
         {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(self.closed_error());
+            }
             client.session_update(&self.id, update).await?;
         }
+        self.replayed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn mark_replay_satisfied(&self) -> Result<(), zuno_acp::RpcError> {
+        let _replay = self.replay_gate.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(self.closed_error());
+        }
+        self.replayed.store(true, Ordering::Release);
         Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), String> {
-        self.control.abort();
-        let Some(mut resources) = self.resources.lock().await.take() else {
-            return Ok(());
-        };
-        let host = resources.host.shutdown().await;
-        if let Some(mcp) = resources.mcp.take() {
-            mcp.shutdown().await;
+        self.closed.store(true, Ordering::Release);
+        if self.prompt_active.load(Ordering::Acquire) {
+            let _disposition = self.control.abort();
+        } else {
+            let _aborted = self.control.abort_active();
         }
-        host
+        let _replay = self.replay_gate.lock().await;
+        let _mount = self.mount_gate.lock().await;
+        self.dormant.lock().await.take();
+        let resources = self.resources.lock().await.take();
+        let result = if let Some(mut resources) = resources {
+            let host = resources.host.shutdown().await;
+            if let Some(mcp) = resources.mcp.take() {
+                mcp.shutdown().await;
+            }
+            host
+        } else {
+            Ok(())
+        };
+        let _cleared = self.control.clear_pending_abort();
+        result
     }
+}
+
+fn replay_work_state(
+    pool: Arc<zuno_db::pool::Pool>,
+    session_id: &str,
+) -> Result<zuno_types::WorkStateProjection, zuno_acp::RpcError> {
+    let snapshot = zuno_tools::work_state::WorkStateStore::new(pool)
+        .snapshot(session_id)
+        .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+    let plan = snapshot.plan.map(|plan| zuno_types::PlanProjection {
+        id: plan.id,
+        goal_id: plan.goal_id,
+        revision: plan.revision,
+        title: plan.title,
+        steps: plan
+            .steps
+            .into_iter()
+            .map(|step| zuno_types::PlanStepProjection {
+                id: step.id,
+                title: step.title,
+                status: step.status.as_str().to_owned(),
+            })
+            .collect(),
+        span: zuno_types::ExecutionSpan::default(),
+        time_created: plan.time_created,
+        time_updated: plan.time_updated,
+    });
+    let todos = snapshot
+        .items
+        .into_iter()
+        .map(|item| zuno_types::TodoProjection {
+            id: item.id,
+            goal_id: item.goal_id,
+            plan_step_id: item.plan_step_id,
+            parent_id: item.parent_id,
+            subject: item.subject,
+            description: item.description,
+            active_form: item.active_form,
+            status: item.status.as_str().to_owned(),
+            priority: item.priority.as_str().to_owned(),
+            dependencies: item.dependencies,
+            owner: item.owner,
+            revision: item.revision,
+            span: zuno_types::ExecutionSpan::default(),
+            time_created: item.time_created,
+            time_updated: item.time_updated,
+        })
+        .collect();
+    Ok(zuno_types::WorkStateProjection {
+        plan,
+        todos,
+        ..zuno_types::WorkStateProjection::default()
+    })
 }
 
 fn live_options(host: &TurnHost) -> TurnOptions {
@@ -1015,10 +1397,10 @@ impl SessionConfiguration {
 
     fn prepare_reconfiguration(
         &self,
-        host: &TurnHost,
+        mut options: TurnOptions,
+        current_effort_override: Option<zuno_llm::effort::ReasoningEffort>,
         change: SessionReconfiguration,
     ) -> Result<Option<PreparedReconfiguration>, zuno_acp::RpcError> {
-        let mut options = live_options(host);
         let persistence = match change {
             SessionReconfiguration::Mode(mode) => {
                 if mode == self.mode {
@@ -1106,7 +1488,7 @@ impl SessionConfiguration {
                     }
                     Some(effort)
                 };
-                if host.effort_override() == effort {
+                if current_effort_override == effort {
                     return Ok(None);
                 }
                 options.effort = effort;
@@ -1565,6 +1947,17 @@ fn resolve_slash_prompt<'a>(
         })
 }
 
+fn available_commands_for_plan(plan: &TurnPlan, env: &zuno_paths::Env) -> Result<Value, String> {
+    let commands = plan.command_registry(env, None)?;
+    let skills = plan
+        .skills()
+        .slash_invokable(commands.list().map(|command| command.name.as_str()))
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(available_commands_update(commands.list(), skills))
+}
+
 fn executable_command(command: &zuno_catalog::command::Info) -> bool {
     command.subtask != Some(true)
         && matches!(command.template, zuno_catalog::command::Template::Text(_))
@@ -1700,6 +2093,13 @@ fn map_session_lookup(session_id: &str, error: zuno_error::DbError) -> zuno_acp:
         }
         error => zuno_acp::RpcError::internal(error.to_string()),
     }
+}
+
+fn session_capacity_error() -> zuno_acp::RpcError {
+    zuno_acp::RpcError::invalid_params(format!(
+        "this ACP connection already has {MAX_OPEN_ACP_SESSIONS} open sessions; close an inactive \
+         session before opening another"
+    ))
 }
 
 fn session_info(session: zuno_db::session::Session) -> Value {
