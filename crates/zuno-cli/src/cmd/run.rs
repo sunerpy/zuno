@@ -313,6 +313,22 @@ where
                     event: StreamEvent::StatusDetail { detail },
                     ..
                 } => writeln!(stderr, "{detail}").map_err(to_string)?,
+                TurnEvent::SessionTitleUpdated { title } => {
+                    writeln!(stderr, "session titled: {title}").map_err(to_string)?;
+                }
+                TurnEvent::SessionCommandStarted { command } => {
+                    writeln!(stderr, "[{}] started", command.name()).map_err(to_string)?;
+                }
+                TurnEvent::SessionCommandOutput { content, .. } => {
+                    writeln!(stderr, "{content}").map_err(to_string)?;
+                }
+                TurnEvent::SessionCommandCompleted { command } => {
+                    writeln!(stderr, "[{}] completed", command.name()).map_err(to_string)?;
+                }
+                TurnEvent::SessionCommandFailed { command, message } => {
+                    writeln!(stderr, "[{}] failed: {message}", command.name())
+                        .map_err(to_string)?;
+                }
                 TurnEvent::ToolDispatchStarted { display_name, .. } => {
                     writeln!(stderr, "[{display_name}] started").map_err(to_string)?;
                 }
@@ -362,6 +378,21 @@ fn event_json(event: TurnEvent) -> Value {
     match event {
         TurnEvent::SessionMaterialized { session_id, title } => {
             json!({"type":"session_materialized","sessionID":session_id,"title":title})
+        }
+        TurnEvent::SessionTitleUpdated { title } => {
+            json!({"type":"session_title_updated","title":title})
+        }
+        TurnEvent::SessionCommandStarted { command } => {
+            json!({"type":"session_command_started","command":command.name()})
+        }
+        TurnEvent::SessionCommandOutput { command, content } => {
+            json!({"type":"session_command_output","command":command.name(),"content":content})
+        }
+        TurnEvent::SessionCommandCompleted { command } => {
+            json!({"type":"session_command_completed","command":command.name()})
+        }
+        TurnEvent::SessionCommandFailed { command, message } => {
+            json!({"type":"session_command_failed","command":command.name(),"message":message})
         }
         TurnEvent::SkillLoaded { name, source } => {
             json!({"type":"skill_loaded","name":name,"source":source})
@@ -834,6 +865,16 @@ mod tests {
         assert_eq!(
             stream_event_json(7, StreamEvent::RetryRollback { attempt: 2, max: 3 }),
             json!({"type":"retry_rollback","step":7,"attempt":2,"max":3})
+        );
+    }
+
+    #[test]
+    fn run_native_session_command_json_uses_the_stable_command_name() {
+        assert_eq!(
+            event_json(TurnEvent::SessionCommandCompleted {
+                command: zuno_engine::session_command::SessionCommand::Compact,
+            }),
+            json!({"type":"session_command_completed","command":"compact"})
         );
     }
 

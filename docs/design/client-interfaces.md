@@ -255,9 +255,15 @@ The TUI favors dense, keyboard-first operation:
   materializes exactly one new session through the normal durable-input
   transaction;
 - `/compact` invokes the runtime compaction agent and persists the resulting
-  summary. `compaction.threshold_percent` controls proactive compaction against
-  the usable model window, while `compaction.auto: false` disables that proactive
-  trigger without removing manual compaction or bounded context-limit recovery;
+  summary; `/goal` invokes the shared durable goal handler. Both are typed
+  native session commands rather than model prompts. `compaction.threshold_percent`
+  controls proactive compaction against the usable model window, while
+  `compaction.auto: false` disables that proactive trigger without removing
+  manual compaction or bounded context-limit recovery;
+- `/plan`, `/start-plan`, and `/start-work` are native collaboration-mode
+  controls. ACP publishes standard mode/config updates after a transactional
+  host replacement, while the TUI keeps its explicit confirmation surface.
+  Neither path may return from Plan to Work without a durable plan;
 - the same session list owns row actions: `Ctrl+R` opens a pre-filled rename
   prompt, while `Ctrl+D` must be pressed twice on the same row before deletion.
   Both actions are revalidated by the host and use the transactional session

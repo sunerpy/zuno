@@ -41,6 +41,13 @@ impl TurnEventProjector {
                 event: StreamEvent::ReasoningDelta(text),
                 ..
             } => Some(content_update("agent_thought_chunk", text)),
+            TurnEvent::SessionTitleUpdated { title } => Some(json!({
+                "sessionUpdate": "session_info_update",
+                "title": title,
+            })),
+            TurnEvent::SessionCommandOutput { content, .. } => {
+                Some(content_update("agent_message_chunk", content))
+            }
             TurnEvent::Provider {
                 event: StreamEvent::ToolUseStart { id, .. },
                 ..

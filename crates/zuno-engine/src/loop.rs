@@ -57,6 +57,7 @@ use crate::prompt::{PromptAssembly, PromptTraceSet};
 use crate::retry::{
     PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, retry_provider_with_wake,
 };
+use crate::session_command::SessionCommand;
 use crate::status::SessionRunGuard;
 
 /// Maximum queued transitions before the turn applies lossless backpressure.
@@ -175,6 +176,28 @@ pub enum TurnEvent {
     SessionMaterialized {
         session_id: String,
         title: String,
+    },
+    /// The prelude persisted a generated human-readable title for this session.
+    SessionTitleUpdated {
+        title: String,
+    },
+    /// A native session command acquired the session's exclusive run ownership.
+    SessionCommandStarted {
+        command: SessionCommand,
+    },
+    /// A native session command produced user-visible output without model text.
+    SessionCommandOutput {
+        command: SessionCommand,
+        content: String,
+    },
+    /// A native session command completed and its durable mutation is visible.
+    SessionCommandCompleted {
+        command: SessionCommand,
+    },
+    /// A native session command failed after it acquired run ownership.
+    SessionCommandFailed {
+        command: SessionCommand,
+        message: String,
     },
     /// A skill explicitly named by the user was loaded by the host before the
     /// first provider request, without fabricating an assistant tool call.

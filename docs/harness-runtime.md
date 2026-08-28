@@ -501,6 +501,13 @@ exist, and the confirmation names its title, revision, and completed-step count.
 `/start-plan` enters Plan mode directly; `/start-work` performs the same durable
 plan check and confirmation without first toggling through `/plan`.
 
+ACP publishes the same three names as native session commands. Because sending
+the slash prompt is already an explicit client action, ACP performs the
+transactional mode replacement directly, never sends the command to the model,
+and reports the result through standard `current_mode_update` and
+`config_option_update` notifications. Returning to Work still requires a
+durable plan.
+
 Plan is enforced below the prompt by a deny-by-default capability overlay. It
 allows repository inspection, read-only LSP and search, questions, Skills, and
 typed Goal/Plan/Todo operations, while shell and file mutation remain denied.
@@ -508,14 +515,30 @@ The model can recommend Start Work but cannot select it for the user. A confirme
 selection is persisted as the session agent, so explicit resume and in-process
 session switching restore the collaboration mode without restarting the TUI.
 
-## Compaction and hard interruption
+## Native session commands, compaction, and hard interruption
 
-`/compact` invokes the hidden compaction agent through the live `TurnHost`; it
-does not synthesize a client-only summary. The summary, retained tail, marker,
-prompt provenance, and usage are durable. Proactive compaction uses the validated
-`compaction.threshold_percent` of the usable model window and can be disabled
-with `compaction.auto: false`. A provider-confirmed context-limit failure retains
-its bounded recovery compaction, while a manual command is always eligible.
+The typed `SessionCommand` registry is shared by client surfaces and currently
+contains `/compact`, `/goal`, `/plan`, `/start-plan`, and `/start-work`.
+Native discovery resolves before Markdown commands and Skills, so a same-named
+user workflow cannot shadow a runtime control.
+
+`/compact` and `/goal` invoke shared live-`TurnHost` handlers in both the TUI
+and ACP. Compact runs the hidden compaction agent; Goal exposes
+show/history/create/edit/pause/resume/block/complete/cancel against the durable
+goal store. Neither surface sends the slash text to the model or synthesizes a
+private client-only result. Goal output is a typed session-command output event,
+not reasoning.
+
+The command acquires the session's exclusive run ownership and emits typed
+started, output, completed, or failed lifecycle events. TUI and ACP consume
+those events directly; the HTTP event service commits their stable
+`session.command.{started,output,completed,failed}` projections before live
+delivery.
+The summary, retained tail, marker, prompt provenance, and usage are durable.
+Proactive compaction uses the validated `compaction.threshold_percent` of the
+usable model window and can be disabled with `compaction.auto: false`. A
+provider-confirmed context-limit failure retains its bounded recovery
+compaction, while a manual command is always eligible.
 
 Historical image bytes are excluded from the compaction model request. The
 summary input keeps a stable human label such as

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
+use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
@@ -820,7 +821,26 @@ impl AcpSession {
         state: &AcpState,
         client: zuno_acp::ClientConnection,
     ) -> Result<SessionConfiguration, zuno_acp::RpcError> {
-        if self.prompt_active.load(Ordering::Acquire) {
+        self.reconfigure_inner(change, state, client, false).await
+    }
+
+    async fn reconfigure_from_prompt(
+        &self,
+        change: SessionReconfiguration,
+        state: &AcpState,
+        client: zuno_acp::ClientConnection,
+    ) -> Result<SessionConfiguration, zuno_acp::RpcError> {
+        self.reconfigure_inner(change, state, client, true).await
+    }
+
+    async fn reconfigure_inner(
+        &self,
+        change: SessionReconfiguration,
+        state: &AcpState,
+        client: zuno_acp::ClientConnection,
+        prompt_owns_session: bool,
+    ) -> Result<SessionConfiguration, zuno_acp::RpcError> {
+        if !prompt_owns_session && self.prompt_active.load(Ordering::Acquire) {
             return Err(zuno_acp::RpcError::invalid_params(
                 "session configuration cannot change while a prompt is active",
             ));
@@ -989,9 +1009,16 @@ impl AcpSession {
         state: &AcpState,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
+        let native_session = prompt.slash_text().and_then(resolve_session_slash_prompt);
         let _active = ActivePrompt::begin(&self.prompt_active)?;
         if self.closed.load(Ordering::Acquire) {
             return Err(self.closed_error());
+        }
+        if let Some(SlashInvocation::Session { command, arguments }) = native_session
+            && command.is_mode_control()
+        {
+            validate_session_command_arguments(command, &arguments)?;
+            return self.execute_mode_command(command, state, client).await;
         }
         let activated = self.ensure_active(state, client.clone()).await?;
         if activated {
@@ -1013,11 +1040,34 @@ impl AcpSession {
             &invocation,
             Some(SlashInvocation::Skill { arguments, .. }) if arguments.is_empty()
         );
+        if let Some(SlashInvocation::Session { command, arguments }) = &invocation
+            && !command.accepts_arguments()
+            && !arguments.is_empty()
+        {
+            return Err(zuno_acp::RpcError::invalid_params(format!(
+                "/{} does not accept arguments",
+                command.name()
+            )));
+        }
         let (events, receiver) = event_channel();
         let drive = async {
             let mut resources = self.resources.lock().await;
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
             let outcome = match &invocation {
+                Some(SlashInvocation::Session { command, arguments }) => match command {
+                    SessionCommand::Compact | SessionCommand::Goal => {
+                        resources
+                            .host
+                            .execute_session_command(*command, arguments, events.clone())
+                            .await
+                    }
+                    SessionCommand::Plan
+                    | SessionCommand::StartPlan
+                    | SessionCommand::StartWork => Err(format!(
+                        "/{} mode control was not handled before host execution",
+                        command.name()
+                    )),
+                },
                 Some(SlashInvocation::Command { name, arguments }) => {
                     resources
                         .host
@@ -1066,6 +1116,65 @@ impl AcpSession {
                 Err(error) => Err(error),
             },
         }
+    }
+
+    async fn execute_mode_command(
+        &self,
+        command: SessionCommand,
+        state: &AcpState,
+        client: zuno_acp::ClientConnection,
+    ) -> Result<Value, zuno_acp::RpcError> {
+        let current = self.current_configuration().await?;
+        let target = match command {
+            SessionCommand::Plan if current.mode == "plan" => "build",
+            SessionCommand::Plan | SessionCommand::StartPlan => "plan",
+            SessionCommand::StartWork => "build",
+            SessionCommand::Compact | SessionCommand::Goal => {
+                return Err(zuno_acp::RpcError::internal(format!(
+                    "/{} is not a mode control",
+                    command.name()
+                )));
+            }
+        };
+        if target == "build" && current.mode == "plan" && !self.has_durable_plan()? {
+            return Err(zuno_acp::RpcError::invalid_params(
+                "no durable plan is ready; run /start-plan and let the plan Agent create one",
+            ));
+        }
+        let configuration = self
+            .reconfigure_from_prompt(
+                SessionReconfiguration::Mode(target.to_owned()),
+                state,
+                client.clone(),
+            )
+            .await?;
+        client
+            .session_update(
+                &self.id,
+                json!({
+                    "sessionUpdate": "current_mode_update",
+                    "currentModeId": configuration.mode,
+                }),
+            )
+            .await?;
+        client
+            .session_update(
+                &self.id,
+                json!({
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": configuration.config_options(),
+                }),
+            )
+            .await?;
+        Ok(json!({ "stopReason": "end_turn" }))
+    }
+
+    fn has_durable_plan(&self) -> Result<bool, zuno_acp::RpcError> {
+        let store = zuno_tools::WorkStateStore::new(Arc::new(durable_pool()?));
+        store
+            .plan(&self.id)
+            .map(|plan| plan.is_some())
+            .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))
     }
 
     async fn ensure_active(
@@ -1903,6 +2012,10 @@ fn filename_from_uri(uri: &str) -> Option<String> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SlashInvocation {
+    Session {
+        command: SessionCommand,
+        arguments: String,
+    },
     Command {
         name: String,
         arguments: String,
@@ -1919,6 +2032,9 @@ fn resolve_slash_prompt<'a>(
     commands: impl IntoIterator<Item = &'a zuno_catalog::command::Info>,
     skills: &[zuno_catalog::skill::Skill],
 ) -> Option<SlashInvocation> {
+    if let Some(invocation) = resolve_session_slash_prompt(text) {
+        return Some(invocation);
+    }
     let invocation = text.strip_prefix('/')?;
     let name_end = invocation
         .find(char::is_whitespace)
@@ -1947,6 +2063,32 @@ fn resolve_slash_prompt<'a>(
         })
 }
 
+fn resolve_session_slash_prompt(text: &str) -> Option<SlashInvocation> {
+    let invocation = text.strip_prefix('/')?;
+    let name_end = invocation
+        .find(char::is_whitespace)
+        .unwrap_or(invocation.len());
+    let name = &invocation[..name_end];
+    let command = SessionCommand::from_name(name)?;
+    Some(SlashInvocation::Session {
+        command,
+        arguments: invocation[name_end..].trim_start().to_owned(),
+    })
+}
+
+fn validate_session_command_arguments(
+    command: SessionCommand,
+    arguments: &str,
+) -> Result<(), zuno_acp::RpcError> {
+    if command.accepts_arguments() || arguments.is_empty() {
+        return Ok(());
+    }
+    Err(zuno_acp::RpcError::invalid_params(format!(
+        "/{} does not accept arguments",
+        command.name()
+    )))
+}
+
 fn available_commands_for_plan(plan: &TurnPlan, env: &zuno_paths::Env) -> Result<Value, String> {
     let commands = plan.command_registry(env, None)?;
     let skills = plan
@@ -1967,31 +2109,52 @@ fn available_commands_update<'a>(
     commands: impl IntoIterator<Item = &'a zuno_catalog::command::Info>,
     skills: impl IntoIterator<Item = zuno_catalog::skill::Skill>,
 ) -> Value {
-    let mut available = commands
+    let mut available = SessionCommand::ALL
         .into_iter()
-        .filter(|command| executable_command(command))
         .map(|command| {
             let mut advertised = json!({
-                "name": command.name,
-                "description": command.description.clone().unwrap_or_else(|| {
-                    format!("Run the /{} Zuno command.", command.name)
-                }),
+                "name": command.name(),
+                "description": command.description(),
             });
-            if !command.hints.is_empty() {
-                advertised["input"] = json!({ "hint": command.hints.join(" ") });
+            if let Some(hint) = command.input_hint() {
+                advertised["input"] = json!({ "hint": hint });
             }
             advertised
         })
         .collect::<Vec<_>>();
-    available.extend(skills.into_iter().map(|skill| {
-        json!({
-            "name": skill.name,
-            "description": skill.description.unwrap_or_else(|| {
-                "Load this Skill for the current session.".to_owned()
+    available.extend(
+        commands
+            .into_iter()
+            .filter(|command| {
+                executable_command(command) && SessionCommand::from_name(&command.name).is_none()
+            })
+            .map(|command| {
+                let mut advertised = json!({
+                    "name": command.name,
+                    "description": command.description.clone().unwrap_or_else(|| {
+                        format!("Run the /{} Zuno command.", command.name)
+                    }),
+                });
+                if !command.hints.is_empty() {
+                    advertised["input"] = json!({ "hint": command.hints.join(" ") });
+                }
+                advertised
             }),
-            "input": { "hint": "arguments" },
-        })
-    }));
+    );
+    available.extend(
+        skills
+            .into_iter()
+            .filter(|skill| SessionCommand::from_name(&skill.name).is_none())
+            .map(|skill| {
+                json!({
+                    "name": skill.name,
+                    "description": skill.description.unwrap_or_else(|| {
+                        "Load this Skill for the current session.".to_owned()
+                    }),
+                    "input": { "hint": "arguments" },
+                })
+            }),
+    );
     json!({
         "sessionUpdate": "available_commands_update",
         "availableCommands": available,
@@ -2029,7 +2192,13 @@ async fn project_turn(
                     _ => "end_turn",
                 }));
             }
+            TurnEvent::SessionCommandCompleted { .. } => {
+                return Ok(ProjectedTurn::Completed("end_turn"));
+            }
             TurnEvent::TurnInterrupted { .. } => return Ok(ProjectedTurn::Interrupted),
+            TurnEvent::SessionCommandFailed { message, .. } => {
+                return Ok(ProjectedTurn::Failed(message));
+            }
             TurnEvent::TurnFailed { message, .. } => {
                 return Ok(ProjectedTurn::Failed(message));
             }
@@ -2262,6 +2431,12 @@ mod tests {
     fn available_commands_exclude_unhandled_sources_and_include_slash_skills() {
         let commands = [
             command(
+                "compact",
+                Some("User-defined compact prompt"),
+                Template::Text("Do not run this prompt".to_owned()),
+                None,
+            ),
+            command(
                 "review",
                 Some("Review the change"),
                 Template::Text("Review $ARGUMENTS".to_owned()),
@@ -2284,12 +2459,20 @@ mod tests {
                 Some(true),
             ),
         ];
-        let skills = vec![zuno_catalog::skill::Skill::embedded(
-            "codegraph",
-            Some("Navigate code structurally".to_owned()),
-            "builtin://codegraph",
-            "Use CodeGraph.",
-        )];
+        let skills = vec![
+            zuno_catalog::skill::Skill::embedded(
+                "compact",
+                Some("User-defined compact Skill".to_owned()),
+                "builtin://compact",
+                "Do not load this Skill.",
+            ),
+            zuno_catalog::skill::Skill::embedded(
+                "codegraph",
+                Some("Navigate code structurally".to_owned()),
+                "builtin://codegraph",
+                "Use CodeGraph.",
+            ),
+        ];
 
         let update = available_commands_update(commands.iter(), skills);
         let advertised = update["availableCommands"]
@@ -2300,25 +2483,55 @@ mod tests {
                 .iter()
                 .filter_map(|command| command["name"].as_str())
                 .collect::<Vec<_>>(),
-            vec!["review", "codegraph"]
+            vec![
+                "compact",
+                "goal",
+                "plan",
+                "start-plan",
+                "start-work",
+                "review",
+                "codegraph"
+            ]
         );
-        assert_eq!(advertised[0]["input"]["hint"], "question");
+        assert_eq!(
+            advertised[0]["description"],
+            "Summarize older context and keep the recent turn tail"
+        );
+        assert!(advertised[0].get("input").is_none());
+        assert_eq!(advertised[1]["input"]["hint"], "action [value]");
+        assert_eq!(advertised[5]["input"]["hint"], "question");
     }
 
     #[test]
     fn slash_prompt_resolution_prefers_commands_and_preserves_arguments() {
-        let commands = [command(
-            "review",
-            Some("Review"),
-            Template::Text("Review $ARGUMENTS".to_owned()),
-            None,
-        )];
-        let skills = vec![zuno_catalog::skill::Skill::embedded(
-            "codegraph",
-            Some("Navigate code".to_owned()),
-            "builtin://codegraph",
-            "Use CodeGraph.",
-        )];
+        let commands = [
+            command(
+                "compact",
+                Some("Shadow compact"),
+                Template::Text("Do not run".to_owned()),
+                None,
+            ),
+            command(
+                "review",
+                Some("Review"),
+                Template::Text("Review $ARGUMENTS".to_owned()),
+                None,
+            ),
+        ];
+        let skills = vec![
+            zuno_catalog::skill::Skill::embedded(
+                "compact",
+                Some("Shadow compact Skill".to_owned()),
+                "builtin://compact",
+                "Do not load.",
+            ),
+            zuno_catalog::skill::Skill::embedded(
+                "codegraph",
+                Some("Navigate code".to_owned()),
+                "builtin://codegraph",
+                "Use CodeGraph.",
+            ),
+        ];
 
         assert_eq!(
             resolve_slash_prompt("/review src/lib.rs", commands.iter(), &skills),
@@ -2333,6 +2546,48 @@ mod tests {
                 name: "codegraph".to_owned(),
                 source: "builtin://codegraph".to_owned(),
                 arguments: "trace calls".to_owned(),
+            })
+        );
+        assert_eq!(
+            resolve_slash_prompt("/compact", commands.iter(), &skills),
+            Some(SlashInvocation::Session {
+                command: SessionCommand::Compact,
+                arguments: String::new(),
+            })
+        );
+        assert_eq!(
+            resolve_slash_prompt("/compact unexpected", commands.iter(), &skills),
+            Some(SlashInvocation::Session {
+                command: SessionCommand::Compact,
+                arguments: "unexpected".to_owned(),
+            })
+        );
+        assert_eq!(
+            resolve_slash_prompt("/goal create ship ACP commands", commands.iter(), &skills),
+            Some(SlashInvocation::Session {
+                command: SessionCommand::Goal,
+                arguments: "create ship ACP commands".to_owned(),
+            })
+        );
+        assert_eq!(
+            resolve_slash_prompt("/plan", commands.iter(), &skills),
+            Some(SlashInvocation::Session {
+                command: SessionCommand::Plan,
+                arguments: String::new(),
+            })
+        );
+        assert_eq!(
+            resolve_slash_prompt("/start-plan", commands.iter(), &skills),
+            Some(SlashInvocation::Session {
+                command: SessionCommand::StartPlan,
+                arguments: String::new(),
+            })
+        );
+        assert_eq!(
+            resolve_slash_prompt("/start-work", commands.iter(), &skills),
+            Some(SlashInvocation::Session {
+                command: SessionCommand::StartWork,
+                arguments: String::new(),
             })
         );
     }

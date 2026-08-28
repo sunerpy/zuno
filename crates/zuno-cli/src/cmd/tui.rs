@@ -48,6 +48,7 @@ use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, watch};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender, event_channel};
+use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::SessionRunRegistry;
 use zuno_engine::terminal_lease::{TerminalLease, TerminalLeaseCleanup};
 use zuno_llm::event::StreamEvent;
@@ -3600,51 +3601,29 @@ async fn execute_host_command(
     snapshots: &mut SnapshotHistory,
     events: &TurnEventSender,
 ) -> Result<(), String> {
-    let detail = match command {
+    match command {
         HostCommand::Compact => {
-            if !host.is_session_materialized() {
-                return Err("nothing to compact; send a message first".to_owned());
-            }
-            host.compact(false).await?;
-            "context compacted; older history was summarized".to_owned()
+            host.execute_session_command(SessionCommand::Compact, "", events.clone())
+                .await
         }
         HostCommand::Goal(arguments) => {
-            let was_materialized = host.is_session_materialized();
-            let outcome = host.goal_command(&arguments);
-            if !was_materialized && host.is_session_materialized() {
-                events
-                    .publish(TurnEvent::SessionMaterialized {
-                        session_id: host.session_id().to_owned(),
-                        title: host.session_title().unwrap_or("New session").to_owned(),
-                    })
-                    .await
-                    .map_err(to_string)?;
-            }
-            outcome?
+            host.execute_session_command(SessionCommand::Goal, &arguments, events.clone())
+                .await
         }
-        HostCommand::Undo | HostCommand::Redo => {
-            return restore_snapshot(command, snapshots, events).await;
-        }
+        HostCommand::Undo | HostCommand::Redo => restore_snapshot(command, snapshots, events).await,
         HostCommand::Plan | HostCommand::StartPlan | HostCommand::StartWork => {
-            return Err("plan mode controls must be handled by the TUI selection layer".to_owned());
+            Err("plan mode controls must be handled by the TUI selection layer".to_owned())
         }
         HostCommand::Preset(_) => {
-            return Err("preset controls must be handled by the TUI selection layer".to_owned());
+            Err("preset controls must be handled by the TUI selection layer".to_owned())
         }
         HostCommand::Council(_) => {
-            return Err("Council controls must be handled by the TUI submission layer".to_owned());
+            Err("Council controls must be handled by the TUI submission layer".to_owned())
         }
         HostCommand::Stop(_) => {
-            return Err("background stop must be handled by the TUI background service".to_owned());
+            Err("background stop must be handled by the TUI background service".to_owned())
         }
-    };
-    events
-        .publish(TurnEvent::Provider {
-            step: 0,
-            event: StreamEvent::StatusDetail { detail },
-        })
-        .await
-        .map_err(to_string)
+    }
 }
 
 async fn publish_restore_report(

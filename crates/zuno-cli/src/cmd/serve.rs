@@ -333,8 +333,8 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
             };
             let mut host = executor.open_active(&spec).await?;
             let outcome = async {
-                host.compact(request.automatic).await?;
-                drop(guard);
+                host.compact_with_guard(request.automatic, guard, events.clone())
+                    .await?;
                 while host
                     .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
                     .await?

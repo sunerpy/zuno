@@ -113,7 +113,10 @@ impl LiveSessions {
         };
         let mut changed = session.transcript.observe(event);
         match event {
-            TurnEvent::SessionMaterialized { title, .. } if session.title != *title => {
+            TurnEvent::SessionMaterialized { title, .. }
+            | TurnEvent::SessionTitleUpdated { title }
+                if session.title != *title =>
+            {
                 session.title.clone_from(title);
                 changed = true;
             }

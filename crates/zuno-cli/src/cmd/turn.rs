@@ -66,6 +66,7 @@ use zuno_engine::prelude::{
     compact_requested, run_prelude,
 };
 use zuno_engine::prompt::PromptAssembly;
+use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_error::{DbError, ProviderError, Recovery};
 use zuno_goal::{
@@ -2799,6 +2800,82 @@ impl TurnHost {
         serde_json::to_string_pretty(&output).map_err(to_string)
     }
 
+    /// Execute one native host-owned session command without entering the model loop.
+    pub(crate) async fn execute_session_command(
+        &mut self,
+        command: SessionCommand,
+        arguments: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        if !command.accepts_arguments() && !arguments.trim().is_empty() {
+            return Err(format!("/{} does not accept arguments", command.name()));
+        }
+        match command {
+            SessionCommand::Compact => self.compact(false, events).await,
+            SessionCommand::Goal => self.execute_goal_command(arguments, events).await,
+            SessionCommand::Plan | SessionCommand::StartPlan | SessionCommand::StartWork => {
+                Err(format!(
+                    "/{} replaces the collaboration host and must be handled by the client surface",
+                    command.name()
+                ))
+            }
+        }
+    }
+
+    async fn execute_goal_command(
+        &mut self,
+        arguments: &str,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let _guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        events
+            .publish(TurnEvent::SessionCommandStarted {
+                command: SessionCommand::Goal,
+            })
+            .await
+            .map_err(to_string)?;
+        let was_materialized = self.is_session_materialized();
+        match self.goal_command(arguments) {
+            Ok(content) => {
+                if !was_materialized && self.is_session_materialized() {
+                    events
+                        .publish(TurnEvent::SessionMaterialized {
+                            session_id: self.session_id().to_owned(),
+                            title: self.session_title().unwrap_or("New session").to_owned(),
+                        })
+                        .await
+                        .map_err(to_string)?;
+                }
+                events
+                    .publish(TurnEvent::SessionCommandOutput {
+                        command: SessionCommand::Goal,
+                        content,
+                    })
+                    .await
+                    .map_err(to_string)?;
+                events
+                    .publish(TurnEvent::SessionCommandCompleted {
+                        command: SessionCommand::Goal,
+                    })
+                    .await
+                    .map_err(to_string)
+            }
+            Err(error) => {
+                events
+                    .publish(TurnEvent::SessionCommandFailed {
+                        command: SessionCommand::Goal,
+                        message: error.clone(),
+                    })
+                    .await
+                    .map_err(to_string)?;
+                Err(error)
+            }
+        }
+    }
+
     pub(super) fn work_state(&self) -> Result<zuno_types::WorkStateProjection, String> {
         let goal = self
             .goal_store
@@ -4358,15 +4435,40 @@ impl TurnHost {
         Ok(())
     }
 
-    pub(crate) async fn compact(&mut self, automatic: bool) -> Result<(), String> {
+    pub(crate) async fn compact(
+        &mut self,
+        automatic: bool,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        let guard = self
+            .runs
+            .begin_turn(self.session_id.clone())
+            .map_err(to_string)?;
+        self.compact_with_guard(automatic, guard, events).await
+    }
+
+    pub(crate) async fn compact_with_guard(
+        &mut self,
+        automatic: bool,
+        _guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
         self.require_active_extension_composition()?;
+        if !self.is_session_materialized() {
+            return Err("nothing to compact; send a message first".to_owned());
+        }
         self.goal_projection
             .ingest(&self.goal_store)
             .map_err(to_string)?;
         let usage_before = goal_usage(&self.connection, &self.session_id)?;
         let started = Instant::now();
-        let result = self.compact_unaccounted(automatic).await;
-        match result {
+        events
+            .publish(TurnEvent::SessionCommandStarted {
+                command: SessionCommand::Compact,
+            })
+            .await
+            .map_err(to_string)?;
+        let result = match self.compact_unaccounted(automatic).await {
             Ok(()) => {
                 self.last_turn_completed = true;
                 self.finish_goal_turn(usage_before, started, None)
@@ -4379,6 +4481,24 @@ impl TurnHost {
                         "{error}; additionally failed to record terminal goal state: {goal_error}"
                     )),
                 }
+            }
+        };
+        match result {
+            Ok(()) => events
+                .publish(TurnEvent::SessionCommandCompleted {
+                    command: SessionCommand::Compact,
+                })
+                .await
+                .map_err(to_string),
+            Err(error) => {
+                events
+                    .publish(TurnEvent::SessionCommandFailed {
+                        command: SessionCommand::Compact,
+                        message: error.clone(),
+                    })
+                    .await
+                    .map_err(to_string)?;
+                Err(error)
             }
         }
     }
@@ -5058,7 +5178,12 @@ async fn report_prelude(
 ) -> Result<(), String> {
     let mut details: Vec<String> = notes.to_vec();
     if let Some(title) = &outcome.title {
-        details.push(format!("session titled: {title}"));
+        events
+            .publish(TurnEvent::SessionTitleUpdated {
+                title: title.clone(),
+            })
+            .await
+            .map_err(to_string)?;
     }
     if outcome.compacted {
         details.push("history compacted before this turn".to_owned());

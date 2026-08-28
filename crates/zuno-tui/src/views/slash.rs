@@ -25,6 +25,8 @@
 
 use std::collections::BTreeSet;
 
+use zuno_engine::session_command::SessionCommand;
+
 use crate::keybind::DEFINITIONS;
 
 #[cfg(test)]
@@ -404,9 +406,9 @@ fn ui_commands() -> Vec<SlashCommand> {
         })
         .chain([
             SlashCommand {
-                name: "compact".to_owned(),
+                name: SessionCommand::Compact.name().to_owned(),
                 aliases: Vec::new(),
-                description: "Summarize older context and keep the recent turn tail".to_owned(),
+                description: SessionCommand::Compact.description().to_owned(),
                 kind: SlashCommandKind::Host(HostCommand::Compact),
             },
             SlashCommand {

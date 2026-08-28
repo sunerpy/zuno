@@ -1111,7 +1111,7 @@ fn views_scrollbar_hides_its_thumb_when_everything_fits() {
 fn views_transcript_keeps_a_warning_detail_that_the_status_strip_would_overwrite() {
     let mut transcript = TranscriptView::new(ViewContext::defaults());
     let warning = "warning: tool `grep` from built-in suppressed by same-named tool from plugin";
-    for detail in [warning, "session titled: something else"] {
+    for detail in [warning, "history compacted before this turn"] {
         transcript.handle_event(&AppEvent::Engine(TurnEvent::Provider {
             step: 0,
             event: StreamEvent::StatusDetail {
@@ -1141,7 +1141,7 @@ fn views_transcript_keeps_a_warning_detail_that_the_status_strip_would_overwrite
         "the warning is attributed to a party to the conversation:\n{joined}"
     );
     assert!(
-        !joined.contains("session titled"),
+        !joined.contains("history compacted"),
         "an ordinary status detail must stay on the strip, not fill the transcript:\n{joined}"
     );
 }
@@ -1246,6 +1246,28 @@ fn views_transcript_tracks_the_running_flag() {
         steps: 1,
     });
     assert!(!transcript.is_running());
+}
+
+#[test]
+fn views_native_compaction_has_activity_and_a_completion_notice() {
+    let mut transcript = Transcript::new();
+
+    assert!(transcript.observe(&TurnEvent::SessionCommandStarted {
+        command: zuno_engine::session_command::SessionCommand::Compact,
+    }));
+    assert!(transcript.is_running());
+
+    assert!(transcript.observe(&TurnEvent::SessionCommandCompleted {
+        command: zuno_engine::session_command::SessionCommand::Compact,
+    }));
+    assert!(!transcript.is_running());
+    assert_eq!(
+        transcript.messages().last(),
+        Some(&Message::noticed(
+            crate::views::toast::ToastLevel::Success,
+            "context compacted; older history was summarized",
+        ))
+    );
 }
 
 #[test]

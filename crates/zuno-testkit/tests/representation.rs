@@ -44,6 +44,7 @@ use zuno_engine::r#loop::{
     ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, ToolBlockKind, ToolDiff, TurnEvent,
     project_history, project_history_owned,
 };
+use zuno_engine::session_command::SessionCommand;
 use zuno_llm::event::{
     ConnectionPhase, FinishReason, Message, RequestContentBlock, StreamEvent, ThoughtSignature,
 };
@@ -171,6 +172,17 @@ fn stream_event_variant_name(event: &StreamEvent) -> &'static str {
 fn turn_event_payloads() -> Vec<VariantPayload> {
     vec![
         payload("SessionMaterialized", size_of::<(String, String)>()),
+        payload("SessionTitleUpdated", size_of::<(String,)>()),
+        payload("SessionCommandStarted", size_of::<(SessionCommand,)>()),
+        payload(
+            "SessionCommandOutput",
+            size_of::<(SessionCommand, String)>(),
+        ),
+        payload("SessionCommandCompleted", size_of::<(SessionCommand,)>()),
+        payload(
+            "SessionCommandFailed",
+            size_of::<(SessionCommand, String)>(),
+        ),
         payload("SkillLoaded", size_of::<(String, String)>()),
         payload("TurnStarted", size_of::<(String,)>()),
         payload("HistoryRepaired", size_of::<(usize,)>()),
@@ -219,6 +231,11 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
 fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
     match event {
         TurnEvent::SessionMaterialized { .. } => "SessionMaterialized",
+        TurnEvent::SessionTitleUpdated { .. } => "SessionTitleUpdated",
+        TurnEvent::SessionCommandStarted { .. } => "SessionCommandStarted",
+        TurnEvent::SessionCommandOutput { .. } => "SessionCommandOutput",
+        TurnEvent::SessionCommandCompleted { .. } => "SessionCommandCompleted",
+        TurnEvent::SessionCommandFailed { .. } => "SessionCommandFailed",
         TurnEvent::SkillLoaded { .. } => "SkillLoaded",
         TurnEvent::TurnStarted { .. } => "TurnStarted",
         TurnEvent::HistoryRepaired { .. } => "HistoryRepaired",

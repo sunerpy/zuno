@@ -46,6 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, TurnEvent};
+use zuno_engine::session_command::SessionCommand;
 use zuno_llm::event::StreamEvent;
 pub use zuno_types::TokenUsage;
 use zuno_types::UsageSnapshot;
@@ -965,6 +966,38 @@ impl Transcript {
             }
             TurnEvent::TurnStarted { .. } => {
                 self.mark_running();
+                true
+            }
+            TurnEvent::SessionCommandStarted { .. } => {
+                self.mark_running();
+                true
+            }
+            TurnEvent::SessionCommandOutput { content, .. } => {
+                self.messages.push(Message::noticed(
+                    crate::views::toast::ToastLevel::Info,
+                    content.clone(),
+                ));
+                true
+            }
+            TurnEvent::SessionCommandCompleted { command } => {
+                self.running = false;
+                self.streaming = None;
+                self.close_reasoning();
+                if let SessionCommand::Compact = command {
+                    self.messages.push(Message::noticed(
+                        crate::views::toast::ToastLevel::Success,
+                        "context compacted; older history was summarized",
+                    ));
+                }
+                true
+            }
+            TurnEvent::SessionCommandFailed { .. } => {
+                // The owning surface reports the returned command error as the
+                // terminal turn failure. Stop the command activity here without
+                // rendering the same error twice.
+                self.running = false;
+                self.streaming = None;
+                self.close_reasoning();
                 true
             }
             TurnEvent::ProviderRequestStarted {

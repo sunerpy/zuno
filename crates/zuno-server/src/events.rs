@@ -168,6 +168,25 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "session.materialized",
             object(json!({"sessionID": session_id, "title": title})),
         ),
+        TurnEvent::SessionTitleUpdated { title } => {
+            ("session.title.updated", object(json!({"title": title})))
+        }
+        TurnEvent::SessionCommandStarted { command } => (
+            "session.command.started",
+            object(json!({"command": command.name()})),
+        ),
+        TurnEvent::SessionCommandOutput { command, content } => (
+            "session.command.output",
+            object(json!({"command": command.name(), "content": content})),
+        ),
+        TurnEvent::SessionCommandCompleted { command } => (
+            "session.command.completed",
+            object(json!({"command": command.name()})),
+        ),
+        TurnEvent::SessionCommandFailed { command, message } => (
+            "session.command.failed",
+            object(json!({"command": command.name(), "message": message})),
+        ),
         TurnEvent::SkillLoaded { name, source } => (
             "skill.loaded",
             object(json!({"name": name, "source": source})),
@@ -529,4 +548,42 @@ struct SessionSubscription {
     boundary: i64,
     live: EventSubscription<StreamEvent>,
     cursor: Option<EventCursor>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn_event;
+    use zuno_engine::r#loop::TurnEvent;
+    use zuno_engine::session_command::SessionCommand;
+
+    #[test]
+    fn native_session_command_lifecycle_has_stable_durable_event_names() {
+        let started = turn_event(&TurnEvent::SessionCommandStarted {
+            command: SessionCommand::Compact,
+        });
+        assert_eq!(started.event_type, "session.command.started");
+        assert_eq!(started.properties["command"], "compact");
+
+        let output = turn_event(&TurnEvent::SessionCommandOutput {
+            command: SessionCommand::Goal,
+            content: "active goal".to_owned(),
+        });
+        assert_eq!(output.event_type, "session.command.output");
+        assert_eq!(output.properties["command"], "goal");
+        assert_eq!(output.properties["content"], "active goal");
+
+        let completed = turn_event(&TurnEvent::SessionCommandCompleted {
+            command: SessionCommand::Compact,
+        });
+        assert_eq!(completed.event_type, "session.command.completed");
+        assert_eq!(completed.properties["command"], "compact");
+
+        let failed = turn_event(&TurnEvent::SessionCommandFailed {
+            command: SessionCommand::Compact,
+            message: "provider unavailable".to_owned(),
+        });
+        assert_eq!(failed.event_type, "session.command.failed");
+        assert_eq!(failed.properties["command"], "compact");
+        assert_eq!(failed.properties["message"], "provider unavailable");
+    }
 }

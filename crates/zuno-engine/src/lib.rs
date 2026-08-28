@@ -9,6 +9,7 @@ pub mod r#loop;
 pub mod prelude;
 pub mod prompt;
 pub mod retry;
+pub mod session_command;
 pub mod status;
 pub mod stream;
 pub mod terminal_lease;

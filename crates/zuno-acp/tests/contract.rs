@@ -35,6 +35,17 @@ fn engine_stream_events_project_to_protocol_updates() {
     assert_eq!(text["content"]["type"], "text");
     assert_eq!(text["content"]["text"], "hello");
 
+    let command_output = turn_event_update(&TurnEvent::SessionCommandOutput {
+        command: zuno_engine::session_command::SessionCommand::Goal,
+        content: "{\n  \"objective\": \"ship ACP commands\"\n}".to_owned(),
+    })
+    .expect("native command output is client-visible");
+    assert_eq!(command_output["sessionUpdate"], "agent_message_chunk");
+    assert_eq!(
+        command_output["content"]["text"],
+        "{\n  \"objective\": \"ship ACP commands\"\n}"
+    );
+
     let pending = turn_event_update(&TurnEvent::ToolCallStarted {
         step: 1,
         call_id: "call-1".to_owned(),
