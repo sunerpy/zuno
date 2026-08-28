@@ -177,15 +177,37 @@ surface.
 ## 5. Slash commands and Skills
 
 After session creation, loading, resuming, or a successful reconfiguration,
-Zuno publishes the executable commands from its normal command catalog plus
-unambiguous slash-invokable Skills. Zed then exposes them in `/` completion.
+Zuno publishes native session controls, executable commands from its normal
+command catalog, and unambiguous slash-invokable Skills. Zed then exposes them
+in `/` completion.
 
 The sources are the same as other Zuno surfaces:
 
+- native session controls with real runtime handlers: `/compact`, `/goal`,
+  `/plan`, `/start-plan`, and `/start-work`;
 - global `command/*.md` or `commands/*.md` under the Zuno config directory;
 - project `.zuno/command/*.md` or `.zuno/commands/*.md`;
 - built-in commands that have real handlers;
 - discovered Skills whose names do not conflict with commands.
+
+`/compact` accepts no arguments. It invokes the same durable compaction path as
+the TUI, returns only after the command reaches a terminal lifecycle event, and
+does not send the literal slash command to the model. Native controls take
+precedence, so a user-defined command or Skill named `compact` is not published
+as a second ambiguous entry.
+
+`/goal` exposes the same durable goal handler as the TUI. It accepts
+`show`, `history`, `create <objective>`, `edit <objective>`, `pause`, `resume`,
+`block <reason>`, `complete`, and `cancel`; omit the action to show the current
+goal. The command output is projected as an ordinary Agent message rather than
+as reasoning.
+
+`/plan` toggles between Build and Plan. `/start-plan` enters the read-only Plan
+mode directly, while `/start-work` returns to Build. Leaving Plan requires a
+durable plan, so an early handoff fails explicitly instead of weakening the
+mode boundary. Successful changes emit ACP `current_mode_update` and
+`config_option_update` notifications, keeping Zed's selectors synchronized.
+None of these native commands is sent to the model.
 
 Executing `/name arguments` uses Zuno's existing command-template or Skill
 driver, including normal permission and durable-session behavior. ACP does not
@@ -327,21 +349,22 @@ logs for initialization or session-creation errors.
 
 ### A Kiro prompt fails with `unsupported_content_block_projection`
 
-If a file reference plus user text produces an HTTP 400 saying that one message
-contains multiple text content blocks, declare the gateway limitation in the
-Kiro-compatible provider:
+The 2026-08-28 `kiro-provider` build accepts consecutive all-text blocks and
+concatenates them byte-for-byte with no inserted separator only at Kiro's final
+scalar text boundary. Use:
 
 ```json
 "options": {
   "baseURL": "http://127.0.0.1:8787/v1",
-  "maxTokens": null,
-  "responsesTextBlocks": "single"
+  "maxTokens": null
 }
 ```
 
-This joins only provider-bound text projections. Zuno still stores the original
-typed resource link and user text separately. Do not enable it for a standard
-Responses endpoint that accepts multiple `input_text` blocks.
+Remove a stale `responsesTextBlocks: "single"` option: Zuno's generic
+compatibility mode inserts one blank line and would alter the current
+provider's exact projection. Mixed text and non-text blocks whose ordering Kiro
+cannot preserve still fail closed. If pure text still produces the old error,
+verify that Zed is reaching the newly built provider process.
 
 ## 9. Acceptance checks
 

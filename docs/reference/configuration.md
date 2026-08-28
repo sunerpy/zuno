@@ -6,6 +6,32 @@ Zuno reads only `zuno.json` and `zuno.jsonc`. The global files are under `$XDG_C
 
 Objects merge recursively from lower to higher precedence. Arrays and scalar values replace the lower value. The top level rejects unknown keys.
 
+On the first ordinary discovery, Zuno creates a missing global `zuno.json` as
+`{}` and a missing global `AGENTS.md` from its Zuno-authored starter guidance.
+Creation uses exclusive new-file semantics and never overwrites either file.
+An explicit `ZUNO_CONFIG`, `ZUNO_CONFIG_DIR`, or `ZUNO_CONFIG_CONTENT` launch
+does not materialize defaults, so installation or one ordinary launch should
+precede a profile-only first run.
+
+### Global and project instructions
+
+Zuno loads native instruction files in this order:
+
+1. `$XDG_CONFIG_HOME/zuno/AGENTS.md`;
+2. `ZUNO_CONFIG_DIR/AGENTS.md`, when the profile directory supplies one;
+3. project directories from the worktree root to the current directory.
+
+The base global file remains active when `ZUNO_CONFIG_DIR` selects a provider
+or team. A profile-level file appends narrower, higher-priority guidance rather
+than replacing the base global rules. In one project directory,
+`AGENTS.local.md` replaces `AGENTS.md`; nearer directories are appended later.
+
+The starter covers ownership, verification, scoped Git operations, and safe
+worktree decisions. Detailed procedures remain in the built-in `git-workflow`
+and `worktree` Skills so they are loaded only when relevant. Zuno does not copy
+OpenCode, Codex, Claude, or another product's instruction file, and it never
+overwrites a user-maintained global `AGENTS.md`.
+
 ### Switchable configuration overlays
 
 Zuno does not currently have a named `--profile` flag. Use a final configuration
@@ -732,9 +758,11 @@ An unambiguous Skill that does not collide with a real command is directly
 invokable as `/<skill-name>`. Zuno resolves that exact advertised source and
 loads its body before the next provider request. Same-named Skills from multiple
 sources deliberately disable the ambiguous direct slash form; use the Skill
-picker or the typed `skill` tool with an exact source instead. The current
-`worktree` Skill performs preflight guidance only. Worktree creation, leases,
-cleanup, and quota enforcement remain runtime services planned separately.
+picker or the typed `skill` tool with an exact source instead. The `worktree`
+Skill guides explicit, user-authorized `git worktree` creation, isolated work,
+integration, and conservative cleanup with dirty-state and reachability checks.
+It does not create worktrees by itself, grant Shell authority, or provide
+product-owned leases, quotas, or automatic cleanup.
 
 ## Reusable workflows: Skills and Markdown commands
 

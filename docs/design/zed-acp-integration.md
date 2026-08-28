@@ -106,7 +106,7 @@ loop.
 | Initialization | Negotiates stable protocol V1 and reports schema `1.21.0`. Authentication methods are empty because Zuno uses its own configured provider credentials and has no ACP login handler. |
 | Session lifecycle | Implements `session/new`, `load`, `resume`, `list`, `delete`, and `close`. Loading and resuming create a dormant session without constructing a `TurnHost` or connecting configured MCP servers; the first prompt activates it. Loading replays once while that in-process session remains open, while new and resumed sessions treat the client transcript as already owned. |
 | Session configuration | Implements build/plan modes plus transactional Agent, model, and `reasoning_effort` replacement. The reasoning selector uses ACP category `thought_level` and only publishes levels supported by the active catalog model. Reconfiguration is rejected while a prompt is active and rolls back on failure. |
-| Commands and Skills | Publishes executable Catalog commands and unambiguous slash-invokable Skills through `available_commands_update` after new/load/resume and successful reconfiguration. `/name arguments` reuses the same command or Skill driver as other Zuno surfaces; adapter-specific commands are not invented. |
+| Commands and Skills | Publishes native `/compact`, `/goal`, `/plan`, `/start-plan`, and `/start-work` controls with real handlers, executable Catalog commands, and unambiguous slash-invokable Skills through `available_commands_update` after new/load/resume and successful reconfiguration. Native commands resolve first and suppress same-named Catalog or Skill entries. Compact and Goal invoke shared durable `TurnHost` handlers; Plan controls transactionally replace the collaboration host, publish standard mode/config updates, and require a durable plan before returning to Work. Native command text never enters the model; other `/name arguments` invocations reuse the same command or Skill driver as other Zuno surfaces. |
 | Prompt execution | Admits input through the durable Zuno turn path, streams projections while the turn runs, and projects the final durable plan before returning. Concurrent prompts for one session are rejected. |
 | Prompt content | Advertises and accepts text, inline image, native `resource_link`, embedded text resource, and embedded image resource content. Audio remains `false`. Resource links stay typed; images use typed durable file parts; embedded text keeps URI, MIME, and body in one stable persisted envelope. Selection, diagnostics, fetched context, and branch diff use the generic embedded-resource path rather than Zed-specific prompt branches. |
 | Assistant and tool projection | Streams assistant text and reasoning, tool start/update/completion, accumulated raw input, raw output, JSON/text content, written-file locations, and usage. |
@@ -191,11 +191,18 @@ Run this acceptance sequence from a Zed External Agent thread:
 
 1. Start a Zuno thread and confirm the mode, Agent, model, and reasoning
    selectors are populated from Zuno.
-2. Open `/` completion and verify configured commands and unambiguous Skills
-   appear, then execute one command.
-3. Add an image, selection, and branch diff; verify the selected model receives
+2. Open `/` completion and verify native `/compact`, `/goal`, `/plan`,
+   `/start-plan`, and `/start-work`, configured commands, and unambiguous
+   Skills appear exactly once.
+3. Execute `/goal create verify ACP` and `/goal show`; verify the output is an
+   Agent message and the slash text does not enter model input.
+4. Execute `/start-plan`, verify Zed receives mode/config updates, create a
+   durable plan, then execute `/start-work`.
+5. After enough conversation history exists, execute `/compact`; verify it ends
+   normally, persists a summary, and does not send `/compact` as model input.
+6. Add an image, selection, and branch diff; verify the selected model receives
    the supported content without a protocol error.
-4. Ask for a read-only inspection and verify reasoning and tool details stream
+7. Ask for a read-only inspection and verify reasoning and tool details stream
    without corrupting stdout JSON-RPC.
 5. Request a file creation under strict permission policy, answer the Zed
    permission card, and verify the native creation diff has `oldText: null`.
