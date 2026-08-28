@@ -4,17 +4,19 @@ mod permission;
 mod projection;
 mod question;
 mod replay;
+mod routing;
 mod transport;
 
 pub mod conformance;
 
-pub use permission::AcpPermissionAsker;
+pub use permission::{AcpPermissionAsker, AcpPermissionGrants};
 pub use projection::{TurnEventProjector, turn_event_update};
 pub use question::AcpQuestionAsker;
 pub use replay::{
     DurableReplay, REPLAY_MESSAGE_CAP, REPLAY_TRANSCRIPT_BYTE_CAP, ReplayPolicy,
     durable_plan_update, durable_updates, durable_usage_update,
 };
+pub use routing::{AcpSessionRoute, RoutedSession};
 pub use transport::{Agent, ClientConnection, RpcError, ServeError, serve_stdio};
 
 pub const IMPLEMENTED_METHODS: [&str; 11] = [

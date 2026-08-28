@@ -823,6 +823,7 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
+    use zuno_tool::{NeverInterrupted, PermissionAsk, ToolContext};
 
     use super::*;
 
@@ -989,6 +990,143 @@ mod tests {
                 .map(|line| serde_json::from_str(line).expect("ACP output is NDJSON")),
         );
         frames
+    }
+
+    #[derive(Debug, Default)]
+    struct PermissionAgent {
+        grants: Arc<crate::AcpPermissionGrants>,
+    }
+
+    #[async_trait]
+    impl Agent for PermissionAgent {
+        async fn request(
+            &self,
+            method: &str,
+            params: Value,
+            client: ClientConnection,
+        ) -> Result<Value, RpcError> {
+            if method == "initialize" {
+                return Ok(json!({}));
+            }
+            if method != "session/prompt" {
+                return Err(RpcError::method_not_found(method));
+            }
+            let session_id = params["sessionId"]
+                .as_str()
+                .ok_or_else(|| RpcError::invalid_params("sessionId is required"))?;
+            let context = ToolContext::new(
+                session_id,
+                "msg_permission",
+                "call_permission",
+                "build",
+                Arc::new(crate::AcpPermissionAsker::with_grants(
+                    client,
+                    "Approve test tool call",
+                    Arc::clone(&self.grants),
+                )),
+                Arc::new(NeverInterrupted),
+            );
+            let mut ask = PermissionAsk::new("shell", "git status");
+            ask.always = ask.patterns.clone();
+            context
+                .ask("shell", ask)
+                .await
+                .map_err(|error| RpcError::internal(error.to_string()))?;
+            Ok(json!({"allowed": true}))
+        }
+
+        async fn notification(
+            &self,
+            method: &str,
+            _params: Value,
+            _client: ClientConnection,
+        ) -> Result<(), RpcError> {
+            Err(RpcError::method_not_found(method))
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_for_session_skips_the_next_matching_acp_permission_request() {
+        let (mut input_writer, input_reader) = tokio::io::duplex(4096);
+        let (output_writer, output_reader) = tokio::io::duplex(4096);
+        let mut output = BufReader::new(output_reader);
+        let server = tokio::spawn(serve(
+            PermissionAgent::default(),
+            input_reader,
+            output_writer,
+        ));
+
+        input_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .expect("write initialize");
+        let mut line = String::new();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("read initialize response");
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).expect("initialize response")["id"],
+            1
+        );
+
+        input_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"ses_grant\"}}\n",
+            )
+            .await
+            .expect("write first prompt");
+        line.clear();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("read permission request");
+        let permission = serde_json::from_str::<Value>(&line).expect("permission request");
+        assert_eq!(permission["method"], "session/request_permission");
+        assert_eq!(
+            permission["params"]["options"][1]["optionId"],
+            "allow_session"
+        );
+        let permission_id = permission["id"].clone();
+        input_writer
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"allow_session\"}}}}}}\n",
+                    serde_json::to_string(&permission_id).expect("encode permission id")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("allow for session");
+        line.clear();
+        output
+            .read_line(&mut line)
+            .await
+            .expect("read first prompt response");
+        let first = serde_json::from_str::<Value>(&line).expect("first prompt response");
+        assert_eq!(first["id"], 2);
+        assert_eq!(first["result"]["allowed"], true);
+
+        input_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"ses_grant\"}}\n",
+            )
+            .await
+            .expect("write repeated prompt");
+        line.clear();
+        timeout(Duration::from_secs(1), output.read_line(&mut line))
+            .await
+            .expect("standing grant resolves without a permission round trip")
+            .expect("read repeated prompt response");
+        let repeated = serde_json::from_str::<Value>(&line).expect("repeated prompt response");
+        assert_eq!(repeated["id"], 3);
+        assert_eq!(repeated["result"]["allowed"], true);
+
+        input_writer.shutdown().await.expect("close ACP input");
+        server
+            .await
+            .expect("server task joins")
+            .expect("server exits cleanly");
     }
 
     #[tokio::test]
