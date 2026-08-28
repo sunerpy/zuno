@@ -98,7 +98,7 @@ research and asks before shell/environment access:
   "workflows": {
     "release-review": {
       "description": "Run the packaged reviewer.",
-      "prompt": "Call task once with subagent_type=\"release-reviewer\", background=false, and this prompt: Review $ARGUMENTS"
+      "prompt": "Call task once with agent=\"release-reviewer\", objective=\"Review release safety\", deliverable=\"A source-backed release risk report\", instructions=\"Review $ARGUMENTS\", success_evidence=\"Cite every blocking finding\", and background=false."
     }
   }
 }
@@ -110,14 +110,29 @@ participate in the normal child-model precedence ladder, and the child turn
 re-resolves the same extension package, prompt, permissions, skills, tools, and
 working directory. A `primary`-only agent is not a delegation target.
 
+The workflow prompt above is expected to produce the same typed task contract a
+native Agent uses:
+
+```json
+{
+  "agent": "release-reviewer",
+  "objective": "Review release safety",
+  "deliverable": "A source-backed release risk report",
+  "instructions": "Review the requested release scope.",
+  "success_evidence": "Cite every blocking finding.",
+  "background": false
+}
+```
+
 See [agent orchestration and model routing](orchestration.md) for the exact
-direct-Agent and category precedence ladders, reasoning overrides, background
-report delivery, configured workflow DAGs, and Council.
+direct-Agent and host-owned category precedence ladders, reasoning policy,
+background report delivery, configured workflow DAGs, and Council.
 
 A workflow is a slash-command prompt template. `$ARGUMENTS` and positional
 placeholders use the normal command expansion. When a workflow must run a
 specific custom agent, its prompt should issue `task` with that
-`subagent_type`, as the example does; it does not create a hidden second
+`agent` and a complete typed delegation contract, as the example does; it does
+not create a hidden second
 orchestration path.
 
 See [`examples/plugins/review-kit/extension.json`](../examples/plugins/review-kit/extension.json).

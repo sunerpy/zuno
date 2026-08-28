@@ -2,14 +2,14 @@
 
 This guide explains how Zuno's default `orchestrator` delegates work, how to
 choose child-agent models and reasoning levels, and when to use direct tasks,
-categories, configured workflows, or Council.
+configured workflows, or Council.
 
 The short answer is:
 
 - configure agent identity, tools, permissions, and delegation boundaries under
   `agents`;
 - configure switchable team-wide model routes under `presets`;
-- use `task.model` and `task.effort` only for a deliberate one-child override;
+- call `task` with one named `agent` and a complete typed work contract;
 - use `workflows` when the graph and dependency order must be configuration
   owned rather than invented by the model.
 
@@ -258,12 +258,13 @@ See the checked
 `myopenai`, `kiro-local`, and mixed `hybrid` teams covering the complete native
 user-Agent roster.
 
-### Per-task overrides
+### Direct delegation routing
 
-The `task` tool accepts `model` and `effort` for one child only. This is useful
-when the parent discovers that one particular task needs a different model or
-reasoning level. It is less suitable than configuration for a stable policy,
-because the orchestrator model must choose to send the fields.
+The model-facing `task` tool does not accept `model`, `effort`, or `category`.
+The selected Agent, active preset, and parent session determine the effective
+model and reasoning level. This keeps routing and authority in validated host
+configuration instead of allowing a prompt to select an arbitrary provider or
+reasoning policy.
 
 ## Recommended switchable configuration
 
@@ -372,70 +373,54 @@ silently ignoring them.
 
 ## Direct child model precedence
 
-For `task` with `subagent_type`, Zuno chooses the child model in this order:
+For `task` with `agent`, Zuno chooses the child model in this order:
 
-1. valid `task.model`;
-2. `agents.<target>.model`;
-3. `presets.<active>.agents.<target>`;
-4. the parent session model.
+1. `agents.<target>.model`;
+2. `presets.<active>.agents.<target>`;
+3. the parent session model.
 
 An unavailable or unqualified model produces a visible routing diagnostic and
 falls through to the next configured candidate. Model ids must use
 `provider/model` form and exist in the resolved catalog.
 
-Reasoning or variant resolution is:
+Reasoning or variant resolution uses the reasoning or variant attached to the
+winning Agent route, then the selected model/provider default.
 
-1. valid `task.effort`;
-2. the reasoning or variant attached to the model route that won;
-3. the selected model/provider default.
-
-One important consequence is that an explicit `task.model` without
-`task.effort` does not inherit the configured target Agent's reasoning level.
-It uses the explicit model's default.
-
-Example one-child override:
+Example direct delegation:
 
 ```json
 {
-  "description": "Trace auth call chain",
-  "prompt": "Trace login, refresh, logout, credential storage, and every caller. Return exact source evidence.",
-  "subagent_type": "explorer",
-  "model": "myopenai/fast-model",
-  "effort": "low",
+  "agent": "explorer",
+  "objective": "Trace the authentication call chain",
+  "deliverable": "A source-backed call path and affected-file list",
+  "instructions": "Trace login, refresh, logout, credential storage, and every caller.",
+  "success_evidence": "Cite the owning symbols and distinguish observed behavior from inference.",
+  "scope": {
+    "include": ["crates/**"],
+    "exclude": ["target/**"]
+  },
+  "constraints": {
+    "must": ["Remain read-only"],
+    "must_not": ["Edit files"]
+  },
   "background": true,
   "reportDelivery": "nextStep"
 }
 ```
 
-`subagent_type` and `category` are mutually exclusive.
+Unknown fields, including the removed `description`, `prompt`,
+`subagent_type`, `category`, `model`, `effort`, and `load_skills`, fail schema
+validation. Zuno does not translate the old shape.
 
-## Category routing
+## Host-owned category routing
 
-A category is a semantic model tier, not an Agent name:
-
-```json
-{
-  "description": "Summarize test failures",
-  "prompt": "Classify the supplied failures and identify the first actionable cause.",
-  "category": "cheap",
-  "background": false
-}
-```
-
-Category delegation always runs the `general` Agent. Its model order is:
-
-1. valid `task.model`;
-2. `presets.<active>.categories.<category>`;
-3. the parent session model.
-
-`agents.general.model` and `presets.<active>.agents.general` are not consulted
-for a category call. Configure the category itself. If the active preset does
-not define the requested category, Zuno emits a diagnostic and uses the parent
-session model.
-
-Categories are useful when a prompt means “use the inexpensive tier” rather
-than “use the repository explorer.” Use `subagent_type` when the specialist's
-prompt, tools, permissions, or output contract matters.
+Preset `categories` remain available to configured workflow and Council
+routing. They are semantic model tiers, not Agents, and cannot be selected by a
+model-facing `task` call. A host-owned category route runs the bounded
+`general` Agent and resolves through `presets.<active>.categories.<category>`
+before falling back to the parent session model. Use a named `agent` whenever
+specialist prompt, tools, permissions, required Skills, or output ownership
+matters.
 
 ## Top-level Agent model routing
 
@@ -675,15 +660,16 @@ An exact `tools` allowlist hid `task`, an exact `delegates` list removed the
 target, the permission policy denied the target, or `subagent_depth` was
 exhausted. Inspect `zuno agent list` and `zuno debug permissions`.
 
-### “My category uses the wrong model”
+### “A workflow category uses the wrong model”
 
-Configure `presets.<active>.categories.<category>`. Category calls do not use
-the `general` Agent's configured or preset Agent route.
+Configure `presets.<active>.categories.<category>`. Host-owned category routes
+do not use the `general` Agent's configured or preset Agent route.
 
-### “The explicit child model ignored the Agent's reasoning”
+### “The child ignored a model or effort field in the task”
 
-This is intentional. `task.model` selects a new route. Supply `task.effort` too,
-or let that model use its own default.
+Those fields are not part of the `task` schema. Configure
+`agents.<name>.model`, `agents.<name>.reasoning`, or the active preset route
+instead.
 
 ### “The custom reviewer cannot be targeted”
 

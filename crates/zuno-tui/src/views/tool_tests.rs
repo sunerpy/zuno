@@ -177,7 +177,7 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
         ),
         (
             "task",
-            r#"{"subagent_type":"explore","description":"find the parser"}"#,
+            r#"{"agent":"explore","objective":"find the parser"}"#,
             "explore: find the parser",
         ),
         (

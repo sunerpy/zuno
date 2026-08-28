@@ -143,6 +143,119 @@ fn a_replayed_message_keeps_its_stored_id() {
 }
 
 #[test]
+fn a_typed_task_report_replays_as_hidden_projection_data() {
+    let connection = seeded();
+    put_message(
+        &connection,
+        "msg_report",
+        "user",
+        100,
+        json!({
+            "taskReport": {
+                "schemaVersion": 1,
+                "jobId": "job_1",
+                "sessionId": "ses_child",
+                "parentSessionId": SESSION_ID,
+                "agent": "deep",
+                "status": "completed",
+                "finalText": "typed result",
+                "usage": {},
+                "changedPaths": ["src/lib.rs"],
+                "verificationRecords": [],
+                "uncertainSideEffects": [],
+                "evidenceErrors": []
+            }
+        }),
+    );
+    put_part(
+        &connection,
+        "msg_report",
+        "prt_report",
+        100,
+        json!({"type": "text", "text": "opaque report prose"}),
+    );
+
+    let replay = project(history(&connection));
+
+    assert_eq!(replay.messages.len(), 1);
+    assert!(matches!(
+        replay.messages[0].parts.last(),
+        Some(MessagePart::ReplayData { data })
+            if data["taskReport"]["finalText"] == "typed result"
+    ));
+}
+
+#[test]
+fn a_foreground_task_report_replays_from_the_real_tool_metadata_path() {
+    let connection = seeded();
+    put_message(&connection, "msg_task", "assistant", 100, Value::Null);
+    put_part(
+        &connection,
+        "msg_task",
+        "prt_task",
+        100,
+        json!({
+            "type": "tool",
+            "callID": "call_task",
+            "tool": "task",
+            "displayName": "task",
+            "uiIntent": "subagent",
+            "state": {
+                "status": "completed",
+                "input": {
+                    "agent": "deep",
+                    "objective": "repair the bug",
+                    "deliverable": "working fix",
+                    "instructions": "inspect and repair",
+                    "success_evidence": "targeted tests pass"
+                },
+                "title": "repair the bug",
+                "output": "foreground child completed",
+                "metadata": {
+                    "subagent": {
+                        "sessionId": "ses_child",
+                        "jobId": null,
+                        "agent": "deep",
+                        "objective": "repair the bug",
+                        "state": "completed",
+                        "background": false,
+                        "reportDelivery": "foreground",
+                        "report": {
+                            "schemaVersion": 1,
+                            "jobId": "job_foreground",
+                            "sessionId": "ses_child",
+                            "parentSessionId": SESSION_ID,
+                            "agent": "deep",
+                            "status": "completed",
+                            "finalText": "typed foreground result",
+                            "usage": {},
+                            "changedPaths": ["src/fix.rs"],
+                            "verificationRecords": [{
+                                "name": "targeted tests",
+                                "status": "passed",
+                                "evidence": "cargo test -p example"
+                            }],
+                            "uncertainSideEffects": [],
+                            "evidenceErrors": []
+                        }
+                    }
+                }
+            }
+        }),
+    );
+
+    let replay = project(history(&connection));
+
+    assert_eq!(replay.messages.len(), 1);
+    assert!(matches!(
+        replay.messages[0].parts.last(),
+        Some(MessagePart::ReplayData { data })
+            if data["taskReport"]["finalText"] == "typed foreground result"
+                && data["taskReport"]["changedPaths"][0] == "src/fix.rs"
+    ));
+}
+
+#[test]
 fn a_completed_tool_call_replays_with_its_arguments_output_title_and_diff() {
     let connection = seeded();
     put_message(&connection, "msg_a", "assistant", 100, Value::Null);

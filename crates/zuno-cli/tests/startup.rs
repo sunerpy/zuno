@@ -39,6 +39,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use zuno_cli::startup::{PROFILE_LINE_PREFIX, StartupPhase, ZUNO_STARTUP_PROFILE};
@@ -49,6 +50,19 @@ use zuno_cli::startup::{PROFILE_LINE_PREFIX, StartupPhase, ZUNO_STARTUP_PROFILE}
 /// perturbs it far more than it does the minute-scale memory workloads, and the
 /// extra samples cost under a second in total.
 const RUNS: usize = 9;
+
+/// Startup tests share one subject binary and one host.
+///
+/// Rust runs integration-test functions in parallel by default. Every test in
+/// this binary takes this lock, including structural tests that launch only one
+/// child, so the wall-clock assertions never benchmark sibling test processes.
+static STARTUP_MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
+
+fn startup_measurement_lock() -> MutexGuard<'static, ()> {
+    STARTUP_MEASUREMENT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// `zuno --version` — the shortest path through the binary.
 ///
@@ -187,6 +201,7 @@ fn phases(line: &[(String, u128)]) -> BTreeSet<&str> {
 
 #[test]
 fn startup_medians_are_inside_their_budgets() {
+    let _measurement_lock = startup_measurement_lock();
     let cases: [(&str, &[&str], Duration); 4] = [
         ("zuno --version", &["--version"], BUDGET_VERSION),
         (
@@ -235,6 +250,7 @@ fn startup_medians_are_inside_their_budgets() {
 
 #[test]
 fn startup_profile_attributes_every_phase_it_declares() {
+    let _measurement_lock = startup_measurement_lock();
     // Given: the two invocations that between them traverse every phase.
     let version = profile_lines("phases", &["--version"]);
     let dispatch = profile_lines("phases", &["session", "list"]);
@@ -286,6 +302,7 @@ fn startup_profile_attributes_every_phase_it_declares() {
 
 #[test]
 fn startup_version_pays_for_no_log_file_and_no_reexec() {
+    let _measurement_lock = startup_measurement_lock();
     // Given: the fast path, profiled.
     let lines = profile_lines("version-only", &["--version"]);
     let line = &lines[0];
@@ -332,6 +349,7 @@ fn startup_version_pays_for_no_log_file_and_no_reexec() {
 
 #[test]
 fn startup_profile_is_off_unless_asked_for() {
+    let _measurement_lock = startup_measurement_lock();
     // Given/When: the fast path run without the profile variable set.
     let output = command_in("profile-off", &["--version"], false)
         .output()
@@ -358,6 +376,7 @@ fn startup_profile_is_off_unless_asked_for() {
 
 #[test]
 fn startup_profile_never_reaches_stdout_even_when_requested() {
+    let _measurement_lock = startup_measurement_lock();
     // Given/When: the profile is requested on both a fast and a dispatching path.
     for args in [vec!["--version"], vec!["session", "list"]] {
         let output = command_in("stdout-purity", &args, true)
@@ -397,6 +416,7 @@ fn classification(argv: &[&str]) -> bool {
 
 #[test]
 fn startup_only_bounded_commands_are_guarded_against_silence() {
+    let _measurement_lock = startup_measurement_lock();
     // Given/When/Then: the classification the watchdog wiring reads.
     for argv in [
         vec!["zuno", "session", "list"],
@@ -427,6 +447,7 @@ fn startup_only_bounded_commands_are_guarded_against_silence() {
 /// measurable time.
 #[test]
 fn startup_the_liveness_watchdog_costs_nothing_measurable_on_a_bounded_command() {
+    let _measurement_lock = startup_measurement_lock();
     // Given: a command classified as bounded work, so a guard IS taken.
     assert!(
         classification(&["zuno", "session", "list"]),
@@ -455,6 +476,7 @@ fn startup_the_liveness_watchdog_costs_nothing_measurable_on_a_bounded_command()
 /// rather than the watchdog in isolation — can be wrong.
 #[test]
 fn startup_a_completed_command_reports_no_stall() {
+    let _measurement_lock = startup_measurement_lock();
     let (_, data) = isolated_roots("no-false-stall");
     let output = command_in("no-false-stall", &["session", "list"], false)
         .output()

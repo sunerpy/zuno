@@ -425,13 +425,13 @@ flat compatibility forms and provider-specific `variant` fields are rejected.
 The expanded form accepts `reasoning` values `off`, `low`, `medium`, `high`,
 `xhigh`, and `max`. A bare `provider/model` string leaves reasoning unchanged.
 
-For direct `task` delegation with `subagent_type`, model precedence is an
-explicit task `model`, `agents.<target>.model`, the active preset's Agent route,
-then the parent session model. For `category`, the child is the `general` Agent
-and model precedence is an explicit task `model`, the active preset's category
-route, then the parent session model; the `general` Agent route is deliberately
-not consulted. Effort precedence is explicit task `effort`, the reasoning or
-variant attached to the winning route, then the model/provider default.
+For direct `task` delegation with `agent`, model precedence is
+`agents.<target>.model`, the active preset's Agent route, then the parent
+session model. The model-facing tool does not accept `model`, `effort`, or
+`category` overrides. Host-owned workflow and Council category routes use the
+active preset's category route, then the parent session model; the `general`
+Agent route is deliberately not consulted. Reasoning comes from the winning
+route, then the model/provider default.
 
 The top-level turn follows the same specificity principle for its selected
 Agent. An unavailable route produces a visible diagnostic before falling
@@ -717,7 +717,8 @@ under `skills`:
 {
   "skills": {
     "includeInstructions": true,
-    "maxContextTokens": 8000
+    "maxContextTokens": 8000,
+    "maxSelectedContextTokens": 16000
   }
 }
 ```
@@ -726,6 +727,14 @@ under `skills`:
 model prompts. The `skill` tool still supports paged `list` and `search`
 discovery. `load` and `read_resource` return content-bound continuation cursors;
 the caller must read through `complete: true` before applying the instructions.
+
+`maxContextTokens` applies only to the compact catalog. Fully selected Skill
+bodies share a separate aggregate prompt budget. Its default is ten percent of
+a known model context, with a 2,000-token floor and a 32,000-token ceiling; an
+unknown context uses 8,000 approximate tokens. `maxSelectedContextTokens`
+overrides the derived value but remains capped at 32,000 tokens. If one or more
+selected bodies do not fit, loading or restoring the session fails before a
+provider request rather than silently dropping instructions.
 
 Use `zuno debug skill` after restarting to inspect the exact catalog and source
 locations visible to a session. A generic prompt such

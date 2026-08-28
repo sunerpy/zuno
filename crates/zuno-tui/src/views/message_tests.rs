@@ -1812,7 +1812,7 @@ fn views_task_results_render_as_a_child_session_instead_of_raw_envelope_markup()
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolInputDelta {
         id: String::from("task_1"),
         delta: String::from(
-            r#"{"description":"trace the runtime","subagent_type":"deep","prompt":"inspect it"}"#,
+            r#"{"objective":"trace the runtime","deliverable":"call-chain report","instructions":"inspect it","success_evidence":"cite the durable events","agent":"deep"}"#,
         ),
     })));
     view.handle_event(&AppEvent::Engine(provider(StreamEvent::ToolUseEnd {

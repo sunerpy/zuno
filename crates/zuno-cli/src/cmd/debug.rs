@@ -29,7 +29,7 @@ pub(super) fn execute(args: &DebugArgs, environment: &StartupEnvironment) -> Res
         }
         DebugCommand::Agent(args) => {
             let context = Context::resolve(environment)?;
-            agent(args, &context)
+            agent(args, &context, environment)
         }
         DebugCommand::Prompt(args) => prompt(args),
         DebugCommand::Permissions => {
@@ -154,55 +154,196 @@ fn prompt(args: &DebugPromptArgs) -> Result<(), String> {
     let pool = zuno_db::Pool::open_default().map_err(to_string)?;
     let mut connection = pool.get().map_err(to_string)?;
     zuno_db::migration::apply(&mut connection).map_err(to_string)?;
-    let row = match (&args.session_id, args.turn) {
-        (Some(session_id), Some(turn)) => connection
-            .query_row(
-                "SELECT id, aggregate_id, seq, data FROM event \
-                 WHERE type = 'session.prompt.assembled.1' AND aggregate_id = ?1 \
-                 AND CAST(json_extract(data, '$.step') AS INTEGER) = ?2 \
-                 ORDER BY seq DESC LIMIT 1",
-                rusqlite::params![session_id, turn],
-                prompt_row,
-            )
-            .optional(),
-        (Some(session_id), None) => connection
-            .query_row(
-                "SELECT id, aggregate_id, seq, data FROM event \
-                 WHERE type = 'session.prompt.assembled.1' AND aggregate_id = ?1 \
-                 ORDER BY seq DESC LIMIT 1",
-                [session_id],
-                prompt_row,
-            )
-            .optional(),
-        (None, None) => connection
-            .query_row(
-                "SELECT id, aggregate_id, seq, data FROM event \
-                 WHERE type = 'session.prompt.assembled.1' ORDER BY rowid DESC LIMIT 1",
-                [],
-                prompt_row,
-            )
-            .optional(),
-        (None, Some(_)) => unreachable!("turn is positional after session"),
+    let output = prompt_output(&connection, args)?;
+    print_json(&output)
+}
+
+#[derive(Debug)]
+struct ProviderPromptReceipt {
+    event_id: String,
+    sequence: i64,
+    step: u32,
+    prompt_receipt_id: String,
+    estimated_prompt_tokens: Option<u64>,
+}
+
+fn prompt_output(
+    connection: &rusqlite::Connection,
+    args: &DebugPromptArgs,
+) -> Result<serde_json::Value, String> {
+    if args.session_id.is_none() && args.step.is_some() {
+        return Err("`--step` requires `--session <id>`".to_owned());
     }
-    .map_err(to_string)?;
-    let Some((event_id, session_id, sequence, data)) = row else {
-        let target = args
-            .session_id
-            .as_deref()
-            .map_or_else(|| "the database".to_owned(), |id| format!("session `{id}`"));
-        return Err(format!("no prompt receipt found for {target}"));
+
+    let (row, provider_request) = match args.session_id.as_deref() {
+        Some(session_id) => {
+            let provider_request = provider_prompt_receipt(connection, session_id, args.step)?;
+            let row = connection
+                .query_row(
+                    "SELECT id, aggregate_id, seq, data FROM event \
+                     WHERE id = ?1 AND aggregate_id = ?2 \
+                     AND type = 'session.prompt.assembled.1' LIMIT 1",
+                    rusqlite::params![provider_request.prompt_receipt_id, session_id],
+                    prompt_row,
+                )
+                .optional()
+                .map_err(to_string)?
+                .ok_or_else(|| {
+                    format!(
+                        "provider request `{}` references missing prompt receipt `{}` in session `{session_id}`",
+                        provider_request.event_id, provider_request.prompt_receipt_id
+                    )
+                })?;
+            (row, Some(provider_request))
+        }
+        None => {
+            let row = connection
+                .query_row(
+                    "SELECT id, aggregate_id, seq, data FROM event \
+                     WHERE type = 'session.prompt.assembled.1' \
+                     ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    prompt_row,
+                )
+                .optional()
+                .map_err(to_string)?
+                .ok_or_else(|| "no prompt receipt found in the database".to_owned())?;
+            (row, None)
+        }
     };
+
+    let (event_id, session_id, sequence, data) = row;
     let mut properties: serde_json::Value = serde_json::from_str(&data).map_err(to_string)?;
     if !args.show_sensitive {
         redact_prompt_content(&mut properties);
     }
-    print_json(&serde_json::json!({
-        "eventId": event_id,
-        "eventType": "session.prompt.assembled",
-        "sessionId": session_id,
-        "sequence": sequence,
-        "properties": properties,
-    }))
+    let mut output = serde_json::Map::from_iter([
+        ("eventId".to_owned(), serde_json::Value::String(event_id)),
+        (
+            "eventType".to_owned(),
+            serde_json::Value::String("session.prompt.assembled.1".to_owned()),
+        ),
+        (
+            "sessionId".to_owned(),
+            serde_json::Value::String(session_id),
+        ),
+        (
+            "sequence".to_owned(),
+            serde_json::Value::Number(sequence.into()),
+        ),
+        ("properties".to_owned(), properties),
+    ]);
+    if let Some(provider_request) = provider_request {
+        let mut request = serde_json::Map::from_iter([
+            (
+                "eventId".to_owned(),
+                serde_json::Value::String(provider_request.event_id),
+            ),
+            (
+                "sequence".to_owned(),
+                serde_json::Value::Number(provider_request.sequence.into()),
+            ),
+            (
+                "step".to_owned(),
+                serde_json::Value::from(provider_request.step),
+            ),
+            (
+                "promptReceiptID".to_owned(),
+                serde_json::Value::String(provider_request.prompt_receipt_id),
+            ),
+        ]);
+        if let Some(estimated_prompt_tokens) = provider_request.estimated_prompt_tokens {
+            request.insert(
+                "estimatedPromptTokens".to_owned(),
+                serde_json::Value::from(estimated_prompt_tokens),
+            );
+        }
+        output.insert(
+            "providerRequest".to_owned(),
+            serde_json::Value::Object(request),
+        );
+    }
+    Ok(serde_json::Value::Object(output))
+}
+
+fn provider_prompt_receipt(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+    step: Option<std::num::NonZeroU32>,
+) -> Result<ProviderPromptReceipt, String> {
+    let row = match step {
+        Some(step) => connection
+            .query_row(
+                "SELECT id, seq, \
+                    json_extract(data, '$.step'), \
+                    json_extract(data, '$.promptReceiptID'), \
+                    json_extract(data, '$.estimatedPromptTokens') \
+                 FROM event \
+                 WHERE type = 'session.provider.request.1' \
+                   AND aggregate_id = ?1 \
+                   AND json_extract(data, '$.status') = 'started' \
+                   AND CAST(json_extract(data, '$.step') AS INTEGER) = ?2 \
+                   AND json_extract(data, '$.promptReceiptID') IS NOT NULL \
+                 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![session_id, i64::from(step.get())],
+                provider_prompt_receipt_row,
+            )
+            .optional(),
+        None => connection
+            .query_row(
+                "SELECT id, seq, \
+                    json_extract(data, '$.step'), \
+                    json_extract(data, '$.promptReceiptID'), \
+                    json_extract(data, '$.estimatedPromptTokens') \
+                 FROM event \
+                 WHERE type = 'session.provider.request.1' \
+                   AND aggregate_id = ?1 \
+                   AND json_extract(data, '$.status') = 'started' \
+                   AND json_extract(data, '$.promptReceiptID') IS NOT NULL \
+                 ORDER BY seq DESC LIMIT 1",
+                [session_id],
+                provider_prompt_receipt_row,
+            )
+            .optional(),
+    }
+    .map_err(to_string)?;
+
+    row.ok_or_else(|| match step {
+        Some(step) => format!(
+            "no provider request with a prompt receipt found for session `{session_id}` at step {}",
+            step.get()
+        ),
+        None => {
+            format!("no provider request with a prompt receipt found for session `{session_id}`")
+        }
+    })
+}
+
+fn provider_prompt_receipt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderPromptReceipt> {
+    let step = row.get::<_, i64>(2)?;
+    let estimated_prompt_tokens = row.get::<_, Option<i64>>(4)?;
+    Ok(ProviderPromptReceipt {
+        event_id: row.get(0)?,
+        sequence: row.get(1)?,
+        step: u32::try_from(step).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        prompt_receipt_id: row.get(3)?,
+        estimated_prompt_tokens: estimated_prompt_tokens
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
+    })
 }
 
 fn prompt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, i64, String)> {
@@ -228,6 +369,28 @@ fn redact_prompt_content(value: &mut serde_json::Value) {
             "actualSystemPrompt".to_owned(),
             serde_json::json!("<redacted>"),
         );
+    }
+    for key in ["providerProjection", "actualProviderProjection"] {
+        if let Some(projection) = properties.get_mut(key) {
+            redact_provider_projection(projection);
+        }
+    }
+}
+
+fn redact_provider_projection(value: &mut serde_json::Value) {
+    let Some(projection) = value.as_object_mut() else {
+        return;
+    };
+    for lane in ["system", "developer"] {
+        let Some(messages) = projection
+            .get_mut(lane)
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for message in messages {
+            *message = serde_json::json!("<redacted>");
+        }
     }
 }
 
@@ -266,29 +429,20 @@ fn paths(environment: &StartupEnvironment) -> Result<(), String> {
     Ok(())
 }
 
-fn agent(args: &DebugAgentArgs, context: &Context) -> Result<(), String> {
-    if args.tool.is_some() || args.params.is_some() {
-        return Err(
-            "debug agent tool execution requires the model/session/permission runtime and is not available through the catalog-only debug path"
-                .to_owned(),
-        );
-    }
-    let agents = zuno_catalog::agent::load(
-        &context.directory,
-        context.worktree.as_deref(),
-        &context.env,
-    )
-    .map_err(to_string)?;
-    let entry = agents
-        .into_iter()
-        .find(|entry| entry.name == args.name)
-        .ok_or_else(|| {
-            format!(
-                "Agent {} not found, run 'zuno agent list' to get an agent list",
-                args.name
-            )
-        })?;
-    print_json(&entry)
+fn agent(
+    args: &DebugAgentArgs,
+    context: &Context,
+    environment: &StartupEnvironment,
+) -> Result<(), String> {
+    let plan = runtime()?.block_on(super::turn::TurnPlan::resolve(
+        &super::turn::TurnOptions {
+            directory: Some(context.directory.clone()),
+            agent: Some(args.name.clone()),
+            ..super::turn::TurnOptions::default()
+        },
+        environment,
+    ))?;
+    print_json(&plan.debug_agent_snapshot())
 }
 
 fn skill(context: &Context) -> Result<(), String> {
@@ -468,9 +622,18 @@ mod tests {
     #[test]
     fn prompt_debug_redacts_model_visible_bodies_but_keeps_provenance() {
         let mut receipt = serde_json::json!({
+            "schemaVersion": 3,
             "assemblySha256": "assembly-digest",
             "actualSha256": "actual-digest",
             "actualSystemPrompt": "hook-transformed secret",
+            "providerProjection": {
+                "system": ["base secret"],
+                "developer": ["runtime secret", "project secret"]
+            },
+            "actualProviderProjection": {
+                "system": ["hook-transformed secret"],
+                "developer": ["runtime secret", "hook context secret"]
+            },
             "sections": [{
                 "id": "instructions.project.0",
                 "role": "project_instructions",
@@ -485,9 +648,159 @@ mod tests {
 
         assert_eq!(receipt["sections"][0]["content"], "<redacted>");
         assert_eq!(receipt["actualSystemPrompt"], "<redacted>");
+        assert_eq!(
+            receipt["providerProjection"]["system"],
+            serde_json::json!(["<redacted>"])
+        );
+        assert_eq!(
+            receipt["providerProjection"]["developer"],
+            serde_json::json!(["<redacted>", "<redacted>"])
+        );
+        assert_eq!(
+            receipt["actualProviderProjection"]["system"],
+            serde_json::json!(["<redacted>"])
+        );
+        assert_eq!(
+            receipt["actualProviderProjection"]["developer"],
+            serde_json::json!(["<redacted>", "<redacted>"])
+        );
         assert_eq!(receipt["sections"][0]["source"], "/repo/AGENTS.md");
         assert_eq!(receipt["sections"][0]["sha256"], "section-digest");
         assert_eq!(receipt["assemblySha256"], "assembly-digest");
+    }
+
+    #[test]
+    fn prompt_debug_resolves_session_step_through_the_provider_receipt_id() {
+        let connection = prompt_event_connection();
+        insert_prompt_event(
+            &connection,
+            "evt_prompt_matching_step_but_wrong",
+            "ses_example",
+            1,
+            serde_json::json!({
+                "schemaVersion": 3,
+                "step": 7,
+                "sections": [{
+                    "id": "wrong",
+                    "source": "wrong",
+                    "sha256": "wrong",
+                    "estimatedTokens": 1,
+                    "content": "wrong"
+                }],
+                "providerProjection": {"system": ["wrong"], "developer": []}
+            }),
+        );
+        insert_prompt_event(
+            &connection,
+            "evt_prompt_referenced",
+            "ses_example",
+            2,
+            serde_json::json!({
+                "schemaVersion": 3,
+                "step": 99,
+                "sections": [{
+                    "id": "runtime.intent",
+                    "source": "zuno-runtime:runtime.intent",
+                    "sha256": "right-digest",
+                    "estimatedTokens": 11,
+                    "content": "right"
+                }],
+                "providerProjection": {"system": ["right"], "developer": []}
+            }),
+        );
+        insert_event(
+            &connection,
+            "evt_provider",
+            "ses_example",
+            3,
+            "session.provider.request.1",
+            serde_json::json!({
+                "step": 7,
+                "status": "started",
+                "promptReceiptID": "evt_prompt_referenced",
+                "estimatedPromptTokens": 42
+            }),
+        );
+
+        let output = prompt_output(
+            &connection,
+            &DebugPromptArgs {
+                session_id: Some("ses_example".to_owned()),
+                step: std::num::NonZeroU32::new(7),
+                show_sensitive: true,
+            },
+        )
+        .expect("provider-linked prompt receipt");
+
+        assert_eq!(output["eventId"], "evt_prompt_referenced");
+        assert_eq!(output["properties"]["sections"][0]["id"], "runtime.intent");
+        assert_eq!(
+            output["properties"]["sections"][0]["source"],
+            "zuno-runtime:runtime.intent"
+        );
+        assert_eq!(
+            output["properties"]["sections"][0]["sha256"],
+            "right-digest"
+        );
+        assert_eq!(output["properties"]["sections"][0]["estimatedTokens"], 11);
+        assert_eq!(
+            output["properties"]["providerProjection"]["system"],
+            serde_json::json!(["right"])
+        );
+        assert_eq!(output["providerRequest"]["eventId"], "evt_provider");
+        assert_eq!(output["providerRequest"]["estimatedPromptTokens"], 42);
+    }
+
+    #[test]
+    fn prompt_debug_without_a_session_selects_the_database_latest_receipt() {
+        let connection = prompt_event_connection();
+        insert_prompt_event(
+            &connection,
+            "evt_prompt_older",
+            "ses_a",
+            1,
+            serde_json::json!({
+                "schemaVersion": 3,
+                "sections": [],
+                "providerProjection": {"system": ["older"], "developer": []}
+            }),
+        );
+        insert_event(
+            &connection,
+            "evt_unrelated",
+            "ses_a",
+            2,
+            "session.provider.request.1",
+            serde_json::json!({
+                "step": 1,
+                "status": "started",
+                "promptReceiptID": "evt_prompt_older"
+            }),
+        );
+        insert_prompt_event(
+            &connection,
+            "evt_prompt_latest",
+            "ses_b",
+            1,
+            serde_json::json!({
+                "schemaVersion": 3,
+                "sections": [],
+                "providerProjection": {"system": ["latest"], "developer": []}
+            }),
+        );
+
+        let output = prompt_output(
+            &connection,
+            &DebugPromptArgs {
+                session_id: None,
+                step: None,
+                show_sensitive: true,
+            },
+        )
+        .expect("database latest prompt receipt");
+
+        assert_eq!(output["eventId"], "evt_prompt_latest");
+        assert!(output.get("providerRequest").is_none());
     }
 
     #[test]
@@ -513,5 +826,55 @@ mod tests {
             resolve_path(Path::new("/workspace"), "file:///tmp/lib.rs").expect("file URI"),
             Path::new("/tmp/lib.rs")
         );
+    }
+
+    fn prompt_event_connection() -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE event (
+                    id TEXT PRIMARY KEY,
+                    aggregate_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    type TEXT NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .expect("event table");
+        connection
+    }
+
+    fn insert_prompt_event(
+        connection: &rusqlite::Connection,
+        id: &str,
+        session_id: &str,
+        sequence: i64,
+        data: serde_json::Value,
+    ) {
+        insert_event(
+            connection,
+            id,
+            session_id,
+            sequence,
+            "session.prompt.assembled.1",
+            data,
+        );
+    }
+
+    fn insert_event(
+        connection: &rusqlite::Connection,
+        id: &str,
+        session_id: &str,
+        sequence: i64,
+        event_type: &str,
+        data: serde_json::Value,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, session_id, sequence, event_type, data.to_string()],
+            )
+            .expect("insert event");
     }
 }

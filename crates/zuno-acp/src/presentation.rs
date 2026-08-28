@@ -173,43 +173,69 @@ fn subagent_presentation(
 ) -> Option<SubagentPresentation> {
     let input = raw_input?.as_object()?;
     let agent = input
-        .get("subagent_type")
-        .or_else(|| input.get("category"))
+        .get("agent")
         .and_then(Value::as_str)
         .filter(|agent| !agent.is_empty())
         .unwrap_or("subagent");
-    let description = input
-        .get("description")
-        .and_then(Value::as_str)
-        .filter(|description| !description.is_empty());
     let objective = input
-        .get("prompt")
+        .get("objective")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .filter(|objective| !objective.is_empty());
+    let deliverable = input
+        .get("deliverable")
+        .and_then(Value::as_str)
+        .filter(|deliverable| !deliverable.is_empty());
+    let instructions = input
+        .get("instructions")
+        .and_then(Value::as_str)
+        .filter(|instructions| !instructions.is_empty());
+    let success_evidence = input
+        .get("success_evidence")
+        .and_then(Value::as_str)
+        .filter(|evidence| !evidence.is_empty());
+    let scope = input.get("scope").and_then(Value::as_object);
+    let constraints = input.get("constraints").and_then(Value::as_object);
+    let dependencies = input.get("dependencies").and_then(Value::as_array);
     let stored = metadata
         .and_then(|metadata| metadata.get("subagent"))
         .and_then(Value::as_object);
-    let mut typed = stored.cloned().unwrap_or_else(|| {
-        let mut typed = Map::new();
-        typed.insert("agent".to_owned(), Value::String(agent.to_owned()));
-        typed.insert("objective".to_owned(), Value::String(objective.to_owned()));
-        typed.insert(
-            "background".to_owned(),
-            Value::Bool(
-                input
-                    .get("background")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            ),
-        );
-        if let Some(description) = description {
-            typed.insert(
-                "description".to_owned(),
-                Value::String(description.to_owned()),
-            );
+    let mut typed = stored.cloned().unwrap_or_default();
+    typed.insert("agent".to_owned(), Value::String(agent.to_owned()));
+    typed.insert(
+        "background".to_owned(),
+        Value::Bool(
+            input
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+    );
+    let mut contract = Map::new();
+    for (wire, projected, value) in [
+        ("objective", "objective", objective),
+        ("deliverable", "deliverable", deliverable),
+        ("instructions", "instructions", instructions),
+        ("success_evidence", "successEvidence", success_evidence),
+    ] {
+        if let Some(value) = value {
+            let value = Value::String(value.to_owned());
+            contract.insert(wire.to_owned(), value.clone());
+            typed.insert(projected.to_owned(), value);
         }
-        typed
-    });
+    }
+    if let Some(scope) = scope {
+        contract.insert("scope".to_owned(), Value::Object(scope.clone()));
+    }
+    if let Some(constraints) = constraints {
+        contract.insert("constraints".to_owned(), Value::Object(constraints.clone()));
+    }
+    if let Some(dependencies) = dependencies {
+        contract.insert(
+            "dependencies".to_owned(),
+            Value::Array(dependencies.clone()),
+        );
+    }
+    typed.insert("contract".to_owned(), Value::Object(contract));
     if let Some(output) = output {
         for (key, attribute) in [
             ("sessionId", "id"),
@@ -224,15 +250,54 @@ fn subagent_presentation(
         }
     }
     typed.insert("state".to_owned(), Value::String(status.to_owned()));
-    let title = description.map_or_else(
+    let title = objective.map_or_else(
         || format!("Delegate · {agent}"),
-        |description| format!("Delegate · {agent} · {description}"),
+        |objective| format!("Delegate · {agent} · {objective}"),
     );
-    let heading = description.unwrap_or("Delegated task");
+    let heading = objective.unwrap_or("Delegated task");
     let mut lines = vec![format!("### {heading}"), format!("Agent: {agent}")];
-    if !objective.is_empty() {
-        lines.push(format!("Objective: {objective}"));
+    if let Some(deliverable) = deliverable {
+        lines.push(format!("Deliverable: {deliverable}"));
     }
+    if let Some(instructions) = instructions {
+        lines.push(format!("Instructions: {instructions}"));
+    }
+    if let Some(success_evidence) = success_evidence {
+        lines.push(format!("Success evidence: {success_evidence}"));
+    }
+    push_card_list(
+        &mut lines,
+        "Include",
+        scope
+            .and_then(|scope| scope.get("include"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+    );
+    push_card_list(
+        &mut lines,
+        "Exclude",
+        scope
+            .and_then(|scope| scope.get("exclude"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+    );
+    push_card_list(
+        &mut lines,
+        "Must",
+        constraints
+            .and_then(|constraints| constraints.get("must"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+    );
+    push_card_list(
+        &mut lines,
+        "Must not",
+        constraints
+            .and_then(|constraints| constraints.get("must_not"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice),
+    );
+    push_card_list(&mut lines, "Dependencies", dependencies.map(Vec::as_slice));
     lines.push(format!("State: {status}"));
     for (label, key) in [
         ("Session", "sessionId"),
@@ -254,6 +319,21 @@ fn subagent_presentation(
         card: lines.join("\n"),
         metadata: Value::Object(typed),
     })
+}
+
+fn push_card_list(lines: &mut Vec<String>, label: &str, values: Option<&[Value]>) {
+    let Some(values) = values else {
+        return;
+    };
+    let values = values
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    lines.push(format!("{label}:\n- {}", values.join("\n- ")));
 }
 
 fn task_output_attribute(output: &str, name: &str) -> Option<String> {

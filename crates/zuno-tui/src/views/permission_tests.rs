@@ -453,7 +453,7 @@ fn views_permission_describe_covers_every_oracle_branch() {
         ("shell", json!({"command": "ls"}), "#", "Shell command"),
         (
             "task",
-            json!({"subagent_type": "explore", "description": "find it"}),
+            json!({"agent": "explore", "objective": "find it"}),
             "#",
             "Explore Task",
         ),

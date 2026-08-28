@@ -19,7 +19,7 @@ fn native(state: &str, job: Option<&str>) -> MessagePart {
         display_name: "renamed_native_delegate".to_owned(),
         name: "renamed_native_delegate".to_owned(),
         ui_intent: ToolUiIntent::Subagent,
-        arguments: r#"{"description":"survey auth","prompt":"inspect","subagent_type":"deep","background":true}"#
+        arguments: r#"{"objective":"survey auth","deliverable":"root-cause report","instructions":"inspect the auth flow","success_evidence":"cite the call path","scope":{"include":["crates/auth/**"],"exclude":["target/**"]},"constraints":{"must":["remain read-only"],"must_not":["edit files"]},"dependencies":["CodeGraph is current"],"agent":"deep","background":true}"#
             .to_owned(),
         title: None,
         status: ToolStatus::Completed,
@@ -204,10 +204,36 @@ fn intent_not_wire_name_selects_native_and_product_subagents() {
     assert_eq!(rows.len(), 2, "{rows:#?}");
     assert_eq!(rows[0].product, "zuno");
     assert_eq!(rows[0].target.as_deref(), Some("deep"));
+    assert_eq!(rows[0].objective.as_deref(), Some("survey auth"));
+    let contract = rows[0].contract.as_ref().expect("typed task contract");
+    assert_eq!(contract.deliverable.as_deref(), Some("root-cause report"));
+    assert_eq!(contract.include, ["crates/auth/**"]);
+    assert_eq!(contract.must_not, ["edit files"]);
     assert_eq!(rows[0].session_id.as_deref(), Some("ses_child"));
     assert_eq!(rows[1].product, "codex");
     assert_eq!(rows[1].target.as_deref(), Some("reviewer"));
     assert_eq!(rows[1].run_id.as_deref(), Some("run_1"));
+}
+
+#[test]
+fn native_task_details_show_the_typed_contract() {
+    let tasks = delegations(&[message(vec![native("running", Some("job_1"))])]);
+    let mut view = SubagentView::new(ViewContext::defaults(), tasks);
+    view.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+    let body = joined(&mut view);
+    for expected in [
+        "objective survey auth",
+        "deliverable root-cause report",
+        "instructions inspect the auth flow",
+        "evidence cite the call path",
+        "include crates/auth/**",
+        "exclude target/**",
+        "must remain read-only",
+        "must not edit files",
+        "dependencies CodeGraph is current",
+    ] {
+        assert!(body.contains(expected), "missing `{expected}`:\n{body}");
+    }
 }
 
 #[test]
@@ -295,16 +321,62 @@ fn live_durable_projection_refreshes_an_open_subagent_view() {
 }
 
 #[test]
-fn next_step_report_refines_a_running_row() {
-    let messages = vec![
-        message(vec![native("running", Some("job_native"))]),
-        Message::user(
-            "Background subagent `ses_child` completed job `job_native`.\n\nfinal child answer",
-        ),
-    ];
+fn typed_task_report_metadata_restores_history_without_text_guessing_or_live_jobs() {
+    let mut report = Message::user("opaque replay payload");
+    report.attach_replay_data(serde_json::json!({
+        "taskReport": {
+            "schemaVersion": 1,
+            "jobId": "job_native",
+            "sessionId": "ses_child",
+            "parentSessionId": "ses_parent",
+            "agent": "deep",
+            "status": "uncertain",
+            "finalText": "typed final answer",
+            "usage": {},
+            "changedPaths": ["src/lib.rs", "tests/regression.rs"],
+            "verificationRecords": [{
+                "name": "cargo test -p zuno-tui",
+                "status": "passed",
+                "evidence": "42 tests passed"
+            }],
+            "uncertainSideEffects": ["remote publish outcome is unknown"],
+            "evidenceErrors": []
+        }
+    }));
+    let messages = vec![message(vec![native("running", Some("job_native"))]), report];
+
     let rows = delegations(&messages);
-    assert_eq!(rows[0].state, "completed");
-    assert_eq!(rows[0].result.as_deref(), Some("final child answer"));
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, "uncertain");
+    assert_eq!(rows[0].session_id.as_deref(), Some("ses_child"));
+    assert_eq!(rows[0].result.as_deref(), Some("typed final answer"));
+    assert_eq!(
+        rows[0].changed_paths,
+        ["src/lib.rs".to_owned(), "tests/regression.rs".to_owned()]
+    );
+    assert_eq!(
+        rows[0].verification_records,
+        [TaskVerificationEvidence {
+            name: "cargo test -p zuno-tui".to_owned(),
+            status: "passed".to_owned(),
+            evidence: Some("42 tests passed".to_owned()),
+        }]
+    );
+    assert_eq!(
+        rows[0].uncertain_side_effects,
+        ["remote publish outcome is unknown".to_owned()]
+    );
+
+    let mut view = SubagentView::new(ViewContext::defaults(), rows);
+    view.handle_action(action("dialog.select.submit"), &press(KeyCode::Enter));
+    let rendered = joined(&mut view);
+    assert!(rendered.contains("typed final answer"));
+    assert!(rendered.contains("src/lib.rs, tests/regression.rs"));
+    assert!(rendered.contains("cargo test -p zuno-tui · passed · 42 tests passed"));
+    assert!(rendered.contains("remote publish outcome is unknown"));
+    assert!(!rendered.contains("opaque replay payload"));
+    assert!(!rendered.contains("\"taskReport\""));
 }
 
 #[test]

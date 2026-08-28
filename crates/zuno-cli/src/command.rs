@@ -6,6 +6,7 @@
 //! disposition policy; todos 80-85 extend the same request path for maintenance.
 
 use std::ffi::OsString;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -612,20 +613,16 @@ pub enum DebugCommand {
 #[derive(Debug, Clone, Args)]
 pub struct DebugAgentArgs {
     pub name: String,
-    #[arg(long)]
-    pub tool: Option<String>,
-    #[arg(long)]
-    pub params: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
 pub struct DebugPromptArgs {
     /// Session whose prompt receipt should be shown; defaults to the latest receipt.
-    #[arg(value_name = "session")]
+    #[arg(long = "session", value_name = "ID")]
     pub session_id: Option<String>,
-    /// One-based model step within the session; defaults to its latest receipt.
-    #[arg(value_name = "turn")]
-    pub turn: Option<u32>,
+    /// One-based provider request step within the selected session.
+    #[arg(long, value_name = "N", requires = "session_id")]
+    pub step: Option<NonZeroU32>,
     /// Include model-visible instruction, AGENTS, skill, and memory content.
     #[arg(long)]
     pub show_sensitive: bool,
@@ -1295,12 +1292,14 @@ mod tests {
     }
 
     #[test]
-    fn debug_prompt_accepts_optional_session_turn_and_sensitive_flag() {
+    fn debug_prompt_accepts_named_session_step_and_sensitive_flag() {
         let cli = Cli::try_parse_from([
             "zuno",
             "debug",
             "prompt",
+            "--session",
             "ses_example",
+            "--step",
             "7",
             "--show-sensitive",
         ])
@@ -1312,7 +1311,7 @@ mod tests {
             panic!("expected debug prompt");
         };
         assert_eq!(args.session_id.as_deref(), Some("ses_example"));
-        assert_eq!(args.turn, Some(7));
+        assert_eq!(args.step, NonZeroU32::new(7));
         assert!(args.show_sensitive);
 
         let latest =
@@ -1324,8 +1323,54 @@ mod tests {
             panic!("expected latest debug prompt");
         };
         assert!(args.session_id.is_none());
-        assert!(args.turn.is_none());
+        assert!(args.step.is_none());
         assert!(!args.show_sensitive);
+    }
+
+    #[test]
+    fn debug_agent_accepts_only_the_agent_name() {
+        let cli =
+            Cli::try_parse_from(["zuno", "debug", "agent", "deep"]).expect("debug agent parses");
+        let Some(Command::Debug(DebugArgs {
+            command: Some(DebugCommand::Agent(args)),
+        })) = cli.command
+        else {
+            panic!("expected debug agent");
+        };
+        assert_eq!(args.name, "deep");
+        assert!(
+            Cli::try_parse_from(["zuno", "debug", "agent", "deep", "--tool", "shell",]).is_err(),
+            "the removed catalog-only tool executor must not remain on the wire"
+        );
+        assert!(
+            Cli::try_parse_from(["zuno", "debug", "agent", "deep", "--params", "{}",]).is_err(),
+            "the removed catalog-only params flag must not remain on the wire"
+        );
+    }
+
+    #[test]
+    fn debug_prompt_rejects_zero_step_step_without_session_and_legacy_positionals() {
+        assert!(
+            Cli::try_parse_from([
+                "zuno",
+                "debug",
+                "prompt",
+                "--session",
+                "ses_example",
+                "--step",
+                "0",
+            ])
+            .is_err(),
+            "step zero is not a model step"
+        );
+        assert!(
+            Cli::try_parse_from(["zuno", "debug", "prompt", "--step", "1"]).is_err(),
+            "step selection requires an explicit session"
+        );
+        assert!(
+            Cli::try_parse_from(["zuno", "debug", "prompt", "ses_example", "7"]).is_err(),
+            "the old positional session/turn shape must not remain compatible"
+        );
     }
 
     #[test]

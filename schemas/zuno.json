@@ -2475,6 +2475,15 @@
             "null"
           ]
         },
+        "maxSelectedContextTokens": {
+          "description": "Maximum approximate tokens used by all fully selected Skill bodies in one\nsession prompt. Values above the runtime ceiling are clamped.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "paths": {
           "description": "Additional paths to skill folders.",
           "items": {

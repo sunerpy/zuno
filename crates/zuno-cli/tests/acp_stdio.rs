@@ -709,29 +709,42 @@ fn request_with_elicitation(
                 let schema = &request["requestedSchema"];
                 assert_eq!(schema["type"], "object");
                 assert_eq!(schema["title"], "Questions");
-                assert_eq!(schema["required"], json!(["q0"]));
+                assert!(
+                    schema.get("required").is_none(),
+                    "choice plus custom answer fields are alternatives"
+                );
                 assert_eq!(
                     schema["properties"]
                         .as_object()
                         .expect("form properties")
                         .len(),
-                    1
+                    2
                 );
-                let q0 = &schema["properties"]["q0"];
-                assert_eq!(q0["type"], "string");
-                assert_eq!(q0["title"], "Database");
-                assert_eq!(q0["minLength"], 1);
-                let description = q0["description"].as_str().expect("q0 description");
-                assert!(description.contains("Which database?"));
-                assert!(description.contains("Postgres: Relational database"));
-                assert!(description.contains("SQLite: Embedded database"));
+                let choice = &schema["properties"]["q0_choice"];
+                assert_eq!(choice["type"], "string");
+                assert_eq!(choice["title"], "Database");
+                assert_eq!(choice["description"], "Which database?");
+                let options = choice["oneOf"].as_array().expect("native choices");
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0]["const"], "Postgres");
+                assert_eq!(options[0]["description"], "Relational database");
+                assert_eq!(options[1]["const"], "SQLite");
+                assert_eq!(options[1]["description"], "Embedded database");
+
+                let custom = &schema["properties"]["q0_custom"];
+                assert_eq!(custom["type"], "string");
+                assert_eq!(custom["title"], "Database — Other");
+                assert_eq!(custom["minLength"], 1);
+                assert!(custom["description"].as_str().is_some_and(|description| {
+                    description.contains("Which database?") && description.contains("custom answer")
+                }));
 
                 let reply = json!({
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
                         "action": "accept",
-                        "content": {"q0": "SQLite"}
+                        "content": {"q0_choice": "SQLite"}
                     }
                 });
                 writeln!(

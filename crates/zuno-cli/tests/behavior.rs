@@ -383,7 +383,7 @@ fn plugin_add_update_list_and_remove_use_project_extension_storage() {
   "workflows": {
     "network-review": {
       "description": "Delegate a network-aware review.",
-      "prompt": "Use task with subagent_type=network-reviewer for: $ARGUMENTS"
+      "prompt": "Use task with agent=network-reviewer and a complete typed delegation contract for: $ARGUMENTS"
     }
   }
 }"#,

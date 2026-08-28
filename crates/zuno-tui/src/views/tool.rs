@@ -275,11 +275,11 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
                 .or_else(|| first_text(&["query", "question"]))?;
             Some(Summary::tail(queries))
         }
-        // `<subagent_type>: <description>`, so a transcript of six delegations says which
-        // six. `description` alone would omit the agent; `prompt` is a paragraph.
+        // `<agent>: <objective>`, so a transcript of six delegations says both who owns
+        // each child and what durable outcome that child is expected to produce.
         "task" => {
-            let what = text("description").or_else(|| text("prompt"))?;
-            Some(Summary::tail(match text("subagent_type") {
+            let what = text("objective")?;
+            Some(Summary::tail(match text("agent") {
                 Some(agent) => format!("{agent}: {what}"),
                 None => what,
             }))

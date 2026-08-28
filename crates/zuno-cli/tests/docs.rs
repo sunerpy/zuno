@@ -189,7 +189,7 @@ fn plugin_guide_documents_capabilities_protocols_and_examples() {
             "`environment` names",
             "`host.full`",
             "permission.mode",
-            "subagent_type",
+            "\"agent\": \"release-reviewer\"",
             "memoryMiB",
             "zuno.plugin/1",
             "wit/zuno-plugin/plugin.wit",

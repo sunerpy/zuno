@@ -92,6 +92,8 @@ const PARALLEL_PARENT_PROMPT: &str = "ParentSurfaceMarker delegate two foregroun
 const PARALLEL_PARENT_TITLE: &str = "ParallelParentMarker";
 const FIRST_CHILD_DESCRIPTION: &str = "inspect current tree";
 const SECOND_CHILD_DESCRIPTION: &str = "inspect temp tree";
+const FIRST_CHILD_SIDEBAR_PREFIX: &str = "inspect curr";
+const SECOND_CHILD_SIDEBAR_PREFIX: &str = "inspect temp";
 const FIRST_CHILD_PROMPT: &str = "FirstChildProviderMarker inspect the current directory.";
 const SECOND_CHILD_PROMPT: &str = "SecondChildProviderMarker inspect the temporary directory.";
 const CHILD_STEER_PROMPT: &str = "ChildSteerPromptMarker inspect the changed priority.";
@@ -225,15 +227,19 @@ fn compatible_text_response(text: &str) -> ResponseTemplate {
 
 fn compatible_parallel_task_response() -> ResponseTemplate {
     let first_arguments = serde_json::json!({
-        "description": FIRST_CHILD_DESCRIPTION,
-        "prompt": FIRST_CHILD_PROMPT,
-        "subagent_type": "explorer",
+        "objective": FIRST_CHILD_DESCRIPTION,
+        "deliverable": "A first read-only report",
+        "instructions": FIRST_CHILD_PROMPT,
+        "success_evidence": "Return concrete findings from the first scope",
+        "agent": "explorer",
     })
     .to_string();
     let second_arguments = serde_json::json!({
-        "description": SECOND_CHILD_DESCRIPTION,
-        "prompt": SECOND_CHILD_PROMPT,
-        "subagent_type": "explorer",
+        "objective": SECOND_CHILD_DESCRIPTION,
+        "deliverable": "A second read-only report",
+        "instructions": SECOND_CHILD_PROMPT,
+        "success_evidence": "Return concrete findings from the second scope",
+        "agent": "explorer",
     })
     .to_string();
     let chunk = serde_json::json!({
@@ -575,6 +581,7 @@ fn run_parallel_delegation_under_pty(
 
     let started = Instant::now();
     let mut text = String::new();
+    let mut leader_sent = false;
     let mut enter_sent = false;
     let mut child_message_sent = false;
     let mut return_sent = false;
@@ -595,15 +602,18 @@ fn run_parallel_delegation_under_pty(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        if !enter_sent
+        if !leader_sent
             && provider.children_started() == 2
             // Ratatui's diff renderer may insert cursor-positioning CSI sequences
             // between the summary's later spans. `2 running` is one span and remains
             // contiguous in the real PTY byte stream; the two provider requests and
             // the two distinct descriptions prove which two rows it summarizes.
             && text.contains("2 running")
-            && text.contains(FIRST_CHILD_DESCRIPTION)
-            && text.contains(SECOND_CHILD_DESCRIPTION)
+            // The fixed-width Agents sidebar intentionally ellipsizes objectives.
+            // Waiting for the complete strings would defer this keypress until the
+            // completed tool summary renders them in the main transcript.
+            && text.contains(FIRST_CHILD_SIDEBAR_PREFIX)
+            && text.contains(SECOND_CHILD_SIDEBAR_PREFIX)
         {
             saw_two_running_agents = true;
             all_observed_before_child_completion &= provider.children_cannot_have_completed();
@@ -613,7 +623,18 @@ fn run_parallel_delegation_under_pty(
                 .stdin
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("parallel delegation stdin was not piped"))?;
-            stdin.write_all(b"\x18\x1bOB")?;
+            stdin.write_all(b"\x18")?;
+            stdin.flush()?;
+            leader_sent = true;
+        } else if leader_sent && !enter_sent && text.contains("Next key") {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("parallel delegation stdin was not piped"))?;
+            // Zuno does not enable DEC application-cursor mode, so a real terminal
+            // reports Down as CSI `ESC [ B`, not the SS3 `ESC O B` sequence used by
+            // application-cursor mode.
+            stdin.write_all(b"\x1b[B")?;
             stdin.flush()?;
             enter_sent = true;
         } else if enter_sent
@@ -644,7 +665,7 @@ fn run_parallel_delegation_under_pty(
                 .stdin
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("parallel delegation stdin was not piped"))?;
-            stdin.write_all(b"\x18\x1bOA")?;
+            stdin.write_all(b"\x18\x1b[A")?;
             stdin.flush()?;
             return_sent = true;
         } else if return_sent && text.matches(PARALLEL_PARENT_PROMPT).count() > parent_prompt_count

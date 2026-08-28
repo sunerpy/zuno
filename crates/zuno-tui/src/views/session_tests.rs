@@ -8909,7 +8909,7 @@ fn the_sidebar_projects_foreground_running_delegations_from_the_transcript() {
         name: String::from("task"),
         ui_intent: zuno_tool::ToolUiIntent::Subagent,
         arguments: format!(
-            r#"{{"description":"{description}","prompt":"inspect","subagent_type":"explorer"}}"#
+            r#"{{"objective":"{description}","deliverable":"read-only report","instructions":"inspect","success_evidence":"cite findings","agent":"explorer"}}"#
         ),
         title: None,
         status: crate::views::message::ToolStatus::Running,

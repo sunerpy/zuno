@@ -3,7 +3,8 @@
 //! Tool names are configuration, not presentation contracts. A call enters this view
 //! only when its persisted [`zuno_tool::ToolUiIntent`] is `Subagent`; the stable task
 //! and product envelopes then provide subject details. Later `job` output and durable
-//! next-step reports refine the same row to completed, failed, cancelled, or uncertain.
+//! typed next-step report metadata refine the same row to completed, failed, cancelled,
+//! or uncertain.
 
 use crate::keybind::Definition;
 use crate::views::dialog::{Dialog, DialogOutcome, DialogStep, DialogWidth};
@@ -13,6 +14,7 @@ use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use serde::Deserialize;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zuno_tool::ToolUiIntent;
@@ -30,6 +32,9 @@ pub const EMPTY: &str = "no native or product subagent jobs yet";
 /// Where a native child's internal transcript remains available.
 pub const CHILD_TRANSCRIPT_NOTE: &str = "the subagent's own messages are in that session";
 
+const TASK_REPORT_METADATA_KEY: &str = "taskReport";
+const TASK_REPORT_SCHEMA_VERSION: u32 = 1;
+
 /// Stable facts parsed from a native `<task …>` result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskEnvelope {
@@ -38,6 +43,19 @@ pub struct TaskEnvelope {
     pub state: Option<String>,
     pub report_delivery: Option<String>,
     pub result: String,
+}
+
+/// The typed work agreement retained from a native `task` call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DelegationContractView {
+    pub deliverable: Option<String>,
+    pub instructions: Option<String>,
+    pub success_evidence: Option<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub must: Vec<String>,
+    pub must_not: Vec<String>,
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,6 +76,36 @@ pub struct OutputEnvelope {
     pub result: String,
 }
 
+/// One host-observed verification record attached to a delegated task report.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskVerificationEvidence {
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskReportView {
+    schema_version: u32,
+    #[serde(default)]
+    job_id: Option<String>,
+    session_id: String,
+    agent: String,
+    status: String,
+    final_text: String,
+    #[serde(default)]
+    changed_paths: Vec<String>,
+    #[serde(default)]
+    verification_records: Vec<TaskVerificationEvidence>,
+    #[serde(default)]
+    uncertain_side_effects: Vec<String>,
+    #[serde(default)]
+    evidence_errors: Vec<String>,
+}
+
 /// One native or external delegation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delegation {
@@ -66,6 +114,7 @@ pub struct Delegation {
     pub product: String,
     pub target: Option<String>,
     pub objective: Option<String>,
+    pub contract: Option<DelegationContractView>,
     pub dispatch_status: ToolStatus,
     pub state: String,
     pub session_id: Option<String>,
@@ -74,6 +123,10 @@ pub struct Delegation {
     pub report_delivery: Option<String>,
     pub result: Option<String>,
     pub diagnostic: Option<String>,
+    pub changed_paths: Vec<String>,
+    pub verification_records: Vec<TaskVerificationEvidence>,
+    pub uncertain_side_effects: Vec<String>,
+    pub evidence_errors: Vec<String>,
     pub children: Vec<zuno_types::JobChildProjection>,
     pub time_created: Option<i64>,
     pub time_completed: Option<i64>,
@@ -83,7 +136,7 @@ impl Delegation {
     #[must_use]
     pub fn headline(&self, width: usize) -> String {
         let target = self.target.as_deref().unwrap_or("subagent");
-        let objective = self.objective.as_deref().unwrap_or("(no description)");
+        let objective = self.objective.as_deref().unwrap_or("(no objective)");
         truncate(
             &format!(
                 "{} {} {target}: {objective}",
@@ -158,7 +211,9 @@ pub fn delegations(messages: &[Message]) -> Vec<Delegation> {
                     output: Some(output),
                     ..
                 } => refine_from_job_output(&mut found, output),
-                MessagePart::Text { text } => refine_from_report(&mut found, text),
+                MessagePart::ReplayData { data } => {
+                    refine_from_task_report(&mut found, data);
+                }
                 _ => {}
             }
         }
@@ -197,7 +252,9 @@ fn project_call(
             .map(str::to_owned)
             .filter(|value| !value.is_empty())
     };
-    let objective = field("description").or_else(|| field("prompt"));
+    let task_contract = arguments.as_ref().and_then(delegation_contract);
+    let task_objective = field("objective");
+    let product_objective = field("description").or_else(|| field("prompt"));
     let requested_delivery = field("reportDelivery").or_else(|| {
         arguments
             .as_ref()
@@ -212,8 +269,9 @@ fn project_call(
             call_id: call_id.to_owned(),
             tool: name.to_owned(),
             product: "zuno".to_owned(),
-            target: field("subagent_type").or_else(|| field("category")),
-            objective,
+            target: field("agent"),
+            objective: task_objective,
+            contract: task_contract,
             dispatch_status: status,
             state: task
                 .state
@@ -225,6 +283,10 @@ fn project_call(
             result: nonempty(task.result),
             diagnostic: (status == ToolStatus::Error)
                 .then(|| output.unwrap_or_default().to_owned()),
+            changed_paths: Vec::new(),
+            verification_records: Vec::new(),
+            uncertain_side_effects: Vec::new(),
+            evidence_errors: Vec::new(),
             children: Vec::new(),
             time_created: None,
             time_completed: None,
@@ -236,7 +298,8 @@ fn project_call(
             tool: name.to_owned(),
             product: product.product.unwrap_or_else(|| name.to_owned()),
             target: product.instance,
-            objective,
+            objective: product_objective,
+            contract: None,
             dispatch_status: status,
             state: product
                 .state
@@ -248,6 +311,10 @@ fn project_call(
             result: nonempty(product.result),
             diagnostic: (status == ToolStatus::Error)
                 .then(|| output.unwrap_or_default().to_owned()),
+            changed_paths: Vec::new(),
+            verification_records: Vec::new(),
+            uncertain_side_effects: Vec::new(),
+            evidence_errors: Vec::new(),
             children: Vec::new(),
             time_created: None,
             time_completed: None,
@@ -258,8 +325,9 @@ fn project_call(
         call_id: call_id.to_owned(),
         tool: name.to_owned(),
         product: name.to_owned(),
-        target: field("subagent_type").or_else(|| field("category")),
-        objective,
+        target: field("agent"),
+        objective: task_objective.or(product_objective),
+        contract: task_contract,
         dispatch_status: status,
         state: dispatch_state(status).to_owned(),
         session_id: None,
@@ -269,10 +337,49 @@ fn project_call(
         result: output.and_then(|value| nonempty(value.to_owned())),
         diagnostic: (status == ToolStatus::Error)
             .then(|| output.unwrap_or("subagent dispatch failed").to_owned()),
+        changed_paths: Vec::new(),
+        verification_records: Vec::new(),
+        uncertain_side_effects: Vec::new(),
+        evidence_errors: Vec::new(),
         children: Vec::new(),
         time_created: None,
         time_completed: None,
     }
+}
+
+fn delegation_contract(arguments: &Value) -> Option<DelegationContractView> {
+    let object = arguments.as_object()?;
+    let string = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let list = |object: Option<&serde_json::Map<String, Value>>, key: &str| {
+        object
+            .and_then(|object| object.get(key))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    string("objective")?;
+    let scope = object.get("scope").and_then(Value::as_object);
+    let constraints = object.get("constraints").and_then(Value::as_object);
+    Some(DelegationContractView {
+        deliverable: string("deliverable"),
+        instructions: string("instructions"),
+        success_evidence: string("success_evidence"),
+        include: list(scope, "include"),
+        exclude: list(scope, "exclude"),
+        must: list(constraints, "must"),
+        must_not: list(constraints, "must_not"),
+        dependencies: list(Some(object), "dependencies"),
+    })
 }
 
 /// Parse a native task result without depending on the tool's wire name.
@@ -501,6 +608,7 @@ fn merge_job_projections(tasks: &mut Vec<Delegation>, jobs: &[zuno_types::JobPro
             product,
             target,
             objective: None,
+            contract: None,
             dispatch_status: ToolStatus::Completed,
             state: job.status.clone(),
             session_id,
@@ -509,6 +617,10 @@ fn merge_job_projections(tasks: &mut Vec<Delegation>, jobs: &[zuno_types::JobPro
             report_delivery: Some(job.report_delivery.clone()),
             result: job.result.clone(),
             diagnostic: job.error.clone(),
+            changed_paths: Vec::new(),
+            verification_records: Vec::new(),
+            uncertain_side_effects: Vec::new(),
+            evidence_errors: Vec::new(),
             children: job.children.clone(),
             time_created: Some(job.time_created),
             time_completed: job.time_completed,
@@ -524,31 +636,55 @@ fn result_text(value: &Value) -> Option<String> {
         .or_else(|| (!value.is_null()).then(|| value.to_string()))
 }
 
-fn refine_from_report(tasks: &mut [Delegation], text: &str) {
-    for task in tasks {
-        let Some(job) = task.job_id.as_deref() else {
-            continue;
-        };
-        let completed = format!("completed job `{job}`");
-        let failed = format!("failed job `{job}`");
-        let cancelled = format!("cancelled job `{job}`");
-        let uncertain = format!("uncertain outcome for job `{job}`");
-        if text.contains(&uncertain) {
-            task.state = "uncertain".to_owned();
-            task.diagnostic = Some(text.to_owned());
-        } else if text.contains(&cancelled) {
-            task.state = "cancelled".to_owned();
-            task.diagnostic = Some(text.to_owned());
-        } else if text.contains(&failed) {
-            task.state = "failed".to_owned();
-            task.diagnostic = Some(text.to_owned());
-        } else if text.contains(&completed) {
-            task.state = "completed".to_owned();
-            task.result = text
-                .split_once("\n\n")
-                .and_then(|(_, result)| nonempty(result.to_owned()))
-                .or_else(|| task.result.clone());
-        }
+fn refine_from_task_report(tasks: &mut [Delegation], data: &serde_json::Map<String, Value>) {
+    let Some(report) = data.get(TASK_REPORT_METADATA_KEY) else {
+        return;
+    };
+    let Ok(report) = serde_json::from_value::<TaskReportView>(report.clone()) else {
+        return;
+    };
+    if report.schema_version != TASK_REPORT_SCHEMA_VERSION {
+        return;
+    }
+    let Some(task) = tasks
+        .iter_mut()
+        .find(|task| task_report_matches(task, &report))
+    else {
+        return;
+    };
+
+    task.job_id = task.job_id.clone().or(report.job_id);
+    task.session_id = Some(report.session_id);
+    task.target = task.target.clone().or(Some(report.agent));
+    task.state = report.status;
+    task.result = nonempty(report.final_text);
+    task.changed_paths = report.changed_paths;
+    task.verification_records = report.verification_records;
+    task.uncertain_side_effects = report.uncertain_side_effects;
+    task.evidence_errors = report.evidence_errors;
+}
+
+fn task_report_matches(task: &Delegation, report: &TaskReportView) -> bool {
+    let job = report
+        .job_id
+        .as_deref()
+        .map(|job| task.job_id.as_deref() == Some(job));
+    let session = task
+        .session_id
+        .as_deref()
+        .map(|session| session == report.session_id);
+    match (job, session) {
+        (Some(job), Some(session)) => job && session,
+        (Some(job), None) => job,
+        (None, Some(session)) => session,
+        (None, None) => false,
+    }
+}
+
+fn verification_summary(record: &TaskVerificationEvidence) -> String {
+    match record.evidence.as_deref().filter(|value| !value.is_empty()) {
+        Some(evidence) => format!("{} · {} · {evidence}", record.name, record.status),
+        None => format!("{} · {}", record.name, record.status),
     }
 }
 
@@ -589,6 +725,10 @@ fn state_style(state: &str, context: &ViewContext) -> Style {
 
 fn nonempty(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
+}
+
+fn joined_values(values: &[String]) -> Option<String> {
+    (!values.is_empty()).then(|| values.join(", "))
 }
 
 fn now_millis() -> i64 {
@@ -739,7 +879,7 @@ impl SubagentView {
     fn task_line(&self, task: &Delegation, selected: bool, width: usize) -> Line<'static> {
         let marker = if selected { "›" } else { " " };
         let target = task.target.as_deref().unwrap_or("subagent");
-        let objective = task.objective.as_deref().unwrap_or("(no description)");
+        let objective = task.objective.as_deref().unwrap_or("(no objective)");
         self.finish_line(
             vec![
                 Span::styled(
@@ -873,6 +1013,25 @@ impl SubagentView {
                 self.context.text(),
             ),
         );
+        if let Some(objective) = &task.objective {
+            lines.push(self.detail_row(width, "objective", objective.clone(), self.context.text()));
+        }
+        if let Some(contract) = &task.contract {
+            for (label, value) in [
+                ("deliverable", contract.deliverable.clone()),
+                ("instructions", contract.instructions.clone()),
+                ("evidence", contract.success_evidence.clone()),
+                ("include", joined_values(&contract.include)),
+                ("exclude", joined_values(&contract.exclude)),
+                ("must", joined_values(&contract.must)),
+                ("must not", joined_values(&contract.must_not)),
+                ("dependencies", joined_values(&contract.dependencies)),
+            ] {
+                if let Some(value) = value {
+                    lines.push(self.detail_row(width, label, value, self.context.text()));
+                }
+            }
+        }
         lines.push(self.status_detail_row(width, &task.state));
         lines.push(self.detail_row(width, "elapsed", task.elapsed(), self.context.text()));
         lines.push(
@@ -938,6 +1097,23 @@ impl SubagentView {
         }
         if let Some(result) = &task.result {
             lines.push(self.detail_row(width, "result", result.clone(), self.context.text()));
+        }
+        if let Some(paths) = joined_values(&task.changed_paths) {
+            lines.push(self.detail_row(width, "changed", paths, self.context.text()));
+        }
+        for record in &task.verification_records {
+            lines.push(self.detail_row(
+                width,
+                "verification",
+                verification_summary(record),
+                self.context.text(),
+            ));
+        }
+        if let Some(uncertain) = joined_values(&task.uncertain_side_effects) {
+            lines.push(self.detail_row(width, "uncertain", uncertain, self.context.warning()));
+        }
+        if let Some(errors) = joined_values(&task.evidence_errors) {
+            lines.push(self.detail_row(width, "evidence error", errors, self.context.error()));
         }
         if let Some(diagnostic) = &task.diagnostic {
             lines.push(self.detail_row(

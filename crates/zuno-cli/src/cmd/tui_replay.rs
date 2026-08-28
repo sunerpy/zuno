@@ -105,6 +105,16 @@ fn project_message(stored: MessageWithParts) -> Vec<Message> {
         MessageRole::Assistant => Role::Assistant,
     };
     let failure = stored.info.data.get("error").and_then(error_notice);
+    let mut replay_data = Vec::new();
+    if stored.info.data.get("taskReport").is_some() {
+        replay_data.push(stored.info.data.clone());
+    }
+    replay_data.extend(
+        stored
+            .parts
+            .iter()
+            .filter_map(|part| tool_task_report(&part.data)),
+    );
     let visible_reasoning = stored
         .parts
         .iter()
@@ -121,12 +131,16 @@ fn project_message(stored: MessageWithParts) -> Vec<Message> {
         .filter_map(project_part)
         .collect::<Vec<_>>();
     let mut messages = Vec::with_capacity(2);
-    if !parts.is_empty() {
-        messages.push(Message {
+    if !parts.is_empty() || !replay_data.is_empty() {
+        let mut message = Message {
             role,
             id: Some(stored.info.id),
             parts,
-        });
+        };
+        for data in replay_data {
+            message.attach_replay_data(Value::Object(data));
+        }
+        messages.push(message);
     }
     if let Some(failure) = failure {
         messages.push(Message::noticed(ToastLevel::Error, failure));
@@ -275,6 +289,23 @@ fn tool(data: &serde_json::Map<String, Value>) -> Option<MessagePart> {
             .and_then(Value::as_str)
             .map(str::to_owned),
     })
+}
+
+fn tool_task_report(
+    data: &serde_json::Map<String, Value>,
+) -> Option<serde_json::Map<String, Value>> {
+    let report = data
+        .get("state")?
+        .as_object()?
+        .get("metadata")?
+        .as_object()?
+        .get(zuno_tools::task::METADATA_SUBAGENT_KEY)?
+        .as_object()?
+        .get("report")?
+        .clone();
+    let mut replay = serde_json::Map::new();
+    replay.insert("taskReport".to_owned(), report);
+    Some(replay)
 }
 
 /// An attachment, labelled with the best name the stored part carries.

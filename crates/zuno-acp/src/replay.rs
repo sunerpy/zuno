@@ -233,11 +233,24 @@ fn message_updates(stored: &MessageWithParts, policy: &ReplayPolicy) -> Vec<Valu
         match part.kind {
             PartKind::Text => {
                 if let Some(text) = non_empty_string(&part.data, "text") {
-                    updates.push(message_content_update(
+                    let mut update = message_content_update(
                         message_kind(stored.info.role),
                         json!({ "type": "text", "text": text }),
                         &stored.info.id,
-                    ));
+                    );
+                    if let Some(metadata) = stored
+                        .info
+                        .data
+                        .get(zuno_db::message::TASK_REPORT_METADATA_KEY)
+                    {
+                        update["_meta"] = json!({
+                            "zuno": {
+                                "kind": "task_report",
+                                "taskReport": metadata,
+                            }
+                        });
+                    }
+                    updates.push(update);
                 }
             }
             PartKind::Reasoning => {
@@ -612,6 +625,46 @@ mod tests {
     }
 
     #[test]
+    fn replay_preserves_host_generated_task_report_metadata() {
+        let root = tempfile::tempdir().expect("replay root");
+        let mut report = message(
+            "input-report",
+            "user",
+            vec![part(
+                "p-report",
+                "input-report",
+                json!({"type":"text","text":"background result"}),
+            )],
+        );
+        report.info.data.insert(
+            zuno_db::message::TASK_REPORT_METADATA_KEY.to_owned(),
+            json!({
+                "schemaVersion": 1,
+                "jobId": "job-1",
+                "sessionId": "ses-child",
+                "agent": "explorer",
+                "status": "completed",
+                "finalText": "background result",
+                "changedPaths": ["src/lib.rs"]
+            }),
+        );
+
+        let replay = durable_updates(&[report], &ReplayPolicy::for_workspace(root.path()), 0);
+
+        assert_eq!(replay.updates.len(), 1);
+        assert_eq!(replay.updates[0]["content"]["text"], "background result");
+        assert_eq!(replay.updates[0]["_meta"]["zuno"]["kind"], "task_report");
+        assert_eq!(
+            replay.updates[0]["_meta"]["zuno"]["taskReport"]["jobId"],
+            "job-1"
+        );
+        assert_eq!(
+            replay.updates[0]["_meta"]["zuno"]["taskReport"]["changedPaths"],
+            json!(["src/lib.rs"])
+        );
+    }
+
+    #[test]
     fn replay_keeps_shell_commands_copyable_and_interpreters_separate() {
         let root = tempfile::tempdir().expect("replay root");
         let assistant = message(
@@ -783,9 +836,20 @@ mod tests {
                     "state": {
                         "status": "completed",
                         "raw": serde_json::to_string(&json!({
-                            "description": "Inspect tree",
-                            "prompt": "Inspect the ACP child-session call chain.",
-                            "subagent_type": "explorer",
+                            "objective": "Inspect tree",
+                            "deliverable": "A child-session call-chain report.",
+                            "instructions": "Inspect the ACP child-session call chain.",
+                            "success_evidence": "Name the durable events and projection functions.",
+                            "scope": {
+                                "include": ["crates/zuno-acp/**"],
+                                "exclude": ["target/**"]
+                            },
+                            "constraints": {
+                                "must": ["Remain read-only"],
+                                "must_not": ["Edit files"]
+                            },
+                            "dependencies": ["The CodeGraph index is current"],
+                            "agent": "explorer",
                             "background": false
                         }))
                         .expect("raw input"),
@@ -796,8 +860,9 @@ mod tests {
                                 "sessionId": "ses-child",
                                 "jobId": null,
                                 "agent": "explorer",
-                                "description": "Inspect tree",
-                                "objective": "Inspect the ACP child-session call chain.",
+                                "objective": "Inspect tree",
+                                "deliverable": "A child-session call-chain report.",
+                                "successEvidence": "Name the durable events and projection functions.",
                                 "state": "completed",
                                 "background": false,
                                 "reportDelivery": "foreground",
@@ -820,7 +885,13 @@ mod tests {
         assert!(
             replay.updates[0]["content"][0]["content"]["text"]
                 .as_str()
-                .is_some_and(|text| text.contains("Inspect the ACP child-session call chain."))
+                .is_some_and(|text| {
+                    text.contains("Inspect the ACP child-session call chain.")
+                        && text.contains("A child-session call-chain report.")
+                        && text.contains("Name the durable events and projection functions.")
+                        && text.contains("crates/zuno-acp/**")
+                        && text.contains("Remain read-only")
+                })
         );
         assert_eq!(
             replay.updates[1]["_meta"]["zuno"]["subagent"]["sessionId"],

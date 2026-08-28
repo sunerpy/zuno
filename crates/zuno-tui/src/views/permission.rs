@@ -203,18 +203,18 @@ pub fn describe(request: &PermissionRequest, input: &Value) -> Subject {
         }
         "task" => {
             let kind = input
-                .get("subagent_type")
+                .get("agent")
                 .and_then(Value::as_str)
                 .unwrap_or("Unknown")
                 .to_owned();
-            let description = arg("description");
+            let objective = arg("objective");
             Subject {
                 icon: "#",
                 title: format!("{} Task", titlecase(&kind)),
-                detail: if description.is_empty() {
+                detail: if objective.is_empty() {
                     Vec::new()
                 } else {
-                    vec![format!("◉ {description}")]
+                    vec![format!("◉ {objective}")]
                 },
             }
         }

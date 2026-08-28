@@ -495,6 +495,16 @@ pub enum MessagePart {
         /// The report, already sorted worst-first.
         report: crate::views::lsp::Report,
     },
+    /// Durable message-level data retained for client projections.
+    ///
+    /// This part deliberately renders no transcript rows. It carries typed host metadata
+    /// such as `message.data.taskReport` to views that need more than the visible text,
+    /// without serialising that metadata into prose or teaching those views to guess from
+    /// English report strings.
+    ReplayData {
+        /// The stored message `data` object.
+        data: serde_json::Map<String, serde_json::Value>,
+    },
 }
 
 fn compact_activity(part: &MessagePart) -> Option<zuno_types::ActivityKind> {
@@ -607,6 +617,17 @@ impl Message {
             filename: filename.into(),
             mime,
         });
+    }
+
+    /// Retain one durable message `data` object for typed replay projections.
+    ///
+    /// Non-object values cannot be message data and are ignored. Storage adapters keep
+    /// visible parts separate and call this once with the message-level object.
+    pub fn attach_replay_data(&mut self, data: serde_json::Value) {
+        let serde_json::Value::Object(data) = data else {
+            return;
+        };
+        self.parts.push(MessagePart::ReplayData { data });
     }
 }
 
@@ -2756,6 +2777,7 @@ impl TranscriptView {
                 };
                 out.extend(report.lines(width, limit, &self.context));
             }
+            MessagePart::ReplayData { .. } => {}
         }
     }
 
@@ -3238,6 +3260,12 @@ fn fingerprint(message: &Message) -> u64 {
             MessagePart::Diagnostics { report } => {
                 6_u8.hash(&mut hasher);
                 report.hash(&mut hasher);
+            }
+            MessagePart::ReplayData { .. } => {
+                // Replay data is intentionally not rendered. The variant tag and part count
+                // are enough to distinguish it from visible content while allowing messages
+                // whose hidden metadata differs to share identical transcript rows.
+                7_u8.hash(&mut hasher);
             }
         }
     }
