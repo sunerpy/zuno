@@ -1,18 +1,13 @@
 # Deep Work
 
-Use this Skill for a bounded task that benefits from durable Goal, Plan, and
-Todo state.
+Use this Skill for a bounded complex task that needs durable decomposition.
 
-1. Read the current Goal, Plan, and Todo state before changing it.
-2. Convert the request into a concrete deliverable, success criteria, bounded
-   work lanes, dependencies, and verification gates.
-3. Persist state only through the Goal, Plan, and Todo tools actually exposed in
-   the session. Prose such as "next I will" is not durable progress.
-4. Keep one owner per work item, avoid duplicate delegated work, and record a
-   blocker only when its evidence is known.
-5. Complete an item only after its stated evidence is available. Report unknown
-   usage, timing, or verification as unknown rather than zero or passed.
-
-This Skill does not grant tools, permissions, filesystem access, network access,
-or environment access. Use only capabilities already exposed by the active
-Agent profile and permission policy.
+1. Read the current Goal, Plan, and Todo state.
+2. Define one concrete deliverable, success evidence, bounded work lanes, and
+   dependency edges.
+3. Map each meaningful Plan step to owned work and an observable acceptance
+   point. Keep simple tasks out of formal Plan state.
+4. Update the exposed durable state when ownership, dependencies, progress, or
+   blockers materially change.
+5. Reconcile completed work into the parent objective before opening another
+   lane. Preserve unresolved decisions and evidence gaps explicitly.

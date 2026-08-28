@@ -1,8 +1,8 @@
 //! Cross-crate behaviour of the `task` delegation tool.
 //!
 //! Two things can only be checked from here. The first is the plan's acceptance
-//! criterion — that an explicit `model` and `effort` reach the **child's outbound
-//! request** — which is proven by handing the recorded dispatch to
+//! criterion — that the resolved Agent model and effort reach the **child's
+//! outbound request** — which is proven by handing the recorded dispatch to
 //! [`zuno_llm::effort::EffortResolution::apply_to`], the same function a provider
 //! adapter uses to decorate a body. The second is the assertion
 //! `zuno-agent/src/builtin.rs:78` defers to this crate: that its `GOVERNED_TOOL_IDS`
@@ -66,15 +66,26 @@ fn base_body(model: &str) -> Map<String, Value> {
 
 /// QA happy path plus the plan's acceptance criterion, in one assertion chain.
 #[tokio::test]
-async fn an_explicit_model_and_effort_reach_the_childs_outbound_request() {
+async fn configured_agent_model_and_effort_reach_the_childs_outbound_request() {
     let host = Arc::new(RecordingHost::new());
     tool(Arc::clone(&host))
+        .with_agent_override("explorer", ModelChoice::new(REASONER).with_variant("low"))
         .run_erased(
             json!({
-                "prompt": "survey the crate",
-                "subagent_type": "explorer",
-                "model": REASONER,
-                "effort": "low",
+                "objective": "Map the crate",
+                "deliverable": "A concise architecture report",
+                "instructions": "Survey the crate and identify the provider boundary.",
+                "success_evidence": "Name the exact modules and call path inspected.",
+                "scope": {
+                    "include": ["crates/zuno-tools/**"],
+                    "exclude": ["target/**"]
+                },
+                "constraints": {
+                    "must": ["Remain read-only"],
+                    "must_not": ["Change files"]
+                },
+                "dependencies": ["CodeGraph index is current"],
+                "agent": "explorer",
             }),
             context(),
         )
@@ -84,8 +95,29 @@ async fn an_explicit_model_and_effort_reach_the_childs_outbound_request() {
     let dispatched = host.dispatched();
     let request = dispatched.first().expect("one child turn");
     assert_eq!(request.agent, "explorer");
-    assert_eq!(request.model, Some(ModelChoice::new(REASONER)));
+    assert_eq!(
+        request.model,
+        Some(ModelChoice::new(REASONER).with_variant("low"))
+    );
     assert_eq!(request.effort, Some(ReasoningEffort::Low));
+    assert_eq!(request.description.as_deref(), Some("Map the crate"));
+    for expected in [
+        "Objective:\nMap the crate",
+        "Deliverable:\nA concise architecture report",
+        "Instructions:\nSurvey the crate and identify the provider boundary.",
+        "Success evidence:\nName the exact modules and call path inspected.",
+        "Include:\n- crates/zuno-tools/**",
+        "Exclude:\n- target/**",
+        "Must:\n- Remain read-only",
+        "Must not:\n- Change files",
+        "Dependencies:\n- CodeGraph index is current",
+    ] {
+        assert!(
+            request.prompt.contains(expected),
+            "missing `{expected}` in:\n{}",
+            request.prompt
+        );
+    }
 
     // The same merge a provider adapter performs, so this is the child's real body.
     // The assertion changed from `reasoningEffort` to the two wire fields that
@@ -135,7 +167,13 @@ async fn naming_build_is_rejected_with_a_message_listing_valid_targets() {
     let host = Arc::new(RecordingHost::new());
     let error = tool(Arc::clone(&host))
         .run_erased(
-            json!({ "prompt": "coordinate", "subagent_type": COORDINATOR }),
+            json!({
+                "objective": "Coordinate recursively",
+                "deliverable": "A coordinated result",
+                "instructions": "Delegate this work again.",
+                "success_evidence": "Return the child results.",
+                "agent": COORDINATOR
+            }),
             context(),
         )
         .await
@@ -169,7 +207,13 @@ async fn every_delegable_agent_is_reachable_and_the_coordinator_is_not() {
         tool(Arc::clone(&host))
             .with_vision_available(true)
             .run_erased(
-                json!({ "prompt": "work", "subagent_type": agent.name }),
+                json!({
+                    "objective": "Exercise the target",
+                    "deliverable": "A target response",
+                    "instructions": "Perform the assigned work.",
+                    "success_evidence": "Return concrete evidence.",
+                    "agent": agent.name
+                }),
                 context(),
             )
             .await
@@ -262,7 +306,13 @@ async fn a_child_session_cannot_delegate_again_at_the_default_bound() {
 
     let error = TaskTool::new(Arc::new(InChildSession), facts())
         .run_erased(
-            json!({ "prompt": "delegate deeper", "subagent_type": GENERIC_EXECUTOR }),
+            json!({
+                "objective": "Delegate deeper",
+                "deliverable": "A nested child result",
+                "instructions": "Start another delegated turn.",
+                "success_evidence": "Return the nested result.",
+                "agent": GENERIC_EXECUTOR
+            }),
             context(),
         )
         .await

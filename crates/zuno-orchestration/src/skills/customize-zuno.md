@@ -26,7 +26,3 @@ or extension manifests.
    claiming a disk configuration change is active.
 7. Keep process-local extensions distinct from static extension manifests and
    never imply that a Skill owns the runtime lifecycle.
-
-This Skill does not grant tools, permissions, filesystem access, network access,
-or environment access. Use only capabilities already exposed by the active
-Agent profile and permission policy.

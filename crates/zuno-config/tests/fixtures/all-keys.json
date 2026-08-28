@@ -29,7 +29,8 @@
     "paths": ["./skills", "~/.agents/skills"],
     "urls": ["https://example.com/.well-known/skills/"],
     "includeInstructions": true,
-    "maxContextTokens": 8000
+    "maxContextTokens": 8000,
+    "maxSelectedContextTokens": 16000
   },
   "references": {
     "shorthand": "github.com/sst/opencode",

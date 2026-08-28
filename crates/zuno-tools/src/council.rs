@@ -15,13 +15,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use zuno_error::ToolError;
-use zuno_orchestration::{AttemptSnapshot, CouncilPresetDescriptor};
+use zuno_orchestration::{AttemptSnapshot, CouncilPresetDescriptor, sha256_json};
 use zuno_tool::{
     PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, ToolUiIntent,
     TypedTool,
 };
 
-use crate::task::{ChildTurnRequest, ReportDelivery, TaskParams, TaskTool};
+use crate::task::{ChildTurnRequest, DelegationModelRequest, ReportDelivery, TaskTool};
 
 /// Stable model-facing id for Council execution.
 pub const WIRE_ID: &str = "council_run";
@@ -169,13 +169,9 @@ impl CouncilTool {
                     params.question, seat.id, seat.instruction, SEAT_RESPONSE_CONTRACT
                 );
                 let description = Some(format!("{} / {}", preset.name, seat.id));
-                let task_params = TaskParams {
-                    description: description.clone(),
-                    prompt: prompt.clone(),
-                    subagent_type: Some(seat.agent.clone()),
-                    ..TaskParams::default()
-                };
-                let plan = self.task.plan(&seat.agent, None, &task_params);
+                let plan = self
+                    .task
+                    .plan(&seat.agent, None, &DelegationModelRequest::default());
                 CouncilSeatRequest {
                     id: seat.id.clone(),
                     turn: ChildTurnRequest {
@@ -184,6 +180,16 @@ impl CouncilTool {
                         workflow: Some(workflow.clone()),
                         workflow_node: Some(seat.id.clone()),
                         resume_session_id: None,
+                        logical_key: format!(
+                            "council:v1:{}",
+                            sha256_json(&json!({
+                                "preset": preset.name,
+                                "seat": seat.id,
+                                "agent": seat.agent,
+                                "question": params.question,
+                                "instruction": seat.instruction,
+                            }))
+                        ),
                         agent: seat.agent.clone(),
                         description,
                         prompt,
@@ -512,14 +518,20 @@ mod tests {
     fn orchestration_snapshot() -> Arc<AttemptSnapshot> {
         Arc::new(
             serde_json::from_value(json!({
-                "schemaVersion": 2,
+                "schemaVersion": 4,
                 "turnId": "turn-parent",
                 "step": 1,
                 "capability": {
-                    "schemaVersion": 2,
+                    "schemaVersion": 4,
                     "pack": {"id":"test","version":"1","upstreamRevision":"test"},
                     "extensionRevision": 0,
                     "permissionPolicySha256": "policy",
+                    "sandbox": {
+                        "mode": "workspace-write",
+                        "network": "deny",
+                        "writableRoots": [],
+                        "protectedPaths": []
+                    },
                     "profiles": [], "presets": [], "councils": [], "workflows": [], "skills": []
                 },
                 "owner": {

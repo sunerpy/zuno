@@ -1,34 +1,18 @@
 //! `task` — delegating a bounded unit of work to a child session.
 //!
-//! # The five refusals are the feature
+//! # Refusals happen before a child exists
 //!
 //! Everything interesting about a delegation tool happens before a child session
-//! exists. A caller can name no target, two targets, a coordinator, a target it is
-//! not permitted to reach, or reach for one more hop than the recursion bound
-//! allows. Each of those is refused here with a message that **names the fix**,
-//! because a delegation refusal is read by a model, not a human, and a model can
-//! only act on a message that says what to send instead. `oh-my-opencode-slim` pays
-//! for the absence of that property with an entire hook family —
-//! `omo-slim` maps nine error
-//! substrings onto nine `fixHint` strings after the fact, because the tool's own
-//! errors did not carry them.
+//! exists. A caller can name a coordinator, an unknown or forbidden Agent, provide
+//! an incomplete contract, or reach for one more hop than the recursion bound
+//! allows. Each refusal names the concrete fix because it is read by a model, not a
+//! human. The model-facing wire intentionally has one routing field, `agent`; model,
+//! reasoning, category, Skill, and capability routing remain host-owned policy.
 //!
-//! # Why there is no `load_skills`
-//!
-//! Two of those nine patterns are `run_in_background` and `load_skills` — arguments
-//! the model *forgot*, whose fix hints are literally "add `load_skills=[]` (empty
-//! array when no skill is needed)". An argument whose most common value is "the
-//! empty one that means nothing" and whose omission needs a recovery hook is an
-//! argument that should not exist. Skills reach a child through its agent's
-//! permission set instead ([`zuno_agent::builtin::GOVERNED_TOOL_IDS`] includes
-//! `skill`), which is a property of the target rather than of the call, so there is
-//! nothing for a caller to remember. Passing `load_skills` anyway is
-//! [`zuno_error::ToolError::InvalidArgs`] naming per-agent permissions — **not**
-//! silently ignored, because a caller that believes it loaded a skill and did not
-//! would then blame the child for ignoring it.
-//!
-//! `background` survives that same argument only because its default genuinely
-//! carries information: foreground is a blocking wait the caller must opt out of.
+//! The model supplies a typed [`DelegationContract`] rather than an ambiguous title
+//! plus free-form prompt. Required outcome, instructions, and evidence fields are
+//! validated before permission or dispatch. Scope, constraints, and dependencies stay
+//! structured on the wire and are rendered exactly once into the child prompt.
 //!
 //! # Depth is measured from two places, and the bound is the larger
 //!
@@ -53,7 +37,7 @@
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -65,7 +49,7 @@ use zuno_agent::model_policy::{
 };
 use zuno_error::ToolError;
 use zuno_llm::effort::{EffortCapabilities, ProviderFamily, ReasoningEffort};
-use zuno_orchestration::AttemptSnapshot;
+use zuno_orchestration::{AttemptSnapshot, sha256_json};
 use zuno_tool::{
     InterruptHandle, PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolUiIntent,
     TypedTool,
@@ -77,9 +61,9 @@ pub const WIRE_ID: &str = "task";
 
 /// The permission key this tool gates on.
 ///
-/// The *pattern* is the requested `subagent_type`, matching upstream
-/// (`task.ts:118-127`), so a rule may permit delegation to one agent and refuse
-/// another rather than treating delegation as one all-or-nothing capability.
+/// The *pattern* is the requested `agent`, so a rule may permit delegation to one
+/// Agent and refuse another rather than treating delegation as one all-or-nothing
+/// capability.
 pub const PERMISSION_KEY: &str = "task";
 
 /// Durable metadata key for client-facing child-session identity and state.
@@ -91,7 +75,7 @@ pub const METADATA_SUBAGENT_KEY: &str = "subagent";
 /// may delegate, and the child may not.
 pub const DEFAULT_SUBAGENT_DEPTH: u32 = 1;
 
-/// The agent a `category` call runs on.
+/// The generic executor used by workflow-owned category routing.
 ///
 /// A category names a `{model, variant}` and says nothing about *conduct*, so it
 /// cannot select a specialist. omo resolves this the same way — a category forces a
@@ -108,10 +92,8 @@ pub const COORDINATOR: &str = "orchestrator";
 
 /// The description the model reads.
 ///
-/// Deliberately free of model ids: `model` and `effort` are pass-throughs to
-/// whatever the caller's catalog resolved, and naming a model here would bake
-/// today's market into the binary — the failure `zuno-agent`'s
-/// [`zuno_agent::model_policy`] exists to refuse.
+/// Deliberately free of model ids: direct delegations name an Agent, while model
+/// and reasoning routing come from the resolved parent/config/preset policy.
 pub const DESCRIPTION: &str = include_str!("description/task.txt");
 
 /// How a background child reports its terminal state.
@@ -125,28 +107,143 @@ pub enum ReportDelivery {
     Quiet,
 }
 
+/// Explicit filesystem or subsystem ownership for one delegation.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationScope {
+    /// Paths or surfaces the child owns.
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Paths or surfaces the child must leave alone.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// Positive and negative requirements for one delegation.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationConstraints {
+    /// Conditions the child must preserve or satisfy.
+    #[serde(default)]
+    pub must: Vec<String>,
+    /// Actions or outcomes the child must avoid.
+    #[serde(default)]
+    pub must_not: Vec<String>,
+}
+
+/// The model-visible work agreement for one delegated turn.
+#[derive(Debug, Clone, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationContract {
+    /// The concrete outcome this delegation advances.
+    pub objective: String,
+    /// The artifact or answer the child must return.
+    pub deliverable: String,
+    /// Task-specific execution guidance.
+    pub instructions: String,
+    /// Observable evidence that proves the delegation succeeded.
+    pub success_evidence: String,
+    /// Explicit in-scope and out-of-scope ownership.
+    #[serde(default)]
+    pub scope: Option<DelegationScope>,
+    /// Positive and negative requirements.
+    #[serde(default)]
+    pub constraints: Option<DelegationConstraints>,
+    /// Facts or prior work this delegation depends on.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+}
+
+impl DelegationContract {
+    fn validate(&self) -> Result<(), TaskRejection> {
+        for (field, value) in [
+            ("objective", self.objective.as_str()),
+            ("deliverable", self.deliverable.as_str()),
+            ("instructions", self.instructions.as_str()),
+            ("success_evidence", self.success_evidence.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(TaskRejection::EmptyContractField { field });
+            }
+        }
+        if let Some(scope) = &self.scope {
+            validate_items("scope.include", &scope.include)?;
+            validate_items("scope.exclude", &scope.exclude)?;
+        }
+        if let Some(constraints) = &self.constraints {
+            validate_items("constraints.must", &constraints.must)?;
+            validate_items("constraints.must_not", &constraints.must_not)?;
+        }
+        validate_items("dependencies", &self.dependencies)
+    }
+
+    fn render_prompt(&self) -> String {
+        let mut sections = vec![
+            format!("Objective:\n{}", self.objective.trim()),
+            format!("Deliverable:\n{}", self.deliverable.trim()),
+            format!("Instructions:\n{}", self.instructions.trim()),
+            format!("Success evidence:\n{}", self.success_evidence.trim()),
+        ];
+        if let Some(scope) = &self.scope {
+            push_list(&mut sections, "Include", &scope.include);
+            push_list(&mut sections, "Exclude", &scope.exclude);
+        }
+        if let Some(constraints) = &self.constraints {
+            push_list(&mut sections, "Must", &constraints.must);
+            push_list(&mut sections, "Must not", &constraints.must_not);
+        }
+        push_list(&mut sections, "Dependencies", &self.dependencies);
+        sections.join("\n\n")
+    }
+}
+
+/// Stable parent-local identity for one semantic delegation.
+///
+/// Scheduling details such as foreground/background delivery, model routing, and a
+/// newly allocated child session are deliberately excluded. A retry of the same
+/// Agent and contract therefore cannot evade durable reconciliation by changing
+/// execution mechanics.
+#[must_use]
+pub fn delegation_logical_key(agent: &str, contract: &DelegationContract) -> String {
+    let value = json!({
+        "schemaVersion": 1,
+        "agent": agent,
+        "contract": contract,
+    });
+    format!("delegation:v1:{}", sha256_json(&value))
+}
+
+fn validate_items(field: &'static str, values: &[String]) -> Result<(), TaskRejection> {
+    if let Some(index) = values.iter().position(|value| value.trim().is_empty()) {
+        return Err(TaskRejection::EmptyContractItem {
+            field,
+            index: index + 1,
+        });
+    }
+    Ok(())
+}
+
+fn push_list(sections: &mut Vec<String>, heading: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    let body = values
+        .iter()
+        .map(|value| format!("- {}", value.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    sections.push(format!("{heading}:\n{body}"));
+}
+
 /// Arguments for one delegation.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TaskParams {
-    /// A short (3-5 words) description of the task.
-    #[serde(default)]
-    pub description: Option<String>,
-    /// The task for the agent to perform.
-    pub prompt: String,
-    /// The specific agent to delegate to. Mutually exclusive with `category`.
-    #[serde(default)]
-    pub subagent_type: Option<String>,
-    /// A preset shorthand naming the model tier to run the `general` Agent at.
-    /// Mutually exclusive with `subagent_type`.
-    #[serde(default)]
-    pub category: Option<String>,
-    /// Override the model for this child only, as `provider/model`.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Override the reasoning effort for this child only.
-    #[serde(default)]
-    pub effort: Option<String>,
+    /// The typed work agreement passed to the child.
+    #[serde(flatten)]
+    pub contract: DelegationContract,
+    /// The specific Agent to delegate to.
+    pub agent: String,
     /// Run asynchronously and report a job id immediately. Defaults to foreground.
     #[serde(default)]
     pub background: Option<bool>,
@@ -156,13 +253,6 @@ pub struct TaskParams {
     /// Continue a previous delegation's session instead of creating a new one.
     #[serde(default)]
     pub task_id: Option<String>,
-    /// Accepted only so its removal can be explained; see the module docs.
-    ///
-    /// Hidden from the advertised schema, so no caller learns the name from this
-    /// tool — a model that sends it learned it from another harness.
-    #[serde(default)]
-    #[schemars(skip)]
-    pub load_skills: Option<Value>,
 }
 
 /// The recursion bound, and the reason it cannot be waived here.
@@ -249,6 +339,8 @@ pub struct ChildTurnRequest {
     pub workflow_node: Option<String>,
     /// An existing child session to continue, from `task_id`.
     pub resume_session_id: Option<String>,
+    /// Stable semantic identity used to reject unreconciled duplicate work.
+    pub logical_key: String,
     /// The agent the child runs as.
     pub agent: String,
     /// The caller's short label, used for the session title.
@@ -279,6 +371,11 @@ pub struct ChildTurn {
     pub job_id: Option<String>,
     /// The child's final text, or the running-notice for a background dispatch.
     pub output: String,
+    /// Host-generated terminal evidence for a completed foreground child.
+    ///
+    /// Background children publish the same shape through their durable Job result
+    /// and optional next-step report after settlement.
+    pub report_metadata: Option<Value>,
 }
 
 /// Why a dispatch could not produce a child turn.
@@ -324,39 +421,15 @@ pub trait ChildTurnHost: Send + Sync + 'static {
 #[derive(Debug, thiserror::Error)]
 pub enum TaskRejection {
     #[error(
-        "Must provide either `category` or `subagent_type`. Add \
-         `subagent_type=\"{first}\"` naming one of the valid targets ({targets}), or \
-         `category=\"<preset shorthand>\"` to run the `{GENERIC_EXECUTOR}` agent at \
-         that preset's model."
-    )]
-    NoTarget {
-        targets: String,
-        first: &'static str,
-    },
-
-    #[error(
-        "`category` and `subagent_type` are mutually exclusive; you sent \
-         `category=\"{category}\"` and `subagent_type=\"{subagent_type}\"`. Provide \
-         only one: keep `subagent_type=\"{subagent_type}\"` to choose the agent, or \
-         keep `category=\"{category}\"` to run the `{GENERIC_EXECUTOR}` agent at that \
-         preset's model."
-    )]
-    BothTargets {
-        subagent_type: String,
-        category: String,
-    },
-
-    #[error(
         "`{COORDINATOR}` coordinates delegations and cannot be a delegation target — \
          targeting it would reopen the unbounded recursion the roster closes. Set \
-         `subagent_type` to one of the valid targets: {targets}."
+         `agent` to one of the valid targets: {targets}."
     )]
     CoordinatorTarget { targets: String },
 
     #[error(
-        "Unknown agent `{requested}`. Set `subagent_type` to one of the valid \
-         targets: {targets} — or, if `{requested}` is a preset shorthand, send it as \
-         `category=\"{requested}\"` instead."
+        "Unknown Agent `{requested}`. Set `agent` to one of the valid targets: \
+         {targets}."
     )]
     UnknownTarget { requested: String, targets: String },
 
@@ -368,12 +441,10 @@ pub enum TaskRejection {
     )]
     DepthExceeded { depth: u32, limit: u32 },
 
-    #[error(
-        "`load_skills` is not a parameter of `{WIRE_ID}`. Remove it: skills are \
-         permission-gated per agent, so choose the `subagent_type` whose permissions \
-         already grant the skill you wanted instead of naming skills in the call."
-    )]
-    LoadSkillsRemoved,
+    #[error("`{field}` must not be empty in the delegation contract.")]
+    EmptyContractField { field: &'static str },
+    #[error("`{field}` item {index} must not be empty in the delegation contract.")]
+    EmptyContractItem { field: &'static str, index: usize },
     #[error(
         "`reportDelivery` requires `background: true`. Remove `reportDelivery` for a \
          foreground delegation, or add `background: true` to receive the result later."
@@ -388,10 +459,10 @@ pub enum TaskRejection {
 /// [`PermissionAsk`] instead, under [`GUIDANCE_KEY`], where it reaches the human
 /// deciding *and* is recoverable by a caller inspecting the ask.
 #[must_use]
-pub fn denial_guidance(subagent_type: &str, targets: &[String]) -> String {
+pub fn denial_guidance(agent: &str, targets: &[String]) -> String {
     format!(
-        "`{WIRE_ID}` is not permitted for `{subagent_type}`. Grant \
-         `{PERMISSION_KEY}` for pattern `{subagent_type}`, or set `subagent_type` to \
+        "`{WIRE_ID}` is not permitted for `{agent}`. Grant \
+         `{PERMISSION_KEY}` for pattern `{agent}`, or set `agent` to \
          a target the current rules allow ({}).",
         targets.join(", ")
     )
@@ -487,6 +558,17 @@ pub struct DelegationPlan {
     pub notes: Vec<String>,
 }
 
+/// Internal model-routing inputs shared by task, Council, and Workflow.
+///
+/// Council and Workflow already own their work contracts and only need the common
+/// model/effort resolution ladder. Keeping this type separate prevents them from
+/// fabricating a model-facing [`DelegationContract`] merely to reuse routing policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DelegationModelRequest {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 /// Delegation to a child session, gated on depth and permission.
 #[derive(Clone)]
 pub struct TaskTool {
@@ -565,15 +647,16 @@ impl TaskTool {
         )
     }
 
-    /// Resolve the child's model and effort.
+    /// Resolve the child's model and effort for direct or host-owned delegation.
     ///
-    /// Four rungs, highest first. The top one is new; the lower three are
-    /// [`ModelPolicy`]'s, called rather than reimplemented:
+    /// The model-facing `task` wire always passes an empty `request`; configured
+    /// workflows and Council may provide a host-owned route without exposing those
+    /// fields to the model. Resolution reuses [`ModelPolicy`] rather than creating a
+    /// second policy:
     ///
-    /// 1. **this call's `model` / `effort` arguments** — the caller is choosing for
-    ///    one child, which is more specific than anything a config file said,
+    /// 1. an optional host-owned model/reasoning request,
     /// 2. a per-agent config override,
-    /// 3. the active preset's entry for the agent, or for the `category` shorthand,
+    /// 3. the active preset's entry for the agent or workflow category,
     /// 4. the parent session's model.
     ///
     /// Rung 1 is skip-on-unavailable like the rest: an unreachable or unqualified
@@ -582,7 +665,12 @@ impl TaskTool {
     /// What is *not* allowed is silence — every skip is in [`DelegationPlan::notes`]
     /// and reaches the caller in the rendered output.
     #[must_use]
-    pub fn plan(&self, agent: &str, category: Option<&str>, params: &TaskParams) -> DelegationPlan {
+    pub(crate) fn plan(
+        &self,
+        agent: &str,
+        category: Option<&str>,
+        request: &DelegationModelRequest,
+    ) -> DelegationPlan {
         let availability = FactsAvailability(self.facts.as_ref());
         let mut policy = ModelPolicy::new().with_library(&self.presets);
         if let Some(session) = &self.session_model {
@@ -599,9 +687,9 @@ impl TaskTool {
         let mut notes = lower.render_diagnostics();
 
         let model = self
-            .call_model(params.model.as_deref(), &availability, &mut notes)
+            .call_model(request.model.as_deref(), &availability, &mut notes)
             .or(lower.model);
-        let variant = params
+        let variant = request
             .effort
             .clone()
             .or_else(|| model.as_ref().and_then(|choice| choice.variant.clone()));
@@ -712,34 +800,21 @@ impl TaskTool {
         }
     }
 
-    fn target(&self, params: &TaskParams) -> Result<(String, Option<String>), ToolError> {
+    fn target(&self, requested: &str) -> Result<String, ToolError> {
         let targets = self.targets();
         let rendered = targets.join(", ");
-        match (params.subagent_type.as_deref(), params.category.as_deref()) {
-            (None, None) => Err(reject(TaskRejection::NoTarget {
+        if requested == COORDINATOR {
+            return Err(reject(TaskRejection::CoordinatorTarget {
                 targets: rendered,
-                first: GENERIC_EXECUTOR,
-            })),
-            (Some(subagent_type), Some(category)) => Err(reject(TaskRejection::BothTargets {
-                subagent_type: subagent_type.to_owned(),
-                category: category.to_owned(),
-            })),
-            (Some(requested), None) => {
-                if requested == COORDINATOR {
-                    return Err(reject(TaskRejection::CoordinatorTarget {
-                        targets: rendered,
-                    }));
-                }
-                if !targets.iter().any(|name| name == requested) {
-                    return Err(reject(TaskRejection::UnknownTarget {
-                        requested: requested.to_owned(),
-                        targets: rendered,
-                    }));
-                }
-                Ok((requested.to_owned(), None))
-            }
-            (None, Some(category)) => Ok((GENERIC_EXECUTOR.to_owned(), Some(category.to_owned()))),
+            }));
         }
+        if !targets.iter().any(|name| name == requested) {
+            return Err(reject(TaskRejection::UnknownTarget {
+                requested: requested.to_owned(),
+                targets: rendered,
+            }));
+        }
+        Ok(requested.to_owned())
     }
 
     pub(crate) async fn guard_depth(&self, ctx: &ToolContext) -> Result<(), ToolError> {
@@ -780,9 +855,7 @@ impl TypedTool for TaskTool {
     }
 
     async fn run(&self, params: TaskParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        if params.load_skills.is_some() {
-            return Err(reject(TaskRejection::LoadSkillsRemoved));
-        }
+        params.contract.validate().map_err(reject)?;
         let background = params.background.unwrap_or(false);
         if !background && params.report_delivery.is_some() {
             return Err(reject(TaskRejection::ReportDeliveryRequiresBackground));
@@ -793,15 +866,16 @@ impl TypedTool for TaskTool {
         // before checking the agent exists (`task.ts:118-183`). Asking a user to
         // approve delegation to a target that cannot exist spends the one interaction
         // budget this tool has on a call that is going to fail anyway.
-        let (agent, category) = self.target(&params)?;
+        let agent = self.target(&params.agent)?;
         self.guard_depth(&ctx).await?;
 
         let targets = self.targets();
         let mut metadata = Map::new();
-        if let Some(description) = &params.description {
-            metadata.insert("description".to_owned(), Value::String(description.clone()));
-        }
-        metadata.insert("subagent_type".to_owned(), Value::String(agent.clone()));
+        metadata.insert(
+            "objective".to_owned(),
+            Value::String(params.contract.objective.clone()),
+        );
+        metadata.insert("agent".to_owned(), Value::String(agent.clone()));
         metadata.insert(
             GUIDANCE_KEY.to_owned(),
             Value::String(denial_guidance(&agent, &targets)),
@@ -818,7 +892,8 @@ impl TypedTool for TaskTool {
         )
         .await?;
 
-        let plan = self.plan(&agent, category.as_deref(), &params);
+        let plan = self.plan(&agent, None, &DelegationModelRequest::default());
+        let logical_key = delegation_logical_key(&agent, &params.contract);
         let turn = self
             .host
             .dispatch(
@@ -828,9 +903,10 @@ impl TypedTool for TaskTool {
                     workflow: None,
                     workflow_node: None,
                     resume_session_id: params.task_id.clone(),
+                    logical_key,
                     agent,
-                    description: params.description.clone(),
-                    prompt: params.prompt.clone(),
+                    description: Some(params.contract.objective.clone()),
+                    prompt: params.contract.render_prompt(),
                     model: plan.model.clone(),
                     effort: plan.effort,
                     provider_options: plan.provider_options.clone(),
@@ -893,9 +969,8 @@ fn host_failure(error: ChildTurnError) -> ToolError {
 /// Upstream's `renderOutput` (`task.ts:64-78`), plus the background id and the
 /// resolution notes.
 ///
-/// The notes are inside the envelope rather than appended after it because a caller
-/// that reads only the result body would otherwise never learn its `effort` was
-/// dropped — which is precisely the silent downgrade this tool must not perform.
+/// Resolution notes stay inside the envelope so configured routing fallbacks remain
+/// visible rather than silently changing the child model or reasoning level.
 fn render(
     params: &TaskParams,
     plan: &DelegationPlan,
@@ -914,9 +989,7 @@ fn render(
         ),
         None => format!("<task id=\"{}\" state=\"{state}\">", turn.session_id),
     }];
-    if let Some(description) = &params.description {
-        lines.push(format!("<summary>{description}</summary>"));
-    }
+    lines.push(format!("<summary>{}</summary>", params.contract.objective));
     for note in &plan.notes {
         lines.push(format!("<note>{note}</note>"));
     }
@@ -925,10 +998,7 @@ fn render(
     lines.push("</task_result>".to_owned());
     lines.push("</task>".to_owned());
 
-    let title = params
-        .description
-        .clone()
-        .unwrap_or_else(|| format!("Delegated to {}", plan.agent));
+    let title = params.contract.objective.clone();
     let report_delivery = if background {
         match params.report_delivery.unwrap_or_default() {
             ReportDelivery::NextStep => "nextStep",
@@ -937,22 +1007,30 @@ fn render(
     } else {
         "foreground"
     };
-    ToolOutput::text(title, lines.join("\n")).with_metadata(
-        METADATA_SUBAGENT_KEY,
-        json!({
-            "sessionId": turn.session_id,
-            "jobId": turn.job_id,
-            "agent": plan.agent,
-            "category": plan.category,
-            "description": params.description,
-            "objective": params.prompt,
-            "state": state,
-            "background": background,
-            "reportDelivery": report_delivery,
-            "model": plan.model.as_ref().map(|model| model.model.as_str()),
-            "effort": plan.effort.map(ReasoningEffort::as_str),
-        }),
-    )
+    let mut metadata = json!({
+        "sessionId": turn.session_id,
+        "jobId": turn.job_id,
+        "agent": plan.agent,
+        "objective": params.contract.objective,
+        "deliverable": params.contract.deliverable,
+        "successEvidence": params.contract.success_evidence,
+        "contract": params.contract,
+        "state": state,
+        "background": background,
+        "reportDelivery": report_delivery,
+        "model": plan.model.as_ref().map(|model| model.model.as_str()),
+        "effort": plan.effort.map(ReasoningEffort::as_str),
+    });
+    if let Some(report) = &turn.report_metadata {
+        metadata["report"] = report.clone();
+    }
+    let output =
+        ToolOutput::text(title, lines.join("\n")).with_metadata(METADATA_SUBAGENT_KEY, metadata);
+    if background && params.report_delivery.unwrap_or_default() == ReportDelivery::NextStep {
+        output.with_continuation(zuno_tool::ToolContinuation::YieldUntilInput)
+    } else {
+        output
+    }
 }
 
 /// Catalog facts stated by hand, for a test or an unconfigured install.
@@ -1036,6 +1114,7 @@ impl ProviderFacts for FixedFacts {
 pub struct RecordingHost {
     ancestry: u32,
     reuse_session_id_as_job: bool,
+    report_metadata: Option<Value>,
     next_job: AtomicU64,
     dispatched: std::sync::Mutex<Vec<ChildTurnRequest>>,
 }
@@ -1060,6 +1139,13 @@ impl RecordingHost {
     #[must_use]
     pub const fn conflating_ids(mut self) -> Self {
         self.reuse_session_id_as_job = true;
+        self
+    }
+
+    /// Attach host-generated foreground report evidence.
+    #[must_use]
+    pub fn with_report_metadata(mut self, metadata: Value) -> Self {
+        self.report_metadata = Some(metadata);
         self
     }
 
@@ -1104,6 +1190,9 @@ impl ChildTurnHost for RecordingHost {
         Ok(ChildTurn {
             job_id: background.then_some(job),
             output: "done".to_owned(),
+            report_metadata: (!background)
+                .then(|| self.report_metadata.clone())
+                .flatten(),
             session_id,
         })
     }

@@ -13,7 +13,3 @@ planning or editing.
    symbol names.
 5. Do not edit files, regenerate the index, or rewrite instruction files unless
    the user separately requests that work.
-
-This Skill does not grant tools, permissions, filesystem access, network access,
-or environment access. Use only capabilities already exposed by the active
-Agent profile and permission policy.

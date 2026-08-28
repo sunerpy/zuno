@@ -17,8 +17,6 @@ const EXPECTED_NAMES: [&str; 9] = [
     "ui-design",
 ];
 
-const AUTHORITY_GUARD: &str = "This Skill does not grant tools, permissions, filesystem access, network access,\nor environment access.";
-
 #[test]
 fn pack_has_stable_identity_and_exact_catalog() {
     assert_eq!(pack().id, PACK_ID);
@@ -162,12 +160,14 @@ fn content_hashes_match_the_embedded_resources() {
 }
 
 #[test]
-fn bodies_are_nonempty_original_guidance_without_authority_claims() {
+fn bodies_are_nonempty_original_guidance_without_runtime_policy_duplication() {
     for entry in SKILLS {
         assert!(!entry.content.trim().is_empty(), "{} is empty", entry.name);
         assert!(
-            entry.content.contains(AUTHORITY_GUARD),
-            "{} lacks the explicit no-authority guard",
+            !entry
+                .content
+                .contains("This Skill does not grant tools, permissions"),
+            "{} duplicates host-owned runtime authority policy",
             entry.name
         );
 
@@ -186,6 +186,37 @@ fn bodies_are_nonempty_original_guidance_without_authority_claims() {
                 entry.name
             );
         }
+    }
+}
+
+#[test]
+fn deepwork_declares_every_durable_state_reader_and_writer_it_uses() {
+    let deepwork = skill("deepwork").expect("deepwork descriptor");
+    assert_eq!(
+        deepwork.required_tools,
+        &[
+            "goal_get",
+            "plan_get",
+            "plan_update",
+            "todo_get",
+            "todo_update"
+        ]
+    );
+}
+
+#[test]
+fn focused_workflow_skills_stay_within_their_prompt_budgets() {
+    for (name, minimum, maximum) in [
+        ("deepwork", 80, 110),
+        ("git-workflow", 120, 155),
+        ("verification-planning", 80, 105),
+    ] {
+        let entry = skill(name).expect("skill descriptor");
+        let words = entry.content.split_whitespace().count();
+        assert!(
+            (minimum..=maximum).contains(&words),
+            "{name} has {words} words; expected {minimum}..={maximum}"
+        );
     }
 }
 

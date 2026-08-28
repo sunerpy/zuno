@@ -3,17 +3,15 @@
 Use this Skill when a requested change requires repository-aware inspection,
 commit preparation, or delivery.
 
-1. Inspect the current branch, worktree status, relevant history, and staged and
-   unstaged diffs before acting.
-2. Preserve unrelated user changes. Scope edits and staging to the requested
-   files, and verify the exact staged diff before a commit.
-3. Run the relevant checks and capture their final status before describing the
-   change as verified.
-4. Commit, merge, push, create or delete branches, or remove worktrees only when
-   the user's request authorizes that specific action.
-5. Do not use destructive reset or checkout operations to discard work that was
-   not created by the current task.
-
-This Skill does not grant tools, permissions, filesystem access, network access,
-or environment access. Use only capabilities already exposed by the active
-Agent profile and permission policy.
+1. Inspect branch identity, worktree status, relevant history, the full diff,
+   and the index before deciding a Git operation.
+2. Separate pre-existing user changes from the requested change. Build a
+   cohesive commit map and stage only the exact paths or hunks owned by one
+   commit.
+3. Review the staged diff and staged file list before committing. Keep generated
+   files with their owning source change and do not include incidental cleanup.
+4. Treat commit, merge, rebase, push, branch deletion, and worktree removal as
+   distinct externally visible operations; perform only those the request
+   authorizes.
+5. Never discard unrelated work with reset, checkout, clean, or broad restore.
+   Resolve overlap explicitly or stop with the conflicting paths named.

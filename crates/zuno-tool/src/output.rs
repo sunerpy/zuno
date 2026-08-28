@@ -58,6 +58,28 @@ pub const METADATA_WRITTEN_PATHS_KEY: &str = "writtenPaths";
 /// keeping both lets each consumer use the representation it actually understands.
 pub const METADATA_FILE_DIFFS_KEY: &str = "fileDiffs";
 
+/// How the host should proceed after this successful tool result is persisted.
+///
+/// The default is the ordinary model tool loop. `YieldUntilInput` is reserved for
+/// tools that started durable asynchronous work and arranged an external input to
+/// resume the same session. Keeping this typed and tool-owned avoids asking the
+/// model to spend another provider request merely to say that it is waiting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolContinuation {
+    /// Append the result and continue the ordinary model tool loop.
+    #[default]
+    Continue,
+    /// End the current turn unless a new durable input is already available.
+    YieldUntilInput,
+}
+
+impl ToolContinuation {
+    const fn is_continue(&self) -> bool {
+        matches!(self, Self::Continue)
+    }
+}
+
 /// One text file modification produced by a tool call.
 ///
 /// Paths are absolute at this boundary because ACP clients resolve edits outside the
@@ -177,6 +199,9 @@ pub struct ToolOutput {
     /// Files produced by this call.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// Host-owned continuation behavior after a successful dispatch.
+    #[serde(default, skip_serializing_if = "ToolContinuation::is_continue")]
+    pub continuation: ToolContinuation,
 }
 
 impl ToolOutput {
@@ -188,6 +213,7 @@ impl ToolOutput {
             output: output.into(),
             metadata: Map::new(),
             attachments: Vec::new(),
+            continuation: ToolContinuation::Continue,
         }
     }
 
@@ -202,6 +228,13 @@ impl ToolOutput {
     #[must_use]
     pub fn with_attachment(mut self, attachment: Attachment) -> Self {
         self.attachments.push(attachment);
+        self
+    }
+
+    /// Requests host-managed suspension after this result is durably appended.
+    #[must_use]
+    pub fn with_continuation(mut self, continuation: ToolContinuation) -> Self {
+        self.continuation = continuation;
         self
     }
 

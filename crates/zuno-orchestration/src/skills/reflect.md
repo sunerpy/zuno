@@ -12,7 +12,3 @@ reviewable, reusable knowledge.
    Otherwise return the candidate in the response; do not claim it was stored.
 5. Never use reflection to rewrite code, prompts, Agents, workflows, or Skills
    automatically.
-
-This Skill does not grant tools, permissions, filesystem access, network access,
-or environment access. Use only capabilities already exposed by the active
-Agent profile and permission policy.

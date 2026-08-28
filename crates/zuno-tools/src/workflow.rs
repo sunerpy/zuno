@@ -12,13 +12,13 @@ use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zuno_error::ToolError;
-use zuno_orchestration::{AttemptSnapshot, WorkflowTemplateDescriptor};
+use zuno_orchestration::{AttemptSnapshot, WorkflowTemplateDescriptor, sha256_json};
 use zuno_tool::{
     PermissionAsk, ToolConcurrencyPolicy, ToolContext, ToolOutput, ToolReplayPolicy, ToolUiIntent,
     TypedTool,
 };
 
-use crate::task::{ChildTurnRequest, ReportDelivery, TaskParams, TaskTool};
+use crate::task::{ChildTurnRequest, DelegationModelRequest, ReportDelivery, TaskTool};
 
 /// Stable model-facing id for configured workflow execution.
 pub const WIRE_ID: &str = "workflow";
@@ -185,13 +185,9 @@ impl WorkflowTool {
                     .description
                     .clone()
                     .or_else(|| Some(format!("{} / {}", params.workflow, node.id)));
-                let task_params = TaskParams {
-                    description: description.clone(),
-                    prompt: prompt.clone(),
-                    subagent_type: Some(node.agent.clone()),
-                    ..TaskParams::default()
-                };
-                let plan = self.task.plan(&node.agent, None, &task_params);
+                let plan = self
+                    .task
+                    .plan(&node.agent, None, &DelegationModelRequest::default());
                 WorkflowNodeRequest {
                     id: node.id.clone(),
                     depends_on: node.depends_on.clone(),
@@ -201,6 +197,15 @@ impl WorkflowTool {
                         workflow: Some(template.name.clone()),
                         workflow_node: Some(node.id.clone()),
                         resume_session_id: None,
+                        logical_key: format!(
+                            "workflow:v1:{}",
+                            sha256_json(&json!({
+                                "workflow": template.name,
+                                "node": node.id,
+                                "agent": node.agent,
+                                "prompt": prompt,
+                            }))
+                        ),
                         agent: node.agent.clone(),
                         description,
                         prompt,
@@ -450,14 +455,20 @@ mod tests {
     fn orchestration_snapshot() -> Arc<AttemptSnapshot> {
         Arc::new(
             serde_json::from_value(json!({
-                "schemaVersion": 2,
+                "schemaVersion": 4,
                 "turnId": "turn-parent",
                 "step": 1,
                 "capability": {
-                    "schemaVersion": 2,
+                    "schemaVersion": 4,
                     "pack": {"id":"test","version":"1","upstreamRevision":"test"},
                     "extensionRevision": 0,
                     "permissionPolicySha256": "policy",
+                    "sandbox": {
+                        "mode": "workspace-write",
+                        "network": "deny",
+                        "writableRoots": [],
+                        "protectedPaths": []
+                    },
                     "profiles": [], "presets": [], "councils": [], "workflows": [], "skills": []
                 },
                 "owner": {

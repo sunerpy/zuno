@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 /// Version of the persisted orchestration snapshot contract.
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 
 /// Stable digest identifying one immutable snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,9 +153,35 @@ pub struct PresetSelection {
     pub sha256: String,
 }
 
+/// Maximum sandbox authority frozen with one capability generation.
+///
+/// Paths remain in their validated configuration spelling here. The shell runtime
+/// resolves them against the active workspace, while this descriptor only ensures a
+/// delegated child cannot silently observe a broader configuration generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxCapabilityDescriptor {
+    pub mode: String,
+    pub network: String,
+    pub writable_roots: Vec<String>,
+    pub protected_paths: Vec<String>,
+}
+
+impl Default for SandboxCapabilityDescriptor {
+    fn default() -> Self {
+        Self {
+            mode: "workspace-write".to_owned(),
+            network: "deny".to_owned(),
+            writable_roots: Vec::new(),
+            protected_paths: Vec::new(),
+        }
+    }
+}
+
 /// The immutable capability catalogue shared by a parent and every admitted child.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilityContents {
+    pub sandbox: SandboxCapabilityDescriptor,
     pub profiles: Vec<ProfileDescriptor>,
     pub presets: Vec<PresetDescriptor>,
     pub councils: Vec<CouncilPresetDescriptor>,
@@ -171,6 +197,7 @@ pub struct CapabilitySnapshot {
     pub pack: PackIdentity,
     pub extension_revision: u64,
     pub permission_policy_sha256: String,
+    pub sandbox: SandboxCapabilityDescriptor,
     pub profiles: Vec<ProfileDescriptor>,
     pub presets: Vec<PresetDescriptor>,
     pub councils: Vec<CouncilPresetDescriptor>,
@@ -210,11 +237,16 @@ impl CapabilitySnapshot {
                 .cmp(&right.name)
                 .then_with(|| left.source.cmp(&right.source))
         });
+        contents.sandbox.writable_roots.sort();
+        contents.sandbox.writable_roots.dedup();
+        contents.sandbox.protected_paths.sort();
+        contents.sandbox.protected_paths.dedup();
         Self {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             pack,
             extension_revision,
             permission_policy_sha256: permission_policy_sha256.into(),
+            sandbox: contents.sandbox,
             profiles: contents.profiles,
             presets: contents.presets,
             councils: contents.councils,
@@ -563,6 +595,33 @@ mod tests {
             "required":["path"]
         }));
         assert_ne!(identity, tool.identity().expect("tool identity"));
+    }
+
+    #[test]
+    fn capability_identity_changes_when_the_sandbox_authority_changes() {
+        let original = capability();
+        let identity = original.identity().expect("identity");
+
+        let mut mode = original.clone();
+        mode.sandbox.mode = "danger-full-access".to_owned();
+        assert_ne!(identity, mode.identity().expect("sandbox mode identity"));
+
+        let mut network = original.clone();
+        network.sandbox.network = "allow".to_owned();
+        assert_ne!(
+            identity,
+            network.identity().expect("sandbox network identity")
+        );
+
+        let mut writable = original;
+        writable
+            .sandbox
+            .writable_roots
+            .push("../shared-cache".to_owned());
+        assert_ne!(
+            identity,
+            writable.identity().expect("sandbox writable-root identity")
+        );
     }
 
     #[test]

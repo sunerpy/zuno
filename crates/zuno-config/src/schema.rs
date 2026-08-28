@@ -400,6 +400,13 @@ pub struct SkillsConfig {
     /// clamped by the runtime.
     #[serde(rename = "maxContextTokens", skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<NonZeroU32>,
+    /// Maximum approximate tokens used by all fully selected Skill bodies in one
+    /// session prompt. Values above the runtime ceiling are clamped.
+    #[serde(
+        rename = "maxSelectedContextTokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_selected_context_tokens: Option<NonZeroU32>,
 }
 
 /// File-watcher configuration (`config/config.ts:49`).

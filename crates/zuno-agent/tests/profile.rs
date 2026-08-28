@@ -63,11 +63,6 @@ fn inherited_parent_tools_are_an_upper_bound_on_child_capabilities() {
     assert!(!profile.capabilities().tool_available("shell"));
     assert!(!profile.capabilities().tool_available("web_search"));
     assert!(!profile.capabilities().tool_available("task"));
-    assert!(
-        profile.prompt_policy().contains("shell: unavailable"),
-        "{}",
-        profile.prompt_policy()
-    );
 }
 
 #[test]
@@ -90,7 +85,7 @@ fn extension_inheritance_precedes_later_user_denies_and_stays_role_bounded() {
 }
 
 #[test]
-fn prompt_policy_describes_enforced_rules_instead_of_an_assumed_role() {
+fn profile_exposes_capability_facts_without_rendering_a_premature_prompt() {
     let rules = vec![
         rule("*", PermissionAction::Deny),
         rule("read", PermissionAction::Allow),
@@ -98,32 +93,24 @@ fn prompt_policy_describes_enforced_rules_instead_of_an_assumed_role() {
         rule("edit", PermissionAction::Allow),
     ];
     let profile = AgentProfile::resolve(native("fixer"), rules, false);
-    let policy = profile.prompt_policy();
 
-    assert!(policy.contains("Enforced capability snapshot"), "{policy}");
-    assert!(policy.contains("delegation: unavailable"), "{policy}");
-    assert!(policy.contains("workspace edits: available"), "{policy}");
-    assert!(policy.contains("shell: unavailable"), "{policy}");
-    assert!(
-        policy.contains("external research: unavailable"),
-        "{policy}"
-    );
+    assert!(profile.capabilities().tool_available("edit"));
+    assert!(!profile.capabilities().tool_available("shell"));
+    assert!(!profile.capabilities().tool_available("task"));
 }
 
 #[test]
-fn native_routing_advice_and_runtime_authority_are_both_preserved() {
+fn native_routing_advice_is_retained_as_data_for_late_runtime_rendering() {
     let rules = vec![
         rule("*", PermissionAction::Deny),
         rule("read", PermissionAction::Allow),
     ];
     let profile = AgentProfile::resolve(native("oracle"), rules, false);
-    let policy = profile.prompt_policy();
+    let guidance = profile
+        .delegation_guidance()
+        .expect("native delegation boundary");
 
-    assert!(policy.contains("Don't delegate when"), "{policy}");
-    assert!(
-        policy.contains("The runtime capability snapshot is authoritative"),
-        "{policy}"
-    );
+    assert!(guidance.contains("Don't delegate when"), "{guidance}");
 }
 
 #[test]

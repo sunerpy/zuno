@@ -28,7 +28,3 @@ isolation for substantial parallel work.
    state, and whether cleanup remains.
 
 This Skill guides user-authorized shell operations. Zuno does not own leases, quotas, or automatic cleanup for worktrees created this way.
-
-This Skill does not grant tools, permissions, filesystem access, network access,
-or environment access. Use only capabilities already exposed by the active
-Agent profile and permission policy.

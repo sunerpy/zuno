@@ -20,6 +20,3 @@ interaction quality, and runtime evidence materially affect correctness.
    Source inspection or a successful build alone is not visual acceptance.
 7. Report the design intent, files changed, interaction and accessibility checks, captured
    evidence, and remaining visual risks.
-
-This Skill does not grant tools, permissions, filesystem access, network access,
-or environment access.

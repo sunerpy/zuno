@@ -456,14 +456,20 @@ mod tests {
     fn orchestration_snapshot() -> Arc<AttemptSnapshot> {
         Arc::new(
             serde_json::from_value(serde_json::json!({
-                "schemaVersion": 2,
+                "schemaVersion": 4,
                 "turnId": "turn-parent",
                 "step": 1,
                 "capability": {
-                    "schemaVersion": 2,
+                    "schemaVersion": 4,
                     "pack": {"id":"test","version":"1","upstreamRevision":"test"},
                     "extensionRevision": 0,
                     "permissionPolicySha256": "policy",
+                    "sandbox": {
+                        "mode": "workspace-write",
+                        "network": "deny",
+                        "writableRoots": [],
+                        "protectedPaths": []
+                    },
                     "profiles": [], "presets": [], "councils": [], "workflows": [], "skills": []
                 },
                 "owner": {

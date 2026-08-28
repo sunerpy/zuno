@@ -72,7 +72,3 @@ permission system.
   <https://github.com/sunerpy/zuno/blob/main/docs/orchestration.md>
 - Runtime lifecycle: `docs/harness-runtime.md` and
   <https://github.com/sunerpy/zuno/blob/main/docs/harness-runtime.md>
-
-This Skill does not grant tools, permissions, filesystem access, network access,
-or environment access. Use only capabilities already exposed by the active
-Agent profile and permission policy.

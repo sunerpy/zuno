@@ -8,17 +8,49 @@ const MODEL_A: &str = "acme/reasoner";
 const MODEL_B: &str = "acme/other-reasoner";
 const MODEL_MUTE: &str = "acme/no-reasoning";
 
-fn params(prompt: &str) -> TaskParams {
+fn contract(objective: &str) -> DelegationContract {
+    DelegationContract {
+        objective: objective.to_owned(),
+        deliverable: "Return the requested result.".to_owned(),
+        instructions: objective.to_owned(),
+        success_evidence: "Cite the concrete evidence used.".to_owned(),
+        scope: None,
+        constraints: None,
+        dependencies: Vec::new(),
+    }
+}
+
+fn params(objective: &str) -> TaskParams {
     TaskParams {
-        prompt: prompt.to_owned(),
-        ..TaskParams::default()
+        contract: contract(objective),
+        agent: "explorer".to_owned(),
+        background: None,
+        report_delivery: None,
+        task_id: None,
     }
 }
 
 fn to_explorer() -> TaskParams {
-    TaskParams {
-        subagent_type: Some("explorer".to_owned()),
-        ..params("look around")
+    params("look around")
+}
+
+#[test]
+fn logical_task_identity_depends_only_on_the_agent_and_contract() {
+    let agreement = contract("inspect the runtime");
+    let first = delegation_logical_key("explorer", &agreement);
+    let second = delegation_logical_key("explorer", &agreement);
+    let other_agent = delegation_logical_key("oracle", &agreement);
+    let other_contract = delegation_logical_key("explorer", &contract("inspect the database"));
+
+    assert_eq!(first, second);
+    assert_ne!(first, other_agent);
+    assert_ne!(first, other_contract);
+}
+
+fn route(model: Option<&str>, effort: Option<&str>) -> DelegationModelRequest {
+    DelegationModelRequest {
+        model: model.map(str::to_owned),
+        effort: effort.map(str::to_owned),
     }
 }
 
@@ -101,60 +133,14 @@ fn message(error: &ToolError) -> String {
     }
 }
 
-// -- rejection 1: neither target ---------------------------------------------
-
-#[tokio::test]
-async fn neither_target_is_refused_with_both_ways_to_fix_it() {
-    let error = tool(Arc::new(RecordingHost::new()))
-        .run(params("do a thing"), allowed())
-        .await
-        .expect_err("a delegation with no target cannot run");
-
-    let text = message(&error);
-    assert!(matches!(error, ToolError::InvalidArgs { .. }));
-    assert!(
-        text.contains("Must provide either `category` or `subagent_type`"),
-        "{text}"
-    );
-    assert!(text.contains("subagent_type=\"general\""), "{text}");
-    assert!(text.contains("category=\"<preset shorthand>\""), "{text}");
-    for target in valid_targets(false) {
-        assert!(text.contains(&target), "the fix must list {target}: {text}");
-    }
-}
-
-// -- rejection 2: both targets ----------------------------------------------
-
-#[tokio::test]
-async fn both_targets_are_refused_as_mutually_exclusive() {
-    let error = tool(Arc::new(RecordingHost::new()))
-        .run(
-            TaskParams {
-                subagent_type: Some("explorer".to_owned()),
-                category: Some("cheap".to_owned()),
-                ..params("do a thing")
-            },
-            allowed(),
-        )
-        .await
-        .expect_err("naming both a category and an agent cannot run");
-
-    let text = message(&error);
-    assert!(matches!(error, ToolError::InvalidArgs { .. }));
-    assert!(text.contains("mutually exclusive"), "{text}");
-    assert!(text.contains("Provide only one"), "{text}");
-    assert!(text.contains("keep `subagent_type=\"explorer\"`"), "{text}");
-    assert!(text.contains("keep `category=\"cheap\"`"), "{text}");
-}
-
-// -- rejection 3: a coordinator as target -----------------------------------
+// -- rejection 1: a coordinator as target -----------------------------------
 
 #[tokio::test]
 async fn the_coordinator_is_refused_and_the_message_lists_the_valid_targets() {
     let error = tool(Arc::new(RecordingHost::new()))
         .run(
             TaskParams {
-                subagent_type: Some(COORDINATOR.to_owned()),
+                agent: COORDINATOR.to_owned(),
                 ..params("coordinate yourself")
             },
             allowed(),
@@ -168,7 +154,7 @@ async fn the_coordinator_is_refused_and_the_message_lists_the_valid_targets() {
         text.contains("`orchestrator` coordinates delegations"),
         "{text}"
     );
-    assert!(text.contains("Set `subagent_type` to one of"), "{text}");
+    assert!(text.contains("Set `agent` to one of"), "{text}");
     let targets = valid_targets(false);
     assert!(!targets.is_empty(), "the roster must offer some target");
     for target in &targets {
@@ -181,11 +167,11 @@ async fn the_coordinator_is_refused_and_the_message_lists_the_valid_targets() {
 }
 
 #[tokio::test]
-async fn an_unknown_agent_is_told_which_agents_exist_and_about_category() {
+async fn an_unknown_agent_is_told_which_agents_exist() {
     let error = tool(Arc::new(RecordingHost::new()))
         .run(
             TaskParams {
-                subagent_type: Some("cheap".to_owned()),
+                agent: "cheap".to_owned(),
                 ..params("do a thing")
             },
             allowed(),
@@ -194,14 +180,13 @@ async fn an_unknown_agent_is_told_which_agents_exist_and_about_category() {
         .expect_err("an agent outside the roster cannot be targeted");
 
     let text = message(&error);
-    assert!(text.contains("Unknown agent `cheap`"), "{text}");
-    assert!(text.contains("category=\"cheap\""), "{text}");
+    assert!(text.contains("Unknown Agent `cheap`"), "{text}");
     for target in valid_targets(false) {
         assert!(text.contains(&target), "must list {target}: {text}");
     }
 }
 
-// -- rejection 4: depth ------------------------------------------------------
+// -- rejection 2: depth ------------------------------------------------------
 
 #[tokio::test]
 async fn depth_exceeded_names_the_config_key_and_is_not_model_correctable() {
@@ -247,7 +232,7 @@ async fn a_raised_bound_permits_exactly_one_more_hop() {
     assert_eq!(host.dispatched().len(), 1);
 }
 
-// -- rejection 5: permission ------------------------------------------------
+// -- rejection 3: permission ------------------------------------------------
 
 #[tokio::test]
 async fn a_permission_refusal_stays_denied_and_carries_guidance_naming_the_grant() {
@@ -292,13 +277,13 @@ async fn a_permission_refusal_stays_denied_and_carries_guidance_naming_the_grant
 }
 
 #[tokio::test]
-async fn the_permission_pattern_is_the_subagent_type() {
+async fn the_permission_pattern_is_the_agent() {
     let asker = Arc::new(RecordingAllower::default());
     tool(Arc::new(RecordingHost::new()))
         .run(
             TaskParams {
-                subagent_type: Some("librarian".to_owned()),
-                description: Some("read the docs".to_owned()),
+                contract: contract("read the docs"),
+                agent: "librarian".to_owned(),
                 ..params("find the spec")
             },
             context(Arc::clone(&asker) as Arc<dyn PermissionAsker>),
@@ -314,75 +299,24 @@ async fn the_permission_pattern_is_the_subagent_type() {
     assert_eq!(ask.permission, PERMISSION_KEY);
     assert_eq!(ask.patterns, vec!["librarian".to_owned()]);
     assert_eq!(ask.always, vec!["*".to_owned()]);
-    assert_eq!(ask.metadata["subagent_type"], "librarian");
-    assert_eq!(ask.metadata["description"], "read the docs");
-}
-
-#[tokio::test]
-async fn a_category_call_gates_on_the_agent_it_actually_runs() {
-    let asker = Arc::new(RecordingAllower::default());
-    tool(Arc::new(RecordingHost::new()))
-        .run(
-            TaskParams {
-                category: Some("cheap".to_owned()),
-                ..params("mechanical edit")
-            },
-            context(Arc::clone(&asker) as Arc<dyn PermissionAsker>),
-        )
-        .await
-        .expect("a category delegation runs");
-
-    let asked = asker
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(
-        asked[0].patterns,
-        vec![GENERIC_EXECUTOR.to_owned()],
-        "a rule cannot match a pattern no agent is named by"
-    );
-}
-
-// -- the dropped argument ---------------------------------------------------
-
-#[tokio::test]
-async fn load_skills_is_refused_and_points_at_per_agent_permissions() {
-    let host = Arc::new(RecordingHost::new());
-    let error = tool(Arc::clone(&host))
-        .run(
-            TaskParams {
-                load_skills: Some(Value::Array(Vec::new())),
-                ..to_explorer()
-            },
-            allowed(),
-        )
-        .await
-        .expect_err("load_skills is not a parameter of this tool");
-
-    let text = message(&error);
-    assert!(text.contains("`load_skills` is not a parameter"), "{text}");
-    assert!(text.contains("permission-gated per agent"), "{text}");
-    assert!(text.contains("choose the `subagent_type`"), "{text}");
-    assert!(
-        host.dispatched().is_empty(),
-        "silently ignoring it would let the caller believe a skill was loaded"
-    );
+    assert_eq!(ask.metadata["agent"], "librarian");
+    assert_eq!(ask.metadata["objective"], "read the docs");
 }
 
 #[test]
-fn the_advertised_schema_never_mentions_load_skills() {
+fn the_advertised_schema_is_a_typed_delegation_contract() {
     let definition = erase(tool(Arc::new(RecordingHost::new()))).definition();
     let properties = &definition.parameters["properties"];
 
-    assert!(properties.get("load_skills").is_none());
-    assert!(!definition.description.contains("load_skills"));
     for expected in [
-        "description",
-        "prompt",
-        "subagent_type",
-        "category",
-        "model",
-        "effort",
+        "objective",
+        "deliverable",
+        "instructions",
+        "success_evidence",
+        "scope",
+        "constraints",
+        "dependencies",
+        "agent",
         "background",
         "reportDelivery",
         "task_id",
@@ -392,20 +326,111 @@ fn the_advertised_schema_never_mentions_load_skills() {
             "{expected} must be advertised"
         );
     }
-    assert_eq!(properties["prompt"]["type"], "string");
+    for removed in ["description", "prompt", "load_skills"] {
+        assert!(
+            properties.get(removed).is_none(),
+            "legacy field `{removed}` must not be advertised"
+        );
+    }
+    assert_eq!(
+        definition.parameters["required"],
+        serde_json::json!([
+            "objective",
+            "deliverable",
+            "instructions",
+            "success_evidence",
+            "agent"
+        ])
+    );
+    assert_eq!(
+        properties["scope"]["properties"]["include"]["items"]["type"],
+        "string"
+    );
+    assert_eq!(
+        properties["scope"]["properties"]["exclude"]["items"]["type"],
+        "string"
+    );
+    assert_eq!(
+        properties["constraints"]["properties"]["must"]["items"]["type"],
+        "string"
+    );
+    assert_eq!(
+        properties["constraints"]["properties"]["must_not"]["items"]["type"],
+        "string"
+    );
 }
 
 #[test]
-fn an_unknown_argument_is_still_refused() {
-    let rendered = format!(
-        "{:?}",
-        serde_json::from_value::<TaskParams>(serde_json::json!({
-            "prompt": "x",
-            "run_in_background": true,
-        }))
-    );
+fn legacy_task_arguments_are_refused_instead_of_migrated() {
+    for removed in [
+        "description",
+        "prompt",
+        "load_skills",
+        "subagent_type",
+        "category",
+        "model",
+        "effort",
+    ] {
+        let mut value = serde_json::json!({
+            "objective": "Current objective",
+            "deliverable": "Current deliverable",
+            "instructions": "Current instructions",
+            "success_evidence": "Current evidence",
+            "agent": "explorer",
+        });
+        value
+            .as_object_mut()
+            .expect("fixture object")
+            .insert(removed.to_owned(), Value::String("legacy".to_owned()));
+        let rendered = format!("{:?}", serde_json::from_value::<TaskParams>(value));
+        assert!(rendered.contains(removed), "{rendered}");
+    }
+}
 
-    assert!(rendered.contains("run_in_background"), "{rendered}");
+#[tokio::test]
+async fn empty_required_contract_fields_are_rejected_before_dispatch() {
+    for field in [
+        "objective",
+        "deliverable",
+        "instructions",
+        "success_evidence",
+    ] {
+        let host = Arc::new(RecordingHost::new());
+        let mut value = to_explorer();
+        match field {
+            "objective" => value.contract.objective = "  ".to_owned(),
+            "deliverable" => value.contract.deliverable = "  ".to_owned(),
+            "instructions" => value.contract.instructions = "  ".to_owned(),
+            "success_evidence" => value.contract.success_evidence = "  ".to_owned(),
+            _ => unreachable!(),
+        }
+        let error = tool(Arc::clone(&host))
+            .run(value, allowed())
+            .await
+            .expect_err("blank required contract fields must not dispatch");
+        assert!(message(&error).contains(&format!("`{field}` must not be empty")));
+        assert!(host.dispatched().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn empty_optional_contract_items_are_rejected_before_dispatch() {
+    let host = Arc::new(RecordingHost::new());
+    let mut value = to_explorer();
+    value.contract.scope = Some(DelegationScope {
+        include: vec!["crates/zuno-tools/**".to_owned(), " ".to_owned()],
+        exclude: Vec::new(),
+    });
+    let error = tool(Arc::clone(&host))
+        .run(value, allowed())
+        .await
+        .expect_err("blank scope items must not dispatch");
+    assert!(
+        message(&error).contains("`scope.include` item 2 must not be empty"),
+        "{}",
+        message(&error)
+    );
+    assert!(host.dispatched().is_empty());
 }
 
 // -- targets come from the roster ------------------------------------------
@@ -440,7 +465,7 @@ async fn a_composition_can_replace_the_native_roster_with_custom_agents() {
         .with_targets(targets)
         .run(
             TaskParams {
-                subagent_type: Some("release-reviewer".to_owned()),
+                agent: "release-reviewer".to_owned(),
                 ..params("review the release")
             },
             allowed(),
@@ -457,7 +482,7 @@ async fn a_composition_can_replace_the_native_roster_with_custom_agents() {
         .run(to_explorer(), allowed())
         .await
         .expect_err("an omitted native target must not remain reachable");
-    assert!(message(&error).contains("Unknown agent `explorer`"));
+    assert!(message(&error).contains("Unknown Agent `explorer`"));
 }
 
 #[test]
@@ -484,20 +509,20 @@ async fn a_vision_gated_target_is_unreachable_until_the_catalog_offers_one() {
     let refused = tool(Arc::new(RecordingHost::new()))
         .run(
             TaskParams {
-                subagent_type: Some(looker.clone()),
+                agent: looker.clone(),
                 ..params("describe the screenshot")
             },
             allowed(),
         )
         .await
         .expect_err("the gated target is absent without a vision model");
-    assert!(message(&refused).contains(&format!("Unknown agent `{looker}`")));
+    assert!(message(&refused).contains(&format!("Unknown Agent `{looker}`")));
 
     tool(Arc::new(RecordingHost::new()))
         .with_vision_available(true)
         .run(
             TaskParams {
-                subagent_type: Some(looker),
+                agent: looker,
                 ..params("describe the screenshot")
             },
             allowed(),
@@ -518,14 +543,7 @@ fn the_call_argument_outranks_the_config_override_the_preset_and_the_session() {
         .with_session_model(ModelChoice::new(MODEL_A))
         .with_agent_override("explorer", ModelChoice::new(MODEL_B));
 
-    let plan = subject.plan(
-        "explorer",
-        None,
-        &TaskParams {
-            model: Some(MODEL_A.to_owned()),
-            ..to_explorer()
-        },
-    );
+    let plan = subject.plan("explorer", None, &route(Some(MODEL_A), None));
 
     assert_eq!(plan.model, Some(ModelChoice::new(MODEL_A)));
     assert!(plan.notes.is_empty(), "{:?}", plan.notes);
@@ -541,12 +559,16 @@ fn without_a_call_argument_the_lower_rungs_still_decide() {
         .with_session_model(ModelChoice::new(MODEL_A));
 
     assert_eq!(
-        subject.plan("explorer", None, &to_explorer()).model,
+        subject
+            .plan("explorer", None, &DelegationModelRequest::default())
+            .model,
         Some(ModelChoice::new(MODEL_B)),
         "the preset rung must still answer"
     );
     assert_eq!(
-        subject.plan("worker", None, &to_explorer()).model,
+        subject
+            .plan("worker", None, &DelegationModelRequest::default())
+            .model,
         Some(ModelChoice::new(MODEL_A)),
         "an agent the preset is silent about falls to the session model"
     );
@@ -561,7 +583,11 @@ fn a_category_resolves_through_the_active_preset_and_runs_the_generic_executor()
         .with_presets(presets)
         .with_session_model(ModelChoice::new(MODEL_A));
 
-    let plan = subject.plan(GENERIC_EXECUTOR, Some("cheap"), &params("mechanical"));
+    let plan = subject.plan(
+        GENERIC_EXECUTOR,
+        Some("cheap"),
+        &DelegationModelRequest::default(),
+    );
 
     assert_eq!(plan.agent, GENERIC_EXECUTOR);
     assert_eq!(plan.model, Some(ModelChoice::new(MODEL_B)));
@@ -577,7 +603,11 @@ fn an_unknown_category_is_a_note_and_the_session_model_not_a_failure() {
         .with_presets(presets)
         .with_session_model(ModelChoice::new(MODEL_A));
 
-    let plan = subject.plan(GENERIC_EXECUTOR, Some("nope"), &params("mechanical"));
+    let plan = subject.plan(
+        GENERIC_EXECUTOR,
+        Some("nope"),
+        &DelegationModelRequest::default(),
+    );
 
     assert_eq!(plan.model, Some(ModelChoice::new(MODEL_A)));
     assert!(
@@ -596,11 +626,7 @@ fn an_explicit_effort_becomes_the_childs_outbound_provider_options() {
     let plan = tool(Arc::new(RecordingHost::new())).plan(
         "explorer",
         None,
-        &TaskParams {
-            model: Some(MODEL_A.to_owned()),
-            effort: Some("low".to_owned()),
-            ..to_explorer()
-        },
+        &route(Some(MODEL_A), Some("low")),
     );
 
     assert_eq!(plan.effort, Some(ReasoningEffort::Low));
@@ -613,10 +639,7 @@ fn an_unavailable_explicit_model_falls_through_and_says_so() {
     let plan = tool(Arc::new(RecordingHost::new())).plan(
         "explorer",
         None,
-        &TaskParams {
-            model: Some("acme/retired".to_owned()),
-            ..to_explorer()
-        },
+        &route(Some("acme/retired"), None),
     );
 
     assert_eq!(plan.model, Some(ModelChoice::new(MODEL_A)));
@@ -631,14 +654,8 @@ fn an_unavailable_explicit_model_falls_through_and_says_so() {
 
 #[test]
 fn an_unqualified_explicit_model_falls_through_and_says_so() {
-    let plan = tool(Arc::new(RecordingHost::new())).plan(
-        "explorer",
-        None,
-        &TaskParams {
-            model: Some("reasoner".to_owned()),
-            ..to_explorer()
-        },
-    );
+    let plan =
+        tool(Arc::new(RecordingHost::new())).plan("explorer", None, &route(Some("reasoner"), None));
 
     assert_eq!(plan.model, Some(ModelChoice::new(MODEL_A)));
     assert!(
@@ -655,11 +672,7 @@ fn an_effort_a_non_reasoning_model_cannot_honour_is_reported_not_silently_droppe
     let plan = tool(Arc::new(RecordingHost::new())).plan(
         "explorer",
         None,
-        &TaskParams {
-            model: Some(MODEL_MUTE.to_owned()),
-            effort: Some("high".to_owned()),
-            ..to_explorer()
-        },
+        &route(Some(MODEL_MUTE), Some("high")),
     );
 
     assert_eq!(plan.effort, None);
@@ -678,11 +691,7 @@ fn an_effort_name_the_model_does_not_declare_is_reported() {
     let plan = tool(Arc::new(RecordingHost::new())).plan(
         "explorer",
         None,
-        &TaskParams {
-            model: Some(MODEL_A.to_owned()),
-            effort: Some("ponder".to_owned()),
-            ..to_explorer()
-        },
+        &route(Some(MODEL_A), Some("ponder")),
     );
 
     assert_eq!(plan.effort, None);
@@ -713,14 +722,7 @@ fn a_model_declared_variant_is_passed_through_verbatim() {
 
     let plan = TaskTool::new(Arc::new(RecordingHost::new()), facts)
         .with_session_model(ModelChoice::new(MODEL_A))
-        .plan(
-            "explorer",
-            None,
-            &TaskParams {
-                effort: Some("ponder".to_owned()),
-                ..to_explorer()
-            },
-        );
+        .plan("explorer", None, &route(None, Some("ponder")));
 
     assert_eq!(plan.provider_options, options);
     assert!(plan.notes.is_empty(), "{:?}", plan.notes);
@@ -731,10 +733,7 @@ fn an_effort_with_no_resolvable_model_is_reported() {
     let plan = TaskTool::new(Arc::new(RecordingHost::new()), Arc::new(NoProviders)).plan(
         "explorer",
         None,
-        &TaskParams {
-            effort: Some("low".to_owned()),
-            ..to_explorer()
-        },
+        &route(None, Some("low")),
     );
 
     assert_eq!(plan.model, None);
@@ -751,7 +750,18 @@ fn an_effort_with_no_resolvable_model_is_reported() {
 
 #[tokio::test]
 async fn a_foreground_delegation_returns_the_child_session_id_and_no_job_id() {
-    let host = Arc::new(RecordingHost::new());
+    let host = Arc::new(
+        RecordingHost::new().with_report_metadata(serde_json::json!({
+            "schemaVersion": 1,
+            "jobId": null,
+            "sessionId": format!("ses_child_of_{PARENT}"),
+            "status": "completed",
+            "finalText": "done",
+            "changedPaths": ["src/lib.rs"],
+            "verificationRecords": [],
+            "uncertainSideEffects": []
+        })),
+    );
     let output = tool(Arc::clone(&host))
         .run(to_explorer(), allowed())
         .await
@@ -764,9 +774,26 @@ async fn a_foreground_delegation_returns_the_child_session_id_and_no_job_id() {
     assert_eq!(output.metadata["subagent"]["sessionId"], child);
     assert_eq!(output.metadata["subagent"]["agent"], "explorer");
     assert_eq!(output.metadata["subagent"]["objective"], "look around");
+    assert_eq!(
+        output.metadata["subagent"]["contract"]["deliverable"],
+        "Return the requested result."
+    );
+    assert_eq!(
+        output.metadata["subagent"]["contract"]["instructions"],
+        "look around"
+    );
+    assert_eq!(
+        output.metadata["subagent"]["contract"]["success_evidence"],
+        "Cite the concrete evidence used."
+    );
     assert_eq!(output.metadata["subagent"]["state"], "completed");
     assert_eq!(output.metadata["subagent"]["background"], false);
     assert_eq!(output.metadata["subagent"]["reportDelivery"], "foreground");
+    assert_eq!(output.metadata["subagent"]["report"]["finalText"], "done");
+    assert_eq!(
+        output.metadata["subagent"]["report"]["changedPaths"],
+        serde_json::json!(["src/lib.rs"])
+    );
     assert_eq!(host.dispatched()[0].parent_session_id, PARENT);
     assert!(!host.dispatched()[0].background);
 }
@@ -924,11 +951,13 @@ async fn a_task_id_resumes_that_session_instead_of_creating_one() {
 async fn the_dispatch_carries_the_resolved_model_effort_and_options() {
     let host = Arc::new(RecordingHost::new());
     tool(Arc::clone(&host))
+        .with_agent_override("explorer", ModelChoice::new(MODEL_B).with_variant("high"))
         .run(
             TaskParams {
-                model: Some(MODEL_B.to_owned()),
-                effort: Some("high".to_owned()),
-                description: Some("survey the crate".to_owned()),
+                contract: DelegationContract {
+                    objective: "survey the crate".to_owned(),
+                    ..contract("look around")
+                },
                 ..to_explorer()
             },
             allowed(),
@@ -939,24 +968,36 @@ async fn the_dispatch_carries_the_resolved_model_effort_and_options() {
     let dispatched = host.dispatched();
     let request = &dispatched[0];
     assert_eq!(request.agent, "explorer");
-    assert_eq!(request.model, Some(ModelChoice::new(MODEL_B)));
+    assert_eq!(
+        request.model,
+        Some(ModelChoice::new(MODEL_B).with_variant("high"))
+    );
     assert_eq!(request.effort, Some(ReasoningEffort::High));
     assert_eq!(request.provider_options["reasoningEffort"], "high");
-    assert_eq!(request.prompt, "look around");
+    assert_eq!(
+        request.logical_key,
+        delegation_logical_key(
+            "explorer",
+            &DelegationContract {
+                objective: "survey the crate".to_owned(),
+                ..contract("look around")
+            }
+        )
+    );
+    assert!(request.prompt.contains("Instructions:\nlook around"));
+    assert!(
+        request
+            .prompt
+            .contains("Deliverable:\nReturn the requested result.")
+    );
     assert_eq!(request.description.as_deref(), Some("survey the crate"));
 }
 
 #[tokio::test]
 async fn a_resolution_note_reaches_the_caller_in_the_rendered_output() {
     let output = tool(Arc::new(RecordingHost::new()))
-        .run(
-            TaskParams {
-                model: Some(MODEL_MUTE.to_owned()),
-                effort: Some("max".to_owned()),
-                ..to_explorer()
-            },
-            allowed(),
-        )
+        .with_agent_override("explorer", ModelChoice::new(MODEL_MUTE).with_variant("max"))
+        .run(to_explorer(), allowed())
         .await
         .expect("an unhonourable effort does not fail the delegation");
 

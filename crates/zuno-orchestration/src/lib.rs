@@ -12,9 +12,9 @@ pub use snapshot::{
     CouncilPresetDescriptor, CouncilRetryPolicyDescriptor, CouncilSeatDescriptor,
     CouncilSynthesisPolicyDescriptor, ModelAttemptIdentity, OwnerLineage, PackIdentity,
     PresetDescriptor, PresetRouteDescriptor, PresetSelection, ProfileDescriptor,
-    PromptReceiptIdentity, SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity,
-    SkillCapabilityDescriptor, SnapshotIdentity, ToolSchemaIdentity, WorkflowNodeDescriptor,
-    WorkflowTemplateDescriptor, sha256_json, sha256_text,
+    PromptReceiptIdentity, SNAPSHOT_SCHEMA_VERSION, SandboxCapabilityDescriptor,
+    SelectedSkillIdentity, SkillCapabilityDescriptor, SnapshotIdentity, ToolSchemaIdentity,
+    WorkflowNodeDescriptor, WorkflowTemplateDescriptor, sha256_json, sha256_text,
 };
 
 /// Stable identifier for the first-party pack.
@@ -177,7 +177,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/customize-zuno",
         allowed_profiles: USER_FACING_PROFILES,
         required_tools: &["read", "glob", "grep"],
-        content_sha256: "b20e2eb8c99ea75982de36ad0b49181099dff467420de83aef0cbd86342b554d",
+        content_sha256: "f243f24bc396f7ef3cbe0cf51d753ad6c84de3f2a86d604afa2a8733b8167a9c",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -188,7 +188,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/develop-zuno",
         allowed_profiles: USER_FACING_PROFILES,
         required_tools: &["read", "glob", "grep"],
-        content_sha256: "f1c142dcefd8bdeae79d3d8755d7be3c45a226ab5d4408d542aa4d3805d9ae12",
+        content_sha256: "e0ea2035be9220076bd020cf9d5eed2ec9159b54cfe370daa28ee3298a79a696",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -198,8 +198,14 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         source_id: "zuno-orchestration:skill/deepwork@0.1.0",
         location: "builtin://zuno-orchestration/0.1.0/deepwork",
         allowed_profiles: DEEPWORK_PROFILES,
-        required_tools: &["plan_get", "plan_update", "todo_get", "todo_update"],
-        content_sha256: "57320629e2f11d7556a2b98217508093f1123828d49165beedda856f48f4a7ea",
+        required_tools: &[
+            "goal_get",
+            "plan_get",
+            "plan_update",
+            "todo_get",
+            "todo_update",
+        ],
+        content_sha256: "14ae721a96c7621e08b2bb030657e4d271f133f92baa6b449a1c687ee1e92284",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -210,7 +216,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/codemap",
         allowed_profiles: CODEMAP_PROFILES,
         required_tools: &["read", "glob", "grep"],
-        content_sha256: "f6391d18439d06cf3c90ed1faa21b3a909e7eec8be5d928c5cf576d548c7ae9c",
+        content_sha256: "0d52f475ad0dfa6a7d82049ad50b48d39f2201f67d5902ee30375e59a8f34d93",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -221,7 +227,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/verification-planning",
         allowed_profiles: VERIFICATION_PROFILES,
         required_tools: &["read"],
-        content_sha256: "1f2a2b26e66c965752a016e896684f4cec158a09caf0438c75000c2f5ff1d27f",
+        content_sha256: "29d7b59c4b9b026617c48ddc574e2ad01bc6dd6585b87eef4a648e6c02ac0898",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -232,7 +238,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/reflect",
         allowed_profiles: REFLECT_PROFILES,
         required_tools: &["read"],
-        content_sha256: "5a4c1ba0f89a8c3b5f83579a48ef32504a34cc3b926b50fecdeb1faab0d3a3f8",
+        content_sha256: "fc492f59ae4d699a855f5f6372eb4822293abfefae4f4c6812f86deec12b8d84",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -243,7 +249,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/worktree",
         allowed_profiles: MUTATING_WORK_PROFILES,
         required_tools: &["read", "shell"],
-        content_sha256: "ba3d1c403aff203b8b88789d30fbc3869ac43a090703c0de74c0339cb40b60f1",
+        content_sha256: "29db03056613a6790bed39a2517b35cfc704be0e7a90054831ae7e23de5cc740",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -254,7 +260,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/git-workflow",
         allowed_profiles: MUTATING_WORK_PROFILES,
         required_tools: &["read", "shell"],
-        content_sha256: "0561c6522da0501cb5a0f68a7c96fa1181a9330f1e2c429952f255ebbd4e6cbf",
+        content_sha256: "9340c1ff9f292f94833c95154c5f7ac38cf29659a34d7ad280dbc011de6f1310",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -265,7 +271,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         location: "builtin://zuno-orchestration/0.1.0/ui-design",
         allowed_profiles: UI_DESIGN_PROFILES,
         required_tools: &["read", "skill"],
-        content_sha256: "a998b55e4eb4da6114c95d6785f2e46b6f21ae36214e0910cf23f97bbade859a",
+        content_sha256: "c7be8a1d626f396f2dd068f6ca4f0cd64565bfc5584dba52e7360f4676afb7c0",
         provenance: NATIVE_PROVENANCE,
     },
 ];

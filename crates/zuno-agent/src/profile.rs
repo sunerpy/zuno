@@ -101,14 +101,6 @@ impl CapabilityPolicy {
             ShellFilesystemAccess::ReadOnly
         }
     }
-
-    fn can_shell(&self) -> bool {
-        self.tool_available("shell")
-    }
-
-    fn can_research_externally(&self) -> bool {
-        self.tool_available("webfetch") || self.tool_available("web_search")
-    }
 }
 
 /// Catalog definition plus the exact capabilities enforced for one attempt.
@@ -116,7 +108,6 @@ impl CapabilityPolicy {
 pub struct AgentProfile {
     definition: Agent,
     capabilities: CapabilityPolicy,
-    prompt_policy: String,
     vision_available: bool,
     extension_rule_index: Option<usize>,
 }
@@ -155,11 +146,9 @@ impl AgentProfile {
         extension_rule_index: Option<usize>,
     ) -> Self {
         let capabilities = CapabilityPolicy::resolve(&definition, rules, vision_available);
-        let prompt_policy = render_prompt_policy(&definition, &capabilities, vision_available);
         Self {
             definition,
             capabilities,
-            prompt_policy,
             vision_available,
             extension_rule_index,
         }
@@ -173,8 +162,6 @@ impl AgentProfile {
     #[must_use]
     pub fn with_tool_authority(mut self, tools: impl IntoIterator<Item = String>) -> Self {
         self.capabilities.tool_authority = Some(tools.into_iter().collect());
-        self.prompt_policy =
-            render_prompt_policy(&self.definition, &self.capabilities, self.vision_available);
         self
     }
 
@@ -223,10 +210,15 @@ impl AgentProfile {
         &self.capabilities
     }
 
-    /// Model-visible routing advice plus an authoritative capability summary.
+    /// Role-specific delegation boundary used by the provider-step runtime policy.
+    ///
+    /// Capability availability is deliberately not rendered here. The dispatcher can
+    /// still remove tools after profile resolution, so the final model-visible policy
+    /// is generated only after the provider-step tool snapshot is locked.
     #[must_use]
-    pub fn prompt_policy(&self) -> &str {
-        &self.prompt_policy
+    pub fn delegation_guidance(&self) -> Option<String> {
+        builtin::get(&self.definition.name, self.vision_available)
+            .map(|native| native.prompt_policy())
     }
 }
 
@@ -239,45 +231,4 @@ fn delegation_target_available(target: &str, vision_available: bool) -> bool {
     // validation. Only omit a target known to the native roster and known to be
     // absent solely because its capability gate is closed.
     builtin::get(target, false).is_some() || builtin::get(target, true).is_none()
-}
-
-fn render_prompt_policy(
-    definition: &Agent,
-    capabilities: &CapabilityPolicy,
-    vision_available: bool,
-) -> String {
-    let mut blocks = Vec::new();
-    if let Some(native) = builtin::get(&definition.name, vision_available) {
-        blocks.push(native.prompt_policy());
-    }
-
-    let delegation = if capabilities.can_delegate() {
-        match capabilities.delegation_targets() {
-            Some(targets) => format!("available (targets: {})", targets.join(", ")),
-            None => "available".to_owned(),
-        }
-    } else {
-        "unavailable".to_owned()
-    };
-    blocks.push(format!(
-        "Enforced capability snapshot for this attempt:\n\
-         - delegation: {delegation}\n\
-         - workspace edits: {}\n\
-         - shell: {}\n\
-         - external research: {}\n\
-         The runtime capability snapshot is authoritative when prose and available \
-         tools appear to disagree.",
-        availability(capabilities.can_edit()),
-        availability(capabilities.can_shell()),
-        availability(capabilities.can_research_externally()),
-    ));
-    blocks.join("\n\n")
-}
-
-fn availability(available: bool) -> &'static str {
-    if available {
-        "available"
-    } else {
-        "unavailable"
-    }
 }

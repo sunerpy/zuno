@@ -1,8 +1,9 @@
-Delegate a self-contained unit of work to a subagent in its own session.
-Name exactly one of `subagent_type` (a specific Agent) or `category` (a preset shorthand, which runs the `general` Agent at that preset's model).
-State the goal, success evidence, relevant files or sources, constraints, and explicit in/out-of-scope boundaries. The parent retains integration decisions and final verification.
+Delegate a self-contained unit of work to the named child `agent` in its own session.
+Provide the required typed contract: `objective`, `deliverable`, `instructions`, and `success_evidence`. Use `scope.include`/`scope.exclude`, `constraints.must`/`constraints.must_not`, and `dependencies` when they materially bound or enable the work.
+The child model, reasoning, MCP, Skill configuration, and sandbox inherit from the parent composition and are narrowed by the selected Agent's policy.
+The parent retains integration decisions and final verification. Do not duplicate the delegated work in the parent.
 Foreground is the default and blocks until the child answers; `background: true` returns immediately with a fresh job id.
 Background jobs default to `reportDelivery: "nextStep"`, which adds the terminal report to the parent's next step and wakes it. Use `"quiet"` only when the persisted job result will be inspected separately.
 Pass `task_id` from a previous call to continue that same child session instead of starting a fresh one.
-Skills are not an argument: each agent's permissions already decide which skills it can load.
-Do not delegate work you are simultaneously performing yourself, and do not create overlapping children unless their ownership boundaries are explicit.
+Skills are not task arguments; the child can load only skills exposed by its effective Agent capabilities.
+Do not create overlapping children unless their `scope` ownership is explicit and non-overlapping.

@@ -279,6 +279,7 @@ impl TypedTool for ReadTool {
                 output,
                 metadata,
                 attachments: Vec::new(),
+                continuation: zuno_tool::ToolContinuation::Continue,
             });
         }
 
@@ -316,6 +317,7 @@ impl TypedTool for ReadTool {
             output,
             metadata,
             attachments: Vec::new(),
+            continuation: zuno_tool::ToolContinuation::Continue,
         })
     }
 }
