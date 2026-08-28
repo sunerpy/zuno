@@ -273,10 +273,24 @@ impl Config {
             .map_or(PermissionMode::Standard, |permission| permission.mode)
     }
 
+    /// Resolve the runtime HITL mode after applying the trusted sandbox authority.
+    ///
+    /// `danger-full-access` is the explicit native-shell mode for callers that
+    /// intentionally want unrestricted host execution without approval prompts.
+    /// Authored permission rules remain available and explicit denies still win.
+    #[must_use]
+    pub fn effective_permission_mode(&self) -> PermissionMode {
+        if self.sandbox_mode() == SandboxMode::DangerFullAccess {
+            PermissionMode::AllowAll
+        } else {
+            self.permission_mode()
+        }
+    }
+
     /// Whether side-effecting tool calls require a fresh attached-user decision.
     #[must_use]
     pub fn strict_authorization(&self) -> bool {
-        self.permission_mode() == PermissionMode::Strict
+        self.effective_permission_mode() == PermissionMode::Strict
     }
 }
 

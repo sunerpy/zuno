@@ -79,9 +79,11 @@ Codex demonstrates the value of a focused Rust core, explicit sandbox and approv
 
 Zuno follows Codex's key security split: approval decides whether an intent may
 run, while confinement limits what the process can do. `allow_all` and TUI
-automation therefore do not widen the sandbox, and selecting
-`danger-full-access` does not erase permission denials. Every mode retains one
-process lifecycle and durable authority path.
+automation therefore do not widen a confined sandbox. Zuno's explicit
+`danger-full-access` mode intentionally selects both native host authority and
+effective `allow_all`; it emits no approval prompts but still honors explicit
+permission denies and catastrophic Shell denials. Every mode retains one process
+lifecycle and durable authority path.
 
 Zuno extends the goal idea with cross-turn exponential backoff. Provider retries remain bounded inside one request, while an active goal can schedule another turn indefinitely for typed recoverable failures. Unknown side-effect outcomes are never blindly replayed.
 

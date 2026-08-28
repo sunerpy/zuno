@@ -510,7 +510,7 @@ async fn allow_all_skips_tool_owned_non_manual_gate() {
 }
 
 #[tokio::test]
-async fn allow_all_keeps_tool_owned_manual_gate_interactive() {
+async fn allow_all_skips_tool_owned_manual_gate() {
     let calls = Arc::new(AtomicUsize::new(0));
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = ToolRegistryDispatcher::new(
@@ -534,9 +534,10 @@ async fn allow_all_keeps_tool_owned_manual_gate_interactive() {
         .await;
 
     assert!(!result.is_error, "{}", result.output.output);
-    let asks = approver.asks();
-    assert_eq!(asks.len(), 1);
-    assert!(asks[0].manual);
+    assert!(
+        approver.asks().is_empty(),
+        "allow_all must not surface a manual approval prompt"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 

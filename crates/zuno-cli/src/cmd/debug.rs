@@ -137,10 +137,16 @@ fn permissions(context: &Context) -> Result<(), String> {
         .map(|permission| permission.rules.clone())
         .unwrap_or_default();
     print_json(&serde_json::json!({
-        "mode": context.config.permission_mode(),
+        "configuredMode": context.config.permission_mode(),
+        "mode": context.config.effective_permission_mode(),
         "rules": rules,
         "strictSideEffectsRequireApproval": context.config.strict_authorization(),
-        "allowAllStillEnforces": ["explicit deny", "sandbox", "argument validation"],
+        "allowAllStillEnforces": [
+            "explicit deny",
+            "catastrophic shell denial",
+            "sandbox authority",
+            "argument validation"
+        ],
     }))
 }
 

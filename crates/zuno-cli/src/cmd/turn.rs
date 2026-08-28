@@ -2406,7 +2406,7 @@ impl TurnHost {
                 runtime_tools.tools,
                 runtime_tools.rules,
                 approval,
-                AuthorizationPolicy::from_mode(plan.config.permission_mode()),
+                AuthorizationPolicy::from_mode(plan.config.effective_permission_mode()),
                 McpToolStatus::Ready,
             );
             let council_presets = plan

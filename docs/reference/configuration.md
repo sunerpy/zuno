@@ -518,10 +518,12 @@ the shell and its external-path escalation:
 }
 ```
 
-An explicit `deny` still wins in every mode. `allow_all` bypasses HITL only; it
-does not bypass sandboxing, argument validation, explicit denies, or the shell's
-destructive-command safety gate. Use `zuno debug permissions` and
-`zuno debug config` to inspect the effective policy.
+An explicit `deny` still wins in every mode. `allow_all` suppresses every Zuno
+tool-approval prompt, including confirmable Shell-risk requests; it does not
+bypass sandboxing, argument validation, explicit denies, or catastrophic Shell
+targets that the risk gate rejects directly. Use `zuno debug permissions` to
+inspect both the configured and effective mode, and `zuno debug config` to
+inspect the merged configuration.
 
 ## Strict HITL authorization
 
@@ -555,6 +557,9 @@ are side-effecting by default.
 `shell` always requires strict approval in strict mode, even for a command such
 as `rg`. Approval and confinement are independent: the native OS sandbox still
 compiles the effective read-only or workspace-write policy after admission.
+The explicit `danger-full-access` sandbox mode is the exception by design: it
+sets the effective permission mode to `allow_all`, so an authored `strict` mode
+remains visible in debug output but does not open approval prompts.
 
 The top-level `shell` field chooses the actual interpreter for both terminal and
 model-issued command execution. The command tool resolves an explicit value first,
@@ -592,8 +597,10 @@ The exact modes are:
 - `workspace-write`: the host root is read-only while the active workspace and
   explicitly trusted `writableRoots` are writable. This is the default.
 - `danger-full-access`: run the configured shell directly as the Zuno user, with
-  host filesystem, process, credential, and network access. This mode is explicit
-  and is never selected when a confined backend fails.
+  host filesystem, process, credential, and network access. It also sets the
+  effective permission mode to `allow_all`, suppressing Zuno tool-approval
+  prompts. This mode is explicit and is never selected when a confined backend
+  fails.
 
 An Agent's own capability contract may only narrow that configured maximum. A
 read-only Agent therefore receives `read-only` even when the invocation selected
@@ -636,14 +643,16 @@ uses the native process backend on all supported platforms. See the
 [sandbox FAQ](../faq.md) for the security boundary, Ubuntu AppArmor setup, and
 nested-sandbox diagnosis.
 
-Independently of sandbox mode and strict mode, the shell risk gate requires fresh approval before
-bounded destructive operations or replacing an existing redirect target. New
-static files under the working directory or OS temporary directory are treated
-as creation. An exact, non-recursive `rm -f` of a statically named path that is
-currently absent below the OS temporary directory is treated as no-op cleanup;
-an existing target, recursive removal, dynamic target, or overwrite still
-requires approval. There is no tool argument that lets a model approve its own
-risky call, and an explicit permission deny always wins.
+The Shell risk gate distinguishes confirmable risk from catastrophic denial.
+Bounded destructive operations, dynamic targets, and replacing an existing
+redirect target request fresh approval unless the effective permission mode is
+`allow_all`; under `allow_all` they proceed without a prompt. Catastrophic
+targets are rejected directly in every mode. New static files under the working
+directory or OS temporary directory are treated as creation. An exact,
+non-recursive `rm -f` of a statically named path that is currently absent below
+the OS temporary directory is treated as no-op cleanup. There is no tool
+argument that lets a model approve its own risky call, and an explicit
+permission deny always wins.
 
 ## Skill discovery
 

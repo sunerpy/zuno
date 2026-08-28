@@ -462,8 +462,8 @@ impl RulePermissionAsker {
             RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
                 tool: tool.to_owned(),
             }),
-            _ if self.requires_manual(&ask) => self.prompt_manual(origin, tool, ask).await,
             _ if self.authorization.is_allow_all() => Ok(()),
+            _ if self.requires_manual(&ask) => self.prompt_manual(origin, tool, ask).await,
             RuleOutcome::Permitted => Ok(()),
             RuleOutcome::Pending(_) if plugin == PermissionHookDecision::Allow => Ok(()),
             RuleOutcome::Pending(pending) => self.prompt(origin, tool, ask, pending).await,
@@ -535,8 +535,8 @@ impl PermissionAsker for RulePermissionAsker {
             RuleOutcome::Denied => Err(zuno_error::ToolError::Denied {
                 tool: tool.to_owned(),
             }),
-            _ if self.requires_manual(&ask) => self.prompt_manual(origin, tool, ask).await,
             _ if self.authorization.is_allow_all() => Ok(()),
+            _ if self.requires_manual(&ask) => self.prompt_manual(origin, tool, ask).await,
             RuleOutcome::Permitted => Ok(()),
             RuleOutcome::Pending(pending) => self.prompt(origin, tool, ask, pending).await,
         }

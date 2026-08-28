@@ -261,6 +261,38 @@ fn canonical_permission_modes_keep_ordered_rules_and_allow_all() {
 }
 
 #[test]
+fn danger_full_access_effectively_disables_hitl_prompts() {
+    let danger = parse(
+        r#"{
+            "permission": {"mode": "strict"},
+            "sandbox": {"mode": "danger-full-access"}
+        }"#,
+    )
+    .expect("trusted full access configuration parses");
+
+    assert_eq!(
+        danger.permission_mode(),
+        PermissionMode::Strict,
+        "the authored permission mode remains inspectable"
+    );
+    assert_eq!(
+        danger.effective_permission_mode(),
+        PermissionMode::AllowAll,
+        "danger-full-access is the explicit no-approval execution mode"
+    );
+    assert!(!danger.strict_authorization());
+
+    let confined = parse(
+        r#"{
+            "permission": {"mode": "strict"},
+            "sandbox": {"mode": "workspace-write"}
+        }"#,
+    )
+    .expect("confined strict configuration parses");
+    assert_eq!(confined.effective_permission_mode(), PermissionMode::Strict);
+}
+
+#[test]
 fn compaction_threshold_percent_is_typed_and_bounded() {
     let config = parse(r#"{"compaction":{"auto":true,"threshold_percent":80}}"#)
         .expect("bounded compaction threshold parses");

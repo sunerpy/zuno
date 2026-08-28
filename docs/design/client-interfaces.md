@@ -83,8 +83,8 @@ The TUI favors dense, keyboard-first operation:
   synthetic answer;
 - visible permission, retry, diagnostics, and background-job states. TUI presentation
   settings live in `tui.json`; authorization remains a runtime concern in the main
-  `zuno.json` `permission` block. `mode: allow_all` skips non-manual human-in-the-loop
-  asks, while explicit denies and tool-declared manual gates remain authoritative.
+  `zuno.json` `permission` block. `mode: allow_all` skips every Zuno tool-approval
+  ask, while explicit denies and catastrophic Shell denials remain authoritative.
   Root and child asks share one foreground queue, but every request retains its trusted
   session, assistant-message, and tool-call origin. Closing the attached TUI refuses
   outstanding asks, and an `Always` grant is scoped to the originating session;

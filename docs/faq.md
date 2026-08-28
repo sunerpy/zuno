@@ -35,14 +35,19 @@ The Linux backend:
   syscalls when network access is denied.
 
 An Agent contract may narrow the configured mode. A read-only Agent therefore
-has no host writable root even when the invocation selected a wider mode.
+has no writable host root even when the invocation selected a wider mode.
 Write-capable Agents receive workspace write authority only under
 `workspace-write`; Git metadata remains protected unless the specific command
 passes the separate Git mutation authorization.
 
-`permission.mode: "allow_all"` and TUI `--auto` skip eligible HITL prompts; they
-do not change sandbox mode. Conversely, `danger-full-access` does not bypass an
-explicit permission deny or the destructive-command approval gate.
+`permission.mode: "allow_all"` skips every Zuno tool-approval prompt without
+changing sandbox mode. TUI `--auto` remains narrower and cannot satisfy a
+human-only request. Selecting `danger-full-access` intentionally combines native
+host execution with an effective permission mode of `allow_all`, so Zuno does
+not open approval cards in TUI, ACP, server, or headless surfaces. Explicit
+permission denies and the Shell risk gate's catastrophic hard denials remain
+terminal; they fail directly instead of asking. Structured user questions are
+not approvals and may still be shown.
 
 Confined macOS and Windows modes currently return a typed unsupported-platform
 error and do not register Shell. Explicit `danger-full-access` remains available

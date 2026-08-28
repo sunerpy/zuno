@@ -61,6 +61,13 @@ fn strict_config(base_url: &str) -> String {
     serde_json::to_string(&config).expect("encode strict test config")
 }
 
+fn danger_full_access_config(base_url: &str) -> String {
+    let mut config: Value =
+        serde_json::from_str(&strict_config(base_url)).expect("strict test config JSON");
+    config["sandbox"] = json!({"mode":"danger-full-access"});
+    serde_json::to_string(&config).expect("encode danger-full-access test config")
+}
+
 fn config_with_remote_mcp(mcp_url: &str, provider_url: &str) -> String {
     let mut config: Value =
         serde_json::from_str(&config_with_second_model(provider_url)).expect("test config JSON");
@@ -2071,6 +2078,78 @@ async fn acp_write_round_trips_strict_permission_and_native_creation_diff() {
             .read_to_string(&mut stderr)
             .expect("read ACP stderr");
         panic!("ACP write process failed: {stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_danger_full_access_emits_no_tool_approval_request() {
+    let root = tempfile::tempdir().expect("ACP test root");
+    let target = root.path().join("created-without-approval.txt");
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(WriteTurnResponder {
+            path: target.to_string_lossy().into_owned(),
+        })
+        .mount(&provider)
+        .await;
+    let config = danger_full_access_config(&provider.uri());
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({"protocolVersion": 1}),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let session_id = created["sessionId"].as_str().expect("session id");
+    let (completed, _updates, permissions) = request_with_permissions(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type":"text","text":"Create the requested file."}]
+        }),
+    );
+
+    assert_eq!(completed["stopReason"], "end_turn");
+    assert!(
+        permissions.is_empty(),
+        "danger-full-access must not emit ACP approval requests: {permissions:#?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("created file"),
+        "created through ACP\n"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP process failed: {stderr}");
     }
 }
 

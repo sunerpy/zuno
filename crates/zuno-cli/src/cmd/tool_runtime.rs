@@ -498,7 +498,7 @@ fn sandbox_policy(
             )
             .map_err(to_string)?;
     }
-    let mode = match config.permission_mode() {
+    let mode = match config.effective_permission_mode() {
         PermissionMode::Standard => "standard",
         PermissionMode::Strict => "strict",
         PermissionMode::AllowAll => "allow_all",

@@ -605,20 +605,23 @@ when a normal rule or plugin says allow. The ask cannot be satisfied by a standi
 grant or automatic approval and offers no "always" choice. TUI `--auto` yields to
 the human broker; headless surfaces deny the call. Approval covers the same
 tool's internal resource checks for that invocation only, while a later explicit
-resource deny still wins.
+resource deny still wins. Explicit `danger-full-access` changes the effective
+permission mode to `allow_all`; in that trusted native-execution mode no Zuno
+approval request is emitted, even if the authored permission mode is `strict`.
 
 The shell's destructive-command gate is independent of strict mode. A protected
 target is denied, while a bounded deletion, a dynamic destructive target, or a
 redirect that would replace an existing path marks the ordinary `shell`
-permission request as human-only. Permission rules still evaluate first, so an
-explicit deny remains terminal; a model-authored argument cannot approve its own
-operation. A new static redirect target inside the working directory or the OS
-temporary directory is creation rather than overwrite and does not receive this
-extra risk prompt. An exact, non-recursive forced removal of a statically named
-path that is currently absent below the OS temporary directory is likewise a
-no-op cleanup; existing targets, recursive removal, and dynamic targets remain
-human-only. This filesystem probe is advisory risk classification; actual
-confinement comes from the separately selected sandbox mode and backend.
+permission request as human-only. Effective `allow_all` suppresses that
+confirmable request, while the gate's catastrophic outcome remains a direct
+denial. Permission rules still evaluate first, so an explicit deny remains
+terminal; a model-authored argument cannot approve its own operation. A new
+static redirect target inside the working directory or the OS temporary
+directory is creation rather than overwrite and does not receive this extra risk
+prompt. An exact, non-recursive forced removal of a statically named path that is
+currently absent below the OS temporary directory is likewise a no-op cleanup.
+This filesystem probe is advisory risk classification; actual confinement comes
+from the separately selected sandbox mode and backend.
 
 Refusal is a typed lifecycle outcome rather than an execution failure.
 Malformed or unsafe arguments, unavailable tools, and permission denials emit
@@ -716,17 +719,27 @@ ripgrep is a startup error for the tool runtime, never a silent fallback.
 The Shell tool is admitted through tree-sitter command analysis, the deterministic
 destructive-command gate, and permission checks, then compiled by the selected
 sandbox backend before process-tree containment starts. Existing redirect targets and other confirmable destructive
-operations require a fresh attached-user decision; static creation under the
-working directory or OS temporary directory and exact non-recursive `rm -f`
-cleanup of an absent OS-temporary path do not. Strict authorization adds HITL to
-every side-effecting shell call; neither mechanism adds confinement.
+operations require a fresh attached-user decision unless the effective
+permission mode is `allow_all`; catastrophic targets remain hard-denied. Static
+creation under the working directory or OS temporary directory and exact
+non-recursive `rm -f` cleanup of an absent OS-temporary path do not require a
+decision. Strict authorization adds HITL to every side-effecting shell call;
+neither mechanism adds confinement.
 
 `config.shell` is passed into the same resolver used by non-interactive command
 execution. Selection is explicit configuration, then the operating-system account
 shell, then inherited `SHELL`, then the platform fallback. An invalid explicit value
-is a configuration error rather than a silent fallback. Durable tool output records
-the resolved interpreter name, so clients render `zsh cargo test` or `pwsh ...`
-instead of presenting the provider-facing `shell` wire id as the executable.
+is a configuration error rather than a silent fallback.
+
+The submitted command and the interpreter identity remain separate throughout the
+runtime. Durable tool-output titles contain the exact command text, such as
+`git diff --check`, so a client can display or copy it without inventing a different
+invocation. The resolved interpreter remains available as typed `shell` metadata
+(`zsh`, `pwsh`, and so on), and ACP publishes it as
+`_meta.zuno.interpreter`. POSIX execution still invokes the resolved executable with
+`-lc`; PowerShell uses its non-interactive `-Command` form. A client must not flatten
+that relationship into `zsh git diff --check`: that text is neither the submitted
+command nor an argv-equivalent representation of `zsh -lc 'git diff --check'`.
 
 Terminal selection and model-command admission intentionally diverge after path
 resolution. A PTY may start any executable login shell. A model command may start only
@@ -750,9 +763,12 @@ maximum, so a read-only Agent remains read-only under a wider invocation.
 `read-only` and `workspace-write` require a proved OS backend. Unavailable
 backends fail tool assembly without publishing a Shell definition; they never
 fall back to native execution. `danger-full-access` is an explicit native backend
-that retains host filesystem, process, credential, and network authority. It
-still produces a `PreparedCommand`, persists authority schema version 2, and
-uses the same cancellation, background, log, usage, and lifecycle paths.
+that retains host filesystem, process, credential, and network authority and
+sets the effective permission mode to `allow_all`. It emits no Zuno approval
+requests, while explicit permission denies and catastrophic Shell denials remain
+terminal. It still produces a `PreparedCommand`, persists authority schema
+version 2, and uses the same cancellation, background, log, usage, and lifecycle
+paths.
 
 Confined macOS and Windows modes currently fail closed as unsupported, while
 explicit `danger-full-access` remains available. Tool output and durable
