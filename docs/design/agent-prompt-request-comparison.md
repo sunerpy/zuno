@@ -154,9 +154,17 @@ searchable coverage without recreating the earlier “skills did not fit” fail
 Zuno loads only native instruction locations implicitly:
 
 1. `$XDG_CONFIG_HOME/zuno/AGENTS.md`;
-2. project directories from the worktree root to the current directory;
-3. in one directory, `AGENTS.local.md` replaces `AGENTS.md`;
-4. nearer project files are appended later and therefore have higher priority.
+2. `ZUNO_CONFIG_DIR/AGENTS.md`, when that profile supplies one;
+3. project directories from the worktree root to the current directory;
+4. in one directory, `AGENTS.local.md` replaces `AGENTS.md`;
+5. nearer project files are appended later and therefore have higher priority.
+
+The profile layer never hides the base global file. On the first ordinary
+configuration discovery, Zuno materializes an original starter global
+`AGENTS.md` only when the file is absent; existing user content is never
+rewritten. The starter keeps durable cross-project rules concise and delegates
+detailed Git and worktree procedure to the built-in `git-workflow` and
+`worktree` Skills.
 
 `CLAUDE.md`, OpenCode directories, and other products' global instruction files
 are never implicit fallbacks. Explicit `instructions[]` entries remain
@@ -345,11 +353,15 @@ For Responses Lite, Codex moves base instructions into a separate developer
 message and places additional tool definitions in `input`; the ordinary
 Responses path uses top-level `instructions` and `tools`.
 
-Codex discovers guidance by reading global `AGENTS.override.md` or `AGENTS.md`,
-then walking from project root to cwd and choosing at most one override,
-standard, or configured fallback file per directory. It concatenates root to
-leaf within a default 32 KiB budget. See
-[How Codex discovers guidance](https://learn.chatgpt.com/docs/agent-configuration/agents-md#how-codex-discovers-guidance).
+Codex's documented customization surface includes a user-maintained global
+`AGENTS.override.md` or `AGENTS.md`, followed by project guidance from root to
+cwd. Its public worktree documentation describes product-managed isolated
+checkouts, while reusable procedures belong in Skills. These public contracts
+are design inputs; Codex's private product/system instructions are neither a
+portable global file nor copied into Zuno. See
+[AGENTS.md guidance](https://developers.openai.com/codex/guides/agents-md),
+[customization](https://developers.openai.com/codex/concepts/customization/),
+and [worktrees](https://developers.openai.com/codex/app/worktrees/).
 
 Structured skill selections and text mentions are resolved separately. Plain
 names only match when unambiguous; canonical and logical discovery paths are
@@ -437,8 +449,10 @@ Disposition of the historical recommendations:
 2. **Completed:** preserve base instructions, developer policy, project
    guidance, selected Skill bodies, and the actual user message as typed items
    until provider encoding instead of flattening them all into `system`.
-3. **Completed:** use a Zuno-owned global `AGENTS.md`; another product's
-   instruction file requires an explicit `instructions[]` entry.
+3. **Completed:** create a missing Zuno-owned starter global `AGENTS.md`
+   without overwriting user content, keep it active across
+   `ZUNO_CONFIG_DIR` profiles, and require an explicit `instructions[]` entry
+   for another product's instruction file.
 4. **Completed:** reduce initial catalog weight while keeping source identities
    and complete search/list escalation.
 5. **Completed with native syntax:** `zuno debug prompt [session] [turn]`

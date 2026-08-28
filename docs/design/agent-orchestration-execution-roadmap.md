@@ -529,8 +529,8 @@ After the named-capability registry exists, external packages may contribute
 descriptors through a transactional capability generation. Raw provider
 objects, credentials, database handles, or `HarnessRuntime` are never exposed.
 
-Implementation checkpoint (2026-08-26): the static
-`zuno-orchestration` crate is data-only and contributes the eight Skill
+Implementation checkpoint (2026-08-28): the static
+`zuno-orchestration` crate is data-only and contributes the nine Skill
 descriptors below, including stable source ids, hashes, profile/tool gates, and
 license provenance. It deliberately owns no scheduler, provider, permission,
 session, or lifecycle service. The native profile composition root publishes
@@ -550,13 +550,15 @@ The first orchestration pack should adapt, not copy, these workflow ideas:
 | `verification-planning` | define evidence, commands, fixtures, and acceptance surfaces before implementation |
 | `reflect` | use a typed, redacted, bounded session-query API and propose reviewable memory candidates |
 | `customize-zuno` | explain native configuration, providers, auth, permissions, agents, workflows, Skills, MCP, and plugins |
-| `worktree` | perform read-only preflight now; request a lifecycle-owned lease only after the quota, provenance, status, and cleanup service lands |
+| `develop-zuno` | route a Zuno customization to configuration, Agent Markdown, a user-owned Skill or command, an extension package, or a native component |
+| `worktree` | guide explicit user-authorized worktree creation, isolated work, integration, and conservative cleanup without pretending to own leases or Shell authority |
 | `git-workflow` | preserve user changes, scope commits, inspect history when needed, and verify the staged diff |
 | `ui-design` | align with the existing design system, separate visual observation from implementation, and require real runtime visual evidence |
 
 `git-workflow` is the adapted Zuno name for the useful portion of OMO's
-`git-master` guidance. Worktree lifecycle remains a runtime service rather than
-being hidden in Git prompt prose.
+`git-master` guidance. The `worktree` Skill may guide ordinary user-authorized
+Git operations, but product-owned leases, quotas, and automatic cleanup still
+require a runtime lifecycle service rather than hidden prompt prose.
 
 `dual-review` and `auto-release` are deliberately not built in. The named workflow's
 reviewer topology, release gates, remote authority, artifact targets, and rollback

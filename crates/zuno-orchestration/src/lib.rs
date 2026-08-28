@@ -24,7 +24,7 @@ pub const PACK_ID: &str = "zuno-orchestration";
 pub const PACK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Zuno source revision against which the embedded capability requirements were reviewed.
-pub const CAPABILITY_REVIEW_REVISION: &str = "zuno@ef709e571d40c2cd9fbf12ad5e4c6de81cd498d9";
+pub const CAPABILITY_REVIEW_REVISION: &str = "zuno@eb177e833035ea36aa8c37156d2c131acaaaebac";
 
 /// License review shared by the original first-party resources.
 pub const LICENSE_REVIEW: &str =
@@ -237,13 +237,13 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
     },
     BuiltinSkillDescriptor {
         name: "worktree",
-        description: "Perform read-only worktree preflight checks; the current pack does not create, lease, or clean worktrees.",
+        description: "Safely inspect, create, use, integrate, and clean up user-authorized Git worktrees without claiming runtime-owned leases.",
         content: include_str!("skills/worktree.md"),
         source_id: "zuno-orchestration:skill/worktree@0.1.0",
         location: "builtin://zuno-orchestration/0.1.0/worktree",
         allowed_profiles: MUTATING_WORK_PROFILES,
         required_tools: &["read", "shell"],
-        content_sha256: "fdba7050f32ecb96db4f13fad719896db3b8c5e71d0faaed23022889066d000f",
+        content_sha256: "ba3d1c403aff203b8b88789d30fbc3869ac43a090703c0de74c0339cb40b60f1",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {

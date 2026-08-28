@@ -81,7 +81,7 @@ fn project_aware_options_keep_ancestor_config_visible_outside_git() {
 }
 
 #[test]
-fn an_empty_zuno_root_gets_an_empty_native_file() {
+fn an_empty_zuno_root_gets_native_config_and_global_instructions() {
     let temp = tempfile::tempdir().expect("tempdir");
     let project = temp.path().join("project");
 
@@ -89,11 +89,35 @@ fn an_empty_zuno_root_gets_an_empty_native_file() {
         .expect("a genuinely fresh install gets a default config");
 
     let generated = temp.path().join("xdg-config/zuno/zuno.json");
+    let generated_instructions = temp.path().join("xdg-config/zuno/AGENTS.md");
     assert_eq!(config.schema, None);
     assert!(generated.is_file());
     assert_eq!(
         fs::read_to_string(generated).expect("read generated config"),
         "{}\n"
+    );
+    let instructions =
+        fs::read_to_string(&generated_instructions).expect("read generated global instructions");
+    assert!(generated_instructions.is_file());
+    assert!(instructions.contains("# Zuno global working rules"));
+    assert!(instructions.contains("`git-workflow`"));
+    assert!(instructions.contains("`worktree`"));
+    assert!(instructions.contains("Never remove a dirty worktree"));
+}
+
+#[test]
+fn an_existing_global_agents_file_is_never_overwritten() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let agents = temp.path().join("xdg-config/zuno/AGENTS.md");
+    write(&agents, "user-owned global rules\n");
+
+    discover_with(&fixture_options(temp.path(), &project, std::iter::empty()))
+        .expect("existing global instructions remain usable");
+
+    assert_eq!(
+        fs::read_to_string(agents).expect("read preserved instructions"),
+        "user-owned global rules\n"
     );
 }
 

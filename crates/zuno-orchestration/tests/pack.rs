@@ -190,19 +190,20 @@ fn bodies_are_nonempty_original_guidance_without_authority_claims() {
 }
 
 #[test]
-fn worktree_skill_is_explicitly_preflight_only() {
+fn worktree_skill_guides_only_authorized_and_safe_lifecycle_operations() {
     let worktree = skill("worktree").expect("worktree descriptor");
     assert!(
         worktree
             .content
-            .contains("This Skill performs preflight checks only.")
+            .contains("the user's request explicitly authorizes")
     );
-    assert!(worktree.content.contains("without creating either"));
-    assert!(worktree.content.contains("Do not run `git worktree add`"));
+    assert!(worktree.content.contains("`git worktree list --porcelain`"));
+    assert!(worktree.content.contains("`git worktree add`"));
+    assert!(worktree.content.contains("Never remove a dirty worktree"));
     assert!(
         worktree
             .content
-            .contains("or claim that Zuno will clean them up")
+            .contains("does not own leases, quotas, or automatic cleanup")
     );
 }
 

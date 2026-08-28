@@ -8,6 +8,7 @@
 //! entries first, appends source entries, and removes later duplicates.
 
 use crate::Config;
+use crate::instructions::{DEFAULT_GLOBAL_INSTRUCTIONS, GLOBAL_INSTRUCTION_FILENAME};
 use crate::schema::JsonMap;
 use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -16,6 +17,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use zuno_error::{ConfigError, ConfigIssue};
 use zuno_paths::project::ResolvedProject;
@@ -191,7 +194,7 @@ pub fn discover(directory: &Path, worktree: Option<&Path>) -> Result<Config, Con
 /// Returns [`ConfigError`] for the first existing layer that cannot be read,
 /// parsed, or validated.
 pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> {
-    ensure_default_global_config(options)?;
+    ensure_default_global_files(options)?;
     let mut result = RawJson::empty_object();
 
     // Each file is one layer, so list-like values retain their per-layer merge
@@ -350,7 +353,7 @@ pub fn read_config_directories(
         .collect()
 }
 
-fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), ConfigError> {
+fn ensure_default_global_files(options: &DiscoveryOptions) -> Result<(), ConfigError> {
     if [
         ZUNO_CONFIG,
         zuno_paths::env::ZUNO_CONFIG_DIR,
@@ -362,17 +365,27 @@ fn ensure_default_global_config(options: &DiscoveryOptions) -> Result<(), Config
         return Ok(());
     }
 
-    let candidates = Layout::file_in_directory(options.layout.config(), CONFIG_FILE_STEM);
-    if candidates.iter().any(|path| path.exists()) {
-        return Ok(());
-    }
+    let instructions = options.layout.config().join(GLOBAL_INSTRUCTION_FILENAME);
+    create_default_file(&instructions, DEFAULT_GLOBAL_INSTRUCTIONS);
 
-    let path = &candidates[0];
+    let candidates = Layout::file_in_directory(options.layout.config(), CONFIG_FILE_STEM);
+    if !candidates.iter().any(|path| path.exists()) {
+        create_default_file(&candidates[0], "{}\n");
+    }
+    Ok(())
+}
+
+fn create_default_file(path: &Path, contents: &str) {
+    if path.exists() {
+        return;
+    }
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(path, "{}\n");
-    Ok(())
+    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(path) else {
+        return;
+    };
+    let _ = file.write_all(contents.as_bytes());
 }
 
 fn merge_file(

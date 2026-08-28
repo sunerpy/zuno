@@ -57,6 +57,9 @@ pub const INSTRUCTION_FILENAMES: [&str; 2] = ["AGENTS.local.md", "AGENTS.md"];
 /// The filename probed inside the global config directory.
 pub const GLOBAL_INSTRUCTION_FILENAME: &str = "AGENTS.md";
 
+/// Zuno-owned starter guidance materialized only when the global file is absent.
+pub const DEFAULT_GLOBAL_INSTRUCTIONS: &str = include_str!("default-agents.md");
+
 /// The header the oracle puts above every instruction body (`instruction.ts:162`).
 const HEADER: &str = "Instructions from: ";
 
@@ -234,11 +237,19 @@ impl InstructionOptions {
     }
 
     fn global_files(&self) -> Vec<PathBuf> {
-        vec![
-            self.layout
-                .effective_config()
-                .join(GLOBAL_INSTRUCTION_FILENAME),
-        ]
+        let base = self.layout.config().join(GLOBAL_INSTRUCTION_FILENAME);
+        let mut files = vec![base.clone()];
+        if let Some(override_dir) = self
+            .layout
+            .config_dir_override()
+            .filter(|value| !value.is_empty())
+        {
+            let profile = PathBuf::from(override_dir).join(GLOBAL_INSTRUCTION_FILENAME);
+            if profile != base {
+                files.push(profile);
+            }
+        }
+        files
     }
 }
 
@@ -289,7 +300,6 @@ impl Instructions {
         for file in options.global_files() {
             if file.exists() {
                 paths.insert(&file, Origin::Global);
-                break;
             }
         }
 
@@ -747,7 +757,7 @@ fn transport_or_timeout(error: reqwest::Error) -> WarningKind {
 mod tests {
     use super::*;
     use std::fs;
-    use zuno_paths::env::{HOME, XDG_CONFIG_HOME};
+    use zuno_paths::env::{HOME, XDG_CONFIG_HOME, ZUNO_CONFIG_DIR};
 
     fn env_for(root: &Path) -> Env {
         Env::empty()
@@ -802,10 +812,8 @@ mod tests {
         assert_eq!(options.global_files().len(), 1);
     }
 
-    /// Only one global file is ever loaded: the loop `break`s at the first hit
-    /// (`instruction.ts:115-120`).
     #[test]
-    fn the_global_probe_stops_at_the_first_hit() {
+    fn the_global_probe_is_zuno_only() {
         let root = tempfile::tempdir().expect("tempdir");
         let config_agents = root.path().join("home/.config/zuno/AGENTS.md");
         write(&config_agents, "global agents");
@@ -824,6 +832,54 @@ mod tests {
             .collect();
         assert_eq!(globals.len(), 1);
         assert_eq!(globals[0].path(), resolve(&config_agents));
+    }
+
+    #[test]
+    fn a_profile_appends_rules_without_hiding_the_base_global_agents() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base_agents = root.path().join("home/.config/zuno/AGENTS.md");
+        let profile = root.path().join("profile");
+        let profile_agents = profile.join("AGENTS.md");
+        write(&base_agents, "base global agents");
+        write(&profile_agents, "profile agents");
+        fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
+        let env =
+            env_for(root.path()).with(ZUNO_CONFIG_DIR, profile.to_string_lossy().into_owned());
+        let options =
+            InstructionOptions::new(root.path().join("repo"), None::<PathBuf>, &env, Vec::new());
+
+        let found = Instructions::discover(&options);
+        let globals: Vec<_> = found
+            .paths()
+            .iter()
+            .filter(|entry| entry.origin() == Origin::Global)
+            .collect();
+        assert_eq!(globals.len(), 2);
+        assert_eq!(globals[0].path(), resolve(&base_agents));
+        assert_eq!(globals[1].path(), resolve(&profile_agents));
+    }
+
+    #[test]
+    fn a_profile_without_agents_keeps_the_base_global_agents() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let base_agents = root.path().join("home/.config/zuno/AGENTS.md");
+        let profile = root.path().join("profile");
+        write(&base_agents, "base global agents");
+        fs::create_dir_all(&profile).expect("mkdir profile");
+        fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
+        let env =
+            env_for(root.path()).with(ZUNO_CONFIG_DIR, profile.to_string_lossy().into_owned());
+        let options =
+            InstructionOptions::new(root.path().join("repo"), None::<PathBuf>, &env, Vec::new());
+
+        let found = Instructions::discover(&options);
+        let globals: Vec<_> = found
+            .paths()
+            .iter()
+            .filter(|entry| entry.origin() == Origin::Global)
+            .collect();
+        assert_eq!(globals.len(), 1);
+        assert_eq!(globals[0].path(), resolve(&base_agents));
     }
 
     #[test]
