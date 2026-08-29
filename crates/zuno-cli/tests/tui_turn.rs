@@ -78,6 +78,17 @@ const VIEWPORT_ROWS: u16 = 40;
 /// Viewport columns. See [`REPLY_FRAGMENT`] for why the width still matters.
 const VIEWPORT_COLUMNS: u16 = 120;
 
+/// Screen size for the parallel-delegation test.
+///
+/// Larger than [`VIEWPORT_ROWS`] and [`VIEWPORT_COLUMNS`] on purpose: that test
+/// asserts on the Agents sidebar, which is only rendered once the terminal is wide
+/// enough to place it beside the transcript. These feed both the `stty` call and
+/// [`visible_screen`], so the reconstructed grid cannot drift from the real
+/// terminal — a mismatch there would silently move every row and make the content
+/// assertions meaningless rather than failing outright.
+const PARALLEL_ROWS: usize = 48;
+const PARALLEL_COLS: usize = 180;
+
 const PICKER_FIRST_ID: &str = "ses_picker_first";
 const PICKER_SECOND_ID: &str = "ses_picker_second";
 const PICKER_THIRD_ID: &str = "ses_picker_third";
@@ -529,13 +540,112 @@ fn run_under_pty(
 #[derive(Debug)]
 struct ParallelDelegationTranscript {
     text: String,
-    saw_two_running_agents: bool,
+    saw_both_children_in_sidebar: bool,
     entered_child_surface: bool,
     submitted_child_message: bool,
     provider_received_child_message: bool,
     child_reply_visible: bool,
     returned_to_parent: bool,
     all_observed_before_child_completion: bool,
+}
+
+/// Replay a PTY byte stream onto a character grid and return the visible rows.
+///
+/// WHY A SCREEN MODEL AND NOT `text.contains(..)`
+///
+/// ratatui repaints only the cells that changed. A sidebar summary that reads
+/// `2 running` on screen therefore need never appear as those bytes in sequence: on
+/// CI run 33240681387 the stream carried `1 pending … 1 running`, then the update
+/// `[7;158H2[7;160Hru[7;163Hn`, because `ning` was already on screen from the
+/// previous paint and was not rewritten. A substring check against the raw stream
+/// cannot see that, and stripping the escapes does not help either — the spacing
+/// lives in the cursor jumps, so the fragments concatenate to `2run`.
+///
+/// Only two sequence classes need interpreting to reconstruct the text: `CSI H`
+/// moves the cursor, and `CSI m` sets colour and changes nothing textual. Measured
+/// over that run's full transcript, those are the only two that occur (583 `H`,
+/// 2668 `m`). Everything else is a printable character written at the cursor.
+///
+/// This is deliberately not a terminal emulator. It has no scrolling, no wrapping
+/// and no erase handling, because the assertion it serves only needs the current
+/// contents of a fixed 48x180 screen that the test itself sized with `stty`.
+fn visible_screen(stream: &str, rows: usize, cols: usize) -> Vec<String> {
+    let mut grid = vec![vec![' '; cols]; rows];
+    let (mut row, mut col) = (0usize, 0usize);
+    let mut chars = stream.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            match ch {
+                '\n' => {
+                    row = row.saturating_add(1).min(rows - 1);
+                    col = 0;
+                }
+                '\r' => col = 0,
+                _ => {
+                    if row < rows && col < cols {
+                        grid[row][col] = ch;
+                    }
+                    col += 1;
+                }
+            }
+            continue;
+        }
+
+        // Consume `CSI <params> <final>`; anything else is skipped as a two-byte
+        // escape, which is enough for the sequences this stream contains.
+        if chars.peek() != Some(&'[') {
+            chars.next();
+            continue;
+        }
+        chars.next();
+        let mut params = String::new();
+        let mut final_byte = None;
+        while let Some(&next) = chars.peek() {
+            chars.next();
+            if next.is_ascii_alphabetic() {
+                final_byte = Some(next);
+                break;
+            }
+            params.push(next);
+        }
+        // `H` is 1-based and defaults to the origin when a field is empty.
+        if final_byte == Some('H') {
+            let mut parts = params.split(';');
+            let r: usize = parts.next().unwrap_or("").parse().unwrap_or(1);
+            let c: usize = parts.next().unwrap_or("").parse().unwrap_or(1);
+            row = r.saturating_sub(1).min(rows - 1);
+            col = c.saturating_sub(1).min(cols - 1);
+        }
+    }
+
+    grid.into_iter().map(|r| r.into_iter().collect()).collect()
+}
+
+/// True once the Agents sidebar has both delegated children in its summary.
+///
+/// WHY `2 total` AND NOT `2 running`
+///
+/// `2 running` is a state the UI need never render. The summary is built in
+/// `zuno-tui/src/views/ambient.rs` as either `{running} running · {total} total` or
+/// `{pending} pending · {running} running · {total} total`, so a running count of two
+/// requires both children to be executing in the SAME frame. Locally that window
+/// exists; on a loaded runner the first child completes before the second starts, and
+/// CI run 33240681387 shows the sidebar going straight from `1 pending · 1 running`
+/// to `0 running · 2 total` — it never displayed `2 running` at all. The original
+/// assertion was waiting for a frame that the scheduler is not obliged to produce.
+///
+/// The total is the invariant: both children are registered as agents regardless of
+/// how their execution interleaves. Paired with the two distinct sidebar rows below
+/// and the two observed provider requests, it establishes exactly what this test
+/// needs before it presses Ctrl+X — that the sidebar is showing both real children.
+fn summary_shows_both_children(stream: &str) -> bool {
+    visible_screen(stream, PARALLEL_ROWS, PARALLEL_COLS)
+        .iter()
+        .any(|line| {
+            line.match_indices("2 total")
+                .any(|(at, _)| at == 0 || !line.as_bytes()[at - 1].is_ascii_digit())
+        })
 }
 
 fn run_parallel_delegation_under_pty(
@@ -547,7 +657,7 @@ fn run_parallel_delegation_under_pty(
         std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
     })?;
     let command = format!(
-        "stty rows 48 cols 180; {} --model {MODEL} --auto --prompt {}",
+        "stty rows {PARALLEL_ROWS} cols {PARALLEL_COLS}; {} --model {MODEL} --auto --prompt {}",
         shell_quote(&binary().to_string_lossy()),
         shell_quote(PARALLEL_PARENT_PROMPT),
     );
@@ -588,7 +698,7 @@ fn run_parallel_delegation_under_pty(
     let mut first_description_count = 0;
     let mut second_description_count = 0;
     let mut parent_prompt_count = 0;
-    let mut saw_two_running_agents = false;
+    let mut saw_both_children_in_sidebar = false;
     let mut entered_child_surface = false;
     let mut provider_received_child_message = false;
     let mut child_reply_visible = false;
@@ -604,18 +714,18 @@ fn run_parallel_delegation_under_pty(
 
         if !leader_sent
             && provider.children_started() == 2
-            // Ratatui's diff renderer may insert cursor-positioning CSI sequences
-            // between the summary's later spans. `2 running` is one span and remains
-            // contiguous in the real PTY byte stream; the two provider requests and
-            // the two distinct descriptions prove which two rows it summarizes.
-            && text.contains("2 running")
+            // Checked against the reconstructed screen, NOT the byte stream, and on
+            // the agent TOTAL rather than a running count. See
+            // [`summary_shows_both_children`] for why a running count of two is a frame
+            // the scheduler need never produce.
+            && summary_shows_both_children(&text)
             // The fixed-width Agents sidebar intentionally ellipsizes objectives.
             // Waiting for the complete strings would defer this keypress until the
             // completed tool summary renders them in the main transcript.
             && text.contains(FIRST_CHILD_SIDEBAR_PREFIX)
             && text.contains(SECOND_CHILD_SIDEBAR_PREFIX)
         {
-            saw_two_running_agents = true;
+            saw_both_children_in_sidebar = true;
             all_observed_before_child_completion &= provider.children_cannot_have_completed();
             first_description_count = text.matches(FIRST_CHILD_DESCRIPTION).count();
             second_description_count = text.matches(SECOND_CHILD_DESCRIPTION).count();
@@ -680,7 +790,7 @@ fn run_parallel_delegation_under_pty(
     let _ = child.wait();
     Ok(ParallelDelegationTranscript {
         text,
-        saw_two_running_agents,
+        saw_both_children_in_sidebar,
         entered_child_surface,
         submitted_child_message: child_message_sent,
         provider_received_child_message,
@@ -1564,8 +1674,8 @@ async fn parallel_foreground_children_remain_live_and_navigable_in_the_real_tui(
         transcript.text
     );
     assert!(
-        transcript.saw_two_running_agents,
-        "the real TUI did not refresh its Agents sidebar with two running foreground children\n\
+        transcript.saw_both_children_in_sidebar,
+        "the real TUI did not refresh its Agents sidebar with both foreground children\n\
          transcript:\n{}",
         transcript.text
     );

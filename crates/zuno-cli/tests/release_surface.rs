@@ -1174,10 +1174,22 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
     }
 
     // Narrowing the scan above to `build` is only safe while the one job still
-    // allowed to reach apt uses it for the artifact's own runtime dependency. A
-    // toolchain package appearing here would be the same mistake wearing a
-    // different job name.
+    // allowed to install packages uses that only for the artifact's own runtime
+    // dependency. A toolchain package appearing here would be the same mistake
+    // wearing a different job name.
+    //
+    // Every package manager the workflow can reach is checked, not just apt. The
+    // two Linux legs run different distributions — Ubuntu for x86_64, Amazon Linux
+    // for the `image:arm-3.0` aarch64 route — so the install step branches, and a
+    // guard that only understood apt would have silently stopped covering half the
+    // matrix the moment that branch was added.
     const SANDBOX_PACKAGE: &str = "bubblewrap";
+    const INSTALL_VERBS: &[&str] = &[
+        "apt-get install",
+        "apt install",
+        "dnf install",
+        "yum install",
+    ];
     for line in job_body(&text, "smoke") {
         let code = line
             .split('#')
@@ -1188,10 +1200,9 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
         // accepting its presence as justification is what made an earlier version of
         // this assertion vacuous: the injected `apt-get update && apt-get install
         // musl-tools` satisfied it on the update half alone.
-        let Some(installed) = code
-            .split_once("apt-get install")
-            .or_else(|| code.split_once("apt install"))
-            .map(|(_, rest)| rest)
+        let Some(installed) = INSTALL_VERBS
+            .iter()
+            .find_map(|verb| code.split_once(verb).map(|(_, rest)| rest))
         else {
             continue;
         };
@@ -1201,7 +1212,7 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
             .collect();
         assert!(
             !packages.is_empty() && packages.iter().all(|pkg| *pkg == SANDBOX_PACKAGE),
-            "release.yml's smoke job installs apt package(s) {packages:?}; only \
+            "release.yml's smoke job installs package(s) {packages:?}; only \
              {SANDBOX_PACKAGE:?} is justified here (the OS sandbox backend the smoked \
              binary requires). A toolchain package in this job is the same per-target \
              cross mechanism the build job forbids, wearing a different job name:\n    {}",
