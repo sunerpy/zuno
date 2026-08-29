@@ -517,6 +517,21 @@ jobs:
       - name: Build the smoke driver
         run: cargo build --locked --release -p zuno-testkit --bin zuno-smoke
 
+      # The artifact under test refuses to start without ripgrep 14+ on PATH:
+      # `zuno-search` treats a missing `rg` as a startup error for the whole tool
+      # runtime, by design (docs/harness-runtime.md). No CodeBuild image ships one on
+      # any of these five platforms, and CI run 33227251936 showed the resulting
+      # failure mode — `the headless run exited non-zero` with `ripgrep (`rg`) is
+      # required for glob and grep` on stderr, which reads like an artifact defect
+      # rather than a missing runner dependency. Installed after the driver build so
+      # a resolution failure cannot be mistaken for a compile failure.
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: ripgrep
+
+      - name: Verify ripgrep satisfies the runtime minimum
+        run: rg --version
+
       - name: Smoke the unpacked artifact (unix)
         if: matrix.archive == 'tar.gz'
         run: ./target/release/zuno-smoke --binary "unpacked/${BINARY_NAME}"

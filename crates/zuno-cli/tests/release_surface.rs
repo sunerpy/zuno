@@ -948,7 +948,7 @@ fn every_codebuild_job_has_a_unique_label_set() {
 /// refused.
 ///
 /// Scoped to `release.yml` on purpose. `ci.yml` keeps one hosted `windows` job
-/// behind `if: vars.GITHUB_HOSTED_RUNNERS == 'true'`, off by default, and that job
+/// behind `if: vars.HOSTED_RUNNERS == 'true'`, off by default, and that job
 /// gates nothing that ships.
 #[test]
 fn the_release_path_uses_no_github_hosted_runner() {

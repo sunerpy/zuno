@@ -103,6 +103,24 @@ jobs:
           npm install --global oxfmt@0.59.0
           oxfmt --version
 
+      # `rg` is a hard startup requirement for the tool runtime, not an optional
+      # accelerator: `zuno-search` refuses to build a search adapter without a
+      # ripgrep 14+ on PATH (crates/zuno-search/src/ripgrep.rs), and
+      # docs/harness-runtime.md makes that a startup error on purpose rather than a
+      # silent fallback to a second walker. The CodeBuild standard image ships no
+      # `rg`, unlike the GitHub-hosted `ubuntu-*` images where it is preinstalled
+      # and this step looked unnecessary. Without it 19 `production_registry` tests
+      # fail at tool-registry assembly with "ripgrep (`rg`) is required for glob and
+      # grep" — measured on run 33227251936, where the same absence also broke the
+      # `artifact` job's headless smoke. `--version` is the gate so a broken install
+      # fails here instead of looking like a code failure later.
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: ripgrep
+
+      - name: Verify ripgrep satisfies the runtime minimum
+        run: rg --version
+
       - name: Format check
         run: make fmt-check
 
@@ -167,6 +185,17 @@ jobs:
         with:
           key: artifact
 
+      # The packaged binary refuses to start without ripgrep 14+; see the same step
+      # in `test` for why the CodeBuild image needs it installed explicitly. This job
+      # smokes a real release build, so the absence surfaces as `the headless run
+      # exited non-zero` rather than as a test failure.
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: ripgrep
+
+      - name: Verify ripgrep satisfies the runtime minimum
+        run: rg --version
+
       # `make smoke-artifact` reaches `release`, which is `--offline` by default; see
       # the same step in `test` for why a cold runner needs this first.
       - name: Populate the cargo registry for the offline gates
@@ -188,8 +217,14 @@ jobs:
   #
   # So the job stays defined and stays in `ci-success`'s `needs:`, gated on a
   # repository variable instead of deleted. Unset, it skips, and `ci-success`
-  # tolerates a skip from this job by name. Set `GITHUB_HOSTED_RUNNERS=true` once
+  # tolerates a skip from this job by name. Set `HOSTED_RUNNERS=true` once
   # minutes exist and it is a hard gate again with no other edit.
+  #
+  # NOT `GITHUB_HOSTED_RUNNERS`: `GITHUB_` is a reserved configuration-variable
+  # prefix, so the REST API refuses to create it — `POST
+  # /repos/{owner}/{repo}/actions/variables` answers `422 Variable names must not
+  # start with GITHUB_.`. Under the old name the gate could never be flipped on,
+  # which made this job permanently skipped rather than opt-in.
   #
   # Deliberately not `continue-on-error: true`: that would also swallow a real
   # Windows failure. The distinction this keeps is "did not run" vs "ran and
@@ -197,7 +232,7 @@ jobs:
   # -------------------------------------------------------------------------
   windows:
     name: Windows
-    if: vars.GITHUB_HOSTED_RUNNERS == 'true'
+    if: vars.HOSTED_RUNNERS == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
