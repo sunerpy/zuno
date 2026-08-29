@@ -12,10 +12,19 @@ It depends on the selected sandbox mode:
   boundary.
 
 The two confined modes are OS-sandboxed only when the active platform backend
-passes its full capability probe. Otherwise, Shell registration fails closed;
-Zuno never turns a failed `read-only` or `workspace-write` request into
-`danger-full-access`. Use `zuno --sandbox danger-full-access` only when native
-host execution is intentionally required.
+passes its full capability probe. Otherwise, Shell registration fails closed by
+default. A trusted global, explicit, environment, CLI, or managed layer may set
+`sandbox.onUnavailable` to `run-unconfined`; that allows only a write-capable
+Agent's `workspace-write` request to use the native backend for a typed platform,
+launcher-absence, or namespace/container-policy availability failure. Read-only
+Agents, untrusted launchers, invalid policy/path, helper/internal errors, and
+command execution errors never fall back.
+
+Unavailable fallback is not the same as selecting `danger-full-access`. It keeps
+the configured permission mode and all explicit denies and catastrophic-command
+refusals, while recording that requested filesystem/network restrictions are not
+OS-enforced. Explicit `danger-full-access` skips confinement discovery and also
+sets effective permission mode to `allow_all`.
 
 On supported Linux hosts, Zuno locates a fixed, root-owned system `bwrap` at
 `/usr/bin/bwrap` or `/bin/bwrap`, probes the required namespaces, compiles the
@@ -34,9 +43,11 @@ and file-capability trust, backend capabilities, and the exact probe failure.
 It checks every launcher ancestor, then executes `/usr/bin/true` through the
 same bubblewrap, capability-drop, `PR_SET_NO_NEW_PRIVS`, and seccomp path used by
 Shell. `--check` exits unsuccessfully when the requested policy is not
-deployable. Do not use `danger-full-access` for deployment verification: that
-mode is reported as a native-execution bypass and intentionally skips both
-launcher trust and the confinement self-test.
+deployable, even if configured fallback would allow runtime execution. The
+report separately shows requested/effective authority, fallback eligibility,
+resolution kind, and typed reason. Do not use `danger-full-access` for deployment
+verification: that mode is reported as a native-execution bypass and
+intentionally skips both launcher trust and the confinement self-test.
 
 The Linux backend:
 
@@ -66,8 +77,9 @@ terminal; they fail directly instead of asking. Structured user questions are
 not approvals and may still be shown.
 
 Confined macOS and Windows modes currently return a typed unsupported-platform
-error and do not register Shell. Explicit `danger-full-access` remains available
-through the native process backend. See the
+error. They do not register Shell under the default `deny`; trusted
+`run-unconfined` may allow a write-capable Agent to proceed natively, while
+explicit `danger-full-access` remains available independently. See the
 [Shell sandbox roadmap](design/shell-sandbox-roadmap.md).
 
 ## Why does `bwrap` fail with `loopback: Failed RTM_NEWADDR: Operation not permitted`?
@@ -184,6 +196,17 @@ route-netlink operations, or nested mount/network namespaces. Fix that runtime's
 specific seccomp, AppArmor/SELinux, user-namespace, and namespace settings, or
 run Zuno in a dedicated VM/bare-metal environment where the complete probe
 passes. Avoid blanket `--privileged` as a substitute for a reviewed policy.
+
+For a deliberately unconfined automation container, a trusted host-level config
+may instead set:
+
+```json
+{"sandbox":{"onUnavailable":"run-unconfined"}}
+```
+
+That choice is ignored for read-only Agents and never hides `debug sandbox
+--check` failure. Project configuration cannot enable it, and managed policy may
+still force `deny`.
 
 WSL1 is unsupported. WSL2 is a Linux VM and may use the Linux
 backend only when the same user, mount, PID, network, filesystem, and seccomp

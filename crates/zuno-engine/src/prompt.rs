@@ -105,6 +105,7 @@ pub struct RuntimePromptPolicy {
     delegation_targets: Option<Vec<String>>,
     delegation_guidance: Option<String>,
     shell_workspace_write: bool,
+    sandbox_notice: Option<String>,
 }
 
 impl RuntimePromptPolicy {
@@ -119,7 +120,15 @@ impl RuntimePromptPolicy {
             delegation_targets,
             delegation_guidance,
             shell_workspace_write,
+            sandbox_notice: None,
         }
+    }
+
+    /// Adds a durable runtime section describing effective shell authority.
+    #[must_use]
+    pub fn with_sandbox_notice(mut self, notice: impl Into<String>) -> Self {
+        self.sandbox_notice = Some(notice.into());
+        self
     }
 
     /// Render the canonical runtime sections from the exact provider-visible tool ids.
@@ -193,6 +202,9 @@ impl RuntimePromptPolicy {
             ),
             RuntimePromptSection::new("runtime.execution", execution),
         ];
+        if let Some(notice) = self.sandbox_notice.as_deref() {
+            sections.push(RuntimePromptSection::new("runtime.sandbox", notice));
+        }
         if can_edit {
             sections.push(RuntimePromptSection::new(
                 "runtime.editing",
@@ -962,6 +974,21 @@ mod tests {
                 .all(|section| !section.content().contains("substantial tool batch")),
             "a tool-free prompt must not describe unavailable tool behavior"
         );
+    }
+
+    #[test]
+    fn unavailable_sandbox_notice_is_a_separate_durable_runtime_section() {
+        let policy = RuntimePromptPolicy::default().with_sandbox_notice(
+            "Shell is running without OS isolation; requested workspace-write, effective host.",
+        );
+        let sections = policy.sections(["shell"], false);
+        let sandbox = sections
+            .iter()
+            .find(|section| section.id() == "runtime.sandbox")
+            .expect("sandbox section");
+
+        assert_eq!(sandbox.source(), "zuno-runtime:runtime.sandbox");
+        assert!(sandbox.content().contains("without OS isolation"));
     }
 
     #[test]

@@ -30,9 +30,11 @@ pub const ZUNO_PRINT_LOGS: &str = "ZUNO_PRINT_LOGS";
 pub const ZUNO_LOG_LEVEL: &str = "ZUNO_LOG_LEVEL";
 /// Trusted per-invocation Shell sandbox override.
 pub const ZUNO_SANDBOX_MODE: &str = "ZUNO_SANDBOX_MODE";
+/// Trusted per-invocation response to an unavailable confined sandbox.
+pub const ZUNO_SANDBOX_ON_UNAVAILABLE: &str = "ZUNO_SANDBOX_ON_UNAVAILABLE";
 
 /// Environment values read by the CLI and its command implementations.
-pub const ZUNO_FLAG_NAMES: [&str; 37] = [
+pub const ZUNO_FLAG_NAMES: [&str; 38] = [
     "ZUNO_ALWAYS_NOTIFY_UPDATE",
     "ZUNO_AUTO_HEAP_SNAPSHOT",
     "ZUNO_CLIENT",
@@ -70,6 +72,7 @@ pub const ZUNO_FLAG_NAMES: [&str; 37] = [
     ZUNO_PID,
     ZUNO_PRINT_LOGS,
     ZUNO_SANDBOX_MODE,
+    ZUNO_SANDBOX_ON_UNAVAILABLE,
 ];
 
 /// The complete flag snapshot handed to command implementations.
@@ -160,6 +163,9 @@ impl StartupEnvironment {
         }
         if let Some(mode) = globals.sandbox {
             overrides.insert(ZUNO_SANDBOX_MODE, mode.as_str().to_owned());
+        }
+        if let Some(action) = globals.sandbox_on_unavailable {
+            overrides.insert(ZUNO_SANDBOX_ON_UNAVAILABLE, action.as_str().to_owned());
         }
         let resolved = overrides.iter().fold(base.clone(), |env, (name, value)| {
             env.with(*name, value.clone())
@@ -287,6 +293,7 @@ mod tests {
             print_logs: true,
             log_level: Some(CliLogLevel::Warn),
             sandbox: None,
+            sandbox_on_unavailable: None,
         };
         let startup = StartupEnvironment::resolve(&Env::empty(), &globals);
 
@@ -298,6 +305,7 @@ mod tests {
         );
         assert_eq!(startup.flags.value(ZUNO_PRINT_LOGS), Some("1"));
         assert_eq!(startup.flags.value(ZUNO_LOG_LEVEL), Some("WARN"));
+        assert_eq!(startup.flags.value(ZUNO_SANDBOX_ON_UNAVAILABLE), None);
     }
 
     #[test]

@@ -23,6 +23,7 @@ zuno plugin [OPTIONS] <COMMAND>
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Subcommands
@@ -50,6 +51,7 @@ zuno plugin list [OPTIONS]
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno plugin add
@@ -72,6 +74,7 @@ zuno plugin add [OPTIONS] <SOURCE>
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno plugin update
@@ -94,6 +97,7 @@ zuno plugin update [OPTIONS] <SOURCE>
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno plugin remove
@@ -116,6 +120,7 @@ zuno plugin remove [OPTIONS] <ID>
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Examples

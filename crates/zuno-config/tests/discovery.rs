@@ -10,7 +10,7 @@ use zuno_config::schema::ordered::OrderedMap;
 use zuno_config::schema::permission::{
     PermissionAction, PermissionConfig, PermissionMode, PermissionObject, PermissionRule,
 };
-use zuno_config::schema::sandbox::{SandboxMode, SandboxNetworkMode};
+use zuno_config::schema::sandbox::{SandboxMode, SandboxNetworkMode, SandboxUnavailableAction};
 use zuno_error::ConfigError;
 use zuno_paths::Env;
 
@@ -216,6 +216,10 @@ fn project_layers_cannot_grant_host_network_or_external_write_roots() {
     for (body, key) in [
         (r#"{"sandbox":{"network":"allow"}}"#, "network"),
         (
+            r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#,
+            "onUnavailable",
+        ),
+        (
             r#"{"sandbox":{"writableRoots":["../shared-cache"]}}"#,
             "writableRoots",
         ),
@@ -240,6 +244,97 @@ fn project_layers_cannot_grant_host_network_or_external_write_roots() {
         assert_eq!(issues[0].key_path, ["sandbox", key]);
         assert!(issues[0].detail.contains("trusted"));
     }
+}
+
+#[test]
+fn trusted_unavailable_override_is_typed_and_managed_policy_can_deny_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let env_only = discover_with(&fixture_options(
+        temp.path(),
+        &project,
+        [(
+            "ZUNO_SANDBOX_ON_UNAVAILABLE".to_owned(),
+            "run-unconfined".to_owned(),
+        )],
+    ))
+    .expect("trusted environment override resolves");
+    assert_eq!(
+        env_only.sandbox_on_unavailable(),
+        SandboxUnavailableAction::RunUnconfined
+    );
+
+    let managed = temp.path().join("managed");
+    write(
+        &managed.join("zuno.json"),
+        r#"{"sandbox":{"onUnavailable":"deny"}}"#,
+    );
+    let options = fixture_options(
+        temp.path(),
+        &project,
+        [
+            (
+                "ZUNO_SANDBOX_ON_UNAVAILABLE".to_owned(),
+                "run-unconfined".to_owned(),
+            ),
+            (
+                "ZUNO_TEST_MANAGED_CONFIG_DIR".to_owned(),
+                managed.to_string_lossy().into_owned(),
+            ),
+        ],
+    );
+
+    let config = discover_with(&options).expect("managed sandbox policy resolves");
+
+    assert_eq!(
+        config.sandbox_on_unavailable(),
+        SandboxUnavailableAction::Deny
+    );
+}
+
+#[test]
+fn project_layer_may_narrow_trusted_unavailable_fallback_to_deny() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    let project = root.join("project");
+    fs::create_dir_all(project.join(".git")).expect("worktree marker");
+    write(
+        &root.join("xdg-config/zuno/zuno.json"),
+        r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#,
+    );
+    write(
+        &project.join(".zuno/zuno.json"),
+        r#"{"sandbox":{"onUnavailable":"deny"}}"#,
+    );
+
+    let config = discover_with(&fixture_options(root, &project, std::iter::empty()))
+        .expect("project deny may narrow trusted fallback");
+
+    assert_eq!(
+        config.sandbox_on_unavailable(),
+        SandboxUnavailableAction::Deny
+    );
+}
+
+#[test]
+fn invalid_unavailable_override_names_the_exact_configuration_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let project = temp.path().join("project");
+    let error = discover_with(&fixture_options(
+        temp.path(),
+        &project,
+        [(
+            "ZUNO_SANDBOX_ON_UNAVAILABLE".to_owned(),
+            "sometimes".to_owned(),
+        )],
+    ))
+    .expect_err("unknown unavailable action must fail");
+    let ConfigError::Invalid { path, issues } = error else {
+        panic!("expected typed unavailable-action validation failure");
+    };
+
+    assert_eq!(path, Path::new("ZUNO_SANDBOX_ON_UNAVAILABLE"));
+    assert_eq!(issues[0].key_path, ["sandbox", "onUnavailable"]);
 }
 
 #[test]

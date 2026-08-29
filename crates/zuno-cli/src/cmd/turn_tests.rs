@@ -59,8 +59,30 @@ impl zuno_sandbox::SandboxBackend for DirectTestSandbox {
     }
 }
 
-fn test_sandbox() -> Option<Arc<dyn zuno_sandbox::SandboxBackend>> {
+fn test_sandbox() -> Option<Arc<dyn zuno_sandbox::SandboxResolver>> {
     Some(Arc::new(DirectTestSandbox::new()))
+}
+
+#[derive(Debug)]
+struct UnavailableTestSandbox;
+
+impl zuno_sandbox::SandboxResolver for UnavailableTestSandbox {
+    fn resolve(
+        self: Arc<Self>,
+        policy: zuno_sandbox::SandboxPolicy,
+        on_unavailable: zuno_sandbox::SandboxUnavailableAction,
+    ) -> Result<zuno_sandbox::SandboxResolution, zuno_sandbox::SandboxError> {
+        let _ = self;
+        if on_unavailable == zuno_sandbox::SandboxUnavailableAction::RunUnconfined
+            && policy.mode() == zuno_sandbox::SandboxMode::WorkspaceWrite
+        {
+            return zuno_sandbox::SandboxResolution::unavailable_fallback(
+                policy,
+                zuno_sandbox::SandboxUnavailableCause::BubblewrapNotFound,
+            );
+        }
+        Err(zuno_sandbox::SandboxError::BubblewrapNotFound)
+    }
 }
 
 fn agent(name: &str) -> Agent {
@@ -3926,6 +3948,280 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
     assert_eq!(output.metadata["sandboxMode"], "danger-full-access");
     assert_eq!(output.metadata["sandboxBackend"], "danger_full_access");
     assert_eq!(output.metadata["sandboxNetwork"], "allowed");
+    assert_eq!(
+        output.metadata["sandboxRequestedMode"],
+        "danger-full-access"
+    );
+    assert_eq!(output.metadata["sandboxResolutionKind"], "explicit_native");
+    assert_eq!(output.metadata["sandboxFallback"], false);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_authority() {
+    use zuno_config::schema::permission::PermissionAction;
+    use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config = zuno_config::schema::Config::from_json_str(
+        Path::new("trusted.json"),
+        r#"{
+            "shell": "/bin/sh",
+            "permission": {
+                "mode": "strict",
+                "rules": {
+                    "shell": {
+                        "*": "allow",
+                        "printf forbidden": "deny"
+                    }
+                }
+            },
+            "sandbox": {
+                "mode": "workspace-write",
+                "network": "deny",
+                "onUnavailable": "run-unconfined"
+            }
+        }"#,
+    )
+    .expect("trusted fallback config");
+    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+    let background_executions = test_background_executions(directory.path());
+    let runtime = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &config,
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            question: None,
+            background_executions: Arc::clone(&background_executions),
+            sandbox: Some(Arc::new(UnavailableTestSandbox)),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+            tool_authority: None,
+        },
+    )
+    .expect("trusted unavailable fallback assembles");
+    assert!(
+        runtime
+            .sandbox_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("without OS isolation"))
+    );
+    assert_eq!(
+        zuno_permission::evaluate("shell", "printf forbidden", &runtime.rules),
+        PermissionAction::Deny,
+        "native fallback must not widen an explicit Shell deny"
+    );
+    let shell = runtime
+        .tools
+        .iter()
+        .find(|tool| tool.id() == "shell")
+        .expect("build exposes Shell");
+
+    let refused = shell
+        .invoke(
+            serde_json::json!({"command": "rm -rf /"}),
+            ToolContext::new(
+                "ses_fallback",
+                "msg_fallback_refusal",
+                "call_fallback_refusal",
+                "build",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            ),
+        )
+        .await
+        .expect_err("catastrophic commands remain refused");
+    let zuno_error::ToolError::Failed { source, .. } = refused else {
+        panic!("catastrophic refusal must be a terminal tool failure");
+    };
+    assert!(source.to_string().contains("blocked"));
+
+    let output = shell
+        .invoke(
+            serde_json::json!({"command": "printf fallback", "background": true}),
+            ToolContext::new(
+                "ses_fallback",
+                "msg_fallback",
+                "call_fallback",
+                "build",
+                Arc::new(AllowAll),
+                Arc::new(NeverInterrupted),
+            ),
+        )
+        .await
+        .expect("fallback command executes through the managed process service");
+
+    assert_eq!(output.metadata["sandboxMode"], "danger-full-access");
+    assert_eq!(output.metadata["sandboxNetwork"], "allowed");
+    assert_eq!(output.metadata["sandboxRequestedMode"], "workspace-write");
+    assert_eq!(output.metadata["sandboxRequestedNetwork"], "denied");
+    assert_eq!(
+        output.metadata["sandboxResolutionKind"],
+        "unavailable_fallback"
+    );
+    assert_eq!(output.metadata["sandboxFallback"], true);
+    assert_eq!(
+        output.metadata["sandboxFallbackReason"]["code"],
+        "bubblewrap_not_found"
+    );
+
+    let id = zuno_pty::BackgroundExecutionId::parse(
+        output.metadata["task_id"]
+            .as_str()
+            .expect("background task id"),
+    )
+    .expect("valid background id");
+    let settled = background_executions
+        .wait(&id, None)
+        .await
+        .expect("background command settles")
+        .info;
+    assert_eq!(settled.authority.schema_version, 3);
+    assert_eq!(settled.authority.approval_mode, "strict");
+    assert_eq!(
+        settled.authority.requested_mode(),
+        zuno_sandbox::SandboxMode::WorkspaceWrite
+    );
+    assert_eq!(
+        settled.authority.mode,
+        zuno_sandbox::SandboxMode::DangerFullAccess
+    );
+}
+
+#[test]
+fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_it() {
+    use zuno_config::schema::permission::PermissionAction;
+
+    let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config = zuno_config::schema::Config::from_json_str(
+        Path::new("trusted.json"),
+        r#"{"sandbox":{"onUnavailable":"run-unconfined"}}"#,
+    )
+    .expect("trusted fallback config");
+    let rules = vec![
+        zuno_permission::Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        },
+        zuno_permission::Rule {
+            permission: "apply_patch".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Deny,
+        },
+        zuno_permission::Rule {
+            permission: "write".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Deny,
+        },
+        zuno_permission::Rule {
+            permission: "edit".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Deny,
+        },
+    ];
+    let selected_agent =
+        zuno_agent::profile::AgentProfile::resolve(agent("read-only-shell"), rules, false);
+
+    let error = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &config,
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            question: None,
+            background_executions: test_background_executions(directory.path()),
+            sandbox: Some(Arc::new(UnavailableTestSandbox)),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+            tool_authority: None,
+        },
+    )
+    .err()
+    .expect("read-only authority must stay fail-closed");
+
+    assert!(error.contains("bubblewrap"));
+}
+
+#[test]
+fn fallback_preserves_each_configured_permission_mode() {
+    for (configured, expected) in [
+        ("standard", "standard"),
+        ("strict", "strict"),
+        ("allow_all", "allow_all"),
+    ] {
+        let directory = tempfile::TempDir::new().expect("temporary tool workspace");
+        let config = zuno_config::schema::Config::from_json_str(
+            Path::new("trusted.json"),
+            &format!(
+                r#"{{
+                    "permission": {{"mode": "{configured}"}},
+                    "sandbox": {{"onUnavailable": "run-unconfined"}}
+                }}"#
+            ),
+        )
+        .expect("permission config");
+        let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+        let requested =
+            tool_runtime::sandbox_policy(directory.path(), &config, &selected_agent, &[])
+                .expect("requested policy");
+        let resolution = zuno_sandbox::SandboxResolution::unavailable_fallback(
+            requested,
+            zuno_sandbox::SandboxUnavailableCause::BubblewrapNotFound,
+        )
+        .expect("fallback resolution");
+        let prepared = resolution
+            .backend()
+            .prepare(zuno_sandbox::PrepareRequest {
+                program: "/bin/sh".into(),
+                arguments: Vec::new(),
+                cwd: directory.path().to_owned(),
+                environment: Default::default(),
+                policy: resolution.execution_policy().clone(),
+            })
+            .expect("prepared fallback");
+
+        assert_eq!(prepared.authority().approval_mode, expected);
+    }
 }
 
 #[cfg(unix)]

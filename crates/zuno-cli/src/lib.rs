@@ -14,9 +14,9 @@ pub mod startup;
 mod version;
 
 pub use command::{
-    AcpArgs, Action, Cli, CliLogLevel, CliSandboxMode, Command, CommandDispatcher, CompletionArgs,
-    DispatchArguments, DispatchError, DispatchRequest, ExportArgs, GlobalOptions,
-    ImplementedCommand, ImportArgs, SelfUpdateArgs,
+    AcpArgs, Action, Cli, CliLogLevel, CliSandboxMode, CliSandboxUnavailableAction, Command,
+    CommandDispatcher, CompletionArgs, DispatchArguments, DispatchError, DispatchRequest,
+    ExportArgs, GlobalOptions, ImplementedCommand, ImportArgs, SelfUpdateArgs,
 };
 pub use disposition::{
     CommandDisposition, Disposition, SurfaceError, disposition_for, dispositions,
@@ -24,7 +24,7 @@ pub use disposition::{
 };
 pub use environment::{
     AGENT, StartupEnvironment, ZUNO, ZUNO_FLAG_NAMES, ZUNO_LOG_LEVEL, ZUNO_PID, ZUNO_PRINT_LOGS,
-    ZUNO_SANDBOX_MODE, ZunoFlags,
+    ZUNO_SANDBOX_MODE, ZUNO_SANDBOX_ON_UNAVAILABLE, ZunoFlags,
 };
 pub use version::{BUILD_ID, RUST_PACKAGE_VERSION, long_version, user_agent, version};
 

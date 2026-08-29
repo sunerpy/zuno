@@ -2331,6 +2331,17 @@
           ],
           "description": "Network authority. Absence defaults to `deny` in confined modes and to\nhost networking in `danger-full-access`; that mode rejects explicit\n`deny` because it cannot enforce it."
         },
+        "onUnavailable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxUnavailableAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Action when a confined backend is unavailable. Absence fails closed.\n\n`run-unconfined` is accepted only from a trusted configuration layer."
+        },
         "protectedPaths": {
           "description": "Paths reapplied read-only after writable roots are mounted.\n\nRelative paths resolve against the active workspace. Missing paths are\nignored until they exist.",
           "items": {
@@ -2385,6 +2396,21 @@
         {
           "const": "allow",
           "description": "Inherit the host network namespace.",
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxUnavailableAction": {
+      "description": "Runtime action when a confined OS backend cannot be deployed.",
+      "oneOf": [
+        {
+          "const": "deny",
+          "description": "Refuse to publish or execute Shell without the requested confinement.",
+          "type": "string"
+        },
+        {
+          "const": "run-unconfined",
+          "description": "Run through the native process backend after an eligible deployment failure.",
           "type": "string"
         }
       ]

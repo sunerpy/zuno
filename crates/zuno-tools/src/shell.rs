@@ -19,7 +19,10 @@ use zuno_pty::{
     BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionRetention,
     BackgroundExecutionService, BackgroundExecutionStatus, CommandShell, CommandShellKind,
 };
-use zuno_sandbox::{NetworkAccess, PrepareRequest, SandboxBackend, SandboxMode, SandboxPolicy};
+use zuno_sandbox::{
+    ExecutionAuthority, NetworkAccess, PrepareRequest, SandboxBackend, SandboxMode, SandboxPolicy,
+    SandboxResolutionKind,
+};
 use zuno_tool::{OutputLimits, PermissionAsk, Tool, ToolContext, ToolOutput, ToolOutputStore};
 
 const TOOL_ID: &str = "shell";
@@ -285,11 +288,11 @@ impl ShellTool {
 
         if params.background {
             lease.disarm();
-            return Ok(background_started_output(command.clone(), &execution)
-                .with_metadata("shell", self.shell.name())
-                .with_metadata("sandboxBackend", execution.authority.backend.clone())
-                .with_metadata("sandboxMode", json!(execution.authority.mode))
-                .with_metadata("sandboxNetwork", json!(execution.authority.network)));
+            return Ok(with_sandbox_metadata(
+                background_started_output(command.clone(), &execution)
+                    .with_metadata("shell", self.shell.name()),
+                &execution.authority,
+            ));
         }
 
         let foreground_timeout = Duration::from_millis(foreground_timeout_ms);
@@ -318,13 +321,11 @@ impl ShellTool {
                 .promote(&execution.id)
                 .map_err(failed)?;
             lease.disarm();
-            return Ok(
+            return Ok(with_sandbox_metadata(
                 timeout_promoted_output(command.clone(), foreground_timeout_ms, &promoted)
-                    .with_metadata("shell", self.shell.name())
-                    .with_metadata("sandboxBackend", promoted.authority.backend.clone())
-                    .with_metadata("sandboxMode", json!(promoted.authority.mode))
-                    .with_metadata("sandboxNetwork", json!(promoted.authority.network)),
-            );
+                    .with_metadata("shell", self.shell.name()),
+                &promoted.authority,
+            ));
         }
         let full = self
             .background_executions
@@ -593,16 +594,16 @@ impl ShellTool {
         if full.is_empty() {
             full = "(no output)".to_owned();
         }
-        let output = ToolOutput::text(command, full)
-            .with_metadata("exit", json!(execution.exit_code))
-            .with_metadata("truncated", false)
-            .with_metadata("background", false)
-            .with_metadata("task_id", execution.id.as_str())
-            .with_metadata("shell", self.shell.name())
-            .with_metadata("sandboxBackend", execution.authority.backend)
-            .with_metadata("sandboxMode", json!(execution.authority.mode))
-            .with_metadata("sandboxNetwork", json!(execution.authority.network))
-            .with_metadata("timeout", json!(foreground_timeout_ms));
+        let output = with_sandbox_metadata(
+            ToolOutput::text(command, full)
+                .with_metadata("exit", json!(execution.exit_code))
+                .with_metadata("truncated", false)
+                .with_metadata("background", false)
+                .with_metadata("task_id", execution.id.as_str())
+                .with_metadata("shell", self.shell.name())
+                .with_metadata("timeout", json!(foreground_timeout_ms)),
+            &execution.authority,
+        );
         OutputPolicy::new(self.output_store.clone(), self.output_limits)
             .apply(TOOL_ID, session_id, output, accept_large_output)
             .map_err(|error| ToolError::Failed {
@@ -610,6 +611,24 @@ impl ShellTool {
                 source: Box::new(error),
             })
     }
+}
+
+fn with_sandbox_metadata(output: ToolOutput, authority: &ExecutionAuthority) -> ToolOutput {
+    output
+        .with_metadata("sandboxBackend", authority.backend.clone())
+        .with_metadata("sandboxMode", json!(authority.mode))
+        .with_metadata("sandboxNetwork", json!(authority.network))
+        .with_metadata("sandboxRequestedMode", json!(authority.requested_mode()))
+        .with_metadata(
+            "sandboxRequestedNetwork",
+            json!(authority.requested_network()),
+        )
+        .with_metadata("sandboxResolutionKind", json!(authority.resolution_kind))
+        .with_metadata(
+            "sandboxFallback",
+            authority.resolution_kind == SandboxResolutionKind::UnavailableFallback,
+        )
+        .with_metadata("sandboxFallbackReason", json!(authority.fallback_reason))
 }
 
 #[async_trait]

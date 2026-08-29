@@ -10,6 +10,8 @@ pub use crate::instructions::{
     InstructionOptions, InstructionPath, InstructionText, InstructionWarning, Instructions,
     LoadedInstructions, Origin, UpwardClaims, WarningKind,
 };
-pub use crate::schema::sandbox::{SandboxConfig, SandboxMode, SandboxNetworkMode};
+pub use crate::schema::sandbox::{
+    SandboxConfig, SandboxMode, SandboxNetworkMode, SandboxUnavailableAction,
+};
 pub use crate::schema::{Config, KNOWN_TOP_LEVEL_KEYS, WebSearchBackend, WebSearchConfig};
 pub use crate::variable::{Missing, Source, Substitution};

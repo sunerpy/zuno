@@ -22,6 +22,7 @@ zuno session [OPTIONS] <COMMAND>
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Subcommands
@@ -50,6 +51,7 @@ zuno session list [OPTIONS]
 | `--roots` | Only root sessions. This is the default; pass `--no-roots` for children | |
 | `--no-roots` | Include child sessions, which are hidden by default | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `--sort <SORT>` | Order by last activity or by creation time. Possible values: `updated` (`time_updated`, last activity; upstream's `listGlobal` order), `created` (`time_created`) | `updated` |
 | `-n`, `--limit <LIMIT>` | Limit to N sessions, most recent first. Defaults to 100. Alias: `--max-count` | |
 | `--format <FORMAT>` | Output format. Possible values: `table`, `json` | `table` |
@@ -74,6 +76,7 @@ zuno session prune [OPTIONS] --older-than <DAYS>
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--archive` | | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `--delete` | | |
 | `--include-shared` | | |
 | `--include-recent` | | |
@@ -98,6 +101,7 @@ zuno session delete [OPTIONS] <SESSION_ID>
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Examples

@@ -54,6 +54,7 @@ The generated developer instructions use stable ids and sources:
 | --- | --- | --- |
 | `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
 | `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, keep tool-driven work visible, and stop using tools once the outcome and evidence are complete. | Always; tool communication and termination guidance are added only when tools exist, and Plan guidance only when `plan_update` exists. |
+| `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode and the typed reason that confinement was unavailable. | Only while a trusted unavailable-sandbox fallback is active. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
 | `runtime.verification` | Require observed evidence and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available. |
 | `runtime.delegation` | Require bounded non-overlapping delegation and durable result reconciliation. | Only when `task` and at least one valid target are effective. |
@@ -1098,6 +1099,8 @@ file-capability launcher; checks every launcher ancestor; revalidates device and
 inode before preparation; probes required namespaces; and executes
 `/usr/bin/true` through bubblewrap, capability dropping, `PR_SET_NO_NEW_PRIVS`,
 and seccomp. A metadata-only probe is not reported as deployment readiness.
+`--check` remains strict: it fails when the requested confinement is not
+deployable even if a trusted runtime fallback would be eligible.
 
 The public modes are `read-only`, `workspace-write`, and
 `danger-full-access`. `workspace-write` is the default. Trusted global, explicit,
@@ -1105,19 +1108,45 @@ managed, environment, and CLI sources define the maximum; project configuration
 may only narrow it. An Agent's capability contract is intersected with that
 maximum, so a read-only Agent remains read-only under a wider invocation.
 
-`read-only` and `workspace-write` require a proved OS backend. Unavailable
-backends fail tool assembly without publishing a Shell definition; they never
-fall back to native execution. `danger-full-access` is an explicit native backend
-that retains host filesystem, process, credential, and network authority and
-sets the effective permission mode to `allow_all`. It emits no Zuno approval
-requests, while explicit permission denies and catastrophic Shell denials remain
-terminal. It still produces a `PreparedCommand`, persists authority schema
-version 2, and uses the same cancellation, background, log, usage, and lifecycle
-paths.
+`read-only` and `workspace-write` require a proved OS backend and fail closed by
+default. The trusted `sandbox.onUnavailable` setting accepts `deny` (default) or
+`run-unconfined`; the same value can be supplied by
+`--sandbox-on-unavailable` or `ZUNO_SANDBOX_ON_UNAVAILABLE`. Project
+configuration may set only `deny`. Global, explicit, environment, CLI, and
+managed layers may enable fallback, and managed policy has final precedence.
 
-Confined macOS and Windows modes currently fail closed as unsupported, while
-explicit `danger-full-access` remains available. Tool output and durable
-background state expose the effective mode, backend, and network policy. The
+The `SandboxResolver` completes discovery, capability checks, and a real
+`verify_deployment` before publishing Shell. Only unsupported platforms, a
+missing trusted launcher, missing required launcher capabilities, and typed
+namespace/container-policy unavailability may activate fallback. Untrusted
+launchers, invalid policy or paths, seccomp/helper/internal errors, generic
+process errors, and command preparation/execution errors remain terminal.
+Read-only Agent contracts never fall back.
+
+An unavailable fallback uses the existing native backend and the same
+`PreparedCommand`, permission review, catastrophic-command denial, background,
+timeout, cancellation, and process-tree lifecycle. It preserves the original
+permission mode; unlike explicit `danger-full-access`, it does not imply
+`allow_all`. Requested network denial, writable roots, and protected paths cannot
+be OS-enforced while the effective authority is the host process user's
+authority. The host emits one warning, and every model request receives the
+durable `runtime.sandbox` section while fallback remains active.
+
+Explicit `danger-full-access` skips restricted-backend discovery entirely,
+retains host filesystem, process, credential, and network authority, and sets the
+effective permission mode to `allow_all`. Explicit permission denies and
+catastrophic Shell denials remain terminal.
+
+Every path produces a `PreparedCommand` and persists execution-authority schema
+version 3: `mode` and `network` are effective authority, while
+`requestedMode`, `requestedNetwork`, `resolutionKind`, and `fallbackReason`
+record resolution. Version-2 background records read as requested equals
+effective with legacy resolution, so in-flight state remains recoverable. Tool
+output mirrors requested/effective authority and fallback metadata.
+
+Confined macOS and Windows modes currently report unsupported. They remain
+fail-closed unless a trusted `run-unconfined` policy is active for a write-capable
+Agent; explicit `danger-full-access` remains available independently. The
 invariants and E2E matrix are recorded in
 [Shell sandbox roadmap](design/shell-sandbox-roadmap.md).
 

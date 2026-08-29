@@ -1203,15 +1203,22 @@ impl TurnPlan {
             &rules,
         ) {
             Ok(policy) => {
-                let deployment = zuno_sandbox::deployment_report(
+                let deployment = zuno_sandbox::deployment_report_with_action(
                     policy.workspace(),
                     policy.mode(),
                     policy.network(),
+                    super::tool_runtime::sandbox_unavailable_action(&self.config),
                 );
                 json!({
                     "configuredMode": self.config.sandbox_mode(),
-                    "effectiveMode": policy.mode(),
-                    "network": policy.network(),
+                    "configuredOnUnavailable": self.config.sandbox_on_unavailable(),
+                    "requestedMode": policy.mode(),
+                    "requestedNetwork": policy.network(),
+                    "effectiveMode": deployment.effective_mode,
+                    "effectiveNetwork": deployment.effective_network,
+                    "resolutionKind": deployment.resolution_kind,
+                    "fallbackEligible": deployment.fallback_eligible,
+                    "fallbackReason": deployment.fallback_reason.clone(),
                     "workspace": policy.workspace(),
                     "ready": deployment.ready,
                     "error": deployment.error.clone(),
@@ -2887,6 +2894,14 @@ impl TurnHost {
                     .iter()
                     .map(|suppression| format!("warning: {suppression}")),
             );
+            if let Some(notice) = runtime_tools.sandbox_notice.as_ref() {
+                notes.push(format!("warning: {notice}"));
+                plan.resolver.runtime_prompt_policy = plan
+                    .resolver
+                    .runtime_prompt_policy
+                    .clone()
+                    .with_sandbox_notice(notice.clone());
+            }
             let dispatcher = ToolRegistryDispatcher::new(
                 runtime_tools.tools,
                 runtime_tools.rules,

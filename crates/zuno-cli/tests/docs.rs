@@ -103,6 +103,49 @@ fn harness_guide_documents_the_native_extension_contract() {
 }
 
 #[test]
+fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
+    contains_all(
+        "docs/design/shell-sandbox-roadmap.md",
+        &[
+            "sandbox.onUnavailable",
+            "UnavailableFallback",
+            "read-only Agent contracts",
+            "never fall back",
+            "command preparation/execution failure",
+        ],
+    );
+    contains_all(
+        "docs/harness-runtime.md",
+        &[
+            "`runtime.sandbox`",
+            "`run-unconfined`",
+            "requestedMode",
+            "fallbackReason",
+            "Version-2 background records",
+        ],
+    );
+    contains_all(
+        "docs/reference/configuration.md",
+        &[
+            "\"onUnavailable\": \"deny\"",
+            "`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`",
+            "A read-only Agent never runs unconfined",
+        ],
+    );
+    contains_all(
+        "docs/faq.md",
+        &[
+            "`sandbox.onUnavailable`",
+            "fallback eligibility",
+            "`--check` exits unsuccessfully",
+        ],
+    );
+    for relative in ["docs/cli/global-options.md", "docs/cli/debug.md"] {
+        contains_all(relative, &["--sandbox-on-unavailable", "run-unconfined"]);
+    }
+}
+
+#[test]
 fn portable_bundle_and_attachment_guides_document_the_public_contracts() {
     contains_all(
         "docs/reference/portable-bundles.md",

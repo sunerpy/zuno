@@ -22,6 +22,7 @@ zuno providers [OPTIONS] <COMMAND>
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Subcommands
@@ -46,6 +47,7 @@ zuno providers list [OPTIONS]
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno providers methods
@@ -66,6 +68,7 @@ zuno providers methods [OPTIONS] <PROVIDER>
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno providers login
@@ -88,6 +91,7 @@ zuno providers login [OPTIONS] [TARGET]
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ### zuno providers logout
@@ -106,6 +110,7 @@ zuno providers logout [OPTIONS] [PROVIDER]
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Examples

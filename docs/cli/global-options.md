@@ -24,6 +24,7 @@ These options appear in the `--help` output of `zuno` and of every subcommand.
 | `--print-logs` | Print logs to stderr in addition to the structured local log store | |
 | `--log-level <LOG_LEVEL>` | Set the minimum log level. Possible values: `TRACE` (maximum tracing detail), `DEBUG` (verbose diagnostic events), `INFO` (normal operational events), `WARN` (warnings and errors), `ERROR` (errors only) | |
 | `--sandbox <SANDBOX>` | Select Shell confinement for this invocation. Possible values: `read-only`, `workspace-write`, `danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | Select what happens when confined Shell cannot be deployed. Possible values: `deny`, `run-unconfined` | `deny` |
 | `-h`, `--help` | Print help (see a summary with `-h`) | |
 
 ## Root invocation options
@@ -60,6 +61,14 @@ Confine Shell to reads for a single interactive session, without changing config
 
 ```sh
 zuno tui --sandbox read-only
+```
+
+Permit a write-capable Agent to run with host authority when a typed confinement
+availability failure is encountered. Read-only Agents still refuse, and managed
+policy may override this back to `deny`.
+
+```sh
+zuno run --sandbox-on-unavailable run-unconfined "run the local build"
 ```
 
 Verify that a confinement mode is actually deployable on this host before relying on it.

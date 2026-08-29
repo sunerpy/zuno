@@ -95,7 +95,7 @@ impl LinuxBubblewrapSandbox {
         let current_exe = validated_helper(helper_executable)?;
 
         run_probe(&bwrap.path, &true_executable.path, false).map_err(|detail| {
-            SandboxError::ProbeFailed {
+            SandboxError::UnavailableCapability {
                 capability: "user, mount, PID, UTS, and IPC namespaces",
                 detail,
             }
@@ -131,7 +131,7 @@ impl LinuxBubblewrapSandbox {
         if request.policy.network() == NetworkAccess::Denied
             && let Some(detail) = &self.network_probe_error
         {
-            return Err(SandboxError::ProbeFailed {
+            return Err(SandboxError::UnavailableCapability {
                 capability: "network namespace",
                 detail: detail.clone(),
             });
@@ -198,7 +198,6 @@ impl SandboxBackend for LinuxBubblewrapSandbox {
     }
 
     fn verify_deployment(&self, policy: &crate::SandboxPolicy) -> Result<(), SandboxError> {
-        self.capabilities.supports(policy)?;
         let executable =
             self.true_executable
                 .as_ref()
@@ -1189,7 +1188,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            SandboxError::ProbeFailed {
+            SandboxError::UnavailableCapability {
                 capability: "network namespace",
                 ..
             }

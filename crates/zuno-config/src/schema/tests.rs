@@ -342,6 +342,10 @@ fn sandbox_defaults_to_denied_network_and_preserves_explicit_paths() {
         crate::schema::sandbox::SandboxNetworkMode::Deny
     );
     assert_eq!(
+        sandbox.resolved_on_unavailable(),
+        crate::schema::sandbox::SandboxUnavailableAction::Deny
+    );
+    assert_eq!(
         sandbox.writable_roots.as_deref(),
         Some(["../shared-cache".to_owned()].as_slice())
     );
@@ -353,7 +357,7 @@ fn sandbox_defaults_to_denied_network_and_preserves_explicit_paths() {
 
 #[test]
 fn sandbox_modes_use_the_exact_public_vocabulary_and_default_to_workspace_write() {
-    use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode};
+    use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode, SandboxUnavailableAction};
 
     assert_eq!(
         Config::default().sandbox_mode(),
@@ -362,6 +366,10 @@ fn sandbox_modes_use_the_exact_public_vocabulary_and_default_to_workspace_write(
     assert_eq!(
         Config::default().sandbox_network(),
         SandboxNetworkMode::Deny
+    );
+    assert_eq!(
+        Config::default().sandbox_on_unavailable(),
+        SandboxUnavailableAction::Deny
     );
 
     for (spelling, expected) in [
@@ -377,6 +385,17 @@ fn sandbox_modes_use_the_exact_public_vocabulary_and_default_to_workspace_write(
     let danger = parse(r#"{"sandbox":{"mode":"danger-full-access"}}"#)
         .expect("full access has host networking when no contradictory network policy is set");
     assert_eq!(danger.sandbox_network(), SandboxNetworkMode::Allow);
+
+    for (spelling, expected) in [
+        ("deny", SandboxUnavailableAction::Deny),
+        ("run-unconfined", SandboxUnavailableAction::RunUnconfined),
+    ] {
+        let config = parse(&format!(
+            r#"{{"sandbox":{{"onUnavailable":"{spelling}"}}}}"#
+        ))
+        .unwrap_or_else(|error| panic!("{spelling} must parse: {error:?}"));
+        assert_eq!(config.sandbox_on_unavailable(), expected);
+    }
 }
 
 #[test]

@@ -70,6 +70,8 @@ pub struct GlobalOptions {
     pub log_level: Option<CliLogLevel>,
     /// Override sandbox authority for this invocation.
     pub sandbox: Option<CliSandboxMode>,
+    /// Override the response to an unavailable confined sandbox.
+    pub sandbox_on_unavailable: Option<CliSandboxUnavailableAction>,
 }
 
 /// The root command parser.
@@ -101,6 +103,10 @@ pub struct Cli {
     #[arg(long, global = true, value_enum)]
     pub sandbox: Option<CliSandboxMode>,
 
+    /// Select what happens when confined Shell cannot be deployed.
+    #[arg(long, global = true, value_enum, value_name = "ACTION")]
+    pub sandbox_on_unavailable: Option<CliSandboxUnavailableAction>,
+
     /// The default command's own options, accepted without naming it.
     #[command(flatten)]
     pub tui: TuiArgs,
@@ -118,6 +124,7 @@ impl Cli {
             print_logs: self.print_logs,
             log_level: self.log_level,
             sandbox: self.sandbox,
+            sandbox_on_unavailable: self.sandbox_on_unavailable,
         }
     }
 
@@ -155,6 +162,23 @@ impl CliSandboxMode {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
             Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
+/// Actions accepted when the requested confined sandbox cannot be deployed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CliSandboxUnavailableAction {
+    Deny,
+    RunUnconfined,
+}
+
+impl CliSandboxUnavailableAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::RunUnconfined => "run-unconfined",
         }
     }
 }
@@ -1227,6 +1251,24 @@ mod tests {
             };
             assert_eq!(
                 request.environment.flags.value(crate::ZUNO_SANDBOX_MODE),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_action_is_a_global_trusted_invocation_override() {
+        for (spelling, expected) in [("deny", "deny"), ("run-unconfined", "run-unconfined")] {
+            let cli = Cli::try_parse_from(["zuno", "--sandbox-on-unavailable", spelling, "run"])
+                .unwrap_or_else(|error| panic!("{spelling} must parse: {error}"));
+            let Action::Dispatch(request) = cli.action(&Env::empty()) else {
+                panic!("sandbox unavailable override must still dispatch");
+            };
+            assert_eq!(
+                request
+                    .environment
+                    .flags
+                    .value(crate::ZUNO_SANDBOX_ON_UNAVAILABLE),
                 Some(expected)
             );
         }

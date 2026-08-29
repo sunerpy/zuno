@@ -10,7 +10,7 @@
 use crate::Config;
 use crate::instructions::{DEFAULT_GLOBAL_INSTRUCTIONS, GLOBAL_INSTRUCTION_FILENAME};
 use crate::schema::JsonMap;
-use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode};
+use crate::schema::sandbox::{SandboxMode, SandboxNetworkMode, SandboxUnavailableAction};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -28,6 +28,7 @@ const ZUNO_CONFIG: &str = "ZUNO_CONFIG";
 const ZUNO_CONFIG_CONTENT: &str = "ZUNO_CONFIG_CONTENT";
 const ZUNO_PERMISSION: &str = "ZUNO_PERMISSION";
 const ZUNO_SANDBOX_MODE: &str = "ZUNO_SANDBOX_MODE";
+const ZUNO_SANDBOX_ON_UNAVAILABLE: &str = "ZUNO_SANDBOX_ON_UNAVAILABLE";
 const ZUNO_DISABLE_AUTOCOMPACT: &str = "ZUNO_DISABLE_AUTOCOMPACT";
 const ZUNO_DISABLE_PRUNE: &str = "ZUNO_DISABLE_PRUNE";
 const ZUNO_TEST_MANAGED_CONFIG_DIR: &str = "ZUNO_TEST_MANAGED_CONFIG_DIR";
@@ -251,6 +252,17 @@ pub fn discover_with(options: &DiscoveryOptions) -> Result<Config, ConfigError> 
         })?;
         apply_sandbox_mode_override(&mut result, mode);
     }
+    if let Some(value) = options.env.truthy_value(ZUNO_SANDBOX_ON_UNAVAILABLE) {
+        let action =
+            SandboxUnavailableAction::parse(value).ok_or_else(|| ConfigError::Invalid {
+                path: PathBuf::from(ZUNO_SANDBOX_ON_UNAVAILABLE),
+                issues: vec![ConfigIssue::new(
+                    ["sandbox", "onUnavailable"],
+                    "expected deny or run-unconfined",
+                )],
+            })?;
+        apply_sandbox_unavailable_override(&mut result, action);
+    }
 
     // config.ts:516-522.
     if options.managed_config_dir.exists() {
@@ -446,6 +458,12 @@ fn validate_layer_authority(
             "project config cannot grant host network access; use a trusted global, managed, environment, or CLI layer",
         ));
     }
+    if sandbox.on_unavailable == Some(SandboxUnavailableAction::RunUnconfined) {
+        issues.push(ConfigIssue::new(
+            ["sandbox", "onUnavailable"],
+            "project config cannot permit unconfined Shell fallback; use a trusted global, managed, environment, or CLI layer",
+        ));
+    }
     if sandbox
         .writable_roots
         .as_ref()
@@ -497,6 +515,12 @@ fn apply_sandbox_mode_override(config: &mut RawJson, mode: SandboxMode) {
             sandbox.remove("protectedPaths");
         }
     }
+}
+
+fn apply_sandbox_unavailable_override(config: &mut RawJson, action: SandboxUnavailableAction) {
+    config
+        .entry_or_insert("sandbox", RawJson::empty_object())
+        .insert("onUnavailable", RawJson::String(action.as_str().to_owned()));
 }
 
 fn raw_from_config(path: &Path, config: &Config) -> Result<RawJson, ConfigError> {

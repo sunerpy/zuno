@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -55,12 +57,144 @@ pub enum NetworkAccess {
     Allowed,
 }
 
+impl NetworkAccess {
+    /// Stable configuration and metadata spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::Allowed => "allowed",
+        }
+    }
+}
+
+/// Trusted policy for a restricted sandbox that cannot be deployed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxUnavailableAction {
+    /// Refuse execution when the requested OS isolation cannot be established.
+    #[default]
+    Deny,
+    /// Run with the Zuno process user's host authority when the failure is eligible.
+    RunUnconfined,
+}
+
+impl SandboxUnavailableAction {
+    /// Stable configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::RunUnconfined => "run-unconfined",
+        }
+    }
+}
+
+/// How the requested sandbox policy reached its execution backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxResolutionKind {
+    /// A restricted backend proved and enforces the requested authority.
+    Confined,
+    /// The caller explicitly requested native host execution.
+    ExplicitNative,
+    /// A trusted policy allowed an unavailable restricted sandbox to run natively.
+    UnavailableFallback,
+    /// A pre-v3 durable authority record without explicit resolution metadata.
+    #[default]
+    Legacy,
+}
+
+impl SandboxResolutionKind {
+    /// Stable metadata spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Confined => "confined",
+            Self::ExplicitNative => "explicit_native",
+            Self::UnavailableFallback => "unavailable_fallback",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
+/// Stable, typed reason why a restricted OS sandbox could not be deployed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum SandboxUnavailableCause {
+    #[error("OS sandbox is not implemented for platform `{platform}`")]
+    UnsupportedPlatform { platform: String },
+    #[error("Linux sandbox does not support architecture `{architecture}`")]
+    UnsupportedArchitecture { architecture: String },
+    #[error("Linux sandbox is unavailable on WSL1")]
+    Wsl1Unsupported,
+    #[error("no trusted system bubblewrap executable was found")]
+    BubblewrapNotFound,
+    #[error("bubblewrap does not provide required option `{option}`")]
+    MissingBubblewrapCapability { option: String },
+    #[error("sandbox deployment capability `{capability}` is unavailable: {detail}")]
+    DeploymentCapabilityUnavailable { capability: String, detail: String },
+}
+
+impl SandboxUnavailableCause {
+    /// Stable machine-readable reason code.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedPlatform { .. } => "unsupported_platform",
+            Self::UnsupportedArchitecture { .. } => "unsupported_architecture",
+            Self::Wsl1Unsupported => "wsl1_unsupported",
+            Self::BubblewrapNotFound => "bubblewrap_not_found",
+            Self::MissingBubblewrapCapability { .. } => "missing_bubblewrap_capability",
+            Self::DeploymentCapabilityUnavailable { .. } => "deployment_capability_unavailable",
+        }
+    }
+
+    fn from_error(error: &SandboxError) -> Option<Self> {
+        match error {
+            SandboxError::UnsupportedPlatform(platform) => Some(Self::UnsupportedPlatform {
+                platform: platform.clone(),
+            }),
+            SandboxError::UnsupportedArchitecture(architecture) => {
+                Some(Self::UnsupportedArchitecture {
+                    architecture: architecture.clone(),
+                })
+            }
+            SandboxError::Wsl1Unsupported => Some(Self::Wsl1Unsupported),
+            SandboxError::BubblewrapNotFound => Some(Self::BubblewrapNotFound),
+            SandboxError::MissingBubblewrapCapability(option) => {
+                Some(Self::MissingBubblewrapCapability {
+                    option: option.clone(),
+                })
+            }
+            SandboxError::UnavailableCapability { capability, detail } => {
+                Some(Self::DeploymentCapabilityUnavailable {
+                    capability: (*capability).to_owned(),
+                    detail: detail.clone(),
+                })
+            }
+            SandboxError::UntrustedBubblewrap { .. }
+            | SandboxError::ProbeFailed { .. }
+            | SandboxError::UnsupportedPolicy { .. }
+            | SandboxError::InvalidPolicy(_)
+            | SandboxError::InvalidPath { .. }
+            | SandboxError::Seccomp(_)
+            | SandboxError::Helper(_)
+            | SandboxError::Io(_) => None,
+        }
+    }
+}
+
 /// Immutable policy selected before a shell command is prepared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
     workspace: PathBuf,
     mode: SandboxMode,
     network: NetworkAccess,
+    requested_mode: SandboxMode,
+    requested_network: NetworkAccess,
+    resolution_kind: SandboxResolutionKind,
+    fallback_reason: Option<SandboxUnavailableCause>,
     writable_roots: Vec<PathBuf>,
     protected_paths: Vec<PathBuf>,
     git_metadata_writable: bool,
@@ -86,6 +220,14 @@ impl SandboxPolicy {
             workspace,
             mode,
             network,
+            requested_mode: mode,
+            requested_network: network,
+            resolution_kind: if mode == SandboxMode::DangerFullAccess {
+                SandboxResolutionKind::ExplicitNative
+            } else {
+                SandboxResolutionKind::Confined
+            },
+            fallback_reason: None,
             writable_roots: Vec::new(),
             protected_paths: Vec::new(),
             git_metadata_writable: false,
@@ -174,6 +316,43 @@ impl SandboxPolicy {
     #[must_use]
     pub const fn network(&self) -> NetworkAccess {
         self.network
+    }
+
+    /// Authority originally requested before any unavailable-sandbox fallback.
+    #[must_use]
+    pub const fn requested_mode(&self) -> SandboxMode {
+        self.requested_mode
+    }
+
+    /// Network authority originally requested before fallback.
+    #[must_use]
+    pub const fn requested_network(&self) -> NetworkAccess {
+        self.requested_network
+    }
+
+    /// Resolution path that selected the effective backend.
+    #[must_use]
+    pub const fn resolution_kind(&self) -> SandboxResolutionKind {
+        self.resolution_kind
+    }
+
+    /// Typed unavailable reason when native fallback was activated.
+    #[must_use]
+    pub const fn fallback_reason(&self) -> Option<&SandboxUnavailableCause> {
+        self.fallback_reason.as_ref()
+    }
+
+    fn into_unavailable_fallback(self, cause: SandboxUnavailableCause) -> Self {
+        Self {
+            mode: SandboxMode::DangerFullAccess,
+            network: NetworkAccess::Allowed,
+            resolution_kind: SandboxResolutionKind::UnavailableFallback,
+            fallback_reason: Some(cause),
+            writable_roots: Vec::new(),
+            protected_paths: Vec::new(),
+            git_metadata_writable: false,
+            ..self
+        }
     }
 }
 
@@ -267,7 +446,13 @@ pub struct SandboxDeploymentReport {
     pub architecture: String,
     pub workspace: PathBuf,
     pub requested_mode: SandboxMode,
-    pub network: NetworkAccess,
+    pub requested_network: NetworkAccess,
+    pub on_unavailable: SandboxUnavailableAction,
+    pub effective_mode: Option<SandboxMode>,
+    pub effective_network: Option<NetworkAccess>,
+    pub resolution_kind: Option<SandboxResolutionKind>,
+    pub fallback_eligible: bool,
+    pub fallback_reason: Option<SandboxUnavailableCause>,
     pub ready: bool,
     pub native_execution_bypass: bool,
     pub capabilities: Option<SandboxCapabilities>,
@@ -319,8 +504,22 @@ pub struct ExecutionAuthority {
     pub backend: String,
     pub backend_executable: Option<PathBuf>,
     pub workspace: PathBuf,
+    /// Effective execution mode at the process boundary.
     pub mode: SandboxMode,
+    /// Effective network authority at the process boundary.
     pub network: NetworkAccess,
+    /// Requested mode before unavailable-sandbox resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_mode: Option<SandboxMode>,
+    /// Requested network authority before unavailable-sandbox resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_network: Option<NetworkAccess>,
+    /// How the effective execution backend was selected.
+    #[serde(default)]
+    pub resolution_kind: SandboxResolutionKind,
+    /// Typed reason for an unavailable-sandbox fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<SandboxUnavailableCause>,
     pub writable_roots: Vec<PathBuf>,
     pub protected_paths: Vec<PathBuf>,
     pub cwd: PathBuf,
@@ -328,6 +527,26 @@ pub struct ExecutionAuthority {
     pub environment_keys: Vec<String>,
     pub approval_mode: String,
     pub reviewer_policy_sha256: String,
+}
+
+impl ExecutionAuthority {
+    /// Requested mode, treating pre-v3 records as requested equals effective.
+    #[must_use]
+    pub const fn requested_mode(&self) -> SandboxMode {
+        match self.requested_mode {
+            Some(mode) => mode,
+            None => self.mode,
+        }
+    }
+
+    /// Requested network authority, treating pre-v3 records as requested equals effective.
+    #[must_use]
+    pub const fn requested_network(&self) -> NetworkAccess {
+        match self.requested_network {
+            Some(network) => network,
+            None => self.network,
+        }
+    }
 }
 
 /// Command accepted by the process boundary.
@@ -363,12 +582,16 @@ impl PreparedCommand {
         environment_keys.sort();
         environment_keys.dedup();
         let authority = ExecutionAuthority {
-            schema_version: 2,
+            schema_version: 3,
             backend: backend.backend.clone(),
             backend_executable: backend.executable.clone(),
             workspace: request.policy.workspace.clone(),
             mode: request.policy.mode,
             network: request.policy.network,
+            requested_mode: Some(request.policy.requested_mode),
+            requested_network: Some(request.policy.requested_network),
+            resolution_kind: request.policy.resolution_kind,
+            fallback_reason: request.policy.fallback_reason.clone(),
             writable_roots,
             protected_paths,
             cwd: request.cwd.clone(),
@@ -430,6 +653,184 @@ pub trait SandboxBackend: Send + Sync {
     /// bounded no-op through the same launcher and first-party helper used by commands.
     fn verify_deployment(&self, policy: &SandboxPolicy) -> Result<(), SandboxError> {
         self.capabilities().supports(policy)
+    }
+}
+
+/// Complete, immutable selection of requested and effective execution authority.
+#[derive(Clone)]
+pub struct SandboxResolution {
+    backend: Arc<dyn SandboxBackend>,
+    requested_policy: SandboxPolicy,
+    execution_policy: SandboxPolicy,
+}
+
+impl fmt::Debug for SandboxResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SandboxResolution")
+            .field("backend", &self.backend.capabilities().backend)
+            .field("requested_policy", &self.requested_policy)
+            .field("execution_policy", &self.execution_policy)
+            .finish()
+    }
+}
+
+impl SandboxResolution {
+    fn new(
+        backend: Arc<dyn SandboxBackend>,
+        requested_policy: SandboxPolicy,
+        execution_policy: SandboxPolicy,
+    ) -> Self {
+        Self {
+            backend,
+            requested_policy,
+            execution_policy,
+        }
+    }
+
+    /// Builds a verified resolution for an injected backend.
+    ///
+    /// Composition roots and tests use this when platform discovery is supplied by
+    /// another component. The execution policy must already carry its resolution
+    /// metadata and must describe the same workspace and original request.
+    pub fn with_verified_backend(
+        backend: Arc<dyn SandboxBackend>,
+        requested_policy: SandboxPolicy,
+        execution_policy: SandboxPolicy,
+    ) -> Result<Self, SandboxError> {
+        if requested_policy.workspace() != execution_policy.workspace()
+            || requested_policy.mode() != execution_policy.requested_mode()
+            || requested_policy.network() != execution_policy.requested_network()
+        {
+            return Err(SandboxError::InvalidPolicy(
+                "sandbox resolution requested/effective authority is inconsistent".to_owned(),
+            ));
+        }
+        backend.verify_deployment(&execution_policy)?;
+        Ok(Self::new(backend, requested_policy, execution_policy))
+    }
+
+    /// Builds a verified native fallback for an injected unavailable cause.
+    pub fn unavailable_fallback(
+        requested_policy: SandboxPolicy,
+        cause: SandboxUnavailableCause,
+    ) -> Result<Self, SandboxError> {
+        if requested_policy.mode() != SandboxMode::WorkspaceWrite {
+            return Err(SandboxError::InvalidPolicy(
+                "only workspace-write authority may fall back to native execution".to_owned(),
+            ));
+        }
+        let execution_policy = requested_policy.clone().into_unavailable_fallback(cause);
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(DangerFullAccessSandbox::new(requested_policy.workspace())?);
+        Self::with_verified_backend(backend, requested_policy, execution_policy)
+    }
+
+    /// Selected execution backend.
+    #[must_use]
+    pub fn backend(&self) -> &Arc<dyn SandboxBackend> {
+        &self.backend
+    }
+
+    /// Authority requested before unavailable-sandbox resolution.
+    #[must_use]
+    pub const fn requested_policy(&self) -> &SandboxPolicy {
+        &self.requested_policy
+    }
+
+    /// Authority that will be compiled at the process boundary.
+    #[must_use]
+    pub const fn execution_policy(&self) -> &SandboxPolicy {
+        &self.execution_policy
+    }
+
+    /// Resolution path that selected the backend.
+    #[must_use]
+    pub const fn kind(&self) -> SandboxResolutionKind {
+        self.execution_policy.resolution_kind()
+    }
+
+    /// Typed unavailable reason when fallback was activated.
+    #[must_use]
+    pub const fn fallback_reason(&self) -> Option<&SandboxUnavailableCause> {
+        self.execution_policy.fallback_reason()
+    }
+
+    /// Consumes the resolution for a tool that owns its backend and policy.
+    #[must_use]
+    pub fn into_execution(self) -> (Arc<dyn SandboxBackend>, SandboxPolicy) {
+        (self.backend, self.execution_policy)
+    }
+}
+
+/// Resolves one requested policy before a command can reach preparation.
+pub trait SandboxResolver: Send + Sync {
+    /// Selects and verifies a backend. Implementations may never switch during prepare/run.
+    fn resolve(
+        self: Arc<Self>,
+        policy: SandboxPolicy,
+        on_unavailable: SandboxUnavailableAction,
+    ) -> Result<SandboxResolution, SandboxError>;
+}
+
+/// Production resolver for the current operating system.
+#[derive(Debug, Default)]
+pub struct SystemSandboxResolver;
+
+impl SandboxResolver for SystemSandboxResolver {
+    fn resolve(
+        self: Arc<Self>,
+        policy: SandboxPolicy,
+        on_unavailable: SandboxUnavailableAction,
+    ) -> Result<SandboxResolution, SandboxError> {
+        let _ = self;
+        resolve_policy_with(policy, on_unavailable, |policy| {
+            system_backend(policy.workspace(), policy.mode()).map(Arc::<dyn SandboxBackend>::from)
+        })
+    }
+}
+
+fn resolve_policy_with(
+    policy: SandboxPolicy,
+    on_unavailable: SandboxUnavailableAction,
+    discover: impl FnOnce(&SandboxPolicy) -> Result<Arc<dyn SandboxBackend>, SandboxError>,
+) -> Result<SandboxResolution, SandboxError> {
+    if policy.mode() == SandboxMode::DangerFullAccess {
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(DangerFullAccessSandbox::new(policy.workspace())?);
+        return SandboxResolution::with_verified_backend(backend, policy.clone(), policy);
+    }
+
+    let resolution = discover(&policy).and_then(|backend| {
+        SandboxResolution::with_verified_backend(backend, policy.clone(), policy.clone())
+    });
+    match resolution {
+        Ok(resolution) => Ok(resolution),
+        Err(error) => {
+            let Some(cause) = SandboxUnavailableCause::from_error(&error) else {
+                return Err(error);
+            };
+            if on_unavailable != SandboxUnavailableAction::RunUnconfined
+                || policy.mode() != SandboxMode::WorkspaceWrite
+            {
+                return Err(error);
+            }
+            SandboxResolution::unavailable_fallback(policy, cause)
+        }
+    }
+}
+
+impl<T> SandboxResolver for T
+where
+    T: SandboxBackend + 'static,
+{
+    fn resolve(
+        self: Arc<Self>,
+        policy: SandboxPolicy,
+        _on_unavailable: SandboxUnavailableAction,
+    ) -> Result<SandboxResolution, SandboxError> {
+        let backend: Arc<dyn SandboxBackend> = self;
+        SandboxResolution::with_verified_backend(backend, policy.clone(), policy)
     }
 }
 
@@ -521,14 +922,35 @@ pub fn deployment_report(
     mode: SandboxMode,
     network: NetworkAccess,
 ) -> SandboxDeploymentReport {
+    deployment_report_with_action(workspace, mode, network, SandboxUnavailableAction::Deny)
+}
+
+/// Probe requested isolation while also reporting a trusted fallback decision.
+///
+/// `ready` remains strict: it is true only when the requested policy itself is
+/// deployable. An eligible native fallback is represented by `effective_*` and
+/// `resolution_kind` without turning `ready` into success.
+#[must_use]
+pub fn deployment_report_with_action(
+    workspace: &Path,
+    mode: SandboxMode,
+    network: NetworkAccess,
+    on_unavailable: SandboxUnavailableAction,
+) -> SandboxDeploymentReport {
     let mut report = SandboxDeploymentReport {
         platform: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
         workspace: workspace.to_owned(),
         requested_mode: mode,
-        network,
+        requested_network: network,
+        on_unavailable,
+        effective_mode: None,
+        effective_network: None,
+        resolution_kind: None,
+        fallback_eligible: false,
+        fallback_reason: None,
         ready: false,
-        native_execution_bypass: mode == SandboxMode::DangerFullAccess,
+        native_execution_bypass: false,
         capabilities: None,
         launcher: None,
         checks: Vec::new(),
@@ -546,7 +968,7 @@ pub fn deployment_report(
             report
                 .checks
                 .push(SandboxDeploymentCheck::failed("policy", error.to_string()));
-            report.error = Some(error.to_string());
+            record_deployment_failure(&mut report, &error);
             return report;
         }
     };
@@ -574,7 +996,7 @@ pub fn deployment_report(
                     "launcher_trust",
                     error.to_string(),
                 ));
-                report.error = Some(error.to_string());
+                record_deployment_failure(&mut report, &error);
                 return report;
             }
         }
@@ -598,26 +1020,27 @@ pub fn deployment_report(
                 "backend_discovery",
                 Some(format!("selected `{}`", capabilities.backend)),
             ));
-            if let Err(error) = capabilities.supports(&policy) {
+            if let Err(error) = backend.verify_deployment(&policy) {
+                report.checks.push(match capabilities.supports(&policy) {
+                    Ok(()) => SandboxDeploymentCheck::passed(
+                        "policy_support",
+                        Some("the backend advertises every requested capability".to_owned()),
+                    ),
+                    Err(support_error) => {
+                        SandboxDeploymentCheck::failed("policy_support", support_error.to_string())
+                    }
+                });
                 report.checks.push(SandboxDeploymentCheck::failed(
-                    "policy_support",
+                    "execution_self_test",
                     error.to_string(),
                 ));
-                report.error = Some(error.to_string());
+                record_deployment_failure(&mut report, &error);
                 return report;
             }
             report.checks.push(SandboxDeploymentCheck::passed(
                 "policy_support",
                 Some("the backend advertises every requested capability".to_owned()),
             ));
-            if let Err(error) = backend.verify_deployment(&policy) {
-                report.checks.push(SandboxDeploymentCheck::failed(
-                    "execution_self_test",
-                    error.to_string(),
-                ));
-                report.error = Some(error.to_string());
-                return report;
-            }
             report
                 .checks
                 .push(if mode == SandboxMode::DangerFullAccess {
@@ -636,16 +1059,40 @@ pub fn deployment_report(
                     )
                 });
             report.ready = true;
+            report.effective_mode = Some(mode);
+            report.effective_network = Some(network);
+            report.resolution_kind = Some(if mode == SandboxMode::DangerFullAccess {
+                SandboxResolutionKind::ExplicitNative
+            } else {
+                SandboxResolutionKind::Confined
+            });
+            report.native_execution_bypass = mode == SandboxMode::DangerFullAccess;
         }
         Err(error) => {
             report.checks.push(SandboxDeploymentCheck::failed(
                 "backend_discovery",
                 error.to_string(),
             ));
-            report.error = Some(error.to_string());
+            record_deployment_failure(&mut report, &error);
         }
     }
     report
+}
+
+fn record_deployment_failure(report: &mut SandboxDeploymentReport, error: &SandboxError) {
+    report.error = Some(error.to_string());
+    let Some(cause) = SandboxUnavailableCause::from_error(error) else {
+        return;
+    };
+    report.fallback_reason = Some(cause);
+    report.fallback_eligible = report.on_unavailable == SandboxUnavailableAction::RunUnconfined
+        && report.requested_mode == SandboxMode::WorkspaceWrite;
+    if report.fallback_eligible {
+        report.effective_mode = Some(SandboxMode::DangerFullAccess);
+        report.effective_network = Some(NetworkAccess::Allowed);
+        report.resolution_kind = Some(SandboxResolutionKind::UnavailableFallback);
+        report.native_execution_bypass = true;
+    }
 }
 
 fn executable_identity(path: &Path) -> SandboxExecutableIdentity {
@@ -722,6 +1169,11 @@ pub enum SandboxError {
     UntrustedBubblewrap { path: PathBuf, reason: String },
     #[error("bubblewrap does not provide required option `{0}`")]
     MissingBubblewrapCapability(String),
+    #[error("sandbox deployment capability `{capability}` is unavailable: {detail}")]
+    UnavailableCapability {
+        capability: &'static str,
+        detail: String,
+    },
     #[error("sandbox probe for `{capability}` failed: {detail}")]
     ProbeFailed {
         capability: &'static str,
@@ -802,6 +1254,39 @@ fn command_sha256(program: &OsStr, arguments: &[OsString]) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct LateUnavailableBackend {
+        capabilities: SandboxCapabilities,
+    }
+
+    impl LateUnavailableBackend {
+        fn new() -> Self {
+            Self {
+                capabilities: SandboxCapabilities {
+                    backend: "late_unavailable".to_owned(),
+                    executable: None,
+                    read_only: true,
+                    workspace_write: true,
+                    danger_full_access: false,
+                    network_isolation: true,
+                },
+            }
+        }
+    }
+
+    impl SandboxBackend for LateUnavailableBackend {
+        fn capabilities(&self) -> &SandboxCapabilities {
+            &self.capabilities
+        }
+
+        fn prepare(&self, _request: PrepareRequest) -> Result<PreparedCommand, SandboxError> {
+            Err(SandboxError::UnavailableCapability {
+                capability: "command launch",
+                detail: "the deployment changed after resolution".to_owned(),
+            })
+        }
+    }
+
     #[test]
     fn capability_refuses_network_denial_without_a_network_namespace() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -873,6 +1358,288 @@ mod tests {
         assert_eq!(prepared.authority().environment_keys, ["SECRET_TOKEN"]);
         assert!(!encoded.contains("do-not-persist"));
         assert_eq!(prepared.authority().command_sha256.len(), 64);
+        assert_eq!(prepared.authority().schema_version, 3);
+        assert_eq!(
+            prepared.authority().requested_mode(),
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            prepared.authority().resolution_kind,
+            SandboxResolutionKind::Confined
+        );
+    }
+
+    #[test]
+    fn v2_authority_reads_requested_as_effective_and_legacy_resolution() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let policy = SandboxPolicy::new(
+            workspace.path(),
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Denied,
+        )
+        .expect("policy");
+        let capabilities = SandboxCapabilities {
+            backend: "test".to_owned(),
+            executable: None,
+            read_only: true,
+            workspace_write: true,
+            danger_full_access: false,
+            network_isolation: true,
+        };
+        let prepared = PreparedCommand::from_backend(
+            PrepareRequest {
+                program: OsString::from("/bin/sh"),
+                arguments: Vec::new(),
+                cwd: workspace.path().to_owned(),
+                environment: BTreeMap::new(),
+                policy,
+            },
+            OsString::from("/bin/sh"),
+            Vec::new(),
+            &capabilities,
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut value = serde_json::to_value(prepared.authority()).expect("authority JSON");
+        let object = value.as_object_mut().expect("authority object");
+        object.insert("schemaVersion".to_owned(), serde_json::json!(2));
+        object.remove("requestedMode");
+        object.remove("requestedNetwork");
+        object.remove("resolutionKind");
+        object.remove("fallbackReason");
+
+        let legacy: ExecutionAuthority =
+            serde_json::from_value(value).expect("v2 authority remains readable");
+
+        assert_eq!(legacy.requested_mode(), legacy.mode);
+        assert_eq!(legacy.requested_network(), legacy.network);
+        assert_eq!(legacy.resolution_kind, SandboxResolutionKind::Legacy);
+        assert!(legacy.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn explicit_full_access_never_invokes_restricted_discovery() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let policy = SandboxPolicy::new(
+            workspace.path(),
+            SandboxMode::DangerFullAccess,
+            NetworkAccess::Allowed,
+        )
+        .expect("policy");
+
+        let resolution =
+            resolve_policy_with(policy, SandboxUnavailableAction::RunUnconfined, |_| {
+                panic!("restricted discovery must not run for explicit full access")
+            })
+            .expect("explicit native resolution");
+
+        assert_eq!(resolution.kind(), SandboxResolutionKind::ExplicitNative);
+        assert!(resolution.fallback_reason().is_none());
+        assert_eq!(
+            resolution.execution_policy().mode(),
+            SandboxMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn eligible_unavailable_error_resolves_to_native_without_widening_approval_mode() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let requested = SandboxPolicy::new(
+            workspace.path(),
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Denied,
+        )
+        .expect("policy")
+        .with_writable_roots([workspace.path().to_owned()])
+        .expect("writable root")
+        .with_approval_context("strict", "rules");
+
+        let resolution =
+            resolve_policy_with(requested, SandboxUnavailableAction::RunUnconfined, |_| {
+                Err(SandboxError::BubblewrapNotFound)
+            })
+            .expect("eligible fallback");
+
+        assert_eq!(
+            resolution.kind(),
+            SandboxResolutionKind::UnavailableFallback
+        );
+        assert!(matches!(
+            resolution.fallback_reason(),
+            Some(SandboxUnavailableCause::BubblewrapNotFound)
+        ));
+        assert_eq!(
+            resolution.requested_policy().mode(),
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            resolution.requested_policy().network(),
+            NetworkAccess::Denied
+        );
+        assert_eq!(
+            resolution.execution_policy().mode(),
+            SandboxMode::DangerFullAccess
+        );
+        assert_eq!(
+            resolution.execution_policy().network(),
+            NetworkAccess::Allowed
+        );
+
+        let prepared = resolution
+            .backend()
+            .prepare(PrepareRequest {
+                program: OsString::from("/bin/sh"),
+                arguments: Vec::new(),
+                cwd: workspace.path().to_owned(),
+                environment: BTreeMap::new(),
+                policy: resolution.execution_policy().clone(),
+            })
+            .expect("native command");
+        let authority = prepared.authority();
+        assert_eq!(authority.approval_mode, "strict");
+        assert_eq!(authority.requested_mode(), SandboxMode::WorkspaceWrite);
+        assert_eq!(authority.mode, SandboxMode::DangerFullAccess);
+        assert_eq!(authority.requested_network(), NetworkAccess::Denied);
+        assert_eq!(authority.network, NetworkAccess::Allowed);
+        assert!(authority.writable_roots.is_empty());
+        assert_eq!(
+            authority.resolution_kind,
+            SandboxResolutionKind::UnavailableFallback
+        );
+    }
+
+    #[test]
+    fn fallback_remains_fail_closed_for_deny_read_only_and_nonavailability_errors() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace_write = || {
+            SandboxPolicy::new(
+                workspace.path(),
+                SandboxMode::WorkspaceWrite,
+                NetworkAccess::Denied,
+            )
+            .expect("workspace-write policy")
+        };
+        let read_only = SandboxPolicy::new(
+            workspace.path(),
+            SandboxMode::ReadOnly,
+            NetworkAccess::Denied,
+        )
+        .expect("read-only policy");
+
+        let denied = resolve_policy_with(workspace_write(), SandboxUnavailableAction::Deny, |_| {
+            Err(SandboxError::BubblewrapNotFound)
+        })
+        .expect_err("default policy remains fail-closed");
+        assert!(matches!(denied, SandboxError::BubblewrapNotFound));
+
+        let read_only =
+            resolve_policy_with(read_only, SandboxUnavailableAction::RunUnconfined, |_| {
+                Err(SandboxError::BubblewrapNotFound)
+            })
+            .expect_err("read-only authority cannot run unconfined");
+        assert!(matches!(read_only, SandboxError::BubblewrapNotFound));
+
+        let untrusted = resolve_policy_with(
+            workspace_write(),
+            SandboxUnavailableAction::RunUnconfined,
+            |_| {
+                Err(SandboxError::UntrustedBubblewrap {
+                    path: PathBuf::from("/tmp/bwrap"),
+                    reason: "writable by another user".to_owned(),
+                })
+            },
+        )
+        .expect_err("untrusted launchers are not availability failures");
+        assert!(matches!(
+            untrusted,
+            SandboxError::UntrustedBubblewrap { .. }
+        ));
+
+        let helper = resolve_policy_with(
+            workspace_write(),
+            SandboxUnavailableAction::RunUnconfined,
+            |_| Err(SandboxError::Helper("internal failure".to_owned())),
+        )
+        .expect_err("helper failures cannot widen authority");
+        assert!(matches!(helper, SandboxError::Helper(_)));
+
+        let probe = resolve_policy_with(
+            workspace_write(),
+            SandboxUnavailableAction::RunUnconfined,
+            |_| {
+                Err(SandboxError::ProbeFailed {
+                    capability: "prepared sandbox helper execution",
+                    detail: "helper exited unexpectedly".to_owned(),
+                })
+            },
+        )
+        .expect_err("helper execution probes cannot widen authority");
+        assert!(matches!(probe, SandboxError::ProbeFailed { .. }));
+    }
+
+    #[test]
+    fn namespace_unavailability_is_eligible_for_trusted_fallback() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let resolution = resolve_policy_with(
+            SandboxPolicy::new(
+                workspace.path(),
+                SandboxMode::WorkspaceWrite,
+                NetworkAccess::Denied,
+            )
+            .expect("policy"),
+            SandboxUnavailableAction::RunUnconfined,
+            |_| {
+                Err(SandboxError::UnavailableCapability {
+                    capability: "network namespace",
+                    detail: "operation not permitted".to_owned(),
+                })
+            },
+        )
+        .expect("namespace policy may activate trusted fallback");
+
+        assert!(matches!(
+            resolution.fallback_reason(),
+            Some(SandboxUnavailableCause::DeploymentCapabilityUnavailable {
+                capability,
+                ..
+            }) if capability == "network namespace"
+        ));
+    }
+
+    #[test]
+    fn command_preparation_failure_never_triggers_a_second_resolution() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let policy = SandboxPolicy::new(
+            workspace.path(),
+            SandboxMode::WorkspaceWrite,
+            NetworkAccess::Allowed,
+        )
+        .expect("policy");
+        let resolution =
+            resolve_policy_with(policy, SandboxUnavailableAction::RunUnconfined, |_| {
+                Ok(Arc::new(LateUnavailableBackend::new()))
+            })
+            .expect("deployment verified before the command");
+
+        assert_eq!(resolution.kind(), SandboxResolutionKind::Confined);
+        let error = resolution
+            .backend()
+            .prepare(PrepareRequest {
+                program: OsString::from("/bin/sh"),
+                arguments: Vec::new(),
+                cwd: workspace.path().to_owned(),
+                environment: BTreeMap::new(),
+                policy: resolution.execution_policy().clone(),
+            })
+            .expect_err("command-stage availability errors are terminal");
+
+        assert!(matches!(
+            error,
+            SandboxError::UnavailableCapability {
+                capability: "command launch",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -951,6 +1718,51 @@ mod tests {
             check.name == "execution_self_test"
                 && check.status == SandboxDeploymentCheckStatus::Skipped
         }));
+    }
+
+    #[test]
+    fn fallback_report_keeps_requested_deployment_unready() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut report = SandboxDeploymentReport {
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            workspace: workspace.path().to_owned(),
+            requested_mode: SandboxMode::WorkspaceWrite,
+            requested_network: NetworkAccess::Denied,
+            on_unavailable: SandboxUnavailableAction::RunUnconfined,
+            effective_mode: None,
+            effective_network: None,
+            resolution_kind: None,
+            fallback_eligible: false,
+            fallback_reason: None,
+            ready: false,
+            native_execution_bypass: false,
+            capabilities: None,
+            launcher: None,
+            checks: Vec::new(),
+            error: None,
+        };
+
+        record_deployment_failure(
+            &mut report,
+            &SandboxError::UnavailableCapability {
+                capability: "network namespace",
+                detail: "operation not permitted".to_owned(),
+            },
+        );
+
+        assert!(!report.ready);
+        assert!(report.fallback_eligible);
+        assert_eq!(
+            report.resolution_kind,
+            Some(SandboxResolutionKind::UnavailableFallback)
+        );
+        assert_eq!(report.effective_mode, Some(SandboxMode::DangerFullAccess));
+        assert_eq!(report.effective_network, Some(NetworkAccess::Allowed));
+        assert!(matches!(
+            report.fallback_reason,
+            Some(SandboxUnavailableCause::DeploymentCapabilityUnavailable { .. })
+        ));
     }
 
     #[cfg(unix)]

@@ -41,7 +41,9 @@ use crate::schema::preset::PresetConfig;
 use crate::schema::product_agent::ProductAgentConfig;
 use crate::schema::provider::ProviderConfig;
 use crate::schema::reference::ReferenceEntry;
-use crate::schema::sandbox::{SandboxConfig, SandboxMode, SandboxNetworkMode};
+use crate::schema::sandbox::{
+    SandboxConfig, SandboxMode, SandboxNetworkMode, SandboxUnavailableAction,
+};
 use crate::schema::workflow::AgentWorkflowConfig;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -246,6 +248,15 @@ impl Config {
         self.sandbox
             .as_ref()
             .map_or(SandboxNetworkMode::Deny, SandboxConfig::resolved_network)
+    }
+
+    /// Resolve the trusted response to an unavailable confined backend.
+    #[must_use]
+    pub fn sandbox_on_unavailable(&self) -> SandboxUnavailableAction {
+        self.sandbox.as_ref().map_or(
+            SandboxUnavailableAction::Deny,
+            SandboxConfig::resolved_on_unavailable,
+        )
     }
 
     /// Resolve the memory master switch and all component defaults.

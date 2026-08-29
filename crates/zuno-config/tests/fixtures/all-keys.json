@@ -4,6 +4,7 @@
   "sandbox": {
     "mode": "workspace-write",
     "network": "deny",
+    "onUnavailable": "run-unconfined",
     "writableRoots": ["../shared-cache"],
     "protectedPaths": [".zuno", ".agents"]
   },

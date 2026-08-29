@@ -140,6 +140,11 @@ async fn cancellation_terminates_the_complete_process_group() {
         .info;
 
     assert_eq!(settled.status, BackgroundExecutionStatus::Cancelled);
+    assert_eq!(settled.authority.schema_version, 3);
+    assert_eq!(
+        settled.authority.requested_mode(),
+        SandboxMode::WorkspaceWrite
+    );
     wait_for_process_exit(parent).await;
     wait_for_process_exit(child).await;
 }
@@ -166,6 +171,11 @@ async fn hard_ceiling_is_terminal_and_never_replays_the_command() {
     assert!(marker.exists());
     assert_eq!(settled.status, BackgroundExecutionStatus::Failed);
     assert!(settled.timed_out);
+    assert_eq!(settled.authority.schema_version, 3);
+    assert_eq!(
+        settled.authority.requested_network(),
+        NetworkAccess::Allowed
+    );
     assert_eq!(
         service.list().len(),
         1,
@@ -284,6 +294,8 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
     let info = service.get(&id).expect("recovered execution");
 
     assert_eq!(info.status, BackgroundExecutionStatus::Uncertain);
+    assert_eq!(info.authority.schema_version, 3);
+    assert_eq!(info.authority.requested_mode(), SandboxMode::WorkspaceWrite);
     assert_eq!(info.output_file, output_file);
     assert_eq!(info.status_file, status_file);
     assert!(
@@ -304,6 +316,61 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
             .expect("recovered output")
             .bytes,
         b"partial"
+    );
+}
+
+#[test]
+fn persisted_v2_authority_recovers_with_requested_equal_to_effective() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let id =
+        BackgroundExecutionId::parse("bg_1123456789abcdef0123456789abcdef").expect("fixture id");
+    let output_file = directory.path().join(format!("{id}.output"));
+    let status_file = directory.path().join(format!("{id}.status.json"));
+    std::fs::write(&output_file, b"legacy").expect("fixture output");
+    let prepared = prepared(directory.path(), "fixture");
+    let mut authority = serde_json::to_value(prepared.authority()).expect("authority JSON");
+    let object = authority.as_object_mut().expect("authority object");
+    object.insert("schemaVersion".to_owned(), serde_json::json!(2));
+    object.remove("requestedMode");
+    object.remove("requestedNetwork");
+    object.remove("resolutionKind");
+    object.remove("fallbackReason");
+    std::fs::write(
+        &status_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "format": 3,
+            "info": {
+                "id": id.as_str(),
+                "sessionId": "ses_background",
+                "title": "fixture",
+                "command": "fixture",
+                "cwd": directory.path(),
+                "status": "completed",
+                "pid": null,
+                "exitCode": 0,
+                "timedOut": false,
+                "timeCreated": 1,
+                "timeUpdated": 1,
+                "timeCompleted": 1,
+                "error": null,
+                "outputFile": "/must/not/be/trusted",
+                "statusFile": "/must/not/be/trusted",
+                "authority": authority
+            }
+        }))
+        .expect("fixture JSON"),
+    )
+    .expect("fixture status");
+
+    let service = BackgroundExecutionService::open(directory.path()).expect("reconciled service");
+    let info = service.get(&id).expect("recovered execution");
+
+    assert_eq!(info.authority.schema_version, 2);
+    assert_eq!(info.authority.requested_mode(), info.authority.mode);
+    assert_eq!(info.authority.requested_network(), info.authority.network);
+    assert_eq!(
+        info.authority.resolution_kind,
+        zuno_sandbox::SandboxResolutionKind::Legacy
     );
 }
 

@@ -677,6 +677,7 @@ commands. The default is `workspace-write`:
   "sandbox": {
     "mode": "workspace-write",
     "network": "deny",
+    "onUnavailable": "deny",
     "writableRoots": ["../shared-cache"],
     "protectedPaths": [".zuno", ".agents", "secrets"]
   }
@@ -692,8 +693,8 @@ The exact modes are:
 - `danger-full-access`: run the configured shell directly as the Zuno user, with
   host filesystem, process, credential, and network access. It also sets the
   effective permission mode to `allow_all`, suppressing Zuno tool-approval
-  prompts. This mode is explicit and is never selected when a confined backend
-  fails.
+  prompts. This mode is explicit, skips restricted-backend discovery, and is
+  independent of unavailable-backend fallback.
 
 An Agent's own capability contract may only narrow that configured maximum. A
 read-only Agent therefore receives `read-only` even when the invocation selected
@@ -705,6 +706,30 @@ trusted layer when model-initiated commands genuinely need host networking.
 `network: "deny"` is invalid. It also rejects `writableRoots` and
 `protectedPaths`, because claiming to enforce either would be misleading.
 
+### Unavailable confinement
+
+`sandbox.onUnavailable` controls what happens when a confined backend cannot be
+deployed:
+
+- `deny` is the default and stops tool assembly.
+- `run-unconfined` allows a write-capable Agent's `workspace-write` request to
+  use the native process backend for an eligible typed availability failure.
+
+Fallback is deliberately narrower than selecting `danger-full-access`.
+`run-unconfined` preserves the configured `standard`, `strict`, or `allow_all`
+permission mode, explicit permission denies, catastrophic-command refusals,
+timeouts, cancellation, and at-most-once background execution. It does not make
+the requested filesystem or network restrictions effective: the command runs
+with the Zuno process user's host authority. Zuno emits a host warning, adds a
+durable `runtime.sandbox` prompt section, and records requested/effective
+authority plus the typed fallback reason.
+
+Only unsupported platforms, a missing trusted launcher, missing required
+launcher capabilities, and namespace/container-policy unavailability are
+eligible. An untrusted launcher, invalid policy/path, seccomp/helper/internal
+failure, generic process error, and command preparation or execution error never
+trigger fallback. A read-only Agent never runs unconfined.
+
 Relative paths resolve from the active workspace. `writableRoots` entries must
 already be directories and are considered only in `workspace-write`.
 `protectedPaths` must exist, may not be symbolic links, and are reapplied
@@ -715,24 +740,29 @@ can add protections but cannot disable confinement.
 Sandbox authority follows configuration provenance. Trusted global, explicit
 config, managed, environment, and CLI layers may select any mode. Project
 `zuno.json[c]` and `.zuno` layers may only narrow to `read-only`, deny networking,
-or add protected paths; they cannot select a wider mode, grant host networking,
-or add external writable roots. Use a trusted one-invocation override when
-needed:
+add protected paths, or set `onUnavailable` to `deny`; they cannot select a wider
+mode, grant host networking, add external writable roots, or enable unconfined
+fallback. Use a trusted one-invocation override when needed:
 
 ```sh
 zuno --sandbox read-only
 zuno --sandbox workspace-write
 zuno --sandbox danger-full-access
+zuno --sandbox-on-unavailable run-unconfined
 ```
 
-Managed policy has later precedence and may still narrow that override.
+The environment equivalent is `ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`.
+Managed policy has later precedence and may still replace either override with
+`deny`.
 
 On Linux, confined Shell registration requires a trusted system bubblewrap plus
 successful user, mount, PID, UTS, IPC, seccomp, and—when `network` is
-`deny`—network namespace probes. A failed probe stops tool assembly; Zuno never
-falls back to raw host execution. Confined macOS and Windows backends are not yet
-implemented and fail closed, while an explicit `danger-full-access` invocation
-uses the native process backend on all supported platforms. See the
+`deny`—network namespace probes. A failed probe stops tool assembly unless it is
+an eligible typed availability failure and trusted policy selected
+`run-unconfined`. Confined macOS and Windows backends are not yet implemented
+and fail closed by default; trusted fallback may run a write-capable Agent
+natively, while an explicit `danger-full-access` invocation always uses the
+native process backend on all supported platforms. See the
 [sandbox FAQ](../faq.md) for the security boundary, Ubuntu AppArmor setup, and
 nested-sandbox diagnosis.
 

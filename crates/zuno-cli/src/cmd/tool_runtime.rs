@@ -47,13 +47,19 @@ use zuno_agent::profile::AgentProfile;
 use zuno_agent::profile::ShellFilesystemAccess;
 use zuno_config::schema::Config;
 use zuno_config::schema::permission::PermissionMode;
-use zuno_config::schema::sandbox::{SandboxMode as ConfigSandboxMode, SandboxNetworkMode};
+use zuno_config::schema::sandbox::{
+    SandboxMode as ConfigSandboxMode, SandboxNetworkMode,
+    SandboxUnavailableAction as ConfigSandboxUnavailableAction,
+};
 use zuno_error::ToolError;
 use zuno_orchestration::{CapabilitySnapshot, ToolSchemaIdentity, sha256_json};
 use zuno_paths::Env;
 use zuno_permission::Rule;
 use zuno_permission::visibility::permission_key;
-use zuno_sandbox::{NetworkAccess, SandboxBackend, SandboxMode, SandboxPolicy};
+use zuno_sandbox::{
+    NetworkAccess, SandboxMode, SandboxPolicy, SandboxResolution, SandboxResolutionKind,
+    SandboxResolver, SandboxUnavailableAction, SystemSandboxResolver,
+};
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolUiIntent, erase};
 use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
@@ -76,6 +82,8 @@ pub(crate) struct ToolRuntime {
     /// a defect a user must see, but which surface can say so — stderr, a transcript
     /// line — is the host's decision, not the registry's.
     pub(crate) suppressions: Vec<String>,
+    /// Durable model-visible notice and one-time host warning for native fallback.
+    pub(crate) sandbox_notice: Option<String>,
 }
 
 pub(crate) struct ToolSelection<'a> {
@@ -85,11 +93,11 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) contributions: Arc<zuno_harness::ToolContributions>,
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
     pub(crate) background_executions: Arc<zuno_pty::BackgroundExecutionService>,
-    /// Test seam for a backend already probed by the composition root.
+    /// Test seam for a resolver supplied by the composition root.
     ///
     /// Production passes `None` and performs native discovery only when Shell
     /// survives the final Agent capability intersection.
-    pub(crate) sandbox: Option<Arc<dyn SandboxBackend>>,
+    pub(crate) sandbox: Option<Arc<dyn SandboxResolver>>,
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
@@ -204,25 +212,23 @@ pub(crate) fn assemble(
         worktree: worktree.map_or_else(|| directory.to_path_buf(), Path::to_path_buf),
     };
     let tooling = SearchTooling::discover(scope).map_err(to_string)?;
+    let mut sandbox_notice = None;
     let shell = shell_visible(selected_profile, selected_agent, &selection).then(|| {
         let policy = sandbox_policy(directory, config, selected_profile, &rules)?;
-        let backend = selection.sandbox.clone().map_or_else(
-            || {
-                zuno_sandbox::system_backend(directory, policy.mode())
-                    .map(Arc::<dyn SandboxBackend>::from)
-                    .map_err(to_string)
-            },
-            Ok,
-        )?;
-        backend
-            .capabilities()
-            .supports(&policy)
+        let resolver = selection
+            .sandbox
+            .clone()
+            .unwrap_or_else(|| Arc::new(SystemSandboxResolver));
+        let resolution = resolver
+            .resolve(policy, sandbox_unavailable_action(config))
             .map_err(to_string)?;
+        sandbox_notice = fallback_notice(&resolution);
+        let (backend, execution_policy) = resolution.into_execution();
         zuno_tools::shell::ShellTool::with_sandbox_backend(
             directory,
             config.shell.as_deref(),
             backend,
-            policy,
+            execution_policy,
         )
         .map_err(to_string)
         .map(|tool| tool.with_background_executions(Arc::clone(&selection.background_executions)))
@@ -434,7 +440,40 @@ pub(crate) fn assemble(
         tools,
         rules,
         suppressions,
+        sandbox_notice,
     })
+}
+
+pub(crate) fn sandbox_unavailable_action(config: &Config) -> SandboxUnavailableAction {
+    match config.sandbox_on_unavailable() {
+        ConfigSandboxUnavailableAction::Deny => SandboxUnavailableAction::Deny,
+        ConfigSandboxUnavailableAction::RunUnconfined => SandboxUnavailableAction::RunUnconfined,
+    }
+}
+
+fn fallback_notice(resolution: &SandboxResolution) -> Option<String> {
+    if resolution.kind() != SandboxResolutionKind::UnavailableFallback {
+        return None;
+    }
+    let requested = resolution.requested_policy();
+    let effective = resolution.execution_policy();
+    let reason = resolution
+        .fallback_reason()
+        .expect("fallback resolution has a typed reason");
+    Some(format!(
+        "The requested OS sandbox is unavailable ({code}: {reason}). Shell commands are running \
+         without OS isolation using the Zuno process user's host authority. Requested authority: \
+         mode={requested_mode}, network={requested_network}. Effective authority: \
+         mode={effective_mode}, network={effective_network}. Requested network denial, writable \
+         root limits, and protected paths cannot be enforced by the OS sandbox in this state. \
+         Permission rules, approvals, catastrophic-command refusals, timeouts, and cancellation \
+         still apply. Do not describe shell execution as sandboxed.",
+        code = reason.code(),
+        requested_mode = requested.mode().as_str(),
+        requested_network = requested.network().as_str(),
+        effective_mode = effective.mode().as_str(),
+        effective_network = effective.network().as_str(),
+    ))
 }
 
 fn shell_visible(
