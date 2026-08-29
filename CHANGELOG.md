@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.0](https://github.com/sunerpy/zuno/compare/v0.2.0...v0.3.0) (2026-08-29)
+
+
+### Features
+
+* **sandbox:** allow trusted unavailable fallback ([03287fc](https://github.com/sunerpy/zuno/commit/03287fcf8f96551c258e5ab8462b26b2fb6d0fa6))
+
+
+### Bug Fixes
+
+* **acp:** retry typed Kiro stream failures ([774ac74](https://github.com/sunerpy/zuno/commit/774ac74bb1054a6f50b9bbd11b2aa94402f45f21))
+* **ci:** 修复 aarch64 腿包管理器与 TUI 不稳定测试 ([2a19555](https://github.com/sunerpy/zuno/commit/2a19555937b7b9527a6abebd2e98683bb2b0f4c9))
+* **ci:** 让无沙箱后端的平台显式声明降级后再冒烟 ([8e150d2](https://github.com/sunerpy/zuno/commit/8e150d2f03f9d890509defd6e0d8a1c14c394e4e))
+* **runtime:** settle interrupted tools and child jobs cooperatively ([d26d1ad](https://github.com/sunerpy/zuno/commit/d26d1ada412855e5b543515ee70be5300e3373aa))
+
 ## [0.2.0](https://github.com/sunerpy/zuno/compare/v0.1.0...v0.2.0) (2026-08-29)
 
 
