@@ -40,9 +40,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use zuno_db::message::{MessageRecord, MessageRole, MessageWithParts, PartKind, PartRecord};
+use zuno_engine::interrupt::HardInterruptRequest;
 use zuno_engine::r#loop::{
-    ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, ToolBlockKind, ToolDiff, TurnEvent,
-    project_history, project_history_owned,
+    ProjectedMessage, TURN_EVENT_CHANNEL_CAPACITY, ToolBlockKind, ToolDiff, ToolInterruption,
+    TurnEvent, project_history, project_history_owned,
 };
 use zuno_engine::session_command::SessionCommand;
 use zuno_llm::event::{
@@ -206,6 +207,18 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
             size_of::<(u32, String, ToolBlockKind)>(),
         ),
         payload(
+            "ToolDispatchInterrupted",
+            size_of::<(
+                u32,
+                String,
+                String,
+                String,
+                String,
+                String,
+                ToolInterruption,
+            )>(),
+        ),
+        payload(
             "ToolDispatchCompleted",
             size_of::<(
                 u32,
@@ -222,7 +235,10 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
         payload("ToolResultAppended", size_of::<(u32, String, bool)>()),
         payload("StepCompleted", size_of::<(u32, Option<FinishReason>)>()),
         payload("TurnCompleted", size_of::<(String, u32)>()),
-        payload("TurnInterrupted", size_of::<(Option<String>, u32)>()),
+        payload(
+            "TurnInterrupted",
+            size_of::<(Option<String>, u32, Option<HardInterruptRequest>)>(),
+        ),
         payload("TurnFailed", size_of::<(Option<String>, u32, String)>()),
     ]
 }
@@ -249,6 +265,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::AssistantCheckpointed { .. } => "AssistantCheckpointed",
         TurnEvent::ToolDispatchStarted { .. } => "ToolDispatchStarted",
         TurnEvent::ToolDispatchBlocked { .. } => "ToolDispatchBlocked",
+        TurnEvent::ToolDispatchInterrupted { .. } => "ToolDispatchInterrupted",
         TurnEvent::ToolDispatchCompleted { .. } => "ToolDispatchCompleted",
         TurnEvent::ToolResultAppended { .. } => "ToolResultAppended",
         TurnEvent::StepCompleted { .. } => "StepCompleted",

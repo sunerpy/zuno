@@ -6,9 +6,10 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use tracing::Instrument as _;
 use zuno_config::schema::permission::PermissionMode;
 use zuno_llm::cache::McpToolStatus;
@@ -24,8 +25,10 @@ use zuno_tool::{
 use crate::hooks::{NoopHooks, PermissionHookDecision, ToolHooks};
 use crate::r#loop::{
     AvailableTools, DispatchRequest, PreparedToolDispatch, ToolBlockKind, ToolDispatchResult,
-    ToolDispatcher,
+    ToolDispatcher, ToolInterruption,
 };
+
+const TOOL_INTERRUPT_SETTLE_GRACE: Duration = Duration::from_secs(2);
 
 /// Executable tools plus the policy collaborators needed at the dispatch boundary.
 pub struct ToolRegistryDispatcher {
@@ -328,12 +331,26 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                     biased;
                     joined = &mut execution => joined_result(&tool_name, replay_policy, joined),
                     () = interrupt.notified() => {
-                        execution.abort();
-                        let _cancelled = execution.await;
-                        error_result(
-                            &tool_name,
-                            format!("Tool `{tool_name}` was interrupted before it completed."),
+                        match tokio::time::timeout(
+                            TOOL_INTERRUPT_SETTLE_GRACE,
+                            &mut execution,
                         )
+                        .await
+                        {
+                            Ok(settled) => interrupted_result(
+                                &tool_name,
+                                ToolInterruption::Cooperative,
+                                Some(joined_result(&tool_name, replay_policy, settled)),
+                            ),
+                            Err(_elapsed) => {
+                                execution.abort();
+                                interrupted_result(
+                                    &tool_name,
+                                    ToolInterruption::Forced,
+                                    None,
+                                )
+                            }
+                        }
                     }
                 };
                 if let Err(error) = hooks
@@ -346,7 +363,14 @@ impl ToolDispatcher for ToolRegistryDispatcher {
                     )
                     .await
                 {
-                    result = error_result(&tool_name, error);
+                    if result.interruption.is_some() {
+                        result
+                            .output
+                            .metadata
+                            .insert("afterHookError".to_owned(), json!({ "message": error }));
+                    } else {
+                        result = error_result(&tool_name, error);
+                    }
                 }
                 finish_observation(lifecycle, &result);
                 result
@@ -851,6 +875,44 @@ fn tool_error_result(
 
 fn error_result(tool: &str, message: String) -> ToolDispatchResult {
     ToolDispatchResult::error(ToolOutput::text(format!("{tool} error"), message))
+}
+
+fn interrupted_result(
+    tool: &str,
+    interruption: ToolInterruption,
+    settled: Option<ToolDispatchResult>,
+) -> ToolDispatchResult {
+    let (forced, uncertain, message) = match interruption {
+        ToolInterruption::Cooperative => (
+            false,
+            false,
+            format!(
+                "Tool `{tool}` acknowledged cancellation and completed its cleanup before returning."
+            ),
+        ),
+        ToolInterruption::Forced => (
+            true,
+            true,
+            format!(
+                "Tool `{tool}` did not stop within {} seconds and was force-aborted. Its final side-effect state is uncertain; inspect authoritative state before retrying.",
+                TOOL_INTERRUPT_SETTLE_GRACE.as_secs()
+            ),
+        ),
+    };
+    let mut output = settled.map_or_else(
+        || ToolOutput::text(format!("{tool} interrupted"), message),
+        |settled| settled.output,
+    );
+    output.metadata.insert(
+        "interruption".to_owned(),
+        json!({
+            "mode": interruption.as_str(),
+            "forced": forced,
+            "uncertain": uncertain,
+            "graceMs": TOOL_INTERRUPT_SETTLE_GRACE.as_millis(),
+        }),
+    );
+    ToolDispatchResult::interrupted(output, interruption)
 }
 
 fn blocked_result(tool: &str, message: String, kind: ToolBlockKind) -> ToolDispatchResult {

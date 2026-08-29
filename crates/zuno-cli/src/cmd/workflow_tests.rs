@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use zuno_db::job::{JobStatus, ReportDelivery as DbReportDelivery};
 use zuno_paths::DbLocation;
 use zuno_tools::council::{CouncilRequest, CouncilSeatRequest};
+use zuno_tools::task::ChildTurnState;
 use zuno_tools::work_state::{WorkItemStatus, WorkStateStore};
 use zuno_tools::workflow::WorkflowNodeRequest;
 
@@ -284,6 +285,7 @@ impl WorkflowNodeRunner for RecordingRunner {
         Ok(ChildTurn {
             session_id: format!("ses_{label}_{attempt}"),
             job_id: None,
+            state: ChildTurnState::Completed,
             output,
             report_metadata: None,
         })

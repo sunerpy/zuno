@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use zuno_db::Pool;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SubmissionState};
 use zuno_db::message::{MessageRecord, MessageStore, PartKind, PartRecord};
@@ -365,6 +366,45 @@ impl ToolDispatcher for FakeDispatcher {
             .as_str()
             .unwrap_or("missing text");
         PreparedToolDispatch::ready(ToolDispatchResult::success(ToolOutput::text("echo", text)))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BlockingToolDispatcher {
+    release: Arc<Semaphore>,
+    completed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl ToolDispatcher for BlockingToolDispatcher {
+    fn available_tools(&self) -> AvailableTools {
+        AvailableTools::new(
+            vec![ToolDefinition {
+                id: "echo".to_owned(),
+                display_name: "echo-runtime".to_owned(),
+                description: "Wait until the test releases the tool.".to_owned(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"]
+                }),
+                ui_intent: zuno_tool::ToolUiIntent::Generic,
+            }],
+            McpToolStatus::Ready,
+        )
+    }
+
+    async fn prepare(&self, _request: DispatchRequest) -> PreparedToolDispatch {
+        let release = Arc::clone(&self.release);
+        let completed = Arc::clone(&self.completed);
+        PreparedToolDispatch::new(Box::pin(async move {
+            let _permit = release
+                .acquire()
+                .await
+                .expect("blocking tool release remains open");
+            completed.store(true, Ordering::Release);
+            ToolDispatchResult::success(ToolOutput::text("echo", "long-running task completed"))
+        }))
     }
 }
 
@@ -2126,6 +2166,116 @@ async fn loop_live_steer_wakes_a_hanging_provider_and_restarts_with_the_new_inpu
     );
 }
 
+#[tokio::test]
+async fn loop_live_steer_waits_for_a_running_tool_instead_of_cancelling_it() {
+    let pool = Arc::new(
+        Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared in-memory loop pool"),
+    );
+    {
+        let mut connection = pool.get().expect("seed connection");
+        migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-loop', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('{SESSION_ID}', 'project-loop', 'loop', '/workspace', 'loop', '1', 1, 1);"
+            ))
+            .expect("seed project and session");
+    }
+    let mut connection = pool.get().expect("turn connection");
+    put_user(&connection, "msg_user", 10, "run the long tool");
+    let inbox = SessionInbox::new(Arc::clone(&pool));
+    let run_registry = SessionRunRegistry::new();
+    let control = run_registry.control(SESSION_ID);
+    let guard = run_registry.begin_turn(SESSION_ID).expect("live turn");
+    let provider = Arc::new(FakeProvider::new(full_turn_responses()));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let release = Arc::new(Semaphore::new(0));
+    let completed = Arc::new(AtomicBool::new(false));
+    let dispatcher = BlockingToolDispatcher {
+        release: Arc::clone(&release),
+        completed: Arc::clone(&completed),
+    };
+    let (sender, mut receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-tool-steer"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            guard.interrupt_signal(),
+        )
+        .with_live_inputs(&guard, &inbox),
+        sender,
+    );
+    let collector = async {
+        let mut events = Vec::new();
+        let mut steered = false;
+        while let Some(event) = receiver.recv().await {
+            if !steered && matches!(event, TurnEvent::ToolDispatchStarted { .. }) {
+                inbox
+                    .admit(NewSessionInput::new(
+                        "msg_tool_steer",
+                        SESSION_ID,
+                        json!({"kind": "user", "prompt": {"text": "keep the result, then continue"}}),
+                        InputDelivery::Steer,
+                        11,
+                    ))
+                    .expect("admit tool-safe steer");
+                control
+                    .queue_soft_interrupt(SoftInterruptMessage {
+                        input_id: Some("msg_tool_steer".to_owned()),
+                        content: "keep the result, then continue".to_owned(),
+                        images: Vec::new(),
+                        urgent: false,
+                        source: SoftInterruptSource::User,
+                    })
+                    .expect("wake the active turn");
+                tokio::task::yield_now().await;
+                assert!(
+                    !completed.load(Ordering::Acquire),
+                    "steering completed or cancelled the running tool before its release"
+                );
+                release.add_permits(1);
+                steered = true;
+            }
+            events.push(event);
+        }
+        assert!(steered, "the tool never reached its steering boundary");
+        events
+    };
+    let (outcome, events) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(turn, collector)
+    })
+    .await
+    .expect("the released tool and steered turn must finish");
+
+    assert!(matches!(
+        outcome.expect("steered tool turn succeeds"),
+        TurnOutcome::Completed { steps: 2, .. }
+    ));
+    assert!(completed.load(Ordering::Acquire));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ToolDispatchCompleted { .. }))
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            TurnEvent::ToolDispatchInterrupted { .. } | TurnEvent::TurnInterrupted { .. }
+        )),
+        "soft steering entered the hard-cancellation projection"
+    );
+    assert!(inbox.pending(SESSION_ID).expect("pending inbox").is_empty());
+    assert_eq!(provider.requests().len(), 2);
+}
+
 async fn collect_and_interrupt_retry_backoff(
     mut receiver: mpsc::Receiver<TurnEvent>,
     interrupt: InterruptSignal,
@@ -3837,6 +3987,7 @@ async fn loop_mid_stream_interrupt_finishes_within_100ms_and_checkpoints_db() {
         Some(TurnEvent::TurnInterrupted {
             assistant_message_id: Some(message_id),
             steps: 1,
+            request: None,
         }) if message_id == "msg_turn-interrupt_0001"
     ));
 
@@ -3910,6 +4061,7 @@ async fn loop_head_interrupt_starts_no_provider_request() {
             TurnEvent::TurnInterrupted {
                 assistant_message_id: None,
                 steps: 0,
+                request: None,
             },
         ]
     );

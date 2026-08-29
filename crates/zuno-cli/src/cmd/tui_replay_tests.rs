@@ -338,6 +338,45 @@ fn a_failed_tool_call_replays_its_error_as_the_output_it_showed_live() {
 }
 
 #[test]
+fn a_cancelled_tool_call_replays_as_cancelled_instead_of_failed() {
+    let connection = seeded();
+    put_message(&connection, "msg_a", "assistant", 100, Value::Null);
+    put_part(
+        &connection,
+        "msg_a",
+        "prt_tool",
+        100,
+        json!({
+            "type": "tool",
+            "callID": "call_1",
+            "tool": "task",
+            "displayName": "Delegate",
+            "state": {
+                "status": "error",
+                "input": {},
+                "title": "Inspect repository",
+                "error": "child supervisor settled",
+                "metadata": {
+                    "interruption": {
+                        "mode": "cooperative",
+                        "forced": false,
+                        "uncertain": false
+                    }
+                }
+            }
+        }),
+    );
+
+    let replay = project(history(&connection));
+
+    let [MessagePart::Tool { status, output, .. }] = replay.messages[0].parts.as_slice() else {
+        panic!("expected one tool part: {:?}", replay.messages[0].parts);
+    };
+    assert_eq!(*status, ToolStatus::Cancelled);
+    assert_eq!(output.as_deref(), Some("child supervisor settled"));
+}
+
+#[test]
 fn a_tool_call_that_never_resolved_replays_as_pending_rather_than_vanishing() {
     let connection = seeded();
     put_message(&connection, "msg_a", "assistant", 100, Value::Null);
@@ -581,7 +620,7 @@ fn an_interrupted_turn_reports_its_failure_beside_the_partial_reply() {
         );
     };
     assert_eq!(text, "Conversation interrupted by user.");
-    assert_eq!(*level, ToastLevel::Error);
+    assert_eq!(*level, ToastLevel::Info);
 }
 
 #[test]

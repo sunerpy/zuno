@@ -321,6 +321,43 @@ impl DelegatedTurnRunner for RecordingRunner {
     }
 }
 
+#[derive(Default)]
+struct StubbornRunner {
+    started: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl DelegatedTurnRunner for StubbornRunner {
+    async fn run(
+        &self,
+        _session_id: &str,
+        _request: &ChildTurnRequest,
+        _cancellation: CancellationToken,
+    ) -> Result<String, String> {
+        self.started.notify_one();
+        pending().await
+    }
+}
+
+#[derive(Default)]
+struct SuccessfulCancellationRunner {
+    started: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl DelegatedTurnRunner for SuccessfulCancellationRunner {
+    async fn run(
+        &self,
+        _session_id: &str,
+        _request: &ChildTurnRequest,
+        cancellation: CancellationToken,
+    ) -> Result<String, String> {
+        self.started.notify_one();
+        cancellation.cancelled().await;
+        Ok(String::from("cleanup completed"))
+    }
+}
+
 #[test]
 fn task_report_metadata_collects_only_typed_durable_evidence() {
     let fixture = Fixture::new();
@@ -1205,12 +1242,163 @@ async fn foreground_dispatch_propagates_parent_interrupt_and_waits_for_runner_ex
     fixture.runner.wait_for_starts(1).await;
     fire.fire();
 
-    let error = tokio::time::timeout(Duration::from_secs(1), task)
+    let turn = tokio::time::timeout(Duration::from_secs(1), task)
         .await
         .expect("foreground cancellation must settle")
         .expect("dispatch task remains attached")
-        .expect_err("an interrupted child cannot report completion");
-    assert!(format!("{error}").contains("cancelled"), "{error}");
+        .expect("an interrupted child returns its durable terminal report");
+    assert_eq!(turn.state, zuno_tools::task::ChildTurnState::Cancelled);
+    assert!(turn.output.contains("cancelled"), "{}", turn.output);
+    assert_eq!(
+        turn.report_metadata
+            .as_ref()
+            .and_then(|report| report["status"].as_str()),
+        Some("cancelled")
+    );
+}
+
+#[tokio::test]
+async fn foreground_cancellation_cannot_be_reclassified_as_successful_completion() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let runner = Arc::new(SuccessfulCancellationRunner::default());
+    let host = ChildSessionHost::with_components(
+        fixture.database.clone(),
+        runner.clone(),
+        fixture.wake.clone(),
+        fixture.jobs.delegation_limiter(
+            NonZeroUsize::new(8).expect("fixture delegation limit is non-zero"),
+        ),
+        fixture.jobs.clone(),
+    )
+    .expect("build cancellation-success child host");
+    let interrupt = Arc::new(InterruptSignal::new());
+    let fire = Arc::clone(&interrupt);
+    let task_host = host.clone();
+    let request = fixture.request("ses_owner");
+    let task =
+        tokio::spawn(async move { ChildTurnHost::dispatch(&task_host, request, interrupt).await });
+
+    runner.started.notified().await;
+    fire.fire();
+    let turn = task
+        .await
+        .expect("foreground task joined")
+        .expect("cancellation returns its durable terminal report");
+
+    assert_eq!(turn.state, zuno_tools::task::ChildTurnState::Cancelled);
+    assert_eq!(turn.output, "cleanup completed");
+    let jobs = host
+        .job_store
+        .list_for_parent("ses_owner")
+        .expect("list foreground child jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, zuno_db::job::JobStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn foreground_child_failure_remains_a_tool_failure_after_job_settlement() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let host = fixture.host.clone();
+    let request = fixture.request("ses_owner");
+    let task =
+        tokio::spawn(async move { ChildTurnHost::dispatch(&host, request, no_interrupt()).await });
+
+    fixture.runner.wait_for_starts(1).await;
+    fixture.runner.complete_with(Err("provider failed"));
+    let error = task
+        .await
+        .expect("foreground task joined")
+        .expect_err("a failed child must remain a failed task tool");
+    assert!(error.to_string().contains("provider failed"), "{error}");
+    let jobs = fixture
+        .host
+        .job_store
+        .list_for_parent("ses_owner")
+        .expect("list foreground child jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].status, zuno_db::job::JobStatus::Failed);
+    assert_eq!(jobs[0].error.as_deref(), Some("provider failed"));
+}
+
+#[tokio::test]
+async fn dropping_the_outer_task_future_still_settles_the_foreground_child_job() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let host = fixture.host.clone();
+    let request = fixture.request("ses_owner");
+    let task =
+        tokio::spawn(async move { ChildTurnHost::dispatch(&host, request, no_interrupt()).await });
+
+    fixture.runner.wait_for_starts(1).await;
+    let jobs = fixture
+        .host
+        .job_store
+        .list_for_parent("ses_owner")
+        .expect("list foreground child jobs");
+    assert_eq!(jobs.len(), 1, "one foreground child job");
+    let job_id = jobs[0].id.clone();
+    task.abort();
+    let _aborted = task.await;
+
+    tokio::time::timeout(Duration::from_secs(1), fixture.jobs.wait_all())
+        .await
+        .expect("the independent child supervisor must settle after its caller is dropped");
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(&job_id)
+            .expect("settled foreground job")
+            .status,
+        zuno_db::job::JobStatus::Cancelled,
+        "dropping TaskTool left a durable job permanently running"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unresponsive_foreground_child_becomes_uncertain_after_the_cancel_deadline() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let runner = Arc::new(StubbornRunner::default());
+    let host = ChildSessionHost::with_components(
+        fixture.database.clone(),
+        runner.clone(),
+        fixture.wake.clone(),
+        fixture.jobs.delegation_limiter(
+            NonZeroUsize::new(8).expect("fixture delegation limit is non-zero"),
+        ),
+        fixture.jobs.clone(),
+    )
+    .expect("build stubborn child host");
+    let task_host = host.clone();
+    let request = fixture.request("ses_owner");
+    let task =
+        tokio::spawn(
+            async move { ChildTurnHost::dispatch(&task_host, request, no_interrupt()).await },
+        );
+
+    runner.started.notified().await;
+    let jobs = host
+        .job_store
+        .list_for_parent("ses_owner")
+        .expect("list foreground child jobs");
+    assert_eq!(jobs.len(), 1, "one foreground child job");
+    let job_id = jobs[0].id.clone();
+    task.abort();
+    let _aborted = task.await;
+
+    tokio::time::advance(Duration::from_secs(10) + Duration::from_millis(1)).await;
+    fixture.jobs.wait_all().await;
+    assert_eq!(
+        host.job_store
+            .get(&job_id)
+            .expect("terminal foreground job")
+            .status,
+        zuno_db::job::JobStatus::Uncertain,
+        "an unresponsive child remained running after the cancellation safety deadline"
+    );
 }
 
 #[tokio::test]
@@ -1389,6 +1577,48 @@ async fn background_dispatch_returns_a_durable_active_job_before_the_child_finis
             .expect("pending report")
             .iter()
             .any(|input| input.id == settled.report_input_id.as_deref().expect("report input id"))
+    );
+}
+
+#[tokio::test]
+async fn an_admitted_background_child_outlives_a_parent_turn_interrupt() {
+    let fixture = Fixture::new();
+    fixture.session("ses_owner", None);
+    let mut request = fixture.request("ses_owner");
+    request.background = true;
+    request.report_delivery = ReportDelivery::Quiet;
+    let interrupt = Arc::new(InterruptSignal::new());
+
+    let turn = fixture
+        .host
+        .dispatch(request, interrupt.clone())
+        .await
+        .expect("admit background child");
+    let job_id = turn.job_id.expect("background job id");
+    fixture.runner.wait_for_starts(1).await;
+    interrupt.fire();
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(&job_id)
+            .expect("background job remains durable")
+            .status,
+        zuno_db::job::JobStatus::Running,
+        "a parent turn interrupt cancelled independent background work"
+    );
+    fixture.runner.complete_with(Ok("background answer"));
+    fixture.jobs.wait_all().await;
+    assert_eq!(
+        fixture
+            .host
+            .job_store
+            .get(&job_id)
+            .expect("settled background job")
+            .status,
+        zuno_db::job::JobStatus::Completed
     );
 }
 

@@ -1,7 +1,47 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
+
+/// The client or lifecycle surface that requested a hard turn interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardInterruptSource {
+    Tui,
+    Acp,
+    Api,
+    Lifecycle,
+}
+
+/// Why a hard turn interruption was requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardInterruptReason {
+    UserCancel,
+    RequestCancelled,
+    Exit,
+    Shutdown,
+    SessionClose,
+}
+
+/// Typed provenance for a hard interruption.
+///
+/// The first accepted request is authoritative. Later lifecycle teardown may
+/// reinforce cancellation, but it cannot rewrite the user action that caused it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardInterruptRequest {
+    pub source: HardInterruptSource,
+    pub reason: HardInterruptReason,
+}
+
+impl HardInterruptRequest {
+    #[must_use]
+    pub const fn new(source: HardInterruptSource, reason: HardInterruptReason) -> Self {
+        Self { source, reason }
+    }
+}
 
 /// A soft interruption to inject at the next safe point in the turn loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +157,65 @@ impl zuno_tool::InterruptHandle for InterruptSignal {
 
     async fn notified(&self) {
         InterruptSignal::notified(self).await;
+    }
+}
+
+/// A hard interrupt signal paired with immutable first-request provenance.
+#[derive(Debug, Clone)]
+pub struct HardInterruptSignal {
+    signal: InterruptSignal,
+    request: Arc<Mutex<Option<HardInterruptRequest>>>,
+}
+
+impl HardInterruptSignal {
+    /// Creates a clear hard-interrupt signal with no accepted request.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            signal: InterruptSignal::new(),
+            request: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Records and fires the first request, preserving it across later requests.
+    ///
+    /// Returns `true` only when `request` became the authoritative source.
+    pub fn request(&self, request: HardInterruptRequest) -> bool {
+        let accepted = {
+            let mut current = self
+                .request
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(request);
+                true
+            }
+        };
+        self.signal.fire();
+        accepted
+    }
+
+    /// The generic cancellation signal consumed by providers and tools.
+    #[must_use]
+    pub fn signal(&self) -> &InterruptSignal {
+        &self.signal
+    }
+
+    /// Returns the first accepted hard-interrupt request.
+    #[must_use]
+    pub fn request_snapshot(&self) -> Option<HardInterruptRequest> {
+        *self
+            .request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Default for HardInterruptSignal {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

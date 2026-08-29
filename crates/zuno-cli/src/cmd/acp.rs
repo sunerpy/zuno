@@ -8,6 +8,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
@@ -109,7 +110,7 @@ impl zuno_acp::Agent for ProductionAcpAgent {
         }
         let session_id = required_string(&params, "sessionId")?;
         let session = self.session(&session_id).await?;
-        session.cancel();
+        session.cancel(HardInterruptReason::UserCancel);
         Ok(())
     }
 
@@ -122,7 +123,7 @@ impl zuno_acp::Agent for ProductionAcpAgent {
         };
         let session = self.state.sessions.lock().await.get(session_id).cloned();
         if let Some(session) = session {
-            session.cancel();
+            session.cancel(HardInterruptReason::RequestCancelled);
         }
     }
 }
@@ -1392,9 +1393,11 @@ impl AcpSession {
         Ok(())
     }
 
-    fn cancel(&self) {
+    fn cancel(&self, reason: HardInterruptReason) {
         if self.prompt_active.load(Ordering::Acquire) {
-            let _disposition = self.control.abort();
+            let _disposition = self
+                .control
+                .abort(HardInterruptRequest::new(HardInterruptSource::Acp, reason));
         }
     }
 
@@ -1483,9 +1486,15 @@ impl AcpSession {
     async fn shutdown(&self) -> Result<(), String> {
         self.closed.store(true, Ordering::Release);
         if self.prompt_active.load(Ordering::Acquire) {
-            let _disposition = self.control.abort();
+            let _disposition = self.control.abort(HardInterruptRequest::new(
+                HardInterruptSource::Lifecycle,
+                HardInterruptReason::SessionClose,
+            ));
         } else {
-            let _aborted = self.control.abort_active();
+            let _aborted = self.control.abort_active(HardInterruptRequest::new(
+                HardInterruptSource::Lifecycle,
+                HardInterruptReason::SessionClose,
+            ));
         }
         let _replay = self.replay_gate.lock().await;
         let _mount = self.mount_gate.lock().await;

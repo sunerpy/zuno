@@ -2,7 +2,7 @@ use serde_json::json;
 use zuno_acp::{
     AttemptBufferedTurnEventProjector, IMPLEMENTED_METHODS, TurnEventProjector, turn_event_update,
 };
-use zuno_engine::r#loop::{ToolBlockKind, ToolDiff, TurnEvent};
+use zuno_engine::r#loop::{ToolBlockKind, ToolDiff, ToolInterruption, TurnEvent};
 use zuno_llm::event::{PromptAccounting, StreamEvent};
 use zuno_tool::{FileDiff, ToolUiIntent};
 
@@ -336,6 +336,52 @@ fn blocked_tools_are_projected_as_failed_with_typed_output() {
         blocked["rawOutput"],
         json!({ "blocked": true, "kind": "denied" })
     );
+}
+
+#[test]
+fn cancelled_tools_use_stable_acp_status_with_typed_zuno_metadata() {
+    let mut projector = TurnEventProjector::new();
+    let cancelled = projector
+        .project(&TurnEvent::ToolDispatchInterrupted {
+            step: 1,
+            call_id: "call-cancelled".to_owned(),
+            display_name: "Delegate".to_owned(),
+            name: "task".to_owned(),
+            title: "Inspect repository".to_owned(),
+            output: "child supervisor settled".to_owned(),
+            interruption: ToolInterruption::Cooperative,
+        })
+        .expect("cancelled tool is client-visible");
+
+    assert_eq!(cancelled["status"], "failed");
+    assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "cancelled");
+    assert_eq!(
+        cancelled["_meta"]["zuno"]["interruptionMode"],
+        "cooperative"
+    );
+    assert_eq!(cancelled["_meta"]["zuno"]["uncertain"], false);
+    assert_eq!(
+        cancelled["content"][0]["content"]["text"],
+        "child supervisor settled"
+    );
+}
+
+#[test]
+fn turn_interruption_projects_typed_provenance_without_a_failure_card() {
+    let update = turn_event_update(&TurnEvent::TurnInterrupted {
+        assistant_message_id: Some("msg-1".to_owned()),
+        steps: 1,
+        request: Some(zuno_engine::interrupt::HardInterruptRequest::new(
+            zuno_engine::interrupt::HardInterruptSource::Acp,
+            zuno_engine::interrupt::HardInterruptReason::UserCancel,
+        )),
+    })
+    .expect("turn interruption is client-visible");
+
+    assert_eq!(update["sessionUpdate"], "agent_message_chunk");
+    assert_eq!(update["_meta"]["zuno"]["kind"], "turn_interrupted");
+    assert_eq!(update["_meta"]["zuno"]["source"], "acp");
+    assert_eq!(update["_meta"]["zuno"]["reason"], "user_cancel");
 }
 
 #[test]

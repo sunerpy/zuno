@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
-use zuno_engine::r#loop::{ToolDiff, TurnEvent};
+use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, ToolDiff, ToolInterruption, TurnEvent};
 use zuno_llm::event::StreamEvent;
 
 use crate::presentation::{decorate_completed_tool_update, decorate_tool_call};
@@ -213,6 +213,37 @@ impl TurnEventProjector {
                     },
                 }))
             }
+            TurnEvent::ToolDispatchInterrupted {
+                call_id,
+                display_name,
+                name,
+                title,
+                output,
+                interruption,
+                ..
+            } => {
+                let raw_input = self
+                    .raw_inputs
+                    .remove(call_id)
+                    .map(|value| json_or_string(&value));
+                self.tool_names.remove(call_id);
+                self.visible_tools.remove(call_id);
+                Some(interrupted_tool_update(
+                    CompletedToolUpdate {
+                        call_id,
+                        display_name,
+                        name,
+                        title,
+                        raw_input: raw_input.as_ref(),
+                        output,
+                        diff: None,
+                        written_paths: &[],
+                        is_error: true,
+                        metadata: None,
+                    },
+                    *interruption,
+                ))
+            }
             TurnEvent::ToolDispatchCompleted {
                 call_id,
                 display_name,
@@ -243,6 +274,10 @@ impl TurnEventProjector {
                     metadata: None,
                 }))
             }
+            TurnEvent::TurnInterrupted { request, .. } => Some(interruption_update(
+                request.map(|request| request.source),
+                request.map(|request| request.reason),
+            )),
             TurnEvent::Provider {
                 event:
                     StreamEvent::ToolResult {
@@ -387,6 +422,54 @@ pub(crate) fn completed_tool_update(input: CompletedToolUpdate<'_>) -> Value {
     update
 }
 
+pub(crate) fn interrupted_tool_update(
+    input: CompletedToolUpdate<'_>,
+    interruption: ToolInterruption,
+) -> Value {
+    let mut metadata = input.metadata.cloned().unwrap_or_default();
+    let presentation_state = if interruption.uncertain() {
+        "uncertain"
+    } else {
+        "cancelled"
+    };
+    match input.name {
+        "task" => {
+            let subagent = metadata
+                .entry("subagent".to_owned())
+                .or_insert_with(|| json!({}));
+            if !subagent.is_object() {
+                *subagent = json!({});
+            }
+            subagent["state"] = json!(presentation_state);
+        }
+        "question" => {
+            metadata.insert("questionStatus".to_owned(), json!(presentation_state));
+        }
+        _ => {}
+    }
+    let mut update = completed_tool_update(CompletedToolUpdate {
+        metadata: Some(&metadata),
+        ..input
+    });
+    let zuno = update
+        .as_object_mut()
+        .expect("tool update is an object")
+        .entry("_meta")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .expect("tool update metadata is an object")
+        .entry("zuno")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .expect("zuno tool metadata is an object");
+    zuno.insert("outcome".to_owned(), json!("cancelled"));
+    zuno.insert("cancelled".to_owned(), json!(true));
+    zuno.insert("interruptionMode".to_owned(), json!(interruption.as_str()));
+    zuno.insert("forced".to_owned(), json!(interruption.uncertain()));
+    zuno.insert("uncertain".to_owned(), json!(interruption.uncertain()));
+    update
+}
+
 fn shell_command<'a>(name: &str, raw_input: Option<&'a Value>) -> Option<&'a str> {
     if name != "shell" {
         return None;
@@ -412,6 +495,23 @@ fn content_update(kind: &str, text: &str) -> Value {
     json!({
         "sessionUpdate": kind,
         "content": { "type": "text", "text": text },
+    })
+}
+
+fn interruption_update(
+    source: Option<zuno_engine::interrupt::HardInterruptSource>,
+    reason: Option<zuno_engine::interrupt::HardInterruptReason>,
+) -> Value {
+    json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "text", "text": INTERRUPTED_TURN_NOTICE },
+        "_meta": {
+            "zuno": {
+                "kind": "turn_interrupted",
+                "source": source,
+                "reason": reason,
+            },
+        },
     })
 }
 

@@ -13,7 +13,10 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput};
 use zuno_db::session::{ListQuery, Session, SessionCreate, SortDirection};
-use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
+use zuno_engine::interrupt::{
+    HardInterruptReason, HardInterruptRequest, HardInterruptSource, SoftInterruptMessage,
+    SoftInterruptSource,
+};
 use zuno_engine::r#loop::event_channel;
 use zuno_engine::status::{SessionRunGuard, SessionStatus};
 use zuno_error::DbError;
@@ -211,15 +214,15 @@ pub struct PromptInputBody {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PromptDelivery {
+    Queue,
     Steer,
-    NextStep,
 }
 
 impl PromptDelivery {
     fn into_inbox(self) -> InputDelivery {
         match self {
+            Self::Queue => InputDelivery::Queue,
             Self::Steer => InputDelivery::Steer,
-            Self::NextStep => InputDelivery::Queue,
         }
     }
 }
@@ -752,7 +755,7 @@ pub async fn prompt(
         model,
     } = input;
     let message_id = id.unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
-    let delivery = delivery.unwrap_or(PromptDelivery::Steer);
+    let delivery = delivery.unwrap_or(PromptDelivery::Queue);
     let created = zuno_db::message::now_millis();
     let selected_model = match model {
         Some(model) => Some(SessionModelSelection {
@@ -1045,7 +1048,10 @@ pub async fn interrupt(
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state.sessions().get(&session_id)?;
-    services.runs.abort(&session_id);
+    services.runs.abort(
+        &session_id,
+        HardInterruptRequest::new(HardInterruptSource::Api, HardInterruptReason::UserCancel),
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 

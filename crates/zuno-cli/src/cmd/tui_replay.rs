@@ -142,8 +142,8 @@ fn project_message(stored: MessageWithParts) -> Vec<Message> {
         }
         messages.push(message);
     }
-    if let Some(failure) = failure {
-        messages.push(Message::noticed(ToastLevel::Error, failure));
+    if let Some((level, failure)) = failure {
+        messages.push(Message::noticed(level, failure));
     }
     messages
 }
@@ -241,6 +241,15 @@ fn tool(data: &serde_json::Map<String, Value>) -> Option<MessagePart> {
                 == Some("blocked") =>
         {
             ToolStatus::Blocked
+        }
+        Some("error")
+            if state
+                .and_then(|state| state.get("metadata"))
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("interruption"))
+                .is_some() =>
+        {
+            ToolStatus::Cancelled
         }
         Some("error") => ToolStatus::Error,
         Some("running") => ToolStatus::Running,
@@ -358,16 +367,16 @@ fn error_summary(error: &Value) -> Option<String> {
 /// Current Zuno checkpoints use `AbortError`; imported sessions may still carry
 /// `MessageAbortedError`. Both name the same user action and are normalised to the
 /// stable live marker instead of exposing provider/storage wording.
-fn error_notice(error: &Value) -> Option<String> {
+fn error_notice(error: &Value) -> Option<(ToastLevel, String)> {
     let interruption = error
         .as_object()
         .and_then(|object| object.get("name"))
         .and_then(Value::as_str)
         .is_some_and(|name| matches!(name, "AbortError" | "MessageAbortedError"));
     if interruption {
-        Some(INTERRUPTED_TURN_NOTICE.to_owned())
+        Some((ToastLevel::Info, INTERRUPTED_TURN_NOTICE.to_owned()))
     } else {
-        error_summary(error)
+        error_summary(error).map(|message| (ToastLevel::Error, message))
     }
 }
 /// The notice shown when a session's stored history could not be read at all.

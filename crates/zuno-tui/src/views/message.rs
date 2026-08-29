@@ -100,6 +100,8 @@ pub enum ToolStatus {
     Completed,
     /// Refused before the requested effect ran.
     Blocked,
+    /// Stopped because the turn received an explicit hard interruption.
+    Cancelled,
     /// Finished with a failure.
     Error,
 }
@@ -113,6 +115,7 @@ impl ToolStatus {
             Self::Running => "…",
             Self::Completed => "✓",
             Self::Blocked => "!",
+            Self::Cancelled => "×",
             Self::Error => "✗",
         }
     }
@@ -1112,6 +1115,27 @@ impl Transcript {
                     *status = ToolStatus::Blocked;
                 }
             }),
+            TurnEvent::ToolDispatchInterrupted {
+                call_id,
+                display_name,
+                title,
+                output,
+                ..
+            } => self.update_tool(call_id, |part| {
+                if let MessagePart::Tool {
+                    status,
+                    display_name: rendered_name,
+                    title: slot,
+                    output: body,
+                    ..
+                } = part
+                {
+                    *status = ToolStatus::Cancelled;
+                    *rendered_name = display_name.clone();
+                    *slot = Some(title.clone());
+                    *body = Some(output.clone());
+                }
+            }),
             TurnEvent::ToolDispatchCompleted {
                 call_id,
                 display_name,
@@ -1158,7 +1182,7 @@ impl Transcript {
                 self.close_reasoning();
                 if !self.interruption_noted {
                     self.messages.push(Message::noticed(
-                        crate::views::toast::ToastLevel::Error,
+                        crate::views::toast::ToastLevel::Info,
                         INTERRUPTED_TURN_NOTICE,
                     ));
                     self.interruption_noted = true;
@@ -2921,7 +2945,7 @@ impl TranscriptView {
         // keeps warning colour because it asks the user to act.
         let body = match status {
             ToolStatus::Error | ToolStatus::Completed => self.context.tool_output(),
-            ToolStatus::Blocked => self.context.warning(),
+            ToolStatus::Blocked | ToolStatus::Cancelled => self.context.warning(),
             ToolStatus::Pending | ToolStatus::Running => self.context.secondary(),
         };
         let rows = wrap(result, body_width);
@@ -3233,7 +3257,8 @@ fn fingerprint(message: &Message) -> u64 {
                     ToolStatus::Running => 1,
                     ToolStatus::Completed => 2,
                     ToolStatus::Blocked => 3,
-                    ToolStatus::Error => 4,
+                    ToolStatus::Cancelled => 4,
+                    ToolStatus::Error => 5,
                 }
                 .hash(&mut hasher);
                 output.hash(&mut hasher);

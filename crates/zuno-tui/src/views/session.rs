@@ -71,6 +71,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 
 /// The dialog id the skill browser reports under.
 pub const SKILL_DIALOG_ID: &str = "prompt_skills";
@@ -609,7 +610,7 @@ pub struct SessionScreen {
     census: Vec<crate::views::diagnostics::Group>,
     /// The runtime facts `§8.7`'s debug report states.
     debug: crate::views::diagnostics::DebugFacts,
-    cancels: Option<mpsc::Sender<()>>,
+    cancels: Option<mpsc::Sender<HardInterruptRequest>>,
     /// Language-server reports produced beside the loop.
     ///
     /// Drained with `try_recv` inside `handle_event`, which is the same non-blocking
@@ -1203,7 +1204,7 @@ impl SessionScreen {
     /// Optional for the same reason [`Self::with_prompt_sink`] is: a screen with no
     /// driver has no turn to cancel. Without it, an exit chord leaves immediately.
     #[must_use]
-    pub fn with_cancel_sink(mut self, cancels: mpsc::Sender<()>) -> Self {
+    pub fn with_cancel_sink(mut self, cancels: mpsc::Sender<HardInterruptRequest>) -> Self {
         self.cancels = Some(cancels);
         self
     }
@@ -3979,7 +3980,12 @@ impl SessionScreen {
         if self.status.is_running()
             && !self.cancel_requested
             && let Some(cancels) = self.cancels.as_ref()
-            && cancels.try_send(()).is_ok()
+            && cancels
+                .try_send(HardInterruptRequest::new(
+                    HardInterruptSource::Tui,
+                    HardInterruptReason::Exit,
+                ))
+                .is_ok()
         {
             self.cancel_requested = true;
             self.interrupt_armed_at_ms = None;
@@ -4015,7 +4021,12 @@ impl SessionScreen {
 
         self.interrupt_armed_at_ms = None;
         if let Some(cancels) = self.cancels.as_ref()
-            && cancels.try_send(()).is_ok()
+            && cancels
+                .try_send(HardInterruptRequest::new(
+                    HardInterruptSource::Tui,
+                    HardInterruptReason::UserCancel,
+                ))
+                .is_ok()
         {
             self.cancel_requested = true;
             self.cancellations += 1;

@@ -20,7 +20,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -38,7 +38,7 @@ use zuno_orchestration::AttemptSnapshot;
 use zuno_tool::{InterruptHandle, PermissionAsker};
 use zuno_tools::question::QuestionAsker;
 use zuno_tools::task::{
-    ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest,
+    ChildTurn, ChildTurnError, ChildTurnHost, ChildTurnRequest, ChildTurnState,
     ReportDelivery as ToolReportDelivery,
 };
 
@@ -60,6 +60,7 @@ const CHILD_SESSION_METADATA_INITIAL_DELAY: Duration = Duration::from_millis(25)
 const CHILD_SESSION_METADATA_MAX_DELAY: Duration = Duration::from_millis(250);
 const PARENT_WAKE_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const PARENT_WAKE_MAX_DELAY: Duration = Duration::from_secs(5);
+const FOREGROUND_CHILD_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_REPORT_METADATA_SCHEMA_VERSION: u32 = 1;
 const TASK_VERIFICATION_METADATA_KEY: &str = "taskVerification";
 const UNCERTAIN_SIDE_EFFECTS_METADATA_KEY: &str = "uncertainSideEffects";
@@ -501,6 +502,32 @@ impl ChildJobLease {
                 "acquire child job lease `{}`: {error}",
                 path.display()
             )),
+        }
+    }
+}
+
+struct ForegroundDispatchLease {
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl ForegroundDispatchLease {
+    fn new(cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ForegroundDispatchLease {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancellation.cancel();
         }
     }
 }
@@ -1202,56 +1229,201 @@ impl ChildSessionHost {
             .await
             .map_err(|error| ChildTurnError::Host(error.to_string()))?;
         let job_id = crate::cmd::turn::prefixed_id("job");
+        let execution_lease = ChildJobLease::try_acquire(self.database.as_ref(), &job_id)
+            .map_err(ChildTurnError::Host)?
+            .ok_or_else(|| {
+                ChildTurnError::Host(format!(
+                    "new foreground job `{job_id}` unexpectedly already has a live executor"
+                ))
+            })?;
         let admitted =
             self.admit_child_job(&request, job_id.clone(), DbReportDelivery::Quiet, false)?;
         let JobSubject::ChildSession { session_id } = &admitted.subject else {
             unreachable!("native child admission always stores a child-session subject")
         };
         let session_id = session_id.clone();
-        let outcome = self
-            .runner
-            .run(&session_id, &request, cancellation.clone())
-            .await;
-        let completed = zuno_db::message::now_millis();
-        let (status, final_text) = match &outcome {
-            Ok(output) => ("completed", output.as_str()),
-            Err(error) if cancellation.is_cancelled() => ("cancelled", error.as_str()),
-            Err(error) => ("failed", error.as_str()),
-        };
-        let report_metadata = serde_json::to_value(task_report_metadata(
-            &self.database,
-            &request,
-            TaskReportBuild {
-                job_id: Some(&job_id),
-                child_session_id: &session_id,
-                evidence_start_rowid: admitted.evidence_start_rowid,
-                status,
-                final_text,
-                uncertain_side_effects: Vec::new(),
+        let evidence_start_rowid = admitted.evidence_start_rowid;
+        let parent_session_id = request.parent_session_id.clone();
+        let runner = Arc::clone(&self.runner);
+        let database = Arc::clone(&self.database);
+        let job_store = self.job_store.clone();
+        let task_cancellation = cancellation.clone();
+        let task_job_id = job_id.clone();
+        let task_session_id = session_id.clone();
+        let (result_sender, result_receiver) = oneshot::channel();
+
+        self.supervisor.spawn(
+            job_id,
+            parent_session_id,
+            cancellation.clone(),
+            async move {
+                let _permit = _permit;
+                let _execution_lease = execution_lease;
+                let outcome = run_foreground_child(
+                    runner,
+                    task_session_id.clone(),
+                    request.clone(),
+                    task_cancellation,
+                )
+                .await;
+                let result = settle_foreground_child(
+                    &database,
+                    &job_store,
+                    &request,
+                    &task_job_id,
+                    &task_session_id,
+                    evidence_start_rowid,
+                    outcome,
+                );
+                if result_sender.send(result).is_err() {
+                    tracing::debug!(
+                        job_id = %task_job_id,
+                        session_id = %task_session_id,
+                        "foreground child settled after its caller detached"
+                    );
+                }
             },
-        ))
-        .map_err(|error| ChildTurnError::Host(error.to_string()))?;
-        let settlement = match &outcome {
-            Ok(_) => JobSettlement::completed(report_metadata.clone(), completed, None),
-            Err(error) if cancellation.is_cancelled() => {
-                JobSettlement::cancelled(error.clone(), completed, None)
-                    .with_result(report_metadata.clone())
+        );
+
+        let mut caller_lease = ForegroundDispatchLease::new(cancellation);
+        let result = result_receiver.await.map_err(|_| {
+            ChildTurnError::Host(format!(
+                "foreground child supervisor for `{session_id}` stopped before publishing its terminal result"
+            ))
+        });
+        caller_lease.disarm();
+        result?
+    }
+}
+
+enum ForegroundChildOutcome {
+    Completed(String),
+    Failed(String),
+    Cancelled(String),
+    Uncertain(String),
+}
+
+async fn run_foreground_child(
+    runner: Arc<dyn DelegatedTurnRunner>,
+    session_id: String,
+    request: ChildTurnRequest,
+    cancellation: CancellationToken,
+) -> ForegroundChildOutcome {
+    let runner_cancellation = cancellation.clone();
+    let mut runner_task =
+        tokio::spawn(async move { runner.run(&session_id, &request, runner_cancellation).await });
+    tokio::select! {
+        biased;
+        joined = &mut runner_task => foreground_child_outcome(joined, cancellation.is_cancelled()),
+        () = cancellation.cancelled() => {
+            match tokio::time::timeout(
+                FOREGROUND_CHILD_CANCEL_SETTLE_TIMEOUT,
+                &mut runner_task,
+            )
+            .await
+            {
+                Ok(joined) => foreground_child_outcome(joined, true),
+                Err(_elapsed) => {
+                    runner_task.abort();
+                    ForegroundChildOutcome::Uncertain(format!(
+                        "child did not acknowledge cancellation within {} seconds; execution was force-aborted and its side effects require inspection",
+                        FOREGROUND_CHILD_CANCEL_SETTLE_TIMEOUT.as_secs()
+                    ))
+                }
             }
-            Err(error) => JobSettlement::failed(error.clone(), completed, None)
-                .with_result(report_metadata.clone()),
-        };
-        self.job_store
-            .settle(&job_id, settlement)
-            .map_err(|error| ChildTurnError::Host(zuno_error::source::describe(&error)))?;
-        match outcome {
-            Ok(output) => Ok(ChildTurn {
-                session_id,
-                job_id: None,
-                output,
-                report_metadata: Some(report_metadata),
-            }),
-            Err(error) => Err(ChildTurnError::Host(error)),
         }
+    }
+}
+
+fn foreground_child_outcome(
+    joined: Result<Result<String, String>, tokio::task::JoinError>,
+    cancellation_requested: bool,
+) -> ForegroundChildOutcome {
+    match joined {
+        Ok(Ok(output)) if cancellation_requested => ForegroundChildOutcome::Cancelled(output),
+        Ok(Ok(output)) => ForegroundChildOutcome::Completed(output),
+        Ok(Err(error)) if cancellation_requested => ForegroundChildOutcome::Cancelled(error),
+        Ok(Err(error)) => ForegroundChildOutcome::Failed(error),
+        Err(error) => ForegroundChildOutcome::Uncertain(format!(
+            "child execution ended without an authoritative result: {error}"
+        )),
+    }
+}
+
+fn settle_foreground_child(
+    database: &zuno_db::pool::Pool,
+    job_store: &AgentJobStore,
+    request: &ChildTurnRequest,
+    job_id: &str,
+    session_id: &str,
+    evidence_start_rowid: i64,
+    outcome: ForegroundChildOutcome,
+) -> Result<ChildTurn, ChildTurnError> {
+    let (status, final_text, uncertain_side_effects) = match &outcome {
+        ForegroundChildOutcome::Completed(output) => ("completed", output.as_str(), Vec::new()),
+        ForegroundChildOutcome::Failed(error) => ("failed", error.as_str(), Vec::new()),
+        ForegroundChildOutcome::Cancelled(error) => ("cancelled", error.as_str(), Vec::new()),
+        ForegroundChildOutcome::Uncertain(error) => {
+            ("uncertain", error.as_str(), vec![error.clone()])
+        }
+    };
+    let report_metadata = serde_json::to_value(task_report_metadata(
+        database,
+        request,
+        TaskReportBuild {
+            job_id: Some(job_id),
+            child_session_id: session_id,
+            evidence_start_rowid,
+            status,
+            final_text,
+            uncertain_side_effects,
+        },
+    ))
+    .map_err(|error| ChildTurnError::Host(error.to_string()))?;
+    let completed = zuno_db::message::now_millis();
+    let settlement = match &outcome {
+        ForegroundChildOutcome::Completed(_) => {
+            JobSettlement::completed(report_metadata.clone(), completed, None)
+        }
+        ForegroundChildOutcome::Failed(error) => {
+            JobSettlement::failed(error.clone(), completed, None)
+                .with_result(report_metadata.clone())
+        }
+        ForegroundChildOutcome::Cancelled(error) => {
+            JobSettlement::cancelled(error.clone(), completed, None)
+                .with_result(report_metadata.clone())
+        }
+        ForegroundChildOutcome::Uncertain(error) => {
+            JobSettlement::uncertain(error.clone(), completed, None)
+                .with_result(report_metadata.clone())
+        }
+    };
+    job_store
+        .settle(job_id, settlement)
+        .map_err(|error| ChildTurnError::Host(zuno_error::source::describe(&error)))?;
+    match outcome {
+        ForegroundChildOutcome::Completed(output) => Ok(ChildTurn {
+            session_id: session_id.to_owned(),
+            job_id: None,
+            state: ChildTurnState::Completed,
+            output,
+            report_metadata: Some(report_metadata),
+        }),
+        ForegroundChildOutcome::Failed(error) => Err(ChildTurnError::Host(error)),
+        ForegroundChildOutcome::Cancelled(output) => Ok(ChildTurn {
+            session_id: session_id.to_owned(),
+            job_id: None,
+            state: ChildTurnState::Cancelled,
+            output,
+            report_metadata: Some(report_metadata),
+        }),
+        ForegroundChildOutcome::Uncertain(error) => Ok(ChildTurn {
+            session_id: session_id.to_owned(),
+            job_id: None,
+            state: ChildTurnState::Uncertain,
+            output: error,
+            report_metadata: Some(report_metadata),
+        }),
     }
 }
 
@@ -1396,7 +1568,10 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {
-                    let _aborted = control.abort();
+                    let _aborted = control.abort(zuno_engine::interrupt::HardInterruptRequest::new(
+                        zuno_engine::interrupt::HardInterruptSource::Lifecycle,
+                        zuno_engine::interrupt::HardInterruptReason::SessionClose,
+                    ));
                     let _drained = drive.await;
                     Err("child turn was cancelled".to_owned())
                 }
@@ -1527,7 +1702,12 @@ impl InteractiveChildInput {
                 let outcome = tokio::select! {
                     biased;
                     () = task_cancellation.cancelled() => {
-                        let _aborted = control.abort();
+                        let _aborted = control.abort(
+                            zuno_engine::interrupt::HardInterruptRequest::new(
+                                zuno_engine::interrupt::HardInterruptSource::Lifecycle,
+                                zuno_engine::interrupt::HardInterruptReason::Shutdown,
+                            ),
+                        );
                         delivery.await
                     }
                     outcome = &mut delivery => outcome,
@@ -2144,10 +2324,7 @@ impl ChildTurnHost for ChildSessionHost {
                 biased;
                 () = interrupt.notified() => {
                     cancellation.cancel();
-                    match dispatch.await {
-                        Ok(_) => Err(ChildTurnError::Host("child turn was cancelled".to_owned())),
-                        Err(error) => Err(error),
-                    }
+                    dispatch.await
                 }
                 result = &mut dispatch => result,
             };
@@ -2351,6 +2528,7 @@ impl ChildTurnHost for ChildSessionHost {
         Ok(ChildTurn {
             session_id,
             job_id: Some(job_id),
+            state: ChildTurnState::Running,
             output: "Background subagent started. Its terminal state will be delivered according \
                      to `reportDelivery`."
                 .to_owned(),

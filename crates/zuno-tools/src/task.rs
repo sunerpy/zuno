@@ -369,6 +369,8 @@ pub struct ChildTurn {
     pub session_id: String,
     /// The job handle, for a background dispatch only. Never the session id.
     pub job_id: Option<String>,
+    /// The durable state reached by this dispatch.
+    pub state: ChildTurnState,
     /// The child's final text, or the running-notice for a background dispatch.
     pub output: String,
     /// Host-generated terminal evidence for a completed foreground child.
@@ -376,6 +378,29 @@ pub struct ChildTurn {
     /// Background children publish the same shape through their durable Job result
     /// and optional next-step report after settlement.
     pub report_metadata: Option<Value>,
+}
+
+/// The durable state reached by one delegated child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildTurnState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Uncertain,
+}
+
+impl ChildTurnState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Uncertain => "uncertain",
+        }
+    }
 }
 
 /// Why a dispatch could not produce a child turn.
@@ -977,7 +1002,7 @@ fn render(
     turn: &ChildTurn,
     background: bool,
 ) -> ToolOutput {
-    let state = if background { "running" } else { "completed" };
+    let state = turn.state.as_str();
     let mut lines = vec![match turn.job_id.as_deref() {
         Some(job) => format!(
             "<task id=\"{}\" job=\"{job}\" state=\"{state}\" reportDelivery=\"{}\">",
@@ -1189,6 +1214,11 @@ impl ChildTurnHost for RecordingHost {
         };
         Ok(ChildTurn {
             job_id: background.then_some(job),
+            state: if background {
+                ChildTurnState::Running
+            } else {
+                ChildTurnState::Completed
+            },
             output: "done".to_owned(),
             report_metadata: (!background)
                 .then(|| self.report_metadata.clone())

@@ -299,6 +299,28 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
                 "kind": kind.as_str(),
             })),
         ),
+        TurnEvent::ToolDispatchInterrupted {
+            step,
+            call_id,
+            display_name,
+            name,
+            title,
+            output,
+            interruption,
+        } => (
+            "tool.dispatch.interrupted",
+            object(json!({
+                "step": step,
+                "callID": call_id,
+                "name": name,
+                "displayName": display_name,
+                "title": title,
+                "output": output,
+                "mode": interruption.as_str(),
+                "forced": interruption.uncertain(),
+                "uncertain": interruption.uncertain(),
+            })),
+        ),
         TurnEvent::ToolDispatchCompleted {
             step,
             call_id,
@@ -353,9 +375,15 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
         TurnEvent::TurnInterrupted {
             assistant_message_id,
             steps,
+            request,
         } => (
             "turn.interrupted",
-            object(json!({"assistantMessageID": assistant_message_id, "steps": steps})),
+            object(json!({
+                "assistantMessageID": assistant_message_id,
+                "steps": steps,
+                "source": request.map(|request| request.source),
+                "reason": request.map(|request| request.reason),
+            })),
         ),
         TurnEvent::TurnFailed {
             assistant_message_id,
@@ -553,6 +581,7 @@ struct SessionSubscription {
 #[cfg(test)]
 mod tests {
     use super::turn_event;
+    use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
     use zuno_engine::r#loop::TurnEvent;
     use zuno_engine::session_command::SessionCommand;
 
@@ -585,5 +614,39 @@ mod tests {
         assert_eq!(failed.event_type, "session.command.failed");
         assert_eq!(failed.properties["command"], "compact");
         assert_eq!(failed.properties["message"], "provider unavailable");
+    }
+
+    #[test]
+    fn hard_interrupt_provenance_is_durable_and_client_visible() {
+        let interrupted = turn_event(&TurnEvent::TurnInterrupted {
+            assistant_message_id: Some("msg_assistant".to_owned()),
+            steps: 3,
+            request: Some(HardInterruptRequest::new(
+                HardInterruptSource::Acp,
+                HardInterruptReason::RequestCancelled,
+            )),
+        });
+
+        assert_eq!(interrupted.event_type, "turn.interrupted");
+        assert_eq!(interrupted.properties["source"], "acp");
+        assert_eq!(interrupted.properties["reason"], "request_cancelled");
+    }
+
+    #[test]
+    fn interrupted_tool_is_not_projected_as_an_ordinary_failure() {
+        let interrupted = turn_event(&TurnEvent::ToolDispatchInterrupted {
+            step: 2,
+            call_id: "call_task".to_owned(),
+            display_name: "Delegate".to_owned(),
+            name: "task".to_owned(),
+            title: "Inspect repository".to_owned(),
+            output: "child did not stop before the deadline".to_owned(),
+            interruption: zuno_engine::r#loop::ToolInterruption::Forced,
+        });
+
+        assert_eq!(interrupted.event_type, "tool.dispatch.interrupted");
+        assert_eq!(interrupted.properties["mode"], "forced");
+        assert_eq!(interrupted.properties["forced"], true);
+        assert_eq!(interrupted.properties["uncertain"], true);
     }
 }

@@ -68,6 +68,10 @@ fn root_prompt_with(
     TargetedPromptSubmission::root_with(PromptEnvelope::new(payload, delivery, origin))
 }
 
+fn tui_interrupt(reason: HardInterruptReason) -> HardInterruptRequest {
+    HardInterruptRequest::new(HardInterruptSource::Tui, reason)
+}
+
 #[test]
 fn session_screen_renders_the_transcript_reply_identity_and_prompt() {
     let (mut screen, _shutdown) = screen();
@@ -1598,7 +1602,11 @@ fn session_screen_the_second_exit_chord_leaves_even_if_the_cancelled_turn_never_
     screen.status.mark_running();
 
     screen.handle_action(action("app_exit"), &press_none());
-    assert_eq!(cancelled.try_recv(), Ok(()), "the turn was not cancelled");
+    assert_eq!(
+        cancelled.try_recv(),
+        Ok(tui_interrupt(HardInterruptReason::Exit)),
+        "the turn was not cancelled"
+    );
     assert_eq!(screen.cancellations(), 1);
     assert!(
         shutdown.try_recv().is_err(),
@@ -1666,7 +1674,7 @@ fn session_screen_double_escape_cancels_without_leaving_the_application() {
     );
     assert_eq!(
         cancelled.try_recv(),
-        Ok(()),
+        Ok(tui_interrupt(HardInterruptReason::UserCancel)),
         "the second escape did not cancel"
     );
     assert_eq!(screen.cancellations(), 1);
@@ -1727,7 +1735,7 @@ fn session_screen_two_escapes_cancel_even_when_the_first_closes_a_question_dialo
     );
     assert_eq!(
         cancelled.try_recv(),
-        Ok(()),
+        Ok(tui_interrupt(HardInterruptReason::UserCancel)),
         "two physical escape presses did not cancel the active turn"
     );
 }
@@ -1762,7 +1770,7 @@ fn session_screen_two_escapes_cancel_even_when_the_first_rejects_permission() {
     );
     assert_eq!(
         cancelled.try_recv(),
-        Ok(()),
+        Ok(tui_interrupt(HardInterruptReason::UserCancel)),
         "two physical escape presses did not cancel the permission-blocked turn"
     );
 }
@@ -1802,10 +1810,14 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
         )))
     );
     screen.handle_action(action("app_exit"), &press_none());
-    assert_eq!(cancelled.try_recv(), Ok(()));
+    assert_eq!(
+        cancelled.try_recv(),
+        Ok(tui_interrupt(HardInterruptReason::Exit))
+    );
     screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
         assistant_message_id: None,
         steps: 0,
+        request: None,
     }));
 
     screen.submit_prompt("second");
@@ -1819,7 +1831,7 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
 
     assert_eq!(
         cancelled.try_recv(),
-        Ok(()),
+        Ok(tui_interrupt(HardInterruptReason::Exit)),
         "a fresh turn inherited the previous turn's spent cancellation"
     );
     assert_eq!(screen.cancellations(), 2);
@@ -1833,7 +1845,9 @@ fn session_screen_a_full_cancel_sink_falls_through_to_shutdown() {
     let mut screen =
         SessionScreen::new(ViewContext::defaults(), sender).with_cancel_sink(cancels.clone());
     screen.status.mark_running();
-    cancels.try_send(()).expect("the sink starts empty");
+    cancels
+        .try_send(tui_interrupt(HardInterruptReason::UserCancel))
+        .expect("the sink starts empty");
 
     screen.handle_action(action("app_exit"), &press_none());
 
@@ -2645,6 +2659,13 @@ fn session_screen_suppresses_late_provider_and_tool_events_after_cancellation_is
         .transcript_mut()
         .push(Message::user("stop this turn"));
     screen.status.mark_running();
+    screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchStarted {
+        step: 1,
+        call_id: String::from("active-tool"),
+        display_name: String::from("Delegate"),
+        name: String::from("task"),
+        ui_intent: zuno_tool::ToolUiIntent::Subagent,
+    }));
 
     for _ in 0..2 {
         screen.handle_action(
@@ -2652,7 +2673,10 @@ fn session_screen_suppresses_late_provider_and_tool_events_after_cancellation_is
             &press(crossterm::event::KeyCode::Esc),
         );
     }
-    assert_eq!(cancelled.try_recv(), Ok(()));
+    assert_eq!(
+        cancelled.try_recv(),
+        Ok(tui_interrupt(HardInterruptReason::UserCancel))
+    );
 
     screen.handle_event(&AppEvent::Engine(TurnEvent::AssistantMessageCreated {
         step: 2,
@@ -2669,15 +2693,27 @@ fn session_screen_suppresses_late_provider_and_tool_events_after_cancellation_is
         name: String::from("shell"),
         ui_intent: zuno_tool::ToolUiIntent::Generic,
     }));
+    screen.handle_event(&AppEvent::Engine(TurnEvent::ToolDispatchInterrupted {
+        step: 1,
+        call_id: String::from("active-tool"),
+        display_name: String::from("Delegate"),
+        name: String::from("task"),
+        title: String::from("Inspect repository"),
+        output: String::from("child supervisor settled"),
+        interruption: zuno_engine::r#loop::ToolInterruption::Cooperative,
+    }));
 
     let stopping = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible")).join("\n");
     assert!(!stopping.contains("late model output"), "{stopping}");
     assert!(!stopping.contains("late-tool"), "{stopping}");
+    assert!(stopping.contains("Inspect repository"), "{stopping}");
+    assert!(stopping.contains("child supervisor settled"), "{stopping}");
     assert!(stopping.contains("interrupting…"), "{stopping}");
 
     screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
         assistant_message_id: None,
         steps: 2,
+        request: None,
     }));
     let settled = rows(&render_offscreen(&mut screen, 100, 24).expect("infallible")).join("\n");
     assert!(!settled.contains("late model output"), "{settled}");
@@ -2816,6 +2852,7 @@ fn session_reports_an_interrupted_turns_writes_too() {
     screen.handle_event(&AppEvent::Engine(TurnEvent::TurnInterrupted {
         assistant_message_id: None,
         steps: 1,
+        request: None,
     }));
     assert_eq!(nudges.try_recv(), Ok(()));
     assert_eq!(reader.take().0, vec![String::from("src/lib.rs")]);

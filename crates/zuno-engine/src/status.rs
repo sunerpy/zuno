@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
 
-use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
+use crate::interrupt::{
+    HardInterruptRequest, HardInterruptSignal, InterruptSignal, SoftInterruptMessage,
+};
 
 /// The process-local state exposed to CLI, TUI, HTTP, and ACP surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,13 +98,13 @@ struct RegistryInner {
 #[derive(Debug, Default)]
 struct RegistryState {
     active: HashMap<String, ActiveSession>,
-    pending_interrupts: BTreeSet<String>,
+    pending_interrupts: HashMap<String, HardInterruptRequest>,
 }
 
 #[derive(Debug)]
 struct ActiveSession {
     token: u64,
-    interrupt: InterruptSignal,
+    interrupt: HardInterruptSignal,
     soft_interrupt: InterruptSignal,
     soft_interrupts: VecDeque<SoftInterruptMessage>,
 }
@@ -135,10 +137,10 @@ impl SessionRunRegistry {
         }
 
         let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
-        let interrupt = InterruptSignal::new();
+        let interrupt = HardInterruptSignal::new();
         let soft_interrupt = InterruptSignal::new();
-        if state.pending_interrupts.remove(&session_id) {
-            interrupt.fire();
+        if let Some(request) = state.pending_interrupts.remove(&session_id) {
+            let _accepted = interrupt.request(request);
         }
         state.active.insert(
             session_id.clone(),
@@ -207,13 +209,16 @@ impl SessionRunRegistry {
     /// The registry lock makes the handoff linearizable: a cancellation arriving after
     /// one guard is removed but before the accepted follow-up acquires the next guard is
     /// retained and that next guard starts interrupted.
-    pub fn abort(&self, session_id: &str) -> AbortDisposition {
+    pub fn abort(&self, session_id: &str, request: HardInterruptRequest) -> AbortDisposition {
         let mut state = self.lock_state();
         if let Some(active) = state.active.get(session_id) {
-            active.interrupt.fire();
+            let _accepted = active.interrupt.request(request);
             AbortDisposition::Active
         } else {
-            state.pending_interrupts.insert(session_id.to_owned());
+            state
+                .pending_interrupts
+                .entry(session_id.to_owned())
+                .or_insert(request);
             AbortDisposition::ArmedNext
         }
     }
@@ -222,10 +227,10 @@ impl SessionRunRegistry {
     ///
     /// Lifecycle teardown uses this variant: closing an already-idle surface must
     /// not poison the next process-local mount of the same durable session.
-    pub fn abort_active(&self, session_id: &str) -> bool {
+    pub fn abort_active(&self, session_id: &str, request: HardInterruptRequest) -> bool {
         let state = self.lock_state();
         state.active.get(session_id).is_some_and(|active| {
-            active.interrupt.fire();
+            let _accepted = active.interrupt.request(request);
             true
         })
     }
@@ -237,7 +242,10 @@ impl SessionRunRegistry {
     /// that handoff from leaking into a later, independent mount of the same
     /// durable session.
     pub fn clear_pending_abort(&self, session_id: &str) -> bool {
-        self.lock_state().pending_interrupts.remove(session_id)
+        self.lock_state()
+            .pending_interrupts
+            .remove(session_id)
+            .is_some()
     }
 
     /// Queues a message for the live turn's next safe point without firing abort.
@@ -344,14 +352,14 @@ impl SessionControl {
     }
 
     /// Aborts whichever turn is live now, not the turn that created this handle.
-    pub fn abort(&self) -> AbortDisposition {
-        self.registry.abort(&self.session_id)
+    pub fn abort(&self, request: HardInterruptRequest) -> AbortDisposition {
+        self.registry.abort(&self.session_id, request)
     }
 
     /// Abort a live turn if one exists, without arming the next turn.
     #[must_use]
-    pub fn abort_active(&self) -> bool {
-        self.registry.abort_active(&self.session_id)
+    pub fn abort_active(&self, request: HardInterruptRequest) -> bool {
+        self.registry.abort_active(&self.session_id, request)
     }
 
     /// Clears a cancellation armed for a future turn during lifecycle teardown.
@@ -385,7 +393,7 @@ pub struct SessionRunGuard {
     registry: SessionRunRegistry,
     session_id: String,
     token: u64,
-    interrupt: InterruptSignal,
+    interrupt: HardInterruptSignal,
     soft_interrupt: InterruptSignal,
 }
 
@@ -398,7 +406,13 @@ impl SessionRunGuard {
     /// Returns the live signal to pass directly into `TurnContext`.
     #[must_use]
     pub fn interrupt_signal(&self) -> &InterruptSignal {
-        &self.interrupt
+        self.interrupt.signal()
+    }
+
+    /// Returns the first hard-interrupt request accepted for this turn.
+    #[must_use]
+    pub fn interrupt_request(&self) -> Option<HardInterruptRequest> {
+        self.interrupt.request_snapshot()
     }
 
     /// Returns the wake-only signal used to stop a provider wait at a steering boundary.
@@ -427,8 +441,8 @@ impl Drop for SessionRunGuard {
     fn drop(&mut self) {
         // Capture before unregistering. If another cancel lands before cleanup,
         // reset_if_epoch refuses to erase that newer, not-yet-observed fire.
-        let epoch = self.interrupt.epoch();
+        let epoch = self.interrupt.signal().epoch();
         self.registry.unregister(&self.session_id, self.token);
-        let _reset_applied = self.interrupt.reset_if_epoch(epoch);
+        let _reset_applied = self.interrupt.signal().reset_if_epoch(epoch);
     }
 }

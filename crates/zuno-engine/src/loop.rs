@@ -53,7 +53,7 @@ use zuno_tool::{
 };
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
-use crate::interrupt::{InterruptSignal, SoftInterruptMessage};
+use crate::interrupt::{HardInterruptRequest, InterruptSignal, SoftInterruptMessage};
 use crate::prompt::{
     PromptAssembly, PromptAssemblyError, PromptProviderProjection, PromptTraceSet,
     RuntimePromptPolicy, ensure_prompt_context_budget,
@@ -281,6 +281,21 @@ pub enum TurnEvent {
         call_id: String,
         kind: ToolBlockKind,
     },
+    /// A dispatched call stopped because the turn received a hard interruption.
+    ///
+    /// The model-visible tool result remains an error so every provider transcript
+    /// stays protocol-complete, but clients must not present an explicit user
+    /// cancellation as an ordinary execution failure.
+    ToolDispatchInterrupted {
+        step: u32,
+        call_id: String,
+        /// Stable client-facing identity resolved from the locked tool snapshot.
+        display_name: String,
+        name: String,
+        title: String,
+        output: String,
+        interruption: ToolInterruption,
+    },
     ToolDispatchCompleted {
         step: u32,
         call_id: String,
@@ -325,6 +340,9 @@ pub enum TurnEvent {
     TurnInterrupted {
         assistant_message_id: Option<String>,
         steps: u32,
+        /// Typed provenance for a product hard interrupt. Direct engine callers
+        /// using a bare [`InterruptSignal`] have no surface provenance.
+        request: Option<HardInterruptRequest>,
     },
     TurnFailed {
         assistant_message_id: Option<String>,
@@ -353,6 +371,32 @@ impl ToolBlockKind {
             Self::InvalidArguments => "invalid_arguments",
             Self::Unavailable => "unavailable",
         }
+    }
+}
+
+/// How a running tool settled after a hard turn interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolInterruption {
+    /// The tool observed cancellation and returned during the grace period.
+    Cooperative,
+    /// The grace period elapsed and the host aborted the execution future.
+    Forced,
+}
+
+impl ToolInterruption {
+    /// Stable wire/storage spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cooperative => "cooperative",
+            Self::Forced => "forced",
+        }
+    }
+
+    /// Whether the final side-effect state requires authoritative inspection.
+    #[must_use]
+    pub const fn uncertain(self) -> bool {
+        matches!(self, Self::Forced)
     }
 }
 
@@ -792,6 +836,8 @@ pub struct ToolDispatchResult {
     pub recovery: Option<ToolFailureRecovery>,
     /// Present only when execution was refused before the requested effect ran.
     pub blocked: Option<ToolBlockKind>,
+    /// Present only when an already-running call settled after a hard interruption.
+    pub interruption: Option<ToolInterruption>,
 }
 
 impl ToolDispatchResult {
@@ -802,6 +848,7 @@ impl ToolDispatchResult {
             is_error: false,
             recovery: None,
             blocked: None,
+            interruption: None,
         }
     }
 
@@ -812,6 +859,7 @@ impl ToolDispatchResult {
             is_error: true,
             recovery: None,
             blocked: None,
+            interruption: None,
         }
     }
 
@@ -822,6 +870,18 @@ impl ToolDispatchResult {
             is_error: true,
             recovery: None,
             blocked: Some(kind),
+            interruption: None,
+        }
+    }
+
+    #[must_use]
+    pub fn interrupted(output: ToolOutput, interruption: ToolInterruption) -> Self {
+        Self {
+            output,
+            is_error: true,
+            recovery: None,
+            blocked: None,
+            interruption: Some(interruption),
         }
     }
 
@@ -832,6 +892,7 @@ impl ToolDispatchResult {
             is_error: true,
             recovery: Some(recovery),
             blocked: None,
+            interruption: None,
         }
     }
 }
@@ -993,6 +1054,13 @@ impl<'a> TurnContext<'a> {
         self.tool_concurrency = limit;
         self
     }
+}
+
+fn hard_interrupt_request(context: &TurnContext<'_>) -> Option<HardInterruptRequest> {
+    context
+        .live_inputs
+        .as_ref()
+        .and_then(|live| live.guard.interrupt_request())
 }
 
 #[derive(Debug)]
@@ -1348,6 +1416,7 @@ async fn run_turn_in_span(
                 .send(TurnEvent::TurnInterrupted {
                     assistant_message_id: last_assistant_id,
                     steps,
+                    request: hard_interrupt_request(&context),
                 })
                 .await?;
             return Ok(outcome);
@@ -1938,6 +2007,7 @@ async fn run_turn_in_span(
         }
 
         if provider_exit == ProviderStreamExit::Interrupted {
+            let interruption = hard_interrupt_request(&context);
             append_provider_request_terminal(
                 context.connection,
                 &request,
@@ -1954,7 +2024,7 @@ async fn run_turn_in_span(
                 &mut assistant,
                 &accumulator,
                 &locked_tools,
-                AssistantCheckpointDisposition::Interrupted,
+                AssistantCheckpointDisposition::Interrupted(interruption),
             )?;
             events
                 .send(TurnEvent::AssistantCheckpointed {
@@ -1967,6 +2037,7 @@ async fn run_turn_in_span(
                 .send(TurnEvent::TurnInterrupted {
                     assistant_message_id: Some(assistant_id.clone()),
                     steps,
+                    request: interruption,
                 })
                 .await?;
             return Ok(TurnOutcome::Interrupted {
@@ -2262,24 +2333,38 @@ async fn run_turn_in_span(
                             })
                             .await?;
                     }
-                    events
-                        .send(TurnEvent::ToolDispatchCompleted {
-                            step,
-                            call_id: call.id.clone(),
-                            display_name,
-                            name: call.name,
-                            title: dispatch.output.title.clone(),
-                            output: dispatch.output.output.clone(),
-                            diff: ToolDiff::from_output(&dispatch.output),
-                            written_paths: dispatch
-                                .output
-                                .written_paths()
-                                .into_iter()
-                                .map(str::to_owned)
-                                .collect(),
-                            is_error: dispatch.is_error,
-                        })
-                        .await?;
+                    if let Some(interruption) = dispatch.interruption {
+                        events
+                            .send(TurnEvent::ToolDispatchInterrupted {
+                                step,
+                                call_id: call.id.clone(),
+                                display_name,
+                                name: call.name,
+                                title: dispatch.output.title.clone(),
+                                output: dispatch.output.output.clone(),
+                                interruption,
+                            })
+                            .await?;
+                    } else {
+                        events
+                            .send(TurnEvent::ToolDispatchCompleted {
+                                step,
+                                call_id: call.id.clone(),
+                                display_name,
+                                name: call.name,
+                                title: dispatch.output.title.clone(),
+                                output: dispatch.output.output.clone(),
+                                diff: ToolDiff::from_output(&dispatch.output),
+                                written_paths: dispatch
+                                    .output
+                                    .written_paths()
+                                    .into_iter()
+                                    .map(str::to_owned)
+                                    .collect(),
+                                is_error: dispatch.is_error,
+                            })
+                            .await?;
+                    }
                     events
                         .send(TurnEvent::ToolResultAppended {
                             step,
@@ -3939,7 +4024,7 @@ fn hook_messages(history: &[MessageWithParts]) -> Vec<HookMessageWithParts> {
 #[derive(Debug)]
 enum AssistantCheckpointDisposition<'error> {
     Completed,
-    Interrupted,
+    Interrupted(Option<HardInterruptRequest>),
     Steered,
     Failed(&'error TurnError),
 }
@@ -3968,12 +4053,18 @@ fn checkpoint_assistant(
     }
     match &disposition {
         AssistantCheckpointDisposition::Completed => {}
-        AssistantCheckpointDisposition::Interrupted => {
+        AssistantCheckpointDisposition::Interrupted(request) => {
+            let source = request.map(|request| request.source);
+            let reason = request.map(|request| request.reason);
             assistant.data.insert(
                 "error".to_owned(),
                 json!({
                     "name": "AbortError",
-                    "data": { "message": INTERRUPTED_TURN_NOTICE }
+                    "data": {
+                        "message": INTERRUPTED_TURN_NOTICE,
+                        "source": source,
+                        "reason": reason,
+                    }
                 }),
             );
         }
@@ -4052,7 +4143,7 @@ fn checkpoint_assistant(
     }
     let tool_failure = match &disposition {
         AssistantCheckpointDisposition::Completed => None,
-        AssistantCheckpointDisposition::Interrupted => Some(INTERRUPTED_TOOL_RESULT),
+        AssistantCheckpointDisposition::Interrupted(_) => Some(INTERRUPTED_TOOL_RESULT),
         AssistantCheckpointDisposition::Steered => {
             Some("[Tool execution skipped because newer user input arrived]")
         }

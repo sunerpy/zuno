@@ -403,6 +403,44 @@ fn views_tool_call_walks_pending_running_and_terminal_states() {
 }
 
 #[test]
+fn views_user_cancelled_tool_as_cancelled_instead_of_failed() {
+    let mut transcript = Transcript::new();
+    transcript.observe(&started());
+    transcript.observe(&TurnEvent::ToolDispatchStarted {
+        step: 1,
+        call_id: String::from("cancelled"),
+        display_name: String::from("Delegate"),
+        name: String::from("task"),
+        ui_intent: zuno_tool::ToolUiIntent::Subagent,
+    });
+    transcript.observe(&TurnEvent::ToolDispatchInterrupted {
+        step: 1,
+        call_id: String::from("cancelled"),
+        display_name: String::from("Delegate"),
+        name: String::from("task"),
+        title: String::from("Inspect repository"),
+        output: String::from("child supervisor settled"),
+        interruption: zuno_engine::r#loop::ToolInterruption::Cooperative,
+    });
+
+    let [
+        MessagePart::Tool {
+            status,
+            title,
+            output,
+            ..
+        },
+    ] = transcript.messages()[0].parts.as_slice()
+    else {
+        panic!("expected one cancelled tool part");
+    };
+    assert_eq!(*status, ToolStatus::Cancelled);
+    assert_eq!(status.glyph(), "×");
+    assert_eq!(title.as_deref(), Some("Inspect repository"));
+    assert_eq!(output.as_deref(), Some("child supervisor settled"));
+}
+
+#[test]
 fn views_tool_dispatch_without_a_provider_stream_still_appears() {
     // A reconnect can deliver the dispatch without the `ToolUseStart` that
     // normally precedes it. Dropping the call would hide work from the user.
@@ -1244,6 +1282,7 @@ fn views_transcript_tracks_the_running_flag() {
     transcript.observe(&TurnEvent::TurnInterrupted {
         assistant_message_id: None,
         steps: 1,
+        request: None,
     });
     assert!(!transcript.is_running());
 }
@@ -1283,12 +1322,14 @@ fn views_transcript_marks_an_interrupted_turn_once_as_session_state() {
         TurnEvent::TurnInterrupted {
             assistant_message_id: Some(String::from("msg_1")),
             steps: 1,
+            request: None,
         },
         // Terminal delivery can be retried by a client boundary. The transcript marker
         // describes one turn and therefore remains exactly once.
         TurnEvent::TurnInterrupted {
             assistant_message_id: Some(String::from("msg_1")),
             steps: 1,
+            request: None,
         },
     ] {
         view.handle_event(&AppEvent::Engine(event));
@@ -1307,8 +1348,8 @@ fn views_transcript_marks_an_interrupted_turn_once_as_session_state() {
         .collect::<Vec<_>>();
     assert_eq!(
         notices,
-        vec![(Role::System, crate::views::toast::ToastLevel::Error)],
-        "the user interruption must be a single session-owned error marker"
+        vec![(Role::System, crate::views::toast::ToastLevel::Info)],
+        "the user interruption must be a single session-owned cancellation marker"
     );
 
     let joined = draw(&mut view, 72, 12).join("\n");

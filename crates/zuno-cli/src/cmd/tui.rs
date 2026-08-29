@@ -47,6 +47,7 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, watch};
+use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender, event_channel};
 use zuno_engine::session_command::SessionCommand;
 use zuno_engine::status::SessionRunRegistry;
@@ -817,7 +818,10 @@ fn execute_once(
         // the worker-shutdown timeout.
         drop(app);
         let _stopping = worker_shutdown.send(true);
-        let _aborted = shutdown_control.abort();
+        let _aborted = shutdown_control.abort(HardInterruptRequest::new(
+            HardInterruptSource::Lifecycle,
+            HardInterruptReason::Shutdown,
+        ));
         let _stopping = editor_shutdown.send(true);
         input_shutdown.stop();
         let (
@@ -1636,7 +1640,7 @@ fn mcp_enabled(server: &zuno_config::schema::mcp::McpServerConfig) -> bool {
 /// escape a cancellation merely because the previous guard dropped first.
 async fn forward_cancellations(
     control: zuno_engine::status::SessionControl,
-    mut cancels: mpsc::Receiver<()>,
+    mut cancels: mpsc::Receiver<HardInterruptRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -1649,10 +1653,10 @@ async fn forward_cancellations(
                 }
             }
             cancellation = cancels.recv() => {
-                let Some(()) = cancellation else {
+                let Some(request) = cancellation else {
                     return;
                 };
-                match control.abort() {
+                match control.abort(request) {
                     zuno_engine::status::AbortDisposition::Active => tracing::info!(
                         target: "zuno::tui::cancellation",
                         session_id = %control.session_id(),
@@ -3768,13 +3772,23 @@ mod tests {
         let worker = tokio::spawn(forward_cancellations(control, receiver, shutdown_source));
 
         requests
-            .send(())
+            .send(HardInterruptRequest::new(
+                HardInterruptSource::Tui,
+                HardInterruptReason::UserCancel,
+            ))
             .await
             .expect("the cancellation bridge is listening");
         tokio::time::timeout(Duration::from_secs(1), signal.notified())
             .await
             .expect("the cancellation bridge never fired the turn signal");
         assert!(signal.is_set(), "the turn signal remained clear");
+        assert_eq!(
+            guard.interrupt_request(),
+            Some(HardInterruptRequest::new(
+                HardInterruptSource::Tui,
+                HardInterruptReason::UserCancel,
+            ))
+        );
 
         shutdown.send(true).expect("the worker observes shutdown");
         worker.await.expect("the cancellation bridge exits cleanly");
@@ -3789,7 +3803,10 @@ mod tests {
         let worker = tokio::spawn(forward_cancellations(control, receiver, shutdown_source));
 
         requests
-            .send(())
+            .send(HardInterruptRequest::new(
+                HardInterruptSource::Tui,
+                HardInterruptReason::Exit,
+            ))
             .await
             .expect("the cancellation bridge is listening");
         tokio::task::yield_now().await;
@@ -3800,6 +3817,13 @@ mod tests {
             .await
             .expect("the handoff interrupt never reached the accepted follow-up");
         assert!(guard.interrupt_signal().is_set());
+        assert_eq!(
+            guard.interrupt_request(),
+            Some(HardInterruptRequest::new(
+                HardInterruptSource::Tui,
+                HardInterruptReason::Exit,
+            ))
+        );
 
         shutdown.send(true).expect("the worker observes shutdown");
         worker.await.expect("the cancellation bridge exits cleanly");
@@ -3819,7 +3843,10 @@ mod tests {
             .expect("the replacement host owns the live turn");
 
         assert_eq!(
-            control.abort(),
+            control.abort(HardInterruptRequest::new(
+                HardInterruptSource::Tui,
+                HardInterruptReason::UserCancel,
+            )),
             zuno_engine::status::AbortDisposition::Active,
             "a control created before host replacement targeted an abandoned registry"
         );
@@ -4076,6 +4103,26 @@ mod tests {
             registry.status("ses_tui_steer_race"),
             zuno_engine::status::SessionStatus::Idle,
             "steering an already-finished turn must not manufacture a live turn"
+        );
+        let promoted = inbox
+            .promote_next("ses_tui_steer_race", None)
+            .expect("next turn promotes the preserved input")
+            .expect("the preserved input remains available");
+        assert_eq!(promoted.id, pending[0].id);
+        assert_eq!(
+            inbox
+                .mark_consumed("ses_tui_steer_race", &promoted.id)
+                .expect("consume preserved input")
+                .expect("input reaches consumed state")
+                .state,
+            zuno_db::inbox::SubmissionState::Consumed
+        );
+        assert!(
+            inbox
+                .promote_next("ses_tui_steer_race", None)
+                .expect("inspect queue after consumption")
+                .is_none(),
+            "the race-lost steer was delivered more than once"
         );
     }
 

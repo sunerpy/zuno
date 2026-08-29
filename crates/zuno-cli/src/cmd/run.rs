@@ -336,6 +336,21 @@ where
                     if is_error { "failed" } else { "completed" }
                 )
                 .map_err(to_string)?,
+                TurnEvent::ToolDispatchInterrupted {
+                    display_name,
+                    title,
+                    interruption,
+                    ..
+                } => writeln!(
+                    stderr,
+                    "[{display_name}] cancelled{}: {title}",
+                    if interruption.uncertain() {
+                        " (uncertain)"
+                    } else {
+                        ""
+                    }
+                )
+                .map_err(to_string)?,
                 _ => {}
             },
             RunFormat::Json => writeln!(stdout, "{}", event_json(event)).map_err(to_string)?,
@@ -464,6 +479,28 @@ fn event_json(event: TurnEvent) -> Value {
         } => {
             json!({"type":"tool_dispatch_blocked","step":step,"callID":call_id,"kind":kind.as_str()})
         }
+        TurnEvent::ToolDispatchInterrupted {
+            step,
+            call_id,
+            display_name,
+            name,
+            title,
+            output,
+            interruption,
+        } => {
+            json!({
+                "type":"tool_dispatch_interrupted",
+                "step":step,
+                "callID":call_id,
+                "name":name,
+                "displayName":display_name,
+                "title":title,
+                "output":output,
+                "mode":interruption.as_str(),
+                "forced":interruption.uncertain(),
+                "uncertain":interruption.uncertain(),
+            })
+        }
         TurnEvent::ToolDispatchCompleted {
             step,
             call_id,
@@ -497,7 +534,14 @@ fn event_json(event: TurnEvent) -> Value {
         TurnEvent::TurnInterrupted {
             assistant_message_id,
             steps,
-        } => json!({"type":"turn_interrupted","messageID":assistant_message_id,"steps":steps}),
+            request,
+        } => json!({
+            "type":"turn_interrupted",
+            "messageID":assistant_message_id,
+            "steps":steps,
+            "source":request.map(|request| request.source),
+            "reason":request.map(|request| request.reason),
+        }),
         TurnEvent::TurnFailed {
             assistant_message_id,
             steps,

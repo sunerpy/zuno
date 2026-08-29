@@ -511,7 +511,7 @@ pub fn status_style(
     use crate::views::message::ToolStatus;
     match status {
         ToolStatus::Error => context.error(),
-        ToolStatus::Blocked => context.warning(),
+        ToolStatus::Blocked | ToolStatus::Cancelled => context.warning(),
         ToolStatus::Completed if intent == zuno_tool::ToolUiIntent::Subagent => {
             context.delegation()
         }

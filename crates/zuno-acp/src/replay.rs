@@ -7,11 +7,13 @@ use serde_json::{Map, Value, json};
 use url::Url;
 use zuno_db::message::{MessageRole, MessageWithParts, PartKind, PartRecord};
 use zuno_db::session::{MessageUsage, TokenAccounting};
-use zuno_engine::r#loop::ToolDiff;
+use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, ToolDiff, ToolInterruption};
 use zuno_tool::ToolOutput;
 use zuno_types::WorkStateProjection;
 
-use crate::projection::{CompletedToolUpdate, completed_tool_update, tool_call};
+use crate::projection::{
+    CompletedToolUpdate, completed_tool_update, interrupted_tool_update, tool_call,
+};
 
 /// Maximum retained durable messages hydrated for one ACP load.
 pub const REPLAY_MESSAGE_CAP: usize = 512;
@@ -296,7 +298,31 @@ fn message_updates(stored: &MessageWithParts, policy: &ReplayPolicy) -> Vec<Valu
             | PartKind::Compaction => {}
         }
     }
+    if let Some(update) = interruption_update(stored) {
+        updates.push(update);
+    }
     updates
+}
+
+fn interruption_update(stored: &MessageWithParts) -> Option<Value> {
+    let error = stored.info.data.get("error")?.as_object()?;
+    let name = error.get("name")?.as_str()?;
+    if !matches!(name, "AbortError" | "MessageAbortedError") {
+        return None;
+    }
+    let data = error.get("data").and_then(Value::as_object);
+    Some(json!({
+        "sessionUpdate": "agent_message_chunk",
+        "content": { "type": "text", "text": INTERRUPTED_TURN_NOTICE },
+        "messageId": stored.info.id,
+        "_meta": {
+            "zuno": {
+                "kind": "turn_interrupted",
+                "source": data.and_then(|data| data.get("source")).cloned(),
+                "reason": data.and_then(|data| data.get("reason")).cloned(),
+            },
+        },
+    }))
 }
 
 fn is_provider_reasoning(part: &PartRecord) -> bool {
@@ -379,7 +405,7 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
     let diff = ToolDiff::from_output(&durable_output)
         .as_ref()
         .and_then(|diff| replay_diff(diff, policy));
-    let mut completed = completed_tool_update(CompletedToolUpdate {
+    let completed_input = CompletedToolUpdate {
         call_id,
         display_name,
         name,
@@ -390,7 +416,21 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
         written_paths: &written_paths,
         is_error: status == "error",
         metadata: Some(&metadata),
-    });
+    };
+    let interruption = metadata
+        .get("interruption")
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("mode"))
+        .and_then(Value::as_str)
+        .and_then(|mode| match mode {
+            "cooperative" => Some(ToolInterruption::Cooperative),
+            "forced" => Some(ToolInterruption::Forced),
+            _ => None,
+        });
+    let mut completed = match interruption {
+        Some(interruption) => interrupted_tool_update(completed_input, interruption),
+        None => completed_tool_update(completed_input),
+    };
     if let Some(content) = completed.get_mut("content").and_then(Value::as_array_mut) {
         content.extend(
             state
@@ -643,6 +683,71 @@ mod tests {
         assert_eq!(updates[4]["locations"], json!([{"path":edited}]));
         assert_eq!(updates[5]["content"]["text"], "done");
         assert_eq!(updates[5]["messageId"], "msg-assistant");
+    }
+
+    #[test]
+    fn replay_preserves_cancelled_tool_outcome_and_uncertainty() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-tool",
+                "msg-assistant",
+                json!({
+                    "type": "tool",
+                    "callID": "call-task",
+                    "tool": "task",
+                    "displayName": "Delegate",
+                    "state": {
+                        "status": "error",
+                        "title": "Inspect repository",
+                        "error": "child did not acknowledge cancellation",
+                        "metadata": {
+                            "interruption": {
+                                "mode": "forced",
+                                "forced": true,
+                                "uncertain": true
+                            }
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+        assert_eq!(replay.updates.len(), 2);
+        let cancelled = &replay.updates[1];
+        assert_eq!(cancelled["status"], "failed");
+        assert_eq!(cancelled["_meta"]["zuno"]["outcome"], "cancelled");
+        assert_eq!(cancelled["_meta"]["zuno"]["interruptionMode"], "forced");
+        assert_eq!(cancelled["_meta"]["zuno"]["uncertain"], true);
+    }
+
+    #[test]
+    fn replay_preserves_typed_turn_interruption_provenance() {
+        let root = tempfile::tempdir().expect("replay root");
+        let mut assistant = message("msg-assistant", "assistant", Vec::new());
+        assistant.info.data.insert(
+            "error".to_owned(),
+            json!({
+                "name": "AbortError",
+                "data": {
+                    "message": INTERRUPTED_TURN_NOTICE,
+                    "source": "acp",
+                    "reason": "user_cancel"
+                }
+            }),
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+        assert_eq!(replay.updates.len(), 1);
+        assert_eq!(
+            replay.updates[0]["_meta"]["zuno"]["kind"],
+            "turn_interrupted"
+        );
+        assert_eq!(replay.updates[0]["_meta"]["zuno"]["source"], "acp");
+        assert_eq!(replay.updates[0]["_meta"]["zuno"]["reason"], "user_cancel");
     }
 
     #[test]

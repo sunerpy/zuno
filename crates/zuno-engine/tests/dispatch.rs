@@ -277,6 +277,65 @@ impl Tool for BlockingDropTool {
     }
 }
 
+struct CooperativeInterruptTool {
+    started: Arc<Notify>,
+    cleaned: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for CooperativeInterruptTool {
+    fn id(&self) -> &str {
+        "task"
+    }
+
+    fn description(&self) -> &str {
+        "A long-running tool that acknowledges cancellation before returning."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, _args: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.started.notify_one();
+        ctx.interrupt.notified().await;
+        self.cleaned.store(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("task", "child supervisor settled"))
+    }
+}
+
+struct IgnoringInterruptTool {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl Tool for IgnoringInterruptTool {
+    fn id(&self) -> &str {
+        "task"
+    }
+
+    fn description(&self) -> &str {
+        "A broken tool that never acknowledges cancellation."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
 fn allow_all_rule() -> Rule {
     Rule {
         permission: "*".to_owned(),
@@ -383,6 +442,23 @@ impl ToolHooks for AllowingHooks {
         _request: &zuno_permission::PermissionRequest,
     ) -> Result<PermissionHookDecision, String> {
         Ok(PermissionHookDecision::Allow)
+    }
+}
+
+#[derive(Default)]
+struct FailingAfterHooks;
+
+#[async_trait]
+impl ToolHooks for FailingAfterHooks {
+    async fn after(
+        &self,
+        _tool: &str,
+        _session_id: &str,
+        _call_id: &str,
+        _args: &Value,
+        _output: &mut ToolOutput,
+    ) -> Result<(), String> {
+        Err(String::from("after hook failed"))
     }
 }
 
@@ -1132,6 +1208,132 @@ async fn dispatch_interrupt_cancels_a_pending_permission_before_execution() {
 }
 
 #[tokio::test]
+async fn dispatch_interrupt_waits_for_cooperative_tool_cleanup() {
+    let started = Arc::new(Notify::new());
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let dispatcher = Arc::new(dispatcher(
+        vec![Arc::new(CooperativeInterruptTool {
+            started: Arc::clone(&started),
+            cleaned: Arc::clone(&cleaned),
+        })],
+        vec![allow_all_rule()],
+        Arc::new(RecordingApprover::default()),
+    ));
+    let call = request(&dispatcher, "call_cooperative", "task", json!({}));
+    let interrupt = call.interrupt.clone();
+    let task = {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move { dispatcher.dispatch(call).await })
+    };
+
+    started.notified().await;
+    interrupt.fire();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("cooperative cleanup must finish inside the grace period")
+        .expect("dispatch task");
+
+    assert_eq!(
+        cleaned.load(Ordering::SeqCst),
+        1,
+        "dispatch dropped the tool future before it could settle its owned work"
+    );
+    assert!(result.is_error);
+    assert_eq!(
+        result.interruption,
+        Some(zuno_engine::r#loop::ToolInterruption::Cooperative)
+    );
+    assert_eq!(
+        result.output.output, "child supervisor settled",
+        "cooperative cancellation must preserve the tool's terminal report"
+    );
+    assert_eq!(
+        result.output.metadata["interruption"]["mode"],
+        "cooperative"
+    );
+    assert_eq!(result.output.metadata["interruption"]["uncertain"], false);
+}
+
+#[tokio::test]
+async fn dispatch_interrupt_keeps_typed_cancellation_when_after_hook_fails() {
+    let started = Arc::new(Notify::new());
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let dispatcher = Arc::new(
+        dispatcher(
+            vec![Arc::new(CooperativeInterruptTool {
+                started: Arc::clone(&started),
+                cleaned: Arc::clone(&cleaned),
+            })],
+            vec![allow_all_rule()],
+            Arc::new(RecordingApprover::default()),
+        )
+        .with_hooks(Arc::new(FailingAfterHooks)),
+    );
+    let call = request(&dispatcher, "call_after_hook", "task", json!({}));
+    let interrupt = call.interrupt.clone();
+    let task = {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move { dispatcher.dispatch(call).await })
+    };
+
+    started.notified().await;
+    interrupt.fire();
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("cooperative cleanup must finish inside the grace period")
+        .expect("dispatch task");
+
+    assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        result.interruption,
+        Some(zuno_engine::r#loop::ToolInterruption::Cooperative)
+    );
+    assert_eq!(result.output.output, "child supervisor settled");
+    assert_eq!(
+        result.output.metadata["afterHookError"]["message"],
+        "after hook failed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatch_interrupt_forces_and_marks_a_tool_that_ignores_cancellation() {
+    let started = Arc::new(Notify::new());
+    let dispatcher = Arc::new(dispatcher(
+        vec![Arc::new(IgnoringInterruptTool {
+            started: Arc::clone(&started),
+        })],
+        vec![allow_all_rule()],
+        Arc::new(RecordingApprover::default()),
+    ));
+    let call = request(&dispatcher, "call_forced", "task", json!({}));
+    let interrupt = call.interrupt.clone();
+    let task = {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move { dispatcher.dispatch(call).await })
+    };
+
+    started.notified().await;
+    interrupt.fire();
+    tokio::task::yield_now().await;
+    assert!(
+        !task.is_finished(),
+        "dispatch forced the tool before the cooperative cleanup grace elapsed"
+    );
+
+    tokio::time::advance(Duration::from_secs(2) + Duration::from_millis(1)).await;
+    let result = task.await.expect("dispatch task");
+
+    assert!(result.is_error);
+    assert_eq!(
+        result.interruption,
+        Some(zuno_engine::r#loop::ToolInterruption::Forced)
+    );
+    assert_eq!(result.output.metadata["interruption"]["mode"], "forced");
+    assert_eq!(result.output.metadata["interruption"]["forced"], true);
+    assert_eq!(result.output.metadata["interruption"]["uncertain"], true);
+}
+
+#[tokio::test]
 async fn dispatch_passes_argument_pattern_to_permission_approver() {
     let approver = Arc::new(RecordingApprover::default());
     let dispatcher = dispatcher(
@@ -1169,7 +1371,7 @@ async fn dispatch_passes_argument_pattern_to_permission_approver() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dispatch_interrupt_joins_the_cancelled_tool_before_returning() {
+async fn dispatch_forced_interrupt_marks_uncertainty_while_the_abort_is_reaped() {
     let started = Arc::new(Notify::new());
     let drop_entered = Arc::new(AtomicUsize::new(0));
     let drop_release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1196,14 +1398,13 @@ async fn dispatch_interrupt_joins_the_cancelled_tool_before_returning() {
 
     started.notified().await;
     interrupt.fire();
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(3), async {
         while drop_entered.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("cancelled tool future reaches Drop");
-    let returned_before_drop_finished = task.is_finished();
     {
         let (released, changed) = &*drop_release;
         *released.lock().expect("drop release lock") = true;
@@ -1211,12 +1412,18 @@ async fn dispatch_interrupt_joins_the_cancelled_tool_before_returning() {
     }
     let result = task.await.expect("dispatch task");
 
-    assert!(
-        !returned_before_drop_finished,
-        "dispatch reported interruption while the cancelled tool future was still live"
-    );
     assert!(result.is_error);
-    assert!(result.output.output.contains("interrupted"));
+    assert_eq!(
+        result.interruption,
+        Some(zuno_engine::r#loop::ToolInterruption::Forced)
+    );
+    assert!(
+        result.output.output.contains("force-aborted"),
+        "{}",
+        result.output.output
+    );
+    assert_eq!(result.output.metadata["interruption"]["mode"], "forced");
+    assert_eq!(result.output.metadata["interruption"]["uncertain"], true);
 }
 
 #[test]

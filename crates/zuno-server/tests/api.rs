@@ -18,6 +18,7 @@ use zuno_db::artifact_gc::ArtifactGcPaths;
 use zuno_db::event_log::SessionEventLog;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
 use zuno_db::session::SessionCreate;
+use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::TurnEventSender;
 use zuno_engine::status::{AbortDisposition, SessionStatus};
 use zuno_paths::DbLocation;
@@ -43,6 +44,10 @@ fn api_app_with_services(state: ApiState) -> (Router, ServerServices) {
         .with_routes(api::router(state))
         .router();
     (app, services)
+}
+
+fn api_cancel() -> HardInterruptRequest {
+    HardInterruptRequest::new(HardInterruptSource::Api, HardInterruptReason::UserCancel)
 }
 
 #[derive(Debug, Default)]
@@ -1248,7 +1253,7 @@ async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
 }
 
 #[tokio::test]
-async fn api_prompt_resume_false_is_durable_without_starting_a_turn() {
+async fn api_prompt_defaults_to_queue_and_resume_false_does_not_start_a_turn() {
     let fixture = MutationApiFixture::new("ses_deferred");
     let executor = Arc::new(BlockingMutationExecutor::default());
     let services = ServerServices::new(64).with_mutations(executor.clone());
@@ -1264,7 +1269,6 @@ async fn api_prompt_resume_false_is_durable_without_starting_a_turn() {
             Some(json!({
                 "id": "msg_deferred",
                 "prompt": {"text": "later", "files": [], "agents": []},
-                "delivery": "nextStep",
                 "resume": false
             })),
         ))
@@ -1274,7 +1278,7 @@ async fn api_prompt_resume_false_is_durable_without_starting_a_turn() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response_json(response).await;
     assert_eq!(body["data"]["admittedSeq"], 0);
-    assert_eq!(body["data"]["delivery"], "nextStep");
+    assert_eq!(body["data"]["delivery"], "queue");
     assert_eq!(services.runs.status("ses_deferred"), SessionStatus::Idle);
     assert!(executor.prompts().is_empty());
     let pending = SessionInbox::new(Arc::clone(&fixture.pool))
@@ -1339,7 +1343,10 @@ async fn api_busy_steer_is_durable_and_runs_after_the_active_prompt() {
         1
     );
 
-    assert_eq!(services.runs.abort("ses_queued"), AbortDisposition::Active);
+    assert_eq!(
+        services.runs.abort("ses_queued", api_cancel()),
+        AbortDisposition::Active
+    );
     executor.wait_until_prompt_count(2).await;
     assert_eq!(
         executor
@@ -1355,7 +1362,10 @@ async fn api_busy_steer_is_durable_and_runs_after_the_active_prompt() {
             .expect("drained inbox reads")
             .is_empty()
     );
-    assert_eq!(services.runs.abort("ses_queued"), AbortDisposition::Active);
+    assert_eq!(
+        services.runs.abort("ses_queued", api_cancel()),
+        AbortDisposition::Active
+    );
     services.runs.wait_until_idle("ses_queued").await;
 }
 
@@ -1391,7 +1401,7 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
             Some(json!({
                 "id": "msg_user",
                 "prompt": {"text": "user input", "files": [], "agents": []},
-                "delivery": "nextStep"
+                "delivery": "queue"
             })),
         ))
         .await
@@ -1401,7 +1411,10 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
     executor.wait_until_prompt_count(1).await;
     assert_eq!(executor.prompts()[0].message_id, "input_report");
     assert_eq!(executor.prompts()[0].prompt, "background result");
-    assert_eq!(services.runs.abort("ses_report"), AbortDisposition::Active);
+    assert_eq!(
+        services.runs.abort("ses_report", api_cancel()),
+        AbortDisposition::Active
+    );
     executor.wait_until_prompt_count(2).await;
     assert_eq!(
         executor
@@ -1414,7 +1427,10 @@ async fn api_prompt_driver_runs_a_durable_subagent_report_before_later_user_inpu
             ("msg_user".to_owned(), "user input".to_owned())
         ]
     );
-    assert_eq!(services.runs.abort("ses_report"), AbortDisposition::Active);
+    assert_eq!(
+        services.runs.abort("ses_report", api_cancel()),
+        AbortDisposition::Active
+    );
     services.runs.wait_until_idle("ses_report").await;
 }
 
@@ -1444,7 +1460,7 @@ async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the
             Some(json!({
                 "id": "msg_user",
                 "prompt": {"text": "user input", "files": [], "agents": []},
-                "delivery": "nextStep"
+                "delivery": "queue"
             })),
         ))
         .await
@@ -1455,7 +1471,7 @@ async fn api_prompt_driver_skips_a_malformed_durable_input_without_stranding_the
     assert_eq!(executor.prompts()[0].message_id, "msg_user");
     assert_eq!(executor.prompts()[0].prompt, "user input");
     assert_eq!(
-        services.runs.abort("ses_malformed"),
+        services.runs.abort("ses_malformed", api_cancel()),
         AbortDisposition::Active
     );
     services.runs.wait_until_idle("ses_malformed").await;

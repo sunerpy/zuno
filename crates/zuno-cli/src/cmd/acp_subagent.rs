@@ -292,8 +292,8 @@ async fn run_worker(
                                 .await
                                 .map_err(|error| error.to_string())?;
                         }
-                        if let Some((state, failure)) = terminal_state(&event) {
-                            if let Some(message) = failure {
+                        if let Some(terminal) = terminal_state(&event) {
+                            if let Some(message) = terminal.failure {
                                 client
                                     .session_update(
                                         &session_id,
@@ -315,15 +315,19 @@ async fn run_worker(
                             }
                             let parent_session_id = child.parent_session_id.clone();
                             children.remove(&session_id);
+                            let update = json!({
+                                "sessionUpdate": "subagent_state_update",
+                                "subagentSessionId": session_id,
+                                "state": terminal.state,
+                                "_meta": {
+                                    "zuno": {
+                                        "source": terminal.source,
+                                        "reason": terminal.reason,
+                                    },
+                                },
+                            });
                             client
-                                .session_update(
-                                    &parent_session_id,
-                                    json!({
-                                        "sessionUpdate": "subagent_state_update",
-                                        "subagentSessionId": session_id,
-                                        "state": state,
-                                    }),
-                                )
+                                .session_update(&parent_session_id, update)
                                 .await
                                 .map_err(|error| error.to_string())?;
                         }
@@ -470,14 +474,36 @@ async fn open_child(
     Ok(())
 }
 
-fn terminal_state(event: &TurnEvent) -> Option<(&'static str, Option<String>)> {
+struct TerminalState {
+    state: &'static str,
+    failure: Option<String>,
+    source: Option<zuno_engine::interrupt::HardInterruptSource>,
+    reason: Option<zuno_engine::interrupt::HardInterruptReason>,
+}
+
+fn terminal_state(event: &TurnEvent) -> Option<TerminalState> {
     match event {
         TurnEvent::TurnCompleted { .. } | TurnEvent::SessionCommandCompleted { .. } => {
-            Some(("completed", None))
+            Some(TerminalState {
+                state: "completed",
+                failure: None,
+                source: None,
+                reason: None,
+            })
         }
-        TurnEvent::TurnInterrupted { .. } => Some(("cancelled", None)),
+        TurnEvent::TurnInterrupted { request, .. } => Some(TerminalState {
+            state: "cancelled",
+            failure: None,
+            source: request.map(|request| request.source),
+            reason: request.map(|request| request.reason),
+        }),
         TurnEvent::TurnFailed { message, .. } | TurnEvent::SessionCommandFailed { message, .. } => {
-            Some(("failed", Some(message.clone())))
+            Some(TerminalState {
+                state: "failed",
+                failure: Some(message.clone()),
+                source: None,
+                reason: None,
+            })
         }
         _ => None,
     }
@@ -513,5 +539,28 @@ mod tests {
             "the terminal transition must displace a high-frequency update"
         );
         assert_eq!(state.omitted.get("ses-child"), Some(&1));
+    }
+
+    #[test]
+    fn child_terminal_state_keeps_hard_interrupt_provenance() {
+        let terminal = terminal_state(&TurnEvent::TurnInterrupted {
+            assistant_message_id: Some("msg-child".to_owned()),
+            steps: 2,
+            request: Some(zuno_engine::interrupt::HardInterruptRequest::new(
+                zuno_engine::interrupt::HardInterruptSource::Acp,
+                zuno_engine::interrupt::HardInterruptReason::UserCancel,
+            )),
+        })
+        .expect("interruption is terminal");
+
+        assert_eq!(terminal.state, "cancelled");
+        assert_eq!(
+            terminal.source,
+            Some(zuno_engine::interrupt::HardInterruptSource::Acp)
+        );
+        assert_eq!(
+            terminal.reason,
+            Some(zuno_engine::interrupt::HardInterruptReason::UserCancel)
+        );
     }
 }

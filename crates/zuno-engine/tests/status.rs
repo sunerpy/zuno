@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use futures::stream;
 use zuno_db::message::{MessageRecord, MessageStore, PartRecord};
 use zuno_db::{Connection, migration, open};
-use zuno_engine::interrupt::{SoftInterruptMessage, SoftInterruptSource};
+use zuno_engine::interrupt::{
+    HardInterruptReason, HardInterruptRequest, HardInterruptSource, SoftInterruptMessage,
+    SoftInterruptSource,
+};
 use zuno_engine::r#loop::{
     AgentModelResolver, AvailableTools, DispatchRequest, PreparedToolDispatch, ResolvedAgent,
     ResolvedModel, RunTurnRequest, ToolDispatcher, TurnContext, TurnEvent, TurnOutcome,
@@ -115,9 +118,11 @@ fn status_rejects_two_concurrent_prompts_for_one_session() {
 fn status_abort_during_an_idle_handoff_interrupts_the_next_accepted_turn() {
     let registry = SessionRunRegistry::new();
     let control = registry.control(SESSION_ID);
+    let request =
+        HardInterruptRequest::new(HardInterruptSource::Api, HardInterruptReason::UserCancel);
 
     assert_eq!(
-        control.abort(),
+        control.abort(request),
         AbortDisposition::ArmedNext,
         "a cancellation accepted between turn guards must be armed, not dropped",
     );
@@ -128,6 +133,11 @@ fn status_abort_during_an_idle_handoff_interrupts_the_next_accepted_turn() {
         next.interrupt_signal().is_set(),
         "the handoff cancellation did not reach the next turn"
     );
+    assert_eq!(
+        next.interrupt_request(),
+        Some(request),
+        "the accepted follow-up lost the durable cancellation provenance"
+    );
 }
 
 #[test]
@@ -135,7 +145,13 @@ fn status_abort_active_does_not_poison_the_next_idle_turn() {
     let registry = SessionRunRegistry::new();
     let control = registry.control(SESSION_ID);
 
-    assert!(!control.abort_active(), "idle teardown must be a no-op");
+    assert!(
+        !control.abort_active(HardInterruptRequest::new(
+            HardInterruptSource::Lifecycle,
+            HardInterruptReason::Shutdown,
+        )),
+        "idle teardown must be a no-op"
+    );
     let next = registry
         .begin_turn(SESSION_ID)
         .expect("the next turn acquires its guard");
@@ -150,7 +166,13 @@ fn status_teardown_can_clear_an_abort_armed_during_prompt_handoff() {
     let registry = SessionRunRegistry::new();
     let control = registry.control(SESSION_ID);
 
-    assert_eq!(control.abort(), AbortDisposition::ArmedNext);
+    assert_eq!(
+        control.abort(HardInterruptRequest::new(
+            HardInterruptSource::Tui,
+            HardInterruptReason::Exit,
+        )),
+        AbortDisposition::ArmedNext
+    );
     assert!(
         control.clear_pending_abort(),
         "teardown must remove the handoff cancellation"
@@ -165,6 +187,28 @@ fn status_teardown_can_clear_an_abort_armed_during_prompt_handoff() {
     assert!(
         !next.interrupt_signal().is_set(),
         "teardown cancellation leaked into a later session mount"
+    );
+}
+
+#[test]
+fn status_first_hard_interrupt_source_wins_over_later_shutdown() {
+    let registry = SessionRunRegistry::new();
+    let control = registry.control(SESSION_ID);
+    let turn = registry.begin_turn(SESSION_ID).expect("active turn");
+    let user_cancel =
+        HardInterruptRequest::new(HardInterruptSource::Tui, HardInterruptReason::UserCancel);
+    let shutdown = HardInterruptRequest::new(
+        HardInterruptSource::Lifecycle,
+        HardInterruptReason::Shutdown,
+    );
+
+    assert_eq!(control.abort(user_cancel), AbortDisposition::Active);
+    assert_eq!(control.abort(shutdown), AbortDisposition::Active);
+
+    assert_eq!(
+        turn.interrupt_request(),
+        Some(user_cancel),
+        "lifecycle teardown overwrote the user action that first interrupted the turn"
     );
 }
 
@@ -190,7 +234,10 @@ async fn status_abort_through_stale_handle_interrupts_the_live_turn() {
 
     let aborter = std::thread::spawn(move || {
         started.wait();
-        stale_handle.abort()
+        stale_handle.abort(HardInterruptRequest::new(
+            HardInterruptSource::Api,
+            HardInterruptReason::UserCancel,
+        ))
     });
     let context = TurnContext::new(
         &mut connection,
