@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/sunerpy/zuno/compare/v0.3.0...v0.3.1) (2026-08-29)
+
+
+### Bug Fixes
+
+* **testkit:** 在冒烟配置中声明无沙箱平台的降级 ([004c73e](https://github.com/sunerpy/zuno/commit/004c73ee170d03300bdafc09dd37a7025f907420))
+
 ## [0.3.0](https://github.com/sunerpy/zuno/compare/v0.2.0...v0.3.0) (2026-08-29)
 
 
