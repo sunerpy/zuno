@@ -686,12 +686,34 @@ jobs:
           fi
           echo "bubblewrap $version satisfies the 0.8.0 minimum"
 
-      - name: Smoke the unpacked artifact (unix)
-        if: matrix.archive == 'tar.gz'
+      # The Linux legs run with the sandbox STRICT: bubblewrap was installed above,
+      # so a smoke failure there is a real defect and must not be masked.
+      - name: Smoke the unpacked artifact (linux)
+        if: contains(matrix.target, 'linux')
         run: ./target/release/zuno-smoke --binary "unpacked/${BINARY_NAME}"
 
+      # macOS has no OS confinement backend — `zuno-sandbox` compiles one for
+      # `target_os = "linux"` only — so a default session answers
+      # `OS sandbox is not implemented for platform 'macos'` and refuses to start.
+      # That is the intended fail-closed behaviour, not something to fix here, and it
+      # is why this leg must opt into unconfined execution explicitly to be smoked at
+      # all. `UnsupportedPlatform` is an eligible fallback cause, so the artifact runs
+      # and prints the notice describing exactly what is and is not enforced.
+      #
+      # Scoped to this step: it is an environment variable on one smoke invocation,
+      # not a change to what the published binary defaults to. A user on macOS still
+      # gets the refusal unless they make the same explicit choice.
+      - name: Smoke the unpacked artifact (macos)
+        if: contains(matrix.target, 'darwin')
+        env:
+          ZUNO_SANDBOX_ON_UNAVAILABLE: run-unconfined
+        run: ./target/release/zuno-smoke --binary "unpacked/${BINARY_NAME}"
+
+      # Same reasoning as macOS: no Windows confinement backend exists.
       - name: Smoke the unpacked artifact (windows)
         if: matrix.archive == 'zip'
+        env:
+          ZUNO_SANDBOX_ON_UNAVAILABLE: run-unconfined
         run: ./target/release/zuno-smoke.exe --binary "unpacked/${env:BINARY_NAME}.exe"
 
   # -------------------------------------------------------------------------
