@@ -22,7 +22,7 @@ use zuno_engine::r#loop::{
 };
 use zuno_engine::prompt::{PromptAssembly, PromptAssemblyError, RuntimePromptPolicy};
 use zuno_engine::status::{SessionControl, SessionRunRegistry};
-use zuno_error::ProviderError;
+use zuno_error::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::event::{FinishReason, PromptAccounting, RequestContentBlock, Role, StreamEvent};
 use zuno_llm::registry::{
@@ -2875,14 +2875,24 @@ async fn loop_accepts_a_tool_only_assistant_step_as_non_empty() {
 }
 
 #[tokio::test]
-async fn loop_provider_retry_replays_transient_503_and_rolls_back_partial_output() {
+async fn loop_provider_retry_replaces_typed_partial_stream_and_persists_attempts() {
     let mut connection = seeded();
     put_user(&connection, "msg_retry_user", 10, "retry once");
     let provider = Arc::new(FakeProvider::new(vec![
         ScriptedResponse::failed(
-            vec![StreamEvent::TextDelta("discarded attempt".to_owned())],
-            ProviderError::Transient {
-                status: Some(503),
+            vec![
+                StreamEvent::TextDelta("discarded attempt".to_owned()),
+                StreamEvent::ToolUseStart {
+                    id: "discarded-call".to_owned(),
+                    name: "echo".to_owned(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: "discarded-call".to_owned(),
+                    delta: r#"{"text":"must not run"}"#.to_owned(),
+                },
+            ],
+            ProviderError::Stream {
+                code: ProviderStreamFailure::UpstreamStreamIncomplete,
                 source: None,
             },
         ),
@@ -2916,7 +2926,17 @@ async fn loop_provider_retry_replays_transient_503_and_rolls_back_partial_output
         outcome,
         Ok(TurnOutcome::Completed { steps: 1, .. })
     ));
-    assert_eq!(provider.requests().len(), 2);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].request_context(),
+        requests[1].request_context(),
+        "replacement attempts must retain the durable session affinity"
+    );
+    assert!(
+        dispatcher.calls().is_empty(),
+        "a tool from the discarded attempt must never be dispatched"
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         TurnEvent::Provider {
@@ -2938,6 +2958,40 @@ async fn loop_provider_retry_replays_transient_503_and_rolls_back_partial_output
         .find(|part| part.kind == PartKind::Text)
         .expect("successful replay text was persisted");
     assert_eq!(text.data["text"], "completed replay");
+
+    let mut statement = connection
+        .prepare(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.provider.attempt.1' ORDER BY seq",
+        )
+        .expect("prepare provider attempt events");
+    let attempts = statement
+        .query_map([SESSION_ID], |row| row.get::<_, String>(0))
+        .expect("query provider attempt events")
+        .map(|row| {
+            serde_json::from_str::<Value>(&row.expect("provider attempt event"))
+                .expect("provider attempt JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(attempts[0]["status"], "started");
+    assert_eq!(attempts[0]["attempt"], 1);
+    assert_eq!(attempts[1]["status"], "failed");
+    assert_eq!(attempts[1]["attempt"], 1);
+    assert_eq!(attempts[1]["partialOutput"], true);
+    assert_eq!(
+        attempts[1]["providerErrorCode"],
+        "upstream_stream_incomplete"
+    );
+    assert_eq!(attempts[1]["retryable"], true);
+    assert_eq!(attempts[1]["partialOutputRetryPermitted"], true);
+    assert_eq!(attempts[2]["status"], "started");
+    assert_eq!(attempts[2]["attempt"], 2);
+    assert_eq!(attempts[3]["status"], "completed");
+    assert_eq!(attempts[3]["attempt"], 2);
+    assert_eq!(attempts[0]["attemptID"], attempts[1]["attemptID"]);
+    assert_eq!(attempts[2]["attemptID"], attempts[3]["attemptID"]);
+    assert_ne!(attempts[0]["attemptID"], attempts[2]["attemptID"]);
 }
 
 #[tokio::test]
@@ -3087,14 +3141,14 @@ async fn loop_checkpoints_partial_reasoning_and_tools_when_stream_processing_fai
 }
 
 #[tokio::test]
-async fn loop_provider_retry_never_replays_a_permanent_failure() {
+async fn loop_provider_retry_never_replays_a_protocol_failure() {
     let mut connection = seeded();
     put_user(&connection, "msg_permanent_user", 10, "do not retry");
     let provider = Arc::new(FakeProvider::new(vec![
         ScriptedResponse::failed(
             Vec::new(),
-            ProviderError::Fatal {
-                status: Some(400),
+            ProviderError::Protocol {
+                code: ProviderProtocolFailure::InvalidUpstreamToolCall,
                 source: None,
             },
         ),
@@ -3123,8 +3177,8 @@ async fn loop_provider_retry_never_replays_a_permanent_failure() {
 
     assert!(matches!(
         outcome,
-        Err(TurnError::Provider(ProviderError::Fatal {
-            status: Some(400),
+        Err(TurnError::Provider(ProviderError::Protocol {
+            code: ProviderProtocolFailure::InvalidUpstreamToolCall,
             ..
         }))
     ));
@@ -3136,6 +3190,19 @@ async fn loop_provider_retry_never_replays_a_permanent_failure() {
             ..
         }
     )));
+
+    let terminal: String = connection
+        .query_row(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.provider.attempt.1' \
+               AND json_extract(data, '$.status') = 'failed'",
+            [SESSION_ID],
+            |row| row.get(0),
+        )
+        .expect("failed protocol attempt");
+    let terminal: Value = serde_json::from_str(&terminal).expect("protocol attempt JSON");
+    assert_eq!(terminal["providerErrorCode"], "invalid_upstream_tool_call");
+    assert_eq!(terminal["retryable"], false);
 }
 
 #[tokio::test]

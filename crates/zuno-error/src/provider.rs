@@ -2,7 +2,102 @@
 
 use crate::recovery::{Recoverable, Recovery};
 use crate::source::BoxSource;
+use std::fmt;
 use std::time::Duration;
+
+/// A structured provider stream failure that may be replayed as a replacement attempt.
+///
+/// These codes are emitted only after the HTTP response has started, so no status
+/// code remains available. The code is retained as data because the engine must
+/// distinguish a replay-safe truncated attempt from an opaque transport error
+/// after partial output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStreamFailure {
+    UpstreamStreamError,
+    UpstreamStreamIncomplete,
+    UpstreamStreamIdleTimeout,
+    RequestDeadlineExceeded,
+}
+
+impl ProviderStreamFailure {
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "upstream_stream_error" => Some(Self::UpstreamStreamError),
+            "upstream_stream_incomplete" => Some(Self::UpstreamStreamIncomplete),
+            "upstream_stream_idle_timeout" => Some(Self::UpstreamStreamIdleTimeout),
+            "request_deadline_exceeded" => Some(Self::RequestDeadlineExceeded),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamStreamError => "upstream_stream_error",
+            Self::UpstreamStreamIncomplete => "upstream_stream_incomplete",
+            Self::UpstreamStreamIdleTimeout => "upstream_stream_idle_timeout",
+            Self::RequestDeadlineExceeded => "request_deadline_exceeded",
+        }
+    }
+}
+
+impl fmt::Display for ProviderStreamFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A structured provider protocol failure that requires implementation correction.
+///
+/// Repeating the same request cannot repair these failures. Keeping their wire code
+/// typed lets durable attempt records and diagnostics identify the violated contract
+/// without parsing the chained source text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProtocolFailure {
+    UpstreamProtocolError,
+    UpstreamInvalidState,
+    UnsupportedUpstreamEvent,
+    InvalidUpstreamReasoning,
+    InvalidUpstreamToolCall,
+    IncompleteUpstreamToolCall,
+    MissingUpstreamStream,
+}
+
+impl ProviderProtocolFailure {
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "upstream_protocol_error" => Some(Self::UpstreamProtocolError),
+            "upstream_invalid_state" => Some(Self::UpstreamInvalidState),
+            "unsupported_upstream_event" => Some(Self::UnsupportedUpstreamEvent),
+            "invalid_upstream_reasoning" => Some(Self::InvalidUpstreamReasoning),
+            "invalid_upstream_tool_call" => Some(Self::InvalidUpstreamToolCall),
+            "incomplete_upstream_tool_call" => Some(Self::IncompleteUpstreamToolCall),
+            "missing_upstream_stream" => Some(Self::MissingUpstreamStream),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamProtocolError => "upstream_protocol_error",
+            Self::UpstreamInvalidState => "upstream_invalid_state",
+            Self::UnsupportedUpstreamEvent => "unsupported_upstream_event",
+            Self::InvalidUpstreamReasoning => "invalid_upstream_reasoning",
+            Self::InvalidUpstreamToolCall => "invalid_upstream_tool_call",
+            Self::IncompleteUpstreamToolCall => "incomplete_upstream_tool_call",
+            Self::MissingUpstreamStream => "missing_upstream_stream",
+        }
+    }
+}
+
+impl fmt::Display for ProviderProtocolFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// A failure from a model provider, classified by what recovery it permits.
 ///
@@ -46,6 +141,15 @@ pub enum ProviderError {
         source: Option<BoxSource>,
     },
 
+    /// A structured in-stream failure whose partial output may be discarded and
+    /// replaced by a bounded replay of the identical request.
+    #[error("retryable provider stream failure `{code}`")]
+    Stream {
+        code: ProviderStreamFailure,
+        #[source]
+        source: Option<BoxSource>,
+    },
+
     /// Credentials were missing, expired, or rejected.
     ///
     /// `provider` names whose credentials to refresh, so the recovery path does
@@ -79,6 +183,14 @@ pub enum ProviderError {
         provider: String,
         model: String,
         capability: &'static str,
+    },
+
+    /// A structured upstream protocol violation that mechanical retry cannot fix.
+    #[error("provider protocol failure `{code}`")]
+    Protocol {
+        code: ProviderProtocolFailure,
+        #[source]
+        source: Option<BoxSource>,
     },
 
     /// A failure no retry can fix: a malformed request, an unknown model, a
@@ -163,11 +275,36 @@ impl ProviderError {
             Self::RateLimited { retry_after } => *retry_after,
             Self::ContextLimit { .. }
             | Self::Transient { .. }
+            | Self::Stream { .. }
+            | Self::Auth { .. }
+            | Self::Refused { .. }
+            | Self::UnsupportedCapability { .. }
+            | Self::Protocol { .. }
+            | Self::Fatal { .. } => None,
+        }
+    }
+
+    /// The exact structured provider code, when the wire contract supplied one.
+    #[must_use]
+    pub const fn structured_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Stream { code, .. } => Some(code.as_str()),
+            Self::Protocol { code, .. } => Some(code.as_str()),
+            Self::ContextLimit { .. }
+            | Self::RateLimited { .. }
+            | Self::Transient { .. }
             | Self::Auth { .. }
             | Self::Refused { .. }
             | Self::UnsupportedCapability { .. }
             | Self::Fatal { .. } => None,
         }
+    }
+
+    /// Whether partial output from this failed request may be discarded before
+    /// replaying the identical request as a replacement attempt.
+    #[must_use]
+    pub const fn permits_partial_output_retry(&self) -> bool {
+        matches!(self, Self::Stream { .. })
     }
 }
 
@@ -182,11 +319,12 @@ impl Recoverable for ProviderError {
             Self::RateLimited { retry_after } => Recovery::Retry {
                 after: *retry_after,
             },
-            Self::Transient { .. } => Recovery::Retry { after: None },
+            Self::Transient { .. } | Self::Stream { .. } => Recovery::Retry { after: None },
             Self::Auth { .. } => Recovery::Reauthenticate,
-            Self::Refused { .. } | Self::UnsupportedCapability { .. } | Self::Fatal { .. } => {
-                Recovery::Fail
-            }
+            Self::Refused { .. }
+            | Self::UnsupportedCapability { .. }
+            | Self::Protocol { .. }
+            | Self::Fatal { .. } => Recovery::Fail,
         }
     }
 }
@@ -253,6 +391,28 @@ mod tests {
         };
         assert!(e.is_retryable());
         assert_eq!(e.retry_after(), None);
+    }
+
+    #[test]
+    fn structured_stream_failures_allow_replacement_retry() {
+        let error = ProviderError::Stream {
+            code: ProviderStreamFailure::UpstreamStreamIncomplete,
+            source: None,
+        };
+        assert_eq!(error.recovery(), Recovery::Retry { after: None });
+        assert_eq!(error.structured_code(), Some("upstream_stream_incomplete"));
+        assert!(error.permits_partial_output_retry());
+    }
+
+    #[test]
+    fn structured_protocol_failures_are_terminal() {
+        let error = ProviderError::Protocol {
+            code: ProviderProtocolFailure::InvalidUpstreamToolCall,
+            source: None,
+        };
+        assert_eq!(error.recovery(), Recovery::Fail);
+        assert_eq!(error.structured_code(), Some("invalid_upstream_tool_call"));
+        assert!(!error.permits_partial_output_retry());
     }
 
     #[test]
@@ -364,6 +524,10 @@ mod tests {
                 status: None,
                 source: None,
             },
+            ProviderError::Stream {
+                code: ProviderStreamFailure::UpstreamStreamError,
+                source: None,
+            },
             ProviderError::Auth {
                 provider: "google".to_owned(),
                 source: None,
@@ -376,6 +540,10 @@ mod tests {
                 provider: "google".to_owned(),
                 model: "text-only".to_owned(),
                 capability: "attachments",
+            },
+            ProviderError::Protocol {
+                code: ProviderProtocolFailure::UpstreamProtocolError,
+                source: None,
             },
             ProviderError::Fatal {
                 status: None,

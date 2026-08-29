@@ -12,7 +12,7 @@ use zuno_engine::retry::{
     ProviderRetryPolicy, RecoveryAttempt, RecoveryBudget, RecoveryBudgets, RetryError,
     retry_provider, retry_provider_with_sleep,
 };
-use zuno_error::ProviderError;
+use zuno_error::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 use zuno_llm::event::StreamEvent;
 
 fn policy(max_attempts: u32) -> ProviderRetryPolicy {
@@ -76,6 +76,23 @@ fn every_terminal_turn_error_has_an_explicit_goal_recovery_decision() {
                 reason: TurnRetryReason::ProviderTransient,
                 after: None,
             },
+        ),
+        (
+            TurnError::Provider(ProviderError::Stream {
+                code: ProviderStreamFailure::UpstreamStreamError,
+                source: None,
+            }),
+            TurnRecovery::Retry {
+                reason: TurnRetryReason::ProviderTransient,
+                after: None,
+            },
+        ),
+        (
+            TurnError::Provider(ProviderError::Protocol {
+                code: ProviderProtocolFailure::UpstreamProtocolError,
+                source: None,
+            }),
+            TurnRecovery::Fail,
         ),
         (
             TurnError::ProviderRetryDeadlineExceeded {
@@ -521,6 +538,10 @@ async fn retry_never_replays_non_retryable_provider_errors() {
         ProviderError::Refused {
             provider: "test".to_owned(),
             provider_text: Some("refused".to_owned()),
+        },
+        ProviderError::Protocol {
+            code: ProviderProtocolFailure::InvalidUpstreamReasoning,
+            source: None,
         },
         ProviderError::Fatal {
             status: Some(400),

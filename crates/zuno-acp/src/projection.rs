@@ -14,6 +14,68 @@ pub struct TurnEventProjector {
     visible_tools: HashSet<String>,
 }
 
+/// ACP projection that exposes provider output only after its attempt is durable.
+///
+/// ACP message chunks are append-only. Holding attempt-scoped updates until
+/// [`TurnEvent::AssistantCheckpointed`] is therefore the only protocol-safe way
+/// to discard a failed partial stream when the engine emits `RetryRollback`.
+#[derive(Debug, Default)]
+pub struct AttemptBufferedTurnEventProjector {
+    projector: TurnEventProjector,
+    pending: Vec<Value>,
+    buffering: bool,
+}
+
+impl AttemptBufferedTurnEventProjector {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_context_size(context_size: u64) -> Self {
+        Self {
+            projector: TurnEventProjector::with_context_size(context_size),
+            ..Self::default()
+        }
+    }
+
+    /// Project one engine event into zero or more committed ACP updates.
+    #[must_use]
+    pub fn project(&mut self, event: &TurnEvent) -> Vec<Value> {
+        match event {
+            TurnEvent::ProviderRequestStarted { .. } => {
+                self.pending.clear();
+                self.projector.reset_attempt();
+                self.buffering = true;
+                Vec::new()
+            }
+            TurnEvent::Provider {
+                event: StreamEvent::RetryRollback { .. },
+                ..
+            } => {
+                self.pending.clear();
+                self.projector.reset_attempt();
+                Vec::new()
+            }
+            TurnEvent::AssistantCheckpointed { .. } => {
+                if let Some(update) = self.projector.project(event) {
+                    self.pending.push(update);
+                }
+                self.buffering = false;
+                std::mem::take(&mut self.pending)
+            }
+            _ if self.buffering => {
+                if let Some(update) = self.projector.project(event) {
+                    self.pending.push(update);
+                }
+                Vec::new()
+            }
+            _ => self.projector.project(event).into_iter().collect(),
+        }
+    }
+}
+
 impl TurnEventProjector {
     #[must_use]
     pub fn new() -> Self {
@@ -31,6 +93,12 @@ impl TurnEventProjector {
     #[must_use]
     pub fn project(&mut self, event: &TurnEvent) -> Option<Value> {
         self.project_inner(event)
+    }
+
+    fn reset_attempt(&mut self) {
+        self.raw_inputs.clear();
+        self.tool_names.clear();
+        self.visible_tools.clear();
     }
 
     #[must_use]

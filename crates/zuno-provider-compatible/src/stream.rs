@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Deserialize;
-use zuno_error::ProviderError;
+use zuno_error::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 use zuno_llm::event::PromptAccounting;
 use zuno_llm::registry::{ApiSurface, FinishReason, StreamEvent};
 use zuno_llm::sse::{StreamLimits, append_tool_input, ensure_tool_input_size};
@@ -666,6 +666,24 @@ pub fn finish_reason(wire: &str) -> FinishReason {
 /// [`WireError::message`] is attached as payload and never examined.
 #[must_use]
 pub fn classify(provider: &str, error: &WireError) -> ProviderError {
+    if let Some(code) = error.code_str().and_then(ProviderStreamFailure::from_code) {
+        return ProviderError::Stream {
+            code,
+            source: Some(Box::new(ReportedWireError::new(provider, error))),
+        };
+    }
+    if let Some(code) = error
+        .code_str()
+        .and_then(ProviderProtocolFailure::from_code)
+    {
+        return ProviderError::Protocol {
+            code,
+            source: Some(Box::new(ReportedWireError::new(provider, error))),
+        };
+    }
+    if error.code_str() == Some("upstream_error") {
+        return ProviderError::fatal(ReportedWireError::new(provider, error));
+    }
     if let Some("context_length_exceeded") = error.code_str() {
         return ProviderError::ContextLimit {
             limit_tokens: None,
@@ -898,6 +916,95 @@ mod tests {
             panic!("type-only server_error must be transient");
         };
         assert!(source.to_string().contains("server_error"));
+    }
+
+    #[test]
+    fn kiro_stream_failure_codes_are_retryable_replacement_attempts() {
+        let cases = [
+            (
+                "upstream_stream_error",
+                ProviderStreamFailure::UpstreamStreamError,
+            ),
+            (
+                "upstream_stream_incomplete",
+                ProviderStreamFailure::UpstreamStreamIncomplete,
+            ),
+            (
+                "upstream_stream_idle_timeout",
+                ProviderStreamFailure::UpstreamStreamIdleTimeout,
+            ),
+            (
+                "request_deadline_exceeded",
+                ProviderStreamFailure::RequestDeadlineExceeded,
+            ),
+        ];
+
+        for (wire_code, expected) in cases {
+            let error = classify(
+                "kiro-local",
+                &WireError {
+                    message: Some("stream failed".to_owned()),
+                    code: Some(serde_json::json!(wire_code)),
+                    kind: Some("upstream_error".to_owned()),
+                },
+            );
+            assert!(matches!(
+                error,
+                ProviderError::Stream { code, .. } if code == expected
+            ));
+            assert_eq!(error.recovery(), Recovery::Retry { after: None });
+            assert!(error.permits_partial_output_retry());
+        }
+    }
+
+    #[test]
+    fn kiro_protocol_failure_codes_are_terminal() {
+        let cases = [
+            (
+                "upstream_protocol_error",
+                ProviderProtocolFailure::UpstreamProtocolError,
+            ),
+            (
+                "invalid_upstream_tool_call",
+                ProviderProtocolFailure::InvalidUpstreamToolCall,
+            ),
+            (
+                "invalid_upstream_reasoning",
+                ProviderProtocolFailure::InvalidUpstreamReasoning,
+            ),
+        ];
+
+        for (wire_code, expected) in cases {
+            let error = classify(
+                "kiro-local",
+                &WireError {
+                    message: Some("protocol failed".to_owned()),
+                    code: Some(serde_json::json!(wire_code)),
+                    kind: Some("upstream_protocol_error".to_owned()),
+                },
+            );
+            assert!(matches!(
+                error,
+                ProviderError::Protocol { code, .. } if code == expected
+            ));
+            assert_eq!(error.recovery(), Recovery::Fail);
+            assert!(!error.permits_partial_output_retry());
+        }
+    }
+
+    #[test]
+    fn legacy_generic_upstream_error_remains_terminal() {
+        let error = classify(
+            "kiro-local",
+            &WireError {
+                message: Some("ambiguous legacy error".to_owned()),
+                code: Some(serde_json::json!("upstream_error")),
+                kind: Some("server_error".to_owned()),
+            },
+        );
+
+        assert!(matches!(error, ProviderError::Fatal { .. }));
+        assert_eq!(error.recovery(), Recovery::Fail);
     }
 
     #[test]

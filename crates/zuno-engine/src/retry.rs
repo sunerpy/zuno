@@ -203,6 +203,36 @@ where
     },
 }
 
+/// A durable observer's view of one provider attempt.
+#[derive(Debug)]
+pub enum ProviderAttemptObservation<'a, T> {
+    /// The attempt is about to call the provider.
+    Started { attempt: u32, max: u32 },
+    /// The attempt returned, before any rollback, delay, or replay is admitted.
+    Finished {
+        attempt: u32,
+        max: u32,
+        result: &'a Result<T, ProviderError>,
+    },
+}
+
+/// A provider retry failed either in recovery itself or while durably observing
+/// an attempt boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderRetryObservedError<E, O>
+where
+    E: Error + 'static,
+    O: Error + 'static,
+{
+    #[error(transparent)]
+    Retry(#[from] ProviderRetryError<E>),
+    #[error("provider attempt observation failed")]
+    Observation {
+        #[source]
+        source: O,
+    },
+}
+
 /// Retry a provider operation with real Tokio sleeps between attempts.
 ///
 /// `emit` receives [`StreamEvent::RetryRollback`] before every sleep and replay.
@@ -253,6 +283,51 @@ where
     retry_provider_with_sleep_and_wake(policy, operation, emit, tokio::time::sleep, wake).await
 }
 
+/// Retry a provider operation while synchronously observing every attempt boundary.
+///
+/// `observe` runs before the provider call and immediately after it returns. A
+/// failed observation aborts recovery before rollback or another attempt, so a
+/// caller can require durable attempt records before replay is scheduled.
+pub async fn retry_provider_with_wake_observed<
+    T,
+    Operation,
+    OperationFuture,
+    Emit,
+    EmitFuture,
+    EmitError,
+    Wake,
+    WakeFuture,
+    Observe,
+    ObserveError,
+>(
+    policy: ProviderRetryPolicy,
+    operation: Operation,
+    emit: Emit,
+    wake: Wake,
+    observe: Observe,
+) -> Result<T, ProviderRetryObservedError<EmitError, ObserveError>>
+where
+    Operation: FnMut(u32) -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, ProviderError>>,
+    Emit: FnMut(StreamEvent) -> EmitFuture,
+    EmitFuture: Future<Output = Result<(), EmitError>>,
+    EmitError: Error + 'static,
+    Wake: FnMut() -> WakeFuture,
+    WakeFuture: Future<Output = T>,
+    Observe: for<'a> FnMut(ProviderAttemptObservation<'a, T>) -> Result<(), ObserveError>,
+    ObserveError: Error + 'static,
+{
+    retry_provider_with_sleep_and_wake_observed(
+        policy,
+        operation,
+        emit,
+        tokio::time::sleep,
+        wake,
+        observe,
+    )
+    .await
+}
+
 /// Retry a provider operation with an injected sleeper for deterministic tests.
 ///
 /// The callback order is operation failure, rollback emission, sleep, then the
@@ -298,10 +373,10 @@ async fn retry_provider_with_sleep_and_wake<
     WakeFuture,
 >(
     policy: ProviderRetryPolicy,
-    mut operation: Operation,
-    mut emit: Emit,
-    mut sleep: Sleep,
-    mut wake: Wake,
+    operation: Operation,
+    emit: Emit,
+    sleep: Sleep,
+    wake: Wake,
 ) -> Result<T, ProviderRetryError<EmitError>>
 where
     Operation: FnMut(u32) -> OperationFuture,
@@ -314,22 +389,81 @@ where
     Wake: FnMut() -> WakeFuture,
     WakeFuture: Future<Output = T>,
 {
+    let result = retry_provider_with_sleep_and_wake_observed(
+        policy,
+        operation,
+        emit,
+        sleep,
+        wake,
+        |_: ProviderAttemptObservation<'_, T>| Ok::<(), std::convert::Infallible>(()),
+    )
+    .await;
+    match result {
+        Ok(output) => Ok(output),
+        Err(ProviderRetryObservedError::Retry(error)) => Err(error),
+        Err(ProviderRetryObservedError::Observation { source }) => match source {},
+    }
+}
+
+async fn retry_provider_with_sleep_and_wake_observed<
+    T,
+    Operation,
+    OperationFuture,
+    Emit,
+    EmitFuture,
+    EmitError,
+    Sleep,
+    SleepFuture,
+    Wake,
+    WakeFuture,
+    Observe,
+    ObserveError,
+>(
+    policy: ProviderRetryPolicy,
+    mut operation: Operation,
+    mut emit: Emit,
+    mut sleep: Sleep,
+    mut wake: Wake,
+    mut observe: Observe,
+) -> Result<T, ProviderRetryObservedError<EmitError, ObserveError>>
+where
+    Operation: FnMut(u32) -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, ProviderError>>,
+    Emit: FnMut(StreamEvent) -> EmitFuture,
+    EmitFuture: Future<Output = Result<(), EmitError>>,
+    EmitError: Error + 'static,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: Future<Output = ()>,
+    Wake: FnMut() -> WakeFuture,
+    WakeFuture: Future<Output = T>,
+    Observe: for<'a> FnMut(ProviderAttemptObservation<'a, T>) -> Result<(), ObserveError>,
+    ObserveError: Error + 'static,
+{
     let max = policy.max_attempts().get();
     let mut recovery_started = None;
     let mut attempt = 1_u32;
 
     loop {
+        observe(ProviderAttemptObservation::Started { attempt, max })
+            .map_err(|source| ProviderRetryObservedError::Observation { source })?;
         let result = operation(attempt).await;
+        observe(ProviderAttemptObservation::Finished {
+            attempt,
+            max,
+            result: &result,
+        })
+        .map_err(|source| ProviderRetryObservedError::Observation { source })?;
         match result {
             Ok(output) => return Ok(output),
             Err(error) if !error.is_retryable() => {
-                return Err(ProviderRetryError::Provider(error));
+                return Err(ProviderRetryError::Provider(error).into());
             }
             Err(error) if attempt >= max => {
                 return Err(ProviderRetryError::AttemptsExhausted {
                     attempts: attempt,
                     source: error,
-                });
+                }
+                .into());
             }
             Err(error) => {
                 let started = *recovery_started.get_or_insert_with(tokio::time::Instant::now);
@@ -340,7 +474,8 @@ where
                     return Err(ProviderRetryError::DeadlineExceeded {
                         attempt,
                         elapsed: started.elapsed(),
-                    });
+                    }
+                    .into());
                 }
                 tokio::time::timeout_at(
                     deadline,
@@ -350,12 +485,16 @@ where
                     }),
                 )
                 .await
-                .map_err(|_| ProviderRetryError::DeadlineExceeded {
-                    attempt,
-                    elapsed: started.elapsed(),
+                .map_err(|_| {
+                    ProviderRetryObservedError::Retry(ProviderRetryError::DeadlineExceeded {
+                        attempt,
+                        elapsed: started.elapsed(),
+                    })
                 })?
-                .map_err(|source| ProviderRetryError::RollbackEmission {
-                    source: Box::new(source),
+                .map_err(|source| {
+                    ProviderRetryObservedError::Retry(ProviderRetryError::RollbackEmission {
+                        source: Box::new(source),
+                    })
                 })?;
                 let wait = async {
                     tokio::select! {
@@ -365,10 +504,10 @@ where
                     }
                 };
                 let delay = tokio::time::timeout_at(deadline, wait).await.map_err(|_| {
-                    ProviderRetryError::DeadlineExceeded {
+                    ProviderRetryObservedError::Retry(ProviderRetryError::DeadlineExceeded {
                         attempt,
                         elapsed: started.elapsed(),
-                    }
+                    })
                 })?;
                 if let RetryDelay::Woken(output) = delay {
                     return Ok(output);

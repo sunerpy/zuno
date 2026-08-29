@@ -11,7 +11,7 @@ mod transport;
 pub mod conformance;
 
 pub use permission::{AcpPermissionAsker, AcpPermissionGrants};
-pub use projection::{TurnEventProjector, turn_event_update};
+pub use projection::{AttemptBufferedTurnEventProjector, TurnEventProjector, turn_event_update};
 pub use question::AcpQuestionAsker;
 pub use replay::{
     DurableReplay, REPLAY_MESSAGE_CAP, REPLAY_TRANSCRIPT_BYTE_CAP, ReplayPolicy,

@@ -2415,10 +2415,11 @@ async fn project_turn(
     mut receiver: tokio::sync::mpsc::Receiver<TurnEvent>,
     client: zuno_acp::ClientConnection,
 ) -> Result<ProjectedTurn, zuno_acp::RpcError> {
-    let mut projector = zuno_acp::TurnEventProjector::with_context_size(context_size);
+    let mut projector =
+        zuno_acp::AttemptBufferedTurnEventProjector::with_context_size(context_size);
     let mut finish_reason = None;
     while let Some(event) = receiver.recv().await {
-        if let Some(update) = projector.project(&event) {
+        for update in projector.project(&event) {
             client.session_update(session_id, update).await?;
         }
         match event {

@@ -447,6 +447,17 @@ verify that Zed is reaching the newly built provider process.
 300-second request and 180-second stream-idle deadlines. This lets the gateway
 return its typed timeout before the ACP client closes the request.
 
+`kiro-provider` v0.5.0 and later also distinguish retryable stream failures from
+fatal protocol failures. Zuno retries only
+`upstream_stream_error`, `upstream_stream_incomplete`,
+`upstream_stream_idle_timeout`, and `request_deadline_exceeded`; the legacy
+generic `upstream_error` is not enough to authorize retry. Every call is recorded
+under `session.provider.attempt.1`, and the same durable session affinity is
+reused. Because ACP cannot retract an appended message chunk, Zuno commits
+provider text, reasoning, and pending tool rows only after the attempt is
+checkpointed. A failed partial attempt is discarded instead of being concatenated
+with its replacement.
+
 ## 9. Acceptance checks
 
 After configuration:
@@ -464,8 +475,9 @@ After configuration:
    summary survives a session reload;
 7. execute one configured command or unambiguous Skill;
 8. attach an image, selection, and branch diff and confirm they reach the turn;
-9. send a read-only repository question and confirm reasoning
-   and tool updates stream incrementally;
+9. send a read-only repository question and confirm the committed reasoning,
+   answer, and pending tool rows appear once; inject one retryable stream failure
+   and confirm the failed partial attempt is absent;
 10. delegate a foreground child and confirm either the negotiated child-session
     stream or the complete stable task card, depending on client capability;
 11. delegate a background child, close the root thread, and confirm the job is

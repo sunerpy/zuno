@@ -100,7 +100,7 @@ pub use crate::db::DbError;
 pub use crate::lsp::LspError;
 pub use crate::mcp::McpError;
 pub use crate::plugin::PluginError;
-pub use crate::provider::ProviderError;
+pub use crate::provider::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 pub use crate::recovery::{Recoverable, Recovery};
 pub use crate::source::BoxSource;
 pub use crate::tool::ToolError;

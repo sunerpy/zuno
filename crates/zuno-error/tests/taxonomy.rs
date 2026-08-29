@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use zuno_error::{
     ConfigError, ConfigIssue, DbError, Error, LspError, McpError, PluginError, ProviderError,
-    Recoverable, Recovery, ToolError,
+    ProviderProtocolFailure, ProviderStreamFailure, Recoverable, Recovery, ToolError,
 };
 
 /// The criterion this task exists to satisfy: the delay a provider sent survives
@@ -60,6 +60,13 @@ fn recovery_decisions_need_no_access_to_rendered_text() {
             Recovery::Retry { after: None },
         ),
         (
+            ProviderError::Stream {
+                code: ProviderStreamFailure::UpstreamStreamIncomplete,
+                source: None,
+            },
+            Recovery::Retry { after: None },
+        ),
+        (
             ProviderError::Auth {
                 provider: "anthropic".to_owned(),
                 source: None,
@@ -70,6 +77,13 @@ fn recovery_decisions_need_no_access_to_rendered_text() {
             ProviderError::Refused {
                 provider: "anthropic".to_owned(),
                 provider_text: None,
+            },
+            Recovery::Fail,
+        ),
+        (
+            ProviderError::Protocol {
+                code: ProviderProtocolFailure::InvalidUpstreamToolCall,
+                source: None,
             },
             Recovery::Fail,
         ),

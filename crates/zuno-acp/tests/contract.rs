@@ -1,5 +1,7 @@
 use serde_json::json;
-use zuno_acp::{IMPLEMENTED_METHODS, TurnEventProjector, turn_event_update};
+use zuno_acp::{
+    AttemptBufferedTurnEventProjector, IMPLEMENTED_METHODS, TurnEventProjector, turn_event_update,
+};
 use zuno_engine::r#loop::{ToolBlockKind, ToolDiff, TurnEvent};
 use zuno_llm::event::{PromptAccounting, StreamEvent};
 use zuno_tool::{FileDiff, ToolUiIntent};
@@ -463,4 +465,95 @@ fn usage_updates_require_an_explicit_context_window() {
     assert_eq!(update["sessionUpdate"], "usage_update");
     assert_eq!(update["used"], 175);
     assert_eq!(update["size"], 200_000);
+}
+
+#[test]
+fn attempt_buffering_discards_failed_partial_output_before_acp_commit() {
+    let mut projector = AttemptBufferedTurnEventProjector::with_context_size(200_000);
+    assert!(
+        projector
+            .project(&TurnEvent::ProviderRequestStarted {
+                step: 1,
+                message_count: 1,
+                estimated_prompt_tokens: 12,
+            })
+            .is_empty()
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 1,
+                event: StreamEvent::TextDelta("discarded".to_owned()),
+            })
+            .is_empty(),
+        "attempt output must remain provisional"
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 1,
+                event: StreamEvent::ToolUseStart {
+                    id: "discarded-call".to_owned(),
+                    name: "read".to_owned(),
+                },
+            })
+            .is_empty()
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::ToolCallStarted {
+                step: 1,
+                call_id: "discarded-call".to_owned(),
+                display_name: "Read".to_owned(),
+                name: "read".to_owned(),
+                ui_intent: ToolUiIntent::Generic,
+            })
+            .is_empty(),
+        "a failed attempt must not create a visible ACP tool row"
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 1,
+                event: StreamEvent::RetryRollback { attempt: 2, max: 3 },
+            })
+            .is_empty()
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 1,
+                event: StreamEvent::ReasoningDelta("kept thought".to_owned()),
+            })
+            .is_empty()
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 1,
+                event: StreamEvent::TextDelta("kept answer".to_owned()),
+            })
+            .is_empty()
+    );
+
+    let committed = projector.project(&TurnEvent::AssistantCheckpointed {
+        step: 1,
+        message_id: "msg-1".to_owned(),
+        interrupted: false,
+    });
+    assert_eq!(committed.len(), 2);
+    assert_eq!(committed[0]["sessionUpdate"], "agent_thought_chunk");
+    assert_eq!(committed[0]["content"]["text"], "kept thought");
+    assert_eq!(committed[1]["sessionUpdate"], "agent_message_chunk");
+    assert_eq!(committed[1]["content"]["text"], "kept answer");
+    assert!(
+        committed
+            .iter()
+            .all(|update| update["content"]["text"] != "discarded")
+    );
+    assert!(
+        committed
+            .iter()
+            .all(|update| update["toolCallId"] != "discarded-call")
+    );
 }

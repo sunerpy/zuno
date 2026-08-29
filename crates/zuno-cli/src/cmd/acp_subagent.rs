@@ -222,7 +222,7 @@ impl BridgeEvent {
 
 struct ChildProjection {
     parent_session_id: String,
-    projector: zuno_acp::TurnEventProjector,
+    projector: zuno_acp::AttemptBufferedTurnEventProjector,
 }
 
 async fn run_worker(
@@ -286,7 +286,7 @@ async fn run_worker(
                             background.remove(&session_id);
                         }
                     } else if let Some(child) = children.get_mut(&session_id) {
-                        if let Some(update) = child.projector.project(&event) {
+                        for update in child.projector.project(&event) {
                             client
                                 .session_update(&session_id, update)
                                 .await
@@ -464,7 +464,7 @@ async fn open_child(
         opened.session_id,
         ChildProjection {
             parent_session_id: opened.parent_session_id,
-            projector: zuno_acp::TurnEventProjector::with_context_size(context_size),
+            projector: zuno_acp::AttemptBufferedTurnEventProjector::with_context_size(context_size),
         },
     );
     Ok(())

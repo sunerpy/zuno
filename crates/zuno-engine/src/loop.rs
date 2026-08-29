@@ -59,7 +59,8 @@ use crate::prompt::{
     RuntimePromptPolicy, ensure_prompt_context_budget,
 };
 use crate::retry::{
-    PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError, ProviderRetryPolicy, retry_provider_with_wake,
+    PROVIDER_RETRY_MAX_ATTEMPTS, ProviderAttemptObservation, ProviderRetryError,
+    ProviderRetryObservedError, ProviderRetryPolicy, retry_provider_with_wake_observed,
 };
 use crate::session_command::SessionCommand;
 use crate::status::SessionRunGuard;
@@ -520,15 +521,20 @@ impl TurnError {
             Self::Provider(ProviderError::Transient { .. }) => {
                 "The provider connection failed before the turn completed.".to_owned()
             }
+            Self::Provider(ProviderError::Stream { .. }) => {
+                "The provider stream ended before the turn completed.".to_owned()
+            }
             Self::Provider(ProviderError::UnsupportedCapability {
                 provider,
                 model,
                 capability,
             }) => format!("Model `{provider}/{model}` does not support `{capability}` input."),
-            Self::Provider(ProviderError::Refused { .. } | ProviderError::Fatal { .. }) => {
-                "The provider rejected or malformed the response before the turn completed."
-                    .to_owned()
-            }
+            Self::Provider(
+                ProviderError::Refused { .. }
+                | ProviderError::Protocol { .. }
+                | ProviderError::Fatal { .. },
+            ) => "The provider rejected or malformed the response before the turn completed."
+                .to_owned(),
             _ => self.to_string(),
         }
     }
@@ -567,16 +573,19 @@ impl TurnError {
                 reason: TurnRetryReason::RateLimited,
                 after: *retry_after,
             },
-            Self::Provider(ProviderError::Transient { .. }) => TurnRecovery::Retry {
-                reason: TurnRetryReason::ProviderTransient,
-                after: None,
-            },
+            Self::Provider(ProviderError::Transient { .. } | ProviderError::Stream { .. }) => {
+                TurnRecovery::Retry {
+                    reason: TurnRetryReason::ProviderTransient,
+                    after: None,
+                }
+            }
             Self::Provider(ProviderError::Auth { .. }) | Self::EventConsumerClosed => {
                 TurnRecovery::Pause
             }
             Self::Provider(
                 ProviderError::Refused { .. }
                 | ProviderError::UnsupportedCapability { .. }
+                | ProviderError::Protocol { .. }
                 | ProviderError::Fatal { .. },
             )
             | Self::NoUserMessage { .. }
@@ -1647,154 +1656,204 @@ async fn run_turn_in_span(
             .live_inputs
             .as_ref()
             .map(|live| live.guard.soft_interrupt_signal().clone());
+        let provider_interrupt = context.interrupt.clone();
         let retry_interrupt = context.interrupt.clone();
         let retry_soft_interrupt = soft_interrupt.clone();
-        let attempt = retry_provider_with_wake(
-            policy,
-            |attempt| {
-                let provider = Arc::clone(&provider);
-                let completion = completion.clone();
-                let interrupt = context.interrupt.clone();
-                let soft_interrupt = soft_interrupt.clone();
-                let events = events.clone();
-                let accumulator = Arc::clone(&accumulator);
-                let locked_tools = Arc::clone(&locked_tools);
-                let request_span = span::provider_request_for_session(
-                    &request.session_id,
-                    &model.catalog_provider_id,
-                    &model.catalog_model_id,
-                    attempt,
-                    true,
-                    "turn",
-                );
-                async move {
-                    let operation_span = request_span.clone();
-                    let result = async move {
-                        let mut stream = provider.stream(completion);
-                        // `Some(n)` once the message has finished: how many more frames may be
-                        // read for their bookkeeping before the step ends regardless.
-                        let mut trailing: Option<u8> = None;
-                        loop {
-                            let control = wait_for_provider_control(
-                                interrupt.clone(),
-                                soft_interrupt.clone(),
-                            );
-                            tokio::pin!(control);
-                            let next = tokio::select! {
-                                biased;
-                                exit = &mut control => return Ok(Ok(exit)),
-                                event = stream.next() => event,
-                            };
-                            let Some(next) = next else {
-                                return Ok(Ok(ProviderStreamExit::Completed));
-                            };
-                            // An error *after* the message has finished is not the turn's
-                            // failure: the answer is already complete and persisted, and the
-                            // only thing still outstanding is bookkeeping. Failing the turn
-                            // over a truncated trailing frame would throw away a reply the
-                            // user has already read.
-                            if trailing.is_some() && next.is_err() {
-                                return Ok(Ok(ProviderStreamExit::Completed));
-                            }
-                            let event = match next {
-                                Ok(event) => event,
-                                Err(error @ ProviderError::Transient { status: None, .. })
-                                    if accumulator
-                                        .lock()
-                                        .expect("step accumulator lock")
-                                        .has_generated_output() =>
-                                {
-                                    return Ok(Err(TurnError::Provider(error)));
-                                }
-                                Err(error) => return Err(error),
-                            };
-                            let ended = matches!(event, StreamEvent::MessageEnd { .. });
-                            let apply = accumulator
-                                .lock()
-                                .expect("step accumulator lock")
-                                .apply(step, &event);
-                            if let Err(error) = apply {
-                                return Ok(Err(error));
-                            }
-                            if let StreamEvent::ToolUseStart { id, name } = &event
-                                && let Err(error) = events
-                                    .send(TurnEvent::ToolCallStarted {
-                                        step,
-                                        call_id: id.clone(),
-                                        display_name: tool_display_name(&locked_tools, name),
-                                        name: name.clone(),
-                                        ui_intent: tool_ui_intent(&locked_tools, name),
-                                    })
-                                    .await
-                            {
-                                return Ok(Err(error));
-                            }
-                            if let Err(error) =
-                                events.send(TurnEvent::Provider { step, event }).await
-                            {
-                                return Ok(Err(error));
-                            }
-                            // `MessageEnd` is not the last frame an OpenAI-compatible endpoint
-                            // sends: `usage` arrives in a chunk *after* the one carrying the
-                            // finish reason, and `[DONE]` after that. Returning here read the
-                            // finish reason and discarded everything behind it, so
-                            // `StreamEvent::TokenUsage` — and therefore
-                            // `StepAccumulator`'s token fields, and therefore the `tokens`
-                            // column `update_usage` writes — could never be reached on those
-                            // providers. Measured: every assistant row in a nine-session
-                            // database had `input: 0, output: 0`.
-                            //
-                            // So a finished message starts a bounded trailing drain rather
-                            // than ending the step. Bounded because a provider that keeps
-                            // streaming after saying it finished must not hold the turn open:
-                            // the count is generous next to the one-or-two frames a real
-                            // endpoint sends, and the provider's own idle timeout still
-                            // governs how long any single frame may take to arrive.
-                            if ended {
-                                trailing = Some(TRAILING_FRAME_BUDGET);
-                            }
-                            if let Some(remaining) = trailing.as_mut() {
-                                if *remaining == 0 {
+        let attempt = {
+            let attempt_connection = &mut *context.connection;
+            retry_provider_with_wake_observed(
+                policy,
+                |attempt| {
+                    let provider = Arc::clone(&provider);
+                    let completion = completion.clone();
+                    let interrupt = provider_interrupt.clone();
+                    let soft_interrupt = soft_interrupt.clone();
+                    let events = events.clone();
+                    let accumulator = Arc::clone(&accumulator);
+                    let locked_tools = Arc::clone(&locked_tools);
+                    let request_span = span::provider_request_for_session(
+                        &request.session_id,
+                        &model.catalog_provider_id,
+                        &model.catalog_model_id,
+                        attempt,
+                        true,
+                        "turn",
+                    );
+                    async move {
+                        let operation_span = request_span.clone();
+                        let result = async move {
+                            let mut stream = provider.stream(completion);
+                            // `Some(n)` once the message has finished: how many more frames may be
+                            // read for their bookkeeping before the step ends regardless.
+                            let mut trailing: Option<u8> = None;
+                            loop {
+                                let control = wait_for_provider_control(
+                                    interrupt.clone(),
+                                    soft_interrupt.clone(),
+                                );
+                                tokio::pin!(control);
+                                let next = tokio::select! {
+                                    biased;
+                                    exit = &mut control => return Ok(Ok(exit)),
+                                    event = stream.next() => event,
+                                };
+                                let Some(next) = next else {
+                                    return Ok(Ok(ProviderStreamExit::Completed));
+                                };
+                                // An error *after* the message has finished is not the turn's
+                                // failure: the answer is already complete and persisted, and the
+                                // only thing still outstanding is bookkeeping. Failing the turn
+                                // over a truncated trailing frame would throw away a reply the
+                                // user has already read.
+                                if trailing.is_some() && next.is_err() {
                                     return Ok(Ok(ProviderStreamExit::Completed));
                                 }
-                                *remaining -= 1;
+                                let event = match next {
+                                    Ok(event) => event,
+                                    Err(error)
+                                        if error.is_retryable()
+                                            && !error.permits_partial_output_retry()
+                                            && accumulator
+                                                .lock()
+                                                .expect("step accumulator lock")
+                                                .has_generated_output() =>
+                                    {
+                                        // Opaque transient failures cannot authorize replacement
+                                        // after bytes were exposed. Only a structured stream code
+                                        // carries that replay permission.
+                                        return Ok(Err(TurnError::Provider(error)));
+                                    }
+                                    Err(error) => return Err(error),
+                                };
+                                let ended = matches!(event, StreamEvent::MessageEnd { .. });
+                                let apply = accumulator
+                                    .lock()
+                                    .expect("step accumulator lock")
+                                    .apply(step, &event);
+                                if let Err(error) = apply {
+                                    return Ok(Err(error));
+                                }
+                                if let StreamEvent::ToolUseStart { id, name } = &event
+                                    && let Err(error) = events
+                                        .send(TurnEvent::ToolCallStarted {
+                                            step,
+                                            call_id: id.clone(),
+                                            display_name: tool_display_name(&locked_tools, name),
+                                            name: name.clone(),
+                                            ui_intent: tool_ui_intent(&locked_tools, name),
+                                        })
+                                        .await
+                                {
+                                    return Ok(Err(error));
+                                }
+                                if let Err(error) =
+                                    events.send(TurnEvent::Provider { step, event }).await
+                                {
+                                    return Ok(Err(error));
+                                }
+                                // `MessageEnd` is not the last frame an OpenAI-compatible endpoint
+                                // sends: `usage` arrives in a chunk *after* the one carrying the
+                                // finish reason, and `[DONE]` after that. Returning here read the
+                                // finish reason and discarded everything behind it, so
+                                // `StreamEvent::TokenUsage` — and therefore
+                                // `StepAccumulator`'s token fields, and therefore the `tokens`
+                                // column `update_usage` writes — could never be reached on those
+                                // providers. Measured: every assistant row in a nine-session
+                                // database had `input: 0, output: 0`.
+                                //
+                                // So a finished message starts a bounded trailing drain rather
+                                // than ending the step. Bounded because a provider that keeps
+                                // streaming after saying it finished must not hold the turn open:
+                                // the count is generous next to the one-or-two frames a real
+                                // endpoint sends, and the provider's own idle timeout still
+                                // governs how long any single frame may take to arrive.
+                                if ended {
+                                    trailing = Some(TRAILING_FRAME_BUDGET);
+                                }
+                                if let Some(remaining) = trailing.as_mut() {
+                                    if *remaining == 0 {
+                                        return Ok(Ok(ProviderStreamExit::Completed));
+                                    }
+                                    *remaining -= 1;
+                                }
                             }
                         }
+                        .instrument(operation_span)
+                        .await;
+                        record_provider_attempt(&request_span, step, &result);
+                        result
                     }
-                    .instrument(operation_span)
-                    .await;
-                    record_provider_attempt(&request_span, step, &result);
-                    result
-                }
-            },
-            |event| {
-                let events = events.clone();
-                let accumulator = Arc::clone(&accumulator);
-                async move {
-                    accumulator
-                        .lock()
-                        .expect("step accumulator lock")
-                        .apply(step, &event)?;
-                    events.send(TurnEvent::Provider { step, event }).await
-                }
-            },
-            move || {
-                let interrupt = retry_interrupt.clone();
-                let soft_interrupt = retry_soft_interrupt.clone();
-                async move { Ok(wait_for_provider_control(interrupt, soft_interrupt).await) }
-            },
-        )
-        .await;
+                },
+                |event| {
+                    let events = events.clone();
+                    let accumulator = Arc::clone(&accumulator);
+                    async move {
+                        accumulator
+                            .lock()
+                            .expect("step accumulator lock")
+                            .apply(step, &event)?;
+                        events.send(TurnEvent::Provider { step, event }).await
+                    }
+                },
+                move || {
+                    let interrupt = retry_interrupt.clone();
+                    let soft_interrupt = retry_soft_interrupt.clone();
+                    async move { Ok(wait_for_provider_control(interrupt, soft_interrupt).await) }
+                },
+                |observation| match observation {
+                    ProviderAttemptObservation::Started { attempt, max } => {
+                        append_provider_attempt_started(
+                            attempt_connection,
+                            &request,
+                            ProviderAttemptRecord {
+                                step,
+                                request_id: &request_id,
+                                assistant_message_id: &assistant_id,
+                                attempt,
+                                max_attempts: max,
+                            },
+                        )
+                    }
+                    ProviderAttemptObservation::Finished {
+                        attempt,
+                        max,
+                        result,
+                    } => {
+                        let generated_output = accumulator
+                            .lock()
+                            .expect("step accumulator lock")
+                            .has_generated_output();
+                        append_provider_attempt_terminal(
+                            attempt_connection,
+                            &request,
+                            ProviderAttemptRecord {
+                                step,
+                                request_id: &request_id,
+                                assistant_message_id: &assistant_id,
+                                attempt,
+                                max_attempts: max,
+                            },
+                            generated_output,
+                            result,
+                        )
+                    }
+                },
+            )
+            .await
+        };
         let provider_result = match attempt {
             Ok(result) => result,
-            Err(ProviderRetryError::Provider(error))
-            | Err(ProviderRetryError::AttemptsExhausted { source: error, .. }) => {
-                Err(TurnError::Provider(error))
-            }
-            Err(ProviderRetryError::DeadlineExceeded { attempt, elapsed }) => {
-                Err(TurnError::ProviderRetryDeadlineExceeded { attempt, elapsed })
-            }
-            Err(ProviderRetryError::RollbackEmission { source }) => Err(*source),
+            Err(ProviderRetryObservedError::Retry(error)) => match error {
+                ProviderRetryError::Provider(error)
+                | ProviderRetryError::AttemptsExhausted { source: error, .. } => {
+                    Err(TurnError::Provider(error))
+                }
+                ProviderRetryError::DeadlineExceeded { attempt, elapsed } => {
+                    Err(TurnError::ProviderRetryDeadlineExceeded { attempt, elapsed })
+                }
+                ProviderRetryError::RollbackEmission { source } => Err(*source),
+            },
+            Err(ProviderRetryObservedError::Observation { source }) => Err(source),
         };
         let mut accumulator = {
             let mut accumulator = accumulator.lock().expect("step accumulator lock");
@@ -2345,9 +2404,11 @@ fn provider_error_metadata(error: &ProviderError) -> (&'static str, Option<u16>)
         ProviderError::ContextLimit { .. } => ("context_limit", None),
         ProviderError::RateLimited { .. } => ("rate_limited", Some(429)),
         ProviderError::Transient { status, .. } => ("transient", *status),
+        ProviderError::Stream { .. } => ("stream", None),
         ProviderError::Auth { .. } => ("authentication", None),
         ProviderError::Refused { .. } => ("refused", None),
         ProviderError::UnsupportedCapability { .. } => ("unsupported_capability", None),
+        ProviderError::Protocol { .. } => ("protocol", None),
         ProviderError::Fatal { status, .. } => ("fatal", *status),
     }
 }
@@ -3428,6 +3489,15 @@ struct ProviderRequestStart<'a> {
     step_limit_finalization: Option<NonZeroU32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProviderAttemptRecord<'a> {
+    step: u32,
+    request_id: &'a str,
+    assistant_message_id: &'a str,
+    attempt: u32,
+    max_attempts: u32,
+}
+
 fn append_provider_request_started(
     connection: &mut Connection,
     request: &RunTurnRequest,
@@ -3502,6 +3572,115 @@ fn append_provider_request_started(
         NewSessionEvent::new("session.provider.request", properties)?,
     )?;
     Ok(())
+}
+
+fn append_provider_attempt_started(
+    connection: &mut Connection,
+    request: &RunTurnRequest,
+    attempt: ProviderAttemptRecord<'_>,
+) -> Result<(), TurnError> {
+    let mut properties = provider_attempt_properties(request, attempt);
+    properties.insert("status".to_owned(), Value::String("started".to_owned()));
+    append_with_connection(
+        connection,
+        &request.session_id,
+        NewSessionEvent::new("session.provider.attempt", properties)?,
+    )?;
+    Ok(())
+}
+
+fn append_provider_attempt_terminal(
+    connection: &mut Connection,
+    request: &RunTurnRequest,
+    attempt: ProviderAttemptRecord<'_>,
+    generated_output: bool,
+    result: &Result<Result<ProviderStreamExit, TurnError>, ProviderError>,
+) -> Result<(), TurnError> {
+    let mut properties = provider_attempt_properties(request, attempt);
+    let partial_output =
+        generated_output && !matches!(result, Ok(Ok(ProviderStreamExit::Completed)));
+    properties.insert("partialOutput".to_owned(), Value::Bool(partial_output));
+    match result {
+        Ok(Ok(ProviderStreamExit::Completed)) => {
+            properties.insert("status".to_owned(), Value::String("completed".to_owned()));
+        }
+        Ok(Ok(ProviderStreamExit::Interrupted)) => {
+            properties.insert("status".to_owned(), Value::String("interrupted".to_owned()));
+        }
+        Ok(Ok(ProviderStreamExit::Steered)) => {
+            properties.insert("status".to_owned(), Value::String("steered".to_owned()));
+        }
+        Ok(Err(error)) => {
+            properties.insert("status".to_owned(), Value::String("failed".to_owned()));
+            properties.insert(
+                "turnErrorKind".to_owned(),
+                Value::String(error.kind().to_owned()),
+            );
+            if let TurnError::Provider(error) = error {
+                insert_provider_attempt_error(&mut properties, error);
+            }
+        }
+        Err(error) => {
+            properties.insert("status".to_owned(), Value::String("failed".to_owned()));
+            properties.insert(
+                "turnErrorKind".to_owned(),
+                Value::String("provider".to_owned()),
+            );
+            insert_provider_attempt_error(&mut properties, error);
+        }
+    }
+    append_with_connection(
+        connection,
+        &request.session_id,
+        NewSessionEvent::new("session.provider.attempt", properties)?,
+    )?;
+    Ok(())
+}
+
+fn provider_attempt_properties(
+    request: &RunTurnRequest,
+    attempt: ProviderAttemptRecord<'_>,
+) -> Map<String, Value> {
+    Map::from_iter([
+        (
+            "attemptID".to_owned(),
+            Value::String(format!(
+                "{}.attempt.{}",
+                attempt.request_id, attempt.attempt
+            )),
+        ),
+        (
+            "requestID".to_owned(),
+            Value::String(attempt.request_id.to_owned()),
+        ),
+        ("turnID".to_owned(), Value::String(request.turn_id.clone())),
+        ("step".to_owned(), Value::from(attempt.step)),
+        ("attempt".to_owned(), Value::from(attempt.attempt)),
+        ("maxAttempts".to_owned(), Value::from(attempt.max_attempts)),
+        (
+            "assistantMessageID".to_owned(),
+            Value::String(attempt.assistant_message_id.to_owned()),
+        ),
+    ])
+}
+
+fn insert_provider_attempt_error(properties: &mut Map<String, Value>, error: &ProviderError) {
+    let (kind, status) = provider_error_metadata(error);
+    properties.insert("errorKind".to_owned(), Value::String(kind.to_owned()));
+    properties.insert("retryable".to_owned(), Value::Bool(error.is_retryable()));
+    properties.insert(
+        "partialOutputRetryPermitted".to_owned(),
+        Value::Bool(error.permits_partial_output_retry()),
+    );
+    if let Some(status) = status {
+        properties.insert("httpStatus".to_owned(), Value::from(status));
+    }
+    if let Some(code) = error.structured_code() {
+        properties.insert(
+            "providerErrorCode".to_owned(),
+            Value::String(code.to_owned()),
+        );
+    }
 }
 
 struct AttemptSnapshotInput<'a> {

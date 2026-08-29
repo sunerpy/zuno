@@ -579,6 +579,34 @@ later replay, but never interrupts the first request or an already-running
 replay. Cancellation continues to interrupt either operation through the turn's
 control signal.
 
+OpenAI-compatible error frames retain structured stream and protocol codes.
+`upstream_stream_error`, `upstream_stream_incomplete`,
+`upstream_stream_idle_timeout`, and `request_deadline_exceeded` are typed
+replacement-safe stream failures. They may discard partial text, reasoning, and
+unfinished tool calls before replaying the unchanged request. Protocol codes
+such as `upstream_protocol_error`, `invalid_upstream_reasoning`, and
+`invalid_upstream_tool_call` are terminal. The legacy generic
+`upstream_error` remains terminal because it mixed both recovery classes.
+An opaque transient error after partial output is also terminal for that
+request; only the structured stream variant authorizes replacement.
+
+Every provider call in the bounded recovery sequence has a durable
+`session.provider.attempt.1` lifecycle. Its started and terminal events share
+`attemptID` and `requestID` and record the attempt number, maximum attempts,
+terminal status, whether partial output existed, the typed provider code when
+present, and whether that code permits partial-output replacement. The enclosing
+`session.provider.request.1` remains the logical step lifecycle. Replays clone
+the original `CompletionRequest`, including its private durable-session affinity,
+and the engine never adds the failed partial assistant output to history.
+
+Tool execution begins only after the successful assistant checkpoint, so a
+failed streamed tool call cannot dispatch a side effect. ACP is append-only and
+cannot retract an already published text chunk. Its live projector therefore
+holds provider text, reasoning, and pending tool updates until
+`AssistantCheckpointed`; `RetryRollback` clears the provisional attempt and only
+the replacement attempt is published. Other clients may continue consuming the
+engine's lossless live events directly.
+
 OpenAI-compatible transports resolve three independent provider options:
 
 - `timeout`: a whole-request deadline in milliseconds, or `false` for none;
