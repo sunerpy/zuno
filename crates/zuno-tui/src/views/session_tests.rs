@@ -49,7 +49,23 @@ fn type_into_screen(screen: &mut SessionScreen, text: &str) {
 }
 
 fn root_prompt(submission: PromptSubmission) -> TargetedPromptSubmission {
+    root_prompt_with(
+        submission,
+        PromptDelivery::Direct,
+        PromptOrigin::TuiKeybinding,
+    )
+}
+
+fn root_programmatic_prompt(submission: PromptSubmission) -> TargetedPromptSubmission {
     TargetedPromptSubmission::root(submission)
+}
+
+fn root_prompt_with(
+    payload: PromptSubmission,
+    delivery: PromptDelivery,
+    origin: PromptOrigin,
+) -> TargetedPromptSubmission {
+    TargetedPromptSubmission::root_with(PromptEnvelope::new(payload, delivery, origin))
 }
 
 #[test]
@@ -193,9 +209,11 @@ fn session_screen_a_submission_during_work_is_queued_for_the_next_turn() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(root_prompt(PromptSubmission::Queue(Box::new(
-            PromptSubmission::Text(String::from("change direction"))
-        )))),
+        Ok(root_prompt_with(
+            PromptSubmission::Text(String::from("change direction")),
+            PromptDelivery::Queue,
+            PromptOrigin::Programmatic,
+        )),
         "the active turn caused the follow-up to be refused instead of admitted"
     );
     assert!(
@@ -248,9 +266,11 @@ fn session_screen_ctrl_enter_marks_a_busy_submission_as_an_explicit_steer() {
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(root_prompt(PromptSubmission::Steer(Box::new(
-            PromptSubmission::Text(String::from("change direction now"))
-        ))))
+        Ok(root_prompt_with(
+            PromptSubmission::Text(String::from("change direction now")),
+            PromptDelivery::Steer,
+            PromptOrigin::TuiForceSubmit,
+        ))
     );
     assert!(
         ActionComponent::drain_toasts(&mut screen).is_empty(),
@@ -278,6 +298,64 @@ fn session_screen_ctrl_enter_marks_a_busy_submission_as_an_explicit_steer() {
             .iter()
             .any(|toast| toast.text().contains("next safe point")),
         "the committed steer was not acknowledged: {notices:?}"
+    );
+}
+
+#[test]
+fn session_screen_force_submit_uses_typed_steer_without_requesting_cancellation() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(2);
+    let (cancels, mut cancellation_requests) = mpsc::channel(2);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_cancel_sink(cancels);
+    screen.status.mark_running();
+    screen.editor.set_text("steer without stopping the task");
+
+    screen.handle_action(action("input_force_submit"), &press_none());
+
+    let submitted = submitted
+        .try_recv()
+        .expect("force submit must reach the prompt driver");
+    assert_eq!(submitted.prompt.delivery, PromptDelivery::Steer);
+    assert_eq!(submitted.prompt.origin, PromptOrigin::TuiForceSubmit);
+    assert_eq!(
+        submitted.prompt.payload,
+        PromptSubmission::Text(String::from("steer without stopping the task"))
+    );
+    assert_eq!(
+        cancellation_requests.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "force submit must not share the hard-cancellation channel"
+    );
+}
+
+#[test]
+fn session_screen_palette_force_submit_preserves_palette_origin_without_cancelling() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (prompts, mut submitted) = mpsc::channel(2);
+    let (cancels, mut cancellation_requests) = mpsc::channel(2);
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_prompt_sink(prompts)
+        .with_cancel_sink(cancels);
+    screen.status.mark_running();
+    screen.editor.set_text("palette steer");
+
+    screen.dispatch_action("input_force_submit");
+
+    let submitted = submitted
+        .try_recv()
+        .expect("palette force submit must reach the prompt driver");
+    assert_eq!(submitted.prompt.delivery, PromptDelivery::Steer);
+    assert_eq!(submitted.prompt.origin, PromptOrigin::TuiPalette);
+    assert_eq!(
+        submitted.prompt.payload,
+        PromptSubmission::Text(String::from("palette steer"))
+    );
+    assert_eq!(
+        cancellation_requests.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "the command palette must not translate force submit into hard cancellation"
     );
 }
 
@@ -399,7 +477,7 @@ fn session_screen_a_pasted_image_path_becomes_an_atomic_rich_attachment() {
     screen.handle_action(action("input_submit"), &press_none());
 
     let submitted = submitted.try_recv().expect("rich image submission");
-    let PromptSubmission::Content { text, content } = submitted.submission else {
+    let PromptSubmission::Content { text, content } = submitted.prompt.payload else {
         panic!("a pasted image path was not submitted as rich content");
     };
     assert_eq!(text, "[Image #1]");
@@ -449,7 +527,7 @@ fn session_screen_clipboard_image_becomes_the_same_attachment_shape() {
 
     let submitted = submitted.try_recv().expect("clipboard image submission");
     assert!(matches!(
-        submitted.submission,
+        submitted.prompt.payload,
         PromptSubmission::Content { .. }
     ));
 }
@@ -1719,7 +1797,9 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
     screen.submit_prompt("first");
     assert_eq!(
         submitted.try_recv(),
-        Ok(root_prompt(PromptSubmission::Text(String::from("first"))))
+        Ok(root_programmatic_prompt(PromptSubmission::Text(
+            String::from("first")
+        )))
     );
     screen.handle_action(action("app_exit"), &press_none());
     assert_eq!(cancelled.try_recv(), Ok(()));
@@ -1731,7 +1811,9 @@ fn session_screen_a_new_turn_can_be_cancelled_after_an_earlier_one_was() {
     screen.submit_prompt("second");
     assert_eq!(
         submitted.try_recv(),
-        Ok(root_prompt(PromptSubmission::Text(String::from("second"))))
+        Ok(root_programmatic_prompt(PromptSubmission::Text(
+            String::from("second")
+        )))
     );
     screen.handle_action(action("app_exit"), &press_none());
 
@@ -2044,7 +2126,7 @@ fn session_screen_complete_council_command_keeps_the_user_text_and_typed_request
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(root_prompt(PromptSubmission::Council {
+        Ok(root_programmatic_prompt(PromptSubmission::Council {
             text: input.to_owned(),
             preset: String::from("balanced-review"),
             question: String::from("Should we ship this design?"),
@@ -2068,17 +2150,19 @@ fn session_screen_running_council_is_queued_even_when_force_send_is_requested() 
     screen.status.mark_running();
     let input = "/council balanced-review Should we ship this design?";
 
-    screen.submit(input.to_owned(), true);
+    screen.submit(input.to_owned(), true, PromptOrigin::TuiForceSubmit);
 
     assert_eq!(
         submitted.try_recv(),
-        Ok(root_prompt(PromptSubmission::Queue(Box::new(
+        Ok(root_prompt_with(
             PromptSubmission::Council {
                 text: input.to_owned(),
                 preset: String::from("balanced-review"),
                 question: String::from("Should we ship this design?"),
-            }
-        ))))
+            },
+            PromptDelivery::Queue,
+            PromptOrigin::TuiForceSubmit,
+        ))
     );
 }
 
@@ -8575,9 +8659,11 @@ fn live_running_child_enter_submits_plain_text_as_a_targeted_steer() {
         submitted.try_recv(),
         Ok(TargetedPromptSubmission {
             target: PromptTarget::Session(String::from("ses_child")),
-            submission: PromptSubmission::Steer(Box::new(PromptSubmission::Text(String::from(
-                "/help must stay text"
-            )))),
+            prompt: PromptEnvelope::new(
+                PromptSubmission::Text(String::from("/help must stay text")),
+                PromptDelivery::Steer,
+                PromptOrigin::TuiChild,
+            ),
         }),
         "ordinary Enter on a running child must steer that child without slash dispatch"
     );
@@ -8634,7 +8720,11 @@ fn live_completed_child_enter_submits_a_targeted_continuation() {
         submitted.try_recv(),
         Ok(TargetedPromptSubmission {
             target: PromptTarget::Session(String::from("ses_child")),
-            submission: PromptSubmission::Text(String::from("continue with refresh handling")),
+            prompt: PromptEnvelope::new(
+                PromptSubmission::Text(String::from("continue with refresh handling")),
+                PromptDelivery::Direct,
+                PromptOrigin::TuiChild,
+            ),
         }),
         "a completed child needs ordinary continuation input rather than a steer wrapper"
     );

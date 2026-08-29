@@ -74,8 +74,8 @@ use zuno_tui::views::picker::{
     QueuedInputNotice, QueuedInputNoticeKind, QueuedInputProjection,
 };
 use zuno_tui::views::session::{
-    PromptSubmission, PromptTarget, QueuedInputMutation, SessionScreen, TargetedPromptSubmission,
-    scopes,
+    PromptDelivery, PromptEnvelope, PromptOrigin, PromptSubmission, PromptTarget,
+    QueuedInputMutation, SessionScreen, TargetedPromptSubmission, scopes,
 };
 use zuno_tui::views::slash::{CatalogCommand, HostCommand};
 
@@ -2280,31 +2280,33 @@ impl DriverPrompt {
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum PersistedTuiInput {
-    TuiPrompt { submission: PromptSubmission },
+    TuiPrompt {
+        submission: PromptSubmission,
+        origin: PromptOrigin,
+    },
 }
 
 fn dispatch_child_prompt(
     children: &InteractiveChildInput,
     session_id: &str,
-    submission: PromptSubmission,
+    prompt: PromptEnvelope,
 ) -> Result<(), String> {
-    let text = match &submission {
+    let text = match &prompt.payload {
         PromptSubmission::Text(text) | PromptSubmission::Content { text, .. } => text.clone(),
-        PromptSubmission::Steer(inner) => match inner.as_ref() {
-            PromptSubmission::Text(text) | PromptSubmission::Content { text, .. } => text.clone(),
-            _ => {
-                return Err(
-                    "an attached child session accepts text and image input only".to_owned(),
-                );
-            }
-        },
         _ => {
             return Err("an attached child session accepts text and image input only".to_owned());
         }
     };
-    let prompt =
-        serde_json::to_value(PersistedTuiInput::TuiPrompt { submission }).map_err(to_string)?;
-    children.submit_text(session_id, prompt, text)?;
+    let delivery = match prompt.delivery {
+        PromptDelivery::Steer => zuno_db::inbox::InputDelivery::Steer,
+        PromptDelivery::Direct | PromptDelivery::Queue => zuno_db::inbox::InputDelivery::Queue,
+    };
+    let persisted = serde_json::to_value(PersistedTuiInput::TuiPrompt {
+        submission: prompt.payload,
+        origin: prompt.origin,
+    })
+    .map_err(to_string)?;
+    children.submit_text(session_id, persisted, text, delivery)?;
     Ok(())
 }
 
@@ -2329,12 +2331,12 @@ fn route_targeted_prompt(
     children: &InteractiveChildInput,
     observer: Option<Arc<dyn ChildTurnObserver>>,
     prompt: TargetedPromptSubmission,
-    root: &mut VecDeque<PromptSubmission>,
+    root: &mut VecDeque<PromptEnvelope>,
 ) {
     match prompt.target {
-        PromptTarget::Root => root.push_back(prompt.submission),
+        PromptTarget::Root => root.push_back(prompt.prompt),
         PromptTarget::Session(session_id) => {
-            if let Err(error) = dispatch_child_prompt(children, &session_id, prompt.submission) {
+            if let Err(error) = dispatch_child_prompt(children, &session_id, prompt.prompt) {
                 report_child_prompt_failure(observer, &session_id, error);
             }
         }
@@ -2350,7 +2352,7 @@ fn project_queued_inputs(
         if input.prompt.get("kind").and_then(serde_json::Value::as_str) != Some("tuiPrompt") {
             continue;
         }
-        let PersistedTuiInput::TuiPrompt { submission } =
+        let PersistedTuiInput::TuiPrompt { submission, .. } =
             serde_json::from_value(input.prompt).map_err(to_string)?;
         let (text, editable) = queued_submission_display(&submission);
         projected.push(QueuedInputEntry {
@@ -2404,9 +2406,6 @@ fn queued_submission_display(submission: &PromptSubmission) -> (String, bool) {
             },
             false,
         ),
-        PromptSubmission::Queue(inner) | PromptSubmission::Steer(inner) => {
-            queued_submission_display(inner)
-        }
     }
 }
 
@@ -2453,16 +2452,13 @@ async fn apply_queued_input_mutation(
                     .map_err(to_string)?
                     .ok_or_else(|| format!("queued input `{id}` no longer exists"))?;
                 let delivery = current.delivery;
+                let PersistedTuiInput::TuiPrompt { origin, .. } =
+                    serde_json::from_value(current.prompt).map_err(to_string)?;
                 let submission = super::tui_reference::resolve_submission(
                     &reference_root,
                     PromptSubmission::Text(text),
                 )
                 .await?;
-                let submission = if delivery == zuno_db::inbox::InputDelivery::Steer {
-                    PromptSubmission::Steer(Box::new(submission))
-                } else {
-                    submission
-                };
                 inbox
                     .edit_pending(
                         &session_id,
@@ -2470,6 +2466,7 @@ async fn apply_queued_input_mutation(
                         expected_revision,
                         serde_json::to_value(PersistedTuiInput::TuiPrompt {
                             submission: submission.clone(),
+                            origin,
                         })
                         .map_err(to_string)?,
                         zuno_db::message::now_millis(),
@@ -2477,7 +2474,7 @@ async fn apply_queued_input_mutation(
                     .map_err(to_string)?;
                 if delivery == zuno_db::inbox::InputDelivery::Steer {
                     let _removed = control.cancel_soft_interrupt(&id);
-                    if let Some(message) = soft_interrupt(&id, &submission) {
+                    if let Some(message) = soft_interrupt(delivery, &id, &submission) {
                         let _queued = control.queue_soft_interrupt(message);
                     }
                 }
@@ -2607,42 +2604,59 @@ async fn drive_turns(
         // mid-turn would drop the stream the loop is still reading.
         let prompt = match pending {
             Some(pending) => pending,
-            None if !root_prompts.is_empty() => DriverPrompt::direct(
-                root_prompts
+            None if !root_prompts.is_empty() => {
+                let prompt = root_prompts
                     .pop_front()
-                    .expect("the non-empty root prompt queue has a front"),
-            ),
+                    .expect("the non-empty root prompt queue has a front");
+                if prompt.delivery == PromptDelivery::Direct {
+                    DriverPrompt::direct(prompt.payload)
+                } else {
+                    if let Err(message) = admit_followup(
+                        driver.host.session_inbox(),
+                        driver.host.control(),
+                        driver.reference_root.clone(),
+                        driver.queued_inputs.clone(),
+                        driver.queue_wake.clone(),
+                        prompt,
+                    )
+                    .await
+                    {
+                        report_input_failure(&events, message).await;
+                    }
+                    continue 'driver;
+                }
+            }
             None => tokio::select! {
                 biased;
                 prompt = prompts.recv() => match prompt {
                     Some(TargetedPromptSubmission {
                         target: PromptTarget::Root,
-                        submission: prompt @ PromptSubmission::Queue(_),
+                        prompt,
                     }) => {
-                        if let Err(message) = admit_followup(
-                            driver.host.session_inbox(),
-                            driver.host.control(),
-                            driver.reference_root.clone(),
-                            driver.queued_inputs.clone(),
-                            driver.queue_wake.clone(),
-                            prompt,
-                        ).await {
-                            report_input_failure(&events, message).await;
+                        if prompt.delivery == PromptDelivery::Direct {
+                            DriverPrompt::direct(prompt.payload)
+                        } else {
+                            if let Err(message) = admit_followup(
+                                driver.host.session_inbox(),
+                                driver.host.control(),
+                                driver.reference_root.clone(),
+                                driver.queued_inputs.clone(),
+                                driver.queue_wake.clone(),
+                                prompt,
+                            ).await {
+                                report_input_failure(&events, message).await;
+                            }
+                            continue 'driver;
                         }
-                        continue 'driver;
-                    }
-                    Some(TargetedPromptSubmission {
-                        target: PromptTarget::Root,
-                        submission,
-                    }) => DriverPrompt::direct(submission),
+                    },
                     Some(TargetedPromptSubmission {
                         target: PromptTarget::Session(session_id),
-                        submission,
+                        prompt,
                     }) => {
                         if let Err(error) = dispatch_child_prompt(
                             &driver.interactive_children,
                             &session_id,
-                            submission,
+                            prompt,
                         ) {
                             report_child_prompt_failure(
                                 driver.continuity.child_observer(),
@@ -3038,7 +3052,7 @@ async fn drive_one(
     driver: &mut TurnDriver,
     prompt: DriverPrompt,
     prompts: &mut mpsc::Receiver<TargetedPromptSubmission>,
-    root_prompts: &mut VecDeque<PromptSubmission>,
+    root_prompts: &mut VecDeque<PromptEnvelope>,
     queue_mutations: &mut mpsc::Receiver<QueuedInputMutation>,
     queue_mutations_open: &mut bool,
     events: &TurnEventSender,
@@ -3065,10 +3079,6 @@ async fn drive_one(
             } = prompt;
             let prompt =
                 super::tui_reference::resolve_submission(reference_root, submission).await?;
-            let prompt = match prompt {
-                PromptSubmission::Queue(prompt) | PromptSubmission::Steer(prompt) => *prompt,
-                prompt => prompt,
-            };
             if let PromptSubmission::Host(command) = prompt {
                 return execute_host_command(host, command, snapshots, events).await;
             }
@@ -3123,23 +3133,23 @@ async fn drive_one(
                         match followup {
                             Some(TargetedPromptSubmission {
                                 target: PromptTarget::Root,
-                                submission,
+                                prompt,
                             }) => admissions.push(Box::pin(admit_followup(
                                     inbox.clone(),
                                     control.clone(),
                                     admission_root.clone(),
                                     queued_inputs.clone(),
                                     queue_wake.clone(),
-                                    submission,
+                                    prompt,
                                 ))),
                             Some(TargetedPromptSubmission {
                                 target: PromptTarget::Session(session_id),
-                                submission,
+                                prompt,
                             }) => {
                                 if let Err(error) = dispatch_child_prompt(
                                     &interactive_children,
                                     &session_id,
-                                    submission,
+                                    prompt,
                                 ) {
                                     report_child_prompt_failure(
                                         child_observer.as_ref().map(Arc::clone),
@@ -3162,13 +3172,13 @@ async fn drive_one(
                         admission_root.clone(),
                         queued_inputs.clone(),
                         queue_wake.clone(),
-                        followup.submission,
+                        followup.prompt,
                     ))),
                     PromptTarget::Session(session_id) => {
                         if let Err(error) = dispatch_child_prompt(
                             &interactive_children,
                             &session_id,
-                            followup.submission,
+                            followup.prompt,
                         ) {
                             report_child_prompt_failure(
                                 child_observer.as_ref().map(Arc::clone),
@@ -3294,9 +3304,6 @@ async fn drive_submission(
         (PromptSubmission::Host(_), _) => {
             unreachable!("host submissions are handled before a turn is started")
         }
-        (PromptSubmission::Queue(_), _) | (PromptSubmission::Steer(_), _) => {
-            unreachable!("delivery marker is removed before a turn is driven")
-        }
     };
     if let (Err(error), Some(message_id)) = (&result, promoted_message_id) {
         let _settled =
@@ -3306,29 +3313,28 @@ async fn drive_submission(
     result
 }
 
-fn followup_delivery(prompt: &PromptSubmission) -> zuno_db::inbox::InputDelivery {
-    match prompt {
-        PromptSubmission::Queue(_) => zuno_db::inbox::InputDelivery::Queue,
-        PromptSubmission::Steer(inner)
-            if matches!(
-                inner.as_ref(),
-                PromptSubmission::Text(_) | PromptSubmission::Content { .. }
-            ) =>
-        {
-            zuno_db::inbox::InputDelivery::Steer
-        }
-        _ => zuno_db::inbox::InputDelivery::Queue,
+fn followup_delivery(prompt: &PromptEnvelope) -> zuno_db::inbox::InputDelivery {
+    if prompt.delivery == PromptDelivery::Steer
+        && matches!(
+            &prompt.payload,
+            PromptSubmission::Text(_) | PromptSubmission::Content { .. }
+        )
+    {
+        zuno_db::inbox::InputDelivery::Steer
+    } else {
+        zuno_db::inbox::InputDelivery::Queue
     }
 }
 
 fn soft_interrupt(
+    delivery: zuno_db::inbox::InputDelivery,
     input_id: &str,
     prompt: &PromptSubmission,
 ) -> Option<zuno_engine::interrupt::SoftInterruptMessage> {
-    let PromptSubmission::Steer(prompt) = prompt else {
+    if delivery != zuno_db::inbox::InputDelivery::Steer {
         return None;
-    };
-    let (content, images) = match prompt.as_ref() {
+    }
+    let (content, images) = match prompt {
         PromptSubmission::Text(text) => (text.clone(), Vec::new()),
         PromptSubmission::Content { content, .. } => {
             let mut text = Vec::new();
@@ -3357,9 +3363,7 @@ fn soft_interrupt(
         PromptSubmission::Command { .. }
         | PromptSubmission::Skill { .. }
         | PromptSubmission::Council { .. }
-        | PromptSubmission::Host(_)
-        | PromptSubmission::Queue(_)
-        | PromptSubmission::Steer(_) => return None,
+        | PromptSubmission::Host(_) => return None,
     };
     Some(zuno_engine::interrupt::SoftInterruptMessage {
         input_id: Some(input_id.to_owned()),
@@ -3376,17 +3380,19 @@ async fn admit_followup(
     reference_root: PathBuf,
     queued_inputs: QueuedInputProjection,
     queue_wake: mpsc::Sender<TerminalEvent>,
-    prompt: PromptSubmission,
+    prompt: PromptEnvelope,
 ) -> Result<(), String> {
-    let prompt = super::tui_reference::resolve_submission(&reference_root, prompt).await?;
-    let input_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let origin = prompt.origin;
     let delivery = followup_delivery(&prompt);
+    let prompt = super::tui_reference::resolve_submission(&reference_root, prompt.payload).await?;
+    let input_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     inbox
         .admit(zuno_db::inbox::NewSessionInput::new(
             input_id.clone(),
             control.session_id(),
             serde_json::to_value(PersistedTuiInput::TuiPrompt {
                 submission: prompt.clone(),
+                origin,
             })
             .map_err(to_string)?,
             delivery,
@@ -3407,7 +3413,7 @@ async fn admit_followup(
         }),
     );
     if delivery == zuno_db::inbox::InputDelivery::Steer
-        && let Some(message) = soft_interrupt(&input_id, &prompt)
+        && let Some(message) = soft_interrupt(delivery, &input_id, &prompt)
     {
         match control.queue_soft_interrupt(message) {
             Ok(()) => tracing::debug!(
@@ -3454,7 +3460,7 @@ fn promote_pending_prompt(
 
 fn decode_pending_prompt(input: &zuno_db::inbox::SessionInput) -> Result<PromptSubmission, String> {
     if input.prompt.get("kind").and_then(serde_json::Value::as_str) == Some("tuiPrompt") {
-        let PersistedTuiInput::TuiPrompt { submission } =
+        let PersistedTuiInput::TuiPrompt { submission, .. } =
             serde_json::from_value(input.prompt.clone()).map_err(to_string)?;
         return Ok(submission);
     }
@@ -3886,39 +3892,55 @@ mod tests {
 
     #[test]
     fn tui_followup_delivery_queues_by_default_and_only_steers_explicit_overrides() {
+        let prompt =
+            |payload, delivery| PromptEnvelope::new(payload, delivery, PromptOrigin::Programmatic);
         assert_eq!(
-            followup_delivery(&PromptSubmission::Text(String::from("direct"))),
+            followup_delivery(&prompt(
+                PromptSubmission::Text(String::from("direct")),
+                PromptDelivery::Direct,
+            )),
             zuno_db::inbox::InputDelivery::Queue
         );
         assert_eq!(
-            followup_delivery(&PromptSubmission::Queue(Box::new(PromptSubmission::Text(
-                String::from("queue")
-            )))),
+            followup_delivery(&prompt(
+                PromptSubmission::Text(String::from("queue")),
+                PromptDelivery::Queue,
+            )),
             zuno_db::inbox::InputDelivery::Queue
         );
         assert_eq!(
-            followup_delivery(&PromptSubmission::Steer(Box::new(PromptSubmission::Text(
-                String::from("steer")
-            )))),
+            followup_delivery(&prompt(
+                PromptSubmission::Text(String::from("steer")),
+                PromptDelivery::Steer,
+            )),
             zuno_db::inbox::InputDelivery::Steer
         );
         assert_eq!(
-            followup_delivery(&PromptSubmission::Command {
-                name: String::from("review"),
-                arguments: String::new(),
-            }),
+            followup_delivery(&prompt(
+                PromptSubmission::Command {
+                    name: String::from("review"),
+                    arguments: String::new(),
+                },
+                PromptDelivery::Steer,
+            )),
             zuno_db::inbox::InputDelivery::Queue
         );
         assert_eq!(
-            followup_delivery(&PromptSubmission::Skill {
-                name: String::from("codegraph"),
-                source: String::from("/skills/codegraph/SKILL.md"),
-                arguments: String::new(),
-            }),
+            followup_delivery(&prompt(
+                PromptSubmission::Skill {
+                    name: String::from("codegraph"),
+                    source: String::from("/skills/codegraph/SKILL.md"),
+                    arguments: String::new(),
+                },
+                PromptDelivery::Steer,
+            )),
             zuno_db::inbox::InputDelivery::Queue
         );
         assert_eq!(
-            followup_delivery(&PromptSubmission::Host(HostCommand::Undo)),
+            followup_delivery(&prompt(
+                PromptSubmission::Host(HostCommand::Undo),
+                PromptDelivery::Steer,
+            )),
             zuno_db::inbox::InputDelivery::Queue
         );
     }
@@ -3960,9 +3982,11 @@ mod tests {
             reference_root.path().to_path_buf(),
             projection.clone(),
             wake,
-            PromptSubmission::Steer(Box::new(PromptSubmission::Text(
-                "change direction now".to_owned(),
-            ))),
+            PromptEnvelope::new(
+                PromptSubmission::Text("change direction now".to_owned()),
+                PromptDelivery::Steer,
+                PromptOrigin::TuiForceSubmit,
+            ),
         )
         .await
         .expect("admit follow-up");
@@ -3970,6 +3994,14 @@ mod tests {
         let pending = inbox.pending("ses_tui_steer").expect("read durable inbox");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].delivery, zuno_db::inbox::InputDelivery::Steer);
+        assert_eq!(
+            pending[0]
+                .prompt
+                .get("origin")
+                .and_then(serde_json::Value::as_str),
+            Some("tui_force_submit"),
+            "the durable input lost the gesture that selected steering"
+        );
         assert_eq!(projection.snapshot().len(), 1);
         assert!(matches!(
             projection.observe().2.map(|notice| notice.kind),
@@ -3992,9 +4024,64 @@ mod tests {
         assert_eq!(delivered.messages[0].content, "change direction now");
     }
 
+    #[tokio::test]
+    async fn tui_steer_that_loses_the_active_turn_race_remains_pending() {
+        let pool = Arc::new(
+            zuno_db::pool::Pool::open(&zuno_paths::DbLocation::Memory)
+                .expect("open shared in-memory inbox"),
+        );
+        {
+            let mut connection = pool.get().expect("seed connection");
+            zuno_db::migration::apply(&mut connection).expect("apply schema");
+            connection
+                .execute_batch(
+                    "INSERT INTO project \
+                       (id, worktree, time_created, time_updated, sandboxes) \
+                     VALUES ('project-tui-steer-race', '/workspace', 1, 1, '[]');
+                     INSERT INTO session \
+                       (id, project_id, slug, directory, title, version, \
+                        time_created, time_updated) \
+                     VALUES ('ses_tui_steer_race', 'project-tui-steer-race', 'steer-race', \
+                             '/workspace', 'steer race', '1', 1, 1);",
+                )
+                .expect("seed project and session");
+        }
+        let inbox = zuno_db::inbox::SessionInbox::new(pool);
+        let registry = SessionRunRegistry::new();
+        let reference_root = tempfile::tempdir().expect("reference root");
+        let projection = QueuedInputProjection::default();
+        let (wake, _wake_source) = zuno_tui::app::terminal_event_channel();
+
+        admit_followup(
+            inbox.clone(),
+            registry.control("ses_tui_steer_race"),
+            reference_root.path().to_path_buf(),
+            projection,
+            wake,
+            PromptEnvelope::new(
+                PromptSubmission::Text("arrived after completion".to_owned()),
+                PromptDelivery::Steer,
+                PromptOrigin::TuiForceSubmit,
+            ),
+        )
+        .await
+        .expect("durable admission survives an idle target");
+
+        let pending = inbox
+            .pending("ses_tui_steer_race")
+            .expect("read durable inbox");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery, zuno_db::inbox::InputDelivery::Steer);
+        assert_eq!(
+            registry.status("ses_tui_steer_race"),
+            zuno_engine::status::SessionStatus::Idle,
+            "steering an already-finished turn must not manufacture a live turn"
+        );
+    }
+
     #[test]
     fn tui_soft_interrupt_keeps_resolved_text_and_images() {
-        let submission = PromptSubmission::Steer(Box::new(PromptSubmission::Content {
+        let submission = PromptSubmission::Content {
             text: String::from("inspect @diagram.png"),
             content: vec![
                 zuno_llm::event::RequestContentBlock::Text {
@@ -4009,10 +4096,14 @@ mod tests {
                     data: String::from("AAAA"),
                 },
             ],
-        }));
+        };
 
-        let message =
-            soft_interrupt("msg_followup", &submission).expect("content can steer safely");
+        let message = soft_interrupt(
+            zuno_db::inbox::InputDelivery::Steer,
+            "msg_followup",
+            &submission,
+        )
+        .expect("content can steer safely");
 
         assert_eq!(message.input_id.as_deref(), Some("msg_followup"));
         assert_eq!(
@@ -4029,37 +4120,51 @@ mod tests {
     #[test]
     fn tui_prompt_submission_has_a_durable_round_trip() {
         let submissions = [
-            PromptSubmission::Text(String::from("change direction")),
-            PromptSubmission::Content {
-                text: String::from("inspect @diagram.png"),
-                content: vec![zuno_llm::event::RequestContentBlock::Image {
-                    filename: Some(String::from("diagram.png")),
-                    media_type: String::from("image/png"),
-                    data: String::from("AAAA"),
-                }],
-            },
-            PromptSubmission::Command {
-                name: String::from("review"),
-                arguments: String::from("the queue"),
-            },
-            PromptSubmission::Skill {
-                name: String::from("github-project-scaffold"),
-                source: String::from("/skills/github-project-scaffold/SKILL.md"),
-                arguments: String::from("audit the repository"),
-            },
-            PromptSubmission::Host(HostCommand::Undo),
-            PromptSubmission::Queue(Box::new(PromptSubmission::Text(String::from(
-                "queued follow-up",
-            )))),
-            PromptSubmission::Steer(Box::new(PromptSubmission::Text(String::from(
-                "urgent correction",
-            )))),
+            PromptEnvelope::new(
+                PromptSubmission::Text(String::from("change direction")),
+                PromptDelivery::Direct,
+                PromptOrigin::Programmatic,
+            ),
+            PromptEnvelope::new(
+                PromptSubmission::Content {
+                    text: String::from("inspect @diagram.png"),
+                    content: vec![zuno_llm::event::RequestContentBlock::Image {
+                        filename: Some(String::from("diagram.png")),
+                        media_type: String::from("image/png"),
+                        data: String::from("AAAA"),
+                    }],
+                },
+                PromptDelivery::Steer,
+                PromptOrigin::TuiForceSubmit,
+            ),
+            PromptEnvelope::new(
+                PromptSubmission::Command {
+                    name: String::from("review"),
+                    arguments: String::from("the queue"),
+                },
+                PromptDelivery::Queue,
+                PromptOrigin::TuiPalette,
+            ),
+            PromptEnvelope::new(
+                PromptSubmission::Skill {
+                    name: String::from("github-project-scaffold"),
+                    source: String::from("/skills/github-project-scaffold/SKILL.md"),
+                    arguments: String::from("audit the repository"),
+                },
+                PromptDelivery::Queue,
+                PromptOrigin::TuiKeybinding,
+            ),
+            PromptEnvelope::new(
+                PromptSubmission::Host(HostCommand::Undo),
+                PromptDelivery::Direct,
+                PromptOrigin::TuiKeybinding,
+            ),
         ];
 
         for submission in submissions {
             let stored = serde_json::to_value(&submission).expect("serialize submission");
             let restored =
-                serde_json::from_value::<PromptSubmission>(stored).expect("decode submission");
+                serde_json::from_value::<PromptEnvelope>(stored).expect("decode submission");
             assert_eq!(restored, submission);
         }
     }

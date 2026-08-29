@@ -641,6 +641,7 @@ async fn interactive_child_input_targets_only_the_child_and_steers_an_active_tur
                 }
             }),
             "change direction".to_owned(),
+            zuno_db::inbox::InputDelivery::Steer,
         )
         .expect("admit interactive child input");
 
@@ -691,6 +692,7 @@ async fn interactive_child_input_reopens_an_idle_child_through_the_pending_drive
                 }
             }),
             "continue from here".to_owned(),
+            zuno_db::inbox::InputDelivery::Queue,
         )
         .expect("admit idle child input");
     jobs.wait_all().await;

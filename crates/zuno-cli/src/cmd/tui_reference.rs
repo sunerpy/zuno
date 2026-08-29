@@ -97,25 +97,10 @@ pub(super) async fn resolve_submission(
     root: &Path,
     submission: PromptSubmission,
 ) -> Result<PromptSubmission, String> {
-    enum Delivery {
-        Direct,
-        Queue,
-        Steer,
-    }
-    let (submission, delivery) = match submission {
-        PromptSubmission::Queue(submission) => (*submission, Delivery::Queue),
-        PromptSubmission::Steer(submission) => (*submission, Delivery::Steer),
-        submission => (submission, Delivery::Direct),
-    };
-    let wrap = |submission| match delivery {
-        Delivery::Direct => submission,
-        Delivery::Queue => PromptSubmission::Queue(Box::new(submission)),
-        Delivery::Steer => PromptSubmission::Steer(Box::new(submission)),
-    };
     let (text, existing_content) = match submission {
         PromptSubmission::Text(text) => (text, None),
         PromptSubmission::Content { text, content } => (text, Some(content)),
-        submission => return Ok(wrap(submission)),
+        submission => return Ok(submission),
     };
     let references = reference_tokens(&text)?;
     let resolved = if references.is_empty() {
@@ -134,7 +119,7 @@ pub(super) async fn resolve_submission(
         .await
         .map_err(|error| format!("file reference worker failed: {error}"))??
     };
-    Ok(wrap(resolved))
+    Ok(resolved)
 }
 
 fn reference_tokens(text: &str) -> Result<Vec<String>, String> {

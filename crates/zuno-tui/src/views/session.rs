@@ -627,6 +627,7 @@ pub struct SessionScreen {
     /// separately could disagree with the screen about what happened.
     touched: Vec<String>,
     submissions: Vec<String>,
+    submission_origin_override: Option<PromptOrigin>,
     cancellations: usize,
     cancel_requested: bool,
     interrupt_armed_at_ms: Option<u64>,
@@ -804,15 +805,57 @@ pub enum PromptSubmission {
     },
     /// A session-local operation executed by the runtime host.
     Host(HostCommand),
-    /// Explicitly retain a submission in the durable FIFO even if the active turn ends
-    /// before the driver reads the handoff channel.
-    Queue(Box<PromptSubmission>),
-    /// Explicitly steer a running generation at its next safe boundary.
-    ///
-    /// Ordinary submissions are durable FIFO work. Keeping the override in the
-    /// value prevents the user's gesture from being lost between the terminal,
-    /// admission worker, durable inbox, and resumed turn.
-    Steer(Box<PromptSubmission>),
+}
+
+/// How a prompt-channel message enters the durable turn lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDelivery {
+    /// Start a turn directly when the target is idle.
+    Direct,
+    /// Retain the input in the durable FIFO for a later turn.
+    Queue,
+    /// Admit the input durably, then wake an active turn at its next safe point.
+    Steer,
+}
+
+/// The user-visible gesture or host path that produced one submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOrigin {
+    /// A host supplied a prompt without a terminal gesture.
+    Programmatic,
+    /// A normal key-bound submit action.
+    TuiKeybinding,
+    /// The dedicated force-submit key binding.
+    TuiForceSubmit,
+    /// A command-palette action.
+    TuiPalette,
+    /// The composer of an attached child session.
+    TuiChild,
+}
+
+/// One payload plus its delivery semantics and provenance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PromptEnvelope {
+    pub payload: PromptSubmission,
+    pub delivery: PromptDelivery,
+    pub origin: PromptOrigin,
+}
+
+impl PromptEnvelope {
+    #[must_use]
+    pub const fn new(
+        payload: PromptSubmission,
+        delivery: PromptDelivery,
+        origin: PromptOrigin,
+    ) -> Self {
+        Self {
+            payload,
+            delivery,
+            origin,
+        }
+    }
 }
 
 /// The durable session a prompt-channel message belongs to.
@@ -831,7 +874,7 @@ pub enum PromptTarget {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TargetedPromptSubmission {
     pub target: PromptTarget,
-    pub submission: PromptSubmission,
+    pub prompt: PromptEnvelope,
 }
 
 impl TargetedPromptSubmission {
@@ -839,7 +882,11 @@ impl TargetedPromptSubmission {
     pub const fn root(submission: PromptSubmission) -> Self {
         Self {
             target: PromptTarget::Root,
-            submission,
+            prompt: PromptEnvelope::new(
+                submission,
+                PromptDelivery::Direct,
+                PromptOrigin::Programmatic,
+            ),
         }
     }
 
@@ -847,7 +894,27 @@ impl TargetedPromptSubmission {
     pub fn session(session_id: impl Into<String>, submission: PromptSubmission) -> Self {
         Self {
             target: PromptTarget::Session(session_id.into()),
-            submission,
+            prompt: PromptEnvelope::new(
+                submission,
+                PromptDelivery::Direct,
+                PromptOrigin::Programmatic,
+            ),
+        }
+    }
+
+    #[must_use]
+    pub const fn root_with(prompt: PromptEnvelope) -> Self {
+        Self {
+            target: PromptTarget::Root,
+            prompt,
+        }
+    }
+
+    #[must_use]
+    pub fn session_with(session_id: impl Into<String>, prompt: PromptEnvelope) -> Self {
+        Self {
+            target: PromptTarget::Session(session_id.into()),
+            prompt,
         }
     }
 }
@@ -946,6 +1013,7 @@ impl SessionScreen {
             edits: None,
             touched: Vec::new(),
             submissions: Vec::new(),
+            submission_origin_override: None,
             cancellations: 0,
             cancel_requested: false,
             interrupt_armed_at_ms: None,
@@ -1486,7 +1554,7 @@ impl SessionScreen {
     /// invocation and a typed one cannot diverge — which is exactly the divergence a
     /// host that pushed to the transcript itself would introduce.
     pub fn submit_prompt(&mut self, text: impl Into<String>) {
-        self.submit(text.into(), false);
+        self.submit(text.into(), false, PromptOrigin::Programmatic);
     }
 
     /// Hand `text` to the driver, or say in the transcript that nobody took it.
@@ -1494,29 +1562,35 @@ impl SessionScreen {
     /// Reporting the refusal is the point. A prompt that vanished because the driver
     /// had gone away, rendered identically to one accepted, is the defect where "no
     /// results" and "cannot see the data" look the same.
-    fn submit(&mut self, text: String, force: bool) {
+    fn submit(&mut self, text: String, force: bool, origin: PromptOrigin) {
         if let Some(attached) = self.attachments.take_prompt(&text) {
             let submission = PromptSubmission::Content {
                 text: text.clone(),
                 content: attached.content,
             };
-            let submission = if force {
-                PromptSubmission::Steer(Box::new(submission))
+            let delivery = if force {
+                PromptDelivery::Steer
             } else {
-                submission
+                PromptDelivery::Direct
             };
-            self.submit_to_driver_with_attachments(text, submission, attached.labels);
+            self.submit_to_driver_with_attachments(
+                text,
+                submission,
+                attached.labels,
+                delivery,
+                origin,
+            );
             return;
         }
         match self.slash.resolve(&text) {
             SlashSubmission::Prompt(prompt) => {
                 let submission = PromptSubmission::Text(prompt.clone());
-                let submission = if force {
-                    PromptSubmission::Steer(Box::new(submission))
+                let delivery = if force {
+                    PromptDelivery::Steer
                 } else {
-                    submission
+                    PromptDelivery::Direct
                 };
-                self.submit_to_driver(prompt, submission);
+                self.submit_to_driver(prompt, submission, delivery, origin);
             }
             SlashSubmission::UiAction(action) => {
                 self.dispatch_action(action);
@@ -1527,6 +1601,8 @@ impl SessionScreen {
                     name: command,
                     arguments,
                 },
+                PromptDelivery::Direct,
+                origin,
             ),
             SlashSubmission::Skill {
                 name,
@@ -1539,6 +1615,8 @@ impl SessionScreen {
                     source,
                     arguments,
                 },
+                PromptDelivery::Direct,
+                origin,
             ),
             SlashSubmission::Host(HostCommand::Undo) => {
                 self.requested.push(Box::new(
@@ -1559,7 +1637,7 @@ impl SessionScreen {
                 self.select_preset(&preset);
             }
             SlashSubmission::Host(HostCommand::Council(arguments)) => {
-                self.submit_council(text, &arguments);
+                self.submit_council(text, &arguments, origin);
             }
             SlashSubmission::Host(HostCommand::Plan) => {
                 if self.plan_mode_active() {
@@ -1582,7 +1660,12 @@ impl SessionScreen {
                 self.cancel_background(&execution_id);
             }
             SlashSubmission::Host(command) => {
-                self.submit_to_driver(text, PromptSubmission::Host(command));
+                self.submit_to_driver(
+                    text,
+                    PromptSubmission::Host(command),
+                    PromptDelivery::Direct,
+                    origin,
+                );
             }
             SlashSubmission::Unknown(name) => {
                 let shown = if name.is_empty() {
@@ -1684,7 +1767,7 @@ impl SessionScreen {
         EventResult::REDRAW
     }
 
-    fn submit_council(&mut self, text: String, arguments: &str) {
+    fn submit_council(&mut self, text: String, arguments: &str, origin: PromptOrigin) {
         if self.catalog.councils.is_empty() {
             self.request_council_picker();
             return;
@@ -1717,7 +1800,7 @@ impl SessionScreen {
             preset: preset.to_owned(),
             question: question.to_owned(),
         };
-        self.submit_to_driver(text, submission);
+        self.submit_to_driver(text, submission, PromptDelivery::Direct, origin);
     }
 
     fn select_collaboration_agent(&mut self, agent: &str) {
@@ -1779,8 +1862,14 @@ impl SessionScreen {
         ));
     }
 
-    fn submit_to_driver(&mut self, shown: String, submission: PromptSubmission) {
-        self.submit_to_driver_with_attachments(shown, submission, Vec::new());
+    fn submit_to_driver(
+        &mut self,
+        shown: String,
+        submission: PromptSubmission,
+        delivery: PromptDelivery,
+        origin: PromptOrigin,
+    ) {
+        self.submit_to_driver_with_attachments(shown, submission, Vec::new(), delivery, origin);
     }
 
     fn submit_to_driver_with_attachments(
@@ -1788,15 +1877,20 @@ impl SessionScreen {
         shown: String,
         submission: PromptSubmission,
         attachments: Vec<crate::views::attachment::AttachmentLabel>,
+        requested_delivery: PromptDelivery,
+        origin: PromptOrigin,
     ) {
-        let submission = if self.status.is_running()
-            && !matches!(
+        let delivery = if !self.status.is_running() {
+            PromptDelivery::Direct
+        } else if requested_delivery == PromptDelivery::Steer
+            && matches!(
                 submission,
-                PromptSubmission::Queue(_) | PromptSubmission::Steer(_)
-            ) {
-            PromptSubmission::Queue(Box::new(submission))
+                PromptSubmission::Text(_) | PromptSubmission::Content { .. }
+            )
+        {
+            PromptDelivery::Steer
         } else {
-            submission
+            PromptDelivery::Queue
         };
         let mut message = Message::user(shown.clone());
         for attachment in attachments {
@@ -1811,10 +1905,10 @@ impl SessionScreen {
                     | PromptSubmission::Command { .. }
                     | PromptSubmission::Skill { .. }
                     | PromptSubmission::Council { .. }
-                    | PromptSubmission::Queue(_)
-                    | PromptSubmission::Steer(_)
             );
-            match prompts.try_send(TargetedPromptSubmission::root(submission)) {
+            match prompts.try_send(TargetedPromptSubmission::root_with(PromptEnvelope::new(
+                submission, delivery, origin,
+            ))) {
                 Ok(()) => {
                     if tracks_model_turn {
                         self.mark_turn_accepted();
@@ -1852,15 +1946,18 @@ impl SessionScreen {
                 )
             },
         );
-        let submission = if live.is_running() {
-            PromptSubmission::Steer(Box::new(submission))
+        let delivery = if live.is_running() {
+            PromptDelivery::Steer
         } else {
-            submission
+            PromptDelivery::Direct
         };
         live.push_user_submission_with_attachments(shown.clone(), &attachments);
 
         if let Some(prompts) = self.prompts.as_ref() {
-            match prompts.try_send(TargetedPromptSubmission::session(session_id, submission)) {
+            match prompts.try_send(TargetedPromptSubmission::session_with(
+                session_id,
+                PromptEnvelope::new(submission, delivery, PromptOrigin::TuiChild),
+            )) {
                 Ok(()) => live.mark_turn_accepted(),
                 Err(error) => {
                     let reason = match error {
@@ -3650,7 +3747,10 @@ impl SessionScreen {
             crossterm::event::KeyCode::Null,
             crossterm::event::KeyModifiers::NONE,
         );
-        self.handle_action(definition, &event)
+        self.submission_origin_override = Some(PromptOrigin::TuiPalette);
+        let result = self.handle_action(definition, &event);
+        self.submission_origin_override = None;
+        result
     }
 
     /// Ask the host to open `dialog`, or report why it cannot be opened.
@@ -4463,6 +4563,8 @@ impl ActionComponent for SessionScreen {
                     self.submit_to_driver(
                         String::from("/undo"),
                         PromptSubmission::Host(HostCommand::Undo),
+                        PromptDelivery::Direct,
+                        PromptOrigin::TuiKeybinding,
                     );
                 }
                 EventResult::REDRAW
@@ -4738,7 +4840,14 @@ impl ActionComponent for SessionScreen {
         match signal {
             EditorSignal::None => EventResult::IGNORED,
             EditorSignal::Submit(text) => {
-                self.submit(text, action.name == "input_force_submit");
+                let origin = self.submission_origin_override.unwrap_or_else(|| {
+                    if action.name == "input_force_submit" {
+                        PromptOrigin::TuiForceSubmit
+                    } else {
+                        PromptOrigin::TuiKeybinding
+                    }
+                });
+                self.submit(text, action.name == "input_force_submit", origin);
                 self.autocomplete.hide();
                 EventResult::REDRAW
             }

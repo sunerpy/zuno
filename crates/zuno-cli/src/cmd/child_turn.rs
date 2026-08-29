@@ -1471,6 +1471,7 @@ impl InteractiveChildInput {
         session_id: &str,
         mut prompt: Value,
         text: String,
+        delivery: InputDelivery,
     ) -> Result<String, String> {
         if text.trim().is_empty() {
             return Err("interactive child input cannot be empty".to_owned());
@@ -1493,7 +1494,7 @@ impl InteractiveChildInput {
                 input_id.clone(),
                 session_id,
                 prompt,
-                InputDelivery::Steer,
+                delivery,
                 zuno_db::message::now_millis(),
             ))
             .map_err(to_string)?;
