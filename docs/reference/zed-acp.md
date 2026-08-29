@@ -270,6 +270,11 @@ Generated titles use ACP `session_info_update`, and operational status or
 provider failure text is handled by lifecycle/error reporting rather than being
 rendered as model thought.
 
+Historical replay keeps provider reasoning capsules durable for future provider
+requests, but does not render an exact capsule copy when the same message
+already contains its visible reasoning summary. Provider-only reasoning remains
+visible, so replay deduplication does not hide the only available thought.
+
 Shell tool-call titles are the exact submitted command, not an interpreter-prefixed
 pseudo-command. For example, Zed receives `git diff --check` as the copyable title
 and receives the resolved `zsh` identity separately in
@@ -425,7 +430,10 @@ scalar text boundary. Use:
 ```json
 "options": {
   "baseURL": "http://127.0.0.1:8787/v1",
-  "maxTokens": null
+  "maxTokens": null,
+  "timeout": false,
+  "headerTimeout": 330000,
+  "chunkTimeout": 210000
 }
 ```
 
@@ -434,6 +442,10 @@ compatibility mode inserts one blank line and would alter the current
 provider's exact projection. Mixed text and non-text blocks whose ordering Kiro
 cannot preserve still fail closed. If pure text still produces the old error,
 verify that Zed is reaching the newly built provider process.
+
+`headerTimeout` and `chunkTimeout` deliberately exceed kiro-provider's matching
+300-second request and 180-second stream-idle deadlines. This lets the gateway
+return its typed timeout before the ACP client closes the request.
 
 ## 9. Acceptance checks
 

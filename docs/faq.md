@@ -212,7 +212,10 @@ Use the normal provider options:
     "kiro-local": {
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
-        "maxTokens": null
+        "maxTokens": null,
+        "timeout": false,
+        "headerTimeout": 330000,
+        "chunkTimeout": 210000
       }
     }
   }
@@ -222,6 +225,10 @@ Use the normal provider options:
 Remove a stale `responsesTextBlocks: "single"` setting when upgrading. That
 generic Zuno compatibility mode joins text with one blank line, so it changes
 the bytes compared with the provider's current lossless projection.
+
+The timeout values let kiro-provider's 300-second request deadline and
+180-second stream-idle deadline fire first. Zuno then receives a typed gateway
+error instead of cancelling the connection at the same boundary.
 
 The error remains intentional when several text blocks are interleaved with an
 image, document, tool content, or another non-text block whose ordering cannot

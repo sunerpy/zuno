@@ -146,13 +146,32 @@ Set the provider options to:
 ```json
 {
   "baseURL": "http://127.0.0.1:8787/v1",
-  "maxTokens": null
+  "maxTokens": null,
+  "timeout": false,
+  "headerTimeout": 330000,
+  "chunkTimeout": 210000
 }
 ```
 
 The null output default prevents Zuno's generic provider layer from injecting
 an unsupported 32,000-token cap. Declare each model's real `limit.output`
-instead. Current `kiro-provider` preserves consecutive all-text blocks in its
+instead. `timeout` bounds the complete HTTP request; `false` leaves long active
+reasoning streams uncapped. `headerTimeout` bounds only the wait for response
+headers, while `chunkTimeout` is reset after every streamed body chunk. The
+values above leave a 30-second propagation margin beyond kiro-provider's
+recommended 300-second request deadline and 180-second stream-idle deadline.
+Keep the Zuno limits greater than the gateway limits so the gateway can return
+its typed timeout instead of losing a race with the client.
+
+When omitted, `headerTimeout` defaults to 330 seconds and `chunkTimeout` keeps
+the compatible transport's 120-second idle default. Set `headerTimeout: false`
+only when the endpoint has an authoritative upstream deadline and an unbounded
+header wait is intentional.
+
+These transport limits are independent from provider retry recovery. Zuno starts
+the retry recovery budget only after a retryable provider failure; it never uses
+that budget to terminate the first request or an active replay. Current
+`kiro-provider` preserves consecutive all-text blocks in its
 canonical request and concatenates them byte-for-byte with no inserted separator
 only at Kiro's scalar text boundary. Do not set
 `responsesTextBlocks: "single"` for this provider version: that older Zuno

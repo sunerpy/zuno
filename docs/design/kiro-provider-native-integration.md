@@ -222,12 +222,20 @@ Current provider configuration is:
       "surface": "responses",
       "options": {
         "baseURL": "http://127.0.0.1:8787/v1",
-        "maxTokens": null
+        "maxTokens": null,
+        "timeout": false,
+        "headerTimeout": 330000,
+        "chunkTimeout": 210000
       }
     }
   }
 }
 ```
+
+The gateway owns a 300-second request deadline and a 180-second stream-idle
+deadline. Zuno's matching phase limits remain 30 seconds larger, while the
+whole-request timeout is disabled, so the gateway can return a typed timeout
+instead of racing a client-side absolute deadline.
 
 The provider now retains consecutive all-text blocks in its canonical request
 and joins them byte-for-byte with no inserted separator only at Kiro's scalar

@@ -53,7 +53,7 @@ The generated developer instructions use stable ids and sources:
 | section | purpose | presence |
 | --- | --- | --- |
 | `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
-| `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, and avoid unchanged re-reads or repeated checks. | Always; Plan guidance is added only when `plan_update` exists. |
+| `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, keep tool-driven work visible, and stop using tools once the outcome and evidence are complete. | Always; tool communication and termination guidance are added only when tools exist, and Plan guidance only when `plan_update` exists. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
 | `runtime.verification` | Require observed evidence and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available. |
 | `runtime.delegation` | Require bounded non-overlapping delegation and durable result reconciliation. | Only when `task` and at least one valid target are effective. |
@@ -129,6 +129,15 @@ work, evidence, and blockers. The finalization request and instruction digest
 are persisted in `session.provider.request.1.stepLimitFinalization`. If that
 single finalization still cannot terminate cleanly, the turn ends with a typed
 step-limit failure.
+
+Zuno does not inject a convergence instruction after an arbitrary number of
+tool calls. Tool-capable prompts instead require a short preamble before a
+substantial batch, concise progress updates at meaningful milestones, and a
+specific evidence gap before more tool work. Once the outcome and evidence are
+complete, the Agent must stop calling tools and answer. The provider-driven loop
+continues while the model requests follow-up work, subject to interruption,
+context management, durable goal state, and an optional operator-configured
+step ceiling.
 
 ## Extension packages and executable plugin hosts
 
@@ -560,6 +569,33 @@ Each foreground `session.provider.request` event records `requestPurpose`,
 `affinityAttached`, and, when attached,
 `affinitySource: "durable-session"`. It does not persist the raw routing
 identity, credentials, or upstream account and conversation identifiers.
+
+### Provider timeout and retry boundaries
+
+An active provider request and recovery after a failed request are separate
+lifecycles. The retry recovery budget starts when the first retryable provider
+failure is observed. It bounds rollback emission, backoff, and admission of a
+later replay, but never interrupts the first request or an already-running
+replay. Cancellation continues to interrupt either operation through the turn's
+control signal.
+
+OpenAI-compatible transports resolve three independent provider options:
+
+- `timeout`: a whole-request deadline in milliseconds, or `false` for none;
+- `headerTimeout`: the maximum wait for HTTP response headers in milliseconds,
+  or `false` for none;
+- `chunkTimeout`: the maximum silent gap between streamed body chunks in
+  milliseconds.
+
+The whole-request deadline spans headers and body. Header timeout ends after the
+response arrives; chunk timeout restarts after every received chunk. When more
+than one deadline applies, the earliest one wins and produces a typed transient
+provider error naming the phase. OpenAI-compatible providers default to a
+330-second response-header timeout and a 120-second streamed-chunk idle timeout;
+`headerTimeout: false` explicitly disables the former. Provider-specific
+gateways should set their own upstream deadline below Zuno's matching phase
+deadline so their typed error reaches Zuno before the client cancels the
+connection.
 
 ## Auditable memory and reflection
 
