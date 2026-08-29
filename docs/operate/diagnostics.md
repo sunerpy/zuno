@@ -109,18 +109,31 @@ Probe whether the confinement mode is actually deployable on this host:
 zuno debug sandbox --mode workspace-write
 zuno debug sandbox --mode read-only --check
 zuno debug sandbox --mode workspace-write --network allow
+zuno debug sandbox --mode workspace-write \
+  --sandbox-on-unavailable run-unconfined
 ```
 
 | Option | Values | Default |
 | --- | --- | --- |
 | `--mode <MODE>` | `read-only`, `workspace-write`, `danger-full-access` | `workspace-write` |
 | `--network <NETWORK>` | `deny`, `allow` | `deny` for confined modes, `allow` for `danger-full-access` |
+| `--sandbox-on-unavailable <ACTION>` | `deny`, `run-unconfined` | `deny` |
 | `--check` | Exit unsuccessfully when the requested policy is not deployable | |
 
 A restricted mode verifies bubblewrap deployment, so this is the command that
 distinguishes "my configuration is wrong" from "this host cannot enforce the mode I
 asked for". Use `--check` in CI or a health check, where a non-zero exit is more useful
 than output.
+
+The JSON report separates the requested policy from the execution resolution. Inspect
+`requestedMode`, `requestedNetwork`, `effectiveMode`, `effectiveNetwork`,
+`fallbackEligible`, `resolutionKind`, and `fallbackReason`. An eligible
+`run-unconfined` result can therefore report `ready: false` for requested confinement
+while showing `resolutionKind: "unavailable_fallback"` and effective host authority.
+
+`--check` stays strict: it exits unsuccessfully whenever the requested confinement is not
+deployable, even when runtime fallback is permitted. This makes it safe as a deployment
+gate instead of accidentally validating an unconfined host.
 
 The confinement semantics themselves are in
 [Permissions and sandboxing](/guide/permissions).
@@ -184,6 +197,7 @@ Every `debug` subcommand accepts the global options:
 | `--print-logs` | Print logs to stderr in addition to the structured local log store |
 | `--log-level <LOG_LEVEL>` | `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `--sandbox <SANDBOX>` | `read-only`, `workspace-write`, `danger-full-access` |
+| `--sandbox-on-unavailable <ACTION>` | `deny`, `run-unconfined` |
 
 ```sh
 zuno debug config --print-logs --log-level DEBUG

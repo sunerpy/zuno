@@ -6,7 +6,7 @@ hero:
   text: 零代码，任何任务
   tagline: >
     用 Rust 编写的单二进制编码 Agent CLI。无运行时依赖，会话在进程重启后仍可恢复，
-    OS 沙箱在不可用时拒绝执行而非降级运行。
+    OS 沙箱默认失败即拒绝，无约束执行必须经过受信的显式选择。
   actions:
     - theme: brand
       text: 快速开始
@@ -26,10 +26,11 @@ features:
     link: /zh/guide/installation
     linkText: 安装
 
-  - title: 沙箱不可用时直接拒绝
+  - title: 沙箱默认失败即拒绝
     details: >
       read-only 与 workspace-write 都要求一个已验证的 OS 约束后端。后端缺失时
-      Zuno 拒绝启动会话，而不是静默地以无约束方式运行你的代码。
+      Zuno 默认拒绝启动会话，而不是静默地以无约束方式运行你的代码；只有受信策略
+      显式选择原生执行或仅不可用时降级，才会使用宿主后端。
     link: /zh/guide/permissions
     linkText: 权限与沙箱
 

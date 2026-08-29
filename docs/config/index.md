@@ -90,7 +90,8 @@ and its siblings explain the groups; that page is authoritative for a single fie
   },
   "sandbox": {
     "mode": "workspace-write",
-    "network": "deny"
+    "network": "deny",
+    "onUnavailable": "deny"
   }
 }
 ```
@@ -98,6 +99,39 @@ and its siblings explain the groups; that page is authoritative for a single fie
 There is no default model id. Zuno does not ship hidden provider defaults, so a
 configuration without a reachable route produces a visible routing diagnostic rather than
 silently choosing something.
+
+## Choosing no-sandbox behavior
+
+The default remains fail-closed: `workspace-write` plus `onUnavailable: "deny"` requires
+the requested confinement backend to be deployable.
+
+To always use the native host process backend, select the explicit mode:
+
+```json
+{
+  "sandbox": {
+    "mode": "danger-full-access"
+  }
+}
+```
+
+To prefer confinement but allow a write-capable `workspace-write` Agent to continue only
+when the backend has an eligible typed availability failure:
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "onUnavailable": "run-unconfined"
+  }
+}
+```
+
+`run-unconfined` is accepted only from a trusted global, explicit, environment, CLI, or
+managed layer. Project configuration cannot enable it, read-only Agents never use it, and
+managed policy may force it back to `deny`. See
+[Permissions and sandboxing](/guide/permissions) for the exact fallback boundary.
 
 ## Schema validation while editing
 

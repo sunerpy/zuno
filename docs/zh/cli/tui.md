@@ -26,6 +26,7 @@ zuno tui [OPTIONS]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `-s`, `--session <SESSION>` | 在这个确切的 session 中对话 | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `--auto` | 不询问就准入每一项未被显式拒绝的权限。上游自己的描述以 "(dangerous!)" 结尾，而且名副其实：这等于把权限提示处的人替换掉，于是默认规则集本来会停下来征询的工具调用会无人看管地继续执行 | |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 

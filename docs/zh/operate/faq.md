@@ -10,9 +10,15 @@
   凭据和网络。它不是一道操作系统安全边界。
 
 两种受约束模式只有在当前平台后端通过完整能力探测时才真正受操作系统沙箱约束。否则
-Shell 注册会失败并拒绝；Zuno 绝不会把一次失败的 `read-only` 或 `workspace-write`
-请求转成 `danger-full-access`。只有在确实需要原生宿主执行时才使用
-`zuno --sandbox danger-full-access`。
+Shell 默认失败即拒绝。受信的全局、显式配置、环境、CLI 或受管层可以把
+`sandbox.onUnavailable` 设为 `run-unconfined`；它只允许具备写能力的 Agent 所请求的
+`workspace-write`，在平台不支持、缺少受信启动器或命名空间/容器策略不可用等类型化错误下
+使用原生后端。只读 Agent、不受信启动器、无效策略/路径、helper/内部错误和命令执行错误
+绝不降级。
+
+不可用降级不等于选择 `danger-full-access`。它保留已配置的权限模式、所有显式拒绝与
+灾难性命令硬拒绝，同时记录请求的文件系统和网络限制没有得到 OS 强制执行。
+显式 `danger-full-access` 会跳过受限后端发现，并把生效权限模式设为 `allow_all`。
 
 在受支持的 Linux 宿主上，Zuno 会定位一个固定的、root 所有的系统 `bwrap`，路径为
 `/usr/bin/bwrap` 或 `/bin/bwrap`，探测所需的命名空间，编译生效的 Agent 策略，并且只把
@@ -28,8 +34,9 @@ zuno debug sandbox --mode workspace-write --network deny --check
 组/全局可写性、特殊位与文件 capability 的信任判断、后端能力，以及确切的探测失败原因。
 它会检查启动器的每一级祖先目录，然后通过与 Shell 相同的 bubblewrap、capability 丢弃、
 `PR_SET_NO_NEW_PRIVS` 和 seccomp 路径执行 `/usr/bin/true`。当请求的策略无法部署时，
-`--check` 以非成功状态退出。不要用 `danger-full-access` 做部署验证：该模式会被报告为
-原生执行旁路，并刻意跳过启动器信任检查与约束自测。
+`--check` 以非成功状态退出，即使已配置的降级允许运行时继续。报告会分别显示请求/实际
+权限、降级资格、解析类型与类型化原因。不要用 `danger-full-access` 做部署验证：该模式会
+被报告为原生执行旁路，并刻意跳过启动器信任检查与约束自测。
 
 Linux 后端会：
 
@@ -53,8 +60,9 @@ TUI `--auto` 仍然更窄，无法满足只能由人类回答的请求。选择 
 server 或 headless 界面上弹出准入卡片。显式的权限拒绝以及 Shell 风险门禁的灾难性硬拒绝
 仍然是终态；它们直接失败，而不是询问。结构化的用户提问不是准入，仍然可能被展示。
 
-macOS 与 Windows 的受约束模式目前返回一个带类型的不支持平台错误，并且不注册 Shell。
-显式的 `danger-full-access` 仍可通过原生进程后端使用。参见
+macOS 与 Windows 的受约束模式目前返回一个带类型的不支持平台错误。在默认 `deny` 下不会
+注册 Shell；受信的 `run-unconfined` 可以让具备写能力的 Agent 原生继续，而显式的
+`danger-full-access` 始终可以独立使用原生进程后端。参见
 [Shell sandbox roadmap](https://github.com/sunerpy/zuno/blob/main/docs/design/shell-sandbox-roadmap.md)。
 
 ## 为什么 `bwrap` 会以 `loopback: Failed RTM_NEWADDR: Operation not permitted` 失败？
@@ -157,6 +165,16 @@ sudo journalctl -k --since '-10 minutes' \
 空间。请修正那个运行时具体的 seccomp、AppArmor/SELinux、user namespace 和命名空间设置，
 或者把 Zuno 运行在完整探测能够通过的专用虚拟机/裸金属环境中。不要用一刀切的
 `--privileged` 代替一份经过审阅的策略。
+
+对于刻意不使用沙箱的自动化容器，可以在受信的宿主级配置中设置：
+
+```json
+{"sandbox":{"onUnavailable":"run-unconfined"}}
+```
+
+这个选择对只读 Agent 无效，也不会掩盖 `debug sandbox --check` 的失败。项目配置不能启用
+它，受管策略仍可强制使用 `deny`。如果容器应当始终原生运行，而不是先尝试沙箱，请直接使用
+`"mode": "danger-full-access"`。
 
 WSL1 不受支持。WSL2 是一台 Linux 虚拟机，只有在相同的 user、mount、PID、network、
 文件系统和 seccomp 探测都通过时才可以使用 Linux 后端。

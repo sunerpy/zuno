@@ -13,13 +13,16 @@ model asks to run a command
       allow / after asking you
         │
         ▼
-    sandbox ── no backend ──▶ session refuses to start
-        │
-        ▼
-   command runs, confined
+  sandbox resolver
+        ├── confined backend ready ──▶ command runs, confined
+        ├── eligible unavailable error + trusted fallback
+        │                              └──▶ warning, then native execution
+        └── otherwise ───────────────▶ refused, nothing runs
 ```
 
-权限决策关乎意图：这次调用该不该发生。沙箱关乎能力：一旦发生，这个进程能触达什么。准入一次调用不会放宽沙箱，而一个宽松的沙箱也不会跳过权限门。
+权限决策关乎意图：这次调用该不该发生。沙箱关乎能力：一旦发生，这个进程能触达什么。
+准入一次调用不会放宽沙箱，宽松沙箱也不会抹掉显式拒绝或硬安全检查。显式的
+`danger-full-access` 还会选择生效的 `allow_all`，因此按设计跳过普通审批提示。
 
 ## 沙箱模式
 
@@ -37,16 +40,76 @@ model asks to run a command
 {
   "sandbox": {
     "mode": "workspace-write",
-    "network": "deny"
+    "network": "deny",
+    "onUnavailable": "deny"
   }
 }
 ```
+
+### 如何选择无沙箱执行
+
+无 OS 约束执行有两种不同含义。请按部署意图选择：
+
+| 意图 | 设置 | 实际行为 |
+| --- | --- | --- |
+| 必须有沙箱 | `workspace-write` 加 `onUnavailable: "deny"` | 默认行为。后端不可用时停止组装 Shell。 |
+| 优先使用沙箱，仅在不可用时允许降级 | `workspace-write` 加 `onUnavailable: "run-unconfined"` | Zuno 先探测并验证受限后端，只在符合条件的类型化不可用错误下才降级。 |
+| 始终使用宿主进程后端 | `danger-full-access` | Zuno 跳过受限后端发现，在所有受支持平台上直接原生执行。 |
+
+一次性显式使用无沙箱模式：
+
+```sh
+zuno run --sandbox danger-full-access "run the local build"
+```
+
+也可以在受信配置层中设置：
+
+```json
+{
+  "sandbox": {
+    "mode": "danger-full-access"
+  }
+}
+```
+
+如果容器或宿主应当尽量使用沙箱，但沙箱不可用时可以接受宿主执行：
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "onUnavailable": "run-unconfined"
+  }
+}
+```
+
+对应的一次性参数和环境变量是：
+
+```sh
+zuno run \
+  --sandbox workspace-write \
+  --sandbox-on-unavailable run-unconfined \
+  "run the local build"
+
+ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno run "run the local build"
+```
+
+只有受信的全局、显式配置、环境、CLI 或受管层可以启用 `run-unconfined`。
+项目 `zuno.json[c]` 与 `.zuno` 配置只能设置 `deny`；被检入仓库的配置不能让自己
+获得宿主执行权限。受管策略拥有最终决定权，仍可把它强制改回 `deny`。
+如果要持久设置，请把 JSON 写入 `zuno debug paths` 所显示配置根目录下的全局
+`zuno.json`，通常是 `$XDG_CONFIG_HOME/zuno/zuno.json` 或
+`~/.config/zuno/zuno.json`。
 
 ### 网络权限
 
 `sandbox.network` 取 `deny` 或 `allow`。在受约束模式下默认为 `deny`，它会创建一个私有网络命名空间并拒绝网络系统调用 —— 不是一条能被执意而为的进程绕过的防火墙规则。
 
 `danger-full-access` 继承宿主网络，并且**拒绝显式的 `deny`**，因为它无法强制执行。这个拒绝是刻意的：一份静默地没能提供其所声明的隔离的配置，比一份直接拒绝加载的配置更糟。
+
+不可用降级同样继承宿主网络。请求的 `deny` 仍会被记录，但命令原生运行期间，它不是
+实际生效的网络边界。
 
 ### 受保护路径
 
@@ -62,9 +125,10 @@ model asks to run a command
 }
 ```
 
-## 沙箱失败即拒绝
+在不可用降级期间，可写根目录与受保护路径仍属于请求策略和诊断信息，但宿主进程后端
+无法强制执行它们。
 
-这是在把 Zuno 部署到任何地方之前值得先理解的部分。
+## 沙箱默认失败即拒绝
 
 `read-only` 与 `workspace-write` 都**要求一个已验证的 OS 约束后端**。当后端不可用时，Zuno 不会退回到以无约束方式运行你的命令 —— 它拒绝启动会话：
 
@@ -72,7 +136,26 @@ model asks to run a command
 no trusted system bubblewrap executable was found
 ```
 
-没有任何配置项能把这件事变成警告，受限模式也绝不会降级到无约束后端。如果你想要无约束执行，就必须指名请求，即使用 `danger-full-access`，那是一个显式的信任选择，而不是缺少某个软件包导致的静默后果。
+默认的 `onUnavailable: "deny"` 会让后端不可用直接停止 Shell 组装。
+
+受信的 `run-unconfined` 只改变具备写能力的 Agent 所请求的 `workspace-write`，并且
+只接受符合条件的不可用错误。可降级原因包括平台不受支持、没有受信启动器、启动器缺少
+所需能力，或命名空间/容器策略导致部署不可用。
+
+以下情况绝不触发降级：
+
+- 启动器存在但不受信；
+- 沙箱配置或路径无效；
+- seccomp、helper 或内部错误；
+- 命令准备或执行错误；
+- 任意只读 Agent 或 `read-only` 请求。
+
+降级激活时，Zuno 会输出一次宿主警告，并记录请求模式、网络策略、实际宿主权限、
+解析类型和类型化原因。它仍保留已配置的权限模式、显式权限拒绝、灾难性命令硬拒绝、
+后台生命周期、超时、取消和至多一次执行；但无法保留请求的 OS 文件系统与网络限制。
+
+显式的 `danger-full-access` 与此不同：它完全跳过沙箱探测，从一开始就使用原生后端，
+并把生效权限模式设为 `allow_all`。显式拒绝与灾难性命令拒绝仍然是终态。
 
 ### Linux 后端需要什么
 
@@ -95,7 +178,9 @@ OS 约束后端已在 Linux 上实现。在 macOS 与 Windows 上，受限模式
 OS sandbox is not implemented for platform `macos`
 ```
 
-这与上面是同一种失败即拒绝行为，不是特例：没有后端就没有受约束的会话。
+默认仍然失败即拒绝。受信的 `run-unconfined` 可以让具备写能力的
+`workspace-write` Agent 原生继续；只读 Agent 仍会拒绝。`danger-full-access`
+始终直接选择原生执行。
 
 ## 权限模式
 
@@ -161,13 +246,15 @@ zuno debug permissions
 | 配置 | 实际会发生什么 |
 | --- | --- |
 | `allow_all` + `read-only` | 不再询问，但写入仍然失败。沙箱不受权限模式影响。 |
-| `standard` + `danger-full-access` | 仍然会询问你，但被批准的命令拥有完整的宿主权限。 |
+| `standard` + `danger-full-access` | 生效权限变为 `allow_all`；跳过普通提示，但显式拒绝与灾难性硬拒绝仍然有效。 |
 | `allow_all` + 规则 `"shell": "deny"` | Shell 调用被拒绝。显式拒绝优先。 |
-| 任意受限模式，且没有后端 | 会话不会启动。什么都不会运行。 |
+| `workspace-write` + 默认 `deny`，且没有后端 | Shell 不会被组装。什么都不会运行。 |
+| `workspace-write` + 受信的 `run-unconfined`，且发生可降级不可用错误 | 命令使用宿主权限；已配置权限模式和硬拒绝仍然保留。 |
+| `read-only` + `run-unconfined`，且没有后端 | Shell 不会被组装。只读执行绝不降级。 |
 
 ## Agent 契约只收窄，绝不放宽
 
-无论配置要求什么，只读 Agent 都被钉在 `read-only`。这个方向按设计是单向的：Agent 契约只能削减权限，因此选择一个只读 Agent 是一项保证，而不是一个可被配置悄悄反转的默认值。
+无论配置要求什么，只读 Agent 都被钉在 `read-only`。这个方向按设计是单向的：Agent 契约只能削减权限，因此选择一个只读 Agent 是一项保证，而不是一个可被配置悄悄反转的默认值。这也意味着只读 Agent 永远不会使用 `run-unconfined`。
 
 ```sh
 # Cannot write, whatever sandbox.mode says.

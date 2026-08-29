@@ -140,8 +140,98 @@ fn sandbox_docs_pin_the_trusted_unavailable_fallback_contract() {
             "`--check` exits unsuccessfully",
         ],
     );
-    for relative in ["docs/cli/global-options.md", "docs/cli/debug.md"] {
+    contains_all(
+        "docs/guide/permissions.md",
+        &[
+            "Choosing native execution",
+            "\"onUnavailable\": \"run-unconfined\"",
+            "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
+            "read-only Agent never uses",
+        ],
+    );
+    contains_all(
+        "docs/zh/guide/permissions.md",
+        &[
+            "如何选择无沙箱执行",
+            "\"onUnavailable\": \"run-unconfined\"",
+            "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
+            "只读 Agent 永远不会使用",
+        ],
+    );
+    contains_all(
+        "docs/config/index.md",
+        &[
+            "Choosing no-sandbox behavior",
+            "\"mode\": \"danger-full-access\"",
+            "\"onUnavailable\": \"run-unconfined\"",
+        ],
+    );
+    contains_all(
+        "docs/zh/config/index.md",
+        &[
+            "选择无沙箱行为",
+            "\"mode\": \"danger-full-access\"",
+            "\"onUnavailable\": \"run-unconfined\"",
+        ],
+    );
+    for relative in [
+        "docs/operate/diagnostics.md",
+        "docs/zh/operate/diagnostics.md",
+    ] {
+        contains_all(
+            relative,
+            &[
+                "--sandbox-on-unavailable",
+                "requestedMode",
+                "unavailable_fallback",
+            ],
+        );
+    }
+    contains_all(
+        "docs/zh/config/reference.md",
+        &[
+            "沙箱模式与后端不可用策略",
+            "ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined",
+            "fallbackReason",
+        ],
+    );
+    contains_all(
+        "docs/zh/operate/faq.md",
+        &[
+            "`sandbox.onUnavailable`",
+            "run-unconfined",
+            "`debug sandbox --check`",
+        ],
+    );
+    for relative in [
+        "docs/cli/global-options.md",
+        "docs/cli/debug.md",
+        "docs/zh/cli/global-options.md",
+        "docs/zh/cli/debug.md",
+    ] {
         contains_all(relative, &["--sandbox-on-unavailable", "run-unconfined"]);
+    }
+
+    for directory in ["docs/cli", "docs/zh/cli"] {
+        let path = workspace_root().join(directory);
+        for entry in std::fs::read_dir(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        {
+            let path = entry.expect("read CLI docs entry").path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let sandbox_options = text.matches("--sandbox <SANDBOX>").count();
+            let unavailable_options = text.matches("--sandbox-on-unavailable <ACTION>").count();
+            assert_eq!(
+                unavailable_options,
+                sandbox_options,
+                "{} must keep the sandbox global options together",
+                path.display()
+            );
+        }
     }
 }
 

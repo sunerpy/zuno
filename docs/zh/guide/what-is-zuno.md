@@ -18,15 +18,22 @@ Linux 发行版是静态 musl 产物，macOS 与 Windows 使用原生构建。�
 
 这也正是存储会不断增长、最终需要清理的原因。参见[会话与回合](/zh/guide/sessions)。
 
-### 沙箱失败即拒绝
+### 沙箱默认失败即拒绝
 
-`read-only` 与 `workspace-write` 都要求一个已验证的 OS 约束后端。当没有可用后端时，Zuno 拒绝启动会话。它不会只警告一声就以无约束方式继续，也没有任何配置项能把这次拒绝降级成警告：
+`read-only` 与 `workspace-write` 都要求一个已验证的 OS 约束后端。当没有可用后端时，
+默认的 `sandbox.onUnavailable: "deny"` 会拒绝 Shell：
 
 ```text
 no trusted system bubblewrap executable was found
 ```
 
-无约束执行必须被指名请求，即使用 `danger-full-access`。约束后端目前只在 Linux 上实现，因此在 macOS 与 Windows 上，受限模式会报告平台不受支持，而不是悄悄在宿主机上执行命令。完整细节见[权限与沙箱](/zh/guide/permissions)。
+无约束执行始终需要受信的显式选择。`danger-full-access` 直接指名无约束执行，跳过受限后端
+发现并使用原生进程后端。另一种方式是设置
+`sandbox.onUnavailable: "run-unconfined"`，只允许具备写能力的
+`workspace-write` Agent 在符合条件的类型化不可用错误之后降级；只读 Agent、不安全错误与
+内部错误绝不降级。约束后端目前只在 Linux 上实现，因此 macOS 与 Windows 默认失败即拒绝，
+但具备写能力的执行可以使用以上任一受信选择。完整细节见
+[权限与沙箱](/zh/guide/permissions)。
 
 ### 扩展是原生的，不是插件 ABI
 
@@ -55,7 +62,8 @@ no trusted system bubblewrap executable was found
 - 没有自卸载。用当初安装它的方式移除这个二进制文件。
 - 没有增量数据库迁移链。项目尚未发布，所以 schema 变更会提升格式版本，开发数据库直接重建。参见[数据库生命周期](/zh/operate/migration)。
 - 与 OpenCode、Codex 或 Claude Code 之间没有配置、插件、hook 或工具参数兼容性。它们是设计参考，不是兼容目标。
-- macOS 与 Windows 上还没有受约束的沙箱。这是一处失败即拒绝的缺口，不是降级方案。
+- macOS 与 Windows 上还没有受约束的沙箱。默认失败即拒绝；受信的
+  `danger-full-access` 或仅不可用时降级可以为具备写能力的 Agent 选择原生执行。
 
 ## 从哪里开始
 

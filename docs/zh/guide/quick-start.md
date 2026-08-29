@@ -19,9 +19,26 @@ zuno debug sandbox --mode workspace-write --check
 
 它运行的是 Shell 所用的同一个后端：先检查启动器的归属与可信性，然后通过真实的 bubblewrap、能力丢弃和 seccomp 路径执行一次探测。当策略无法部署时，`--check` 以失败退出。
 
-如果失败，现在就修。一个无法被证明的受限沙箱模式会拒绝启动会话；它不会降级为无约束执行。在 Linux 上常见原因是 bubblewrap 版本低于 0.8.0，或者策略禁止非特权用户命名空间。参见[权限与沙箱](/zh/guide/permissions)。
+如果失败，默认行为是拒绝 Shell，而不是用高于配置请求的权限继续运行。在 Linux 上常见
+原因是 bubblewrap 版本低于 0.8.0，或者策略禁止非特权用户命名空间。
 
-在 macOS 与 Windows 上受约束后端尚未实现，因此受限模式会报告平台不受支持。这些宿主目前需要显式使用 `--sandbox danger-full-access`，这是一个刻意的信任决定，而不是绕过手段。
+如果这台宿主本来就无法提供沙箱，请做出以下一种受信选择：
+
+```sh
+# 始终使用宿主原生后端。
+zuno run --sandbox danger-full-access "run the local build"
+
+# 优先使用 workspace-write 约束，仅在符合条件的不可用错误下降级。
+zuno run \
+  --sandbox workspace-write \
+  --sandbox-on-unavailable run-unconfined \
+  "run the local build"
+```
+
+降级形式只适用于具备写能力的 `workspace-write` Agent。没有受限后端时，只读 Agent 仍会
+拒绝。在尚未实现约束后端的 macOS 与 Windows 上，这两种受信选择都可以让具备写能力的
+Agent 原生运行；`danger-full-access` 会完全跳过沙箱探测。参见
+[权限与沙箱](/zh/guide/permissions)。
 
 ## 3. 配置一个 provider
 
@@ -98,7 +115,9 @@ zuno models myopenai --verbose
 zuno run --agent plan "summarize how configuration precedence works in this repository"
 ```
 
-`plan` 是只读的：不注册任何写入类工具，并且它的契约会把沙箱钉在 `read-only`，与配置无关。它是端到端确认整条路径能走通的最安全方式。
+`plan` 是只读的：不注册任何写入类工具，并且它的契约会把沙箱钉在 `read-only`，与配置
+无关。在约束后端可用的宿主上，它是端到端确认整条路径能走通的最安全方式。只读 Agent
+刻意不会使用 `run-unconfined`。
 
 现在做真正的工作：
 
@@ -116,8 +135,8 @@ zuno
 
 | 现象 | 原因 | 修复 |
 | --- | --- | --- |
-| `no trusted system bubblewrap executable was found` | 没有约束后端 | 安装 bubblewrap 0.8.0 或更新版本，然后重新运行 `zuno debug sandbox --check` |
-| `OS sandbox is not implemented for platform` | 在 macOS 或 Windows 上使用受约束模式 | 刻意使用 `--sandbox danger-full-access`，或者在 Linux 上运行 |
+| `no trusted system bubblewrap executable was found` | 没有约束后端 | 安装 bubblewrap 0.8.0 或更新版本、显式使用 `danger-full-access`，或为具备写能力的 Agent 启用受信的不可用降级 |
+| `OS sandbox is not implemented for platform` | 在 macOS 或 Windows 上使用受约束模式 | 显式使用 `danger-full-access`、为具备写能力的 Agent 启用受信的 `run-unconfined` 降级，或在 Linux 上运行 |
 | 校验错误指出某个被拒绝的顶层键 | 仅 TUI 使用的键（如 `theme`）写进了 `zuno.json` | 把它移到 `tui.json`。参见[配置文件与优先级](/zh/config/files) |
 | 切换构建后会话列表为空 | 源码构建与发布构建打开的是不同的数据库文件 | 参见[数据库生命周期](/zh/operate/migration) |
 | 找不到某个模型 id | 目录在该 provider 添加之前就已缓存 | `zuno models --refresh` |

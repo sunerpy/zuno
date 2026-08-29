@@ -22,6 +22,7 @@ zuno [OPTIONS] [COMMAND]
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`（最详尽的追踪细节）、`DEBUG`（详细诊断事件）、`INFO`（常规运行事件）、`WARN`（警告与错误）、`ERROR`（仅错误） | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 根调用选项
@@ -56,6 +57,13 @@ zuno run --print-logs --log-level DEBUG "summarize the build failure"
 
 ```sh
 zuno tui --sandbox read-only
+```
+
+当发生符合条件的约束后端不可用错误时，允许具备写能力的 Agent 使用宿主权限继续。
+只读 Agent 仍会拒绝，受管策略也可以把这个选择改回 `deny`。
+
+```sh
+zuno run --sandbox-on-unavailable run-unconfined "run the local build"
 ```
 
 在依赖某个约束模式之前，先验证它在本宿主上是否真的可部署。

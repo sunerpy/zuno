@@ -64,15 +64,25 @@ zuno run --print-logs --log-level DEBUG "summarize the build failure"
 ```sh
 zuno run --sandbox read-only --agent plan "audit the retry policy"
 zuno run --sandbox workspace-write "fix the failing test and re-run it"
+zuno run --sandbox danger-full-access "run in a deliberately unconfined container"
+zuno run --sandbox workspace-write \
+  --sandbox-on-unavailable run-unconfined \
+  "prefer confinement, but allow eligible unavailable fallback"
 ```
 
-Agent 契约仍可能进一步收窄它。即使调用时请求了更宽的模式，只读 Agent 也只获得 `read-only`。
+Agent 契约仍可能进一步收窄它。即使调用时请求了更宽的模式，只读 Agent 也只获得
+`read-only`，并且绝不会使用不可用降级。`danger-full-access` 始终选择原生后端。
+`run-unconfined` 会保留已配置的权限模式和硬拒绝，但降级期间请求的文件系统与网络限制
+不会由 OS 强制执行。
 
 在 CI 中依赖它之前先验证可部署性，并让退出状态成为 job 的门禁：
 
 ```sh
 zuno debug sandbox --mode workspace-write --network deny --check
 ```
+
+即使 `--sandbox-on-unavailable run-unconfined` 可以让运行时继续，只要请求的约束不可用，
+`--check` 仍会失败。
 
 ## 没有人在场时的权限模式
 

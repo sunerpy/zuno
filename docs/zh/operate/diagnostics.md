@@ -99,16 +99,27 @@ zuno debug prompt --show-sensitive
 zuno debug sandbox --mode workspace-write
 zuno debug sandbox --mode read-only --check
 zuno debug sandbox --mode workspace-write --network allow
+zuno debug sandbox --mode workspace-write \
+  --sandbox-on-unavailable run-unconfined
 ```
 
 | 选项 | 取值 | 默认值 |
 | --- | --- | --- |
 | `--mode <MODE>` | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
 | `--network <NETWORK>` | `deny`、`allow` | 受约束模式为 `deny`，`danger-full-access` 为 `allow` |
+| `--sandbox-on-unavailable <ACTION>` | `deny`、`run-unconfined` | `deny` |
 | `--check` | 当请求的策略无法部署时以非成功状态退出 | |
 
 受限模式会验证 bubblewrap 的部署情况，因此这条命令能区分「我的配置错了」和「这台宿主
 无法强制我所要求的模式」。在 CI 或健康检查中使用 `--check`，因为那里非零退出码比输出更有用。
+
+JSON 报告会把请求策略与执行解析分开。重点检查 `requestedMode`、`requestedNetwork`、
+`effectiveMode`、`effectiveNetwork`、`fallbackEligible`、`resolutionKind` 和
+`fallbackReason`。因此一次符合条件的 `run-unconfined` 结果可以对请求的约束报告
+`ready: false`，同时显示 `resolutionKind: "unavailable_fallback"` 与实际宿主权限。
+
+`--check` 始终保持严格：只要请求的约束无法部署，它就以失败退出，即使运行时允许降级。
+因此它仍可以安全地作为部署门禁，而不会误把一台无沙箱宿主验证为合格。
 
 约束语义本身见 [权限与沙箱](/zh/guide/permissions)。
 
@@ -169,6 +180,7 @@ zuno debug snapshot patch <HASH>
 | `--print-logs` | 在结构化本地日志存储之外，把日志打印到 stderr |
 | `--log-level <LOG_LEVEL>` | `TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` |
 | `--sandbox <SANDBOX>` | `read-only`、`workspace-write`、`danger-full-access` |
+| `--sandbox-on-unavailable <ACTION>` | `deny`、`run-unconfined` |
 
 ```sh
 zuno debug config --print-logs --log-level DEBUG

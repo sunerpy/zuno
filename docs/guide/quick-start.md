@@ -23,15 +23,28 @@ This runs the same backend Shell uses: it checks the launcher's ownership and tr
 executes a probe through the real bubblewrap, capability-drop, and seccomp path. `--check`
 exits unsuccessfully when the policy is not deployable.
 
-If it fails, fix it now. A restricted sandbox mode that cannot be proved refuses to start
-the session; it does not degrade to unconfined execution. On Linux the usual causes are a
-bubblewrap older than 0.8.0 or a policy that forbids unprivileged user namespaces. See
-[Permissions and sandboxing](/guide/permissions).
+If it fails, the default is to refuse Shell rather than run with more authority than the
+configuration requested. On Linux the usual causes are a bubblewrap older than 0.8.0 or a
+policy that forbids unprivileged user namespaces.
 
-On macOS and Windows the confined backend is not implemented yet, so a restricted mode
-reports an unsupported platform. Those hosts currently need explicit
-`--sandbox danger-full-access`, which is a deliberate trust decision rather than a
-workaround.
+If this host intentionally cannot provide a sandbox, make one of these trusted choices:
+
+```sh
+# Always use the native host backend.
+zuno run --sandbox danger-full-access "run the local build"
+
+# Prefer workspace-write confinement, but fall back for eligible availability errors.
+zuno run \
+  --sandbox workspace-write \
+  --sandbox-on-unavailable run-unconfined \
+  "run the local build"
+```
+
+The fallback form applies only to write-capable `workspace-write` Agents. Read-only Agents
+still refuse without a confined backend. On macOS and Windows, where confinement is not
+implemented yet, either trusted choice can run a write-capable Agent natively;
+`danger-full-access` skips the sandbox probe entirely. See
+[Permissions and sandboxing](/guide/permissions).
 
 ## 3. Configure a provider
 
@@ -120,7 +133,8 @@ zuno run --agent plan "summarize how configuration precedence works in this repo
 
 `plan` is read-only: no write tool is registered, and its contract pins the sandbox to
 `read-only` regardless of configuration. It is the safest way to confirm the whole path
-works end to end.
+works end to end on a host with working confinement. A read-only Agent deliberately does
+not use `run-unconfined`.
 
 Now do real work:
 
@@ -138,8 +152,8 @@ zuno
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `no trusted system bubblewrap executable was found` | No confinement backend | Install bubblewrap 0.8.0 or newer, then re-run `zuno debug sandbox --check` |
-| `OS sandbox is not implemented for platform` | Confined mode on macOS or Windows | Use `--sandbox danger-full-access` deliberately, or run on Linux |
+| `no trusted system bubblewrap executable was found` | No confinement backend | Install bubblewrap 0.8.0 or newer, use explicit `danger-full-access`, or enable trusted unavailable fallback for a write-capable Agent |
+| `OS sandbox is not implemented for platform` | Confined mode on macOS or Windows | Use explicit `danger-full-access`, trusted `run-unconfined` fallback for a write-capable Agent, or run on Linux |
 | A validation error naming a rejected top-level key | TUI-only key such as `theme` in `zuno.json` | Move it to `tui.json`. See [Files and precedence](/config/files) |
 | Empty session list after switching builds | Source and release builds open different database files | See [Database lifecycle](/migration) |
 | A model id is not found | Catalog cached before the provider was added | `zuno models --refresh` |

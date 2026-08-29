@@ -116,20 +116,24 @@ not the whole story.
 | Layer | Sandbox authority |
 | --- | --- |
 | Trusted global, explicit config, managed, environment, CLI | May select any mode |
-| Project `zuno.json[c]` and `.zuno` | May only narrow to `read-only`, deny networking, or add protected paths |
+| Project `zuno.json[c]` and `.zuno` | May only narrow to `read-only`, deny networking, add protected paths, or set `onUnavailable` to `deny` |
 
 A project layer cannot select a wider mode, grant host networking, or add external writable
-roots. A checked-in repository configuration therefore cannot escalate its own confinement,
-which is the property that makes cloning an unfamiliar repository safe.
+roots. It also cannot enable `run-unconfined`. A checked-in repository configuration
+therefore cannot escalate its own confinement, which is the property that makes cloning an
+unfamiliar repository safe.
 
 Use a trusted one-invocation override when a wider mode is genuinely wanted:
 
 ```sh
 zuno --sandbox read-only
 zuno --sandbox danger-full-access
+zuno --sandbox workspace-write --sandbox-on-unavailable run-unconfined
 ```
 
-Managed policy has later precedence and may still narrow that override. See
+The environment equivalent for unavailable-only fallback is
+`ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined`. Managed policy has later precedence and may
+still narrow either override or force the unavailable action back to `deny`. See
 [Permissions and sandboxing](/guide/permissions).
 
 ## Where other assets are discovered

@@ -79,16 +79,26 @@ Unsupported binary files, including PDFs, are not silently converted. See
 ```sh
 zuno run --sandbox read-only --agent plan "audit the retry policy"
 zuno run --sandbox workspace-write "fix the failing test and re-run it"
+zuno run --sandbox danger-full-access "run in a deliberately unconfined container"
+zuno run --sandbox workspace-write \
+  --sandbox-on-unavailable run-unconfined \
+  "prefer confinement, but allow eligible unavailable fallback"
 ```
 
 An agent contract may still narrow this. A read-only agent receives `read-only` even when
-the invocation asked for something wider.
+the invocation asked for something wider, and read-only Agents never use unavailable
+fallback. `danger-full-access` always selects the native backend. `run-unconfined`
+preserves the configured permission mode and hard denials, but requested filesystem and
+network restrictions are not OS-enforced during fallback.
 
 Verify deployability before depending on it in CI, and let the exit status gate the job:
 
 ```sh
 zuno debug sandbox --mode workspace-write --network deny --check
 ```
+
+`--check` still fails when requested confinement is unavailable, even if
+`--sandbox-on-unavailable run-unconfined` would let runtime execution proceed.
 
 ## Permission modes without a human
 

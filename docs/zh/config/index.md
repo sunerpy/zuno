@@ -77,12 +77,45 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
   },
   "sandbox": {
     "mode": "workspace-write",
-    "network": "deny"
+    "network": "deny",
+    "onUnavailable": "deny"
   }
 }
 ```
 
 没有默认模型 id。Zuno 不附带隐藏的 provider 默认值，因此一份没有可达路由的配置会产生一条可见的路由诊断，而不是静默地选一个。
+
+## 选择无沙箱行为
+
+默认仍然失败即拒绝：`workspace-write` 加 `onUnavailable: "deny"` 要求请求的约束后端
+确实可部署。
+
+如果要始终使用宿主原生进程后端，请选择显式模式：
+
+```json
+{
+  "sandbox": {
+    "mode": "danger-full-access"
+  }
+}
+```
+
+如果要优先使用沙箱，但允许具备写能力的 `workspace-write` Agent 仅在后端发生符合条件的
+类型化不可用错误时继续：
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "onUnavailable": "run-unconfined"
+  }
+}
+```
+
+只有受信的全局、显式配置、环境、CLI 或受管层可以设置 `run-unconfined`。项目配置不能
+启用它，只读 Agent 永远不会使用它，受管策略也可以把它强制改回 `deny`。精确的降级边界见
+[权限与沙箱](/zh/guide/permissions)。
 
 ## 编辑时的 schema 校验
 

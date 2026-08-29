@@ -33,20 +33,23 @@ instead of dying with the process.
 That is also why the store grows and eventually needs pruning. See
 [Sessions and turns](/guide/sessions).
 
-### The sandbox fails closed
+### The sandbox fails closed by default
 
 `read-only` and `workspace-write` both require a proved OS confinement backend. When
-none is available, Zuno refuses to start the session. It does not warn and continue
-unconfined, and no configuration option turns the refusal into a warning:
+none is available, the default `sandbox.onUnavailable: "deny"` refuses Shell:
 
 ```text
 no trusted system bubblewrap executable was found
 ```
 
-Unconfined execution has to be requested by name, with `danger-full-access`. The
-confinement backend is currently implemented for Linux only, so on macOS and Windows a
-restricted mode reports an unsupported platform rather than quietly running commands on
-the host. Full detail is in [Permissions and sandboxing](/guide/permissions).
+Unconfined execution is always a trusted opt-in. `danger-full-access` names it directly,
+skips confined-backend discovery, and uses the native process backend. Alternatively,
+`sandbox.onUnavailable: "run-unconfined"` may let a write-capable
+`workspace-write` Agent fall back only after an eligible typed availability failure;
+read-only Agents and unsafe or internal failures never fall back. The confinement
+backend is currently implemented for Linux only, so macOS and Windows fail closed by
+default but can use either explicit trusted option for write-capable execution. Full
+detail is in [Permissions and sandboxing](/guide/permissions).
 
 ### Extensions are native, not a plugin ABI
 
@@ -88,7 +91,9 @@ Being explicit about this saves time:
   [Database lifecycle](/migration).
 - No configuration, plugin, hook, or tool-argument compatibility with OpenCode, Codex,
   or Claude Code. Those are design references, not compatibility targets.
-- No confined sandbox on macOS or Windows yet. That is a fail-closed gap, not a fallback.
+- No confined sandbox on macOS or Windows yet. The default is fail-closed; trusted
+  `danger-full-access` or unavailable-only fallback can select native execution for a
+  write-capable Agent.
 
 ## Where to start
 

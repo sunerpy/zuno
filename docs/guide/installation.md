@@ -13,11 +13,13 @@ or kept version-aligned.
 | `bwrap` (bubblewrap) 0.8.0 or newer, Linux only | Required by the `read-only` and `workspace-write` sandbox backends |
 | `curl` or `wget`, and `tar` | Only for the shell installer |
 
-Without a working confinement backend on Linux, a restricted sandbox mode refuses to
-start the session rather than running unconfined. Install bubblewrap before relying on
-either confined mode, and verify it with `zuno debug sandbox`. See
-[Permissions and sandboxing](/guide/permissions) for the complete probe list and the
-Ubuntu AppArmor case.
+Without a working confinement backend on Linux, a restricted sandbox mode fails closed
+by default. Install bubblewrap before relying on either confined mode, and verify it with
+`zuno debug sandbox`. A trusted deployment that intentionally runs without OS
+confinement can instead select explicit `danger-full-access`, or set
+`sandbox.onUnavailable` to `run-unconfined` for eligible write-capable
+`workspace-write` fallback. See [Permissions and sandboxing](/guide/permissions) for the
+exact boundary, complete probe list, and Ubuntu AppArmor case.
 
 ## Install script
 

@@ -21,6 +21,7 @@ zuno session [OPTIONS] <COMMAND>
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 子命令
@@ -49,6 +50,7 @@ zuno session list [OPTIONS]
 | `--roots` | 只看根 session。这是默认行为；传 `--no-roots` 可看子 session | |
 | `--no-roots` | 包含默认被隐藏的子 session | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `--sort <SORT>` | 按最后活动时间或创建时间排序。可选值：`updated`（`time_updated`，最后活动；上游 `listGlobal` 的顺序）、`created`（`time_created`） | `updated` |
 | `-n`, `--limit <LIMIT>` | 限制为 N 个 session，最近的在前。默认为 100。别名：`--max-count` | |
 | `--format <FORMAT>` | 输出格式。可选值：`table`、`json` | `table` |
@@ -73,6 +75,7 @@ zuno session prune [OPTIONS] --older-than <DAYS>
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--archive` | | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `--delete` | | |
 | `--include-shared` | | |
 | `--include-recent` | | |
@@ -97,6 +100,7 @@ zuno session delete [OPTIONS] <SESSION_ID>
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 示例

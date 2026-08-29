@@ -16,15 +16,18 @@ model asks to run a command
       allow / after asking you
         │
         ▼
-    sandbox ── no backend ──▶ session refuses to start
-        │
-        ▼
-   command runs, confined
+  sandbox resolver
+        ├── confined backend ready ──▶ command runs, confined
+        ├── eligible unavailable error + trusted fallback
+        │                              └──▶ warning, then native execution
+        └── otherwise ───────────────▶ refused, nothing runs
 ```
 
 A permission decision is about intent: should this call happen. A sandbox is about
 capability: what the process can reach once it does. Allowing a call does not widen
-the sandbox, and a permissive sandbox does not skip the permission gate.
+the sandbox, and a permissive sandbox does not erase explicit denies or hard safety
+checks. The explicit `danger-full-access` mode also selects effective
+`allow_all`, so it suppresses ordinary approval prompts by design.
 
 ## Sandbox modes
 
@@ -43,10 +46,70 @@ contract still narrows it — see [Agents](/guide/agents).
 {
   "sandbox": {
     "mode": "workspace-write",
-    "network": "deny"
+    "network": "deny",
+    "onUnavailable": "deny"
   }
 }
 ```
+
+### Choosing native execution
+
+There are two different ways to run without OS confinement. Choose the one whose
+meaning matches the deployment:
+
+| Intent | Setting | What happens |
+| --- | --- | --- |
+| Require confinement | `workspace-write` plus `onUnavailable: "deny"` | The default. An unavailable backend stops Shell assembly. |
+| Prefer confinement, but permit an unavailable-only fallback | `workspace-write` plus `onUnavailable: "run-unconfined"` | Zuno probes and verifies the confined backend first, then falls back only for an eligible typed availability failure. |
+| Always use the host process backend | `danger-full-access` | Zuno skips confined-backend discovery and runs natively on every supported platform. |
+
+For an explicitly unconfined invocation:
+
+```sh
+zuno run --sandbox danger-full-access "run the local build"
+```
+
+Or set it in a trusted configuration layer:
+
+```json
+{
+  "sandbox": {
+    "mode": "danger-full-access"
+  }
+}
+```
+
+For a container or host where confinement should be used when possible but native
+execution is acceptable when the backend is unavailable:
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "onUnavailable": "run-unconfined"
+  }
+}
+```
+
+The one-invocation and environment equivalents are:
+
+```sh
+zuno run \
+  --sandbox workspace-write \
+  --sandbox-on-unavailable run-unconfined \
+  "run the local build"
+
+ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno run "run the local build"
+```
+
+`run-unconfined` may be enabled only by a trusted global, explicit, environment,
+CLI, or managed layer. Project `zuno.json[c]` and `.zuno` configuration may set
+only `deny`; a checked-in repository cannot opt itself into host execution.
+Managed policy has final authority and may force the value back to `deny`.
+For a persistent user choice, put the JSON in the global `zuno.json` under the
+config root printed by `zuno debug paths`—normally
+`$XDG_CONFIG_HOME/zuno/zuno.json` or `~/.config/zuno/zuno.json`.
 
 ### Network authority
 
@@ -58,6 +121,10 @@ firewall rule that a determined process can route around.
 because it cannot enforce one. That rejection is deliberate: a configuration that
 silently failed to deliver the isolation it names would be worse than one that
 refuses to load.
+
+An unavailable fallback also inherits host networking. The requested `deny` remains
+recorded, but it is not the effective network boundary while the command is running
+natively.
 
 ### Protected paths
 
@@ -74,22 +141,44 @@ so a path can be carved out of a directory that is otherwise writable.
 }
 ```
 
-## The sandbox fails closed
+During an unavailable fallback, writable roots and protected paths remain part of the
+requested policy and diagnostics, but the host process backend cannot enforce them.
 
-This is the part worth understanding before you deploy Zuno anywhere.
+## The sandbox fails closed by default
 
 `read-only` and `workspace-write` both **require a proved OS confinement backend**.
-When one is unavailable, Zuno does not fall back to running your command
-unconfined — it refuses to start the session:
+With the default `onUnavailable: "deny"`, an unavailable backend stops Shell
+assembly:
 
 ```
 no trusted system bubblewrap executable was found
 ```
 
-There is no configuration option that turns this into a warning, and restricted
-modes never downgrade to the unconfined backend. If you want unconfined execution
-you have to ask for it by name, with `danger-full-access`, which is an explicit
-trusted choice rather than a silent consequence of a missing package.
+Trusted `run-unconfined` policy changes only eligible availability failures for a
+write-capable Agent's `workspace-write` request. Eligible causes include an
+unsupported platform, no trusted launcher being present, a missing required
+launcher capability, or a namespace/container policy that makes deployment
+unavailable.
+
+The following never trigger fallback:
+
+- a launcher that is present but untrusted;
+- invalid sandbox configuration or paths;
+- seccomp, helper, or internal errors;
+- command preparation or execution errors; and
+- every `read-only` Agent or `read-only` request.
+
+When fallback activates, Zuno emits a host warning and records the requested mode,
+network policy, effective host authority, resolution kind, and typed reason. It
+preserves the configured permission mode, explicit permission denies,
+catastrophic-command hard refusals, background lifecycle, timeout, cancellation,
+and at-most-once execution. It cannot preserve the requested OS filesystem or
+network restrictions.
+
+Explicit `danger-full-access` is separate: it skips sandbox probing entirely, uses
+the native backend from the start, and sets the effective permission mode to
+`allow_all`. Explicit denies and catastrophic-command refusals still remain
+terminal.
 
 ### What the Linux backend needs
 
@@ -118,8 +207,9 @@ restricted mode reports:
 OS sandbox is not implemented for platform `macos`
 ```
 
-This is the same fail-closed behaviour, not a special case: no backend means no
-confined session.
+The default remains fail-closed. A trusted `run-unconfined` policy may let a
+write-capable `workspace-write` Agent proceed natively; a read-only Agent still
+refuses. `danger-full-access` always selects native execution directly.
 
 ## Permission modes
 
@@ -192,16 +282,19 @@ them has real consequences.
 | Configuration | What actually happens |
 | --- | --- |
 | `allow_all` + `read-only` | No prompts, but writes still fail. The sandbox is unaffected by permission mode. |
-| `standard` + `danger-full-access` | You are still asked, but an approved command has full host authority. |
+| `standard` + `danger-full-access` | Effective permission becomes `allow_all`; ordinary prompts are skipped, while explicit denies and catastrophic hard refusals remain. |
 | `allow_all` + rule `"shell": "deny"` | Shell calls are refused. The explicit deny wins. |
-| Any restricted mode, no backend | The session does not start. Nothing runs. |
+| `workspace-write` + default `deny`, no backend | Shell is not assembled. Nothing runs. |
+| `workspace-write` + trusted `run-unconfined`, eligible unavailable error | The command uses host authority; the configured permission mode and hard denials remain. |
+| `read-only` + `run-unconfined`, no backend | Shell is not assembled. Read-only execution never falls back. |
 
 ## Agent contracts narrow, never widen
 
 A read-only agent is pinned to `read-only` regardless of what configuration asks
 for. This direction is one-way by design: an agent contract can only reduce
 authority, so selecting a read-only agent is a guarantee rather than a default that
-configuration can quietly reverse.
+configuration can quietly reverse. It also means a read-only Agent never uses
+`run-unconfined`.
 
 ```sh
 # Cannot write, whatever sandbox.mode says.

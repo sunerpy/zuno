@@ -6,8 +6,8 @@ hero:
   text: Zero code. Any task.
   tagline: >
     A single-binary coding agent CLI in Rust. No runtime dependency, sessions that
-    survive a restart, and an OS sandbox that refuses to run rather than run
-    unconfined.
+    survive a restart, and an OS sandbox that fails closed by default while keeping
+    native execution behind an explicit trusted choice.
   actions:
     - theme: brand
       text: Quick start
@@ -27,11 +27,12 @@ features:
     link: /guide/installation
     linkText: Install
 
-  - title: A sandbox that fails closed
+  - title: A sandbox that fails closed by default
     details: >
       Read-only and workspace-write both require a proved OS confinement backend.
       When none is available Zuno refuses to start the session instead of silently
-      running your code unconfined.
+      running your code unconfined, unless trusted policy explicitly selects native
+      execution or unavailable-only fallback.
     link: /guide/permissions
     linkText: Permissions and sandboxing
 

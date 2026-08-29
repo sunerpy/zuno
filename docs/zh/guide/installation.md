@@ -11,7 +11,11 @@ Zuno 每个平台只发布一个可执行文件。安装就是三件事：把二
 | `bwrap`（bubblewrap）0.8.0 或更新，仅 Linux | `read-only` 与 `workspace-write` 沙箱后端需要 |
 | `curl` 或 `wget`，以及 `tar` | 仅 shell 安装脚本需要 |
 
-在 Linux 上如果没有可用的约束后端，受限沙箱模式会拒绝启动会话，而不是以无约束方式运行。在依赖任一受约束模式之前先安装 bubblewrap，并用 `zuno debug sandbox` 验证。完整的探测项清单以及 Ubuntu AppArmor 这个特例见[权限与沙箱](/zh/guide/permissions)。
+在 Linux 上如果没有可用的约束后端，受限沙箱模式默认失败即拒绝。在依赖任一受约束模式
+之前先安装 bubblewrap，并用 `zuno debug sandbox` 验证。有意不使用 OS 约束的受信部署，
+可以改为显式选择 `danger-full-access`，或把 `sandbox.onUnavailable` 设为
+`run-unconfined`，仅对符合条件、具备写能力的 `workspace-write` 请求降级。精确边界、
+完整探测项清单以及 Ubuntu AppArmor 这个特例见[权限与沙箱](/zh/guide/permissions)。
 
 ## 安装脚本
 

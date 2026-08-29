@@ -28,6 +28,7 @@ zuno serve [OPTIONS]
 | `--mdns-domain <MDNS_DOMAIN>` | | `zuno.local` |
 | `--cors <CORS>` | | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
+| `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
 ## 示例

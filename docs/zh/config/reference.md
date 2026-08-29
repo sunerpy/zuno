@@ -124,6 +124,64 @@ Council 让多个隔离的席位各自独立评估同一个问题，然后综合
 
 完整说明与两个门禁如何交互见 [权限与沙箱](/zh/guide/permissions)。
 
+## 沙箱模式与后端不可用策略
+
+顶层 `sandbox` 对象设置模型发起的 Shell 命令所能获得的最大权限：
+
+| 键 | 取值 | 默认值 |
+| --- | --- | --- |
+| `mode` | `read-only`、`workspace-write`、`danger-full-access` | `workspace-write` |
+| `network` | `deny`、`allow` | 受限模式为 `deny`，`danger-full-access` 使用宿主网络 |
+| `onUnavailable` | `deny`、`run-unconfined` | `deny` |
+| `writableRoots` | 额外的现有可写目录数组 | 空 |
+| `protectedPaths` | 重新施加只读保护的路径数组 | 空 |
+
+默认配置明确写出如下：
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "onUnavailable": "deny"
+  }
+}
+```
+
+`danger-full-access` 始终跳过受限后端发现，以 Zuno 用户的宿主文件系统、进程、凭据和网络
+权限原生执行，并把生效权限模式设为 `allow_all`。它不能与 `network: "deny"`、
+`writableRoots` 或 `protectedPaths` 组合，因为原生后端无法兑现这些限制。
+
+`run-unconfined` 不是另一个永久无沙箱模式。它让具备写能力的 Agent 所请求的
+`workspace-write` 先尝试完整的沙箱发现、能力校验与部署验证，只在符合条件的类型化不可用
+错误下改用原生后端：
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "onUnavailable": "run-unconfined"
+  }
+}
+```
+
+降级时仍保留 `standard`、`strict` 或 `allow_all` 权限模式、显式拒绝、灾难性命令硬拒绝、
+后台执行、超时与取消链路；但请求的网络拒绝、可写根目录和受保护路径不会由 OS 强制执行。
+只读 Agent 永远不会无沙箱降级。
+
+项目 `zuno.json[c]` 与 `.zuno` 配置只能把 `onUnavailable` 设为 `deny`。只有受信的全局、
+显式配置、环境、CLI 或受管层可以启用 `run-unconfined`，受管策略仍拥有最终否决权：
+
+```sh
+zuno --sandbox danger-full-access
+zuno --sandbox workspace-write --sandbox-on-unavailable run-unconfined
+ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
+```
+
+用 `zuno debug sandbox` 查看请求/实际权限、降级资格、`resolutionKind` 和
+`fallbackReason`。`--check` 仍严格检查请求的约束是否可部署，不会因为允许降级而成功。
+
 ## 严格 HITL 授权
 
 `strict` 模式要求每个有副作用的调用都获得一次新的人工决策。这适用于不希望任何写操作在无人确认下发生的场景。
