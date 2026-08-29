@@ -879,7 +879,11 @@ fn every_codebuild_job_has_a_unique_label_set() {
     // two macOS smoke legs, one Windows build leg and one Windows smoke leg — six
     // more routed jobs, less the two `aarch64-pc-windows-msvc` legs that were
     // dropped because no CodeBuild machine can execute that artifact.
-    const EXPECTED_MIGRATED_JOBS: usize = 17;
+    //
+    // 18 since the `release_please` job became the entry point of the automated
+    // release path. It runs on CodeBuild like every other Linux job, so it carries a
+    // routing label set of its own.
+    const EXPECTED_MIGRATED_JOBS: usize = 18;
 
     let workflows = [
         ("ci.yml", workflow("ci.yml")),
