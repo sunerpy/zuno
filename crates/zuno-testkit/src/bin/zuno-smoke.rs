@@ -419,6 +419,28 @@ fn provider_config(base_url: &str) -> String {
     serde_json::json!({
         "formatter": false,
         "lsp": false,
+        // The smoke opens a real session, so it needs a Shell policy that can
+        // actually resolve on the host running it.
+        //
+        // On Linux the confinement backend exists and the release workflow installs
+        // bubblewrap, so the default `deny` is correct and a failure there is a real
+        // defect. macOS and Windows have no backend at all — `zuno-sandbox` compiles
+        // one for `target_os = "linux"` only — so a default session answers
+        // `OS sandbox is not implemented for platform 'macos'` and refuses to start.
+        // That refusal is the intended fail-closed behaviour, which is why the smoke
+        // has to make the trusted choice explicitly rather than expect it to pass.
+        //
+        // This belongs here and NOT in a workflow environment variable: `invoke`
+        // calls `env_clear()` and forwards only the map built by `turn_variables`, so
+        // a `ZUNO_SANDBOX_ON_UNAVAILABLE` set on the job never reaches the child.
+        // Measured on release run 33266202995, where both darwin legs still failed
+        // with the platform error while the env var was set on the step.
+        //
+        // `ZUNO_CONFIG_CONTENT` is a trusted configuration layer, so `run-unconfined`
+        // is accepted from it; a project config could not enable this.
+        "sandbox": {
+            "onUnavailable": if cfg!(target_os = "linux") { "deny" } else { "run-unconfined" }
+        },
         "provider": {
             "test": {
                 "name": "Test",
