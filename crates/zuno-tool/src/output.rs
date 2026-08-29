@@ -58,12 +58,15 @@ pub const METADATA_WRITTEN_PATHS_KEY: &str = "writtenPaths";
 /// keeping both lets each consumer use the representation it actually understands.
 pub const METADATA_FILE_DIFFS_KEY: &str = "fileDiffs";
 
+/// Durable human request that caused a tool-owned turn suspension.
+pub const METADATA_HUMAN_REQUEST_ID_KEY: &str = "humanRequestID";
+
 /// How the host should proceed after this successful tool result is persisted.
 ///
-/// The default is the ordinary model tool loop. `YieldUntilInput` is reserved for
-/// tools that started durable asynchronous work and arranged an external input to
-/// resume the same session. Keeping this typed and tool-owned avoids asking the
-/// model to spend another provider request merely to say that it is waiting.
+/// The default is the ordinary model tool loop. Suspension variants are reserved
+/// for tools that already committed the durable state that will wake a future
+/// turn. Keeping this typed and tool-owned avoids asking the model to spend
+/// another provider request merely to say that it is waiting.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ToolContinuation {
@@ -72,6 +75,10 @@ pub enum ToolContinuation {
     Continue,
     /// End the current turn unless a new durable input is already available.
     YieldUntilInput,
+    /// End the turn because a named durable human request is pending.
+    ///
+    /// The request id is carried in [`METADATA_HUMAN_REQUEST_ID_KEY`].
+    WaitingForHuman,
 }
 
 impl ToolContinuation {

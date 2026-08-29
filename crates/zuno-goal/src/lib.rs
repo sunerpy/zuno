@@ -56,6 +56,7 @@
 
 pub mod continuation;
 pub mod error;
+pub mod pause;
 pub mod projection;
 pub mod retry;
 pub mod spill;
@@ -69,6 +70,7 @@ pub use crate::continuation::{
     render_goal_context,
 };
 pub use crate::error::GoalError;
+pub use crate::pause::{GoalPauseReason, GoalPauseState, InteractionPolicy};
 pub use crate::projection::{
     Check, Document, Edited, Field, GITIGNORE_SNIPPET, GOAL_DIRECTORY, GoalProjection, Ingest,
     Notes, OBJECTIVE_BEGIN, OBJECTIVE_END, PROJECT_DIRECTORY, Refusal, RejectedEdit, document_path,
@@ -84,13 +86,14 @@ pub use crate::spill::{
 };
 pub use crate::status::{GoalStatus, ModelStatus, StatusOwner, SystemStatus};
 pub use crate::store::{
-    AUXILIARY_SCHEMA, FailureStreak, Goal, GoalHistoryEntry, GoalStore, OBJECTIVE_SPILL_DIRECTORY,
-    SCHEMA, TABLE, default_spill_dir,
+    AUXILIARY_SCHEMA, FailureStreak, Goal, GoalHistoryEntry, GoalHumanRequestOrigin, GoalStore,
+    OBJECTIVE_SPILL_DIRECTORY, SCHEMA, TABLE, default_spill_dir,
 };
 pub use crate::tools::{
     CREATE_GOAL_TOOL_ID, CreateGoalParams, CreateGoalTool, GET_GOAL_TOOL_ID, GetGoalParams,
-    GetGoalTool, UPDATE_GOAL_TOOL_ID, UpdateGoalParams, UpdateGoalStatus, UpdateGoalTool,
-    goal_from_metadata, goal_tools,
+    GetGoalTool, GoalInputOption, GoalRequestInputParams, GoalRequestInputTool,
+    REQUEST_GOAL_INPUT_TOOL_ID, UPDATE_GOAL_TOOL_ID, UpdateGoalParams, UpdateGoalStatus,
+    UpdateGoalTool, goal_from_metadata, goal_tools,
 };
 
 #[cfg(test)]

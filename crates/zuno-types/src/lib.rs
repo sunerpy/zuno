@@ -372,6 +372,47 @@ pub struct MemoryEntryProjection {
 
 /// Active goal summary shown by clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalPauseProjection {
+    pub reason: String,
+    pub human_request_id: Option<String>,
+    pub time_paused: i64,
+}
+
+/// One persisted cross-turn Goal retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalRetryProjection {
+    pub attempt: u32,
+    pub reason: String,
+    pub delay_ms: i64,
+    pub retry_at_ms: i64,
+    pub scheduled_at_ms: i64,
+}
+
+/// One persisted provider-request backoff checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderBackoffProjection {
+    pub request_id: String,
+    pub turn_id: String,
+    pub failed_attempt: u32,
+    pub next_attempt: u32,
+    pub max_attempts: u32,
+    pub reason: String,
+    pub delay_ms: i64,
+    pub retry_at_ms: i64,
+    pub scheduled_at_ms: i64,
+}
+
+/// One durable human request currently blocking Goal continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HumanRequestProjection {
+    pub id: String,
+    pub kind: String,
+    pub summary: Option<String>,
+    pub time_created: i64,
+}
+
+/// Active goal summary shown by clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalStateProjection {
     pub id: String,
     pub revision: i64,
@@ -381,6 +422,10 @@ pub struct GoalStateProjection {
     pub blocked_reason: Option<String>,
     pub span: ExecutionSpan,
     pub token_budget: Option<i64>,
+    pub pause: Option<GoalPauseProjection>,
+    pub retry: Option<GoalRetryProjection>,
+    pub provider_backoff: Option<ProviderBackoffProjection>,
+    pub pending_human_requests: Vec<HumanRequestProjection>,
     pub time_created: i64,
     pub time_updated: i64,
 }

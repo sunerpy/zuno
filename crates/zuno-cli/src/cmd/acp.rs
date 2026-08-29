@@ -598,6 +598,8 @@ struct SessionResources {
     mcp: Option<McpRuntime>,
     subagents: Option<super::acp_subagent::AcpSubagentBridge>,
     subagent_flush: Option<super::acp_subagent::AcpSubagentFlush>,
+    question_asker: Option<Arc<zuno_acp::AcpQuestionAsker>>,
+    permission_asker: Arc<zuno_acp::AcpPermissionAsker>,
     configuration: SessionConfiguration,
 }
 
@@ -664,19 +666,23 @@ async fn open_session_resources(
         None => Vec::new(),
     };
     let session_route = Arc::new(zuno_acp::AcpSessionRoute::new(native_subagents));
-    let question = elicitation_form.then(|| {
+    let question_asker = elicitation_form.then(|| {
         Arc::new(zuno_acp::AcpQuestionAsker::with_route(
             client.clone(),
             Arc::clone(&session_route),
-        )) as Arc<dyn zuno_tools::question::QuestionAsker>
+        ))
     });
+    let question = question_asker
+        .as_ref()
+        .map(|asker| Arc::clone(asker) as Arc<dyn zuno_tools::question::QuestionAsker>);
+    let permission_asker = Arc::new(zuno_acp::AcpPermissionAsker::with_grants_and_route(
+        client.clone(),
+        "Approve Zuno tool call",
+        permission_grants,
+        Arc::clone(&session_route),
+    ));
     let approval: Arc<dyn PermissionAsker> =
-        Arc::new(zuno_acp::AcpPermissionAsker::with_grants_and_route(
-            client.clone(),
-            "Approve Zuno tool call",
-            permission_grants,
-            Arc::clone(&session_route),
-        ));
+        Arc::clone(&permission_asker) as Arc<dyn PermissionAsker>;
     let (child_observer, mut subagents) = if native_subagents {
         let (observer, bridge) = super::acp_subagent::AcpSubagentBridge::start(
             client.clone(),
@@ -765,6 +771,12 @@ async fn open_session_resources(
             }
         });
     }
+    let goals = host.goal_store();
+    let human_requests = goals.human_requests();
+    permission_asker.attach_durable(human_requests.clone(), Arc::clone(&goals));
+    if let Some(question_asker) = &question_asker {
+        question_asker.attach_durable(human_requests, goals);
+    }
     let subagent_flush = subagents
         .as_ref()
         .map(super::acp_subagent::AcpSubagentBridge::flush_handle);
@@ -773,6 +785,8 @@ async fn open_session_resources(
         mcp,
         subagents,
         subagent_flush,
+        question_asker,
+        permission_asker,
         configuration,
     })
 }
@@ -1146,6 +1160,7 @@ impl AcpSession {
         if activated {
             self.defer_available_commands(&client).await?;
         }
+        self.recover_pending_human_requests(&client).await?;
         let (context_size, invocation) = {
             let resources = self.resources.lock().await;
             let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
@@ -1221,23 +1236,220 @@ impl AcpSession {
         let projected = projected?;
         self.flush_subagents().await?;
         self.project_plan(&client).await?;
-        match projected {
-            ProjectedTurn::Completed(stop_reason) => {
-                driven?;
-                Ok(json!({ "stopReason": stop_reason }))
+        let mut driven = driven;
+        let mut projected = projected;
+        loop {
+            match projected {
+                ProjectedTurn::Completed(stop_reason) => {
+                    driven?;
+                    if let Some(next) = self.drive_goal_continuation(&client).await? {
+                        (driven, projected) = next;
+                        continue;
+                    }
+                    return Ok(json!({ "stopReason": stop_reason }));
+                }
+                ProjectedTurn::WaitingForHuman(request_id) => {
+                    driven?;
+                    if !self.answer_pending_human_request(&request_id).await? {
+                        return Ok(json!({ "stopReason": "end_turn" }));
+                    }
+                    let Some(next) = self.drive_next_durable_input(&client).await? else {
+                        return Err(zuno_acp::RpcError::internal(format!(
+                            "answered human request `{request_id}` did not admit durable input"
+                        )));
+                    };
+                    (driven, projected) = next;
+                }
+                ProjectedTurn::Interrupted => {
+                    return Ok(json!({ "stopReason": "cancelled" }));
+                }
+                ProjectedTurn::Failed(message) => {
+                    let error = driven.err().map_or(message, |error| error.message);
+                    return Err(zuno_acp::RpcError::internal(error));
+                }
+                ProjectedTurn::Missing => {
+                    return match driven {
+                        Ok(()) if skill_selection_only => Ok(json!({ "stopReason": "end_turn" })),
+                        Ok(()) => Err(zuno_acp::RpcError::internal(
+                            "turn ended without a terminal durable event",
+                        )),
+                        Err(error) => Err(error),
+                    };
+                }
             }
-            ProjectedTurn::Interrupted => Ok(json!({ "stopReason": "cancelled" })),
-            ProjectedTurn::Failed(message) => {
-                let error = driven.err().map_or(message, |error| error.message);
-                Err(zuno_acp::RpcError::internal(error))
+        }
+    }
+
+    async fn answer_pending_human_request(
+        &self,
+        request_id: &str,
+    ) -> Result<bool, zuno_acp::RpcError> {
+        let (request, question, permission) = {
+            let resources = self.resources.lock().await;
+            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+            let request = resources
+                .host
+                .goal_store()
+                .human_requests()
+                .get(request_id)
+                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
+                .ok_or_else(|| {
+                    zuno_acp::RpcError::internal(format!(
+                        "human request `{request_id}` disappeared before presentation"
+                    ))
+                })?;
+            (
+                request,
+                resources.question_asker.as_ref().map(Arc::clone),
+                Arc::clone(&resources.permission_asker),
+            )
+        };
+        match request.kind {
+            zuno_db::human_request::HumanRequestKind::Input => question
+                .ok_or_else(|| {
+                    zuno_acp::RpcError::internal(
+                        "ACP client does not advertise form elicitation for pending Goal input",
+                    )
+                })?
+                .answer_pending(request_id)
+                .await
+                .map_err(|error| zuno_acp::RpcError::internal(error.to_string())),
+            zuno_db::human_request::HumanRequestKind::Permission => permission
+                .answer_pending(request_id)
+                .await
+                .map_err(|error| zuno_acp::RpcError::internal(error.to_string())),
+        }
+    }
+
+    async fn recover_pending_human_requests(
+        &self,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<(), zuno_acp::RpcError> {
+        loop {
+            let pending_request_id = {
+                let resources = self.resources.lock().await;
+                let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+                resources
+                    .host
+                    .goal_store()
+                    .human_requests()
+                    .pending(Some(resources.host.session_id()))
+                    .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
+                    .into_iter()
+                    .next()
+                    .map(|request| request.id)
+            };
+            if let Some(request_id) = pending_request_id
+                && !self.answer_pending_human_request(&request_id).await?
+            {
+                continue;
             }
-            ProjectedTurn::Missing => match driven {
-                Ok(()) if skill_selection_only => Ok(json!({ "stopReason": "end_turn" })),
-                Ok(()) => Err(zuno_acp::RpcError::internal(
-                    "turn ended without a terminal durable event",
-                )),
-                Err(error) => Err(error),
-            },
+
+            let Some((driven, projected)) = self.drive_next_durable_input(client).await? else {
+                return Ok(());
+            };
+            match projected {
+                ProjectedTurn::Completed(_) => driven?,
+                ProjectedTurn::WaitingForHuman(request_id) => {
+                    driven?;
+                    if !self.answer_pending_human_request(&request_id).await? {
+                        return Ok(());
+                    }
+                }
+                ProjectedTurn::Interrupted => return Ok(()),
+                ProjectedTurn::Failed(message) => {
+                    let error = driven.err().map_or(message, |error| error.message);
+                    return Err(zuno_acp::RpcError::internal(error));
+                }
+                ProjectedTurn::Missing => {
+                    driven?;
+                    return Err(zuno_acp::RpcError::internal(
+                        "recovered durable input ended without a terminal event",
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn drive_next_durable_input(
+        &self,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
+        let (input_id, text, context_size) = {
+            let resources = self.resources.lock().await;
+            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+            let inbox = resources.host.session_inbox();
+            let Some(input) = inbox
+                .pending(resources.host.session_id())
+                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
+                .into_iter()
+                .next()
+            else {
+                return Ok(None);
+            };
+            let text = durable_input_text(&input)?;
+            let promoted = inbox
+                .promote_id(resources.host.session_id(), &input.id)
+                .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?
+                .ok_or_else(|| {
+                    zuno_acp::RpcError::internal(format!(
+                        "durable input `{}` changed before ACP promotion",
+                        input.id
+                    ))
+                })?;
+            (promoted.id, text, resources.configuration.context_size)
+        };
+        let (events, receiver) = event_channel();
+        let drive = async {
+            let mut resources = self.resources.lock().await;
+            let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
+            let outcome = resources
+                .host
+                .drive_promoted(&text, &input_id, events.clone())
+                .await;
+            drop(events);
+            outcome.map_err(zuno_acp::RpcError::internal)
+        };
+        let projection = project_turn(&self.id, context_size, receiver, client.clone());
+        let (driven, projected) = tokio::join!(drive, projection);
+        Ok(Some((driven, projected?)))
+    }
+
+    async fn drive_goal_continuation(
+        &self,
+        client: &zuno_acp::ClientConnection,
+    ) -> Result<Option<(Result<(), zuno_acp::RpcError>, ProjectedTurn)>, zuno_acp::RpcError> {
+        loop {
+            let context_size = {
+                let resources = self.resources.lock().await;
+                resources
+                    .as_ref()
+                    .ok_or_else(|| self.closed_error())?
+                    .configuration
+                    .context_size
+            };
+            let (events, receiver) = event_channel();
+            let drive = async {
+                let mut resources = self.resources.lock().await;
+                let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
+                let continued = resources
+                    .host
+                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
+                    .await
+                    .map_err(zuno_acp::RpcError::internal)?;
+                drop(events);
+                Ok::<bool, zuno_acp::RpcError>(continued)
+            };
+            let projection = project_turn(&self.id, context_size, receiver, client.clone());
+            let (continued, projected) = tokio::join!(drive, projection);
+            let projected = projected?;
+            match (continued, projected) {
+                (Ok(false), ProjectedTurn::Missing) => return Ok(None),
+                (Ok(true), ProjectedTurn::Missing) => continue,
+                (continued, projected) => {
+                    return Ok(Some((continued.map(|_| ()), projected)));
+                }
+            }
         }
     }
 
@@ -2413,6 +2625,7 @@ fn available_commands_update<'a>(
 
 enum ProjectedTurn {
     Completed(&'static str),
+    WaitingForHuman(String),
     Interrupted,
     Failed(String),
     Missing,
@@ -2446,6 +2659,9 @@ async fn project_turn(
             TurnEvent::SessionCommandCompleted { .. } => {
                 return Ok(ProjectedTurn::Completed("end_turn"));
             }
+            TurnEvent::TurnWaitingForHuman { request_id, .. } => {
+                return Ok(ProjectedTurn::WaitingForHuman(request_id));
+            }
             TurnEvent::TurnInterrupted { .. } => return Ok(ProjectedTurn::Interrupted),
             TurnEvent::SessionCommandFailed { message, .. } => {
                 return Ok(ProjectedTurn::Failed(message));
@@ -2457,6 +2673,29 @@ async fn project_turn(
         }
     }
     Ok(ProjectedTurn::Missing)
+}
+
+fn durable_input_text(input: &zuno_db::inbox::SessionInput) -> Result<String, zuno_acp::RpcError> {
+    if matches!(
+        input.prompt.get("kind").and_then(Value::as_str),
+        Some("subagentReport" | "productAgentReport" | "humanRequestAnswer")
+    ) {
+        return input
+            .prompt
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                zuno_acp::RpcError::internal(format!(
+                    "durable input `{}` has no string `text`",
+                    input.id
+                ))
+            });
+    }
+    Err(zuno_acp::RpcError::internal(format!(
+        "durable input `{}` has an unsupported ACP prompt shape",
+        input.id
+    )))
 }
 
 fn lifecycle_directory(params: &Value) -> Result<PathBuf, zuno_acp::RpcError> {

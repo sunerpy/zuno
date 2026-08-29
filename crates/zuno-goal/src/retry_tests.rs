@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::{
-    GoalFailureDisposition, GoalRetryPolicy, GoalRetryPolicyError, GoalRetryReason, GoalStatus,
-    GoalStore, GoalTerminalFailure, ModelStatus, SystemStatus,
+    GoalFailureDisposition, GoalPauseReason, GoalRetryPolicy, GoalRetryPolicyError,
+    GoalRetryReason, GoalStatus, GoalStore, GoalTerminalFailure, ModelStatus, SystemStatus,
 };
 
 const SESSION: &str = "ses_retry";
@@ -128,14 +128,13 @@ fn retry_policy_rejects_an_inverted_window_or_invalid_jitter() {
 }
 
 #[test]
-fn tool_retry_reasons_have_stable_persisted_discriminators() {
-    for (reason, persisted) in [
-        (GoalRetryReason::ToolTransient, "tool_transient"),
-        (GoalRetryReason::ToolUncertain, "tool_uncertain"),
-    ] {
-        assert_eq!(reason.as_str(), persisted);
-        assert_eq!(GoalRetryReason::parse(persisted), Some(reason));
-    }
+fn transient_tool_retry_reason_has_a_stable_persisted_discriminator() {
+    assert_eq!(GoalRetryReason::ToolTransient.as_str(), "tool_transient");
+    assert_eq!(
+        GoalRetryReason::parse("tool_transient"),
+        Some(GoalRetryReason::ToolTransient)
+    );
+    assert_eq!(GoalRetryReason::parse("tool_uncertain"), None);
 }
 
 #[test]
@@ -343,7 +342,12 @@ fn terminal_failure_disposition_never_retries_auth_or_permanent_failures() {
     );
 
     let paused = continuation
-        .record_terminal_failure_at(SESSION, GoalTerminalFailure::Pause, 2_000, 0)
+        .record_terminal_failure_at(
+            SESSION,
+            GoalTerminalFailure::Pause(GoalPauseReason::Authentication),
+            2_000,
+            0,
+        )
         .expect("pause after authentication failure");
     assert!(matches!(paused, GoalFailureDisposition::Paused(_)));
     assert_eq!(

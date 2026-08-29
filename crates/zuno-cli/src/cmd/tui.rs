@@ -500,6 +500,14 @@ fn execute_once(
             }
         });
     }
+    let goals = host.goal_store();
+    let human_requests = goals.human_requests();
+    broker.attach_durable(
+        human_requests.clone(),
+        Arc::clone(&goals),
+        host.session_id(),
+    );
+    question_broker.attach_durable(human_requests, goals, host.session_id());
     let child_restore_diagnostics = if host.is_session_materialized() {
         restore_child_sessions(&host.database_pool(), host.session_id(), &live_sessions)
     } else {
@@ -3470,7 +3478,7 @@ fn decode_pending_prompt(input: &zuno_db::inbox::SessionInput) -> Result<PromptS
     }
     if matches!(
         input.prompt.get("kind").and_then(serde_json::Value::as_str),
-        Some("subagentReport" | "productAgentReport")
+        Some("subagentReport" | "productAgentReport" | "humanRequestAnswer")
     ) {
         let text = input
             .prompt

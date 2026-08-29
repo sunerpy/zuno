@@ -8,6 +8,44 @@ use zuno_tui::keybind::{ActionComponent, Definition};
 use zuno_tui::views::dialog::ObservedBase;
 use zuno_tui::views::message::TranscriptView;
 
+fn durable_goal(
+    session_id: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<zuno_db::Pool>,
+    Arc<zuno_goal::GoalStore>,
+) {
+    let spill = tempfile::tempdir().expect("spill directory");
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open durable database"),
+    );
+    let mut connection = pool.get().expect("connection");
+    zuno_db::migration::apply(&mut connection).expect("schema");
+    connection
+        .execute(
+            "INSERT INTO project \
+             (id,worktree,vcs,name,icon_url,icon_url_override,icon_color,time_created,\
+              time_updated,time_initialized,sandboxes,commands) \
+             VALUES ('prj','/tmp',NULL,NULL,NULL,NULL,NULL,1,1,NULL,'[]',NULL)",
+            [],
+        )
+        .expect("project");
+    connection
+        .execute(
+            "INSERT INTO session \
+             (id,project_id,slug,directory,title,version,time_created,time_updated) \
+             VALUES (?1,'prj',?1,'/tmp',?1,'test',1,1)",
+            rusqlite::params![session_id],
+        )
+        .expect("session");
+    drop(connection);
+    let goals = Arc::new(
+        zuno_goal::GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+            .expect("goal store"),
+    );
+    (spill, pool, goals)
+}
+
 fn broker() -> (Arc<QuestionBroker>, mpsc::Receiver<TerminalEvent>) {
     let (sender, receiver) = zuno_tui::app::terminal_event_channel();
     (Arc::new(QuestionBroker::new(sender)), receiver)
@@ -210,5 +248,68 @@ async fn question_escape_cancels_the_tool_and_never_hangs() {
         outcome.expect("the cancellation is an authoritative outcome"),
         QuestionOutcome::Cancelled,
         "escape returned a fabricated answer instead of cancelling"
+    );
+}
+
+#[test]
+fn recovered_goal_question_answers_through_durable_state_and_resumes_once() {
+    const SESSION: &str = "ses_recovered_question";
+    let (_spill, pool, goals) = durable_goal(SESSION);
+    let goal = goals
+        .create_goal(SESSION, "finish after a human choice", None)
+        .expect("create goal");
+    goals
+        .request_human_input(
+            SESSION,
+            goal.revision,
+            "que_recovered".to_owned(),
+            serde_json::json!({
+                "source": "goal_request_input",
+                "questions": [request("Choose a release channel", "Channel")]
+            }),
+            Some("msg_recovered".to_owned()),
+            Some("call_recovered".to_owned()),
+        )
+        .expect("persist request");
+
+    let (broker, _wake) = broker();
+    broker.attach_durable(goals.human_requests(), Arc::clone(&goals), SESSION);
+    let mut bridge = bridge(&broker);
+    assert!(bridge.handle_event(&resize()).redraw);
+    let frame = rendered_text(&mut bridge);
+    assert!(
+        frame.contains("Choose a release channel"),
+        "the durable request was not projected into the TUI:\n{frame}"
+    );
+    bridge.handle_action(
+        action("dialog.select.submit"),
+        &key(zuno_tui::crossterm::event::KeyCode::Enter),
+    );
+
+    assert_eq!(
+        goals
+            .human_requests()
+            .get("que_recovered")
+            .expect("read request")
+            .expect("request")
+            .state,
+        zuno_db::human_request::HumanRequestState::Answered
+    );
+    let resumed = goals.goal(SESSION).expect("read goal").expect("goal");
+    assert_eq!(resumed.status, zuno_goal::GoalStatus::Active);
+    assert_eq!(
+        goals
+            .resume_for_work(SESSION)
+            .expect("repeat resume")
+            .expect("goal")
+            .revision,
+        resumed.revision
+    );
+    assert_eq!(
+        zuno_db::inbox::SessionInbox::new(pool)
+            .pending(SESSION)
+            .expect("pending input")
+            .len(),
+        1
     );
 }

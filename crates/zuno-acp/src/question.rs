@@ -1,8 +1,14 @@
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
+use zuno_db::human_request::{
+    HumanRequestKind, HumanRequestState, HumanRequestStore, NewHumanRequest,
+};
 use zuno_error::ToolError;
+use zuno_goal::GoalStore;
 use zuno_tools::question::{Answer, QuestionAsker, QuestionOutcome, QuestionRequest};
 
 use crate::ClientConnection;
@@ -16,7 +22,14 @@ const QUESTION_TOOL: &str = "question";
 #[derive(Debug, Clone)]
 pub struct AcpQuestionAsker {
     client: ClientConnection,
-    route: Option<std::sync::Arc<crate::AcpSessionRoute>>,
+    route: Option<Arc<crate::AcpSessionRoute>>,
+    durable: Arc<Mutex<Option<DurableQuestions>>>,
+}
+
+#[derive(Debug, Clone)]
+struct DurableQuestions {
+    store: HumanRequestStore,
+    goals: Arc<GoalStore>,
 }
 
 impl AcpQuestionAsker {
@@ -25,24 +38,89 @@ impl AcpQuestionAsker {
         Self {
             client,
             route: None,
+            durable: Arc::new(Mutex::new(None)),
         }
     }
 
     #[must_use]
-    pub fn with_route(
-        client: ClientConnection,
-        route: std::sync::Arc<crate::AcpSessionRoute>,
-    ) -> Self {
+    pub fn with_route(client: ClientConnection, route: Arc<crate::AcpSessionRoute>) -> Self {
         Self {
             client,
             route: Some(route),
+            durable: Arc::new(Mutex::new(None)),
         }
     }
-}
 
-#[async_trait]
-impl QuestionAsker for AcpQuestionAsker {
-    async fn ask(
+    pub fn attach_durable(&self, store: HumanRequestStore, goals: Arc<GoalStore>) {
+        *locked(&self.durable) = Some(DurableQuestions { store, goals });
+    }
+
+    /// Present and settle one request that survived its originating process.
+    ///
+    /// An answered request is admitted to the durable inbox before this returns;
+    /// the abandoned provider/tool request is never revived.
+    pub async fn answer_pending(&self, request_id: &str) -> Result<bool, ToolError> {
+        let durable = locked(&self.durable)
+            .clone()
+            .ok_or_else(|| question_failure("durable question store is not attached"))?;
+        let request = durable
+            .store
+            .get(request_id)
+            .map_err(question_store_failure)?
+            .filter(|request| {
+                request.kind == HumanRequestKind::Input
+                    && request.state == HumanRequestState::Pending
+            })
+            .ok_or_else(|| question_failure(format!("question `{request_id}` is not pending")))?;
+        let questions = serde_json::from_value::<Vec<QuestionRequest>>(
+            request
+                .payload
+                .get("questions")
+                .cloned()
+                .ok_or_else(|| question_failure("durable question has no `questions` array"))?,
+        )
+        .map_err(|error| question_failure(error.to_string()))?;
+        let call = request
+            .message_id
+            .as_deref()
+            .zip(request.call_id.as_deref());
+        let outcome = self
+            .ask_client(&request.session_id, &questions, call)
+            .await?;
+        let now = zuno_db::message::now_millis();
+        let answered = match &outcome {
+            QuestionOutcome::Answered(answers) => durable
+                .store
+                .answer_with_input(request_id, json!({"answers": answers}), now)
+                .map_err(question_store_failure)?
+                .is_some(),
+            QuestionOutcome::Cancelled => durable
+                .store
+                .resolve(request_id, HumanRequestState::Cancelled, None, now)
+                .map_err(question_store_failure)?
+                .is_some(),
+            QuestionOutcome::Expired => durable
+                .store
+                .resolve(request_id, HumanRequestState::Expired, None, now)
+                .map_err(question_store_failure)?
+                .is_some(),
+            QuestionOutcome::Failed => durable
+                .store
+                .resolve(request_id, HumanRequestState::Failed, None, now)
+                .map_err(question_store_failure)?
+                .is_some(),
+        };
+        if answered && matches!(outcome, QuestionOutcome::Answered(_)) && request.goal_id.is_some()
+        {
+            durable
+                .goals
+                .resume_for_work(&request.session_id)
+                .map_err(|error| question_failure(error.to_string()))?;
+        }
+        Ok(answered && matches!(outcome, QuestionOutcome::Answered(_)))
+    }
+
+    async fn ask_client(
         &self,
         session_id: &str,
         questions: &[QuestionRequest],
@@ -65,6 +143,76 @@ impl QuestionAsker for AcpQuestionAsker {
             Err(_) => return Ok(QuestionOutcome::Failed),
         };
         Ok(elicitation_outcome(&response, questions))
+    }
+}
+
+#[async_trait]
+impl QuestionAsker for AcpQuestionAsker {
+    async fn ask(
+        &self,
+        session_id: &str,
+        questions: &[QuestionRequest],
+        call: Option<(&str, &str)>,
+    ) -> Result<QuestionOutcome, ToolError> {
+        let request_id = format!("que_{}", Uuid::new_v4().simple());
+        if let Some(durable) = locked(&self.durable).clone() {
+            durable
+                .store
+                .create(NewHumanRequest {
+                    id: request_id.clone(),
+                    session_id: session_id.to_owned(),
+                    goal_id: None,
+                    kind: HumanRequestKind::Input,
+                    payload: json!({
+                        "source": QUESTION_TOOL,
+                        "questions": questions,
+                    }),
+                    message_id: call.map(|(message_id, _)| message_id.to_owned()),
+                    call_id: call.map(|(_, call_id)| call_id.to_owned()),
+                    time_created: zuno_db::message::now_millis(),
+                })
+                .map_err(question_store_failure)?;
+        }
+        let outcome = self.ask_client(session_id, questions, call).await?;
+        if let Some(durable) = locked(&self.durable).clone() {
+            let (state, response) = match &outcome {
+                QuestionOutcome::Answered(answers) => (
+                    HumanRequestState::Answered,
+                    Some(json!({"answers": answers})),
+                ),
+                QuestionOutcome::Cancelled => (HumanRequestState::Cancelled, None),
+                QuestionOutcome::Expired => (HumanRequestState::Expired, None),
+                QuestionOutcome::Failed => (HumanRequestState::Failed, None),
+            };
+            durable
+                .store
+                .resolve(
+                    &request_id,
+                    state,
+                    response.as_ref(),
+                    zuno_db::message::now_millis(),
+                )
+                .map_err(question_store_failure)?;
+        }
+        Ok(outcome)
+    }
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn question_store_failure(error: zuno_error::DbError) -> ToolError {
+    ToolError::Failed {
+        tool: QUESTION_TOOL.to_owned(),
+        source: Box::new(error),
+    }
+}
+
+fn question_failure(message: impl Into<String>) -> ToolError {
+    ToolError::Failed {
+        tool: QUESTION_TOOL.to_owned(),
+        source: Box::new(std::io::Error::other(message.into())),
     }
 }
 

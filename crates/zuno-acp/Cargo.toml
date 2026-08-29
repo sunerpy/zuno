@@ -14,7 +14,9 @@ async-trait = { workspace = true }
 zuno-db = { workspace = true }
 zuno-engine = { workspace = true }
 zuno-error = { workspace = true }
+zuno-goal = { workspace = true }
 zuno-llm = { workspace = true }
+zuno-permission = { workspace = true }
 zuno-tool = { workspace = true }
 zuno-tools = { workspace = true }
 zuno-types = { workspace = true }

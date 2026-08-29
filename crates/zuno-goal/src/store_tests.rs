@@ -50,6 +50,27 @@ impl Fixture {
             .join("goal-test.db")
     }
 
+    fn materialize_session(&self, session_id: &str) {
+        let connection = self.store.pool().get().expect("check out connection");
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO project \
+                 (id,worktree,vcs,name,icon_url,icon_url_override,icon_color,time_created,\
+                  time_updated,time_initialized,sandboxes,commands) \
+                 VALUES ('goal-fixture','/tmp',NULL,NULL,NULL,NULL,NULL,1,1,NULL,'[]',NULL)",
+                [],
+            )
+            .expect("insert project");
+        connection
+            .execute(
+                "INSERT INTO session \
+                 (id,project_id,slug,directory,title,version,time_created,time_updated) \
+                 VALUES (?1,'goal-fixture',?1,'/tmp',?1,'test',1,1)",
+                params![session_id],
+            )
+            .expect("insert session");
+    }
+
     /// Close every connection and open the same file again.
     fn restart(self) -> Self {
         let Self {
@@ -315,6 +336,202 @@ fn the_model_attempting_paused_is_refused_by_name_and_the_goal_is_untouched() {
     assert!(refusal.is_model_refusal());
     assert_eq!(fixture.goal(SESSION), created);
     assert_eq!(fixture.raw_status(SESSION), "active");
+}
+
+#[test]
+fn human_input_and_permission_survive_restart_and_resume_once() {
+    const SESSION_ID: &str = "ses_human_restart";
+    let fixture = Fixture::on_disk();
+    fixture.materialize_session(SESSION_ID);
+    let goal = fixture
+        .store
+        .create_goal(SESSION_ID, "finish after human decisions", None)
+        .expect("create goal");
+    let request = fixture
+        .store
+        .request_human_input_at(
+            SESSION_ID,
+            goal.revision,
+            "que_restart".to_owned(),
+            serde_json::json!({
+                "source": "goal_request_input",
+                "questions": [{
+                    "question": "Which release channel?",
+                    "header": "Channel",
+                    "options": [],
+                    "multiple": false,
+                    "custom": true
+                }]
+            }),
+            GoalHumanRequestOrigin {
+                message_id: Some("msg_question".to_owned()),
+                call_id: Some("call_question".to_owned()),
+            },
+            1_000,
+        )
+        .expect("persist question and pause");
+    assert_eq!(request.goal_id.as_deref(), Some(goal.goal_id.as_str()));
+    assert_eq!(
+        fixture
+            .store
+            .pause_state(SESSION_ID)
+            .expect("read pause")
+            .expect("paused goal")
+            .reason,
+        GoalPauseReason::HumanInput
+    );
+
+    let fixture = fixture.restart();
+    assert_eq!(
+        fixture
+            .store
+            .human_requests()
+            .get("que_restart")
+            .expect("read request")
+            .expect("request")
+            .state,
+        zuno_db::human_request::HumanRequestState::Pending
+    );
+    fixture
+        .store
+        .human_requests()
+        .answer_with_input(
+            "que_restart",
+            serde_json::json!({"answers": [["canary"]]}),
+            2_000,
+        )
+        .expect("answer question")
+        .expect("pending question");
+    let resumed = fixture
+        .store
+        .resume_for_work(SESSION_ID)
+        .expect("resume work")
+        .expect("goal");
+    assert_eq!(resumed.status, GoalStatus::Active);
+    assert_eq!(
+        fixture
+            .store
+            .resume_for_work(SESSION_ID)
+            .expect("repeat resume")
+            .expect("goal")
+            .revision,
+        resumed.revision,
+        "Start Work must consume the pause only once"
+    );
+
+    let permission = fixture
+        .store
+        .request_permission(
+            SESSION_ID,
+            "per_restart".to_owned(),
+            serde_json::json!({
+                "id": "per_restart",
+                "sessionId": SESSION_ID,
+                "permission": "shell",
+                "patterns": ["git push"],
+                "metadata": {},
+                "always": []
+            }),
+            Some("msg_permission".to_owned()),
+            Some("call_permission".to_owned()),
+        )
+        .expect("persist permission")
+        .expect("active goal pauses");
+    assert_eq!(permission.goal_id.as_deref(), Some(goal.goal_id.as_str()));
+    let fixture = fixture.restart();
+    fixture
+        .store
+        .human_requests()
+        .answer_with_input("per_restart", serde_json::json!({"reply": "reject"}), 3_000)
+        .expect("answer permission")
+        .expect("pending permission");
+    let resumed = fixture
+        .store
+        .resume_for_work(SESSION_ID)
+        .expect("resume after permission")
+        .expect("goal");
+    assert_eq!(resumed.status, GoalStatus::Active);
+    assert_eq!(
+        fixture
+            .store
+            .human_requests()
+            .pending(Some(SESSION_ID))
+            .expect("list requests"),
+        Vec::new()
+    );
+    assert_eq!(
+        zuno_db::inbox::SessionInbox::new(Arc::clone(&fixture.store.pool))
+            .pending(SESSION_ID)
+            .expect("read admitted answers")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn plan_mode_survives_restart_and_start_work_is_idempotent() {
+    const SESSION_ID: &str = "ses_plan_restart";
+    let fixture = Fixture::on_disk();
+    let goal = fixture
+        .store
+        .create_goal(SESSION_ID, "plan then implement", None)
+        .expect("create goal");
+    let paused = fixture
+        .store
+        .enter_plan_mode(SESSION_ID)
+        .expect("enter plan")
+        .expect("goal");
+    assert_eq!(paused.status, GoalStatus::Paused);
+    assert_eq!(paused.revision, goal.revision + 1);
+    assert_eq!(
+        fixture
+            .store
+            .enter_plan_mode(SESSION_ID)
+            .expect("repeat plan")
+            .expect("goal")
+            .revision,
+        paused.revision
+    );
+
+    let fixture = fixture.restart();
+    assert_eq!(
+        fixture
+            .store
+            .pause_state(SESSION_ID)
+            .expect("read pause")
+            .expect("pause")
+            .reason,
+        GoalPauseReason::PlanMode
+    );
+    assert_eq!(
+        fixture
+            .store
+            .enter_plan_mode(SESSION_ID)
+            .expect("reopen plan")
+            .expect("goal")
+            .revision,
+        paused.revision
+    );
+    let active = fixture
+        .store
+        .resume_for_work(SESSION_ID)
+        .expect("start work")
+        .expect("goal");
+    assert_eq!(active.status, GoalStatus::Active);
+    assert_eq!(active.revision, paused.revision + 1);
+    assert_eq!(
+        fixture
+            .store
+            .resume_for_work(SESSION_ID)
+            .expect("repeat start work")
+            .expect("goal")
+            .revision,
+        active.revision
+    );
+    assert_eq!(
+        fixture.store.pause_state(SESSION_ID).expect("read pause"),
+        None
+    );
 }
 
 #[test]
@@ -1024,7 +1241,6 @@ fn the_table_declares_the_check_constraint_and_deliberately_no_foreign_key() {
         "context_limit",
         "context_compacted",
         "tool_transient",
-        "tool_uncertain",
     ] {
         assert!(
             retry_ddl.contains(&format!("'{reason}'")),
@@ -1032,20 +1248,30 @@ fn the_table_declares_the_check_constraint_and_deliberately_no_foreign_key() {
         );
     }
     assert!(
+        !retry_ddl.contains("'tool_uncertain'"),
+        "uncertain side effects must be pauses, not retry reasons: {retry_ddl}"
+    );
+    assert!(
         !retry_ddl.to_ascii_uppercase().contains("FOREIGN KEY"),
         "retry state follows the goal's explicit ownership: {retry_ddl}"
     );
 
-    let tables: i64 = connection
+    let pause_ddl: String = connection
         .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'goal_pause'",
             [],
             |row| row.get(0),
         )
-        .expect("count the tables");
-    assert_eq!(
-        tables, 6,
-        "the shared database fixture holds goal state and its durable history"
+        .expect("read the pause table's DDL");
+    for reason in GoalPauseReason::ALL {
+        assert!(
+            pause_ddl.contains(&format!("'{}'", reason.as_str())),
+            "the pause CHECK constraint omits {reason}: {pause_ddl}"
+        );
+    }
+    assert!(
+        pause_ddl.contains("'uncertain_side_effect'"),
+        "uncertain side effects must require inspection before any replay: {pause_ddl}"
     );
 }
 
@@ -1253,7 +1479,8 @@ fn assert_job_completion_blocked(store: &GoalStore, goal: &Goal) {
         GoalError::CompletionBlocked {
             plan_steps: 0,
             work_items: 0,
-            jobs: 1
+            jobs: 1,
+            human_requests: 0,
         }
     ));
     assert_eq!(
@@ -1261,6 +1488,65 @@ fn assert_job_completion_blocked(store: &GoalStore, goal: &Goal) {
         Some(goal.clone()),
         "a blocked completion must not advance the goal revision"
     );
+}
+
+#[test]
+fn completion_waits_for_a_pending_goal_human_request() {
+    let (_spill, _pool, store, goal) = shared_completion_fixture();
+    store
+        .request_human_input_at(
+            SESSION,
+            goal.revision,
+            "que_completion".to_owned(),
+            serde_json::json!({
+                "source": "goal_request_input",
+                "questions": [{
+                    "question": "Confirm release?",
+                    "header": "Release",
+                    "options": [],
+                    "multiple": false,
+                    "custom": true
+                }]
+            }),
+            GoalHumanRequestOrigin {
+                message_id: Some("msg_completion".to_owned()),
+                call_id: Some("call_completion".to_owned()),
+            },
+            2,
+        )
+        .expect("persist pending request");
+    let paused = store.goal(SESSION).expect("read goal").expect("goal");
+    assert!(matches!(
+        store
+            .complete_checked(SESSION, paused.revision)
+            .expect_err("pending request must block completion"),
+        GoalError::CompletionBlocked {
+            plan_steps: 0,
+            work_items: 0,
+            jobs: 0,
+            human_requests: 1,
+        }
+    ));
+
+    store
+        .human_requests()
+        .answer_with_input(
+            "que_completion",
+            serde_json::json!({"answers": [["yes"]]}),
+            3,
+        )
+        .expect("answer request")
+        .expect("pending request");
+    let active = store
+        .resume_for_work(SESSION)
+        .expect("resume goal")
+        .expect("goal");
+    assert_eq!(active.status, GoalStatus::Active);
+    let completed = store
+        .complete_checked(SESSION, active.revision)
+        .expect("completion is released")
+        .expect("goal");
+    assert_eq!(completed.status, GoalStatus::Complete);
 }
 
 #[test]
@@ -1304,7 +1590,8 @@ fn completion_waits_for_plan_work_items_and_jobs_in_one_transaction() {
         GoalError::CompletionBlocked {
             plan_steps: 1,
             work_items: 1,
-            jobs: 1
+            jobs: 1,
+            human_requests: 0,
         }
     ));
     assert_eq!(store.goal(SESSION).expect("read goal"), Some(goal.clone()));

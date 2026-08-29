@@ -100,6 +100,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) sandbox: Option<Arc<dyn SandboxResolver>>,
     pub(crate) todo_store: Arc<zuno_db::pool::Pool>,
     pub(crate) goal_store: Arc<zuno_goal::GoalStore>,
+    pub(crate) interaction_policy: zuno_goal::InteractionPolicy,
     pub(crate) mcp_loader: Option<Arc<dyn McpToolLoader>>,
     pub(crate) skills: Arc<zuno_catalog::skill::Skills>,
     pub(crate) capability: Arc<CapabilitySnapshot>,
@@ -234,8 +235,9 @@ pub(crate) fn assemble(
         .map(|tool| tool.with_background_executions(Arc::clone(&selection.background_executions)))
     });
     let shell = shell.transpose()?;
-    if selection.manifest.contains(BuiltinSlot::Question)
-        && let Some(asker) = selection.question
+    if selection.interaction_policy.allows_question()
+        && selection.manifest.contains(BuiltinSlot::Question)
+        && let Some(asker) = selection.question.clone()
     {
         builder
             .register_builtin(BuiltinSlot::Question, erase(QuestionTool::new(asker)))
@@ -405,6 +407,11 @@ pub(crate) fn assemble(
     for tool in zuno_goal::goal_tools(Arc::clone(&selection.goal_store)) {
         builder.register_configured_builtin(tool);
     }
+    if selection.interaction_policy.allows_goal_request_input() && selection.question.is_some() {
+        builder.register_configured_builtin(erase(zuno_goal::GoalRequestInputTool::new(
+            Arc::clone(&selection.goal_store),
+        )));
+    }
     for tool in zuno_tools::work_state_tools(Arc::clone(&selection.todo_store)) {
         builder.register_configured_builtin(tool);
     }
@@ -430,6 +437,13 @@ pub(crate) fn assemble(
     if !selected_profile.capabilities().can_delegate() {
         tools.retain(|tool| tool.ui_intent() != ToolUiIntent::Subagent);
     }
+    tools.retain(|tool| match tool.id() {
+        zuno_tools::question::WIRE_ID => selection.interaction_policy.allows_question(),
+        zuno_goal::REQUEST_GOAL_INPUT_TOOL_ID => {
+            selection.interaction_policy.allows_goal_request_input()
+        }
+        _ => true,
+    });
     if let Some(authority) = selection.tool_authority.as_deref() {
         tools.retain(|tool| {
             let identity = tool.definition().schema_identity();

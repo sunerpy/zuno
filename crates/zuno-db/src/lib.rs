@@ -43,6 +43,7 @@
 pub mod artifact_gc;
 pub mod event_log;
 pub mod fts;
+pub mod human_request;
 pub mod inbox;
 pub mod job;
 pub mod memory_candidate;
@@ -51,6 +52,7 @@ pub mod message;
 pub mod migration;
 pub mod open;
 pub mod pool;
+pub mod provider_backoff;
 pub mod prune;
 pub mod retention;
 pub mod schema;

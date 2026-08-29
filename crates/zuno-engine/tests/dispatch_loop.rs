@@ -25,8 +25,8 @@ use zuno_llm::registry::{
 };
 use zuno_permission::{PermissionAction, Rule};
 use zuno_tool::{
-    AllowAll, Tool, ToolConcurrencyPolicy, ToolContext, ToolContinuation, ToolOutput,
-    ToolReplayPolicy,
+    AllowAll, METADATA_HUMAN_REQUEST_ID_KEY, Tool, ToolConcurrencyPolicy, ToolContext,
+    ToolContinuation, ToolOutput, ToolReplayPolicy,
 };
 
 const SESSION_ID: &str = "ses_dispatch_loop";
@@ -215,6 +215,29 @@ impl Tool for YieldingTaskTool {
             "The durable nextStep report will resume this session.",
         )
         .with_continuation(ToolContinuation::YieldUntilInput))
+    }
+}
+
+struct WaitingForHumanTool;
+
+#[async_trait]
+impl Tool for WaitingForHumanTool {
+    fn id(&self) -> &str {
+        "goal_request_input"
+    }
+
+    fn description(&self) -> &str {
+        "Persist a human request and stop the current turn."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("Waiting for human input", "Goal paused.")
+            .with_metadata(METADATA_HUMAN_REQUEST_ID_KEY, "que_dispatch_wait")
+            .with_continuation(ToolContinuation::WaitingForHuman))
     }
 }
 
@@ -653,6 +676,75 @@ async fn a_next_step_tool_yields_without_spending_a_second_provider_request() {
             .count(),
         1,
         "the host must wait for the durable report instead of asking the model to say it is waiting"
+    );
+}
+
+#[tokio::test]
+async fn a_human_request_stops_after_its_result_is_durable() {
+    let mut connection = seeded();
+    let mut responses = named_provider_events("goal_request_input", &[("call-question", "ask")]);
+    responses.truncate(1);
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let providers = registry(provider);
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(WaitingForHumanTool)],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(
+            SESSION_ID,
+            "turn-waits-for-human",
+            DynamicContext::default(),
+        ),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome.expect("turn waits cleanly"),
+        TurnOutcome::WaitingForHuman {
+            steps: 1,
+            ref request_id,
+            ..
+        } if request_id == "que_dispatch_wait"
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnEvent::ToolResultAppended {
+            call_id,
+            is_error: false,
+            ..
+        } if call_id == "call-question"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TurnEvent::TurnWaitingForHuman { request_id, .. }
+            if request_id == "que_dispatch_wait"
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TurnEvent::ProviderRequestStarted { .. }))
+            .count(),
+        1,
+        "waiting must not spend a provider request asking the model to narrate the pause"
     );
 }
 

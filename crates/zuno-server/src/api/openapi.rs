@@ -171,39 +171,9 @@ const BODY_SCHEMA_GAPS: &[BodySchemaGap] = &[
         "the response upgrades to WebSocket frames and has no JSON body model",
     ),
     (
-        "/api/permission/request",
-        "get",
-        "the opaque Json<impl Serialize> envelope has no nameable JsonSchema type",
-    ),
-    (
         "/api/permission/saved",
         "get",
         "Data<Vec<Value>> leaves each saved permission payload untyped",
-    ),
-    (
-        "/api/session/{sessionID}/permission",
-        "get",
-        "PermissionRequest does not derive JsonSchema",
-    ),
-    (
-        "/api/session/{sessionID}/permission/{requestID}/reply",
-        "post",
-        "PermissionReplyBody does not derive JsonSchema",
-    ),
-    (
-        "/api/question/request",
-        "get",
-        "the opaque Json<impl Serialize> envelope has no nameable JsonSchema type",
-    ),
-    (
-        "/api/session/{sessionID}/question",
-        "get",
-        "QuestionRequest does not derive JsonSchema",
-    ),
-    (
-        "/api/session/{sessionID}/question/{requestID}/reply",
-        "post",
-        "QuestionReplyBody does not derive JsonSchema",
     ),
     (
         "/api/session/prune",
@@ -291,6 +261,9 @@ pub fn document() -> Value {
                     "503": {"description": "Operation is known but its local backend is explicitly unavailable"}
                 }
             });
+            if let Some(description) = operation_description(method, path) {
+                operation["description"] = Value::String(description.to_owned());
+            }
             bind_existing_body_schemas(&mut operation, method, path);
             methods.insert((*method).to_owned(), operation);
         }
@@ -307,7 +280,25 @@ pub fn document() -> Value {
                 "SessionListResponse": schemars::schema_for!(super::session::SessionListResponse),
                 "SessionActive": schemars::schema_for!(super::session::SessionActive),
                 "SessionActiveResponse": schemars::schema_for!(super::session::SessionActiveResponse),
-                "SessionPruneMutation": schemars::schema_for!(super::maintenance::MutationBody)
+                "SessionPruneMutation": schemars::schema_for!(super::maintenance::MutationBody),
+                "PermissionRequestListResponse": schemars::schema_for!(
+                    super::request::LocationResponse<crate::PermissionRequest>
+                ),
+                "SessionPermissionResponse": schemars::schema_for!(
+                    super::Data<Vec<crate::PermissionRequest>>
+                ),
+                "PermissionReply": schemars::schema_for!(
+                    super::request::PermissionReplyBody
+                ),
+                "QuestionRequestListResponse": schemars::schema_for!(
+                    super::request::LocationResponse<crate::QuestionRequest>
+                ),
+                "SessionQuestionResponse": schemars::schema_for!(
+                    super::Data<Vec<crate::QuestionRequest>>
+                ),
+                "QuestionReply": schemars::schema_for!(
+                    super::request::QuestionReplyBody
+                )
             }
         }
     })
@@ -325,7 +316,45 @@ fn bind_existing_body_schemas(operation: &mut Value, method: &str, path: &str) {
         }
         ("get", "/api/session/active") => bind_response(operation, "SessionActiveResponse"),
         ("get", "/api/session/{sessionID}") => bind_response(operation, "SessionResponse"),
+        ("get", "/api/permission/request") => {
+            bind_response(operation, "PermissionRequestListResponse");
+        }
+        ("get", "/api/session/{sessionID}/permission") => {
+            bind_response(operation, "SessionPermissionResponse");
+        }
+        ("post", "/api/session/{sessionID}/permission/{requestID}/reply") => {
+            bind_request(operation, "PermissionReply");
+        }
+        ("get", "/api/question/request") => {
+            bind_response(operation, "QuestionRequestListResponse");
+        }
+        ("get", "/api/session/{sessionID}/question") => {
+            bind_response(operation, "SessionQuestionResponse");
+        }
+        ("post", "/api/session/{sessionID}/question/{requestID}/reply") => {
+            bind_request(operation, "QuestionReply");
+        }
         _ => {}
+    }
+}
+
+fn operation_description(method: &str, path: &str) -> Option<&'static str> {
+    match (method, path) {
+        ("get", "/api/permission/request") | ("get", "/api/session/{sessionID}/permission") => {
+            Some(
+                "Lists pending durable permission requests. Requests survive process restart; live channels only wake consumers.",
+            )
+        }
+        ("post", "/api/session/{sessionID}/permission/{requestID}/reply") => Some(
+            "Settles one durable permission request and admits its answer before Goal continuation resumes.",
+        ),
+        ("get", "/api/question/request") | ("get", "/api/session/{sessionID}/question") => {
+            Some("Lists pending durable human-input requests in deterministic creation order.")
+        }
+        ("post", "/api/session/{sessionID}/question/{requestID}/reply") => Some(
+            "Atomically settles one durable question and admits the model-visible answer to the session inbox.",
+        ),
+        _ => None,
     }
 }
 
@@ -368,7 +397,7 @@ mod tests {
     fn every_operation_is_bound_bodyless_or_a_reasoned_frozen_gap() {
         assert_eq!(
             BODY_SCHEMA_GAPS.len(),
-            38,
+            32,
             "review and re-freeze every gap change"
         );
         assert_eq!(

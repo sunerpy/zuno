@@ -372,6 +372,18 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
             "turn.completed",
             object(json!({"assistantMessageID": assistant_message_id, "steps": steps})),
         ),
+        TurnEvent::TurnWaitingForHuman {
+            assistant_message_id,
+            steps,
+            request_id,
+        } => (
+            "turn.waiting_for_human",
+            object(json!({
+                "assistantMessageID": assistant_message_id,
+                "steps": steps,
+                "requestID": request_id,
+            })),
+        ),
         TurnEvent::TurnInterrupted {
             assistant_message_id,
             steps,

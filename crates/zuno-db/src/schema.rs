@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 24;
+pub const TABLE_COUNT: usize = 26;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -143,6 +143,33 @@ CREATE TABLE `session_input` (
   `time_created` integer NOT NULL,
   `time_updated` integer NOT NULL,
   CONSTRAINT `fk_session_input_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
+);
+CREATE TABLE `human_request` (
+  `id` text PRIMARY KEY,
+  `session_id` text NOT NULL,
+  `goal_id` text,
+  `kind` text NOT NULL CHECK (`kind` IN ('input','permission')),
+  `state` text NOT NULL CHECK (`state` IN ('pending','answered','cancelled','expired','failed')),
+  `payload` text NOT NULL CHECK (json_valid(`payload`)),
+  `response` text CHECK (`response` IS NULL OR json_valid(`response`)),
+  `message_id` text,
+  `call_id` text,
+  `revision` integer NOT NULL CHECK (`revision` >= 1),
+  `time_created` integer NOT NULL,
+  `time_updated` integer NOT NULL,
+  `time_resolved` integer
+);
+CREATE TABLE `provider_retry_backoff` (
+  `session_id` text PRIMARY KEY,
+  `request_id` text NOT NULL,
+  `turn_id` text NOT NULL,
+  `failed_attempt` integer NOT NULL CHECK (`failed_attempt` >= 1),
+  `next_attempt` integer NOT NULL CHECK (`next_attempt` > `failed_attempt`),
+  `max_attempts` integer NOT NULL CHECK (`max_attempts` >= `next_attempt`),
+  `reason` text NOT NULL,
+  `delay_ms` integer NOT NULL CHECK (`delay_ms` > 0),
+  `retry_at_ms` integer NOT NULL,
+  `scheduled_at_ms` integer NOT NULL
 );
 CREATE TABLE `session_message` (
   `id` text PRIMARY KEY,
@@ -346,6 +373,8 @@ CREATE INDEX `part_session_idx` ON `part` (`session_id`);
 CREATE INDEX `session_input_session_pending_delivery_seq_idx` ON `session_input` (`session_id`,`state`,`delivery`,`admitted_seq`);
 CREATE UNIQUE INDEX `session_input_session_admitted_seq_idx` ON `session_input` (`session_id`,`admitted_seq`);
 CREATE UNIQUE INDEX `session_input_session_promoted_seq_idx` ON `session_input` (`session_id`,`promoted_seq`);
+CREATE INDEX `human_request_session_state_created_idx` ON `human_request` (`session_id`,`state`,`time_created`,`id`);
+CREATE INDEX `human_request_goal_state_created_idx` ON `human_request` (`goal_id`,`state`,`time_created`,`id`);
 CREATE UNIQUE INDEX `session_message_session_seq_idx` ON `session_message` (`session_id`,`seq`);
 CREATE INDEX `session_message_session_type_seq_idx` ON `session_message` (`session_id`,`type`,`seq`);
 CREATE INDEX `session_message_session_time_created_id_idx` ON `session_message` (`session_id`,`time_created`,`id`);

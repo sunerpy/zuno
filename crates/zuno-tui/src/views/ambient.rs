@@ -1050,9 +1050,13 @@ impl SidebarView {
         if let Some(goal) = &self.ambient.work.goal {
             lines.push(blank());
             headers.push((lines.len(), Section::Goal));
+            let goal_status = goal.pause.as_ref().map_or_else(
+                || goal.status.clone(),
+                |pause| format!("{} · {}", goal.status, pause.reason),
+            );
             lines.push(self.heading(
                 "Goal",
-                &goal.status,
+                &goal_status,
                 self.disclosure(self.expanded.goal),
                 width,
             ));
@@ -1072,6 +1076,39 @@ impl SidebarView {
                 if let Some(reason) = goal.blocked_reason.as_deref() {
                     for row in wrap(reason, usize::from(width).saturating_sub(4), 2) {
                         lines.push(padded(&format!("  ! {row}"), width, self.context.warning()));
+                    }
+                }
+                if let Some(retry) = &goal.retry {
+                    lines.push(padded(
+                        &format!(
+                            "  retry #{} · {} · at {}",
+                            retry.attempt, retry.reason, retry.retry_at_ms
+                        ),
+                        width,
+                        self.context.warning(),
+                    ));
+                }
+                if let Some(backoff) = &goal.provider_backoff {
+                    lines.push(padded(
+                        &format!(
+                            "  provider retry {}/{} · {} · at {}",
+                            backoff.next_attempt,
+                            backoff.max_attempts,
+                            backoff.reason,
+                            backoff.retry_at_ms
+                        ),
+                        width,
+                        self.context.warning(),
+                    ));
+                }
+                for request in goal.pending_human_requests.iter().take(3) {
+                    let summary = request.summary.as_deref().unwrap_or(&request.id);
+                    for row in wrap(summary, usize::from(width).saturating_sub(4), 2) {
+                        lines.push(padded(
+                            &format!("  ? {} · {row}", request.kind),
+                            width,
+                            self.context.warning(),
+                        ));
                     }
                 }
                 let usage = goal.token_budget.map_or_else(

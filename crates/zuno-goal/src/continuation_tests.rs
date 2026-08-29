@@ -1,4 +1,5 @@
 use super::*;
+use crate::GoalPauseReason;
 use zuno_engine::compaction::select_boundary;
 use zuno_llm::event::RequestContentBlock;
 
@@ -202,6 +203,77 @@ fn resume_deferral_suppresses_exactly_one_eligible_continuation() {
             .continuation
             .prepare_if_idle("ses_goal", GoalTurnMode::Work, QueuedUserInput::Absent)
             .expect("second attempt"),
+        ContinuationAttempt::Prepared(_)
+    ));
+}
+
+#[test]
+fn provider_backoff_deadline_survives_restart_before_a_new_turn_can_start() {
+    let database = tempfile::tempdir().expect("create database directory");
+    let spill = tempfile::tempdir().expect("create spill directory");
+    let path = database.path().join("goal-test.db");
+    {
+        let store = GoalStore::open_at(&path, spill.path().to_owned()).expect("open goal store");
+        store
+            .create_goal(
+                "ses_provider_backoff",
+                "wait for the committed deadline",
+                None,
+            )
+            .expect("create goal");
+        let connection = store.pool().get().expect("check out connection");
+        zuno_db::provider_backoff::schedule(
+            &connection,
+            &zuno_db::provider_backoff::ProviderBackoffCheckpoint {
+                session_id: "ses_provider_backoff".to_owned(),
+                request_id: "req_old_provider_call".to_owned(),
+                turn_id: "turn_old_provider_call".to_owned(),
+                failed_attempt: 1,
+                next_attempt: 2,
+                max_attempts: 3,
+                reason: "rate_limited".to_owned(),
+                delay_ms: 4_000,
+                retry_at_ms: 5_000,
+                scheduled_at_ms: 1_000,
+            },
+        )
+        .expect("persist provider backoff before simulated crash");
+    }
+
+    let store =
+        Arc::new(GoalStore::open_at(&path, spill.path().to_owned()).expect("reopen goal store"));
+    let continuation = GoalContinuation::new(Arc::clone(&store), SessionRunRegistry::new());
+    assert!(matches!(
+        continuation
+            .prepare_if_idle_at(
+                "ses_provider_backoff",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                3_000,
+            )
+            .expect("read recovered deadline"),
+        ContinuationAttempt::Suppressed(ContinuationSuppression::ProviderRetryBackoff {
+            remaining
+        }) if remaining == std::time::Duration::from_secs(2)
+    ));
+    assert_eq!(
+        store
+            .provider_backoff_state("ses_provider_backoff")
+            .expect("read checkpoint")
+            .expect("checkpoint")
+            .request_id,
+        "req_old_provider_call",
+        "restart recovery must retain evidence of the abandoned request"
+    );
+    assert!(matches!(
+        continuation
+            .prepare_if_idle_at(
+                "ses_provider_backoff",
+                GoalTurnMode::Work,
+                QueuedUserInput::Absent,
+                5_000,
+            )
+            .expect("deadline reached"),
         ContinuationAttempt::Prepared(_)
     ));
 }
@@ -457,47 +529,31 @@ fn retry_context_tells_the_model_to_verify_side_effects_before_repeating_them() 
 }
 
 #[test]
-fn uncertain_tool_recovery_forbids_replay_until_external_state_is_verified() {
+fn uncertain_tool_outcome_pauses_instead_of_scheduling_replay() {
     let fixture = Fixture::new();
     fixture.create("publish without duplicating side effects");
-    fixture
-        .store
-        .schedule_retry(
+    let disposition = fixture
+        .continuation
+        .record_terminal_failure_at(
             "ses_goal",
-            crate::GoalRetryReason::ToolUncertain,
-            None,
-            crate::GoalRetryPolicy::new(
-                std::time::Duration::from_secs(2),
-                std::time::Duration::from_secs(30),
-                0,
-                std::time::Duration::from_millis(250),
-            )
-            .expect("valid policy"),
+            GoalTerminalFailure::Pause(GoalPauseReason::UncertainSideEffect),
             1_000,
             0,
         )
-        .expect("schedule retry")
-        .expect("active goal");
-
-    let entry = fixture
-        .continuation
-        .injection("ses_goal")
-        .expect("read retry context")
-        .expect("active goal");
-    let rendered = entry
-        .message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            zuno_llm::event::RequestContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-
-    assert!(rendered.contains("tool_uncertain"), "{rendered}");
-    assert!(
-        rendered.contains("Verify authoritative external state"),
-        "{rendered}"
+        .expect("record uncertain side effect");
+    assert!(matches!(disposition, GoalFailureDisposition::Paused(_)));
+    assert_eq!(
+        fixture.store.retry_state("ses_goal").expect("read retry"),
+        None
+    );
+    assert_eq!(
+        fixture
+            .store
+            .pause_state("ses_goal")
+            .expect("read pause")
+            .expect("pause")
+            .reason,
+        GoalPauseReason::UncertainSideEffect
     );
 }
 

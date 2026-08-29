@@ -3,7 +3,7 @@
 use crate::retry::{
     GoalFailureDisposition, GoalRetryPolicy, GoalRetryState, GoalTerminalFailure, entropy, now_ms,
 };
-use crate::{FailureStreak, Goal, GoalError, GoalStatus, GoalStore, ModelStatus, SystemStatus};
+use crate::{FailureStreak, Goal, GoalError, GoalStatus, GoalStore, ModelStatus};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -75,6 +75,11 @@ pub enum ContinuationSuppression {
     /// A recoverable failure has not reached its persisted retry time.
     RetryBackoff {
         /// Time until another automatic turn may be attempted.
+        remaining: Duration,
+    },
+    /// A same-request provider retry was sleeping when the process stopped.
+    ProviderRetryBackoff {
+        /// Time left on the exact deadline committed before that sleep.
         remaining: Duration,
     },
 }
@@ -280,6 +285,18 @@ impl GoalContinuation {
                 },
             ));
         }
+        if let Some(backoff) = self.store.provider_backoff_state(session_id)?
+            && backoff.retry_at_ms > now_ms
+        {
+            let remaining_ms = backoff.retry_at_ms.saturating_sub(now_ms);
+            return Ok(ContinuationAttempt::Suppressed(
+                ContinuationSuppression::ProviderRetryBackoff {
+                    remaining: Duration::from_millis(
+                        u64::try_from(remaining_ms).unwrap_or(u64::MAX),
+                    ),
+                },
+            ));
+        }
 
         let run_guard = match self.runs.begin_turn(session_id.to_owned()) {
             Ok(guard) => guard,
@@ -378,9 +395,9 @@ impl GoalContinuation {
                         GoalFailureDisposition::RetryScheduled,
                     )
                 }),
-            GoalTerminalFailure::Pause => self
+            GoalTerminalFailure::Pause(reason) => self
                 .store
-                .set_status_as_system(session_id, SystemStatus::Paused)
+                .pause_with_reason(session_id, reason)
                 .map(|goal| {
                     goal.map_or(
                         GoalFailureDisposition::NoActiveGoal,
@@ -475,9 +492,6 @@ fn render_goal_context_with_retry(goal: &Goal, retry: Option<&GoalRetryState>) -
         let replay_guidance = match retry.reason {
             crate::GoalRetryReason::ToolTransient => {
                 "- The failed tool explicitly permits replay after backoff. Re-read current evidence before choosing the next call; do not create a tight retry loop.\n"
-            }
-            crate::GoalRetryReason::ToolUncertain => {
-                "- The failed tool may have completed an external side effect before its result was lost. Verify authoritative external state before issuing any equivalent mutation.\n"
             }
             _ => {
                 "- Inspect the current worktree and external state before repeating an action with side effects. The action may have completed even if its result was lost.\n"

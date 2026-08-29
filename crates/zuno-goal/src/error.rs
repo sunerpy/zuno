@@ -57,6 +57,13 @@ pub enum GoalError {
         value: String,
     },
 
+    /// A pause reason in the auxiliary table is outside the closed runtime set.
+    #[error("unknown goal pause reason `{value}`")]
+    UnknownPauseReason {
+        /// Corrupt stored discriminator.
+        value: String,
+    },
+
     /// `create_goal` found a goal that is not replaceable yet.
     ///
     /// Distinct from a plain conflict because the remedy is specific: finish the
@@ -69,6 +76,22 @@ pub enum GoalError {
         /// The session whose goal blocked the replacement.
         session_id: String,
         /// The status that blocked it, read in the same transaction that refused.
+        status: GoalStatus,
+    },
+
+    /// A Goal-only operation was requested for a session without a Goal.
+    #[error("session {session_id} has no goal")]
+    NoGoal {
+        /// Session whose Goal was expected.
+        session_id: String,
+    },
+
+    /// A Goal-only operation requires the current Goal to be active.
+    #[error("session {session_id} goal is `{status}`; the operation requires `active`")]
+    GoalNotActive {
+        /// Session whose Goal is suspended or terminal.
+        session_id: String,
+        /// Current durable status.
         status: GoalStatus,
     },
 
@@ -87,7 +110,7 @@ pub enum GoalError {
 
     /// Completion was requested while durable work still says the goal is unfinished.
     #[error(
-        "goal cannot complete while {plan_steps} plan steps, {work_items} work items, and {jobs} jobs remain unfinished"
+        "goal cannot complete while {plan_steps} plan steps, {work_items} work items, {jobs} jobs, and {human_requests} human requests remain unfinished"
     )]
     CompletionBlocked {
         /// Plan steps not completed or cancelled.
@@ -96,6 +119,8 @@ pub enum GoalError {
         work_items: usize,
         /// Jobs not completed or cancelled.
         jobs: usize,
+        /// Human requests that have not reached a terminal response.
+        human_requests: usize,
     },
 
     /// An objective was empty or only whitespace.
@@ -169,11 +194,14 @@ impl GoalError {
             Self::StatusNotModelOwned { .. }
             | Self::UnknownStatus { .. }
             | Self::GoalNotReplaceable { .. }
+            | Self::NoGoal { .. }
+            | Self::GoalNotActive { .. }
             | Self::RevisionConflict { .. }
             | Self::CompletionBlocked { .. }
             | Self::EmptyObjective => true,
             Self::Db(_)
             | Self::UnknownRetryReason { .. }
+            | Self::UnknownPauseReason { .. }
             | Self::Spill { .. }
             | Self::PointerTooLong { .. }
             | Self::Document { .. }

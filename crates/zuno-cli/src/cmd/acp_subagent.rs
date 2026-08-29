@@ -491,6 +491,14 @@ fn terminal_state(event: &TurnEvent) -> Option<TerminalState> {
                 reason: None,
             })
         }
+        TurnEvent::TurnWaitingForHuman { request_id, .. } => Some(TerminalState {
+            state: "failed",
+            failure: Some(format!(
+                "subagent attempted to wait for direct human input ({request_id})"
+            )),
+            source: None,
+            reason: None,
+        }),
         TurnEvent::TurnInterrupted { request, .. } => Some(TerminalState {
             state: "cancelled",
             failure: None,

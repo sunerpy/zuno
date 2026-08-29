@@ -531,6 +531,16 @@ fn event_json(event: TurnEvent) -> Value {
             assistant_message_id,
             steps,
         } => json!({"type":"turn_completed","messageID":assistant_message_id,"steps":steps}),
+        TurnEvent::TurnWaitingForHuman {
+            assistant_message_id,
+            steps,
+            request_id,
+        } => json!({
+            "type":"turn_waiting_for_human",
+            "messageID":assistant_message_id,
+            "steps":steps,
+            "requestID":request_id,
+        }),
         TurnEvent::TurnInterrupted {
             assistant_message_id,
             steps,

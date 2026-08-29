@@ -133,7 +133,7 @@ impl QuestionPrompt {
 /// (`packages/schema/src/v1/question.ts:27-30`). Only internal callers construct this
 /// with `custom` set; a model-written question always leaves it `None`, which the
 /// client reads as "allow a typed answer" — the documented default.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct QuestionRequest {
     /// The question text.
     pub question: String,

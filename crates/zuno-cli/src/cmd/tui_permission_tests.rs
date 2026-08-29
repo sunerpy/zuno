@@ -20,6 +20,44 @@ fn broker() -> (Arc<PermissionBroker>, mpsc::Receiver<TerminalEvent>) {
     (Arc::new(PermissionBroker::new(sender)), receiver)
 }
 
+fn durable_goal(
+    session_id: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<zuno_db::Pool>,
+    Arc<zuno_goal::GoalStore>,
+) {
+    let spill = tempfile::tempdir().expect("spill directory");
+    let pool = Arc::new(
+        zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open durable database"),
+    );
+    let mut connection = pool.get().expect("connection");
+    zuno_db::migration::apply(&mut connection).expect("schema");
+    connection
+        .execute(
+            "INSERT INTO project \
+             (id,worktree,vcs,name,icon_url,icon_url_override,icon_color,time_created,\
+              time_updated,time_initialized,sandboxes,commands) \
+             VALUES ('prj','/tmp',NULL,NULL,NULL,NULL,NULL,1,1,NULL,'[]',NULL)",
+            [],
+        )
+        .expect("project");
+    connection
+        .execute(
+            "INSERT INTO session \
+             (id,project_id,slug,directory,title,version,time_created,time_updated) \
+             VALUES (?1,'prj',?1,'/tmp',?1,'test',1,1)",
+            rusqlite::params![session_id],
+        )
+        .expect("session");
+    drop(connection);
+    let goals = Arc::new(
+        zuno_goal::GoalStore::from_pool(Arc::clone(&pool), spill.path().to_owned())
+            .expect("goal store"),
+    );
+    (spill, pool, goals)
+}
+
 fn bridge(broker: &Arc<PermissionBroker>) -> PermissionBridge {
     let context = ViewContext::defaults();
     let host = DialogHost::new(
@@ -978,6 +1016,74 @@ async fn cmd_tui_permission_prompt_replaces_the_live_pulse() {
     );
 
     asked.abort();
+}
+
+#[test]
+fn recovered_goal_permission_uses_durable_state_without_replaying_the_tool() {
+    const SESSION: &str = "ses_recovered_permission";
+    let (_spill, pool, goals) = durable_goal(SESSION);
+    goals
+        .create_goal(SESSION, "publish only after approval", None)
+        .expect("create goal");
+    let request = PermissionRequest {
+        id: "per_recovered".to_owned(),
+        session_id: SESSION.to_owned(),
+        permission: "shell".to_owned(),
+        patterns: vec!["git push".to_owned()],
+        metadata: serde_json::Map::new(),
+        always: Vec::new(),
+        tool: Some(zuno_permission::ToolCall {
+            message_id: "msg_recovered".to_owned(),
+            call_id: "call_recovered".to_owned(),
+        }),
+    };
+    goals
+        .request_permission(
+            SESSION,
+            request.id.clone(),
+            serde_json::to_value(&request).expect("serialize request"),
+            Some("msg_recovered".to_owned()),
+            Some("call_recovered".to_owned()),
+        )
+        .expect("persist permission")
+        .expect("active goal pauses");
+
+    let (broker, _wake) = broker();
+    broker.attach_durable(goals.human_requests(), Arc::clone(&goals), SESSION);
+    let mut bridge = bridge(&broker);
+    assert!(bridge.handle_event(&resize()).redraw);
+    let rendered = rendered_text(&mut bridge, 80, 24);
+    assert!(
+        rendered.contains("Permission required"),
+        "the durable permission was not projected:\n{rendered}"
+    );
+    bridge.handle_action(submit(), &press());
+
+    assert_eq!(
+        goals
+            .human_requests()
+            .get("per_recovered")
+            .expect("read request")
+            .expect("request")
+            .state,
+        zuno_db::human_request::HumanRequestState::Answered
+    );
+    assert_eq!(
+        goals
+            .goal(SESSION)
+            .expect("read goal")
+            .expect("goal")
+            .status,
+        zuno_goal::GoalStatus::Active
+    );
+    assert_eq!(
+        zuno_db::inbox::SessionInbox::new(pool)
+            .pending(SESSION)
+            .expect("pending input")
+            .len(),
+        1,
+        "recovery admits only the decision; it never reruns the abandoned tool call"
+    );
 }
 
 fn frame(bridge: &mut PermissionBridge) -> String {

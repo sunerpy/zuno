@@ -113,12 +113,31 @@ state, but its deny-by-default capability overlay prevents shell and product-fil
 Creating an execution plan in ordinary Work mode does not enter Plan mode, and calling
 `plan_update` cannot switch collaboration modes.
 
+If the session has an active Goal, entering Plan mode atomically changes the Goal to
+`paused` and records `goal_pause.reason = plan_mode`. Re-entering Plan is idempotent.
+Start Work requires a durable plan and only resumes a Goal whose current pause reason is
+`plan_mode`; it cannot clear an authentication, permission, human-input, user-interruption,
+or uncertain-side-effect pause. A restart between the two commands preserves the same
+pause, and repeated Start Work attempts resume it at most once.
+
+Interaction policy follows the collaboration owner rather than the visible prompt:
+
+- Plan may use the ordinary synchronous `question` tool for implementation-defining
+  clarification.
+- An active Goal does not receive `question`. It may call `goal_request_input`, which
+  commits a durable request, pauses with `human_input`, and ends the turn as
+  `WaitingForHuman`.
+- A delegated child receives neither direct human tool. It reports a structured blocker to
+  its parent, which owns any user interaction.
+
 ## Lifecycle and client behavior
 
 The durable plan is a shared projection for TUI, server, ACP, and future clients. Clients may
 render plan revisions and status changes, but they must not add a private execution loop or
 wake a session merely because pending steps exist. Goal state, inbox state, retry deadlines,
-and typed runtime failures remain the authorities for continuation and recovery.
+typed human requests, and typed runtime failures remain the authorities for continuation
+and recovery. Process-local channels may wake a client or runner after commit, but they are
+never the source of request or collaboration-mode state.
 
 ## Non-goals
 

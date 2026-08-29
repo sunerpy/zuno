@@ -429,7 +429,15 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .map_err(|error| error.to_string())?
             .with_configured_shell(harness_config.shell.clone())
             .with_events(events.clone());
-        let requests = RequestBroker::with_events(events.clone());
+        let goals = Arc::new(
+            zuno_goal::GoalStore::from_pool(Arc::clone(&pool), zuno_goal::default_spill_dir())
+                .map_err(|error| error.to_string())?,
+        );
+        let requests = RequestBroker::with_events(events.clone())
+            .with_store(zuno_db::human_request::HumanRequestStore::new(Arc::clone(
+                &pool,
+            )))
+            .with_goal_store(goals);
         let services =
             ServerServices::new(DEFAULT_EVENT_SUBSCRIBER_CAPACITY).with_requests(requests.clone());
         // Connected once for the server's lifetime, not per request: every host this

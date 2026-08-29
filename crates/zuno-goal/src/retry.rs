@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::Goal;
+use crate::{Goal, GoalPauseReason};
 use zuno_engine::r#loop::TurnRetryReason;
 
 /// Initial delay for the first recoverable goal-turn failure.
@@ -40,8 +40,6 @@ pub enum GoalRetryReason {
     ContextCompacted,
     /// A read-only or idempotent tool failed transiently.
     ToolTransient,
-    /// A retryable tool failure may already have produced an external side effect.
-    ToolUncertain,
 }
 
 impl GoalRetryReason {
@@ -59,7 +57,6 @@ impl GoalRetryReason {
             Self::ContextLimit => "context_limit",
             Self::ContextCompacted => "context_compacted",
             Self::ToolTransient => "tool_transient",
-            Self::ToolUncertain => "tool_uncertain",
         }
     }
 
@@ -75,7 +72,6 @@ impl GoalRetryReason {
             "context_limit" => Some(Self::ContextLimit),
             "context_compacted" => Some(Self::ContextCompacted),
             "tool_transient" => Some(Self::ToolTransient),
-            "tool_uncertain" => Some(Self::ToolUncertain),
             _ => None,
         }
     }
@@ -205,8 +201,8 @@ pub enum GoalTerminalFailure {
         /// Delay requested by the failed peer, when one was supplied.
         retry_after: Option<Duration>,
     },
-    /// Stop automatic execution until a user resumes the goal.
-    Pause,
+    /// Stop automatic execution for a typed, durable reason.
+    Pause(GoalPauseReason),
     /// Mark the goal blocked because repeating cannot repair the failure.
     Block,
 }

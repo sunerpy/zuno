@@ -1263,6 +1263,7 @@ impl SessionScreen {
                 }
             }
             zuno_engine::r#loop::TurnEvent::TurnCompleted { .. }
+            | zuno_engine::r#loop::TurnEvent::TurnWaitingForHuman { .. }
             | zuno_engine::r#loop::TurnEvent::TurnInterrupted { .. }
             | zuno_engine::r#loop::TurnEvent::TurnFailed { .. } => {
                 if self.touched.is_empty() {
@@ -3065,6 +3066,7 @@ impl SessionScreen {
             event,
             AppEvent::Engine(
                 zuno_engine::r#loop::TurnEvent::TurnCompleted { .. }
+                    | zuno_engine::r#loop::TurnEvent::TurnWaitingForHuman { .. }
                     | zuno_engine::r#loop::TurnEvent::TurnInterrupted { .. }
                     | zuno_engine::r#loop::TurnEvent::TurnFailed { .. }
             )

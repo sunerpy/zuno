@@ -749,6 +749,22 @@ Enter, Space for multi-select, and mouse selection. Per-question cursors and
 custom drafts survive navigation. Cancelling either interaction resolves the
 tool as a typed denial and never fabricates an answer.
 
+Goal-owned interaction is durable rather than a parked tool future. The
+`goal_request_input` tool commits a `human_request` row and the exact
+`goal_pause(human_input)` state in one transaction, then returns
+`TurnOutcome::WaitingForHuman`. Permission requests tied to an active Goal use
+the same table with kind `permission`. Answering atomically settles the request
+and admits a model-visible FIFO inbox item; resuming the Goal is a separate
+idempotent transition, so a crash between those operations remains recoverable.
+TUI, server, and ACP re-present pending rows after restart. Their process-local
+channels only wake consumers after durable state exists.
+
+Interaction registration is host policy. Plan and ordinary non-Goal Work may
+receive synchronous `question`; autonomous Goal turns receive only
+`goal_request_input`; delegated children receive neither and must report their
+blocker to the parent. A headless Goal without a human-request surface does not
+receive a request tool it cannot complete.
+
 The conversation surface separates reply identity from transient work state. The
 identity row contains the resolved agent, catalog model display name, and configured
 reasoning effort. It follows the bottom of a short assistant reply; once transcript
@@ -781,6 +797,13 @@ Plan mode it becomes the handoff path to implementation: a durable plan must
 exist, and the confirmation names its title, revision, and completed-step count.
 `/start-plan` enters Plan mode directly; `/start-work` performs the same durable
 plan check and confirmation without first toggling through `/plan`.
+
+For an active Goal, entering Plan and recording `paused(plan_mode)` are one
+transactional host transition. Re-entering Plan is idempotent. Start Work only
+clears that exact pause after the durable-plan gate succeeds; it cannot clear
+authentication, human-input, permission, user-interruption, or
+uncertain-side-effect pauses. The same checks run after restart, so
+Goal → Plan → restart → Work resumes at most once.
 
 ACP publishes the same three names as native session commands. Because sending
 the slash prompt is already an explicit client action, ACP performs the
@@ -886,7 +909,7 @@ the context limit, and the latest accounting mode.
 
 ## Durable goal recovery
 
-An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. If that sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
+An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Before every wait it commits a `provider_retry_backoff` checkpoint with the request id, turn id, failed and next attempt, typed reason, selected delay, and deadline. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. After a process restart, Zuno waits out any remaining checkpoint deadline and starts a new turn and provider request instead of attempting to revive the old transport. If the bounded sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
 
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 
@@ -910,7 +933,11 @@ Recovery is selected from typed errors, never rendered messages:
 - Transport failures, rate limits, incomplete streams, SQLite writer contention, and empty assistant messages schedule another goal turn.
 - An explicit Agent `steps` limit normally produces a text-only finalization. `StepLimit` recovery is reserved for a provider that attempts to continue with tools after that finalization boundary.
 - Context-limit failures compact retained history before retrying. Successful compaction is persisted as its own retry phase so a restart does not compact the same history twice.
-- Authentication failures, user interruption, and a closed event consumer pause the goal for human action.
+- Authentication failures and user interruption pause the Goal with typed reasons. Human
+  input and permission waits carry the durable request id in the pause row.
+- A timeout or lost response around a non-replayable side effect pauses with
+  `uncertain_side_effect`; recovery requires authoritative-state inspection and never
+  automatically invokes the tool again.
 - Invalid provider protocol, unsupported typed input such as an image sent to a text-only model, unavailable agent/model configuration, corrupt durable state, and other permanent failures block the goal.
 
 OpenAI and Compatible Responses decoders treat `response.failed` as a typed
@@ -1278,7 +1305,9 @@ still queued, steering, or promoted. Consuming that report releases the Job
 block. Any uncertain Job blocks regardless of delivery or report consumption
 until typed authoritative reconciliation changes its state. A terminal `quiet`
 completed, failed, or cancelled Job has no parent input and does not block
-completion.
+completion. A pending Goal-owned human request is also part of the barrier; the
+Goal cannot complete while it is still asking the user for a decision or
+permission.
 
 The `job` tool reads durable status for jobs owned by the current parent session. `JobSubject` distinguishes child sessions, product agents, and workflow runs; status is `queued`, `running`, `completed`, `failed`, `cancelled`, or `uncertain`, together with delivery policy, result, error, and subject identity. Council execution remains stored through the workflow service, while the frontend-neutral projection types `council:<preset>` as a Council and attaches its durable child WorkItems. The same child projection represents ordinary workflow nodes and Council seats, including owner, status, elapsed time, and usage.
 

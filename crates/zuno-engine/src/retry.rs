@@ -177,7 +177,11 @@ impl ProviderRetryPolicy {
     pub fn delay_after(self, failed_attempt: u32, error: &ProviderError) -> Duration {
         error
             .retry_after()
-            .unwrap_or_else(|| fallback_delay(failed_attempt))
+            .filter(|delay| !delay.is_zero())
+            .map_or_else(
+                || fallback_delay(failed_attempt),
+                |delay| delay.min(self.max_elapsed).max(Duration::from_millis(1)),
+            )
     }
 }
 
@@ -213,6 +217,14 @@ pub enum ProviderAttemptObservation<'a, T> {
         attempt: u32,
         max: u32,
         result: &'a Result<T, ProviderError>,
+    },
+    /// Rollback was emitted and this exact deadline must commit before sleeping.
+    BackoffScheduled {
+        failed_attempt: u32,
+        next_attempt: u32,
+        max: u32,
+        delay: Duration,
+        error: &'a ProviderError,
     },
 }
 
@@ -496,6 +508,14 @@ where
                         source: Box::new(source),
                     })
                 })?;
+                observe(ProviderAttemptObservation::BackoffScheduled {
+                    failed_attempt: attempt,
+                    next_attempt,
+                    max,
+                    delay,
+                    error: &error,
+                })
+                .map_err(|source| ProviderRetryObservedError::Observation { source })?;
                 let wait = async {
                     tokio::select! {
                         biased;

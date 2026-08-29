@@ -529,6 +529,36 @@ fn api_openapi_binds_every_body_with_an_existing_rust_schema() {
         response_ref("/api/session/{sessionID}", "get"),
         Some("#/components/schemas/SessionResponse")
     );
+    assert_eq!(
+        response_ref("/api/permission/request", "get"),
+        Some("#/components/schemas/PermissionRequestListResponse")
+    );
+    assert_eq!(
+        response_ref("/api/session/{sessionID}/permission", "get"),
+        Some("#/components/schemas/SessionPermissionResponse")
+    );
+    assert_eq!(
+        request_ref(
+            "/api/session/{sessionID}/permission/{requestID}/reply",
+            "post"
+        ),
+        Some("#/components/schemas/PermissionReply")
+    );
+    assert_eq!(
+        response_ref("/api/question/request", "get"),
+        Some("#/components/schemas/QuestionRequestListResponse")
+    );
+    assert_eq!(
+        response_ref("/api/session/{sessionID}/question", "get"),
+        Some("#/components/schemas/SessionQuestionResponse")
+    );
+    assert_eq!(
+        request_ref(
+            "/api/session/{sessionID}/question/{requestID}/reply",
+            "post"
+        ),
+        Some("#/components/schemas/QuestionReply")
+    );
 }
 
 #[tokio::test]

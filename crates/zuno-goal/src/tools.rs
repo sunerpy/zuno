@@ -3,11 +3,15 @@
 use crate::{Goal, GoalError, GoalStore, ModelStatus};
 use async_trait::async_trait;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Arc;
 use zuno_error::ToolError;
-use zuno_tool::{Tool, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy, TypedTool, erase};
+use zuno_tool::{
+    METADATA_HUMAN_REQUEST_ID_KEY, Tool, ToolContext, ToolEffect, ToolOutput, ToolReplayPolicy,
+    TypedTool, erase,
+};
 
 /// Wire name of the goal reader.
 pub const GET_GOAL_TOOL_ID: &str = "goal_get";
@@ -15,6 +19,8 @@ pub const GET_GOAL_TOOL_ID: &str = "goal_get";
 pub const CREATE_GOAL_TOOL_ID: &str = "goal_propose";
 /// Wire name of the model-authorized status updater.
 pub const UPDATE_GOAL_TOOL_ID: &str = "goal_update";
+/// Wire name of the durable Goal input request.
+pub const REQUEST_GOAL_INPUT_TOOL_ID: &str = "goal_request_input";
 
 /// The description the model reads for [`GetGoalTool`].
 pub const GET_DESCRIPTION: &str = include_str!("description/get-goal.txt");
@@ -22,6 +28,8 @@ pub const GET_DESCRIPTION: &str = include_str!("description/get-goal.txt");
 pub const CREATE_DESCRIPTION: &str = include_str!("description/create-goal.txt");
 /// The description the model reads for [`UpdateGoalTool`].
 pub const UPDATE_DESCRIPTION: &str = include_str!("description/update-goal.txt");
+/// The description the model reads for [`GoalRequestInputTool`].
+pub const REQUEST_INPUT_DESCRIPTION: &str = include_str!("description/request-input.txt");
 
 /// No-argument payload for [`GetGoalTool`].
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -72,6 +80,34 @@ pub struct UpdateGoalParams {
     /// Stable description of the impasse. Required only with `status: blocked`.
     #[serde(default)]
     pub blocking_condition: Option<String>,
+}
+
+/// One selectable response for a durable Goal request.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GoalInputOption {
+    /// Concise display label.
+    pub label: String,
+    /// Consequence or meaning of choosing the option.
+    pub description: String,
+}
+
+/// Payload for [`GoalRequestInputTool`].
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GoalRequestInputParams {
+    /// Revision returned by `goal_get`; stale requests are rejected atomically.
+    pub expected_revision: i64,
+    /// Complete question that names the missing decision or fact.
+    pub question: String,
+    /// Short client-facing label.
+    pub header: String,
+    /// Optional choices. An empty list requests free-form input.
+    #[serde(default)]
+    pub options: Vec<GoalInputOption>,
+    /// Whether more than one offered option may be selected.
+    #[serde(default)]
+    pub multiple: Option<bool>,
 }
 
 /// Reads the current session goal.
@@ -285,6 +321,85 @@ impl TypedTool for UpdateGoalTool {
     }
 }
 
+/// Creates one durable human request and yields the autonomous Goal turn.
+#[derive(Debug, Clone)]
+pub struct GoalRequestInputTool {
+    store: Arc<GoalStore>,
+}
+
+impl GoalRequestInputTool {
+    #[must_use]
+    pub fn new(store: Arc<GoalStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl TypedTool for GoalRequestInputTool {
+    type Params = GoalRequestInputParams;
+
+    fn id(&self) -> &str {
+        REQUEST_GOAL_INPUT_TOOL_ID
+    }
+
+    fn description(&self) -> &str {
+        REQUEST_INPUT_DESCRIPTION
+    }
+
+    fn effect(&self, _args: &Value) -> ToolEffect {
+        ToolEffect::UserMediated
+    }
+
+    async fn run(
+        &self,
+        params: GoalRequestInputParams,
+        ctx: ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        validate_goal_request(&params)?;
+        let request_id = format!("que_{}", uuid::Uuid::new_v4().simple());
+        let payload = serde_json::json!({
+            "source": REQUEST_GOAL_INPUT_TOOL_ID,
+            "questions": [{
+                "question": params.question,
+                "header": params.header,
+                "options": params.options,
+                "multiple": params.multiple,
+                "custom": true,
+            }],
+        });
+        let store = Arc::clone(&self.store);
+        let session_id = ctx.session_id;
+        let message_id = ctx.message_id;
+        let call_id = ctx.call_id;
+        let expected_revision = params.expected_revision;
+        let request = tokio::task::spawn_blocking(move || {
+            store.request_human_input(
+                &session_id,
+                expected_revision,
+                request_id,
+                payload,
+                Some(message_id),
+                Some(call_id),
+            )
+        })
+        .await
+        .map_err(|error| failed(REQUEST_GOAL_INPUT_TOOL_ID, error))?
+        .map_err(|error| map_goal_error(REQUEST_GOAL_INPUT_TOOL_ID, error))?;
+        let request_value = serde_json::to_value(&request)
+            .map_err(|error| failed(REQUEST_GOAL_INPUT_TOOL_ID, error))?;
+        Ok(ToolOutput::text(
+            "Waiting for human input",
+            format!(
+                "Goal paused. Durable human request `{}` is pending; this turn will stop.",
+                request.id
+            ),
+        )
+        .with_metadata(METADATA_HUMAN_REQUEST_ID_KEY, request.id)
+        .with_metadata("humanRequest", request_value)
+        .with_continuation(zuno_tool::ToolContinuation::WaitingForHuman))
+    }
+}
+
 /// Build all three goal tools over one authoritative store.
 #[must_use]
 pub fn goal_tools(store: Arc<GoalStore>) -> Vec<Arc<dyn Tool>> {
@@ -293,6 +408,45 @@ pub fn goal_tools(store: Arc<GoalStore>) -> Vec<Arc<dyn Tool>> {
         erase(CreateGoalTool::new(Arc::clone(&store))),
         erase(UpdateGoalTool::new(store)),
     ]
+}
+
+fn validate_goal_request(params: &GoalRequestInputParams) -> Result<(), ToolError> {
+    if params.expected_revision <= 0 {
+        return Err(invalid(
+            REQUEST_GOAL_INPUT_TOOL_ID,
+            "expected_revision must be a positive integer returned by goal_get",
+        ));
+    }
+    if params.question.trim().is_empty() {
+        return Err(invalid(
+            REQUEST_GOAL_INPUT_TOOL_ID,
+            "question must not be empty",
+        ));
+    }
+    let header = params.header.trim();
+    if header.is_empty() || header.chars().count() > 30 {
+        return Err(invalid(
+            REQUEST_GOAL_INPUT_TOOL_ID,
+            "header must contain 1 to 30 characters",
+        ));
+    }
+    if params.multiple == Some(true) && params.options.is_empty() {
+        return Err(invalid(
+            REQUEST_GOAL_INPUT_TOOL_ID,
+            "multiple requires at least one option",
+        ));
+    }
+    let mut labels = HashSet::new();
+    for option in &params.options {
+        let label = option.label.trim();
+        if label.is_empty() || !labels.insert(label) {
+            return Err(invalid(
+                REQUEST_GOAL_INPUT_TOOL_ID,
+                "option labels must be non-empty and unique",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn goal_output(tool: &str, goal: Option<Goal>) -> Result<ToolOutput, ToolError> {

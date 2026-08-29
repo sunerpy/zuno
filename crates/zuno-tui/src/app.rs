@@ -116,6 +116,7 @@ impl RedrawSchedule {
         let active = !matches!(
             event,
             TurnEvent::TurnCompleted { .. }
+                | TurnEvent::TurnWaitingForHuman { .. }
                 | TurnEvent::TurnInterrupted { .. }
                 | TurnEvent::TurnFailed { .. }
         );

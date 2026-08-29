@@ -1176,6 +1176,16 @@ impl Transcript {
                 self.close_reasoning();
                 true
             }
+            TurnEvent::TurnWaitingForHuman { request_id, .. } => {
+                self.running = false;
+                self.streaming = None;
+                self.close_reasoning();
+                self.messages.push(Message::noticed(
+                    crate::views::toast::ToastLevel::Info,
+                    format!("waiting for human input: {request_id}"),
+                ));
+                true
+            }
             TurnEvent::TurnInterrupted { .. } => {
                 self.running = false;
                 self.streaming = None;
@@ -3772,6 +3782,7 @@ impl Component for StatusView {
                 EventResult::REDRAW
             }
             TurnEvent::TurnCompleted { .. }
+            | TurnEvent::TurnWaitingForHuman { .. }
             | TurnEvent::TurnInterrupted { .. }
             | TurnEvent::TurnFailed { .. } => {
                 self.reset(false);

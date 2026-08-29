@@ -8,9 +8,9 @@ use std::time::Duration;
 use zuno_engine::r#loop::{TurnError, TurnRecovery, TurnRetryReason};
 use zuno_engine::retry::{
     MAX_CONTEXT_LIMIT_RETRIES, MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS,
-    MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, PROVIDER_RETRY_MAX_ATTEMPTS, ProviderRetryError,
-    ProviderRetryPolicy, RecoveryAttempt, RecoveryBudget, RecoveryBudgets, RetryError,
-    retry_provider, retry_provider_with_sleep,
+    MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, PROVIDER_RETRY_MAX_ATTEMPTS, ProviderAttemptObservation,
+    ProviderRetryError, ProviderRetryPolicy, RecoveryAttempt, RecoveryBudget, RecoveryBudgets,
+    RetryError, retry_provider, retry_provider_with_sleep, retry_provider_with_wake_observed,
 };
 use zuno_error::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 use zuno_llm::event::StreamEvent;
@@ -458,6 +458,60 @@ async fn retry_rate_limit_uses_the_carried_retry_after_duration() {
 
     assert_eq!(result, "complete");
     assert_eq!(*sleeps.borrow(), [Duration::from_secs(30)]);
+}
+
+#[tokio::test]
+async fn durable_backoff_observation_precedes_every_wait_or_wake() {
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let result = retry_provider_with_wake_observed(
+        policy(2),
+        {
+            let trace = Rc::clone(&trace);
+            move |_| {
+                trace.borrow_mut().push("provider");
+                ready(Err::<&'static str, _>(ProviderError::Transient {
+                    status: Some(503),
+                    source: None,
+                }))
+            }
+        },
+        {
+            let trace = Rc::clone(&trace);
+            move |_| {
+                trace.borrow_mut().push("rollback");
+                ready(Ok::<(), std::io::Error>(()))
+            }
+        },
+        {
+            let trace = Rc::clone(&trace);
+            move || {
+                trace.borrow_mut().push("wake");
+                ready("interrupted")
+            }
+        },
+        {
+            let trace = Rc::clone(&trace);
+            move |observation| {
+                trace.borrow_mut().push(match observation {
+                    ProviderAttemptObservation::Started { .. } => "started",
+                    ProviderAttemptObservation::Finished { .. } => "finished",
+                    ProviderAttemptObservation::BackoffScheduled { .. } => "backoff",
+                });
+                Ok::<(), std::convert::Infallible>(())
+            }
+        },
+    )
+    .await
+    .expect("wake ends retry recovery");
+
+    assert_eq!(result, "interrupted");
+    assert_eq!(
+        *trace.borrow(),
+        [
+            "started", "provider", "finished", "rollback", "backoff", "wake"
+        ],
+        "the durable deadline hook must run after rollback and before any wait can be interrupted"
+    );
 }
 
 #[tokio::test]

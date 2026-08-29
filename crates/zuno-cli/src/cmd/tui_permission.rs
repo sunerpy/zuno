@@ -30,13 +30,18 @@
 //! prompting again — which is what makes `always` different from `once` rather than a
 //! second spelling of it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+use zuno_db::human_request::{
+    HumanRequestKind, HumanRequestState, HumanRequestStore, NewHumanRequest,
+};
 use zuno_error::ToolError;
+use zuno_goal::GoalStore;
 use zuno_permission::{PermissionRequest, ReplyKind};
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
 use zuno_tui::app::{AppEvent, Component, EventResult, TerminalEvent};
@@ -66,14 +71,23 @@ struct Pending {
 struct Parked {
     waiting: VecDeque<PermissionRequest>,
     pending: HashMap<PendingKey, Pending>,
+    presented: HashSet<PendingKey>,
     standing: Vec<Grant>,
     surfaces: usize,
+}
+
+#[derive(Clone)]
+struct DurablePermissions {
+    store: HumanRequestStore,
+    goals: Arc<GoalStore>,
+    recovery_session_id: String,
 }
 
 /// The asker a surface with a human attached hands to the dispatcher.
 pub(crate) struct PermissionBroker {
     parked: Mutex<Parked>,
     wake: mpsc::Sender<TerminalEvent>,
+    durable: Mutex<Option<DurablePermissions>>,
 }
 
 pub(crate) struct PermissionSurfaceLease {
@@ -103,7 +117,21 @@ impl PermissionBroker {
         Self {
             parked: Mutex::new(Parked::default()),
             wake,
+            durable: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn attach_durable(
+        &self,
+        store: HumanRequestStore,
+        goals: Arc<GoalStore>,
+        recovery_session_id: impl Into<String>,
+    ) {
+        *locked(&self.durable) = Some(DurablePermissions {
+            store,
+            goals,
+            recovery_session_id: recovery_session_id.into(),
+        });
     }
 
     /// Lease the single attached TUI surface. Dropping it refuses every pending ask.
@@ -127,6 +155,7 @@ impl PermissionBroker {
                 return;
             }
             parked.waiting.clear();
+            parked.presented.clear();
             parked
                 .pending
                 .drain()
@@ -143,6 +172,7 @@ impl PermissionBroker {
             let mut parked = locked(&self.parked);
             parked.surfaces = 0;
             parked.waiting.clear();
+            parked.presented.clear();
             parked
                 .pending
                 .drain()
@@ -160,10 +190,30 @@ impl PermissionBroker {
         while let Some(request) = parked.waiting.pop_front() {
             let key = (request.session_id.clone(), request.id.clone());
             if parked.pending.contains_key(&key) {
+                parked.presented.insert(key);
                 return Some(request);
             }
         }
-        None
+        let durable = locked(&self.durable).clone()?;
+        let request = durable
+            .store
+            .pending(Some(&durable.recovery_session_id))
+            .ok()?
+            .into_iter()
+            .find_map(|request| {
+                if request.kind != HumanRequestKind::Permission {
+                    return None;
+                }
+                let key = (request.session_id.clone(), request.id.clone());
+                if parked.pending.contains_key(&key) || parked.presented.contains(&key) {
+                    return None;
+                }
+                serde_json::from_value::<PermissionRequest>(request.payload).ok()
+            })?;
+        parked
+            .presented
+            .insert((request.session_id.clone(), request.id.clone()));
+        Some(request)
     }
 
     /// Answer a resolved request, and remember an `always` for this session.
@@ -171,20 +221,141 @@ impl PermissionBroker {
         let pending = {
             let mut parked = locked(&self.parked);
             let key = (session_id.to_owned(), request_id.to_owned());
-            let Some(pending) = parked.pending.remove(&key) else {
-                return false;
-            };
-            pending
+            parked.presented.remove(&key);
+            parked.pending.remove(&key)
         };
-        if pending.answer.send(reply).is_err() {
+        let durable = locked(&self.durable).clone();
+        let recovered = pending.is_none();
+        let request = durable
+            .as_ref()
+            .and_then(|durable| durable.store.get(request_id).ok().flatten());
+        if recovered
+            && !request.as_ref().is_some_and(|request| {
+                request.session_id == session_id
+                    && request.kind == HumanRequestKind::Permission
+                    && request.state == HumanRequestState::Pending
+            })
+        {
             return false;
         }
-        if reply == ReplyKind::Always
-            && let Some(grant) = pending.grant
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.answer.is_closed())
+        {
+            if let Some(durable) = durable.as_ref() {
+                let _settled = durable.store.resolve(
+                    request_id,
+                    HumanRequestState::Failed,
+                    None,
+                    zuno_db::message::now_millis(),
+                );
+            }
+            return false;
+        }
+        let persisted = durable.as_ref().is_none_or(|durable| {
+            let response = json!({"reply": reply});
+            let settled = if recovered {
+                durable
+                    .store
+                    .answer_with_input(request_id, response, zuno_db::message::now_millis())
+                    .ok()
+                    .flatten()
+                    .is_some()
+            } else {
+                durable
+                    .store
+                    .resolve(
+                        request_id,
+                        HumanRequestState::Answered,
+                        Some(&response),
+                        zuno_db::message::now_millis(),
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some()
+            };
+            if settled
+                && request
+                    .as_ref()
+                    .is_some_and(|request| request.goal_id.is_some())
+            {
+                return durable.goals.resume_for_work(session_id).is_ok();
+            }
+            settled
+        });
+        if !persisted {
+            if let Some(pending) = pending {
+                let _delivered = pending.answer.send(ReplyKind::Reject);
+            }
+            return false;
+        }
+        let grant = pending
+            .as_ref()
+            .and_then(|pending| pending.grant.clone())
+            .or_else(|| {
+                request.as_ref().and_then(|request| {
+                    let request =
+                        serde_json::from_value::<PermissionRequest>(request.payload.clone())
+                            .ok()?;
+                    (!request.always.is_empty()).then_some((
+                        request.session_id,
+                        request.permission,
+                        request.patterns,
+                    ))
+                })
+            });
+        let delivered = pending.map_or(recovered, |pending| pending.answer.send(reply).is_ok());
+        if delivered
+            && reply == ReplyKind::Always
+            && let Some(grant) = grant
         {
             locked(&self.parked).standing.push(grant);
         }
-        true
+        delivered
+    }
+
+    fn persist(&self, request: &PermissionRequest) -> Result<(), ToolError> {
+        let Some(durable) = locked(&self.durable).clone() else {
+            return Ok(());
+        };
+        let payload = serde_json::to_value(request).map_err(|source| ToolError::Failed {
+            tool: String::from("permission"),
+            source: Box::new(source),
+        })?;
+        if durable
+            .goals
+            .request_permission(
+                &request.session_id,
+                request.id.clone(),
+                payload.clone(),
+                request.tool.as_ref().map(|tool| tool.message_id.clone()),
+                request.tool.as_ref().map(|tool| tool.call_id.clone()),
+            )
+            .map_err(|source| ToolError::Failed {
+                tool: String::from("permission"),
+                source: Box::new(source),
+            })?
+            .is_some()
+        {
+            return Ok(());
+        }
+        durable
+            .store
+            .create(NewHumanRequest {
+                id: request.id.clone(),
+                session_id: request.session_id.clone(),
+                goal_id: None,
+                kind: HumanRequestKind::Permission,
+                payload,
+                message_id: request.tool.as_ref().map(|tool| tool.message_id.clone()),
+                call_id: request.tool.as_ref().map(|tool| tool.call_id.clone()),
+                time_created: zuno_db::message::now_millis(),
+            })
+            .map(|_| ())
+            .map_err(|source| ToolError::Failed {
+                tool: String::from("permission"),
+                source: Box::new(source),
+            })
     }
 }
 
@@ -198,14 +369,15 @@ impl PermissionAsker for PermissionBroker {
     ) -> Result<(), ToolError> {
         let request_id = format!("per_{}", Uuid::new_v4().simple());
         let (sender, receiver) = oneshot::channel();
+        let session_id = origin.session_id().to_owned();
+        let grant: Grant = (
+            session_id.clone(),
+            ask.permission.clone(),
+            ask.patterns.clone(),
+        );
+        let reusable = !ask.manual && !ask.always.is_empty();
+        let request = origin.into_request(request_id.clone(), ask);
         {
-            let session_id = origin.session_id().to_owned();
-            let grant: Grant = (
-                session_id.clone(),
-                ask.permission.clone(),
-                ask.patterns.clone(),
-            );
-            let reusable = !ask.manual && !ask.always.is_empty();
             let mut parked = locked(&self.parked);
             if parked.surfaces == 0 {
                 return Err(ToolError::Denied {
@@ -215,16 +387,15 @@ impl PermissionAsker for PermissionBroker {
             if reusable && parked.standing.contains(&grant) {
                 return Ok(());
             }
+            self.persist(&request)?;
             parked.pending.insert(
-                (session_id, request_id.clone()),
+                (session_id.clone(), request_id.clone()),
                 Pending {
                     answer: sender,
                     grant: reusable.then_some(grant),
                 },
             );
-            parked
-                .waiting
-                .push_back(origin.into_request(request_id, ask));
+            parked.waiting.push_back(request);
         }
         // A full terminal channel means at least 64 events are already queued, so the
         // bridge is about to run anyway and will find the request; the nudge only
@@ -235,9 +406,29 @@ impl PermissionAsker for PermissionBroker {
         ) {
             self.close_surfaces();
         }
-        match receiver.await {
-            Ok(ReplyKind::Once | ReplyKind::Always) => Ok(()),
-            Ok(ReplyKind::Reject) | Err(_) => Err(ToolError::Denied {
+        let reply = receiver.await.unwrap_or(ReplyKind::Reject);
+        if let Some(durable) = locked(&self.durable).clone()
+            && let Ok(Some(request)) = durable.store.get(&request_id)
+            && request.state == HumanRequestState::Pending
+        {
+            let response = json!({"reply": reply});
+            if durable
+                .store
+                .resolve(
+                    &request_id,
+                    HumanRequestState::Answered,
+                    Some(&response),
+                    zuno_db::message::now_millis(),
+                )
+                .is_ok()
+                && request.goal_id.is_some()
+            {
+                let _resumed = durable.goals.resume_for_work(&session_id);
+            }
+        }
+        match reply {
+            ReplyKind::Once | ReplyKind::Always => Ok(()),
+            ReplyKind::Reject => Err(ToolError::Denied {
                 tool: tool.to_owned(),
             }),
         }

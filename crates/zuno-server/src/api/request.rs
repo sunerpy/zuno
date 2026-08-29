@@ -2,6 +2,7 @@ use axum::Json;
 use axum::body::to_bytes;
 use axum::extract::{Extension, Path, Request, State};
 use axum::http::StatusCode;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zuno_permission::ReplyKind;
@@ -13,21 +14,21 @@ use crate::{QuestionDecision, ServerServices};
 
 const MAX_REPLY_BODY_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-struct LocationResponse<T> {
+pub(super) struct LocationResponse<T> {
     location: Location,
     data: Vec<T>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct Location {
     directory: String,
     project: Project,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 struct Project {
     id: &'static str,
     directory: String,
@@ -93,17 +94,18 @@ pub async fn session_permission_requests(
     )))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct PermissionReplyBody {
+pub(super) struct PermissionReplyBody {
+    #[schemars(with = "String")]
     reply: ReplyKind,
     #[serde(default)]
     message: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct QuestionReplyBody {
+pub(super) struct QuestionReplyBody {
     answers: Vec<Vec<String>>,
 }
 

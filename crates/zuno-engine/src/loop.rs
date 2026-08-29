@@ -48,8 +48,8 @@ use zuno_orchestration::{
     SNAPSHOT_SCHEMA_VERSION, SelectedSkillIdentity, sha256_json, sha256_text,
 };
 use zuno_tool::{
-    FileDiff, ToolConcurrencyPolicy, ToolContinuation, ToolDefinition, ToolOutput,
-    ToolReplayPolicy, ToolUiIntent,
+    FileDiff, METADATA_HUMAN_REQUEST_ID_KEY, ToolConcurrencyPolicy, ToolContinuation,
+    ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
 };
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
@@ -337,6 +337,11 @@ pub enum TurnEvent {
         assistant_message_id: String,
         steps: u32,
     },
+    TurnWaitingForHuman {
+        assistant_message_id: String,
+        steps: u32,
+        request_id: String,
+    },
     TurnInterrupted {
         assistant_message_id: Option<String>,
         steps: u32,
@@ -422,6 +427,11 @@ pub enum TurnOutcome {
         assistant_message_id: Option<String>,
         steps: u32,
     },
+    WaitingForHuman {
+        assistant_message_id: String,
+        steps: u32,
+        request_id: String,
+    },
 }
 
 /// Recovery information retained after a model-visible tool failure.
@@ -458,6 +468,10 @@ pub enum TurnError {
     StreamEndedWithoutMessageEnd { step: u32 },
     #[error("provider `{provider_id}` returned an empty assistant response during step {step}")]
     EmptyAssistantMessage { provider_id: String, step: u32 },
+    #[error(
+        "tool `{tool}` requested a human wait without `{METADATA_HUMAN_REQUEST_ID_KEY}` metadata"
+    )]
+    MissingHumanRequestId { tool: String },
     #[error("provider started duplicate tool call `{call_id}` in step {step}")]
     DuplicateToolUse { step: u32, call_id: String },
     #[error("provider emitted input for unknown tool call `{call_id}` in step {step}")]
@@ -535,6 +549,7 @@ impl TurnError {
             Self::StepLimit { .. } => "step_limit",
             Self::StreamEndedWithoutMessageEnd { .. } => "stream_ended_without_message_end",
             Self::EmptyAssistantMessage { .. } => "empty_assistant_message",
+            Self::MissingHumanRequestId { .. } => "missing_human_request_id",
             Self::DuplicateToolUse { .. } => "duplicate_tool_use",
             Self::ToolInputWithoutStart { .. } => "tool_input_without_start",
             Self::ToolUseEndWithoutStart { .. } => "tool_end_without_start",
@@ -636,6 +651,7 @@ impl TurnError {
             | Self::MissingUserField { .. }
             | Self::AgentNotFound { .. }
             | Self::ModelNotFound { .. }
+            | Self::MissingHumanRequestId { .. }
             | Self::DuplicateToolUse { .. }
             | Self::ToolInputWithoutStart { .. }
             | Self::ToolUseEndWithoutStart { .. }
@@ -1871,6 +1887,10 @@ async fn run_turn_in_span(
                 },
                 |observation| match observation {
                     ProviderAttemptObservation::Started { attempt, max } => {
+                        zuno_db::provider_backoff::clear_session(
+                            attempt_connection,
+                            &request.session_id,
+                        )?;
                         append_provider_attempt_started(
                             attempt_connection,
                             &request,
@@ -1905,6 +1925,33 @@ async fn run_turn_in_span(
                             generated_output,
                             result,
                         )
+                    }
+                    ProviderAttemptObservation::BackoffScheduled {
+                        failed_attempt,
+                        next_attempt,
+                        max,
+                        delay,
+                        error,
+                    } => {
+                        let scheduled_at_ms = zuno_db::message::now_millis();
+                        let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX).max(1);
+                        let (reason, _status) = provider_error_metadata(error);
+                        zuno_db::provider_backoff::schedule(
+                            attempt_connection,
+                            &zuno_db::provider_backoff::ProviderBackoffCheckpoint {
+                                session_id: request.session_id.clone(),
+                                request_id: request_id.clone(),
+                                turn_id: request.turn_id.clone(),
+                                failed_attempt,
+                                next_attempt,
+                                max_attempts: max,
+                                reason: reason.to_owned(),
+                                delay_ms,
+                                retry_at_ms: scheduled_at_ms.saturating_add(delay_ms),
+                                scheduled_at_ms,
+                            },
+                        )
+                        .map_err(TurnError::Database)
                     }
                 },
             )
@@ -2202,6 +2249,7 @@ async fn run_turn_in_span(
         }
         let mut injected = inject_live_inputs(&mut context, &request, &requested)?;
         let mut yield_until_input = false;
+        let mut waiting_for_human = None;
         if !injected.skip_remaining_tools {
             let mut next_call = 0;
             while next_call < calls.len() && !injected.skip_remaining_tools {
@@ -2301,10 +2349,24 @@ async fn run_turn_in_span(
                 // execution result is appended in model order before an urgent inbox
                 // item may prevent the next group from starting.
                 for (call_index, call, display_name, ui_intent, dispatch) in completed {
-                    if !dispatch.is_error
-                        && dispatch.output.continuation == ToolContinuation::YieldUntilInput
-                    {
-                        yield_until_input = true;
+                    if !dispatch.is_error {
+                        match dispatch.output.continuation {
+                            ToolContinuation::Continue => {}
+                            ToolContinuation::YieldUntilInput => yield_until_input = true,
+                            ToolContinuation::WaitingForHuman => {
+                                let request_id = dispatch
+                                    .output
+                                    .metadata
+                                    .get(METADATA_HUMAN_REQUEST_ID_KEY)
+                                    .and_then(Value::as_str)
+                                    .filter(|request_id| !request_id.is_empty())
+                                    .ok_or_else(|| TurnError::MissingHumanRequestId {
+                                        tool: call.name.clone(),
+                                    })?
+                                    .to_owned();
+                                waiting_for_human = Some(request_id);
+                            }
+                        }
                     }
                     if let Some(recovery) = dispatch.recovery.clone() {
                         unresolved_tool_failures.insert(recovery.tool.clone(), recovery);
@@ -2372,12 +2434,18 @@ async fn run_turn_in_span(
                             is_error: dispatch.is_error,
                         })
                         .await?;
-                    injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
+                    if waiting_for_human.is_some() {
+                        injected.skip_remaining_tools = true;
+                    } else {
+                        injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
+                    }
                 }
                 next_call = group_end;
             }
         }
-        injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
+        if waiting_for_human.is_none() {
+            injected.merge(inject_live_inputs(&mut context, &request, &requested)?);
+        }
 
         events
             .send(TurnEvent::StepCompleted {
@@ -2385,6 +2453,21 @@ async fn run_turn_in_span(
                 finish_reason: accumulator.finish_reason,
             })
             .await?;
+
+        if let Some(request_id) = waiting_for_human {
+            events
+                .send(TurnEvent::TurnWaitingForHuman {
+                    assistant_message_id: assistant_id.clone(),
+                    steps,
+                    request_id: request_id.clone(),
+                })
+                .await?;
+            return Ok(TurnOutcome::WaitingForHuman {
+                assistant_message_id: assistant_id,
+                steps,
+                request_id,
+            });
+        }
 
         if injected.count > 0 {
             continue;
@@ -3929,6 +4012,7 @@ fn append_provider_request_terminal(
         &request.session_id,
         NewSessionEvent::new("session.provider.request", properties)?,
     )?;
+    zuno_db::provider_backoff::clear_request(connection, &request.session_id, request_id)?;
     Ok(())
 }
 

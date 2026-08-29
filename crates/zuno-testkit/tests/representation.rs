@@ -240,6 +240,7 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
             size_of::<(Option<String>, u32, Option<HardInterruptRequest>)>(),
         ),
         payload("TurnFailed", size_of::<(Option<String>, u32, String)>()),
+        payload("TurnWaitingForHuman", size_of::<(String, u32, String)>()),
     ]
 }
 
@@ -272,6 +273,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::TurnCompleted { .. } => "TurnCompleted",
         TurnEvent::TurnInterrupted { .. } => "TurnInterrupted",
         TurnEvent::TurnFailed { .. } => "TurnFailed",
+        TurnEvent::TurnWaitingForHuman { .. } => "TurnWaitingForHuman",
     }
 }
 

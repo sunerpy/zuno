@@ -409,6 +409,8 @@ pub(crate) struct TurnPlan {
     thinking_override: bool,
     /// Fully validated automatic recovery policy for active goals.
     goal_retry_policy: GoalRetryPolicy,
+    /// Whether this plan was admitted as a child of another agent attempt.
+    is_delegated: bool,
 }
 
 impl TurnPlan {
@@ -816,6 +818,7 @@ impl TurnPlan {
             variant_override: options.variant.clone(),
             thinking_override: options.thinking,
             goal_retry_policy,
+            is_delegated: false,
         })
     }
 
@@ -842,6 +845,7 @@ impl TurnPlan {
             .cloned()
             .ok_or_else(|| "delegated turn has no resolved orchestration seed".to_owned())?;
         self.capability = Arc::new(parent.capability.clone());
+        self.is_delegated = true;
         self.resolver.orchestration_seed = Some(Arc::new(AttemptSeed {
             capability: parent.capability.clone(),
             parent_attempt: Some(parent_attempt),
@@ -1946,7 +1950,15 @@ impl TurnFailure {
                 reason: GoalRetryReason::ContextLimit,
                 retry_after: None,
             },
-            TurnRecovery::Pause => GoalTerminalFailure::Pause,
+            TurnRecovery::Pause => GoalTerminalFailure::Pause(match self {
+                Self::Engine(TurnError::Provider(ProviderError::Auth { .. })) => {
+                    zuno_goal::GoalPauseReason::Authentication
+                }
+                Self::Engine(_)
+                | Self::Host(_)
+                | Self::EventConsumer(_)
+                | Self::GoalRecovery { .. } => zuno_goal::GoalPauseReason::UserInterruption,
+            }),
             TurnRecovery::Fail => GoalTerminalFailure::Block,
         }
     }
@@ -2682,13 +2694,28 @@ impl TurnHost {
                 })?;
             let goal_continuation = GoalContinuation::new(Arc::clone(&goal_store), runs.clone())
                 .with_retry_policy(plan.goal_retry_policy);
-            let active_goal = if prepared.identity.is_materialized() {
-                goal_store
-                    .goal(prepared.identity.id())
-                    .map_err(to_string)?
-                    .is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active)
+            let current_goal = if prepared.identity.is_materialized() {
+                goal_store.goal(prepared.identity.id()).map_err(to_string)?
             } else {
-                false
+                None
+            };
+            let interaction_policy = if plan.is_delegated
+                || matches!(
+                    plan.agent.definition().mode,
+                    zuno_catalog::agent::AgentMode::Subagent
+                ) {
+                zuno_goal::InteractionPolicy::SubagentReportOnly
+            } else if plan.agent.name() == "plan" {
+                zuno_goal::InteractionPolicy::PlanClarification
+            } else if current_goal.as_ref().is_some_and(|goal| {
+                matches!(
+                    goal.status,
+                    zuno_goal::GoalStatus::Active | zuno_goal::GoalStatus::Paused
+                )
+            }) {
+                zuno_goal::InteractionPolicy::GoalAutonomous
+            } else {
+                zuno_goal::InteractionPolicy::WorkOnDemand
             };
 
             let memory_root = worktree.as_deref().unwrap_or(&plan.directory);
@@ -2853,6 +2880,7 @@ impl TurnHost {
                     sandbox: None,
                     todo_store,
                     goal_store: Arc::clone(&goal_store),
+                    interaction_policy,
                     mcp_loader: mcp.map(|catalog| {
                         Arc::new(catalog.loader()) as Arc<dyn zuno_tools::registry::McpToolLoader>
                     }),
@@ -2917,7 +2945,7 @@ impl TurnHost {
                 .collect();
             let tool_concurrency = ToolConcurrencyLimit::new(concurrency.tool_calls)
                 .expect("configuration validates tool concurrency");
-            Ok(Self {
+            let mut host = Self {
                 profile_runtime: profile_runtime.clone(),
                 runtime,
                 driver,
@@ -2965,12 +2993,24 @@ impl TurnHost {
                 product_agents,
                 workflows: workflow_host,
                 background_reports_recovered: false,
-                last_turn_completed: active_goal,
+                last_turn_completed: false,
                 title_sink: None,
                 work_changes,
                 memory,
                 reflection,
-            })
+            };
+            let goal = if host.agent == "plan" {
+                host.goal_store
+                    .enter_plan_mode(&host.session_id)
+                    .map_err(to_string)?
+            } else {
+                host.goal_store
+                    .resume_for_work(&host.session_id)
+                    .map_err(to_string)?
+            };
+            host.last_turn_completed =
+                goal.is_some_and(|goal| goal.status == zuno_goal::GoalStatus::Active);
+            Ok(host)
         })();
         match assembled {
             Ok(host) => Ok(host),
@@ -3188,13 +3228,7 @@ impl TurnHost {
         let value = parts.next().unwrap_or_default().trim();
         let mut changed = false;
         let output = match action {
-            "" | "get" | "show" | "status" => {
-                let goal = self.goal_store.goal(&self.session_id).map_err(to_string)?;
-                json!({
-                    "revision": goal.as_ref().map(|goal| goal.revision),
-                    "goal": goal
-                })
-            }
+            "" | "get" | "show" | "status" => self.goal_status_value()?,
             "history" => serde_json::to_value(
                 self.goal_store
                     .history(&self.session_id)
@@ -3321,6 +3355,39 @@ impl TurnHost {
         serde_json::to_string_pretty(&output).map_err(to_string)
     }
 
+    fn goal_status_value(&self) -> Result<Value, String> {
+        let goal = self.goal_store.goal(&self.session_id).map_err(to_string)?;
+        let pause = self
+            .goal_store
+            .pause_state(&self.session_id)
+            .map_err(to_string)?;
+        let retry = self
+            .goal_store
+            .retry_state(&self.session_id)
+            .map_err(to_string)?;
+        let provider_backoff = self
+            .goal_store
+            .provider_backoff_state(&self.session_id)
+            .map_err(to_string)?;
+        let goal_id = goal.as_ref().map(|goal| goal.goal_id.as_str());
+        let pending_human_requests = self
+            .goal_store
+            .human_requests()
+            .pending(Some(&self.session_id))
+            .map_err(to_string)?
+            .into_iter()
+            .filter(|request| human_request_belongs_to_goal(request.goal_id.as_deref(), goal_id))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "revision": goal.as_ref().map(|goal| goal.revision),
+            "goal": goal,
+            "pause": pause,
+            "retry": retry,
+            "providerBackoff": provider_backoff,
+            "pendingHumanRequests": pending_human_requests
+        }))
+    }
+
     /// Execute one native host-owned session command without entering the model loop.
     pub(crate) async fn execute_session_command(
         &mut self,
@@ -3398,30 +3465,80 @@ impl TurnHost {
     }
 
     pub(super) fn work_state(&self) -> Result<zuno_types::WorkStateProjection, String> {
-        let goal = self
+        let goal = self.goal_store.goal(&self.session_id).map_err(to_string)?;
+        let pause = self
             .goal_store
-            .goal(&self.session_id)
+            .pause_state(&self.session_id)
+            .map_err(to_string)?;
+        let retry = self
+            .goal_store
+            .retry_state(&self.session_id)
+            .map_err(to_string)?;
+        let provider_backoff = self
+            .goal_store
+            .provider_backoff_state(&self.session_id)
+            .map_err(to_string)?;
+        let goal_id = goal.as_ref().map(|goal| goal.goal_id.as_str());
+        let pending_human_requests = self
+            .goal_store
+            .human_requests()
+            .pending(Some(&self.session_id))
             .map_err(to_string)?
-            .map(|goal| zuno_types::GoalStateProjection {
-                id: goal.goal_id,
-                revision: goal.revision,
-                objective: goal.objective,
-                success_criteria: goal.success_criteria,
-                status: goal.status.as_str().to_owned(),
-                blocked_reason: goal.blocked_reason,
-                span: zuno_types::ExecutionSpan::from_aggregate(
-                    goal.created_at_ms,
-                    goal.status.is_terminal().then_some(goal.updated_at_ms),
-                    u64::try_from(goal.time_used_seconds)
-                        .unwrap_or_default()
-                        .saturating_mul(1_000),
-                    u64::try_from(goal.tokens_used).unwrap_or_default(),
-                    goal.usage_known,
-                ),
-                token_budget: goal.token_budget,
-                time_created: goal.created_at_ms,
-                time_updated: goal.updated_at_ms,
-            });
+            .into_iter()
+            .filter(|request| human_request_belongs_to_goal(request.goal_id.as_deref(), goal_id))
+            .map(|request| zuno_types::HumanRequestProjection {
+                id: request.id,
+                kind: request.kind.as_str().to_owned(),
+                summary: human_request_summary(&request.payload),
+                time_created: request.time_created,
+            })
+            .collect::<Vec<_>>();
+        let goal = goal.map(|goal| zuno_types::GoalStateProjection {
+            id: goal.goal_id,
+            revision: goal.revision,
+            objective: goal.objective,
+            success_criteria: goal.success_criteria,
+            status: goal.status.as_str().to_owned(),
+            blocked_reason: goal.blocked_reason,
+            span: zuno_types::ExecutionSpan::from_aggregate(
+                goal.created_at_ms,
+                goal.status.is_terminal().then_some(goal.updated_at_ms),
+                u64::try_from(goal.time_used_seconds)
+                    .unwrap_or_default()
+                    .saturating_mul(1_000),
+                u64::try_from(goal.tokens_used).unwrap_or_default(),
+                goal.usage_known,
+            ),
+            token_budget: goal.token_budget,
+            pause: pause.map(|pause| zuno_types::GoalPauseProjection {
+                reason: pause.reason.as_str().to_owned(),
+                human_request_id: pause.human_request_id,
+                time_paused: pause.paused_at_ms,
+            }),
+            retry: retry.map(|retry| zuno_types::GoalRetryProjection {
+                attempt: retry.attempt,
+                reason: retry.reason.as_str().to_owned(),
+                delay_ms: retry.delay_ms,
+                retry_at_ms: retry.retry_at_ms,
+                scheduled_at_ms: retry.scheduled_at_ms,
+            }),
+            provider_backoff: provider_backoff.map(|backoff| {
+                zuno_types::ProviderBackoffProjection {
+                    request_id: backoff.request_id,
+                    turn_id: backoff.turn_id,
+                    failed_attempt: backoff.failed_attempt,
+                    next_attempt: backoff.next_attempt,
+                    max_attempts: backoff.max_attempts,
+                    reason: backoff.reason,
+                    delay_ms: backoff.delay_ms,
+                    retry_at_ms: backoff.retry_at_ms,
+                    scheduled_at_ms: backoff.scheduled_at_ms,
+                }
+            }),
+            pending_human_requests,
+            time_created: goal.created_at_ms,
+            time_updated: goal.updated_at_ms,
+        });
         let work = zuno_tools::WorkStateStore::new(Arc::clone(&self.database))
             .snapshot(&self.session_id)
             .map_err(to_string)?;
@@ -3801,6 +3918,11 @@ impl TurnHost {
     /// Database pool shared with independently driven child-session input.
     pub(crate) fn database_pool(&self) -> Arc<zuno_db::pool::Pool> {
         Arc::clone(&self.database)
+    }
+
+    /// Goal state shared with interactive surfaces that settle durable human requests.
+    pub(crate) fn goal_store(&self) -> Arc<GoalStore> {
+        Arc::clone(&self.goal_store)
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
@@ -4623,9 +4745,10 @@ impl TurnHost {
             .map_err(to_string)?
         {
             ContinuationAttempt::Prepared(prepared) => *prepared,
-            ContinuationAttempt::Suppressed(ContinuationSuppression::RetryBackoff {
-                remaining,
-            }) => {
+            ContinuationAttempt::Suppressed(
+                ContinuationSuppression::RetryBackoff { remaining }
+                | ContinuationSuppression::ProviderRetryBackoff { remaining },
+            ) => {
                 tokio::time::sleep(
                     remaining.min(self.goal_continuation.retry_policy().poll_interval()),
                 )
@@ -4770,7 +4893,9 @@ impl TurnHost {
                             reason: GoalRetryReason::ContextLimit,
                             retry_after: after,
                         },
-                        Recovery::Reauthenticate => GoalTerminalFailure::Pause,
+                        Recovery::Reauthenticate => {
+                            GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::Authentication)
+                        }
                         Recovery::Compact | Recovery::Fail => GoalTerminalFailure::Block,
                     };
                     TurnFailure::goal_recovery(
@@ -4822,9 +4947,13 @@ impl TurnHost {
             }
             Some(TurnOutcome::Interrupted { .. }) => {
                 self.goal_continuation
-                    .record_terminal_failure(&self.session_id, GoalTerminalFailure::Pause)
+                    .record_terminal_failure(
+                        &self.session_id,
+                        GoalTerminalFailure::Pause(zuno_goal::GoalPauseReason::UserInterruption),
+                    )
                     .map_err(to_string)?;
             }
+            Some(TurnOutcome::WaitingForHuman { .. }) => {}
             None => {}
         }
         self.write_goal_projection()?;
@@ -5217,24 +5346,46 @@ impl TurnHost {
     }
 }
 
+fn human_request_belongs_to_goal(
+    request_goal_id: Option<&str>,
+    active_goal_id: Option<&str>,
+) -> bool {
+    active_goal_id.is_some_and(|goal_id| request_goal_id == Some(goal_id))
+}
+
+fn human_request_summary(payload: &Value) -> Option<String> {
+    payload
+        .get("questions")
+        .and_then(Value::as_array)
+        .and_then(|questions| questions.first())
+        .and_then(|question| {
+            question
+                .get("header")
+                .or_else(|| question.get("question"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| payload.get("action").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
 fn goal_tool_failure(recoveries: &[ToolFailureRecovery]) -> Option<GoalTerminalFailure> {
     if recoveries.is_empty() {
         return None;
     }
-    let reason = if recoveries
+    if recoveries
         .iter()
         .any(|recovery| recovery.replay_policy == ToolReplayPolicy::Never)
     {
-        GoalRetryReason::ToolUncertain
-    } else {
-        GoalRetryReason::ToolTransient
-    };
+        return Some(GoalTerminalFailure::Pause(
+            zuno_goal::GoalPauseReason::UncertainSideEffect,
+        ));
+    }
     let retry_after = recoveries
         .iter()
         .filter_map(|recovery| recovery.retry_after)
         .max();
     Some(GoalTerminalFailure::Retry {
-        reason,
+        reason: GoalRetryReason::ToolTransient,
         retry_after,
     })
 }

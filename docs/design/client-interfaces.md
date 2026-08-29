@@ -10,6 +10,8 @@ Every client uses four runtime surfaces:
 2. Session events are the durable record of prompts, model output, tools, retries, questions, approvals, subagent reports, and lifecycle changes.
 3. Projections derive current conversation and status state from those events.
 4. The durable inbox accepts prompts, live steering, and `reportDelivery: nextStep` reports before work is scheduled.
+5. Durable human requests own Goal questions and permissions across process restarts;
+   process-local channels only notify already-running surfaces after commit.
 
 The shared projection vocabulary includes:
 
@@ -63,6 +65,13 @@ client channel capacity or reconnect timing never decides its fate.
 
 Human input has priority over an automatic goal retry. The client may show the persisted retry deadline and reason, but cancellation, pause, and resume are explicit commands rather than local timer changes.
 
+Goal-owned questions and permissions are rows, not open sockets or parked client
+futures. A client lists the shared pending set, answers by request id, and treats the
+answer as successful only after the request settlement and FIFO inbox admission commit
+together. On reconnect it re-presents pending rows in deterministic creation order.
+Only the runtime may conditionally resume the matching Goal; the client must not infer
+resumption from a local dialog closing.
+
 ## Backpressure and disconnects
 
 - Durable writes complete before a success response is returned.
@@ -98,6 +107,11 @@ its own session id. A compatibility client receives the ask on the known root
 session with `_meta.zuno.childSessionId`, so it never has to accept an unknown
 route. Reusable permission grants are still owned by the root ACP session and
 are cleared when it closes.
+
+An autonomous Goal is different from an ordinary interactive turn. It may yield
+`WaitingForHuman` through `goal_request_input`, but it does not receive the
+synchronous `question` tool. Plan may ask clarifying questions. A delegated child
+contacts neither client surface directly and reports blockers to its parent.
 
 ## TUI
 
@@ -290,7 +304,10 @@ The TUI favors dense, keyboard-first operation:
 - `/plan`, `/start-plan`, and `/start-work` are native collaboration-mode
   controls. ACP publishes standard mode/config updates after a transactional
   host replacement, while the TUI keeps its explicit confirmation surface.
-  Neither path may return from Plan to Work without a durable plan;
+  Neither path may return from Plan to Work without a durable plan. Entering Plan
+  atomically records `paused(plan_mode)` for an active Goal; Start Work only clears
+  that reason and cannot silently resume a Goal waiting on credentials, a human
+  request, permission, interruption review, or uncertain-side-effect inspection;
 - the same session list owns row actions: `Ctrl+R` opens a pre-filled rename
   prompt, while `Ctrl+D` must be pressed twice on the same row before deletion.
   Both actions are revalidated by the host and use the transactional session
@@ -317,3 +334,8 @@ The first GUI milestone therefore needs no engine fork:
 3. idempotent input admission;
 4. command, question, approval, interrupt, goal pause, and goal resume endpoints;
 5. generic tool rendering with optional specialized renderers.
+
+The HTTP question and permission list/reply operations publish concrete OpenAPI
+schemas. Their responses represent the same durable request rows used by TUI and
+ACP, including recovered requests; they are not merely a snapshot of live
+in-process waiters.

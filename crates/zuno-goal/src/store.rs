@@ -35,6 +35,7 @@
 //!   The refusal is the statement returning no row.
 
 use crate::error::GoalError;
+use crate::pause::{GoalPauseReason, GoalPauseState};
 use crate::retry::{GoalRetryPolicy, GoalRetryReason, GoalRetryState};
 use crate::spill;
 use crate::status::{GoalStatus, ModelStatus, SystemStatus};
@@ -44,6 +45,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zuno_db::Pool;
+use zuno_db::human_request::{
+    HumanRequest, HumanRequestKind, HumanRequestState, NewHumanRequest,
+    create_in as create_request_in,
+};
 use zuno_error::DbError;
 use zuno_paths::DbLocation;
 
@@ -52,6 +57,13 @@ pub const TABLE: &str = "goal";
 
 /// The directory under [`zuno_paths::data`] that oversized objectives spill into.
 pub const OBJECTIVE_SPILL_DIRECTORY: &str = "goal-objective";
+
+/// Durable coordinates of the tool call that requested human input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GoalHumanRequestOrigin {
+    pub message_id: Option<String>,
+    pub call_id: Option<String>,
+}
 
 /// The table, verbatim.
 ///
@@ -104,6 +116,20 @@ CREATE TABLE IF NOT EXISTS goal_failure_streak (
     signal TEXT NOT NULL,
     consecutive_turns INTEGER NOT NULL CHECK(consecutive_turns BETWEEN 1 AND 3)
 );
+CREATE TABLE IF NOT EXISTS goal_pause (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    goal_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(reason IN (
+        'user_interruption',
+        'plan_mode',
+        'human_input',
+        'permission',
+        'authentication',
+        'uncertain_side_effect'
+    )),
+    human_request_id TEXT,
+    paused_at_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS goal_retry (
     session_id TEXT PRIMARY KEY NOT NULL,
     goal_id TEXT NOT NULL,
@@ -118,8 +144,7 @@ CREATE TABLE IF NOT EXISTS goal_retry (
         'empty_assistant_message',
         'context_limit',
         'context_compacted',
-        'tool_transient',
-        'tool_uncertain'
+        'tool_transient'
     )),
     delay_ms INTEGER NOT NULL CHECK(delay_ms >= 0),
     retry_at_ms INTEGER NOT NULL,
@@ -294,6 +319,10 @@ impl GoalStore {
 
     fn open(location: &DbLocation, spill_dir: PathBuf) -> Result<Self, GoalError> {
         let pool = Arc::new(Pool::open(location)?);
+        {
+            let mut connection = pool.get()?;
+            zuno_db::migration::apply(&mut connection)?;
+        }
         Self::from_pool(pool, spill_dir)
     }
 
@@ -348,6 +377,278 @@ impl GoalStore {
             ))
             .map_err(zuno_db::map_error)?;
         read_optional(&mut statement, params![session_id])
+    }
+
+    /// Durable reason attached to a paused Goal, if one is recorded.
+    pub fn pause_state(&self, session_id: &str) -> Result<Option<GoalPauseState>, GoalError> {
+        let connection = self.pool.get()?;
+        pause_state_from(&connection, session_id)
+    }
+
+    /// Shared durable human-request store over the same application pool.
+    #[must_use]
+    pub fn human_requests(&self) -> zuno_db::human_request::HumanRequestStore {
+        zuno_db::human_request::HumanRequestStore::new(Arc::clone(&self.pool))
+    }
+
+    /// Pause the current Goal with a typed reason.
+    ///
+    /// The Goal row and its reason commit in one transaction. A non-paused
+    /// terminal state is never relabelled as paused by this helper.
+    pub fn pause_with_reason(
+        &self,
+        session_id: &str,
+        reason: GoalPauseReason,
+    ) -> Result<Option<Goal>, GoalError> {
+        self.pause_with_reason_checked(session_id, reason, None, None)
+    }
+
+    /// Pause only when an expected Goal revision is still current.
+    pub fn pause_with_reason_at_revision(
+        &self,
+        session_id: &str,
+        reason: GoalPauseReason,
+        expected_revision: i64,
+    ) -> Result<Option<Goal>, GoalError> {
+        self.pause_with_reason_checked(session_id, reason, None, Some(expected_revision))
+    }
+
+    /// Persist a pending human request and suspend the exact active Goal revision.
+    ///
+    /// Insertion of the request, the `paused` transition, and the typed pause
+    /// record are atomic. The caller may safely return a waiting outcome only
+    /// after this method succeeds.
+    pub fn request_human_input(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+        request_id: String,
+        payload: serde_json::Value,
+        message_id: Option<String>,
+        call_id: Option<String>,
+    ) -> Result<HumanRequest, GoalError> {
+        self.request_human_input_at(
+            session_id,
+            expected_revision,
+            request_id,
+            payload,
+            GoalHumanRequestOrigin {
+                message_id,
+                call_id,
+            },
+            now_ms()?,
+        )
+    }
+
+    /// Deterministic-clock form of [`Self::request_human_input`].
+    pub fn request_human_input_at(
+        &self,
+        session_id: &str,
+        expected_revision: i64,
+        request_id: String,
+        payload: serde_json::Value,
+        origin: GoalHumanRequestOrigin,
+        paused_at_ms: i64,
+    ) -> Result<HumanRequest, GoalError> {
+        self.pool.try_transaction(|tx| {
+            let goal = goal_from_transaction(tx, session_id)?.ok_or_else(|| GoalError::NoGoal {
+                session_id: session_id.to_owned(),
+            })?;
+            if goal.revision != expected_revision {
+                return Err(GoalError::RevisionConflict {
+                    session_id: session_id.to_owned(),
+                    expected: expected_revision,
+                    actual: goal.revision,
+                });
+            }
+            if goal.status != GoalStatus::Active {
+                return Err(GoalError::GoalNotActive {
+                    session_id: session_id.to_owned(),
+                    status: goal.status,
+                });
+            }
+
+            let request = create_request_in(
+                tx,
+                &NewHumanRequest {
+                    id: request_id,
+                    session_id: session_id.to_owned(),
+                    goal_id: Some(goal.goal_id.clone()),
+                    kind: HumanRequestKind::Input,
+                    payload,
+                    message_id: origin.message_id,
+                    call_id: origin.call_id,
+                    time_created: paused_at_ms,
+                },
+            )?;
+            let paused = update_system_status_in(
+                tx,
+                session_id,
+                SystemStatus::Paused,
+                Some(expected_revision),
+                paused_at_ms,
+            )?
+            .ok_or_else(|| GoalError::RevisionConflict {
+                session_id: session_id.to_owned(),
+                expected: expected_revision,
+                actual: goal.revision,
+            })?;
+            upsert_pause_in(
+                tx,
+                &paused,
+                GoalPauseReason::HumanInput,
+                Some(&request.id),
+                paused_at_ms,
+            )?;
+            clear_failure_and_retry_state(tx, session_id)?;
+            Ok(request)
+        })
+    }
+
+    /// Persist a permission request and pause an active Goal before the gated
+    /// effect can run.
+    ///
+    /// Returns `None` when the session has no active Goal; callers may then use
+    /// the generic human-request store without changing Goal state.
+    pub fn request_permission(
+        &self,
+        session_id: &str,
+        request_id: String,
+        payload: serde_json::Value,
+        message_id: Option<String>,
+        call_id: Option<String>,
+    ) -> Result<Option<HumanRequest>, GoalError> {
+        let paused_at_ms = now_ms()?;
+        self.pool.try_transaction(|tx| {
+            let Some(goal) = goal_from_transaction(tx, session_id)? else {
+                return Ok(None);
+            };
+            if goal.status != GoalStatus::Active {
+                return Ok(None);
+            }
+            let request = create_request_in(
+                tx,
+                &NewHumanRequest {
+                    id: request_id,
+                    session_id: session_id.to_owned(),
+                    goal_id: Some(goal.goal_id.clone()),
+                    kind: HumanRequestKind::Permission,
+                    payload,
+                    message_id,
+                    call_id,
+                    time_created: paused_at_ms,
+                },
+            )?;
+            let paused = update_system_status_in(
+                tx,
+                session_id,
+                SystemStatus::Paused,
+                Some(goal.revision),
+                paused_at_ms,
+            )?
+            .expect("the active Goal revision was read in this transaction");
+            upsert_pause_in(
+                tx,
+                &paused,
+                GoalPauseReason::Permission,
+                Some(&request.id),
+                paused_at_ms,
+            )?;
+            clear_failure_and_retry_state(tx, session_id)?;
+            Ok(Some(request))
+        })
+    }
+
+    /// Enter Plan mode transactionally.
+    ///
+    /// An active Goal becomes `paused(plan_mode)`. Reopening or restarting in
+    /// Plan mode is idempotent and does not advance the Goal revision again.
+    /// A stronger pre-existing pause (human input, auth, uncertain side effect)
+    /// is preserved.
+    pub fn enter_plan_mode(&self, session_id: &str) -> Result<Option<Goal>, GoalError> {
+        let paused_at_ms = now_ms()?;
+        self.pool.try_transaction(|tx| {
+            let Some(goal) = goal_from_transaction(tx, session_id)? else {
+                return Ok(None);
+            };
+            if goal.status != GoalStatus::Active {
+                return Ok(Some(goal));
+            }
+            let paused = update_system_status_in(
+                tx,
+                session_id,
+                SystemStatus::Paused,
+                Some(goal.revision),
+                paused_at_ms,
+            )?
+            .expect("the active Goal revision was read in this transaction");
+            upsert_pause_in(tx, &paused, GoalPauseReason::PlanMode, None, paused_at_ms)?;
+            clear_failure_and_retry_state(tx, session_id)?;
+            Ok(Some(paused))
+        })
+    }
+
+    /// Start Work by resuming only pauses that are now authoritatively settled.
+    ///
+    /// `plan_mode` resumes immediately. Human-input and permission pauses resume
+    /// only after their durable request is answered. Authentication, manual
+    /// interruption, and uncertain side effects remain paused for an explicit
+    /// recovery action. The matching pause row is consumed in the same
+    /// transaction, making repeated Start Work requests harmless.
+    pub fn resume_for_work(&self, session_id: &str) -> Result<Option<Goal>, GoalError> {
+        let resumed_at_ms = now_ms()?;
+        self.pool.try_transaction(|tx| {
+            let Some(goal) = goal_from_transaction(tx, session_id)? else {
+                return Ok(None);
+            };
+            if goal.status != GoalStatus::Paused {
+                return Ok(Some(goal));
+            }
+            let Some(pause) = pause_state_from(tx, session_id)? else {
+                return Ok(Some(goal));
+            };
+            if pause.goal_id != goal.goal_id {
+                return Ok(Some(goal));
+            }
+            let resumable = match pause.reason {
+                GoalPauseReason::PlanMode => true,
+                reason if reason.waits_for_human_request() => {
+                    let Some(request_id) = pause.human_request_id.as_deref() else {
+                        return Ok(Some(goal));
+                    };
+                    matches!(
+                        zuno_db::human_request::get_from(tx, request_id)?,
+                        Some(HumanRequest {
+                            state: HumanRequestState::Answered,
+                            ..
+                        })
+                    )
+                }
+                GoalPauseReason::UserInterruption
+                | GoalPauseReason::Authentication
+                | GoalPauseReason::UncertainSideEffect => false,
+                GoalPauseReason::HumanInput | GoalPauseReason::Permission => {
+                    unreachable!("human request reasons handled by the guard")
+                }
+            };
+            if !resumable {
+                return Ok(Some(goal));
+            }
+            let resumed = update_system_status_in(
+                tx,
+                session_id,
+                SystemStatus::Active,
+                Some(goal.revision),
+                resumed_at_ms,
+            )?
+            .expect("the paused Goal revision was read in this transaction");
+            tx.execute(
+                "DELETE FROM goal_pause WHERE session_id = ?1 AND goal_id = ?2",
+                params![session_id, goal.goal_id],
+            )
+            .map_err(zuno_db::map_error)?;
+            Ok(Some(resumed))
+        })
     }
 
     /// Immutable revisions for every goal instance in a session, oldest first.
@@ -579,12 +880,14 @@ impl GoalStore {
                 });
             }
 
-            let (plan_steps, work_items, jobs) = completion_blockers(tx, session_id)?;
-            if plan_steps != 0 || work_items != 0 || jobs != 0 {
+            let (plan_steps, work_items, jobs, human_requests) =
+                completion_blockers(tx, session_id)?;
+            if plan_steps != 0 || work_items != 0 || jobs != 0 || human_requests != 0 {
                 return Err(GoalError::CompletionBlocked {
                     plan_steps,
                     work_items,
                     jobs,
+                    human_requests,
                 });
             }
 
@@ -636,6 +939,14 @@ impl GoalStore {
         session_id: &str,
         status: SystemStatus,
     ) -> Result<Option<Goal>, GoalError> {
+        if status == SystemStatus::Paused {
+            return self.pause_with_reason_checked(
+                session_id,
+                GoalPauseReason::UserInterruption,
+                None,
+                None,
+            );
+        }
         self.write_status(
             SET_STATUS_AS_SYSTEM,
             session_id,
@@ -652,6 +963,14 @@ impl GoalStore {
         status: SystemStatus,
         expected_revision: i64,
     ) -> Result<Option<Goal>, GoalError> {
+        if status == SystemStatus::Paused {
+            return self.pause_with_reason_checked(
+                session_id,
+                GoalPauseReason::UserInterruption,
+                None,
+                Some(expected_revision),
+            );
+        }
         self.write_status(
             SET_STATUS_AS_SYSTEM,
             session_id,
@@ -789,6 +1108,15 @@ impl GoalStore {
             .optional()
             .map_err(zuno_db::map_error)?;
         row.map(GoalRetryState::try_from).transpose()
+    }
+
+    /// Same-request provider backoff checkpoint that survived a process stop.
+    pub fn provider_backoff_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<zuno_db::provider_backoff::ProviderBackoffCheckpoint>, GoalError> {
+        let connection = self.pool.get()?;
+        zuno_db::provider_backoff::get(&connection, session_id).map_err(GoalError::from)
     }
 
     /// Remove any retry schedule for a session.
@@ -1136,9 +1464,56 @@ impl GoalStore {
                 )
                 .map_err(zuno_db::map_error)?;
                 clear_retry_state(tx, session_id)?;
+                if goal
+                    .as_ref()
+                    .is_some_and(|current| current.status != GoalStatus::Paused)
+                {
+                    tx.execute(
+                        "DELETE FROM goal_pause WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(zuno_db::map_error)?;
+                }
             }
             Ok(Ok(goal))
         })?
+    }
+
+    fn pause_with_reason_checked(
+        &self,
+        session_id: &str,
+        reason: GoalPauseReason,
+        human_request_id: Option<&str>,
+        expected_revision: Option<i64>,
+    ) -> Result<Option<Goal>, GoalError> {
+        let paused_at_ms = now_ms()?;
+        self.pool.try_transaction(|tx| {
+            let goal = update_system_status_in(
+                tx,
+                session_id,
+                SystemStatus::Paused,
+                expected_revision,
+                paused_at_ms,
+            )?;
+            if goal.is_none()
+                && let Some(error) = revision_conflict(tx, session_id, expected_revision)?
+            {
+                return Err(error);
+            }
+            if let Some(goal) = goal.as_ref() {
+                if goal.status == GoalStatus::Paused {
+                    upsert_pause_in(tx, goal, reason, human_request_id, paused_at_ms)?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM goal_pause WHERE session_id = ?1",
+                        params![session_id],
+                    )
+                    .map_err(zuno_db::map_error)?;
+                }
+                clear_failure_and_retry_state(tx, session_id)?;
+            }
+            Ok(goal)
+        })
     }
 }
 
@@ -1313,7 +1688,7 @@ fn upsert(tx: &Transaction<'_>, input: GoalUpsert<'_>) -> Result<Option<Goal>, D
 fn completion_blockers(
     tx: &Transaction<'_>,
     session_id: &str,
-) -> Result<(usize, usize, usize), DbError> {
+) -> Result<(usize, usize, usize, usize), DbError> {
     let plan_steps = if table_exists(tx, "work_plan")? {
         let steps = tx
             .query_row(
@@ -1388,7 +1763,20 @@ fn completion_blockers(
     } else {
         0
     };
-    Ok((plan_steps, work_items, jobs))
+    let human_requests = if table_exists(tx, "human_request")? {
+        tx.query_row(
+            "SELECT COUNT(*) FROM human_request \
+             WHERE session_id = ?1 AND state = 'pending' \
+               AND goal_id = (SELECT goal_id FROM goal WHERE session_id = ?1)",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(zuno_db::map_error)
+        .map(|count| usize::try_from(count).unwrap_or(usize::MAX))?
+    } else {
+        0
+    };
+    Ok((plan_steps, work_items, jobs, human_requests))
 }
 
 fn table_exists(tx: &Transaction<'_>, table: &str) -> Result<bool, DbError> {
@@ -1398,6 +1786,95 @@ fn table_exists(tx: &Transaction<'_>, table: &str) -> Result<bool, DbError> {
         |row| row.get::<_, bool>(0),
     )
     .map_err(zuno_db::map_error)
+}
+
+fn goal_from_transaction(
+    tx: &Transaction<'_>,
+    session_id: &str,
+) -> Result<Option<Goal>, GoalError> {
+    let mut statement = tx
+        .prepare(&format!(
+            "SELECT {COLUMNS} FROM {TABLE} WHERE session_id = ?1"
+        ))
+        .map_err(zuno_db::map_error)?;
+    read_optional(&mut statement, params![session_id])
+}
+
+fn update_system_status_in(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    status: SystemStatus,
+    expected_revision: Option<i64>,
+    now_ms: i64,
+) -> Result<Option<Goal>, GoalError> {
+    let mut statement = tx
+        .prepare(SET_STATUS_AS_SYSTEM)
+        .map_err(zuno_db::map_error)?;
+    read_optional(
+        &mut statement,
+        params![status.as_str(), now_ms, session_id, expected_revision],
+    )
+}
+
+fn upsert_pause_in(
+    tx: &Transaction<'_>,
+    goal: &Goal,
+    reason: GoalPauseReason,
+    human_request_id: Option<&str>,
+    paused_at_ms: i64,
+) -> Result<(), GoalError> {
+    tx.execute(
+        "INSERT INTO goal_pause \
+         (session_id, goal_id, reason, human_request_id, paused_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+           goal_id=excluded.goal_id, reason=excluded.reason, \
+           human_request_id=excluded.human_request_id, paused_at_ms=excluded.paused_at_ms",
+        params![
+            goal.session_id,
+            goal.goal_id,
+            reason.as_str(),
+            human_request_id,
+            paused_at_ms
+        ],
+    )
+    .map_err(zuno_db::map_error)?;
+    Ok(())
+}
+
+fn pause_state_from(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<GoalPauseState>, GoalError> {
+    let row = connection
+        .query_row(
+            "SELECT session_id, goal_id, reason, human_request_id, paused_at_ms \
+             FROM goal_pause WHERE session_id = ?1",
+            params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>("session_id")?,
+                    row.get::<_, String>("goal_id")?,
+                    row.get::<_, String>("reason")?,
+                    row.get::<_, Option<String>>("human_request_id")?,
+                    row.get::<_, i64>("paused_at_ms")?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(zuno_db::map_error)?;
+    row.map(
+        |(session_id, goal_id, reason, human_request_id, paused_at_ms)| {
+            Ok(GoalPauseState {
+                session_id,
+                goal_id,
+                reason: GoalPauseReason::parse(&reason)?,
+                human_request_id,
+                paused_at_ms,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn revision_conflict(
@@ -1442,6 +1919,41 @@ fn clear_auxiliary_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), D
         params![session_id],
     )
     .map_err(zuno_db::map_error)?;
+    tx.execute(
+        "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(zuno_db::map_error)?;
+    tx.execute(
+        "DELETE FROM goal_failure_streak WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(zuno_db::map_error)?;
+    tx.execute(
+        "DELETE FROM goal_pause WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(zuno_db::map_error)?;
+    if table_exists(tx, "human_request")? {
+        tx.execute(
+            "UPDATE human_request \
+             SET state='cancelled', revision=revision+1, \
+                 time_updated=(SELECT updated_at_ms FROM goal WHERE session_id=?1), \
+                 time_resolved=(SELECT updated_at_ms FROM goal WHERE session_id=?1) \
+             WHERE session_id=?1 AND state='pending' \
+               AND (goal_id IS NULL OR goal_id != (SELECT goal_id FROM goal WHERE session_id=?1))",
+            params![session_id],
+        )
+        .map_err(zuno_db::map_error)?;
+    }
+    if table_exists(tx, "provider_retry_backoff")? {
+        zuno_db::provider_backoff::clear_session(tx, session_id)?;
+    }
+    clear_retry_state(tx, session_id)?;
+    Ok(())
+}
+
+fn clear_failure_and_retry_state(tx: &Transaction<'_>, session_id: &str) -> Result<(), DbError> {
     tx.execute(
         "DELETE FROM goal_pending_failure_signal WHERE session_id = ?1",
         params![session_id],
