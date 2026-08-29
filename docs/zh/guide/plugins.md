@@ -135,7 +135,7 @@ WASI 运行时声明一个相对于包目录的组件产物：
 
 规范接口是 [`wit/zuno-plugin/plugin.wit`](https://github.com/sunerpy/zuno/blob/main/wit/zuno-plugin/plugin.wit)：
 
-```wit
+```text
 initialize: func(package-id: string, workspace: string, capabilities: list<string>) -> result<string, string>;
 invoke: func(tool: string, arguments-json: string, session-id: string, message-id: string, call-id: string, agent: string) -> result<tuple<string, string, string>, string>;
 shutdown: func() -> result<_, string>;
