@@ -139,6 +139,19 @@ jobs:
       #
       # Not available through taiki-e/install-action, so it comes from apt; `sudo` is
       # absent in some CodeBuild images and present in others, hence the conditional.
+      #
+      # ALSO REQUIRES `privilegedMode=true` on the runner project. Installing a new
+      # enough bubblewrap is necessary but not sufficient: a non-privileged CodeBuild
+      # container cannot create an unprivileged user namespace at all, and the probe in
+      # `LinuxBubblewrapSandbox::discover` then fails with `No permissions to create
+      # new namespace` (run 33238108362, with bwrap 0.9.0 already installed). A
+      # read-only agent is pinned to `SandboxMode::ReadOnly` regardless of configured
+      # mode (cmd/tool_runtime.rs:460), and restricted modes never downgrade to
+      # unconfined (sandbox/src/lib.rs:490) — correctly, so the container must grant
+      # the capability instead. Acceptable here only because this repository is private
+      # and runs no untrusted fork PRs; the runner's service role can read the
+      # `zuno-github` connection, so a privileged container must never execute
+      # untrusted code.
       - name: Install bubblewrap for the OS sandbox backend
         run: |
           set -euo pipefail
