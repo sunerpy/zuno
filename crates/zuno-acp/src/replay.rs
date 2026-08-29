@@ -1,5 +1,6 @@
 //! Project durable Zuno messages onto ACP `session/update` notifications.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -23,6 +24,7 @@ pub const REPLAY_TRANSCRIPT_BYTE_CAP: u64 = 16 * 1_024 * 1_024;
 const DEFAULT_REPLAY_TOTAL_BYTES: usize = REPLAY_TRANSCRIPT_BYTE_CAP as usize;
 const DEFAULT_REPLAY_FRAME_BYTES: usize = 8 * 1_024 * 1_024;
 const REPLAY_NOTICE_RESERVE_BYTES: usize = 1_024;
+const PROVIDER_REASONING_KEY: &str = "providerReasoning";
 
 /// Bounded and path-aware projection policy for one ACP restore.
 #[derive(Debug, Clone)]
@@ -229,7 +231,19 @@ fn plan_step_priority<'a>(work: &'a WorkStateProjection, step_id: &str) -> &'a s
 
 fn message_updates(stored: &MessageWithParts, policy: &ReplayPolicy) -> Vec<Value> {
     let mut updates = Vec::new();
+    let visible_reasoning = stored
+        .parts
+        .iter()
+        .filter(|part| part.kind == PartKind::Reasoning && !is_provider_reasoning(part))
+        .filter_map(|part| non_empty_string(&part.data, "text"))
+        .collect::<BTreeSet<_>>();
     for part in &stored.parts {
+        if is_provider_reasoning(part)
+            && non_empty_string(&part.data, "text")
+                .is_some_and(|text| visible_reasoning.contains(text))
+        {
+            continue;
+        }
         match part.kind {
             PartKind::Text => {
                 if let Some(text) = non_empty_string(&part.data, "text") {
@@ -283,6 +297,13 @@ fn message_updates(stored: &MessageWithParts, policy: &ReplayPolicy) -> Vec<Valu
         }
     }
     updates
+}
+
+fn is_provider_reasoning(part: &PartRecord) -> bool {
+    part.data
+        .get("metadata")
+        .and_then(Value::as_object)
+        .is_some_and(|metadata| metadata.contains_key(PROVIDER_REASONING_KEY))
 }
 
 fn message_kind(role: MessageRole) -> &'static str {
@@ -622,6 +643,86 @@ mod tests {
         assert_eq!(updates[4]["locations"], json!([{"path":edited}]));
         assert_eq!(updates[5]["content"]["text"], "done");
         assert_eq!(updates[5]["messageId"], "msg-assistant");
+    }
+
+    #[test]
+    fn replay_deduplicates_a_provider_reasoning_capsule_from_visible_reasoning() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![
+                part(
+                    "p-thought",
+                    "msg-assistant",
+                    json!({"type":"reasoning","text":"inspect durable state"}),
+                ),
+                part(
+                    "p-provider-reasoning",
+                    "msg-assistant",
+                    json!({
+                        "type": "reasoning",
+                        "text": "inspect durable state",
+                        "metadata": {
+                            "providerReasoning": {
+                                "id": "rs_1",
+                                "summary": ["inspect durable state"],
+                                "encryptedContent": "sealed",
+                                "status": "completed"
+                            }
+                        }
+                    }),
+                ),
+            ],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+        let thoughts = replay
+            .updates
+            .iter()
+            .filter(|update| update["sessionUpdate"] == "agent_thought_chunk")
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            thoughts.len(),
+            1,
+            "provider replay data must not duplicate visible reasoning: {thoughts:#?}"
+        );
+        assert_eq!(thoughts[0]["content"]["text"], "inspect durable state");
+    }
+
+    #[test]
+    fn replay_keeps_provider_reasoning_when_no_visible_summary_exists() {
+        let root = tempfile::tempdir().expect("replay root");
+        let assistant = message(
+            "msg-assistant",
+            "assistant",
+            vec![part(
+                "p-provider-reasoning",
+                "msg-assistant",
+                json!({
+                    "type": "reasoning",
+                    "text": "provider-only reasoning",
+                    "metadata": {
+                        "providerReasoning": {
+                            "id": "rs_1",
+                            "summary": ["provider-only reasoning"],
+                            "encryptedContent": "sealed",
+                            "status": "completed"
+                        }
+                    }
+                }),
+            )],
+        );
+
+        let replay = durable_updates(&[assistant], &ReplayPolicy::for_workspace(root.path()), 0);
+
+        assert_eq!(replay.updates.len(), 1);
+        assert_eq!(replay.updates[0]["sessionUpdate"], "agent_thought_chunk");
+        assert_eq!(
+            replay.updates[0]["content"]["text"],
+            "provider-only reasoning"
+        );
     }
 
     #[test]

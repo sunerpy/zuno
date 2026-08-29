@@ -159,6 +159,16 @@ impl RuntimePromptPolicy {
             "Choose the smallest coherent workflow. Batch independent reads and checks, do not \
              re-read unchanged state, and do not rerun a check unless relevant inputs changed.",
         );
+        if !tools.is_empty() {
+            execution.push_str(
+                " Before a substantial tool batch, briefly state the next action. For longer work, \
+                 give concise updates at meaningful milestones without narrating trivial \
+                 operations. Use another tool only to close a specific evidence gap or execute or \
+                 verify an authorized change. When the outcome and evidence are complete, stop \
+                 calling tools and answer. If tools cannot materially advance the objective, \
+                 report the blocker or uncertainty.",
+            );
+        }
         if has("plan_update") {
             execution.push_str(
                 " Use a durable Plan whenever it improves progress visibility, dependency \
@@ -901,6 +911,22 @@ mod tests {
             "Todo items are optional concrete work beneath Plan steps; do not mirror every \
                  Plan step mechanically"
         ));
+        assert!(
+            text.contains("Before a substantial tool batch"),
+            "tool-capable turns must keep the user informed before material work"
+        );
+        assert!(
+            text.contains("meaningful milestones"),
+            "long-running turns must provide concise visible progress"
+        );
+        assert!(
+            text.contains("stop calling tools and answer"),
+            "completed work must terminate instead of extending the tool loop"
+        );
+        assert!(
+            text.contains("materially advance the objective"),
+            "additional tool work must resolve a concrete remaining gap"
+        );
         assert!(!text.contains("at least three meaningful steps"));
         assert!(!text.contains("Simple work needs no formal plan"));
         let estimated_tokens = sections
@@ -927,6 +953,14 @@ mod tests {
             read_only
                 .iter()
                 .all(|section| section.id() != "runtime.persistence")
+        );
+
+        let no_tools = policy.sections(std::iter::empty::<&str>(), false);
+        assert!(
+            no_tools
+                .iter()
+                .all(|section| !section.content().contains("substantial tool batch")),
+            "a tool-free prompt must not describe unavailable tool behavior"
         );
     }
 
