@@ -121,6 +121,26 @@ jobs:
       - name: Verify ripgrep satisfies the runtime minimum
         run: rg --version
 
+      # The sandbox fails closed by design: `read-only` and `workspace-write` both
+      # require a proved OS confinement backend, so `zuno-sandbox` refuses to start a
+      # session when no trusted `bwrap` is on the system
+      # (crates/zuno-sandbox/src/lib.rs:719 `BubblewrapNotFound`). That is deliberate
+      # — an unavailable backend must never silently downgrade to running unconfined.
+      # The CodeBuild `standard:7.0` image ships no bubblewrap, so 14 `acp_stdio`
+      # tests failed `session/new` with `no trusted system bubblewrap executable was
+      # found` on run 33236972372. Not available through taiki-e/install-action, so
+      # it comes from apt; `sudo` is absent in some CodeBuild images and present in
+      # others, hence the conditional.
+      - name: Install bubblewrap for the OS sandbox backend
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update && apt-get install -y --no-install-recommends bubblewrap
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
+          bwrap --version
+
       - name: Format check
         run: make fmt-check
 
@@ -200,6 +220,19 @@ jobs:
       # the same step in `test` for why a cold runner needs this first.
       - name: Populate the cargo registry for the offline gates
         run: cargo fetch --locked
+
+      # The smoked binary opens a real session, so it needs the OS sandbox backend
+      # too; see the same step in `test`. Without it the headless run fails with
+      # `no trusted system bubblewrap executable was found`.
+      - name: Install bubblewrap for the OS sandbox backend
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update && apt-get install -y --no-install-recommends bubblewrap
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
+          bwrap --version
 
       - name: Package and smoke
         run: make smoke-artifact

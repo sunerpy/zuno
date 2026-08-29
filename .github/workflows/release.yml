@@ -532,6 +532,24 @@ jobs:
       - name: Verify ripgrep satisfies the runtime minimum
         run: rg --version
 
+      # Linux only, and that is not an oversight: `zuno-sandbox` compiles an OS
+      # confinement backend for `target_os = "linux"` alone
+      # (crates/zuno-sandbox/src/lib.rs:15), so only these two legs can reach
+      # `BubblewrapNotFound`. The darwin and windows legs answer `UnsupportedPlatform`
+      # instead and need no package. Same fail-closed reasoning as `ci.yml`: a missing
+      # backend must abort rather than run the smoke unconfined.
+      - name: Install bubblewrap for the OS sandbox backend
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update && apt-get install -y --no-install-recommends bubblewrap
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
+          bwrap --version
+
       - name: Smoke the unpacked artifact (unix)
         if: matrix.archive == 'tar.gz'
         run: ./target/release/zuno-smoke --binary "unpacked/${BINARY_NAME}"
