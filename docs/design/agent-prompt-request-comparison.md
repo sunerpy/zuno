@@ -328,7 +328,7 @@ The exact policy appended immediately after it was:
 **Don't delegate when:** the whole task is smaller than the briefing it would take • you already have the file path and need its contents • the answer is in this conversation • explaining the task costs more than doing it • the work is one edit you are already mid-way through.
 ```
 
-The repository instruction body already lives in [`AGENTS.md`](../../AGENTS.md).
+The repository instruction body already lives in [`AGENTS.md`](https://github.com/sunerpy/zuno/blob/main/AGENTS.md).
 The historical copy and complete `skills.index` remain in the local raw artifact
 rather than duplicating a source file or publishing workstation inventory.
 

@@ -1260,7 +1260,7 @@ report admission and wake behavior, prompt receipts, and final evidence. It
 must use a real authorized provider response; an unavailable account, model, or
 service is reported as a blocker rather than replaced with a mock.
 
-See [提示词与工作流 V2 用户指南](guides/prompt-workflow-v2.zh-CN.md) for the
+See [提示词与工作流 V2 用户指南](https://github.com/sunerpy/zuno/blob/main/docs/guides/prompt-workflow-v2.zh-CN.md) for the
 commands, expected observations, and current implementation boundaries.
 
 ## Building a harness

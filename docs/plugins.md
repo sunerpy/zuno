@@ -135,7 +135,7 @@ specific custom agent, its prompt should issue `task` with that
 not create a hidden second
 orchestration path.
 
-See [`examples/plugins/review-kit/extension.json`](../examples/plugins/review-kit/extension.json).
+See [`examples/plugins/review-kit/extension.json`](https://github.com/sunerpy/zuno/blob/main/examples/plugins/review-kit/extension.json).
 
 ## WASI component tools
 
@@ -171,7 +171,7 @@ the relevant proxy variables. Secrets should be passed only when the guest
 actually needs them.
 
 The canonical interface is
-[`wit/zuno-plugin/plugin.wit`](../wit/zuno-plugin/plugin.wit):
+[`wit/zuno-plugin/plugin.wit`](https://github.com/sunerpy/zuno/blob/main/wit/zuno-plugin/plugin.wit):
 
 ```wit
 initialize: func(package-id: string, workspace: string, capabilities: list<string>) -> result<string, string>;
@@ -187,7 +187,7 @@ cancellation, and marks a trapped or timed-out instance unavailable. A lost
 response around possible side effects is `Uncertain` and is never replayed.
 
 The complete Rust guest example is under
-[`examples/plugins/wasi-word-count`](../examples/plugins/wasi-word-count).
+[`examples/plugins/wasi-word-count`](https://github.com/sunerpy/zuno/blob/main/examples/plugins/wasi-word-count).
 Build and exercise it with:
 
 ```sh
@@ -245,7 +245,7 @@ Frames and captured stderr are bounded, diagnostics are scrubbed against known
 secret environment values, timeouts and cancellation stop the process tree, and
 protocol loss after a request is sent is reported as `Uncertain`.
 
-See [`examples/plugins/process-review`](../examples/plugins/process-review) for
+See [`examples/plugins/process-review`](https://github.com/sunerpy/zuno/blob/main/examples/plugins/process-review) for
 the minimal executable example. The complete implementation guide is
 [trusted process plugin development](process-plugin-development.md), including
 protocol frames, security review, cancellation and uncertain outcomes, testing,

@@ -60,15 +60,15 @@ codegraph sync /tmp/zuno-prompt-workflow-v2
 
 | 主题 | 当前证据 |
 | --- | --- |
-| Prompt section、render、receipt、trace 去重 | [`crates/zuno-engine/src/prompt.rs`](../../crates/zuno-engine/src/prompt.rs) |
-| Provider request 与 prompt receipt 提交时机 | [`crates/zuno-engine/src/loop.rs`](../../crates/zuno-engine/src/loop.rs) |
-| Agent profile 与 runtime policy 中间实现 | [`crates/zuno-agent/src/profile.rs`](../../crates/zuno-agent/src/profile.rs) |
-| Orchestration capability catalogue | [`crates/zuno-orchestration/src/snapshot.rs`](../../crates/zuno-orchestration/src/snapshot.rs) |
-| 当前 task wire schema | [`crates/zuno-tools/src/task.rs`](../../crates/zuno-tools/src/task.rs) |
-| Job settlement 与 pending reports | [`crates/zuno-db/src/job.rs`](../../crates/zuno-db/src/job.rs) |
-| Inbox queued/promoted/consumed 状态 | [`crates/zuno-db/src/inbox.rs`](../../crates/zuno-db/src/inbox.rs) |
-| Goal completion blocker | [`crates/zuno-goal/src/store.rs`](../../crates/zuno-goal/src/store.rs) |
-| debug CLI 参数与查询 | [`crates/zuno-cli/src/command.rs`](../../crates/zuno-cli/src/command.rs)、[`crates/zuno-cli/src/cmd/debug.rs`](../../crates/zuno-cli/src/cmd/debug.rs) |
+| Prompt section、render、receipt、trace 去重 | [`crates/zuno-engine/src/prompt.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-engine/src/prompt.rs) |
+| Provider request 与 prompt receipt 提交时机 | [`crates/zuno-engine/src/loop.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-engine/src/loop.rs) |
+| Agent profile 与 runtime policy 中间实现 | [`crates/zuno-agent/src/profile.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-agent/src/profile.rs) |
+| Orchestration capability catalogue | [`crates/zuno-orchestration/src/snapshot.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-orchestration/src/snapshot.rs) |
+| 当前 task wire schema | [`crates/zuno-tools/src/task.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-tools/src/task.rs) |
+| Job settlement 与 pending reports | [`crates/zuno-db/src/job.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-db/src/job.rs) |
+| Inbox queued/promoted/consumed 状态 | [`crates/zuno-db/src/inbox.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-db/src/inbox.rs) |
+| Goal completion blocker | [`crates/zuno-goal/src/store.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-goal/src/store.rs) |
+| debug CLI 参数与查询 | [`crates/zuno-cli/src/command.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-cli/src/command.rs)、[`crates/zuno-cli/src/cmd/debug.rs`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-cli/src/cmd/debug.rs) |
 
 ## 3. 当前实现的真实边界
 

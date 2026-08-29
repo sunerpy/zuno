@@ -11,7 +11,7 @@
 Derived from the newest recorded measurement artefact, the task-123 memory
 measurement.
 The ceilings are not measured here:
-[`benchmarks/ts-baseline.json`](../benchmarks/ts-baseline.json) freezes each
+[`benchmarks/ts-baseline.json`](https://github.com/sunerpy/zuno/blob/main/benchmarks/ts-baseline.json) freezes each
 one at half the TypeScript median for the same workload, and every other column
 below is computed from the five per-repetition Rust peaks the artefact records.
 

@@ -42,7 +42,7 @@
 }
 ```
 
-The checked starter file is [`examples/config/zuno.json`](../../examples/config/zuno.json). `transport` names a native Rust wire implementation; it is not the provider type, provider identity, authentication method, or concrete endpoint. `surface` selects `responses`, `chat`, or `messages`; an OpenAI-wire gateway should normally declare `"transport": "openai", "surface": "responses"`. A model may override the provider default under `models.<id>.provider.surface`. Use `openai-compatible` only when a gateway's behavior differs from OpenAI. Neither transport loads npm packages, starts Node, or runs an AI SDK.
+The checked starter file is [`examples/config/zuno.json`](https://github.com/sunerpy/zuno/blob/main/examples/config/zuno.json). `transport` names a native Rust wire implementation; it is not the provider type, provider identity, authentication method, or concrete endpoint. `surface` selects `responses`, `chat`, or `messages`; an OpenAI-wire gateway should normally declare `"transport": "openai", "surface": "responses"`. A model may override the provider default under `models.<id>.provider.surface`. Use `openai-compatible` only when a gateway's behavior differs from OpenAI. Neither transport loads npm packages, starts Node, or runs an AI SDK.
 
 Provider-level headers are defaults for every configured model. A model may add
 or replace them under `provider.<id>.models.<model>.headers`; model-level `headers` win

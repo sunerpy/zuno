@@ -258,7 +258,7 @@ for await (const line of lines) {
 The real implementation still needs bounded input, semantic argument
 validation, signal handling, output sanitization, and tests. The canonical
 small example is
-[`examples/plugins/process-review`](../examples/plugins/process-review).
+[`examples/plugins/process-review`](https://github.com/sunerpy/zuno/blob/main/examples/plugins/process-review).
 
 ## Logging and output discipline
 

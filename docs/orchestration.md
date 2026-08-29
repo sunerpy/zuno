@@ -254,7 +254,7 @@ review, and a smaller multimodal model for exploration or visual inspection.
 The providers remain independently configured in the shared catalog; the
 preset contains only qualified model routes and canonical reasoning levels.
 See the checked
-[`zuno-multi-provider.json`](../examples/config/zuno-multi-provider.json) for
+[`zuno-multi-provider.json`](https://github.com/sunerpy/zuno/blob/main/examples/config/zuno-multi-provider.json) for
 `myopenai`, `kiro-local`, and mixed `hybrid` teams covering the complete native
 user-Agent roster.
 

@@ -56,7 +56,7 @@ preset remains selected. Select an explicit overlay preset instead.
 One `zuno.json` can declare several providers. Provider ids are catalog
 namespaces, while presets choose which qualified `provider/model` route each
 Agent uses. The checked
-[`examples/config/zuno-multi-provider.json`](../../examples/config/zuno-multi-provider.json)
+[`examples/config/zuno-multi-provider.json`](https://github.com/sunerpy/zuno/blob/main/examples/config/zuno-multi-provider.json)
 keeps both `myopenai` and `kiro-local` in one catalog and defines three teams:
 
 - `myopenai` preserves an all-`myopenai` team;
@@ -101,7 +101,7 @@ ZUNO_CONFIG_DIR="$HOME/.config/zuno/profiles/kiro" zuno
 The same pattern can select `hybrid` or return explicitly to `myopenai`; the
 overlay need not duplicate either provider definition. Checked selector files
 for all three teams live under
-[`examples/config/profiles`](../../examples/config/profiles).
+[`examples/config/profiles`](https://github.com/sunerpy/zuno/blob/main/examples/config/profiles).
 
 Model names belong to the provider's live account-aware catalog, not to an
 authentication plugin or to every account uniformly. The checked example is
@@ -226,7 +226,7 @@ transport pools.
 
 ## JSON Schema
 
-The canonical schema is [`schemas/zuno.json`](../../schemas/zuno.json). It is generated from the same Rust types that deserialize configuration:
+The canonical schema is [`schemas/zuno.json`](https://github.com/sunerpy/zuno/blob/main/schemas/zuno.json). It is generated from the same Rust types that deserialize configuration:
 
 ```sh
 cargo run -p zuno-config --example generate-schema > schemas/zuno.json
@@ -245,7 +245,7 @@ For a repository-root configuration:
 
 Use an editor-specific schema association or an absolute file URI when the config file and repository schema are not in the same tree. A later documentation deployment can publish this unchanged artifact at a stable HTTPS URL.
 
-The complete checked starter is [`examples/config/zuno.json`](../../examples/config/zuno.json). It declares a native `openai` transport and contains no package-manager or AI SDK field. Follow the [provider initialization guide](providers.md#first-run-initialization) to install it, edit the endpoint and model ids, and store credentials.
+The complete checked starter is [`examples/config/zuno.json`](https://github.com/sunerpy/zuno/blob/main/examples/config/zuno.json). It declares a native `openai` transport and contains no package-manager or AI SDK field. Follow the [provider initialization guide](providers.md#first-run-initialization) to install it, edit the endpoint and model ids, and store credentials.
 
 ## Main config versus TUI config
 

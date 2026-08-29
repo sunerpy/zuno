@@ -35,26 +35,26 @@ zero pending files when this document was written.
 
 The current Zuno implementation establishes these facts:
 
-- [`BuiltinSlot`](../../crates/zuno-tools/src/registry.rs) contains generic
+- [`BuiltinSlot`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-tools/src/registry.rs) contains generic
   shell, file, delegation, web, Skill, patch, execution, LSP, and plan slots.
   It contains no GitHub, pull-request, Actions, review-thread, merge, or release
   slot.
 - Tool sources are assembled as built-in, Harness, then MCP contributions.
   This is already the correct extension seam for a future GitHub provider.
-- The compiled [`BuiltinSkillDescriptor`](../../crates/zuno-orchestration/src/lib.rs)
+- The compiled [`BuiltinSkillDescriptor`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-orchestration/src/lib.rs)
   records a stable source identity, pack version, content SHA-256, provenance,
   allowed Agent profiles, and required tools.
 - The built-in `git-workflow` Skill covers local repository hygiene. It does not
   grant remote GitHub authority.
-- [`SkillTool`](../../crates/zuno-tools/src/skill.rs) loads a selected Skill body
+- [`SkillTool`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-tools/src/skill.rs) loads a selected Skill body
   and its resources on demand. Initial discovery is metadata-only, so Zuno
   already has progressive disclosure rather than eagerly injecting every Skill
   body.
 - Extension manifests are typed and validated by
-  [`Package`](../../crates/zuno-extension/src/manifest.rs). Dynamic activation
+  [`Package`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-extension/src/manifest.rs). Dynamic activation
   already separates desired and committed state and supports prepare, commit,
   abort, and rollback.
-- [`ToolReplayPolicy`](../../crates/zuno-tool/src/lib.rs) defaults to `Never`;
+- [`ToolReplayPolicy`](https://github.com/sunerpy/zuno/blob/main/crates/zuno-tool/src/lib.rs) defaults to `Never`;
   only explicitly read-only or idempotent tools may opt into `Safe`.
 
 These existing mechanisms are sufficient foundations. They do not mean a
