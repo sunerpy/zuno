@@ -130,40 +130,90 @@ fn every_terminal_turn_error_has_an_explicit_goal_recovery_decision() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn retry_total_elapsed_never_exceeds_three_minutes() {
-    for (max_attempts, idle_window) in [
-        (PROVIDER_RETRY_MAX_ATTEMPTS, Duration::from_secs(120)),
-        (
-            PROVIDER_RETRY_MAX_ATTEMPTS.saturating_mul(10),
-            Duration::from_secs(120),
-        ),
-        (PROVIDER_RETRY_MAX_ATTEMPTS, Duration::from_secs(240)),
-    ] {
-        let started = tokio::time::Instant::now();
-        let result = retry_provider(
-            policy(max_attempts),
-            |_| async {
-                tokio::time::sleep(idle_window).await;
+async fn first_provider_attempt_is_not_part_of_the_retry_recovery_budget() {
+    let started = tokio::time::Instant::now();
+    let result = retry_provider(
+        policy(PROVIDER_RETRY_MAX_ATTEMPTS),
+        |_| async {
+            tokio::time::sleep(Duration::from_secs(181)).await;
+            Ok::<_, ProviderError>("completed")
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+    )
+    .await;
+
+    assert_eq!(
+        result.expect("a healthy first attempt must not be mistaken for retry recovery"),
+        "completed"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(181));
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_deadline_does_not_interrupt_an_active_replay() {
+    let attempts = Rc::new(Cell::new(0_u32));
+    let seen = Rc::clone(&attempts);
+    let started = tokio::time::Instant::now();
+    let result = retry_provider(
+        policy(PROVIDER_RETRY_MAX_ATTEMPTS),
+        move |attempt| {
+            seen.set(attempt);
+            async move {
+                if attempt == 1 {
+                    return Err(ProviderError::Transient {
+                        status: None,
+                        source: None,
+                    });
+                }
+                tokio::time::sleep(Duration::from_secs(181)).await;
+                Ok::<_, ProviderError>("recovered")
+            }
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+    )
+    .await;
+
+    assert_eq!(result.expect("an active replay may complete"), "recovered");
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(started.elapsed(), Duration::from_secs(183));
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_deadline_prevents_starting_another_replay() {
+    let attempts = Rc::new(Cell::new(0_u32));
+    let seen = Rc::clone(&attempts);
+    let started = tokio::time::Instant::now();
+    let result = retry_provider(
+        policy(PROVIDER_RETRY_MAX_ATTEMPTS),
+        move |attempt| {
+            seen.set(attempt);
+            async move {
+                if attempt > 1 {
+                    tokio::time::sleep(Duration::from_secs(181)).await;
+                }
                 Err::<(), _>(ProviderError::Transient {
                     status: None,
                     source: None,
                 })
-            },
-            |_| ready(Ok::<(), std::io::Error>(())),
-        )
-        .await;
+            }
+        },
+        |_| ready(Ok::<(), std::io::Error>(())),
+    )
+    .await;
 
-        assert!(
-            matches!(result, Err(ProviderRetryError::DeadlineExceeded { .. })),
-            "repeated status-less stalls must end with a typed retry error: {result:?}"
-        );
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed <= Duration::from_secs(180),
-            "provider retry wall time reached {elapsed:?} with max_attempts={max_attempts} and \
-             idle_window={idle_window:?}, above the three-minute ceiling"
-        );
-    }
+    assert!(matches!(
+        result,
+        Err(ProviderRetryError::DeadlineExceeded {
+            attempt: 2,
+            elapsed
+        }) if elapsed == Duration::from_secs(183)
+    ));
+    assert_eq!(
+        attempts.get(),
+        2,
+        "the expired budget must reject attempt 3"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(183));
 }
 
 fn assert_budget<F>(budget: RecoveryBudget, limit: u32, mut record: F)

@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use serde_json::{Map, Value};
@@ -32,7 +33,7 @@ use crate::quirks::Quirks;
 use crate::request::{RequestBody, Sampling};
 use crate::stream::SurfaceTranslator;
 use crate::surface::endpoint_path;
-use crate::transport::{HttpRequest, Transport};
+use crate::transport::{HttpRequest, HttpTimeouts, Transport};
 
 /// The `provider.*.options` key carrying provider-wide capabilities.
 pub const CAPABILITIES_OPTION: &str = "capabilities";
@@ -53,6 +54,10 @@ pub const MODEL_CAPABILITIES_OPTION: &str = "modelCapabilities";
 /// [`PROTECTED_KEYS`](crate::request::PROTECTED_KEYS) are ignored.
 pub const EXTRA_BODY_OPTION: &str = "extraBody";
 
+const REQUEST_TIMEOUT_OPTION: &str = "timeout";
+const HEADER_TIMEOUT_OPTION: &str = "headerTimeout";
+const CHUNK_TIMEOUT_OPTION: &str = "chunkTimeout";
+const DEFAULT_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(330);
 const ZUNO_SESSION_METADATA_KEY: &str = "zuno_session_id";
 
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +70,14 @@ enum RequestShapeError {
         "OpenAI-compatible request parameter `metadata` must be an object when Zuno session affinity is attached"
     )]
     MetadataMustBeObject,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("provider `{provider}` option `{option}` must be {expected}")]
+struct InvalidTimeoutOption {
+    provider: String,
+    option: &'static str,
+    expected: &'static str,
 }
 
 /// An OpenAI-compatible provider.
@@ -81,6 +94,7 @@ pub struct CompatibleProvider {
     credential: Option<String>,
     transport: Arc<dyn Transport>,
     idle: StreamIdleTimeout,
+    timeouts: HttpTimeouts,
 }
 
 impl CompatibleProvider {
@@ -133,6 +147,11 @@ impl CompatibleProvider {
             presence_penalty: numeric_option(&spec, &["presencePenalty", "presence_penalty"]),
         };
         let tool_choice = first_option(&spec, generation::TOOL_CHOICE_KEYS).cloned();
+        let timeouts = http_timeouts(&spec).map_err(Declined::Failed)?;
+        let idle = timeouts
+            .chunk()
+            .map(StreamIdleTimeout::new)
+            .unwrap_or_default();
 
         Ok(Self {
             spec,
@@ -145,7 +164,8 @@ impl CompatibleProvider {
             tool_choice,
             credential,
             transport,
-            idle: StreamIdleTimeout::default(),
+            idle,
+            timeouts,
         })
     }
 
@@ -264,6 +284,7 @@ impl CompatibleProvider {
             url: self.endpoint(&request.model_id, request.surface),
             headers,
             body: self.try_body_for(request)?,
+            timeouts: self.timeouts,
         })
     }
 
@@ -498,6 +519,49 @@ fn first_option<'spec>(spec: &'spec Spec, keys: &[&str]) -> Option<&'spec Value>
 /// read a different key.
 fn numeric_option(spec: &Spec, keys: &[&str]) -> Option<f64> {
     first_option(spec, keys).and_then(Value::as_f64)
+}
+
+fn http_timeouts(spec: &Spec) -> Result<HttpTimeouts, ProviderError> {
+    Ok(HttpTimeouts::new(
+        timeout_option(spec, REQUEST_TIMEOUT_OPTION, true, None)?,
+        timeout_option(
+            spec,
+            HEADER_TIMEOUT_OPTION,
+            true,
+            Some(DEFAULT_RESPONSE_HEADER_TIMEOUT),
+        )?,
+        timeout_option(spec, CHUNK_TIMEOUT_OPTION, false, None)?,
+    ))
+}
+
+fn timeout_option(
+    spec: &Spec,
+    option: &'static str,
+    accepts_false: bool,
+    default: Option<Duration>,
+) -> Result<Option<Duration>, ProviderError> {
+    let Some(value) = spec.options.get(option) else {
+        return Ok(default);
+    };
+    if accepts_false && value == &Value::Bool(false) {
+        return Ok(None);
+    }
+    let millis = value
+        .as_u64()
+        .and_then(|millis| u32::try_from(millis).ok())
+        .filter(|millis| *millis > 0)
+        .ok_or_else(|| {
+            ProviderError::fatal(InvalidTimeoutOption {
+                provider: spec.provider.clone(),
+                option,
+                expected: if accepts_false {
+                    "a positive millisecond integer or false"
+                } else {
+                    "a positive millisecond integer"
+                },
+            })
+        })?;
+    Ok(Some(Duration::from_millis(u64::from(millis))))
 }
 
 fn unsupported(error: UnsupportedProvider) -> Declined {
@@ -886,6 +950,73 @@ mod tests {
             )],
         );
         assert_eq!(provider.body_for(&request)["service_tier"], json!("flex"));
+    }
+
+    #[test]
+    fn provider_timeout_options_reach_the_http_request() {
+        let spec = Spec::new("groq")
+            .with_base_url("https://api.groq.com/openai/v1")
+            .with_option("timeout", json!(300_000))
+            .with_option("headerTimeout", json!(330_000))
+            .with_option("chunkTimeout", json!(210_000));
+        let provider = build(spec).expect("ok");
+        let request = CompletionRequest::new(
+            "llama-3.3-70b",
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "hi",
+            )],
+        );
+
+        let http = provider.http_request(&request).expect("valid request");
+        assert_eq!(
+            http.timeouts.total(),
+            Some(std::time::Duration::from_millis(300_000))
+        );
+        assert_eq!(
+            http.timeouts.header(),
+            Some(std::time::Duration::from_millis(330_000))
+        );
+        assert_eq!(
+            http.timeouts.chunk(),
+            Some(std::time::Duration::from_millis(210_000))
+        );
+    }
+
+    #[test]
+    fn response_header_timeout_has_a_safe_default_and_false_disables_it() {
+        let default = build(Spec::new("groq").with_base_url("https://api.groq.com/openai/v1"))
+            .expect("default provider");
+        let disabled = build(
+            Spec::new("groq")
+                .with_base_url("https://api.groq.com/openai/v1")
+                .with_option("headerTimeout", json!(false)),
+        )
+        .expect("provider with disabled header timeout");
+        let request = CompletionRequest::new(
+            "llama-3.3-70b",
+            vec![zuno_llm::event::Message::new(
+                zuno_llm::event::Role::User,
+                "hi",
+            )],
+        );
+
+        assert_eq!(
+            default
+                .http_request(&request)
+                .expect("default request")
+                .timeouts
+                .header(),
+            Some(DEFAULT_RESPONSE_HEADER_TIMEOUT)
+        );
+        assert_eq!(
+            disabled
+                .http_request(&request)
+                .expect("disabled request")
+                .timeouts
+                .header(),
+            None
+        );
     }
 
     /// A session's reasoning level must reach the provider's own body builder.

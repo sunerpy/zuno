@@ -33,6 +33,48 @@ use crate::wire::ErrorEnvelope;
 /// survive.
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, ProviderError>> + Send>>;
 
+/// Per-request HTTP timeouts resolved from provider configuration.
+///
+/// A whole-request timeout spans response headers and every streamed body chunk.
+/// Header and chunk timeouts are phase-specific; the earliest applicable
+/// deadline wins without changing the other phase's policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HttpTimeouts {
+    total: Option<Duration>,
+    header: Option<Duration>,
+    chunk: Option<Duration>,
+}
+
+impl HttpTimeouts {
+    #[must_use]
+    pub const fn new(
+        total: Option<Duration>,
+        header: Option<Duration>,
+        chunk: Option<Duration>,
+    ) -> Self {
+        Self {
+            total,
+            header,
+            chunk,
+        }
+    }
+
+    #[must_use]
+    pub const fn total(self) -> Option<Duration> {
+        self.total
+    }
+
+    #[must_use]
+    pub const fn header(self) -> Option<Duration> {
+        self.header
+    }
+
+    #[must_use]
+    pub const fn chunk(self) -> Option<Duration> {
+        self.chunk
+    }
+}
+
 /// The default maximum silence between response-body chunks.
 ///
 /// This leaves thirty seconds beyond the ninety-second reasoning gaps already
@@ -59,6 +101,8 @@ pub struct HttpRequest {
     pub headers: BTreeMap<String, String>,
     /// The JSON body.
     pub body: Value,
+    /// Whole-request, response-header, and streamed-chunk timeouts.
+    pub timeouts: HttpTimeouts,
 }
 
 /// How a request reaches a server.
@@ -128,11 +172,26 @@ impl Transport for ReqwestTransport {
         let provider = self.provider.clone();
         let idle = self.idle;
         Box::pin(async move {
+            let started = tokio::time::Instant::now();
+            let total_deadline = request
+                .timeouts
+                .total()
+                .map(|duration| Deadline::after(started, duration, TimeoutPhase::WholeRequest));
+            let header_deadline = request
+                .timeouts
+                .header()
+                .map(|duration| Deadline::after(started, duration, TimeoutPhase::ResponseHeaders));
             let mut builder = client.post(&request.url).json(&request.body);
             for (name, value) in &request.headers {
                 builder = builder.header(name, value);
             }
-            let response = builder.send().await.map_err(ProviderError::transient)?;
+            let response = wait_until(
+                &provider,
+                earliest(total_deadline, header_deadline),
+                builder.send(),
+            )
+            .await?
+            .map_err(ProviderError::transient)?;
 
             let status = response.status();
             if !status.is_success() {
@@ -144,7 +203,9 @@ impl Transport for ReqwestTransport {
                 // Read as bytes and decode strictly: a non-UTF-8 error body loses
                 // its detail rather than being rendered with replacement
                 // characters that could be mistaken for the vendor's own text.
-                let bytes = response.bytes().await.map_err(ProviderError::transient)?;
+                let bytes = wait_until(&provider, total_deadline, response.bytes())
+                    .await?
+                    .map_err(ProviderError::transient)?;
                 let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
                 return Err(classify_response(
                     &provider,
@@ -155,46 +216,131 @@ impl Transport for ReqwestTransport {
             }
 
             let body = Box::pin(response.bytes_stream());
-            let chunks =
-                futures::stream::unfold(Some((body, provider, idle)), |state| async move {
-                    let (mut body, provider, idle) = state?;
-                    match tokio::time::timeout(idle.duration(), body.next()).await {
-                        Ok(Some(Ok(bytes))) => {
-                            Some((Ok(bytes.to_vec()), Some((body, provider, idle))))
-                        }
+            let chunk_timeout = request.timeouts.chunk().unwrap_or_else(|| idle.duration());
+            let chunks = futures::stream::unfold(
+                Some((body, provider, total_deadline, chunk_timeout)),
+                |state| async move {
+                    let (mut body, provider, total_deadline, chunk_timeout) = state?;
+                    let chunk_deadline = Deadline::after(
+                        tokio::time::Instant::now(),
+                        chunk_timeout,
+                        TimeoutPhase::ResponseChunk,
+                    );
+                    match wait_until(
+                        &provider,
+                        earliest(total_deadline, Some(chunk_deadline)),
+                        body.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(Ok(bytes))) => Some((
+                            Ok(bytes.to_vec()),
+                            Some((body, provider, total_deadline, chunk_timeout)),
+                        )),
                         Ok(Some(Err(error))) => Some((Err(ProviderError::transient(error)), None)),
                         Ok(None) => None,
-                        Err(_) => Some((
-                            Err(ProviderError::transient(ResponseIdleTimeout {
-                                provider,
-                                duration: idle.duration(),
-                            })),
-                            None,
-                        )),
+                        Err(error) => Some((Err(error), None)),
                     }
-                });
+                },
+            );
             Ok(Box::pin(chunks) as ChunkStream)
         })
     }
 }
 
-#[derive(Debug)]
-struct ResponseIdleTimeout {
-    provider: String,
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    at: tokio::time::Instant,
     duration: Duration,
+    phase: TimeoutPhase,
 }
 
-impl fmt::Display for ResponseIdleTimeout {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "provider `{}` response stream idle timeout after {:?}; raise {} for slower providers",
-            self.provider, self.duration, STREAM_IDLE_TIMEOUT_ENV
-        )
+impl Deadline {
+    fn after(started: tokio::time::Instant, duration: Duration, phase: TimeoutPhase) -> Self {
+        Self {
+            at: started + duration,
+            duration,
+            phase,
+        }
     }
 }
 
-impl std::error::Error for ResponseIdleTimeout {}
+fn earliest(left: Option<Deadline>, right: Option<Deadline>) -> Option<Deadline> {
+    match (left, right) {
+        (Some(left), Some(right)) if left.at <= right.at => Some(left),
+        (Some(_), Some(right)) => Some(right),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+async fn wait_until<F, T>(
+    provider: &str,
+    deadline: Option<Deadline>,
+    future: F,
+) -> Result<T, ProviderError>
+where
+    F: Future<Output = T>,
+{
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline.at, future)
+            .await
+            .map_err(|_| {
+                ProviderError::transient(HttpTimeoutError {
+                    provider: provider.to_owned(),
+                    duration: deadline.duration,
+                    phase: deadline.phase,
+                })
+            }),
+        None => Ok(future.await),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimeoutPhase {
+    WholeRequest,
+    ResponseHeaders,
+    ResponseChunk,
+}
+
+impl TimeoutPhase {
+    const fn description(self) -> &'static str {
+        match self {
+            Self::WholeRequest => "whole request timeout",
+            Self::ResponseHeaders => "response headers timeout",
+            Self::ResponseChunk => "response stream idle timeout",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct HttpTimeoutError {
+    provider: String,
+    duration: Duration,
+    phase: TimeoutPhase,
+}
+
+impl fmt::Display for HttpTimeoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "provider `{}` {} after {:?}",
+            self.provider,
+            self.phase.description(),
+            self.duration
+        )?;
+        if matches!(self.phase, TimeoutPhase::ResponseChunk) {
+            write!(
+                formatter,
+                "; raise provider options.chunkTimeout or {STREAM_IDLE_TIMEOUT_ENV} for slower providers"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HttpTimeoutError {}
 
 /// Classify a non-2xx response into the typed taxonomy.
 ///
@@ -471,6 +617,7 @@ mod tests {
                 url: format!("http://{address}/chat/completions"),
                 headers: BTreeMap::new(),
                 body: serde_json::json!({}),
+                timeouts: HttpTimeouts::default(),
             })
             .await;
         server.await.expect("fixture task");
@@ -498,13 +645,13 @@ mod tests {
     async fn a_stalled_stream_times_out_after_preserving_received_chunks() {
         let (address, server) =
             spawn_chunked_server(vec![(Duration::ZERO, b"PARTIAL_")], false).await;
-        let transport = ReqwestTransport::new("stalled-fixture")
-            .with_idle_timeout(StreamIdleTimeout::new(Duration::from_millis(75)));
+        let transport = ReqwestTransport::new("stalled-fixture");
         let mut chunks = transport
             .send(HttpRequest {
                 url: format!("http://{address}/chat/completions"),
                 headers: BTreeMap::new(),
                 body: serde_json::json!({}),
+                timeouts: HttpTimeouts::new(None, None, Some(Duration::from_millis(75))),
             })
             .await
             .expect("response headers should arrive");
@@ -525,6 +672,89 @@ mod tests {
         let cause = error.source().expect("idle timeout cause").to_string();
         assert!(cause.contains("idle timeout"), "{cause}");
         assert!(cause.contains("stalled-fixture"), "{cause}");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn a_whole_request_timeout_spans_the_streamed_body() {
+        let (address, server) =
+            spawn_chunked_server(vec![(Duration::ZERO, b"PARTIAL_")], false).await;
+        let transport = ReqwestTransport::new("whole-timeout-fixture");
+        let mut chunks = transport
+            .send(HttpRequest {
+                url: format!("http://{address}/responses"),
+                headers: BTreeMap::new(),
+                body: serde_json::json!({}),
+                timeouts: HttpTimeouts::new(
+                    Some(Duration::from_millis(150)),
+                    None,
+                    Some(Duration::from_secs(1)),
+                ),
+            })
+            .await
+            .expect("response headers should arrive");
+
+        let partial = chunks
+            .next()
+            .await
+            .expect("the stream should contain the partial chunk")
+            .expect("the partial chunk should be successful");
+        assert_eq!(partial, b"PARTIAL_");
+
+        let error = tokio::time::timeout(Duration::from_secs(1), chunks.next())
+            .await
+            .expect("the whole-request timeout must remain active")
+            .expect("the timeout must be a stream item")
+            .expect_err("a held-open response must fail at the whole-request deadline");
+        assert!(matches!(error, ProviderError::Transient { .. }));
+        let cause = error.source().expect("whole timeout cause").to_string();
+        assert!(cause.contains("whole request"), "{cause}");
+        assert!(cause.contains("150ms"), "{cause}");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn a_configured_header_timeout_bounds_the_wait_for_response_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind header-timeout fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 4096];
+            let bytes = socket.read(&mut request).await.expect("read request");
+            assert!(
+                request[..bytes].starts_with(b"POST "),
+                "fixture received an unexpected HTTP request"
+            );
+            std::future::pending::<()>().await;
+        });
+        let transport = ReqwestTransport::new("header-timeout-fixture");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.send(HttpRequest {
+                url: format!("http://{address}/responses"),
+                headers: BTreeMap::new(),
+                body: serde_json::json!({}),
+                timeouts: HttpTimeouts::new(None, Some(Duration::from_millis(75)), None),
+            }),
+        )
+        .await
+        .expect("the transport must apply the configured header timeout");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a server that never sends headers must fail"),
+        };
+
+        assert!(matches!(error, ProviderError::Transient { .. }));
+        let cause = error.source().expect("header timeout cause").to_string();
+        assert!(cause.contains("response headers"), "{cause}");
+        assert!(cause.contains("75ms"), "{cause}");
 
         server.abort();
         let _ = server.await;
@@ -581,6 +811,7 @@ mod tests {
                 url: format!("http://{address}/chat/completions"),
                 headers: BTreeMap::new(),
                 body: serde_json::json!({}),
+                timeouts: HttpTimeouts::default(),
             })
             .await
             .expect("response headers should arrive");

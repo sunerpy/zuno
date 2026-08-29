@@ -33,11 +33,12 @@ pub const RETRY_MAX_DELAY_WITHOUT_PROVIDER: Duration = Duration::from_secs(30);
 /// Maximum provider calls in one recovery sequence.
 pub const PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 3;
 
-/// Hard wall-clock budget for one provider recovery sequence.
+/// Wall-clock budget for coordinating one provider recovery sequence.
 ///
-/// This derives from the shared provider wait policy rather than multiplying an
-/// attempt count by an idle timeout. Either factor may change without enlarging
-/// this deadline.
+/// The budget starts only after the first retryable provider failure. Active
+/// provider attempts are governed by their transport and stream-idle policies;
+/// this budget limits rollback emission, backoff, and admission of another
+/// replay without killing a healthy long-running attempt.
 pub const PROVIDER_RETRY_MAX_ELAPSED: Duration = MAX_PROVIDER_WAIT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,17 +315,11 @@ where
     WakeFuture: Future<Output = T>,
 {
     let max = policy.max_attempts().get();
-    let started = tokio::time::Instant::now();
-    let deadline = started + policy.max_elapsed();
+    let mut recovery_started = None;
     let mut attempt = 1_u32;
 
     loop {
-        let result = tokio::time::timeout_at(deadline, operation(attempt))
-            .await
-            .map_err(|_| ProviderRetryError::DeadlineExceeded {
-                attempt,
-                elapsed: started.elapsed(),
-            })?;
+        let result = operation(attempt).await;
         match result {
             Ok(output) => return Ok(output),
             Err(error) if !error.is_retryable() => {
@@ -337,6 +332,8 @@ where
                 });
             }
             Err(error) => {
+                let started = *recovery_started.get_or_insert_with(tokio::time::Instant::now);
+                let deadline = started + policy.max_elapsed();
                 let delay = policy.delay_after(attempt, &error);
                 let next_attempt = attempt + 1;
                 if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {

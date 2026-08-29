@@ -96,5 +96,5 @@ pub use crate::quirks::Quirks;
 pub use crate::request::{RequestBody, Sampling};
 pub use crate::stream::{ChunkTranslator, ResponsesTranslator, SurfaceTranslator};
 pub use crate::surface::{SurfaceSupport, azure_surface, copilot_surface, endpoint_path};
-pub use crate::transport::{ChunkStream, HttpRequest, ReqwestTransport, Transport};
+pub use crate::transport::{ChunkStream, HttpRequest, HttpTimeouts, ReqwestTransport, Transport};
 pub use crate::wire::ChatChunk;
