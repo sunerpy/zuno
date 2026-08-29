@@ -1097,11 +1097,19 @@ fn publication_includes_the_checksum_manifest_required_by_self_update() {
 /// cross-toolchain. A C compiler for the host is required and expected — bundled
 /// SQLite and `aws-lc-sys` both compile C — so this scans for the specific
 /// mechanisms that were ruled out, not for compilation of C in general.
+///
+/// Scoped to the `build` job, because cross-compilation happens only there. The
+/// `smoke` job installs a runtime dependency of the artifact under test — the
+/// bubblewrap the OS sandbox backend requires — which is a package for the *host*
+/// that runs the binary, not a toolchain for a *target* it is built for. Scanning
+/// the whole file conflated the two and made a legitimate runtime install
+/// indistinguishable from the cross mechanism this rules out.
 #[test]
 fn the_musl_legs_use_zig_and_no_cross_toolchain() {
     let text = workflow("release.yml");
+    let build = job_body(&text, "build").join("\n");
     let mut offenders = Vec::new();
-    for (index, line) in text.lines().enumerate() {
+    for (index, line) in build.lines().enumerate() {
         let code = line.split('#').next().unwrap_or_default();
         let lowered = code.to_ascii_lowercase();
         let banned = [
@@ -1117,7 +1125,7 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
         for (needle, what) in banned {
             if lowered.contains(needle) {
                 offenders.push(format!(
-                    "  release.yml:{}: {what} (matched {needle:?})\n    {}",
+                    "  release.yml build job, line {}: {what} (matched {needle:?})\n    {}",
                     index + 1,
                     line.trim()
                 ));
@@ -1126,7 +1134,7 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
     }
     assert!(
         offenders.is_empty(),
-        "release.yml reaches for a per-target C cross-toolchain. Zig plus \
+        "release.yml's build job reaches for a per-target C cross-toolchain. Zig plus \
          cargo-zigbuild is a hermetic C cross-compiler in one download and is the \
          only cross mechanism this pipeline may use:\n{}",
         offenders.join("\n")
@@ -1159,6 +1167,42 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
                  would not use Zig on its dedicated CodeBuild route"
             );
         }
+    }
+
+    // Narrowing the scan above to `build` is only safe while the one job still
+    // allowed to reach apt uses it for the artifact's own runtime dependency. A
+    // toolchain package appearing here would be the same mistake wearing a
+    // different job name.
+    const SANDBOX_PACKAGE: &str = "bubblewrap";
+    for line in job_body(&text, "smoke") {
+        let code = line
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        // Only the install verb matters. `apt-get update` names no package, and
+        // accepting its presence as justification is what made an earlier version of
+        // this assertion vacuous: the injected `apt-get update && apt-get install
+        // musl-tools` satisfied it on the update half alone.
+        let Some(installed) = code
+            .split_once("apt-get install")
+            .or_else(|| code.split_once("apt install"))
+            .map(|(_, rest)| rest)
+        else {
+            continue;
+        };
+        let packages: Vec<&str> = installed
+            .split_whitespace()
+            .filter(|word| !word.starts_with('-') && *word != "&&")
+            .collect();
+        assert!(
+            !packages.is_empty() && packages.iter().all(|pkg| *pkg == SANDBOX_PACKAGE),
+            "release.yml's smoke job installs apt package(s) {packages:?}; only \
+             {SANDBOX_PACKAGE:?} is justified here (the OS sandbox backend the smoked \
+             binary requires). A toolchain package in this job is the same per-target \
+             cross mechanism the build job forbids, wearing a different job name:\n    {}",
+            line.trim()
+        );
     }
 }
 
