@@ -270,7 +270,7 @@ const CHANNELS: &[ChannelGate] = &[
         "PROMPT_CHANNEL_CAPACITY=1",
         Policy::RefuseNewest,
         "zuno-tui/src/views/session.rs",
-        "match prompts.try_send(TargetedPromptSubmission::root(submission)) {",
+        "match prompts.try_send(TargetedPromptSubmission::root_with(PromptEnvelope::new(",
     ),
     gate(
         "tui-queue-mutations",
@@ -306,7 +306,7 @@ const CHANNELS: &[ChannelGate] = &[
         "CANCEL_CHANNEL_CAPACITY=1",
         Policy::CoalesceFull,
         "zuno-tui/src/views/session.rs",
-        "cancels.try_send(()).is_ok()",
+        "cancels.try_send(HardInterruptRequest::new(",
     ),
     gate(
         "tui-edit-signal",

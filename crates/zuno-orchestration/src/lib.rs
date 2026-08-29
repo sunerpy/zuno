@@ -167,14 +167,36 @@ const NATIVE_PROVENANCE: SkillProvenance = SkillProvenance {
     upstream_revision: CAPABILITY_REVIEW_REVISION,
 };
 
+macro_rules! pack_source_id {
+    ($resource:literal) => {
+        concat!(
+            "zuno-orchestration:",
+            $resource,
+            "@",
+            env!("CARGO_PKG_VERSION")
+        )
+    };
+}
+
+macro_rules! pack_location {
+    ($name:literal) => {
+        concat!(
+            "builtin://zuno-orchestration/",
+            env!("CARGO_PKG_VERSION"),
+            "/",
+            $name
+        )
+    };
+}
+
 /// Every Skill shipped by the first-party pack, in stable presentation order.
 pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
     BuiltinSkillDescriptor {
         name: "customize-zuno",
         description: "Inspect or change Zuno configuration, providers, authentication, permissions, Agents, workflows, Skills, MCP servers, or extensions.",
         content: include_str!("skills/customize-zuno.md"),
-        source_id: "zuno-orchestration:skill/customize-zuno@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/customize-zuno",
+        source_id: pack_source_id!("skill/customize-zuno"),
+        location: pack_location!("customize-zuno"),
         allowed_profiles: USER_FACING_PROFILES,
         required_tools: &["read", "glob", "grep"],
         content_sha256: "f243f24bc396f7ef3cbe0cf51d753ad6c84de3f2a86d604afa2a8733b8167a9c",
@@ -184,8 +206,8 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         name: "develop-zuno",
         description: "Design or implement native Zuno configuration, Agents, Skills, providers, MCP integrations, extension plugins, or runtime extension points.",
         content: include_str!("skills/develop-zuno.md"),
-        source_id: "zuno-orchestration:skill/develop-zuno@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/develop-zuno",
+        source_id: pack_source_id!("skill/develop-zuno"),
+        location: pack_location!("develop-zuno"),
         allowed_profiles: USER_FACING_PROFILES,
         required_tools: &["read", "glob", "grep"],
         content_sha256: "e0ea2035be9220076bd020cf9d5eed2ec9159b54cfe370daa28ee3298a79a696",
@@ -195,8 +217,8 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         name: "deepwork",
         description: "Turn a bounded complex request into durable Goal, Plan, Todo, ownership, dependency, and verification state.",
         content: include_str!("skills/deepwork.md"),
-        source_id: "zuno-orchestration:skill/deepwork@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/deepwork",
+        source_id: pack_source_id!("skill/deepwork"),
+        location: pack_location!("deepwork"),
         allowed_profiles: DEEPWORK_PROFILES,
         required_tools: &[
             "goal_get",
@@ -212,8 +234,8 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         name: "codemap",
         description: "Use the native CodeGraph index and read-only tools to return a scoped structural code map with evidence.",
         content: include_str!("skills/codemap.md"),
-        source_id: "zuno-orchestration:skill/codemap@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/codemap",
+        source_id: pack_source_id!("skill/codemap"),
+        location: pack_location!("codemap"),
         allowed_profiles: CODEMAP_PROFILES,
         required_tools: &["read", "glob", "grep"],
         content_sha256: "0d52f475ad0dfa6a7d82049ad50b48d39f2201f67d5902ee30375e59a8f34d93",
@@ -223,8 +245,8 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         name: "verification-planning",
         description: "Define risk-proportional evidence, commands, fixtures, expected outputs, and acceptance surfaces before delivery.",
         content: include_str!("skills/verification-planning.md"),
-        source_id: "zuno-orchestration:skill/verification-planning@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/verification-planning",
+        source_id: pack_source_id!("skill/verification-planning"),
+        location: pack_location!("verification-planning"),
         allowed_profiles: VERIFICATION_PROFILES,
         required_tools: &["read"],
         content_sha256: "29d7b59c4b9b026617c48ddc574e2ad01bc6dd6585b87eef4a648e6c02ac0898",
@@ -234,8 +256,8 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         name: "reflect",
         description: "Extract bounded, reviewable memory candidates from confirmed outcomes without silently changing code or prompts.",
         content: include_str!("skills/reflect.md"),
-        source_id: "zuno-orchestration:skill/reflect@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/reflect",
+        source_id: pack_source_id!("skill/reflect"),
+        location: pack_location!("reflect"),
         allowed_profiles: REFLECT_PROFILES,
         required_tools: &["read"],
         content_sha256: "fc492f59ae4d699a855f5f6372eb4822293abfefae4f4c6812f86deec12b8d84",
@@ -245,8 +267,8 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         name: "worktree",
         description: "Safely inspect, create, use, integrate, and clean up user-authorized Git worktrees without claiming runtime-owned leases.",
         content: include_str!("skills/worktree.md"),
-        source_id: "zuno-orchestration:skill/worktree@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/worktree",
+        source_id: pack_source_id!("skill/worktree"),
+        location: pack_location!("worktree"),
         allowed_profiles: MUTATING_WORK_PROFILES,
         required_tools: &["read", "shell"],
         content_sha256: "29db03056613a6790bed39a2517b35cfc704be0e7a90054831ae7e23de5cc740",
@@ -256,8 +278,8 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         name: "git-workflow",
         description: "Inspect repository state, preserve user changes, scope commits, and verify staged delivery without destructive cleanup.",
         content: include_str!("skills/git-workflow.md"),
-        source_id: "zuno-orchestration:skill/git-workflow@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/git-workflow",
+        source_id: pack_source_id!("skill/git-workflow"),
+        location: pack_location!("git-workflow"),
         allowed_profiles: MUTATING_WORK_PROFILES,
         required_tools: &["read", "shell"],
         content_sha256: "43b7bf1bfb989c13b6352af40531587e480f62151ec7cb94fa7a6206e0d299ab",
@@ -267,8 +289,8 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         name: "ui-design",
         description: "Review or implement UI with existing-system alignment, interaction and accessibility requirements, and real visual acceptance evidence.",
         content: include_str!("skills/ui-design.md"),
-        source_id: "zuno-orchestration:skill/ui-design@0.1.0",
-        location: "builtin://zuno-orchestration/0.1.0/ui-design",
+        source_id: pack_source_id!("skill/ui-design"),
+        location: pack_location!("ui-design"),
         allowed_profiles: UI_DESIGN_PROFILES,
         required_tools: &["read", "skill"],
         content_sha256: "c7be8a1d626f396f2dd068f6ca4f0cd64565bfc5584dba52e7360f4676afb7c0",
@@ -298,7 +320,7 @@ const BALANCED_REVIEW_SEATS: [BuiltinCouncilSeatDescriptor; 3] = [
 pub const COUNCILS: [BuiltinCouncilPresetDescriptor; 1] = [BuiltinCouncilPresetDescriptor {
     name: "balanced-review",
     description: "Run implementation, contract, and decision reviewers independently, require two valid seats, and synthesize while preserving dissent.",
-    source_id: "zuno-orchestration:council/balanced-review@0.1.0",
+    source_id: pack_source_id!("council/balanced-review"),
     seats: &BALANCED_REVIEW_SEATS,
     quorum: 2,
     max_parallel: 3,

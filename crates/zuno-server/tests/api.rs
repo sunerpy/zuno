@@ -19,7 +19,7 @@ use zuno_db::event_log::SessionEventLog;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox};
 use zuno_db::session::SessionCreate;
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
-use zuno_engine::r#loop::TurnEventSender;
+use zuno_engine::r#loop::{TurnEvent, TurnEventSender};
 use zuno_engine::status::{AbortDisposition, SessionStatus};
 use zuno_paths::DbLocation;
 use zuno_permission::ReplyKind;
@@ -117,6 +117,43 @@ impl SessionMutationExecutor for BlockingMutationExecutor {
         _events: TurnEventSender,
     ) -> SessionMutationFuture {
         self.compact_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Debug, Default)]
+struct InterruptEventExecutor {
+    started: Arc<Notify>,
+}
+
+impl SessionMutationExecutor for InterruptEventExecutor {
+    fn prompt(
+        &self,
+        _request: SessionPromptExecution,
+        guard: zuno_engine::status::SessionRunGuard,
+        events: TurnEventSender,
+    ) -> SessionMutationFuture {
+        let started = Arc::clone(&self.started);
+        Box::pin(async move {
+            started.notify_one();
+            guard.interrupt_signal().notified().await;
+            events
+                .publish(TurnEvent::TurnInterrupted {
+                    assistant_message_id: None,
+                    steps: 0,
+                    request: guard.interrupt_request(),
+                })
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn compact(
+        &self,
+        _request: SessionCompactExecution,
+        _guard: zuno_engine::status::SessionRunGuard,
+        _events: TurnEventSender,
+    ) -> SessionMutationFuture {
         Box::pin(async { Ok(()) })
     }
 }
@@ -1250,6 +1287,67 @@ async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
             model: None,
         }]
     );
+}
+
+#[tokio::test]
+async fn api_interrupt_source_reaches_the_durable_turn_event() {
+    let fixture = MutationApiFixture::new("ses_interrupt_event");
+    let executor = Arc::new(InterruptEventExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let state = fixture
+        .state
+        .clone()
+        .with_events(EventService::new(Arc::clone(&fixture.pool), 64));
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(state))
+        .router();
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_interrupt_event/prompt",
+            Some(json!({
+                "id": "msg_interrupt_event",
+                "prompt": {"text": "wait for cancellation", "files": [], "agents": []}
+            })),
+        ))
+        .await
+        .expect("prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    executor.started.notified().await;
+
+    let interrupted = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_interrupt_event/interrupt",
+            None,
+        ))
+        .await
+        .expect("interrupt responds");
+    assert_eq!(interrupted.status(), StatusCode::NO_CONTENT);
+    services.runs.wait_until_idle("ses_interrupt_event").await;
+
+    let event_log = SessionEventLog::new(fixture.pool);
+    let properties = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let events = event_log
+                .read_after("ses_interrupt_event", None)
+                .expect("durable session events");
+            if let Some(interruption) = events
+                .iter()
+                .find(|event| event.event_type == "turn.interrupted")
+            {
+                return interruption.properties.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("typed turn interruption becomes durable");
+    assert_eq!(properties["source"], "api");
+    assert_eq!(properties["reason"], "user_cancel");
 }
 
 #[tokio::test]

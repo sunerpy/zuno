@@ -708,7 +708,13 @@ next turn; `Ctrl+Enter` is the explicit `steer` override and requests a soft
 interrupt at the nearest safe step boundary. `Shift+Enter`, `Alt+Enter`, and
 `Ctrl+J` insert a newline. The UI reports an item as queued only after SQLite
 commits it, and pending items can be edited or cancelled by revision and survive
-a process restart.
+a process restart. Submission transport is a typed envelope with independent
+`payload`, `delivery`, and `origin` fields. The command palette's immediate-send
+action and input sent to a running child session also produce `steer`; ordinary
+busy input produces `queue`. Only text and typed rich-content payloads may steer.
+Commands, Skills, Council requests, and host commands are queued even if their UI
+gesture requested immediate delivery. The HTTP prompt API follows the same rule:
+omitting `delivery` means `queue`, while `steer` must be explicit.
 
 User input is typed rich content, not only a rendered string. A local image is
 persisted before execution as a durable file part carrying filename, MIME type,
@@ -727,7 +733,8 @@ result reaches the next tool-safe point first. Commands and ordinary active-turn
 submissions target the FIFO queue. If the turn ends before a steer is consumed,
 the already admitted item remains pending and is promoted in FIFO order on the
 next turn; it is never lost or duplicated. The bounded in-process prompt channel
-is only a wakeup and handoff path, not the queue of record.
+is only a wakeup and handoff path, not the queue of record. A steer never fires
+the hard-interrupt signal and therefore cannot cancel a foreground `task`.
 
 Tool-owned human input is projected separately from execution. A permission
 prompt reports `awaiting approval`; a structured question reports `awaiting
@@ -836,11 +843,15 @@ summary input keeps a stable human label such as
 `[Attached diagram.png (image/png)]`, while the original durable file part
 remains unchanged for authoritative replay.
 
-A hard interruption is session-scoped and linearizable across turn handoff. If
-the previous run guard has dropped but an already admitted follow-up has not yet
-acquired its guard, the registry arms that next guard instead of discarding the
-interrupt. The turn starts with its interrupt signal set, emits the normal
-terminal interruption event, and issues no provider request.
+A hard interruption is a typed `HardInterruptRequest` carrying both source and
+reason. Sources distinguish TUI, ACP, HTTP API, and lifecycle teardown; reasons
+distinguish user cancellation, request cancellation, exit, shutdown, and session
+close. It is session-scoped and linearizable across turn handoff. If the previous
+run guard has dropped but an already admitted follow-up has not yet acquired its
+guard, the registry arms that next guard instead of discarding the interrupt.
+The first accepted request remains authoritative, so later shutdown cannot
+overwrite an earlier user action. The turn starts with its interrupt signal set,
+emits the normal terminal interruption event, and issues no provider request.
 
 Within one mounted TUI session, model, agent, effort, and MCP changes may replace
 the `TurnHost`, but they must reuse the mounted session's `SessionRunRegistry`
@@ -853,11 +864,17 @@ and suppresses late provider or tool presentation until `TurnInterrupted` or
 `TurnCompleted` establishes the terminal boundary. Durable persistence and
 diagnostics still run; the client merely refuses to present post-cancel work as
 continued conversation. A side effect that completed before cancellation remains
-an observed result and is never mechanically replayed. `TurnInterrupted` adds a
-separate session-owned `Conversation interrupted by user.` row to the live
-transcript. If an assistant checkpoint exists, the same marker is persisted in
-its typed abort error and reconstructed as a separate row when the session is
-resumed; it is never presented as assistant prose.
+an observed result and is never mechanically replayed. A running tool receives a
+two-second cooperative cleanup window. Settling in that window produces a typed
+`cooperative` cancellation and preserves the tool's terminal report; expiry
+force-aborts the invocation and records `forced` plus `uncertain`, requiring
+authoritative-state inspection before retry. Post-tool hooks may add diagnostics
+but cannot rewrite either cancellation outcome as an ordinary failure.
+`TurnInterrupted` adds a separate session-owned
+`Conversation interrupted by user.` row to the live transcript. The source and
+reason are persisted on `turn.interrupted` and, when an assistant checkpoint
+exists, inside its typed abort error. TUI and ACP replay reconstruct cancellation
+as session state rather than assistant prose or a normal task failure.
 
 Assistant checkpoints reconcile message usage and the session usage projection in the same
 transaction. Repeated checkpoints subtract the previous message snapshot before adding the new
@@ -1170,9 +1187,19 @@ cancelled parent waits until the child runner has acknowledged cancellation and
 shut down; it cannot return a successful child result from the same cancellation
 tick. Every native `task`, foreground or background, is first admitted as a
 durable internal `job_*` while retaining a separate child session identifier for
-conversational continuation. A foreground Job remains attached to the current
-tool call and uses quiet delivery; a background Job follows the selected
-`reportDelivery`.
+conversational continuation. A foreground Child Turn is owned by an independent
+supervisor: dropping or force-aborting the outer `TaskTool` future only cancels
+its token and cannot destroy Job settlement. If the child has not stopped ten
+seconds after cancellation, the supervisor force-aborts it and settles the Job
+as `uncertain`; it never leaves an owned Job permanently `running`. A foreground
+Job remains attached to the current tool call and uses quiet delivery; a
+background Job follows the selected `reportDelivery`.
+
+Background Jobs are independent after admission. Steering or hard-cancelling the
+parent turn does not stop them. They terminate only through an explicit Job
+cancellation, closure of their owning session, or process lifecycle shutdown;
+their supervisor then records the authoritative terminal status before report
+delivery.
 
 Enabled `productAgent` instances register independent static tools backed by a host-installed Codex or Claude Code process. A product invocation has a one-shot `run_*` id and, in background mode, a separate `job_*` id. It does not create a Zuno child session and cannot be resumed as one.
 
