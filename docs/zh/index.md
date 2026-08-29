@@ -115,3 +115,13 @@ zuno run --agent plan "为什么重试预算在首次尝试之前就开始计时
 | 查某条命令 | [CLI 参考](/zh/cli/) |
 | 在编辑器里工作 | [编辑器与 ACP](/zh/guide/editors) |
 | 排查一个故障 | [常见问题](/zh/operate/faq) |
+
+## 关于中文文档
+
+中文文档与英文文档来自同一份源文件仓库，随代码一起维护。绝大多数页面是完整翻译；
+其中 [配置项参考](/zh/config/reference) 与 [Harness 运行时](/zh/operate/harness-runtime)
+两页篇幅较长，中文版是导读，逐节的完整契约以英文版为权威来源，页首已标注。
+
+发现译文与实际行为不一致时，以英文版和
+[`schemas/zuno.json`](https://github.com/sunerpy/zuno/blob/main/schemas/zuno.json)
+为准，并欢迎直接提 issue 或 pull request。
