@@ -34,8 +34,15 @@ ZUNO_CONFIG_DIR="$HOME/.config/zuno/profiles/kiro" zuno
 
 一个 `zuno.json` 可以声明多个 provider。provider id 是 catalog 命名空间，而 preset 决定每个 Agent 使用哪条限定的 `provider/model` 路由。已纳入检查的 [`examples/config/zuno-multi-provider.json`](https://github.com/sunerpy/zuno/blob/main/examples/config/zuno-multi-provider.json) 在同一个 catalog 中同时保留 `myopenai` 与 `kiro-local`，并定义了三个团队。
 
-::: tip 本页与英文原文的关系
-本页是配置的中文说明。逐键的完整枚举以英文版 [Configuration reference](https://github.com/sunerpy/zuno/blob/main/docs/reference/configuration.md) 为权威来源，当两者出现分歧时以英文版和 [`schemas/zuno.json`](https://github.com/sunerpy/zuno/blob/main/schemas/zuno.json) 为准。
+::: tip 本页与英文原文的覆盖范围
+安全相关章节（沙箱模式与降级、权限模式与规则、严格 HITL 授权、Agent 能力上限）是完整
+翻译，限定条件与英文版逐条一致。
+
+其余章节是要点说明：并发、压缩、Council、Skill 发现等给出关键字段与默认值，但没有逐句
+复现英文版对每个字段的展开论述。需要某个字段的完整语义时，查阅英文版
+[Configuration reference](https://github.com/sunerpy/zuno/blob/main/docs/reference/configuration.md)
+与 [`schemas/zuno.json`](https://github.com/sunerpy/zuno/blob/main/schemas/zuno.json)；
+两者出现分歧时以英文版和 schema 为准。
 :::
 
 ## JSON Schema
