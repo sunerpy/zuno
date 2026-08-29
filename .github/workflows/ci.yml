@@ -126,11 +126,19 @@ jobs:
       # session when no trusted `bwrap` is on the system
       # (crates/zuno-sandbox/src/lib.rs:719 `BubblewrapNotFound`). That is deliberate
       # — an unavailable backend must never silently downgrade to running unconfined.
-      # The CodeBuild `standard:7.0` image ships no bubblewrap, so 14 `acp_stdio`
-      # tests failed `session/new` with `no trusted system bubblewrap executable was
-      # found` on run 33236972372. Not available through taiki-e/install-action, so
-      # it comes from apt; `sudo` is absent in some CodeBuild images and present in
-      # others, hence the conditional.
+      # No CodeBuild image ships bubblewrap, so 14 `acp_stdio` tests failed
+      # `session/new` on run 33236972372 until this step existed.
+      #
+      # REQUIRES an Ubuntu 24.04 image. `zuno-sandbox` demands `--disable-userns` and
+      # `--assert-userns-disabled` (linux.rs:22-31), both introduced in bubblewrap
+      # 0.8.0. The runner project ran `standard:7.0` (Ubuntu 22.04 jammy, bubblewrap
+      # 0.6.x), where this step installed successfully and the tests then failed with
+      # `bubblewrap does not provide required option` — measured on run 33237427091.
+      # The `zuno-runner` project was moved to `standard:8.0` (noble, 0.9.0) for this
+      # reason; do not move it back without replacing this step.
+      #
+      # Not available through taiki-e/install-action, so it comes from apt; `sudo` is
+      # absent in some CodeBuild images and present in others, hence the conditional.
       - name: Install bubblewrap for the OS sandbox backend
         run: |
           set -euo pipefail
