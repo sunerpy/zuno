@@ -861,7 +861,7 @@ git diff --check
    命令已落地。
 6. GPT 5.6 Sol / Claude Opus 5 已分别完成原子任务、深度 Debug、并行委派和
    Plan-only E2E；最终 gate 结果和剩余风险以
-   [验收审计](../audits/prompt-workflow-v2-validation-2026-08-28.zh-CN.md) 为准。
+   [验收审计](https://github.com/sunerpy/zuno/blob/main/docs/audits/prompt-workflow-v2-validation-2026-08-28.zh-CN.md) 为准。
 7. 完整 provider-visible Prompt 在已知 context limit 下执行总预算门禁；typed
    child report 可从数据库一致回放到 TUI、ACP 与 CLI。
 8. 上游只作为 adopt/adapt/reject 的设计来源，不复制完整 Prompt 或专属工作流。
