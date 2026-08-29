@@ -5,9 +5,9 @@ hero:
   name: Zuno
   text: Zero code. Any task.
   tagline: >
-    A single-binary coding agent CLI in Rust. No runtime dependency, sessions that
-    survive a restart, and an OS sandbox that fails closed by default while keeping
-    native execution behind an explicit trusted choice.
+    A single-binary coding agent CLI in Rust. Goals with budgets and real termination
+    conditions, a roster of specialist agents instead of one all-purpose prompt, and
+    orchestration the model cannot rewrite at runtime.
   actions:
     - theme: brand
       text: Quick start
@@ -20,51 +20,53 @@ hero:
       link: https://github.com/sunerpy/zuno
 
 features:
-  - title: One binary, nothing beside it
+  - title: Goals that converge instead of drifting
     details: >
-      Static musl builds for Linux, native builds for macOS and Windows. No Node,
-      no Python, no runtime to keep aligned with the agent's version.
-    link: /guide/installation
-    linkText: Install
-
-  - title: A sandbox that fails closed by default
-    details: >
-      Read-only and workspace-write both require a proved OS confinement backend.
-      When none is available Zuno refuses to start the session instead of silently
-      running your code unconfined, unless trusted policy explicitly selects native
-      execution or unavailable-only fallback.
-    link: /guide/permissions
-    linkText: Permissions and sandboxing
-
-  - title: Durable by construction
-    details: >
-      Every prompt section, tool result and subagent report is persisted before the
-      provider request. A restart reconstructs the work, including retry deadlines
-      read back from SQLite.
+      A goal carries an objective the model cannot narrow, success criteria it cannot
+      rewrite, and a token ceiling. Marking it done needs authoritative evidence;
+      reporting blocked needs a concrete condition that survived three turns.
     link: /guide/durable-state
     linkText: Goals, plans and todos
 
-  - title: Native extensions, not a plugin ABI
+  - title: A specialist roster, not one prompt
     details: >
-      WebAssembly components under explicit WASI grants, or contained child
-      processes speaking line-delimited JSON-RPC. Capabilities are declared and
-      checked, never inherited by accident.
-    link: /plugins
-    linkText: Plugins and extensions
+      Ten selectable agents with different capability ceilings. A contract can only
+      narrow authority, never widen it, so choosing the read-only agent is a guarantee
+      rather than a default configuration can reverse.
+    link: /guide/agents
+    linkText: Agents
 
-  - title: Delegation with real boundaries
+  - title: Orchestration owned by configuration
     details: >
-      Hand a bounded objective to a specialist agent. Child reports are evidence the
-      parent verifies, and a child can never obtain a tool its parent lacks.
+      Council seats, quorum, concurrency, retry policy and deadlines are configuration.
+      The model supplies the question and cannot relax its own constraints under
+      pressure.
     link: /orchestration
     linkText: Orchestration
 
-  - title: Bring your own provider
+  - title: Delegation with real boundaries
     details: >
-      Anthropic, OpenAI, Google, Bedrock, and any OpenAI-compatible endpoint.
-      Credentials stay in a store you control; model routing is configuration.
-    link: /reference/providers
-    linkText: Providers and credentials
+      A child never obtains a tool its parent lacks, delegates names exactly who it may
+      call, and its report is evidence the parent verifies rather than a conclusion to
+      adopt.
+    link: /orchestration
+    linkText: Delegation
+
+  - title: One binary, one external dependency
+    details: >
+      Static musl on Linux, native builds elsewhere. No Node, no Python, no runtime to
+      keep aligned. The single requirement is ripgrep 14+, because glob and grep drive
+      real ripgrep rather than a reimplementation.
+    link: /guide/installation
+    linkText: Install
+
+  - title: Native components, not a plugin ABI
+    details: >
+      DeepSeek Harness's "everything is a plugin" made concrete as a Rust Component:
+      typed services, an exact disposer per started effect, and transactional profile
+      replacement. No Rust dynamic libraries, because unloading one proves nothing.
+    link: /plugins
+    linkText: Plugins and extensions
 ---
 
 ## Install
@@ -91,23 +93,30 @@ Then start the terminal application:
 zuno
 ```
 
-## What a turn actually is
+## Pick the agent, not the prompt
 
-Zuno is not a chat window that happens to run commands. A turn is a durable unit of
-work: the assembled prompt is written to SQLite before the request leaves, every
-tool result is logged as an event, and the session can be replayed or resumed after
-the process dies.
+Most of what you configure in Zuno is *who* does the work. An agent's contract fixes
+its ceiling before the turn starts, so the choice is a property of the run rather than
+a request the model may reinterpret.
 
 ```sh
-# Make a change, with the workspace-write sandbox and the tests as the gate.
+# Read-only investigation. No write tool is registered at all, whatever the config says.
+zuno run --agent plan "why does the retry budget start before the first attempt?"
+
+# End-to-end delivery, with the tests as the gate.
 zuno run "add pagination to the /users endpoint and run the tests"
+
+# Hard cross-cutting work that should not fan out further.
+zuno run --agent deep "make session recovery survive a mid-turn provider failure"
 
 # Continue the most recent session rather than starting a new one.
 zuno run --continue "now cap the page size at 100"
-
-# Read-only investigation. No write tool is registered at all.
-zuno run --agent plan "why does the retry budget start before the first attempt?"
 ```
+
+Underneath, a turn is a durable unit of work: the assembled prompt is written to SQLite
+before the request leaves, every tool result is logged as an event, and the session can
+be replayed or resumed after the process dies. That is the floor the guarantees above
+stand on, not the selling point.
 
 ## Where to go next
 
