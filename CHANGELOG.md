@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.0](https://github.com/sunerpy/zuno/compare/v0.0.1...v0.1.0) (2026-08-30)
+
+
+### Features
+
+* initial release ([ef8f46f](https://github.com/sunerpy/zuno/commit/ef8f46fd34c6c2f903269dbe769c42925e874c89))
+
+
+### Bug Fixes
+
+* **provider:** retry malformed upstream tool arguments ([89c3f00](https://github.com/sunerpy/zuno/commit/89c3f0068d5bd94558c57ee1b59a322bc72d6110))
+
 ## 0.0.1
 
 First published release. Zuno is in pre-release development: configuration, data
