@@ -3696,14 +3696,14 @@ async fn execute_host_command(
     events: &TurnEventSender,
 ) -> Result<(), String> {
     match command {
-        HostCommand::Compact => {
-            host.execute_session_command(SessionCommand::Compact, "", events.clone())
-                .await
-        }
-        HostCommand::Goal(arguments) => {
-            host.execute_session_command(SessionCommand::Goal, &arguments, events.clone())
-                .await
-        }
+        HostCommand::Compact => host
+            .execute_session_command(SessionCommand::Compact, "", events.clone())
+            .await
+            .map_err(|error| error.to_string()),
+        HostCommand::Goal(arguments) => host
+            .execute_session_command(SessionCommand::Goal, &arguments, events.clone())
+            .await
+            .map_err(|error| error.to_string()),
         HostCommand::Undo | HostCommand::Redo => restore_snapshot(command, snapshots, events).await,
         HostCommand::Plan | HostCommand::StartPlan | HostCommand::StartWork => {
             Err("plan mode controls must be handled by the TUI selection layer".to_owned())

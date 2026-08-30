@@ -166,7 +166,7 @@ Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所�
 
 `/compact` 不接受参数。它调用与 TUI 相同的持久压缩路径，只在该命令达到终态生命周期事件之后才返回，并且不会把字面的斜杠命令发送给模型。原生控制项优先，因此一个用户定义的名为 `compact` 的命令或 Skill 不会作为第二个有歧义的条目被发布。
 
-`/goal` 暴露与 TUI 相同的持久 goal 处理器。它接受 `show`、`history`、`create <objective>`、`edit <objective>`、`pause`、`resume`、`block <reason>`、`complete` 和 `cancel`；省略动作则显示当前 goal。该命令的输出投影为一条普通的 Agent 消息，而不是推理内容。
+`/goal` 暴露与 TUI 相同的持久 goal 处理器。不带参数时显示当前 Goal；`/goal <目标>` 会在尚无 Goal 或上一条 Goal 已完成、已取消时创建新 Goal，否则更新当前目标并保留生命周期状态、预算和累计用量。`show`、`history`、`create <目标>`、`edit <目标>`、`pause`、`resume`、`block <原因>`、`complete` 和 `cancel` 等显式 action 仍然可用，且首词匹配时优先。该命令的输出投影为一条普通的 Agent 消息，而不是推理内容；显式 action 的非法参数会返回 JSON-RPC invalid params，而不是内部会话错误。
 
 `/plan` 在 Build 与 Plan 之间切换。`/start-plan` 直接进入只读的 Plan 模式，而 `/start-work` 返回 Build。离开 Plan 需要存在一个持久 plan，因此过早的交接会显式失败，而不是削弱模式边界。成功的更改会发出 ACP 的 `current_mode_update` 与 `config_option_update` 通知，让 Zed 的选择器保持同步。这些原生命令都不会被发送给模型。
 
@@ -327,7 +327,7 @@ dev: open acp logs
 1. 在 Zed 中打开一个真实的项目文件夹并创建一个 Zuno Agent 线程；
 2. 选择 `deep`、目标模型，以及 `xhigh` 或 `max`，然后确认该选择显示在会话控制项中；
 3. 输入 `/`，确认 `/compact`、`/goal`、`/plan`、`/start-plan` 和 `/start-work` 各出现且仅出现一次；
-4. 执行 `/goal create verify ACP`，然后执行 `/goal show`，确认结果作为 Agent 输出出现，而不是作为 Thinking；
+4. 执行 `/goal 验证 ACP 简写`、`/goal edit 验证 ACP action` 和 `/goal show`，确认直接目标与显式 action 都作为 Agent 输出出现，而不是作为 Thinking；
 5. 执行 `/start-plan`，确认 Zed 切换到 Plan，然后创建一个持久 plan 并执行 `/start-work`；
 6. 在积累了足够的对话历史之后，执行 `/compact` 并确认摘要能在一次会话重新加载后存活；
 7. 执行一个已配置的命令或一个无歧义的 Skill；

@@ -42,7 +42,7 @@ impl SessionCommand {
     pub const fn description(self) -> &'static str {
         match self {
             Self::Compact => "Summarize older context and keep the recent turn tail",
-            Self::Goal => "View or manage the durable session goal",
+            Self::Goal => "Set, view, or manage the durable session goal",
             Self::Plan => "Enter Plan mode, or resume Work mode when already planning",
             Self::StartPlan => "Enter read-only Plan mode immediately",
             Self::StartWork => "Resume implementation from the durable plan",
@@ -59,7 +59,7 @@ impl SessionCommand {
     #[must_use]
     pub const fn input_hint(self) -> Option<&'static str> {
         match self {
-            Self::Goal => Some("action [value]"),
+            Self::Goal => Some("objective | action [value]"),
             Self::Compact | Self::Plan | Self::StartPlan | Self::StartWork => None,
         }
     }
@@ -122,7 +122,10 @@ mod tests {
     #[test]
     fn only_goal_accepts_a_free_form_argument_tail() {
         assert!(SessionCommand::Goal.accepts_arguments());
-        assert_eq!(SessionCommand::Goal.input_hint(), Some("action [value]"));
+        assert_eq!(
+            SessionCommand::Goal.input_hint(),
+            Some("objective | action [value]")
+        );
         for command in [
             SessionCommand::Compact,
             SessionCommand::Plan,

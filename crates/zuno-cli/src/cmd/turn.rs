@@ -78,9 +78,9 @@ use zuno_error::{DbError, ProviderError, Recovery};
 use zuno_goal::{
     ContinuationAttempt, ContinuationSuppression, DEFAULT_GOAL_RETRY_INITIAL_DELAY,
     DEFAULT_GOAL_RETRY_JITTER_PERCENT, DEFAULT_GOAL_RETRY_MAX_DELAY,
-    DEFAULT_GOAL_RETRY_POLL_INTERVAL, GoalContinuation, GoalFailureDisposition, GoalProjection,
-    GoalRetryPolicy, GoalRetryReason, GoalRetryState, GoalStore, GoalTerminalFailure, GoalTurnMode,
-    GoalTurnOutcome, QueuedUserInput,
+    DEFAULT_GOAL_RETRY_POLL_INTERVAL, GoalContinuation, GoalError, GoalFailureDisposition,
+    GoalProjection, GoalRetryPolicy, GoalRetryReason, GoalRetryState, GoalStatus, GoalStore,
+    GoalTerminalFailure, GoalTurnMode, GoalTurnOutcome, QueuedUserInput,
 };
 use zuno_llm::cache::{DynamicContext, McpToolStatus};
 use zuno_llm::catalog::resolved::ModelEndpoint;
@@ -126,6 +126,51 @@ const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 pub(crate) const DEFAULT_AGENT: &str = "orchestrator";
 
 const ZUNO_ENABLE_EXPERIMENTAL_MODELS: &str = "ZUNO_ENABLE_EXPERIMENTAL_MODELS";
+
+/// A native session-command failure with enough type information for each client surface.
+#[derive(Debug)]
+pub(crate) enum SessionCommandError {
+    /// The command was understood, but its arguments or requested transition were invalid.
+    InvalidArguments(String),
+    /// Storage, projection, lifecycle, or host wiring failed.
+    Internal(String),
+}
+
+impl SessionCommandError {
+    fn invalid_arguments(message: impl Into<String>) -> Self {
+        Self::InvalidArguments(message.into())
+    }
+
+    fn internal(error: impl fmt::Display) -> Self {
+        Self::Internal(error.to_string())
+    }
+
+    fn goal(error: GoalError) -> Self {
+        if error.is_model_refusal() {
+            Self::InvalidArguments(error.to_string())
+        } else {
+            Self::Internal(error.to_string())
+        }
+    }
+
+    /// Whether an ACP client should receive JSON-RPC `invalid params`.
+    #[must_use]
+    pub(crate) fn is_invalid_arguments(&self) -> bool {
+        matches!(self, Self::InvalidArguments(_))
+    }
+}
+
+impl fmt::Display for SessionCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidArguments(message) | Self::Internal(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionCommandError {}
 
 /// Which session a surface wants to talk in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3202,8 +3247,9 @@ impl TurnHost {
         .await
     }
 
-    pub(super) fn goal_command(&mut self, arguments: &str) -> Result<String, String> {
-        let mut parts = arguments.trim().splitn(2, char::is_whitespace);
+    pub(super) fn goal_command(&mut self, arguments: &str) -> Result<String, SessionCommandError> {
+        let arguments = arguments.trim();
+        let mut parts = arguments.splitn(2, char::is_whitespace);
         let action = parts.next().unwrap_or_default();
         let value = parts.next().unwrap_or_default().trim();
         let mut changed = false;
@@ -3212,40 +3258,51 @@ impl TurnHost {
             "history" => serde_json::to_value(
                 self.goal_store
                     .history(&self.session_id)
-                    .map_err(to_string)?,
+                    .map_err(SessionCommandError::goal)?,
             )
-            .map_err(to_string)?,
+            .map_err(SessionCommandError::internal)?,
             "create" => {
                 if value.is_empty() {
-                    return Err("usage: /goal create <objective>".to_owned());
+                    return Err(SessionCommandError::invalid_arguments(
+                        "usage: /goal create <objective>",
+                    ));
                 }
-                self.materialize_session()?;
+                self.materialize_session()
+                    .map_err(SessionCommandError::internal)?;
                 let goal = self
                     .goal_store
                     .create_goal(&self.session_id, value, None)
-                    .map_err(to_string)?;
+                    .map_err(SessionCommandError::goal)?;
                 changed = true;
-                serde_json::to_value(goal).map_err(to_string)?
+                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
             }
             "edit" => {
                 if value.is_empty() {
-                    return Err("usage: /goal edit <objective>".to_owned());
+                    return Err(SessionCommandError::invalid_arguments(
+                        "usage: /goal edit <objective>",
+                    ));
                 }
                 let expected_revision = self
                     .goal_store
                     .goal(&self.session_id)
-                    .map_err(to_string)?
-                    .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
+                    .map_err(SessionCommandError::goal)?
+                    .ok_or_else(|| {
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
+                    })?
                     .revision;
                 let goal = self
                     .goal_store
                     .update_objective_checked(&self.session_id, value, expected_revision)
-                    .map_err(to_string)?
+                    .map_err(SessionCommandError::goal)?
                     .ok_or_else(|| {
-                        "no goal exists; run /goal create <objective> first".to_owned()
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
                     })?;
                 changed = true;
-                serde_json::to_value(goal).map_err(to_string)?
+                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
             }
             "pause" | "resume" | "cancel" => {
                 let status = match action {
@@ -3257,32 +3314,44 @@ impl TurnHost {
                 let expected_revision = self
                     .goal_store
                     .goal(&self.session_id)
-                    .map_err(to_string)?
-                    .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
+                    .map_err(SessionCommandError::goal)?
+                    .ok_or_else(|| {
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
+                    })?
                     .revision;
                 let goal = self
                     .goal_store
                     .set_status_as_system_checked(&self.session_id, status, expected_revision)
-                    .map_err(to_string)?
+                    .map_err(SessionCommandError::goal)?
                     .ok_or_else(|| {
-                        "no goal exists; run /goal create <objective> first".to_owned()
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
                     })?;
                 changed = true;
-                serde_json::to_value(goal).map_err(to_string)?
+                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
             }
             "block" => {
                 if value.is_empty() {
-                    return Err("usage: /goal block <reason>".to_owned());
+                    return Err(SessionCommandError::invalid_arguments(
+                        "usage: /goal block <reason>",
+                    ));
                 }
                 let expected_revision = self
                     .goal_store
                     .goal(&self.session_id)
-                    .map_err(to_string)?
-                    .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
+                    .map_err(SessionCommandError::goal)?
+                    .ok_or_else(|| {
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
+                    })?
                     .revision;
                 self.goal_store
                     .record_failure_signal(&self.session_id, Some(value))
-                    .map_err(to_string)?;
+                    .map_err(SessionCommandError::goal)?;
                 let goal = self
                     .goal_store
                     .update_status_as_model_checked(
@@ -3290,71 +3359,112 @@ impl TurnHost {
                         zuno_goal::ModelStatus::Blocked,
                         expected_revision,
                     )
-                    .map_err(to_string)?
+                    .map_err(SessionCommandError::goal)?
                     .ok_or_else(|| {
-                        "no goal exists; run /goal create <objective> first".to_owned()
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
                     })?;
                 changed = true;
-                serde_json::to_value(goal).map_err(to_string)?
+                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
             }
             "complete" => {
                 let expected_revision = self
                     .goal_store
                     .goal(&self.session_id)
-                    .map_err(to_string)?
-                    .ok_or_else(|| "no goal exists; run /goal create <objective> first".to_owned())?
+                    .map_err(SessionCommandError::goal)?
+                    .ok_or_else(|| {
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
+                    })?
                     .revision;
                 let goal = self
                     .goal_store
                     .complete_checked(&self.session_id, expected_revision)
-                    .map_err(to_string)?
+                    .map_err(SessionCommandError::goal)?
                     .ok_or_else(|| {
-                        "no goal exists; run /goal create <objective> first".to_owned()
+                        SessionCommandError::invalid_arguments(
+                            "no goal exists; run /goal create <objective> first",
+                        )
                     })?;
                 changed = true;
-                serde_json::to_value(goal).map_err(to_string)?
+                serde_json::to_value(goal).map_err(SessionCommandError::internal)?
             }
             "help" => {
-                return Ok("/goal [show|history]
+                return Ok("/goal
+/goal <objective>
+/goal show|history
 /goal create <objective>
 /goal edit <objective>
 /goal pause|resume|complete|cancel
 /goal block <reason>"
                     .to_owned());
             }
-            unknown => {
-                return Err(format!(
-                    "unknown /goal action `{unknown}`; use show, create, edit, pause, resume, block, complete, cancel, or history"
-                ));
+            _ => {
+                let goal = self.set_goal_objective(arguments)?;
+                changed = true;
+                goal
             }
         };
         if changed {
-            self.write_goal_projection()?;
+            self.write_goal_projection()
+                .map_err(SessionCommandError::internal)?;
             self.work_changes.changed();
         }
-        serde_json::to_string_pretty(&output).map_err(to_string)
+        serde_json::to_string_pretty(&output).map_err(SessionCommandError::internal)
     }
 
-    fn goal_status_value(&self) -> Result<Value, String> {
-        let goal = self.goal_store.goal(&self.session_id).map_err(to_string)?;
+    fn set_goal_objective(&mut self, objective: &str) -> Result<Value, SessionCommandError> {
+        let current = self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(SessionCommandError::goal)?;
+        let goal = match current {
+            Some(goal) if !matches!(goal.status, GoalStatus::Complete | GoalStatus::Cancelled) => {
+                self.goal_store
+                    .update_objective_checked(&self.session_id, objective, goal.revision)
+                    .map_err(SessionCommandError::goal)?
+                    .ok_or_else(|| {
+                        SessionCommandError::internal(
+                            "goal disappeared while its objective was being updated",
+                        )
+                    })?
+            }
+            Some(_) | None => {
+                self.materialize_session()
+                    .map_err(SessionCommandError::internal)?;
+                self.goal_store
+                    .create_goal(&self.session_id, objective, None)
+                    .map_err(SessionCommandError::goal)?
+            }
+        };
+        serde_json::to_value(goal).map_err(SessionCommandError::internal)
+    }
+
+    fn goal_status_value(&self) -> Result<Value, SessionCommandError> {
+        let goal = self
+            .goal_store
+            .goal(&self.session_id)
+            .map_err(SessionCommandError::goal)?;
         let pause = self
             .goal_store
             .pause_state(&self.session_id)
-            .map_err(to_string)?;
+            .map_err(SessionCommandError::goal)?;
         let retry = self
             .goal_store
             .retry_state(&self.session_id)
-            .map_err(to_string)?;
+            .map_err(SessionCommandError::goal)?;
         let provider_backoff = self
             .goal_store
             .provider_backoff_state(&self.session_id)
-            .map_err(to_string)?;
+            .map_err(SessionCommandError::goal)?;
         let goal_id = goal.as_ref().map(|goal| goal.goal_id.as_str());
         let pending_human_requests = self
             .goal_store
             .human_requests()
             .pending(Some(&self.session_id))
-            .map_err(to_string)?
+            .map_err(SessionCommandError::internal)?
             .into_iter()
             .filter(|request| human_request_belongs_to_goal(request.goal_id.as_deref(), goal_id))
             .collect::<Vec<_>>();
@@ -3374,18 +3484,24 @@ impl TurnHost {
         command: SessionCommand,
         arguments: &str,
         events: TurnEventSender,
-    ) -> Result<(), String> {
+    ) -> Result<(), SessionCommandError> {
         if !command.accepts_arguments() && !arguments.trim().is_empty() {
-            return Err(format!("/{} does not accept arguments", command.name()));
+            return Err(SessionCommandError::invalid_arguments(format!(
+                "/{} does not accept arguments",
+                command.name()
+            )));
         }
         match command {
-            SessionCommand::Compact => self.compact(false, events).await,
+            SessionCommand::Compact => self
+                .compact(false, events)
+                .await
+                .map_err(SessionCommandError::internal),
             SessionCommand::Goal => self.execute_goal_command(arguments, events).await,
             SessionCommand::Plan | SessionCommand::StartPlan | SessionCommand::StartWork => {
-                Err(format!(
+                Err(SessionCommandError::internal(format!(
                     "/{} replaces the collaboration host and must be handled by the client surface",
                     command.name()
-                ))
+                )))
             }
         }
     }
@@ -3394,17 +3510,17 @@ impl TurnHost {
         &mut self,
         arguments: &str,
         events: TurnEventSender,
-    ) -> Result<(), String> {
+    ) -> Result<(), SessionCommandError> {
         let _guard = self
             .runs
             .begin_turn(self.session_id.clone())
-            .map_err(to_string)?;
+            .map_err(SessionCommandError::internal)?;
         events
             .publish(TurnEvent::SessionCommandStarted {
                 command: SessionCommand::Goal,
             })
             .await
-            .map_err(to_string)?;
+            .map_err(SessionCommandError::internal)?;
         let was_materialized = self.is_session_materialized();
         match self.goal_command(arguments) {
             Ok(content) => {
@@ -3415,7 +3531,7 @@ impl TurnHost {
                             title: self.session_title().unwrap_or("New session").to_owned(),
                         })
                         .await
-                        .map_err(to_string)?;
+                        .map_err(SessionCommandError::internal)?;
                 }
                 events
                     .publish(TurnEvent::SessionCommandOutput {
@@ -3423,22 +3539,22 @@ impl TurnHost {
                         content,
                     })
                     .await
-                    .map_err(to_string)?;
+                    .map_err(SessionCommandError::internal)?;
                 events
                     .publish(TurnEvent::SessionCommandCompleted {
                         command: SessionCommand::Goal,
                     })
                     .await
-                    .map_err(to_string)
+                    .map_err(SessionCommandError::internal)
             }
             Err(error) => {
                 events
                     .publish(TurnEvent::SessionCommandFailed {
                         command: SessionCommand::Goal,
-                        message: error.clone(),
+                        message: error.to_string(),
                     })
                     .await
-                    .map_err(to_string)?;
+                    .map_err(SessionCommandError::internal)?;
                 Err(error)
             }
         }

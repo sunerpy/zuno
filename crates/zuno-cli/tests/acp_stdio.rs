@@ -1769,6 +1769,13 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         native,
         ["compact", "goal", "plan", "start-plan", "start-work"]
     );
+    let goal_command = commands["update"]["availableCommands"]
+        .as_array()
+        .expect("available commands")
+        .iter()
+        .find(|command| command["name"] == "goal")
+        .expect("goal command");
+    assert_eq!(goal_command["input"]["hint"], "objective | action [value]");
 
     let (goal, goal_updates) = request_with_updates(
         &mut stdin,
@@ -1777,21 +1784,76 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         "session/prompt",
         json!({
             "sessionId": &session_id,
-            "prompt": [{"type":"text","text":"/goal create ship ACP commands"}]
+            "prompt": [{
+                "type":"text",
+                "text":"/goal 可能私有仓库配额优先，继续优化 README、docs 和站点"
+            }]
         }),
     );
     assert_eq!(goal["stopReason"], "end_turn");
     assert!(goal_updates.iter().any(|update| {
         update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"].as_str().is_some_and(|text| {
+                text.contains("可能私有仓库配额优先，继续优化 README、docs 和站点")
+            })
+    }));
+
+    let (edited, edited_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{
+                "type":"text",
+                "text":"/goal 进一步移除不必要内容，减少 AI 味并合并"
+            }]
+        }),
+    );
+    assert_eq!(edited["stopReason"], "end_turn");
+    assert!(edited_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
             && update["content"]["text"]
                 .as_str()
-                .is_some_and(|text| text.contains("ship ACP commands"))
+                .is_some_and(|text| text.contains("进一步移除不必要内容，减少 AI 味并合并"))
     }));
+
+    let (shown, shown_updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"/goal show"}]
+        }),
+    );
+    assert_eq!(shown["stopReason"], "end_turn");
+    assert!(shown_updates.iter().any(|update| {
+        update["sessionUpdate"] == "agent_message_chunk"
+            && update["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("进一步移除不必要内容，减少 AI 味并合并"))
+    }));
+
+    let invalid = request_failure(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "session/prompt",
+        json!({
+            "sessionId": &session_id,
+            "prompt": [{"type":"text","text":"/goal create"}]
+        }),
+    );
+    assert_eq!(invalid["code"], -32602);
+    assert_eq!(invalid["message"], "usage: /goal create <objective>");
 
     let (plan, plan_updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
-        4,
+        7,
         "session/prompt",
         json!({
             "sessionId": &session_id,
@@ -1809,7 +1871,7 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
     request(
         &mut stdin,
         &mut stdout,
-        5,
+        8,
         "session/close",
         json!({"sessionId": &session_id}),
     );

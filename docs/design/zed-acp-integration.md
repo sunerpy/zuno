@@ -240,8 +240,11 @@ Run this acceptance sequence from a Zed External Agent thread:
 2. Open `/` completion and verify native `/compact`, `/goal`, `/plan`,
    `/start-plan`, and `/start-work`, configured commands, and unambiguous
    Skills appear exactly once.
-3. Execute `/goal create verify ACP` and `/goal show`; verify the output is an
-   Agent message and the slash text does not enter model input.
+3. Execute `/goal verify ACP shorthand`, `/goal edit verify ACP actions`, and
+   `/goal show`; verify both direct-objective and action forms produce an Agent
+   message and the slash text does not enter model input. Submit `/goal create`
+   without an objective and verify ACP returns invalid params rather than an
+   internal session error.
 4. Execute `/start-plan`, verify Zed receives mode/config updates, create a
    durable plan, then execute `/start-work`.
 5. After enough conversation history exists, execute `/compact`; verify it ends

@@ -853,11 +853,16 @@ Native discovery resolves before Markdown commands and Skills, so a same-named
 user workflow cannot shadow a runtime control.
 
 `/compact` and `/goal` invoke shared live-`TurnHost` handlers in both the TUI
-and ACP. Compact runs the hidden compaction agent; Goal exposes
-show/history/create/edit/pause/resume/block/complete/cancel against the durable
-goal store. Neither surface sends the slash text to the model or synthesizes a
-private client-only result. Goal output is a typed session-command output event,
-not reasoning.
+and ACP. Compact runs the hidden compaction agent. Goal accepts either a direct
+objective or show/history/create/edit/pause/resume/block/complete/cancel against
+the durable goal store. A direct objective creates a goal when none exists or
+the previous goal is complete or cancelled; otherwise it updates the objective
+while preserving lifecycle state, budget, and usage. Recognized action words
+take precedence over the shorthand. Neither surface sends the slash text to the
+model or synthesizes a private client-only result. Goal output is a typed
+session-command output event, not reasoning. Invalid explicit action arguments
+remain typed command failures; ACP maps them to JSON-RPC invalid params rather
+than an internal session error.
 
 The command acquires the session's exclusive run ownership and emits typed
 started, output, completed, or failed lifecycle events. TUI and ACP consume

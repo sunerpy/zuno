@@ -92,7 +92,7 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | 命令 | 用途 |
 | --- | --- |
 | `/compact` | 通过持久压缩流水线压缩历史 |
-| `/goal [action]` | 查看或管理持久 Goal；使用 `/goal help` 查看语法 |
+| `/goal [目标 \| action]` | 设置、查看或管理持久 Goal；使用 `/goal help` 查看语法 |
 | `/plan` | 进入 Plan 模式，或在已处于规划中时确认开始工作 |
 | `/start-plan` | 立即进入只读的 Plan 模式 |
 | `/start-work` | 复核持久 plan 并确认开始实现 |
@@ -104,6 +104,10 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | `/new` | 打开一个空的对话外壳 |
 | `/subagent` | 检查席位与节点进度 |
 | `/memory` | 复核、编辑、批准、拒绝、移除和撤销持久记忆变更 |
+
+TUI 的 `/goal <目标>` 与 ACP 使用同一个持久宿主命令。尚无 Goal，或上一条 Goal
+已完成、已取消时，它会创建新 Goal；其他状态下则更新当前 Goal。`/goal show`、
+`/goal edit ...`、`/goal complete` 等显式 action 仍然可用。
 
 资源选择器沿用同一套命名：`/model`、`/agent`、`/session`、`/skill`、`/theme`、`/mcp`、`/diff`、`/commands`、`/help`。
 

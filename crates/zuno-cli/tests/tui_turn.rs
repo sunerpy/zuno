@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use rusqlite::OptionalExtension as _;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 use zuno_testkit::{DbChoice, MockProvider, Scenario, ScriptedEnv};
@@ -99,6 +100,7 @@ const PICKER_FIRST_TITLE: &str = "PickerFirstMarker";
 const PICKER_SECOND_TITLE: &str = "PickerSecondMarker";
 const PICKER_THIRD_TITLE: &str = "PickerThirdMarker";
 const PICKER_RENAMED_TITLE: &str = "PickerRenamedMarker";
+const DIRECT_GOAL_OBJECTIVE: &str = "Polish the TUI goal workflow directly";
 const PARALLEL_PARENT_PROMPT: &str = "ParentSurfaceMarker delegate two foreground children.";
 const PARALLEL_PARENT_TITLE: &str = "ParallelParentMarker";
 const FIRST_CHILD_DESCRIPTION: &str = "inspect current tree";
@@ -1000,6 +1002,130 @@ fn active_root_session_count(env: &ScriptedEnv) -> Result<usize, std::io::Error>
         .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
+fn latest_goal_objective(env: &ScriptedEnv) -> Result<Option<String>, std::io::Error> {
+    let pool = session_picker_pool(env);
+    let connection = pool
+        .open_connection()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    connection
+        .query_row(
+            "SELECT objective FROM goal ORDER BY updated_at_ms DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+/// Submit a bare-objective `/goal` command through the real editor and wait for SQL.
+fn run_direct_goal_under_pty(env: &ScriptedEnv) -> Result<Transcript, std::io::Error> {
+    let script = which::which("script").map_err(|_| {
+        std::io::Error::other("`script` is required to give the TUI a real PTY; install util-linux")
+    })?;
+    let command = format!(
+        "stty rows {VIEWPORT_ROWS} cols {VIEWPORT_COLUMNS}; {} --model {MODEL} --auto",
+        shell_quote(&binary().to_string_lossy())
+    );
+    let mut child = Command::new(&script)
+        .args(["-qefc".to_owned(), command, "/dev/null".to_owned()])
+        .current_dir(env.working_dir())
+        .env_clear()
+        .envs(variables(env, "http://127.0.0.1:9"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("goal-command stdout was not piped"))?;
+    let (chunks, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match output.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if chunks.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut text = String::new();
+    let mut command_typed_at = None;
+    let mut second_enter_sent = false;
+    let mut objective_seen = false;
+    let mut exit_sent_at = None;
+    let mut second_exit_sent = false;
+    let mut graceful_exit = false;
+
+    while started.elapsed() < PICKER_BUDGET {
+        match received.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => text.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                graceful_exit = exit_sent_at.is_some();
+                break;
+            }
+        }
+
+        if command_typed_at.is_some()
+            && latest_goal_objective(env)?.as_deref() == Some(DIRECT_GOAL_OBJECTIVE)
+        {
+            objective_seen = true;
+        }
+
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("goal-command stdin was not piped"))?;
+        if command_typed_at.is_none() && text.contains("ask anything, or / for commands") {
+            stdin.write_all(format!("/goal {DIRECT_GOAL_OBJECTIVE}\r").as_bytes())?;
+            stdin.flush()?;
+            command_typed_at = Some(Instant::now());
+        } else if !objective_seen
+            && !second_enter_sent
+            && command_typed_at.is_some_and(|sent| sent.elapsed() >= Duration::from_millis(500))
+        {
+            // Depending on autocomplete timing, the first Enter may only accept `/goal`.
+            stdin.write_all(b"\r")?;
+            stdin.flush()?;
+            second_enter_sent = true;
+        } else if objective_seen && exit_sent_at.is_none() {
+            stdin.write_all(b"\x03")?;
+            stdin.flush()?;
+            exit_sent_at = Some(Instant::now());
+        } else if exit_sent_at.is_some_and(|sent| sent.elapsed() >= Duration::from_millis(300))
+            && !second_exit_sent
+        {
+            stdin.write_all(b"\x03")?;
+            stdin.flush()?;
+            second_exit_sent = true;
+        }
+
+        if exit_sent_at.is_some() && child.try_wait()?.is_some() {
+            graceful_exit = true;
+            while let Ok(chunk) = received.recv_timeout(Duration::from_millis(50)) {
+                text.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            break;
+        }
+    }
+
+    if child.try_wait()?.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let saw_wanted = objective_seen
+        && graceful_exit
+        && latest_goal_objective(env)?.as_deref() == Some(DIRECT_GOAL_OBJECTIVE);
+    Ok(Transcript { text, saw_wanted })
+}
+
 /// Run `/new`, prove the remount itself writes nothing, then submit the first prompt.
 ///
 /// This covers the seam component tests cannot: the slash router, session screen,
@@ -1747,6 +1873,22 @@ fn slash_new_is_lazy_until_the_first_prompt_and_then_creates_exactly_one_session
         transcript.saw_wanted,
         "`/new` either materialized before model input, failed to remount, or created more than \
          one durable session for the first prompt\ntranscript:\n{}",
+        transcript.text
+    );
+}
+
+#[test]
+fn a_bare_goal_objective_is_persisted_through_the_real_tui() {
+    let env = ScriptedEnv::new()
+        .expect("isolated environment")
+        .with_db(DbChoice::TempFile);
+
+    let transcript =
+        run_direct_goal_under_pty(&env).expect("the real TUI accepts a bare goal objective");
+
+    assert!(
+        transcript.saw_wanted,
+        "`/goal <objective>` did not persist through the TUI host-command path\ntranscript:\n{}",
         transcript.text
     );
 }

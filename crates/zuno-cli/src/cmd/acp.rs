@@ -18,8 +18,8 @@ use zuno_tool::PermissionAsker;
 use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
 use super::mcp_runtime::McpRuntime;
 use super::turn::{
-    CatalogModelChoice, ExtensionComposition, SessionChoice, TurnHost, TurnHostRuntimeDependencies,
-    TurnOptions, TurnPlan, persisted_session_agent,
+    CatalogModelChoice, ExtensionComposition, SessionChoice, SessionCommandError, TurnHost,
+    TurnHostRuntimeDependencies, TurnOptions, TurnPlan, persisted_session_agent,
 };
 
 use crate::command::AcpArgs;
@@ -1267,44 +1267,40 @@ impl AcpSession {
             let resources = resources.as_mut().ok_or_else(|| self.closed_error())?;
             let outcome = match &invocation {
                 Some(SlashInvocation::Session { command, arguments }) => match command {
-                    SessionCommand::Compact | SessionCommand::Goal => {
-                        resources
-                            .host
-                            .execute_session_command(*command, arguments, events.clone())
-                            .await
-                    }
+                    SessionCommand::Compact | SessionCommand::Goal => resources
+                        .host
+                        .execute_session_command(*command, arguments, events.clone())
+                        .await
+                        .map_err(session_command_rpc_error),
                     SessionCommand::Plan
                     | SessionCommand::StartPlan
-                    | SessionCommand::StartWork => Err(format!(
+                    | SessionCommand::StartWork => Err(zuno_acp::RpcError::internal(format!(
                         "/{} mode control was not handled before host execution",
                         command.name()
-                    )),
+                    ))),
                 },
-                Some(SlashInvocation::Command { name, arguments }) => {
-                    resources
-                        .host
-                        .drive_command(name, arguments, events.clone())
-                        .await
-                }
+                Some(SlashInvocation::Command { name, arguments }) => resources
+                    .host
+                    .drive_command(name, arguments, events.clone())
+                    .await
+                    .map_err(zuno_acp::RpcError::internal),
                 Some(SlashInvocation::Skill {
                     name,
                     source,
                     arguments,
-                }) => {
-                    resources
-                        .host
-                        .drive_skill(name, source, arguments, events.clone())
-                        .await
-                }
-                None => {
-                    resources
-                        .host
-                        .drive_content(&prompt.text, &prompt.content, events.clone())
-                        .await
-                }
+                }) => resources
+                    .host
+                    .drive_skill(name, source, arguments, events.clone())
+                    .await
+                    .map_err(zuno_acp::RpcError::internal),
+                None => resources
+                    .host
+                    .drive_content(&prompt.text, &prompt.content, events.clone())
+                    .await
+                    .map_err(zuno_acp::RpcError::internal),
             };
             drop(events);
-            outcome.map_err(zuno_acp::RpcError::internal)
+            outcome
         };
         let projection = project_turn(&self.id, context_size, receiver, client.clone());
         let (driven, projected) = tokio::join!(drive, projection);
@@ -1339,8 +1335,10 @@ impl AcpSession {
                     return Ok(json!({ "stopReason": "cancelled" }));
                 }
                 ProjectedTurn::Failed(message) => {
-                    let error = driven.err().map_or(message, |error| error.message);
-                    return Err(zuno_acp::RpcError::internal(error));
+                    return match driven {
+                        Err(error) => Err(error),
+                        Ok(()) => Err(zuno_acp::RpcError::internal(message)),
+                    };
                 }
                 ProjectedTurn::Missing => {
                     return match driven {
@@ -1818,6 +1816,14 @@ impl AcpSession {
             (Ok(()), Some(notification)) => Err(notification),
             (Err(error), Some(notification)) => Err(format!("{error}; {notification}")),
         }
+    }
+}
+
+fn session_command_rpc_error(error: SessionCommandError) -> zuno_acp::RpcError {
+    if error.is_invalid_arguments() {
+        zuno_acp::RpcError::invalid_params(error.to_string())
+    } else {
+        zuno_acp::RpcError::internal(error.to_string())
     }
 }
 
@@ -3102,7 +3108,7 @@ mod tests {
             "Summarize older context and keep the recent turn tail"
         );
         assert!(advertised[0].get("input").is_none());
-        assert_eq!(advertised[1]["input"]["hint"], "action [value]");
+        assert_eq!(advertised[1]["input"]["hint"], "objective | action [value]");
         assert_eq!(advertised[5]["input"]["hint"], "question");
     }
 
@@ -3171,6 +3177,13 @@ mod tests {
             Some(SlashInvocation::Session {
                 command: SessionCommand::Goal,
                 arguments: "create ship ACP commands".to_owned(),
+            })
+        );
+        assert_eq!(
+            resolve_slash_prompt("/goal ship ACP commands", commands.iter(), &skills),
+            Some(SlashInvocation::Session {
+                command: SessionCommand::Goal,
+                arguments: "ship ACP commands".to_owned(),
             })
         );
         assert_eq!(

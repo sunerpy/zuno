@@ -196,11 +196,16 @@ does not send the literal slash command to the model. Native controls take
 precedence, so a user-defined command or Skill named `compact` is not published
 as a second ambiguous entry.
 
-`/goal` exposes the same durable goal handler as the TUI. It accepts
+`/goal` exposes the same durable goal handler as the TUI. With no arguments it
+shows the current goal. `/goal <objective>` creates a goal when none exists or
+the previous goal is complete or cancelled, and otherwise updates the current
+objective without resetting its lifecycle state, budget, or usage. Explicit
 `show`, `history`, `create <objective>`, `edit <objective>`, `pause`, `resume`,
-`block <reason>`, `complete`, and `cancel`; omit the action to show the current
-goal. The command output is projected as an ordinary Agent message rather than
-as reasoning.
+`block <reason>`, `complete`, and `cancel` actions remain available and take
+precedence when their name is the first token. The command output is projected
+as an ordinary Agent message rather than as reasoning. Invalid arguments to an
+explicit action are returned as JSON-RPC invalid params, not as an internal
+session error.
 
 `/plan` toggles between Build and Plan. `/start-plan` enters the read-only Plan
 mode directly, while `/start-work` returns to Build. Leaving Plan requires a
@@ -467,8 +472,8 @@ After configuration:
    choice is shown in the session controls;
 3. type `/`, confirm `/compact`, `/goal`, `/plan`, `/start-plan`, and
    `/start-work` each appear exactly once;
-4. execute `/goal create verify ACP`, then `/goal show`, and confirm the result
-   appears as Agent output rather than Thinking;
+4. execute `/goal verify ACP shorthand`, `/goal edit verify ACP actions`, and
+   `/goal show`; confirm the result appears as Agent output rather than Thinking;
 5. execute `/start-plan`, confirm Zed switches to Plan, then create a durable
    plan and execute `/start-work`;
 6. after enough conversation history exists, execute `/compact` and confirm the

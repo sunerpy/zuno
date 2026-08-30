@@ -116,7 +116,7 @@ cannot shadow a runtime control.
 | Command | Purpose |
 | --- | --- |
 | `/compact` | Compact history through the durable compaction pipeline |
-| `/goal [action]` | View or manage the durable session goal; use `/goal help` for syntax |
+| `/goal [objective \| action]` | Set, view, or manage the durable session goal; use `/goal help` for syntax |
 | `/plan` | Enter Plan mode, or confirm starting work when already planning |
 | `/start-plan` | Enter read-only Plan mode immediately |
 | `/start-work` | Review the durable plan and confirm implementation |
@@ -128,6 +128,11 @@ cannot shadow a runtime control.
 | `/new` | Open an empty conversation shell |
 | `/subagent` | Inspect seat and node progress |
 | `/memory` | Review, edit, approve, reject, remove, and undo durable memory changes |
+
+The direct `/goal <objective>` form is handled by the same durable host command as ACP.
+It creates a new goal when none exists or the previous one is complete or cancelled;
+otherwise it updates the current goal. Explicit actions such as `/goal show`,
+`/goal edit ...`, and `/goal complete` remain available.
 
 Resource pickers follow the same naming: `/model`, `/agent`, `/session`, `/skill`,
 `/theme`, `/mcp`, `/diff`, `/commands`, `/help`.

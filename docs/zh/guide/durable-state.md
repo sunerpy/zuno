@@ -50,6 +50,7 @@ Goal 是续跑的授权来源。一个活跃的 goal 会持续下去，直到它
 
 ```text
 /goal
+/goal <目标>
 /goal create <目标>
 /goal edit <目标>
 /goal pause
@@ -60,9 +61,14 @@ Goal 是续跑的授权来源。一个活跃的 goal 会持续下去，直到它
 /goal history
 ```
 
-`/goal` 后的第一个词始终是 action。创建 Goal 必须写成
-`/goal create <目标>`；直接输入 `/goal <目标>` 会把目标的第一个词当作 action，因而被拒绝。
-`/goal help` 可以查看精简用法。
+`/goal` 显示当前状态。`/goal <目标>` 会在尚无 Goal，或上一条 Goal 已完成、已取消时
+创建新 Goal；否则直接更新当前目标，同时保留已有状态、预算和累计用量。生命周期管理仍可
+使用显式 action 形式。
+
+当首词为已知 action 时，action 优先：`show`、`get`、`status`、`history`、`create`、
+`edit`、`pause`、`resume`、`block`、`complete`、`cancel` 和 `help`。如果目标本身以
+这些词开头，请用 `/goal create <目标>` 或 `/goal edit <目标>` 消歧。`/goal help`
+可以查看精简用法。
 
 ## Plan
 

@@ -71,6 +71,10 @@ fn goal_is_a_host_command_and_preserves_its_argument_tail() {
         route("/goal create ship a public release"),
         SlashSubmission::Host(HostCommand::Goal("create ship a public release".to_owned()))
     );
+    assert_eq!(
+        route("/goal ship a public release"),
+        SlashSubmission::Host(HostCommand::Goal("ship a public release".to_owned()))
+    );
     let router = SlashRouter::default();
     let command = router
         .commands()

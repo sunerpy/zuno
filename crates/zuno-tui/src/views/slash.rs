@@ -426,7 +426,7 @@ fn ui_commands() -> Vec<SlashCommand> {
             SlashCommand {
                 name: "goal".to_owned(),
                 aliases: Vec::new(),
-                description: "View or manage the durable session goal".to_owned(),
+                description: SessionCommand::Goal.description().to_owned(),
                 kind: SlashCommandKind::Host(HostCommand::Goal(String::new())),
             },
             SlashCommand {

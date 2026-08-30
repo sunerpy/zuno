@@ -68,6 +68,7 @@ Inspect and manage it with `/goal` in the terminal application:
 
 ```text
 /goal
+/goal <objective>
 /goal create <objective>
 /goal edit <objective>
 /goal pause
@@ -78,9 +79,16 @@ Inspect and manage it with `/goal` in the terminal application:
 /goal history
 ```
 
-The first token after `/goal` is always an action. To create a goal, use
-`/goal create <objective>`; `/goal <objective>` treats the first word of the objective
-as an action and is rejected. `/goal help` prints the compact command summary.
+`/goal` shows the current state. `/goal <objective>` creates a goal when none exists or
+the previous goal is complete or cancelled. Otherwise it updates the current objective
+without resetting its status, budget, or accumulated usage. The explicit action forms
+remain available for lifecycle management.
+
+Known action names take precedence when they are the first token: `show`, `get`, `status`,
+`history`, `create`, `edit`, `pause`, `resume`, `block`, `complete`, `cancel`, and `help`.
+If an objective itself starts with one of those words, use `/goal create <objective>` or
+`/goal edit <objective>` to disambiguate it. `/goal help` prints the compact command
+summary.
 
 Goal status also shows the typed pause, cross-turn retry, provider backoff checkpoint,
 and pending human requests. Completion is rejected while any Plan step, WorkItem, Job,
