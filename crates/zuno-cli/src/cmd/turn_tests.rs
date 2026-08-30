@@ -4199,10 +4199,24 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
     )
     .expect("valid background id");
     let settled = background_executions
-        .wait(&id, None)
+        .wait(&id, Some(std::time::Duration::from_secs(5)))
         .await
-        .expect("background command settles")
-        .info;
+        .expect("background command wait succeeds");
+    if settled.timed_out {
+        background_executions
+            .cancel(&id)
+            .expect("cancel timed-out background command");
+        let cleanup = background_executions
+            .wait(&id, Some(std::time::Duration::from_secs(5)))
+            .await
+            .expect("cancelled background command wait succeeds");
+        assert!(
+            !cleanup.timed_out,
+            "background command did not settle after cancellation"
+        );
+        panic!("background command did not settle within the test deadline");
+    }
+    let settled = settled.info;
     assert_eq!(settled.authority.schema_version, 3);
     assert_eq!(settled.authority.approval_mode, "strict");
     assert_eq!(

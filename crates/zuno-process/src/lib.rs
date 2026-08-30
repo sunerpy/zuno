@@ -18,7 +18,7 @@ const MONITOR_FOREGROUND_MODE: &str = "monitor-foreground";
 const EXEC_MODE: &str = "exec";
 const EXEC_FOREGROUND_MODE: &str = "exec-foreground";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+#[cfg(any(windows, unix))]
 const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a teardown waits for the contained group to stop being able to run.
 ///
@@ -326,7 +326,7 @@ fn run_guard(request: GuardRequest) -> io::Result<ExitStatus> {
 fn supervise_resident(request: GuardRequest) -> io::Result<ExitStatus> {
     #[cfg(target_os = "linux")]
     {
-        supervise_resident_with_signals(request)
+        supervise_resident_linux(request)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -335,13 +335,13 @@ fn supervise_resident(request: GuardRequest) -> io::Result<ExitStatus> {
 }
 
 #[cfg(target_os = "linux")]
-fn supervise_resident_with_signals(request: GuardRequest) -> io::Result<ExitStatus> {
-    let mut signals = signal_hook::iterator::Signals::new([
-        signal_hook::consts::SIGCHLD,
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGHUP,
-    ])?;
+fn supervise_resident_linux(request: GuardRequest) -> io::Result<ExitStatus> {
+    use std::sync::atomic::Ordering;
+
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    use rustix::process::{PidfdFlags, pidfd_open};
+
+    let terminate = termination_flag()?;
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))?;
     if parent_pid() != Some(request.expected_parent) {
         return Err(io::Error::other(
@@ -351,21 +351,32 @@ fn supervise_resident_with_signals(request: GuardRequest) -> io::Result<ExitStat
 
     let mut child = spawn_resident_payload(&request)?;
     let child_pid = child.id();
+    let child_process = rustix::process::Pid::from_raw(child_pid as i32)
+        .ok_or_else(|| io::Error::other("resident payload PID is invalid"))?;
+    let pidfd = pidfd_open(child_process, PidfdFlags::empty()).ok();
+    let wait_timeout = Timespec::try_from(PARENT_POLL_INTERVAL)
+        .map_err(|_| io::Error::other("resident process poll interval is invalid"))?;
     loop {
         if let Some(status) = observe_resident_payload(&mut child, child_pid)? {
             return Ok(status);
         }
-
-        let terminate = signals.wait().any(|signal| {
-            matches!(
-                signal,
-                signal_hook::consts::SIGTERM
-                    | signal_hook::consts::SIGINT
-                    | signal_hook::consts::SIGHUP
-            )
-        });
-        if terminate || parent_pid() != Some(request.expected_parent) {
+        if terminate.load(Ordering::Acquire) || parent_pid() != Some(request.expected_parent) {
             return terminate_guarded_process_group(&mut child, child_pid, false);
+        }
+
+        let Some(pidfd) = pidfd.as_ref() else {
+            std::thread::sleep(PARENT_POLL_INTERVAL);
+            continue;
+        };
+        let mut poll_fd = [PollFd::new(pidfd, PollFlags::IN)];
+        match rustix::event::poll(&mut poll_fd, Some(&wait_timeout)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(error) => {
+                return Err(with_cleanup_error(
+                    error.into(),
+                    terminate_guarded_process_group(&mut child, child_pid, false),
+                ));
+            }
         }
     }
 }

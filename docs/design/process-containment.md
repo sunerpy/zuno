@@ -46,9 +46,14 @@ always-resident helper solely for MCP.
 
 LSP, PTY, foreground editor, process extension, product-agent, and shell paths
 retain their dedicated guards where terminal ownership or a surviving per-tree
-owner is part of the contract. On Linux those guards block on signals and use
-`PR_SET_PDEATHSIG`; other Unix platforms use a bounded parent-liveness fallback,
-and Windows retains Job Object containment.
+owner is part of the contract. On Linux those guards use `PR_SET_PDEATHSIG` and
+wait on the payload's `pidfd`, so natural exit is a kernel-reported readiness
+event rather than a lossy userspace `SIGCHLD` wake. Termination signals set an
+atomic shutdown flag; the pidfd wait has a bounded interval so a signal arriving
+between the flag check and the blocking syscall cannot strand the guard. If the
+kernel or container policy does not permit `pidfd_open`, the same loop falls back
+to bounded child and parent checks. Other Unix platforms use the bounded
+parent-liveness path, and Windows retains Job Object containment.
 
 Shell has an additional security layer before this lifecycle ownership begins.
 `zuno-sandbox` compiles raw argv plus immutable authority into
@@ -73,9 +78,14 @@ transfer and restore terminal foreground process-group ownership.
 - Starting local MCP does not create any additional Zuno helper process.
 - Owners request catchable guard shutdown and then reap it; they do not
   immediately hard-kill the guard.
+- Linux natural-exit observation uses the payload pidfd when available and
+  always returns to `wait`/reaping before the guard reports completion.
+- Linux pidfd denial or absence falls back to bounded lifecycle checks instead
+  of weakening process-tree cleanup.
 - Natural MCP exit and explicit cancellation clean its complete process group.
 - Dedicated guards still clean their own payload groups after Linux parent
   `SIGKILL`; direct MCP explicitly makes no such promise.
 - `crates/zuno-process/tests/containment.rs` pins topology, idle waiting, clean
-  shutdown, and abrupt-parent cleanup for guarded hosts. The mixed-host G6 fixture
-  additionally pins zero MCP helpers and normal MCP process-group cleanup.
+  shutdown, natural payload reaping, and abrupt-parent cleanup for guarded hosts.
+  The mixed-host G6 fixture additionally pins zero MCP helpers and normal MCP
+  process-group cleanup.

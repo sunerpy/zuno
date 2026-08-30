@@ -86,7 +86,7 @@ fn exiting_payload(ready: &Path) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    std::fs::write(ready, child.id().to_string())
+    std::fs::write(ready, format!("{} {}", std::process::id(), child.id()))
 }
 
 fn grandchild() -> io::Result<()> {

@@ -1221,10 +1221,12 @@ Other resident and interactive hosts retain dedicated guards where a surviving
 per-tree owner or terminal foreground transfer is required. The direct child
 returned by `guarded_argv` is the guard, not the payload; owners request
 shutdown through `request_contained_process_shutdown` and reap it only after
-the contained group settles. On Linux the guard blocks on signals and uses the
-parent-death signal. Direct MCP relies on owner close/Drop and therefore does
-not promise descendant cleanup after an uncatchable owner `SIGKILL`. The pinned
-Codex comparison and the split ownership decision are recorded in
+the contained group settles. On Linux the guard uses the parent-death signal and
+waits on the payload pidfd for immediate, race-free natural-exit observation,
+with bounded lifecycle checks when pidfd is unavailable. Direct MCP relies on
+owner close/Drop and therefore does not promise descendant cleanup after an
+uncatchable owner `SIGKILL`. The pinned Codex comparison and the split ownership
+decision are recorded in
 [Resident process containment](design/process-containment.md).
 
 ## Background command execution

@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, Read as _, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -89,7 +90,7 @@ fn resident_payload_uses_exactly_one_guard_process() {
 }
 
 #[test]
-fn resident_guard_waits_for_signals_instead_of_polling() {
+fn resident_guard_waits_without_busy_polling() {
     let directory = tempfile::tempdir().expect("temporary fixture directory");
     let (mut parent, ready, stop) = spawn_parent(directory.path());
     wait_until_ready(&mut parent, &ready);
@@ -125,7 +126,7 @@ fn resident_guard_waits_for_signals_instead_of_polling() {
     );
     assert!(
         deltas.iter().all(|(_, delta)| *delta <= 3),
-        "idle guards should block on signals instead of polling: {deltas:?}"
+        "idle guards should block without busy polling: {deltas:?}"
     );
 }
 
@@ -134,25 +135,23 @@ fn resident_guard_exits_when_its_payload_exits() {
     let directory = tempfile::tempdir().expect("temporary fixture directory");
     let ready = directory.path().join("ready");
     let executable = env!("CARGO_BIN_EXE_zuno-process-fixture");
-    let mut guard = Command::new(executable)
-        .arg(zuno_process::GUARD_MARKER)
-        .arg("supervise")
-        .arg(std::process::id().to_string())
-        .arg("--")
-        .arg(executable)
-        .arg("exiting-payload")
-        .arg(&ready)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn resident guard");
+    let mut guard = ReapingChild::new(
+        Command::new(executable)
+            .arg(zuno_process::GUARD_MARKER)
+            .arg("supervise")
+            .arg(std::process::id().to_string())
+            .arg("--")
+            .arg(executable)
+            .arg("exiting-payload")
+            .arg(&ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn resident guard"),
+    );
 
-    wait_until_ready(&mut guard, &ready);
-    let grandchild = fs::read_to_string(&ready)
-        .expect("read descendant PID")
-        .parse::<u32>()
-        .expect("descendant PID");
+    let descendants = wait_for_reported_pids(&mut guard, &ready, 2);
     let started = Instant::now();
     let status = loop {
         if let Some(status) = guard.try_wait().expect("poll resident guard") {
@@ -166,7 +165,7 @@ fn resident_guard_exits_when_its_payload_exits() {
     };
 
     assert!(status.success(), "resident guard failed: {status}");
-    assert_processes_exit(&[grandchild]);
+    assert_processes_exit(&descendants);
 }
 
 #[test]
@@ -188,18 +187,62 @@ fn parent_sigkill_reaps_the_guarded_process_tree() {
     assert_processes_exit(&pids);
 }
 
-fn spawn_parent(directory: &Path) -> (Child, std::path::PathBuf, std::path::PathBuf) {
+struct ReapingChild(Child);
+
+impl ReapingChild {
+    fn new(child: Child) -> Self {
+        Self(child)
+    }
+}
+
+impl Deref for ReapingChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ReapingChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ReapingChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        if let Some(pid) = rustix::process::Pid::from_raw(self.0.id() as i32) {
+            let _signalled = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+        }
+        let started = Instant::now();
+        while started.elapsed() < TIMEOUT {
+            match self.0.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let _killed = self.0.kill();
+        let _reaped = self.0.wait();
+    }
+}
+
+fn spawn_parent(directory: &Path) -> (ReapingChild, std::path::PathBuf, std::path::PathBuf) {
     let ready = directory.join("ready");
     let stop = directory.join("stop");
-    let child = Command::new(env!("CARGO_BIN_EXE_zuno-process-fixture"))
-        .arg("parent")
-        .arg(&ready)
-        .arg(&stop)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn fixture parent");
+    let child = ReapingChild::new(
+        Command::new(env!("CARGO_BIN_EXE_zuno-process-fixture"))
+            .arg("parent")
+            .arg(&ready)
+            .arg(&stop)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn fixture parent"),
+    );
     (child, ready, stop)
 }
 
@@ -215,6 +258,31 @@ fn wait_until_ready(parent: &mut Child, ready: &Path) {
         assert!(
             started.elapsed() < TIMEOUT,
             "fixture process tree did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_reported_pids(parent: &mut Child, ready: &Path, expected: usize) -> Vec<u32> {
+    let started = Instant::now();
+    loop {
+        if let Ok(contents) = fs::read_to_string(ready) {
+            let parsed = contents
+                .split_whitespace()
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>();
+            if let Ok(pids) = parsed
+                && pids.len() == expected
+            {
+                return pids;
+            }
+        }
+        if let Some(status) = parent.try_wait().expect("poll fixture parent") {
+            panic!("fixture parent exited before reporting PIDs: {status}");
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "fixture did not report {expected} PIDs"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
