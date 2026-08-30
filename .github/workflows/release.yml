@@ -627,9 +627,48 @@ jobs:
       # required for glob and grep` on stderr, which reads like an artifact defect
       # rather than a missing runner dependency. Installed after the driver build so
       # a resolution failure cannot be mistaken for a compile failure.
+      #
+      # NOT on Windows: that container cannot reach `static.crates.io`, so
+      # install-action's source build dies with
+      # `A socket operation was attempted to an unreachable network. (os error 10051)`
+      # — measured on release run 33286323014. The Windows leg downloads an upstream
+      # prebuilt archive instead, in the step below.
       - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        if: matrix.archive != 'zip'
         with:
           tool: ripgrep
+
+      # Windows only. `api.github.com` and `objects.githubusercontent.com` are already
+      # reachable from this container — `actions/checkout` and `download-artifact`
+      # both succeeded — so an upstream release asset works where crates.io does not.
+      #
+      # The checksum is pinned, not fetched alongside the archive: verifying a
+      # download against a hash served by the same host it came from proves only that
+      # the transfer was consistent. Bump both values together when moving versions.
+      - name: Install ripgrep from the upstream prebuilt archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        env:
+          RG_VERSION: '15.2.0'
+          RG_SHA256: '71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5'
+        run: |
+          set -euo pipefail
+          archive="ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc.zip"
+          url="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${archive}"
+          curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused \
+               --location --silent --show-error --fail \
+               --output "$archive" "$url"
+          echo "${RG_SHA256}  ${archive}" | sha256sum --check --strict
+          unzip -q "$archive"
+          rg_dir="$PWD/ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc"
+          # `-f`, not `-x`: the archive carries no Unix permission bits, so the
+          # extracted `rg.exe` is mode 0644 and `test -x` fails under Git Bash even
+          # though Windows runs it perfectly well. Verified locally against the real
+          # archive. The `rg --version` step below is what actually proves it runs.
+          test -f "$rg_dir/rg.exe"
+          # Later steps run in their own shells, so PATH has to persist through the
+          # environment file rather than this process.
+          echo "$rg_dir" >> "$GITHUB_PATH"
 
       # `shell: bash` on purpose. Without it this step inherits pwsh on the Windows
       # leg, where `rg --version` failed even though the preceding install-action
