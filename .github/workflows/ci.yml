@@ -49,6 +49,15 @@ env:
 jobs:
   test:
     name: Test
+    # SECURITY: never run on a fork's pull request. This job is routed to a
+    # CodeBuild runner whose container is `privilegedMode=true` and whose service
+    # role can read the `zuno-github` CodeConnection token. That token's scope is
+    # the GitHub App installation, not this repository, so executing an outside
+    # contributor's code there would hand them a credential reaching further than
+    # the pull request they opened. GitHub withholds secrets from fork pull
+    # requests automatically; it cannot withhold a runner's own IAM role, so the
+    # gate has to be here. Review a fork's changes, then run them from a branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
       - zuno-ci-test
@@ -175,6 +184,15 @@ jobs:
   # legible at a glance instead of buried in a 3000-test log.
   supply-chain:
     name: Supply chain
+    # SECURITY: never run on a fork's pull request. This job is routed to a
+    # CodeBuild runner whose container is `privilegedMode=true` and whose service
+    # role can read the `zuno-github` CodeConnection token. That token's scope is
+    # the GitHub App installation, not this repository, so executing an outside
+    # contributor's code there would hand them a credential reaching further than
+    # the pull request they opened. GitHub withholds secrets from fork pull
+    # requests automatically; it cannot withhold a runner's own IAM role, so the
+    # gate has to be here. Review a fork's changes, then run them from a branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
       - zuno-ci-supply-chain
@@ -209,6 +227,15 @@ jobs:
   # -------------------------------------------------------------------------
   artifact:
     name: Artifact smoke (host)
+    # SECURITY: never run on a fork's pull request. This job is routed to a
+    # CodeBuild runner whose container is `privilegedMode=true` and whose service
+    # role can read the `zuno-github` CodeConnection token. That token's scope is
+    # the GitHub App installation, not this repository, so executing an outside
+    # contributor's code there would hand them a credential reaching further than
+    # the pull request they opened. GitHub withholds secrets from fork pull
+    # requests automatically; it cannot withhold a runner's own IAM role, so the
+    # gate has to be here. Review a fork's changes, then run them from a branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
       - zuno-ci-artifact
@@ -337,7 +364,21 @@ jobs:
     runs-on:
       - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
       - zuno-ci-success
-    if: always()
+    # `always()` so a failed dependency still reaches the gate — that is the whole
+    # point of this job. The added clause is NOT a weakening: on a fork's pull
+    # request every dependency is skipped by design (see the security note on
+    # `test`), so without it this job would report a red gate for a pull request
+    # that was never permitted to run. Skipping the gate alongside the work it
+    # gates keeps "did not run" distinct from "ran and failed", which is the same
+    # distinction the `windows` job's comment defends.
+    #
+    # This job also runs on the privileged runner, so it must carry the same fork
+    # condition regardless.
+    if: |
+      always() && (
+        github.event_name != 'pull_request'
+        || github.event.pull_request.head.repo.full_name == github.repository
+      )
     needs: [test, supply-chain, artifact, windows]
     steps:
       - name: Check every required job succeeded
