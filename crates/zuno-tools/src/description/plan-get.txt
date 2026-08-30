@@ -1,0 +1,3 @@
+Read the durable plan for the current session.
+Returns null when no plan exists. Read it before plan_update so the update can carry the current revision and preserve stable step ids.
+This tool is read-only and safe to call in parallel with other read-only tools.

@@ -1,0 +1,30 @@
+[package]
+name = "zuno-product-agent"
+description = "Native process adapters for Codex and Claude Code product subagents."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "zuno-product-agent-fixture"
+path = "src/bin/zuno-product-agent-fixture.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+zuno-config = { workspace = true }
+zuno-paths = { workspace = true }
+zuno-process = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

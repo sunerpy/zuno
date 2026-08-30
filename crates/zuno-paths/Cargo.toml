@@ -1,0 +1,24 @@
+[package]
+name = "zuno-paths"
+description = "Filesystem layout resolution: project root, data dir, cache dir, and per-worktree state paths."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+# `tests/differential.rs` runs the installed release; `zuno-testkit` resolves and
+# screens it, so this crate names no package-manager path and no release of its
+# own. The edge is a cycle only through dev-dependencies, which cargo permits.
+zuno-testkit = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

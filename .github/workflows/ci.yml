@@ -1,0 +1,435 @@
+# CI: every gate `make ci` runs locally, plus the ones that need a clean machine.
+#
+# The contract with the Makefile is deliberate: `fmt-check`, `lint`, `test`,
+# `deny` and `artifact` below invoke the SAME make targets a developer runs, so
+# "green locally" and "green in CI" cannot drift into meaning different things.
+#
+# Two jobs exist here that `make ci` cannot fully cover on a developer machine:
+#
+#   * `artifact` proves the packaging and smoke path works on every push, not only
+#     when someone cuts a tag. The release workflow's six-target matrix is far too
+#     slow for a per-commit gate, but its host leg is not — and a release pipeline
+#     whose smoke step is first exercised during the real release is untested.
+#   * `windows` catches the platform-specific failures a Linux developer cannot
+#     see: path separators, and the two Windows targets the release ships. It is
+#     the one job here that cannot run on CodeBuild, so it is opt-in — see the
+#     comment above the job for why, and what turns it back on.
+#
+# Every gating job runs on the `zuno-runner` CodeBuild-hosted runner, which
+# consumes no GitHub Actions minutes. That is the required path, and it is
+# complete on its own: nothing GitHub-hosted can hold the merge gate red.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# `g3` is a generation counter, not decoration. Twice now a run has wedged in
+# `queued` — 31832366629, then 31875272553, which ignored two separate cancel
+# requests — and a wedged run holds its group forever, leaving every later run on
+# the ref at `pending` with zero jobs. Bumping the generation is the only remedy
+# that does not need GitHub Support. Try `gh run cancel` first; bump when it fails.
+concurrency:
+  group: ${{ github.workflow }}-g3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY_NAME: zuno
+
+jobs:
+  test:
+    name: Test
+    # SECURITY: never run on a fork's pull request. This job is routed to a
+    # CodeBuild runner whose container is `privilegedMode=true` and whose service
+    # role can read the `zuno-github` CodeConnection token. That token's scope is
+    # the GitHub App installation, not this repository, so executing an outside
+    # contributor's code there would hand them a credential reaching further than
+    # the pull request they opened. GitHub withholds secrets from fork pull
+    # requests automatically; it cannot withhold a runner's own IAM role, so the
+    # gate has to be here. Review a fork's changes, then run them from a branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-ci-test
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # rust-toolchain.toml stays authoritative: a toolchain file outranks
+      # `rustup default`, which is all this action sets. The input is named anyway
+      # because the action hard-requires it (an empty value exits 1 — it does not
+      # read the toml), and naming the SAME version the toml pins is what puts
+      # rustfmt and clippy on the toolchain cargo actually uses instead of on a
+      # second one rustup would then have to auto-install. Bump both together.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+          components: rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # `--locked` first and on its own: a lock file that cannot be reproduced
+      # makes every later failure look like a code problem, and a plain
+      # `cargo build` silently repairs it. Learned the hard way merging wave 7.
+      - name: Verify the lock file is reproducible
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # Every make gate below passes `--offline`, because `OFFLINE ?= --offline` is
+      # the Makefile default and the right one for local work. On a cold runner the
+      # registry is empty and `--offline` then fails resolution outright
+      # (`no matching package named 'async-trait' found`), which is nothing to do
+      # with the code under test. One online fetch makes the shared make targets
+      # behave here exactly as they do locally. No `--target`: without one
+      # `cargo fetch` takes every target's dependencies, including the
+      # Windows-only transitive deps an offline resolve otherwise trips over.
+      - name: Populate the cargo registry for the offline gates
+        run: cargo fetch --locked
+
+      # oxfmt is an npm package with per-platform native bindings and
+      # `engines: ^20.19.0 || >=22.12.0`. The CodeBuild image defaults to Node 18,
+      # where `npm install` only WARNS EBADENGINE, exits 0, and leaves an oxfmt that
+      # dies two steps later on a missing `@oxfmt/binding-linux-x64-gnu`. So pin the
+      # Node line, pin oxfmt to the version the pre-commit hook formats with (a
+      # different one can disagree about already-committed files), and run
+      # `--version` as the gate so a broken install fails in this step.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install oxfmt
+        run: |
+          npm install --global oxfmt@0.59.0
+          oxfmt --version
+
+      # `rg` is a hard startup requirement for the tool runtime, not an optional
+      # accelerator: `zuno-search` refuses to build a search adapter without a
+      # ripgrep 14+ on PATH (crates/zuno-search/src/ripgrep.rs), and
+      # docs/harness-runtime.md makes that a startup error on purpose rather than a
+      # silent fallback to a second walker. The CodeBuild standard image ships no
+      # `rg`, unlike the GitHub-hosted `ubuntu-*` images where it is preinstalled
+      # and this step looked unnecessary. Without it 19 `production_registry` tests
+      # fail at tool-registry assembly with "ripgrep (`rg`) is required for glob and
+      # grep" — measured on run 33227251936, where the same absence also broke the
+      # `artifact` job's headless smoke. `--version` is the gate so a broken install
+      # fails here instead of looking like a code failure later.
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: ripgrep
+
+      - name: Verify ripgrep satisfies the runtime minimum
+        run: rg --version
+
+      # The sandbox fails closed by design: `read-only` and `workspace-write` both
+      # require a proved OS confinement backend, so `zuno-sandbox` refuses to start a
+      # session when no trusted `bwrap` is on the system
+      # (crates/zuno-sandbox/src/lib.rs:719 `BubblewrapNotFound`). That is deliberate
+      # — an unavailable backend must never silently downgrade to running unconfined.
+      # No CodeBuild image ships bubblewrap, so 14 `acp_stdio` tests failed
+      # `session/new` on run 33236972372 until this step existed.
+      #
+      # REQUIRES an Ubuntu 24.04 image. `zuno-sandbox` demands `--disable-userns` and
+      # `--assert-userns-disabled` (linux.rs:22-31), both introduced in bubblewrap
+      # 0.8.0. The runner project ran `standard:7.0` (Ubuntu 22.04 jammy, bubblewrap
+      # 0.6.x), where this step installed successfully and the tests then failed with
+      # `bubblewrap does not provide required option` — measured on run 33237427091.
+      # The `zuno-runner` project was moved to `standard:8.0` (noble, 0.9.0) for this
+      # reason; do not move it back without replacing this step.
+      #
+      # Not available through taiki-e/install-action, so it comes from apt; `sudo` is
+      # absent in some CodeBuild images and present in others, hence the conditional.
+      #
+      # ALSO REQUIRES `privilegedMode=true` on the runner project. Installing a new
+      # enough bubblewrap is necessary but not sufficient: a non-privileged CodeBuild
+      # container cannot create an unprivileged user namespace at all, and the probe in
+      # `LinuxBubblewrapSandbox::discover` then fails with `No permissions to create
+      # new namespace` (run 33238108362, with bwrap 0.9.0 already installed). A
+      # read-only agent is pinned to `SandboxMode::ReadOnly` regardless of configured
+      # mode (cmd/tool_runtime.rs:460), and restricted modes never downgrade to
+      # unconfined (sandbox/src/lib.rs:490) — correctly, so the container must grant
+      # the capability instead. This is safe only because every job on this privileged
+      # runner carries the fork gate below, so a fork's pull request never reaches it;
+      # the runner's service role can read the `zuno-github` connection, so a
+      # privileged container must never execute untrusted code.
+      - name: Install bubblewrap for the OS sandbox backend
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update && apt-get install -y --no-install-recommends bubblewrap
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
+          bwrap --version
+
+      - name: Format check
+        run: make fmt-check
+
+      - name: Clippy
+        run: make lint
+
+      - name: Test suite
+        run: make test
+
+  # The supply-chain gate is its own job so a licence or advisory failure is
+  # legible at a glance instead of buried in a 3000-test log.
+  supply-chain:
+    name: Supply chain
+    # SECURITY: never run on a fork's pull request. This job is routed to a
+    # CodeBuild runner whose container is `privilegedMode=true` and whose service
+    # role can read the `zuno-github` CodeConnection token. That token's scope is
+    # the GitHub App installation, not this repository, so executing an outside
+    # contributor's code there would hand them a credential reaching further than
+    # the pull request they opened. GitHub withholds secrets from fork pull
+    # requests automatically; it cannot withhold a runner's own IAM role, so the
+    # gate has to be here. Review a fork's changes, then run them from a branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-ci-supply-chain
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-deny
+
+      # Online here on purpose: cargo-deny fetches the RUSTSEC advisory database,
+      # and the whole point of the advisories check is to be current. `make deny`
+      # is the offline-capable local equivalent.
+      - name: cargo deny
+        run: cargo deny --all-features check
+
+  # -------------------------------------------------------------------------
+  # artifact: the release pipeline's packaging + smoke path, on the host leg.
+  #
+  # Same three checks the release workflow runs against all six archives —
+  # `--version`, `--help`, and a headless `run` against a committed cassette —
+  # against a real release build that was packaged and unpacked first. Cheap
+  # enough for every push, and it means a break in the smoke driver or the
+  # cassette surfaces on the pull request that caused it.
+  # -------------------------------------------------------------------------
+  artifact:
+    name: Artifact smoke (host)
+    # SECURITY: never run on a fork's pull request. This job is routed to a
+    # CodeBuild runner whose container is `privilegedMode=true` and whose service
+    # role can read the `zuno-github` CodeConnection token. That token's scope is
+    # the GitHub App installation, not this repository, so executing an outside
+    # contributor's code there would hand them a credential reaching further than
+    # the pull request they opened. GitHub withholds secrets from fork pull
+    # requests automatically; it cannot withhold a runner's own IAM role, so the
+    # gate has to be here. Review a fork's changes, then run them from a branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-ci-artifact
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: artifact
+
+      # The packaged binary refuses to start without ripgrep 14+; see the same step
+      # in `test` for why the CodeBuild image needs it installed explicitly. This job
+      # smokes a real release build, so the absence surfaces as `the headless run
+      # exited non-zero` rather than as a test failure.
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: ripgrep
+
+      - name: Verify ripgrep satisfies the runtime minimum
+        run: rg --version
+
+      # `make smoke-artifact` reaches `release`, which is `--offline` by default; see
+      # the same step in `test` for why a cold runner needs this first.
+      - name: Populate the cargo registry for the offline gates
+        run: cargo fetch --locked
+
+      # The smoked binary opens a real session, so it needs the OS sandbox backend
+      # too; see the same step in `test`. Without it the headless run fails with
+      # `no trusted system bubblewrap executable was found`.
+      - name: Install bubblewrap for the OS sandbox backend
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update && apt-get install -y --no-install-recommends bubblewrap
+          else
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
+          bwrap --version
+
+      - name: Package and smoke
+        run: make smoke-artifact
+
+  # -------------------------------------------------------------------------
+  # windows: opt-in, because the capacity to run it is not there.
+  #
+  # This account's GitHub-hosted minutes are exhausted, so a `windows-latest` job
+  # is never assigned a runner: measured on run 31868933369, the job concluded
+  # `failure` with an empty `runner_name` and zero steps — it never started, and
+  # nothing about the code caused it. It cannot move to CodeBuild either: Windows
+  # CodeBuild runners require a reserved-capacity fleet, and `list-fleets` in
+  # cn-northwest-1 answers `Unknown operation ListFleets` — the aws-cn partition
+  # has no fleet API at all, only `LINUX_CONTAINER`.
+  #
+  # So the job stays defined and stays in `ci-success`'s `needs:`, gated on a
+  # repository variable instead of deleted. Unset, it skips, and `ci-success`
+  # tolerates a skip from this job by name. Set `HOSTED_RUNNERS=true` once
+  # minutes exist and it is a hard gate again with no other edit.
+  #
+  # NOT `GITHUB_HOSTED_RUNNERS`: `GITHUB_` is a reserved configuration-variable
+  # prefix, so the REST API refuses to create it — `POST
+  # /repos/{owner}/{repo}/actions/variables` answers `422 Variable names must not
+  # start with GITHUB_.`. Under the old name the gate could never be flipped on,
+  # which made this job permanently skipped rather than opt-in.
+  #
+  # Deliberately not `continue-on-error: true`: that would also swallow a real
+  # Windows failure. The distinction this keeps is "did not run" vs "ran and
+  # failed" — only the first is acceptable.
+  # -------------------------------------------------------------------------
+  windows:
+    name: Windows
+    if: vars.HOSTED_RUNNERS == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.98.0"
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test suite
+        run: cargo test --workspace
+
+  # -------------------------------------------------------------------------
+  # ci-success: the single status check to require in branch protection.
+  #
+  # It must be a STRICT gate. `needs.<job>.result` can be success, failure,
+  # cancelled or skipped; a check that rejects only `failure` passes a run that
+  # was cancelled by a newer push or skipped entirely. Combined with
+  # `cancel-in-progress: true` above, that would let a green tick sit on a run
+  # whose tests never finished. Anything other than `success` fails here,
+  # including any result value GitHub adds in future.
+  #
+  # One narrow exception, enumerated by job name in the script: a job that is
+  # opt-in may be `skipped`. Today that is `windows` alone, because this account
+  # has no GitHub-hosted minutes to run it on. The exception is per-job and per-
+  # result: `skipped` from a named job passes, every other result from it — and
+  # every result but `success` from anything else — still fails. A blanket
+  # "ignore skipped" would re-open the hole this job exists to close.
+  #
+  # The results are read from `toJSON(needs)` rather than named one by one, so
+  # adding a job to `needs:` below makes it required with no change to the script.
+  # GitHub cannot close the remaining gap — the `needs` context contains only the
+  # jobs listed in `needs:`, so a job never added there is invisible to this gate
+  # however the expression is written. `crates/zuno-cli/tests/release_surface.rs`
+  # closes it from outside by asserting `ci-success.needs` lists every job in this
+  # file.
+  # -------------------------------------------------------------------------
+  ci-success:
+    name: CI Success
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-ci-success
+    # `always()` so a failed dependency still reaches the gate — that is the whole
+    # point of this job. The added clause is NOT a weakening: on a fork's pull
+    # request every dependency is skipped by design (see the security note on
+    # `test`), so without it this job would report a red gate for a pull request
+    # that was never permitted to run. Skipping the gate alongside the work it
+    # gates keeps "did not run" distinct from "ran and failed", which is the same
+    # distinction the `windows` job's comment defends.
+    #
+    # This job also runs on the privileged runner, so it must carry the same fork
+    # condition regardless.
+    if: |
+      always() && (
+        github.event_name != 'pull_request'
+        || github.event.pull_request.head.repo.full_name == github.repository
+      )
+    needs: [test, supply-chain, artifact, windows]
+    steps:
+      - name: Check every required job succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NEEDS_JSON:-}" ]; then
+            echo "::error title=CI gate::the needs context was empty; failing closed."
+            exit 1
+          fi
+          if ! printf '%s' "$NEEDS_JSON" | jq -e 'type == "object" and length > 0' > /dev/null 2>&1; then
+            echo "::error title=CI gate::the needs context did not parse as a non-empty object; failing closed."
+            printf 'needs context was: %s\n' "$NEEDS_JSON"
+            exit 1
+          fi
+          # A job whose `result` key is absent renders as <missing> and fails.
+          mapfile -t rows < <(
+            printf '%s' "$NEEDS_JSON" \
+              | jq -r 'to_entries | sort_by(.key)[] | "\(.key)\t\(.value.result // "<missing>")"'
+          )
+          if [ "${#rows[@]}" -eq 0 ]; then
+            echo "::error title=CI gate::no required jobs in the needs context; failing closed."
+            exit 1
+          fi
+          # The enumerated exception. Adding a name here weakens the gate for that
+          # job only, and only for `skipped`.
+          may_be_skipped() {
+            case "$1" in
+              windows) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          offenders=0
+          skips=0
+          for row in "${rows[@]}"; do
+            job="${row%%$'\t'*}"
+            result="${row#*$'\t'}"
+            if [ "$result" = "success" ]; then
+              printf '  ok   %-14s %s\n' "$job" "$result"
+            elif [ "$result" = "skipped" ] && may_be_skipped "$job"; then
+              printf '  skip %-14s %s (opt-in; see the job comment)\n' "$job" "$result"
+              skips=$((skips + 1))
+            else
+              printf '  FAIL %-14s %s\n' "$job" "$result"
+              echo "::error title=CI gate::required job '${job}' concluded '${result}', not 'success'."
+              offenders=$((offenders + 1))
+            fi
+          done
+          if [ "$offenders" -ne 0 ]; then
+            echo "CI failed: ${offenders} of ${#rows[@]} required job(s) did not conclude 'success'."
+            exit 1
+          fi
+          echo "CI passed: $(( ${#rows[@]} - skips )) of ${#rows[@]} required job(s) succeeded, ${skips} opt-in job(s) skipped."

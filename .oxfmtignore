@@ -1,0 +1,22 @@
+# The Chinese README. oxfmt reflows by character count, which mismeasures CJK
+# text and produces lines that render ragged, so this translation is formatted
+# by hand and is deliberately absent from the Makefile's OXFMT_FILES list.
+docs/readme/README.zh-CN.md
+
+# Fixtures and snapshots
+fixtures/
+**/fixtures/
+**/snapshots/
+
+# Tool-owned release files
+changelog/
+CHANGELOG.md
+.release-please-manifest.json
+release-please-config.json
+
+# Lockfiles and build output
+Cargo.lock
+dist/
+build/
+bin/
+target/

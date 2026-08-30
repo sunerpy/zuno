@@ -1,0 +1,59 @@
+---
+source: crates/zuno-tui/src/theme_tests.rs
+expression: "theme_sample(&registry, name, Mode::Dark)"
+---
+"aura                      " fg=#edecee bg=#0f0f0f mod=BOLD
+"primary                   " fg=#a277ff bg=#0f0f0f mod=NONE
+"secondary                 " fg=#f694ff bg=#0f0f0f mod=NONE
+"accent                    " fg=#a277ff bg=#0f0f0f mod=NONE
+"error                     " fg=#ff6767 bg=#0f0f0f mod=NONE
+"warning                   " fg=#ffca85 bg=#0f0f0f mod=NONE
+"success                   " fg=#61ffca bg=#0f0f0f mod=NONE
+"info                      " fg=#a277ff bg=#0f0f0f mod=NONE
+"text                      " fg=#edecee bg=#0f0f0f mod=NONE
+"textMuted                 " fg=#6d6d6d bg=#0f0f0f mod=NONE
+"background                " fg=#0f0f0f bg=#0f0f0f mod=NONE
+"backgroundPanel           " fg=#15141b bg=#0f0f0f mod=NONE
+"backgroundElement         " fg=#15141b bg=#0f0f0f mod=NONE
+"border                    " fg=#2d2d2d bg=#0f0f0f mod=NONE
+"borderActive              " fg=#6d6d6d bg=#0f0f0f mod=NONE
+"borderSubtle              " fg=#2d2d2d bg=#0f0f0f mod=NONE
+"diffAdded                 " fg=#61ffca bg=#0f0f0f mod=NONE
+"diffRemoved               " fg=#ff6767 bg=#0f0f0f mod=NONE
+"diffContext               " fg=#6d6d6d bg=#0f0f0f mod=NONE
+"diffHunkHeader            " fg=#6d6d6d bg=#0f0f0f mod=NONE
+"diffHighlightAdded        " fg=#61ffca bg=#0f0f0f mod=NONE
+"diffHighlightRemoved      " fg=#ff6767 bg=#0f0f0f mod=NONE
+"diffAddedBg               " fg=#354933 bg=#0f0f0f mod=NONE
+"diffRemovedBg             " fg=#3f191a bg=#0f0f0f mod=NONE
+"diffContextBg             " fg=#15141b bg=#0f0f0f mod=NONE
+"diffLineNumber            " fg=#898989 bg=#0f0f0f mod=NONE
+"diffAddedLineNumberBg     " fg=#162620 bg=#0f0f0f mod=NONE
+"diffRemovedLineNumberBg   " fg=#26161a bg=#0f0f0f mod=NONE
+"markdownText              " fg=#edecee bg=#0f0f0f mod=NONE
+"markdownHeading           " fg=#a277ff bg=#0f0f0f mod=NONE
+"markdownLink              " fg=#f694ff bg=#0f0f0f mod=NONE
+"markdownLinkText          " fg=#a277ff bg=#0f0f0f mod=NONE
+"markdownCode              " fg=#61ffca bg=#0f0f0f mod=NONE
+"markdownBlockQuote        " fg=#6d6d6d bg=#0f0f0f mod=NONE
+"markdownEmph              " fg=#ffca85 bg=#0f0f0f mod=NONE
+"markdownStrong            " fg=#a277ff bg=#0f0f0f mod=NONE
+"markdownHorizontalRule    " fg=#6d6d6d bg=#0f0f0f mod=NONE
+"markdownListItem          " fg=#a277ff bg=#0f0f0f mod=NONE
+"markdownListEnumeration   " fg=#a277ff bg=#0f0f0f mod=NONE
+"markdownImage             " fg=#f694ff bg=#0f0f0f mod=NONE
+"markdownImageText         " fg=#a277ff bg=#0f0f0f mod=NONE
+"markdownCodeBlock         " fg=#edecee bg=#0f0f0f mod=NONE
+"syntaxComment             " fg=#6d6d6d bg=#0f0f0f mod=NONE
+"syntaxKeyword             " fg=#f694ff bg=#0f0f0f mod=NONE
+"syntaxFunction            " fg=#a277ff bg=#0f0f0f mod=NONE
+"syntaxVariable            " fg=#a277ff bg=#0f0f0f mod=NONE
+"syntaxString              " fg=#61ffca bg=#0f0f0f mod=NONE
+"syntaxNumber              " fg=#9dff65 bg=#0f0f0f mod=NONE
+"syntaxType                " fg=#a277ff bg=#0f0f0f mod=NONE
+"syntaxOperator            " fg=#f694ff bg=#0f0f0f mod=NONE
+"syntaxPunctuation         " fg=#edecee bg=#0f0f0f mod=NONE
+"selectedListItemText      " fg=#0f0f0f bg=#0f0f0f mod=NONE
+"backgroundMenu            " fg=#15141b bg=#0f0f0f mod=NONE
+"thinkingOpacity 0.60      " fg=#6d6d6d bg=#0f0f0f mod=NONE
+"selectedForeground        " fg=#0f0f0f bg=#a277ff mod=NONE

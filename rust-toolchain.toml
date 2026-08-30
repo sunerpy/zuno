@@ -1,0 +1,5 @@
+# Bumping this is a deliberate change: `clippy all = "warn"` plus `-D warnings`
+# in CI makes any lint a new toolchain adds a build failure.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

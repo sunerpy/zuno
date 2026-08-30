@@ -1,0 +1,26 @@
+package zuno:plugin@1.0.0;
+
+world plugin {
+    /// Negotiate the exact Zuno plugin protocol before any tool can run.
+    export initialize: func(
+        package-id: string,
+        workspace: string,
+        capabilities: list<string>,
+    ) -> result<string, string>;
+
+    /// Execute one manifest-declared tool.
+    ///
+    /// Arguments and metadata are JSON strings so the WIT ABI stays small while
+    /// JSON Schema remains the single model-facing argument contract.
+    export invoke: func(
+        tool: string,
+        arguments-json: string,
+        session-id: string,
+        message-id: string,
+        call-id: string,
+        agent: string,
+    ) -> result<tuple<string, string, string>, string>;
+
+    /// Release guest-owned state before the instance is dropped.
+    export shutdown: func() -> result<_, string>;
+}

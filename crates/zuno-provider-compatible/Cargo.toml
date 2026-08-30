@@ -1,0 +1,39 @@
+[package]
+name = "zuno-provider-compatible"
+description = "OpenAI-compatible endpoints reached through a configurable base URL."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# ---------------------------------------------------------------------------
+# This crate holds ONE profile and depends on the spine, not the other way
+# round. `zuno-llm` must never name it; see `zuno-llm/Cargo.toml`.
+#
+# `reqwest` is here because a provider is useless without a transport, but the
+# transport is behind the `Transport` trait in `transport.rs` so every test in
+# this crate replays recorded bytes instead of opening a socket. There is no
+# `#[cfg(test)]` escape hatch that reaches the network.
+# ---------------------------------------------------------------------------
+[dependencies]
+zuno-error = { workspace = true }
+zuno-llm = { workspace = true }
+zuno-network = { workspace = true }
+
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+zuno-testkit = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+toml = { workspace = true }
+
+[lints]
+workspace = true
