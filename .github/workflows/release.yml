@@ -660,7 +660,14 @@ jobs:
                --output "$archive" "$url"
           echo "${RG_SHA256}  ${archive}" | sha256sum --check --strict
           unzip -q "$archive"
-          rg_dir="$PWD/ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc"
+          # `pwd -W`, not `$PWD`. Git Bash reports `$PWD` in POSIX form
+          # (`/c/codebuild/...`), and while that works for a `rg --version` check run
+          # from this same shell, the binary under test is a native Windows program
+          # and cannot resolve it — release run 33302361906 showed `rg --version`
+          # printing `ripgrep 15.2.0` in this step and the smoke still failing with
+          # `ripgrep (`rg`) is required for glob and grep` two steps later. `pwd -W`
+          # emits the `C:/...` form that both shells and native programs accept.
+          rg_dir="$(pwd -W)/ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc"
           # `-f`, not `-x`: the archive carries no Unix permission bits, so the
           # extracted `rg.exe` is mode 0644 and `test -x` fails under Git Bash even
           # though Windows runs it perfectly well. Verified locally against the real
