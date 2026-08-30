@@ -703,6 +703,32 @@ User prompts and subagent reports share this protocol:
 - An idle parent is claimed and driven immediately.
 - A restarted process recovers pending reports from the durable inbox.
 
+The same boundary now covers every asynchronous continuation source:
+`subagentReport`, `productAgentReport`, `workflowReport`, `councilReport`, and
+`backgroundExecutionReport`. The provider-specific completion signal is never
+the queue of record. A producer first commits a typed `session_input`; only then
+may a process-local watcher nudge the session. A wake is successful only after
+the input is promoted by an active turn or claimed by a newly started turn.
+Persisting the row alone is not an acknowledgement.
+
+This follows the public
+[Codex app-server thread model](https://developers.openai.com/codex/app-server)
+without copying an undocumented implementation: Codex keeps threads resumable,
+exposes runtime status, and allows later turns after the prior turn returned.
+Zuno makes the corresponding local invariant explicit in SQLite. If the process
+remains resident, a completion starts the continuation immediately. If the
+process exits, no model can run in the absence of a resident runtime; the
+notification remains durable and is redriven when that session is activated.
+An explicit session close first unregisters the resident watcher, interrupts and
+joins any detached continuation, and then applies the surface lifecycle policy
+instead of silently reopening the session.
+
+Detached turns use the same engine events as request-owned turns. TUI routes root
+events back to the mounted transcript, ACP sends ordinary root
+`session/update` notifications, and the HTTP server commits and fans out the
+same durable event projection. Child-session events retain their child observer.
+No client owns a private continuation loop.
+
 Interactive TUI input uses the same durable boundary. When idle, `Enter`
 starts a turn. During an active turn, `Enter` admits a FIFO `queue` item for the
 next turn; `Ctrl+Enter` is the explicit `steer` override and requests a soft
@@ -1236,6 +1262,17 @@ section even while a model turn is active. Each row carries status, command,
 pid, elapsed time, and failure context; the section advertises `/ps` for the
 scrollable output view.
 
+A terminal durable command also creates one deterministic
+`backgroundExecutionReport` input (`msg_<background-execution-id>`). The report
+contains terminal status and directs the model to inspect durable output through
+`bg`; it does not inline an unbounded spool and never asks the runtime to replay
+the command. Settlement events trigger immediate delivery, while a 30-second
+reconciliation pass and workspace reopen scan cover lag and process loss.
+Duplicate events reuse the same input id. A crash after promotion but before the
+input became model-visible returns that row to its original delivery lane before
+redrive. Completed, failed, cancelled, and uncertain outcomes are all reported;
+an uncertain outcome explicitly requires authoritative-state inspection.
+
 ## Background subagents and product agents
 
 Foreground `task` runs remain attached to the parent turn's hard interrupt. A
@@ -1289,6 +1326,11 @@ Job settlement and `nextStep` inbox admission share one SQLite transaction.
 Wake occurs only after commit. If a process exits after settlement or after an
 input was promoted, restart recovery reuses the original report row and returns
 it to its admitted lane; it does not create another report or rerun the child.
+The recovery scan performs that Job transition before reading the ordinary
+pending inbox, so a report stranded in `promoted` can itself trigger the next
+turn without waiting for a new user prompt. Recovery holds a process-local
+reservation for the session while repairing the row, so a live turn cannot own
+the same promoted input concurrently.
 Queued jobs that never started reconcile to `cancelled`; running jobs lost with
 the process reconcile to `uncertain` and are not replayed. Concurrent
 process-local wake attempts for one `(session_id, input_id)` are coalesced by an

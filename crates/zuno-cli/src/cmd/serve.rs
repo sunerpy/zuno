@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use uuid::Uuid;
-use zuno_engine::r#loop::TurnEventSender;
+use zuno_engine::r#loop::{TurnEvent, TurnEventSender};
 use zuno_engine::status::{SessionRunGuard, SessionRunRegistry};
 use zuno_error::ToolError;
 use zuno_permission::ReplyKind;
 use zuno_server::api::{self, ApiState};
 use zuno_server::{
-    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventService, PermissionRequest,
+    AuthConfig, DEFAULT_EVENT_SUBSCRIBER_CAPACITY, EventFanout, EventService, PermissionRequest,
     QuestionDecision, QuestionRequest, QuestionToolCall, RequestBroker, ServerBuilder,
     ServerConfig, ServerServices, SessionCompactExecution, SessionMutationExecutor,
     SessionMutationFuture, SessionPromptExecution, events_router,
@@ -17,7 +17,8 @@ use zuno_server::{
 use zuno_tool::{PermissionAsk, PermissionAsker, PermissionOrigin};
 use zuno_tools::question::{QuestionAsker, QuestionOutcome};
 
-use super::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan};
+use super::child_turn::DetachedTurnObserver;
+use super::turn::{SessionChoice, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan};
 use crate::command::ServeArgs;
 use crate::environment::StartupEnvironment;
 
@@ -32,6 +33,7 @@ struct ServerSessionMutationExecutor {
     /// serialized so a request cannot acquire the old revision after a candidate has
     /// reserved it and before that candidate commits.
     composition_gate: Arc<tokio::sync::Mutex<()>>,
+    detached_observer: Arc<dyn DetachedTurnObserver>,
     /// The one MCP catalog every session on this server shares.
     ///
     /// A host is built per request here, so building a *catalog* per request would
@@ -48,12 +50,15 @@ impl ServerSessionMutationExecutor {
         requests: RequestBroker,
         runs: SessionRunRegistry,
         mcp: Option<zuno_mcp::Catalog>,
+        events: EventService,
+        fanout: EventFanout<TurnEvent>,
     ) -> Self {
         Self {
             environment,
             requests,
             runs,
             composition_gate: Arc::new(tokio::sync::Mutex::new(())),
+            detached_observer: Arc::new(ServerDetachedTurnObserver { events, fanout }),
             mcp,
         }
     }
@@ -75,13 +80,17 @@ impl ServerSessionMutationExecutor {
         let question: Arc<dyn QuestionAsker> = Arc::new(ServerQuestionAsker {
             requests: self.requests.clone(),
         });
-        let mut host = TurnHost::open_with_runtime_and_mcp(
+        let mut host = TurnHost::open_with_runtime_mcp_and_observers(
             plan,
             &self.environment,
-            approval,
-            Some(question),
-            self.runs.clone(),
-            self.mcp.clone(),
+            TurnHostRuntimeDependencies {
+                approval,
+                question: Some(question),
+                runs: self.runs.clone(),
+                mcp: self.mcp.clone(),
+                child_observer: None,
+                detached_observer: Some(Arc::clone(&self.detached_observer)),
+            },
         )
         .await?;
         if let Err(error) = host.activate_extension_composition() {
@@ -93,6 +102,7 @@ impl ServerSessionMutationExecutor {
                 }
             });
         }
+        host.activate_background_notifications(&tokio::runtime::Handle::current());
         Ok(host)
     }
 
@@ -272,8 +282,23 @@ impl std::fmt::Debug for ServerSessionMutationExecutor {
             .field("environment", &self.environment)
             .field("requests", &self.requests)
             .field("runs", &self.runs)
+            .field("detached_observer", &"configured")
             .field("mcp", &self.mcp.is_some())
             .finish()
+    }
+}
+
+struct ServerDetachedTurnObserver {
+    events: EventService,
+    fanout: EventFanout<TurnEvent>,
+}
+
+#[async_trait]
+impl DetachedTurnObserver for ServerDetachedTurnObserver {
+    async fn event(&self, session_id: &str, event: &TurnEvent) {
+        self.events
+            .forward_engine_event(session_id, &self.fanout, event.clone())
+            .await;
     }
 }
 
@@ -453,6 +478,8 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             requests,
             services.runs.clone(),
             mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
+            events.clone(),
+            services.events.clone(),
         ));
         let services = services.with_mutations(mutations);
         let server = ServerBuilder::new(server_config)

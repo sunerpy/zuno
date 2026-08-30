@@ -1906,11 +1906,10 @@ async fn a_transient_parent_wake_failure_is_retried_in_the_same_process() {
 }
 
 #[tokio::test]
-async fn parent_wake_retries_past_the_initial_window_without_duplicate_delivery() {
+async fn parent_wake_is_bounded_and_the_same_report_can_be_recovered_later() {
     let fixture = Fixture::new();
     fixture.session("ses_owner", None);
-    let initial_failures = 3;
-    for _ in 0..initial_failures {
+    for _ in 0..3 {
         fixture.wake.fail_once_with("temporary parent wake outage");
     }
     let mut request = fixture.request("ses_owner");
@@ -1924,7 +1923,26 @@ async fn parent_wake_retries_past_the_initial_window_without_duplicate_delivery(
     fixture.runner.complete_with(Ok("child answer"));
     fixture.jobs.wait_all().await;
 
-    assert_eq!(fixture.wake.attempts(), initial_failures + 1);
+    assert_eq!(fixture.wake.attempts(), 3);
+    assert!(
+        fixture
+            .wake
+            .reports
+            .lock()
+            .expect("wake reports")
+            .is_empty()
+    );
+    assert_eq!(
+        fixture
+            .host
+            .recover_pending_reports("ses_owner")
+            .await
+            .expect("schedule report recovery"),
+        1
+    );
+    fixture.jobs.wait_all().await;
+
+    assert_eq!(fixture.wake.attempts(), 4);
     assert_eq!(
         fixture.wake.reports.lock().expect("wake reports").len(),
         1,
@@ -1977,12 +1995,13 @@ async fn a_report_left_pending_by_process_loss_is_recovered_when_the_parent_reop
         recovered_jobs.delegation_limiter(
             NonZeroUsize::new(8).expect("default delegation limit is non-zero"),
         ),
-        recovered_jobs,
+        recovered_jobs.clone(),
     )
     .expect("reopen child host")
     .recover_pending_reports("ses_owner")
     .await
     .expect("recover reports");
+    recovered_jobs.wait_all().await;
 
     assert_eq!(recovered, 1);
     assert_eq!(
@@ -2162,6 +2181,7 @@ async fn restart_reconciliation_cancels_queued_children_and_marks_running_childr
             .expect("wake recovered reports"),
         2
     );
+    fixture.jobs.wait_all().await;
     let statuses = fixture
         .wake
         .reports

@@ -5,7 +5,7 @@
 //! handles retain only a session id plus the registry, so an old UI handle always
 //! looks up the signal and soft-interrupt queue belonging to the current turn.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -98,6 +98,7 @@ struct RegistryInner {
 #[derive(Debug, Default)]
 struct RegistryState {
     active: HashMap<String, ActiveSession>,
+    recovering: HashSet<String>,
     pending_interrupts: HashMap<String, HardInterruptRequest>,
 }
 
@@ -132,7 +133,7 @@ impl SessionRunRegistry {
     ) -> Result<SessionRunGuard, SessionBusy> {
         let session_id = session_id.into();
         let mut state = self.lock_state();
-        if state.active.contains_key(&session_id) {
+        if state.active.contains_key(&session_id) || state.recovering.contains(&session_id) {
             return Err(SessionBusy { session_id });
         }
 
@@ -161,6 +162,26 @@ impl SessionRunRegistry {
         })
     }
 
+    /// Reserve an idle session while repairing orphaned durable input claims.
+    ///
+    /// This lease does not create a turn or consume a pending hard interrupt. It
+    /// only excludes a concurrent turn long enough for the caller to return a
+    /// process-orphaned `promoted` input to its admitted lane.
+    pub fn begin_recovery(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<SessionRecoveryGuard, SessionBusy> {
+        let session_id = session_id.into();
+        let mut state = self.lock_state();
+        if state.active.contains_key(&session_id) || !state.recovering.insert(session_id.clone()) {
+            return Err(SessionBusy { session_id });
+        }
+        Ok(SessionRecoveryGuard {
+            registry: self.clone(),
+            session_id,
+        })
+    }
+
     /// Creates a reusable session control handle.
     ///
     /// The handle deliberately captures no interrupt signal. Every operation resolves
@@ -176,7 +197,8 @@ impl SessionRunRegistry {
     /// Returns the current process-local status for one session.
     #[must_use]
     pub fn status(&self, session_id: &str) -> SessionStatus {
-        if self.lock_state().active.contains_key(session_id) {
+        let state = self.lock_state();
+        if state.active.contains_key(session_id) || state.recovering.contains(session_id) {
             SessionStatus::Busy
         } else {
             SessionStatus::Idle
@@ -324,6 +346,14 @@ impl SessionRunRegistry {
         }
     }
 
+    fn finish_recovery(&self, session_id: &str) {
+        let mut state = self.lock_state();
+        if state.recovering.remove(session_id) {
+            drop(state);
+            self.inner.idle.notify_waiters();
+        }
+    }
+
     fn lock_state(&self) -> MutexGuard<'_, RegistryState> {
         self.inner
             .state
@@ -360,6 +390,11 @@ impl SessionControl {
     #[must_use]
     pub fn abort_active(&self, request: HardInterruptRequest) -> bool {
         self.registry.abort_active(&self.session_id, request)
+    }
+
+    /// Wait until the current live turn, if any, releases this session.
+    pub async fn wait_until_idle(&self) {
+        self.registry.wait_until_idle(&self.session_id).await;
     }
 
     /// Clears a cancellation armed for a future turn during lifecycle teardown.
@@ -444,5 +479,18 @@ impl Drop for SessionRunGuard {
         let epoch = self.interrupt.signal().epoch();
         self.registry.unregister(&self.session_id, self.token);
         let _reset_applied = self.interrupt.signal().reset_if_epoch(epoch);
+    }
+}
+
+/// Short process-local lease used only while recovering orphaned durable input.
+#[derive(Debug)]
+pub struct SessionRecoveryGuard {
+    registry: SessionRunRegistry,
+    session_id: String,
+}
+
+impl Drop for SessionRecoveryGuard {
+    fn drop(&mut self) {
+        self.registry.finish_recovery(&self.session_id);
     }
 }

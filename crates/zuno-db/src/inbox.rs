@@ -331,6 +331,21 @@ impl SessionInbox {
             )
         })
     }
+
+    /// Return one orphaned promoted input to its original admitted lane.
+    ///
+    /// Detached turn recovery uses this only after the prior process can no longer
+    /// own the promotion. Repeating the operation is idempotent for an already
+    /// queued or steering input, while consumed and otherwise terminal inputs are
+    /// left unchanged.
+    pub fn recover_promoted(
+        &self,
+        session_id: &str,
+        input_id: &str,
+    ) -> Result<Option<SessionInput>, DbError> {
+        self.pool
+            .transaction(|transaction| recover_promoted_in(transaction, session_id, input_id))
+    }
 }
 
 pub(crate) fn validate_input(input: &NewSessionInput) -> Result<(), DbError> {

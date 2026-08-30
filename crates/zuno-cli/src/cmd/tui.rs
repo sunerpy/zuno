@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::{mpsc, watch};
@@ -81,12 +82,13 @@ use zuno_tui::views::session::{
 use zuno_tui::views::slash::{CatalogCommand, HostCommand};
 
 use super::child_turn::{
-    ChildSessionOpened, ChildTurnObserver, InteractiveChildInput, InteractiveChildInputContext,
+    ChildSessionOpened, ChildTurnObserver, DetachedTurnObserver, InteractiveChildInput,
+    InteractiveChildInputContext,
 };
 use super::tui_permission::{AutoApproval, PermissionBridge, PermissionBroker};
 use super::tui_question::{QuestionBridge, QuestionBroker};
 use super::turn::{
-    SessionChoice, SessionTitleSink, TurnHost, TurnOptions, TurnPlan,
+    SessionChoice, SessionTitleSink, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
     background_execution_projections, persisted_session_agent,
 };
 use crate::command::TuiArgs;
@@ -482,15 +484,25 @@ fn execute_once(
         sessions: live_sessions.clone(),
         wake: terminal_sender.clone(),
     });
-    let mut host = runtime.block_on(TurnHost::open_with_runtime_mcp_and_observer(
+    let detached_root = Arc::new(Mutex::new(None));
+    let detached_observer: Arc<dyn DetachedTurnObserver> = Arc::new(TuiDetachedTurnObserver {
+        root_session_id: Arc::clone(&detached_root),
+        root_events: engine_sender.clone(),
+        children: Arc::clone(&child_observer),
+    });
+    let mut host = runtime.block_on(TurnHost::open_with_runtime_mcp_and_observers(
         plan,
         environment,
-        approval,
-        Some(Arc::clone(&question)),
-        runs.clone(),
-        Some(mcp_catalog.clone()),
-        Some(Arc::clone(&child_observer)),
+        TurnHostRuntimeDependencies {
+            approval,
+            question: Some(Arc::clone(&question)),
+            runs: runs.clone(),
+            mcp: Some(mcp_catalog.clone()),
+            child_observer: Some(Arc::clone(&child_observer)),
+            detached_observer: Some(Arc::clone(&detached_observer)),
+        },
     ))?;
+    bind_tui_detached_root(&detached_root, host.session_id());
     if let Err(error) = host.activate_extension_composition() {
         let shutdown = runtime.block_on(host.shutdown());
         return Err(match shutdown {
@@ -500,6 +512,7 @@ fn execute_once(
             }
         });
     }
+    host.activate_background_notifications(runtime.handle());
     let goals = host.goal_store();
     let human_requests = goals.human_requests();
     broker.attach_durable(
@@ -527,7 +540,13 @@ fn execute_once(
         wake: terminal_sender.clone(),
     });
     host.set_title_sink(Arc::clone(&title_sink));
-    let continuity = TuiHostContinuity::new(runs, title_sink, Some(child_observer));
+    let continuity = TuiHostContinuity::new(
+        runs,
+        title_sink,
+        Some(child_observer),
+        Some(detached_observer),
+        Some(detached_root),
+    );
     let interactive_children = InteractiveChildInput::new(InteractiveChildInputContext {
         database: host.database_pool(),
         environment: driver_environment.clone(),
@@ -537,6 +556,7 @@ fn execute_once(
         runs: continuity.runs(),
         mcp: Some(mcp_catalog.clone()),
         observer: continuity.child_observer(),
+        detached_observer: continuity.detached_observer(),
         supervisor: environment.background_jobs(&reference_root),
     });
     let work_state = WorkState::new(host.work_state()?);
@@ -973,6 +993,14 @@ struct TuiChildObserver {
     wake: mpsc::Sender<TerminalEvent>,
 }
 
+/// Routes detached root turns back through the mounted transcript while preserving
+/// ordinary child-session projection for nested continuations.
+struct TuiDetachedTurnObserver {
+    root_session_id: Arc<Mutex<Option<String>>>,
+    root_events: TurnEventSender,
+    children: Arc<dyn ChildTurnObserver>,
+}
+
 /// Restore the durable child tree before the first frame of a resumed parent session.
 ///
 /// A child created by an earlier process is still a real session. Keeping this projection
@@ -1078,6 +1106,35 @@ impl ChildTurnObserver for TuiChildObserver {
     }
 }
 
+#[async_trait]
+impl DetachedTurnObserver for TuiDetachedTurnObserver {
+    async fn event(&self, session_id: &str, event: &TurnEvent) {
+        let is_root = self
+            .root_session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref()
+            == Some(session_id);
+        if is_root {
+            if let Err(error) = self.root_events.publish(event.clone()).await {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "detached root turn outlived its TUI projection"
+                );
+            }
+        } else {
+            self.children.event(session_id, event);
+        }
+    }
+}
+
+fn bind_tui_detached_root(root: &Mutex<Option<String>>, session_id: &str) {
+    *root
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id.to_owned());
+}
+
 impl super::turn::SessionTitleSink for TitleProjectionSink {
     fn publish(&self, title: &str) {
         self.projection.replace(Some(title.to_owned()));
@@ -1097,6 +1154,8 @@ struct TuiHostContinuity {
     runs: SessionRunRegistry,
     title_sink: Arc<dyn SessionTitleSink>,
     child_observer: Option<Arc<dyn ChildTurnObserver>>,
+    detached_observer: Option<Arc<dyn DetachedTurnObserver>>,
+    detached_root: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl TuiHostContinuity {
@@ -1104,11 +1163,15 @@ impl TuiHostContinuity {
         runs: SessionRunRegistry,
         title_sink: Arc<dyn SessionTitleSink>,
         child_observer: Option<Arc<dyn ChildTurnObserver>>,
+        detached_observer: Option<Arc<dyn DetachedTurnObserver>>,
+        detached_root: Option<Arc<Mutex<Option<String>>>>,
     ) -> Self {
         Self {
             runs,
             title_sink,
             child_observer,
+            detached_observer,
+            detached_root,
         }
     }
 
@@ -1128,6 +1191,10 @@ impl TuiHostContinuity {
         self.child_observer.as_ref().map(Arc::clone)
     }
 
+    fn detached_observer(&self) -> Option<Arc<dyn DetachedTurnObserver>> {
+        self.detached_observer.as_ref().map(Arc::clone)
+    }
+
     async fn open_host(
         &self,
         plan: TurnPlan,
@@ -1136,17 +1203,24 @@ impl TuiHostContinuity {
         question: Arc<dyn QuestionAsker>,
         mcp: zuno_mcp::Catalog,
     ) -> Result<TurnHost, String> {
-        let mut host = TurnHost::open_with_runtime_mcp_and_observer(
+        let mut host = TurnHost::open_with_runtime_mcp_and_observers(
             plan,
             environment,
-            approval,
-            Some(question),
-            self.runs(),
-            Some(mcp),
-            self.child_observer(),
+            TurnHostRuntimeDependencies {
+                approval,
+                question: Some(question),
+                runs: self.runs(),
+                mcp: Some(mcp),
+                child_observer: self.child_observer(),
+                detached_observer: self.detached_observer(),
+            },
         )
         .await?;
         host.set_title_sink(self.title_sink());
+        if let Some(root) = self.detached_root.as_ref() {
+            bind_tui_detached_root(root, host.session_id());
+        }
+        host.activate_background_notifications(&tokio::runtime::Handle::current());
         Ok(host)
     }
 }
@@ -3476,10 +3550,10 @@ fn decode_pending_prompt(input: &zuno_db::inbox::SessionInput) -> Result<PromptS
             serde_json::from_value(input.prompt.clone()).map_err(to_string)?;
         return Ok(submission);
     }
-    if matches!(
-        input.prompt.get("kind").and_then(serde_json::Value::as_str),
-        Some("subagentReport" | "productAgentReport" | "humanRequestAnswer")
-    ) {
+    if super::background_notification::is_async_notification(&input.prompt)
+        || input.prompt.get("kind").and_then(serde_json::Value::as_str)
+            == Some("humanRequestAnswer")
+    {
         let text = input
             .prompt
             .get("text")
@@ -3843,6 +3917,8 @@ mod tests {
             SessionRunRegistry::new(),
             Arc::new(RecordingTitleSink::default()),
             None,
+            None,
+            None,
         );
         let control = continuity.control("ses_rebuilt");
         let replacement_runs = continuity.runs();
@@ -3880,6 +3956,8 @@ mod tests {
             SessionRunRegistry::new(),
             Arc::clone(&titles) as Arc<dyn SessionTitleSink>,
             None,
+            None,
+            None,
         );
 
         continuity.title_sink().publish("Replacement title");
@@ -3889,6 +3967,70 @@ mod tests {
             ["Replacement title"],
             "a replacement host lost the live sidebar title projection"
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingChildEvents(Mutex<Vec<String>>);
+
+    impl ChildTurnObserver for RecordingChildEvents {
+        fn opened(&self, _opened: ChildSessionOpened) {}
+
+        fn event(&self, session_id: &str, _event: &TurnEvent) {
+            self.0
+                .lock()
+                .expect("child event log")
+                .push(session_id.to_owned());
+        }
+    }
+
+    #[tokio::test]
+    async fn tui_detached_observer_rebinds_root_after_session_switch() {
+        let root = Arc::new(Mutex::new(None));
+        let (root_events, mut root_receiver) = event_channel();
+        let children = Arc::new(RecordingChildEvents::default());
+        let observer = TuiDetachedTurnObserver {
+            root_session_id: Arc::clone(&root),
+            root_events,
+            children: Arc::clone(&children) as Arc<dyn ChildTurnObserver>,
+        };
+
+        bind_tui_detached_root(&root, "ses_first");
+        observer
+            .event(
+                "ses_first",
+                &TurnEvent::TurnStarted {
+                    session_id: "ses_first".to_owned(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            root_receiver.try_recv(),
+            Ok(TurnEvent::TurnStarted { session_id }) if session_id == "ses_first"
+        ));
+
+        bind_tui_detached_root(&root, "ses_second");
+        observer
+            .event(
+                "ses_second",
+                &TurnEvent::TurnStarted {
+                    session_id: "ses_second".to_owned(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            root_receiver.try_recv(),
+            Ok(TurnEvent::TurnStarted { session_id }) if session_id == "ses_second"
+        ));
+
+        observer
+            .event(
+                "ses_child",
+                &TurnEvent::TurnStarted {
+                    session_id: "ses_child".to_owned(),
+                },
+            )
+            .await;
+        assert_eq!(*children.0.lock().expect("child event log"), ["ses_child"]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -15,10 +15,11 @@ use zuno_engine::status::{SessionControl, SessionRunRegistry};
 use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
 
+use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
 use super::mcp_runtime::McpRuntime;
 use super::turn::{
-    CatalogModelChoice, ExtensionComposition, SessionChoice, TurnHost, TurnOptions, TurnPlan,
-    persisted_session_agent,
+    CatalogModelChoice, ExtensionComposition, SessionChoice, TurnHost, TurnHostRuntimeDependencies,
+    TurnOptions, TurnPlan, persisted_session_agent,
 };
 
 use crate::command::AcpArgs;
@@ -486,6 +487,8 @@ impl ProductionAcpAgent {
             .worktree()
             .unwrap_or_else(|| plan.directory())
             .to_path_buf();
+        let background_notification_directory = plan.directory().to_path_buf();
+        let background_notifications = self.state.environment.background_notifications();
         let resources = open_session_resources(
             plan,
             &self.state.environment,
@@ -506,6 +509,8 @@ impl ProductionAcpAgent {
             replay_gate: Mutex::new(()),
             mount_gate: Mutex::new(()),
             replay_root,
+            background_notification_directory,
+            background_notifications,
             _session_slot: session_slot,
             dormant: Mutex::new(None),
             resources: Mutex::new(Some(resources)),
@@ -533,6 +538,8 @@ impl ProductionAcpAgent {
             .worktree()
             .unwrap_or_else(|| plan.directory())
             .to_path_buf();
+        let background_notification_directory = plan.directory().to_path_buf();
+        let background_notifications = self.state.environment.background_notifications();
         let configuration = SessionConfiguration::from_plan(&plan, None);
         let available_commands =
             available_commands_for_plan(&plan, self.state.environment.resolved())
@@ -546,6 +553,8 @@ impl ProductionAcpAgent {
             replay_gate: Mutex::new(()),
             mount_gate: Mutex::new(()),
             replay_root,
+            background_notification_directory,
+            background_notifications,
             _session_slot: session_slot,
             dormant: Mutex::new(Some(DormantSession {
                 options,
@@ -582,6 +591,8 @@ struct AcpSession {
     replay_gate: Mutex<()>,
     mount_gate: Mutex<()>,
     replay_root: PathBuf,
+    background_notification_directory: PathBuf,
+    background_notifications: super::background_notification::BackgroundNotificationRegistry,
     _session_slot: OwnedSemaphorePermit,
     dormant: Mutex<Option<DormantSession>>,
     resources: Mutex<Option<SessionResources>>,
@@ -629,6 +640,38 @@ struct AcpSurfaceContext {
     permission_grants: Arc<zuno_acp::AcpPermissionGrants>,
     elicitation_form: bool,
     native_subagents: bool,
+}
+
+struct AcpDetachedTurnObserver {
+    root_session_id: Arc<OnceLock<String>>,
+    client: zuno_acp::ClientConnection,
+    projector: Mutex<zuno_acp::AttemptBufferedTurnEventProjector>,
+    children: Option<Arc<dyn ChildTurnObserver>>,
+}
+
+#[async_trait]
+impl DetachedTurnObserver for AcpDetachedTurnObserver {
+    async fn event(&self, session_id: &str, event: &TurnEvent) {
+        if self
+            .root_session_id
+            .get()
+            .is_some_and(|root| root == session_id)
+        {
+            let updates = self.projector.lock().await.project(event);
+            for update in updates {
+                if let Err(error) = self.client.session_update(session_id, update).await {
+                    tracing::debug!(
+                        session_id,
+                        %error,
+                        "detached root turn outlived its ACP projection"
+                    );
+                    break;
+                }
+            }
+        } else if let Some(children) = self.children.as_ref() {
+            children.event(session_id, event);
+        }
+    }
 }
 
 impl AcpSurfaceContext {
@@ -693,14 +736,28 @@ async fn open_session_resources(
     } else {
         (None, None)
     };
-    let host = TurnHost::open_with_runtime_mcp_and_observer(
+    let detached_root = Arc::new(OnceLock::new());
+    let detached_observer: Arc<dyn DetachedTurnObserver> = Arc::new(AcpDetachedTurnObserver {
+        root_session_id: Arc::clone(&detached_root),
+        client: client.clone(),
+        projector: Mutex::new(
+            zuno_acp::AttemptBufferedTurnEventProjector::with_context_size(
+                configuration.context_size,
+            ),
+        ),
+        children: child_observer.as_ref().map(Arc::clone),
+    });
+    let host = TurnHost::open_with_runtime_mcp_and_observers(
         plan,
         environment,
-        approval,
-        question,
-        runs,
-        mcp.as_ref().map(McpRuntime::catalog),
-        child_observer,
+        TurnHostRuntimeDependencies {
+            approval,
+            question,
+            runs,
+            mcp: mcp.as_ref().map(McpRuntime::catalog),
+            child_observer,
+            detached_observer: Some(detached_observer),
+        },
     )
     .await;
     let mut host = match host {
@@ -729,6 +786,23 @@ async fn open_session_resources(
             .map(|bridge| format!("; ACP subagent projector shutdown failed: {bridge}"))
             .unwrap_or_default();
         return Err(format!("{error}{host}{bridge}"));
+    }
+    if detached_root.set(host.session_id().to_owned()).is_err() {
+        let shutdown = host.shutdown().await;
+        if let Some(mcp) = mcp.take() {
+            mcp.shutdown().await;
+        }
+        let bridge = shutdown_subagent_bridge(&mut subagents).await;
+        let shutdown = shutdown
+            .err()
+            .map(|error| format!("; candidate ACP host shutdown failed: {error}"))
+            .unwrap_or_default();
+        let bridge = bridge
+            .map(|error| format!("; ACP subagent projector shutdown failed: {error}"))
+            .unwrap_or_default();
+        return Err(format!(
+            "ACP detached-turn observer root was already bound{shutdown}{bridge}"
+        ));
     }
     if let Err(error) = host.activate_extension_composition() {
         let shutdown = host.shutdown().await;
@@ -777,6 +851,7 @@ async fn open_session_resources(
     if let Some(question_asker) = &question_asker {
         question_asker.attach_durable(human_requests, goals);
     }
+    host.activate_background_notifications(&tokio::runtime::Handle::current());
     let subagent_flush = subagents
         .as_ref()
         .map(super::acp_subagent::AcpSubagentBridge::flush_handle);
@@ -1710,9 +1785,25 @@ impl AcpSession {
         }
         let _replay = self.replay_gate.lock().await;
         let _mount = self.mount_gate.lock().await;
+        let notification_task = self
+            .background_notifications
+            .unregister(&self.background_notification_directory, &self.id);
+        let _disposition = self.control.abort(HardInterruptRequest::new(
+            HardInterruptSource::Lifecycle,
+            HardInterruptReason::SessionClose,
+        ));
+        self.control.wait_until_idle().await;
+        let notification_error = match notification_task {
+            Some(task) => task
+                .await
+                .err()
+                .map(|error| format!("background notification watcher failed: {error}")),
+            None => None,
+        };
+        self.control.wait_until_idle().await;
         self.dormant.lock().await.take();
         let resources = self.resources.lock().await.take();
-        let result = if let Some(resources) = resources {
+        let resources_result = if let Some(resources) = resources {
             let (background_jobs, session_id) = resources.host.background_job_scope();
             background_jobs.cancel_for_parent(&session_id);
             background_jobs.wait_for_parent(&session_id).await;
@@ -1721,7 +1812,12 @@ impl AcpSession {
             Ok(())
         };
         let _cleared = self.control.clear_pending_abort();
-        result
+        match (resources_result, notification_error) {
+            (Ok(()), None) => Ok(()),
+            (Err(error), None) => Err(error),
+            (Ok(()), Some(notification)) => Err(notification),
+            (Err(error), Some(notification)) => Err(format!("{error}; {notification}")),
+        }
     }
 }
 
@@ -2676,10 +2772,9 @@ async fn project_turn(
 }
 
 fn durable_input_text(input: &zuno_db::inbox::SessionInput) -> Result<String, zuno_acp::RpcError> {
-    if matches!(
-        input.prompt.get("kind").and_then(Value::as_str),
-        Some("subagentReport" | "productAgentReport" | "humanRequestAnswer")
-    ) {
+    if super::background_notification::is_async_notification(&input.prompt)
+        || input.prompt.get("kind").and_then(Value::as_str) == Some("humanRequestAnswer")
+    {
         return input
             .prompt
             .get("text")

@@ -1,6 +1,7 @@
 mod acp;
 mod acp_subagent;
 mod agent;
+pub(crate) mod background_notification;
 pub(crate) mod child_turn;
 mod completion;
 mod db;

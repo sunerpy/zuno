@@ -59,7 +59,8 @@ const CHILD_SESSION_METADATA_MAX_ATTEMPTS: u32 = 3;
 const CHILD_SESSION_METADATA_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const CHILD_SESSION_METADATA_MAX_DELAY: Duration = Duration::from_millis(250);
 const PARENT_WAKE_INITIAL_DELAY: Duration = Duration::from_millis(10);
-const PARENT_WAKE_MAX_DELAY: Duration = Duration::from_secs(5);
+const PARENT_WAKE_MAX_DELAY: Duration = Duration::from_millis(100);
+const PARENT_WAKE_ATTEMPTS: usize = 3;
 const FOREGROUND_CHILD_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const TASK_REPORT_METADATA_SCHEMA_VERSION: u32 = 1;
 const TASK_VERIFICATION_METADATA_KEY: &str = "taskVerification";
@@ -829,6 +830,16 @@ pub(crate) trait ChildTurnObserver: Send + Sync + 'static {
     fn event(&self, session_id: &str, event: &TurnEvent);
 }
 
+/// Surface projection for a turn started by a durable wake after its caller returned.
+///
+/// Unlike child projection, this path may need ordered async delivery to a root TUI,
+/// ACP connection, or durable HTTP event service. Projection failure never owns the
+/// turn's durable state, so implementations report locally and return.
+#[async_trait]
+pub(crate) trait DetachedTurnObserver: Send + Sync + 'static {
+    async fn event(&self, session_id: &str, event: &TurnEvent);
+}
+
 #[async_trait]
 pub(crate) trait ParentReportWake: Send + Sync + 'static {
     async fn wake(&self, report: SessionInput) -> Result<(), String>;
@@ -844,6 +855,7 @@ pub(crate) struct ChildSessionContext {
     pub(crate) runs: SessionRunRegistry,
     pub(crate) mcp: Option<zuno_mcp::Catalog>,
     pub(crate) observer: Option<Arc<dyn ChildTurnObserver>>,
+    pub(crate) detached_observer: Option<Arc<dyn DetachedTurnObserver>>,
     pub(crate) parent_agent: String,
     pub(crate) parent_model: String,
     pub(crate) parent_effort: Option<zuno_llm::effort::ReasoningEffort>,
@@ -861,6 +873,7 @@ pub(crate) struct InteractiveChildInputContext {
     pub(crate) runs: SessionRunRegistry,
     pub(crate) mcp: Option<zuno_mcp::Catalog>,
     pub(crate) observer: Option<Arc<dyn ChildTurnObserver>>,
+    pub(crate) detached_observer: Option<Arc<dyn DetachedTurnObserver>>,
     pub(crate) supervisor: BackgroundJobSupervisor,
 }
 
@@ -896,6 +909,7 @@ impl ChildSessionHost {
             runs: context.runs.clone(),
             mcp: context.mcp.clone(),
             observer: context.observer.clone(),
+            detached_observer: context.detached_observer.clone(),
             children: context.supervisor.children.clone(),
         });
         let parent_driver: Arc<dyn PendingInputDriver> = Arc::new(ParentReportDriver {
@@ -906,7 +920,8 @@ impl ChildSessionHost {
             question: context.question,
             runs: context.runs.clone(),
             mcp: context.mcp,
-            observer: context.observer,
+            child_observer: context.observer,
+            detached_observer: context.detached_observer,
             inbox: inbox.clone(),
             agent: context.parent_agent,
             model: context.parent_model,
@@ -967,15 +982,13 @@ impl ChildSessionHost {
             let Some(report) = pending.iter().find(|input| input.id == input_id).cloned() else {
                 continue;
             };
-            if let Err(error) = self.wake.wake(report.clone()).await {
-                self.schedule_parent_report_retry(report, error);
-            }
+            self.schedule_parent_report_wake(report);
             recovered = recovered.saturating_add(1);
         }
         Ok(recovered)
     }
 
-    fn schedule_parent_report_retry(&self, report: SessionInput, first_error: String) {
+    fn schedule_parent_report_wake(&self, report: SessionInput) {
         let wake = Arc::clone(&self.wake);
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
@@ -986,13 +999,8 @@ impl ChildSessionHost {
         let spawned =
             self.supervisor
                 .spawn_unique(retry_id, parent_session_id, cancellation, async move {
-                    if let Err(error) = retry_parent_report_after_failure(
-                        wake.as_ref(),
-                        report,
-                        first_error,
-                        task_cancellation,
-                    )
-                    .await
+                    if let Err(error) =
+                        wake_parent_report(wake.as_ref(), report, task_cancellation).await
                     {
                         tracing::warn!(
                             input_id = retry_input_id,
@@ -1436,6 +1444,7 @@ struct ProductionDelegatedTurnRunner {
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
     observer: Option<Arc<dyn ChildTurnObserver>>,
+    detached_observer: Option<Arc<dyn DetachedTurnObserver>>,
     children: ChildSessionSpecs,
 }
 
@@ -1512,10 +1521,12 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
                 mcp: self.mcp.clone(),
                 database: Arc::clone(&self.database),
                 child_observer: self.observer.clone(),
+                detached_observer: self.detached_observer.clone(),
             },
         )
         .await?;
         host.activate_extension_composition()?;
+        host.activate_background_notifications(&tokio::runtime::Handle::current());
         if let Some(observer) = self.observer.as_ref() {
             let messages = match host.resumed_history() {
                 Ok(history) => {
@@ -1607,6 +1618,7 @@ impl InteractiveChildInput {
             runs: context.runs.clone(),
             mcp: context.mcp,
             observer: context.observer.clone(),
+            detached_observer: context.detached_observer.clone(),
             inbox: inbox.clone(),
             children: context.supervisor.children.clone(),
         });
@@ -1751,6 +1763,7 @@ struct InteractiveChildInputDriver {
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
     observer: Option<Arc<dyn ChildTurnObserver>>,
+    detached_observer: Option<Arc<dyn DetachedTurnObserver>>,
     inbox: SessionInbox,
     children: ChildSessionSpecs,
 }
@@ -1805,10 +1818,12 @@ impl PendingInputDriver for InteractiveChildInputDriver {
                 mcp: self.mcp.clone(),
                 database: Arc::clone(&self.database),
                 child_observer: self.observer.clone(),
+                detached_observer: self.detached_observer.clone(),
             },
         )
         .await?;
         host.activate_extension_composition()?;
+        host.activate_background_notifications(&tokio::runtime::Handle::current());
         if let Some(observer) = self.observer.as_ref() {
             let messages = match host.resumed_history() {
                 Ok(history) => {
@@ -1872,7 +1887,8 @@ struct ParentReportDriver {
     question: Option<Arc<dyn QuestionAsker>>,
     runs: SessionRunRegistry,
     mcp: Option<zuno_mcp::Catalog>,
-    observer: Option<Arc<dyn ChildTurnObserver>>,
+    child_observer: Option<Arc<dyn ChildTurnObserver>>,
+    detached_observer: Option<Arc<dyn DetachedTurnObserver>>,
     inbox: SessionInbox,
     agent: String,
     model: String,
@@ -1916,7 +1932,8 @@ impl PendingInputDriver for ParentReportDriver {
                 runs: self.runs.clone(),
                 mcp: self.mcp.clone(),
                 database: Arc::clone(&self.database),
-                child_observer: self.observer.clone(),
+                child_observer: self.child_observer.clone(),
+                detached_observer: self.detached_observer.clone(),
             },
         )
         .await?;
@@ -1928,14 +1945,15 @@ impl PendingInputDriver for ParentReportDriver {
         if promoted.is_none() {
             return host.shutdown().await;
         }
-        let outcome = drive_and_drain(
+        let planning_source = detached_planning_source(&input.prompt);
+        let outcome = drive_detached_and_drain(
             &mut host,
             &text,
             Some(input.id.as_str()),
             Some(guard),
-            PlanningInputSource::ChildReport,
+            planning_source,
             input.session_id.as_str(),
-            self.observer.clone(),
+            self.detached_observer.clone(),
         )
         .await;
         let shutdown = host.shutdown().await;
@@ -1978,65 +1996,40 @@ impl ParentReportWake for CoordinatedParentWake {
     }
 }
 
-async fn wake_parent_report(
+pub(super) async fn wake_parent_report(
     wake: &dyn ParentReportWake,
     report: SessionInput,
     cancellation: CancellationToken,
 ) -> Result<(), String> {
     let mut delay = PARENT_WAKE_INITIAL_DELAY;
-    let mut attempt = 1_usize;
-    loop {
-        match wake.wake(report.clone()).await {
+    for attempt in 1..=PARENT_WAKE_ATTEMPTS {
+        let error = match wake.wake(report.clone()).await {
             Ok(()) => return Ok(()),
-            Err(error) => {
-                if should_log_wake_retry(attempt) {
-                    tracing::warn!(
-                        input_id = %report.id,
-                        attempt,
-                        ?delay,
-                        %error,
-                        "retrying durable parent report wake"
-                    );
-                }
-                tokio::select! {
-                    () = cancellation.cancelled() => {
-                        return Err(format!(
-                            "parent report wake stopped after {attempt} attempt(s): {error}"
-                        ));
-                    }
-                    () = tokio::time::sleep(delay) => {}
-                }
-                delay = delay.saturating_mul(2).min(PARENT_WAKE_MAX_DELAY);
-                attempt = attempt.saturating_add(1);
+            Err(error) => error,
+        };
+        if attempt == PARENT_WAKE_ATTEMPTS {
+            return Err(format!(
+                "parent report wake stopped after {attempt} attempt(s): {error}"
+            ));
+        }
+        tracing::warn!(
+            input_id = %report.id,
+            attempt,
+            ?delay,
+            %error,
+            "retrying durable parent report wake"
+        );
+        tokio::select! {
+            () = cancellation.cancelled() => {
+                return Err(format!(
+                    "parent report wake stopped after {attempt} attempt(s): {error}"
+                ));
             }
+            () = tokio::time::sleep(delay) => {}
         }
+        delay = delay.saturating_mul(2).min(PARENT_WAKE_MAX_DELAY);
     }
-}
-
-async fn retry_parent_report_after_failure(
-    wake: &dyn ParentReportWake,
-    report: SessionInput,
-    first_error: String,
-    cancellation: CancellationToken,
-) -> Result<(), String> {
-    tracing::warn!(
-        input_id = %report.id,
-        attempt = 1,
-        delay = ?PARENT_WAKE_INITIAL_DELAY,
-        error = %first_error,
-        "retrying durable parent report wake"
-    );
-    tokio::select! {
-        () = cancellation.cancelled() => {
-            return Err(format!("parent report wake stopped after 1 attempt: {first_error}"));
-        }
-        () = tokio::time::sleep(PARENT_WAKE_INITIAL_DELAY) => {}
-    }
-    wake_parent_report(wake, report, cancellation).await
-}
-
-fn should_log_wake_retry(attempt: usize) -> bool {
-    attempt <= 3 || attempt.is_power_of_two()
+    unreachable!("the bounded parent wake loop always returns")
 }
 
 async fn drive_and_drain(
@@ -2051,14 +2044,6 @@ async fn drive_and_drain(
     let (sender, receiver) = event_channel();
     let drive = async {
         let outcome = match (guard, message_id, planning_source) {
-            (Some(guard), Some(message_id), PlanningInputSource::ChildReport) => {
-                host.drive_promoted_report_with_guard(prompt, message_id, guard, sender.clone())
-                    .await
-            }
-            (None, Some(message_id), PlanningInputSource::ChildReport) => {
-                host.drive_promoted_report(prompt, message_id, sender.clone())
-                    .await
-            }
             (Some(guard), Some(message_id), _) => {
                 host.drive_promoted_with_guard(prompt, message_id, guard, sender.clone())
                     .await
@@ -2084,6 +2069,55 @@ async fn drive_and_drain(
     outcome
 }
 
+async fn drive_detached_and_drain(
+    host: &mut TurnHost,
+    prompt: &str,
+    message_id: Option<&str>,
+    guard: Option<SessionRunGuard>,
+    planning_source: PlanningInputSource,
+    session_id: &str,
+    observer: Option<Arc<dyn DetachedTurnObserver>>,
+) -> Result<(), String> {
+    let (sender, receiver) = event_channel();
+    let drive = async {
+        let outcome = match (guard, message_id) {
+            (Some(guard), Some(message_id)) => {
+                host.drive_promoted_report_with_guard(
+                    prompt,
+                    message_id,
+                    planning_source,
+                    guard,
+                    sender.clone(),
+                )
+                .await
+            }
+            (None, Some(message_id)) => {
+                host.drive_promoted_report(prompt, message_id, planning_source, sender.clone())
+                    .await
+            }
+            (Some(guard), None) => {
+                host.drive_with_message_id_and_guard(prompt, None, guard, sender.clone())
+                    .await
+            }
+            (None, None) => {
+                host.drive_with_message_id(prompt, None, sender.clone())
+                    .await
+            }
+        };
+        if outcome.is_ok() {
+            while host
+                .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, sender.clone())
+                .await?
+            {}
+        }
+        drop(sender);
+        outcome
+    };
+    let drain = forward_detached_events(session_id.to_owned(), receiver, observer);
+    let (outcome, ()) = tokio::join!(drive, drain);
+    outcome
+}
+
 async fn forward_child_events(
     session_id: String,
     mut receiver: mpsc::Receiver<TurnEvent>,
@@ -2093,6 +2127,26 @@ async fn forward_child_events(
         if let Some(observer) = observer.as_ref() {
             observer.event(&session_id, &event);
         }
+    }
+}
+
+async fn forward_detached_events(
+    session_id: String,
+    mut receiver: mpsc::Receiver<TurnEvent>,
+    observer: Option<Arc<dyn DetachedTurnObserver>>,
+) {
+    while let Some(event) = receiver.recv().await {
+        if let Some(observer) = observer.as_ref() {
+            observer.event(&session_id, &event).await;
+        }
+    }
+}
+
+fn detached_planning_source(prompt: &Value) -> PlanningInputSource {
+    if prompt.get("kind").and_then(Value::as_str) == Some("backgroundExecutionReport") {
+        PlanningInputSource::BackgroundReport
+    } else {
+        PlanningInputSource::ChildReport
     }
 }
 

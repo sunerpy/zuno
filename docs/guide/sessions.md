@@ -53,6 +53,21 @@ This is why a background delegation with `reportDelivery: nextStep` cannot lose 
 report to a polling race: the settle, the admission, and the wake are one transactional
 sequence.
 
+Product-agent, workflow, council, and durable background-command completions use
+the same continuation rule. The previous assistant reply may already have ended
+with a message such as “the background task is still running; I will wait.”
+That prose is not execution state. When the task settles, Zuno admits a typed
+durable input and starts another turn if the process still owns a runtime. TUI,
+ACP, and the HTTP server observe that turn through their normal event path.
+After a process restart, the same input is redriven when the session is
+activated; the command or subagent itself is not replayed.
+
+An explicit close is different from an ended turn. Ending a turn leaves the
+session eligible for background continuation. Closing a session unregisters its
+resident notification watcher, interrupts and joins any detached continuation,
+then applies the surface's lifecycle policy to owned work. It does not promise
+that a non-resident process will continue generating.
+
 ## Prompt provenance
 
 Prompt assembly uses stable section identifiers, an exact source, ordered content, and a

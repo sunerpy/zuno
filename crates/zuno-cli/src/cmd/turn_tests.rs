@@ -1142,6 +1142,7 @@ async fn prepared_extension_aborts_cleanly_when_session_preparation_fails() {
             mcp: None,
             database,
             child_observer: None,
+            detached_observer: None,
         },
     )
     .await;
@@ -7235,14 +7236,12 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
              server's session open on the far side"
         );
     }
-    assert!(
-        read("run.rs").contains("TurnHost::open_with_mcp"),
-        "`zuno run` must reach the constructor that takes a catalog"
-    );
-    assert!(
-        read("serve.rs").contains("TurnHost::open_with_runtime_and_mcp"),
-        "`zuno serve` must reach the constructor that takes a catalog"
-    );
+    for surface in ["run.rs", "serve.rs"] {
+        assert!(
+            read(surface).contains("TurnHost::open_with_runtime_mcp_and_observers"),
+            "`{surface}` must reach the constructor that takes a catalog and detached-turn observer"
+        );
+    }
 }
 
 #[test]

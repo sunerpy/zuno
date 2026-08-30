@@ -141,6 +141,30 @@ fn status_abort_during_an_idle_handoff_interrupts_the_next_accepted_turn() {
 }
 
 #[test]
+fn status_recovery_reservation_blocks_turn_without_consuming_an_armed_abort() {
+    let registry = SessionRunRegistry::new();
+    let control = registry.control(SESSION_ID);
+    let recovery = registry
+        .begin_recovery(SESSION_ID)
+        .expect("idle session accepts recovery reservation");
+
+    assert_eq!(registry.status(SESSION_ID), SessionStatus::Busy);
+    assert!(
+        registry.begin_turn(SESSION_ID).is_err(),
+        "a turn raced durable claim recovery"
+    );
+    let request =
+        HardInterruptRequest::new(HardInterruptSource::Api, HardInterruptReason::UserCancel);
+    assert_eq!(control.abort(request), AbortDisposition::ArmedNext);
+
+    drop(recovery);
+    let turn = registry
+        .begin_turn(SESSION_ID)
+        .expect("turn starts after recovery releases the session");
+    assert_eq!(turn.interrupt_request(), Some(request));
+}
+
+#[test]
 fn status_abort_active_does_not_poison_the_next_idle_turn() {
     let registry = SessionRunRegistry::new();
     let control = registry.control(SESSION_ID);

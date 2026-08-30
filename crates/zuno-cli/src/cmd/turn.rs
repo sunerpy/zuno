@@ -381,7 +381,8 @@ pub(crate) struct TurnPlan {
     /// The `AGENTS.md`-class rule files this session runs under, read once here.
     ///
     /// Loaded during resolution rather than at host construction because the read is
-    /// `async` and [`TurnHost::open_with_runtime_and_mcp`] is not — and because these
+    /// `async` and [`TurnHost::open_with_runtime_mcp_and_observers`] is not — and
+    /// because these
     /// bytes must not be re-read per turn: a rule file the user edits mid-session
     /// would otherwise change the static prompt prefix underneath the provider's
     /// cache, which is the same reason [`zuno_memory::SessionMemory`] freezes its
@@ -418,7 +419,8 @@ impl TurnPlan {
     ///
     /// Server request assembly uses this to hold the old composition closed while
     /// configuration and the candidate profile are prepared. TUI replacement can
-    /// continue to reserve inside [`TurnHost::open_with_runtime_and_mcp`] because it
+    /// continue to reserve inside [`TurnHost::open_with_runtime_mcp_and_observers`]
+    /// because it
     /// already owns the only foreground host.
     pub(crate) fn use_prepared_extension_transition(
         &mut self,
@@ -1490,8 +1492,9 @@ fn resolve_goal_retry_policy(
 /// # Why an internal cannot leave the session's provider
 ///
 /// [`ModelPolicy`] may legitimately answer with a model under a different provider,
-/// and this function then declines it and records why. [`TurnHost::open_with_mcp`] wires
-/// exactly one credential — the session provider's — so honouring a cross-provider
+/// and this function then declines it and records why.
+/// [`TurnHost::open_with_runtime_mcp_and_observers`] wires exactly one credential — the
+/// session provider's — so honouring a cross-provider
 /// answer would mean presenting that credential to a different vendor's endpoint.
 /// Falling back to the session's own model costs a larger model for a small job;
 /// the alternative costs the user's API key. The note is emitted on the turn's event
@@ -1787,6 +1790,16 @@ pub(super) struct TurnHostDependencies {
     pub(super) mcp: Option<zuno_mcp::Catalog>,
     pub(super) database: Arc<zuno_db::pool::Pool>,
     pub(super) child_observer: Option<Arc<dyn super::child_turn::ChildTurnObserver>>,
+    pub(super) detached_observer: Option<Arc<dyn super::child_turn::DetachedTurnObserver>>,
+}
+
+pub(super) struct TurnHostRuntimeDependencies {
+    pub(super) approval: Arc<dyn PermissionAsker>,
+    pub(super) question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
+    pub(super) runs: SessionRunRegistry,
+    pub(super) mcp: Option<zuno_mcp::Catalog>,
+    pub(super) child_observer: Option<Arc<dyn super::child_turn::ChildTurnObserver>>,
+    pub(super) detached_observer: Option<Arc<dyn super::child_turn::DetachedTurnObserver>>,
 }
 
 /// An open database, an assembled tool set, and the session a turn runs in.
@@ -1853,6 +1866,8 @@ pub(crate) struct TurnHost {
     runs: SessionRunRegistry,
     background_jobs: super::child_turn::BackgroundJobSupervisor,
     background_executions: Arc<zuno_pty::BackgroundExecutionService>,
+    background_notifications: super::background_notification::BackgroundNotificationRegistry,
+    background_notification_directory: PathBuf,
     background_reports: super::child_turn::ChildSessionHost,
     product_agents: super::product_agent::NativeProductAgentHost,
     workflows: super::workflow::NativeWorkflowHost,
@@ -2480,66 +2495,24 @@ impl TurnHost {
     ///
     /// Returns a message when the database cannot be opened or migrated, when the
     /// session cannot be resolved, or when the tools cannot be assembled.
-    /// The headless entry point: no live user to ask, one optional MCP catalog.
-    ///
-    /// There was an `open` beside this taking no catalog at all, and `zuno run` called
-    /// it — which is how the same configuration produced MCP tools in the TUI and none
-    /// headlessly. It is gone rather than deprecated: a constructor that silently
-    /// drops a capability is one a future caller reaches for again.
-    pub(crate) async fn open_with_mcp(
-        plan: TurnPlan,
-        environment: &StartupEnvironment,
-        approval: Arc<dyn PermissionAsker>,
-        mcp: Option<zuno_mcp::Catalog>,
-    ) -> Result<Self, String> {
-        Self::open_with_runtime_and_mcp(
-            plan,
-            environment,
-            approval,
-            None,
-            SessionRunRegistry::new(),
-            mcp,
-        )
-        .await
-    }
-
     /// The full constructor. **Every** surface reaches this one.
     ///
-    /// There is deliberately no wrapper that defaults `mcp` away. Two existed — `open`
-    /// and `open_with_runtime` — and between them they were how `zuno run` and
-    /// `zuno serve` came to advertise fewer tools than `zuno tui` from identical
-    /// configuration, with no error on either path. A surface that genuinely wants no
-    /// MCP passes `None` here and says so at its own call site.
-    pub(crate) async fn open_with_runtime_and_mcp(
-        plan: TurnPlan,
+    /// MCP and both optional projection roles are explicit. A constructor that
+    /// silently defaults any of them away is how surfaces drift into different
+    /// products while sharing the same configuration.
+    pub(crate) async fn open_with_runtime_mcp_and_observers(
+        mut plan: TurnPlan,
         environment: &StartupEnvironment,
-        approval: Arc<dyn PermissionAsker>,
-        question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
-        runs: SessionRunRegistry,
-        mcp: Option<zuno_mcp::Catalog>,
+        dependencies: TurnHostRuntimeDependencies,
     ) -> Result<Self, String> {
-        Self::open_with_runtime_mcp_and_observer(
-            plan,
-            environment,
+        let TurnHostRuntimeDependencies {
             approval,
             question,
             runs,
             mcp,
-            None,
-        )
-        .await
-    }
-
-    /// Interactive constructor with an optional process-local child-session observer.
-    pub(crate) async fn open_with_runtime_mcp_and_observer(
-        mut plan: TurnPlan,
-        environment: &StartupEnvironment,
-        approval: Arc<dyn PermissionAsker>,
-        question: Option<Arc<dyn zuno_tools::question::QuestionAsker>>,
-        runs: SessionRunRegistry,
-        mcp: Option<zuno_mcp::Catalog>,
-        child_observer: Option<Arc<dyn super::child_turn::ChildTurnObserver>>,
-    ) -> Result<Self, String> {
+            child_observer,
+            detached_observer,
+        } = dependencies;
         let database = match zuno_db::pool::Pool::open_default() {
             Ok(database) => Arc::new(database),
             Err(error) => {
@@ -2562,6 +2535,7 @@ impl TurnHost {
                 mcp,
                 database,
                 child_observer,
+                detached_observer,
             },
         )
         .await
@@ -2579,6 +2553,7 @@ impl TurnHost {
             mcp,
             database,
             child_observer,
+            detached_observer,
         } = dependencies;
         let mut extension_ownership = Some(match plan.extension_prepared.take() {
             Some(prepared) => ExtensionOwnership::Prepared(prepared),
@@ -2826,6 +2801,7 @@ impl TurnHost {
                     runs: runs.clone(),
                     mcp: mcp.clone(),
                     observer: child_observer.clone(),
+                    detached_observer: detached_observer.clone(),
                     parent_agent: plan.agent.name().to_owned(),
                     parent_model: format!("{}/{}", plan.provider_id, plan.model_id),
                     parent_effort: plan.effort,
@@ -2862,6 +2838,8 @@ impl TurnHost {
             let background_executions = environment
                 .background_executions(&plan.directory)
                 .map_err(to_string)?;
+            let background_notifications = environment.background_notifications();
+            let background_notification_directory = plan.directory.clone();
             let delegation_agents = delegation_agents(&plan.agents, plan.vision_available)?;
 
             let runtime_tools = super::tool_runtime::assemble(
@@ -2989,6 +2967,8 @@ impl TurnHost {
                 runs,
                 background_jobs,
                 background_executions,
+                background_notifications,
+                background_notification_directory,
                 background_reports: child_host,
                 product_agents,
                 workflows: workflow_host,
@@ -3864,6 +3844,25 @@ impl TurnHost {
         Ok(())
     }
 
+    /// Bind process-owned background completion delivery to this host's latest driver.
+    ///
+    /// This is separate from construction so a prepared extension transition is
+    /// committed before a restart scan can open a detached continuation turn.
+    pub(crate) fn activate_background_notifications(&self, runtime: &tokio::runtime::Handle) {
+        self.background_notifications.register(
+            runtime,
+            &self.background_notification_directory,
+            super::background_notification::BackgroundNotificationRegistration {
+                service: Arc::clone(&self.background_executions),
+                session_id: self.session_id.clone(),
+                inbox: self.inbox.clone(),
+                jobs: zuno_db::job::AgentJobStore::new(Arc::clone(&self.database)),
+                runs: self.runs.clone(),
+                wake: self.background_reports.wake_handle(),
+            },
+        );
+    }
+
     fn require_active_extension_composition(&self) -> Result<(), String> {
         match self.extension_ownership {
             Some(ExtensionOwnership::Active(_)) => Ok(()),
@@ -4207,16 +4206,21 @@ impl TurnHost {
         &mut self,
         prompt: &str,
         message_id: &str,
+        source: PlanningInputSource,
         guard: SessionRunGuard,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        debug_assert!(matches!(
+            source,
+            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
+        ));
         self.drive_input(
             prompt,
             DriveInputOptions::plain(
                 Some(message_id),
                 None,
                 UserInputPersistence::AlreadyPromoted,
-                PlanningInputSource::ChildReport,
+                source,
             ),
             &guard,
             events,
@@ -4254,8 +4258,13 @@ impl TurnHost {
         &mut self,
         prompt: &str,
         message_id: &str,
+        source: PlanningInputSource,
         events: TurnEventSender,
     ) -> Result<(), String> {
+        debug_assert!(matches!(
+            source,
+            PlanningInputSource::ChildReport | PlanningInputSource::BackgroundReport
+        ));
         let guard = self
             .runs
             .begin_turn(self.session_id.clone())
@@ -4266,7 +4275,7 @@ impl TurnHost {
                 Some(message_id),
                 None,
                 UserInputPersistence::AlreadyPromoted,
-                PlanningInputSource::ChildReport,
+                source,
             ),
             &guard,
             events,

@@ -115,11 +115,24 @@ impl EventService {
         mut events: mpsc::Receiver<TurnEvent>,
     ) {
         while let Some(event) = events.recv().await {
-            local.publish(event.clone());
-            let projected = turn_event(&event);
-            if let Err(error) = self.publish(session_id, projected).await {
-                eprintln!("failed to publish HTTP turn event for `{session_id}`: {error}");
-            }
+            self.forward_engine_event(session_id, local, event).await;
+        }
+    }
+
+    /// Project one engine event from a detached continuation turn.
+    ///
+    /// Detached turns have no request-owned channel to drain. Reusing this seam keeps
+    /// their durable HTTP history and live fan-out identical to ordinary prompt turns.
+    pub async fn forward_engine_event(
+        &self,
+        session_id: &str,
+        local: &EventFanout<TurnEvent>,
+        event: TurnEvent,
+    ) {
+        local.publish(event.clone());
+        let projected = turn_event(&event);
+        if let Err(error) = self.publish(session_id, projected).await {
+            eprintln!("failed to publish HTTP turn event for `{session_id}`: {error}");
         }
     }
 

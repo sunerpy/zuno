@@ -4,9 +4,9 @@
 //!
 //! MCP was wired into exactly one of three surfaces. `zuno tui` built a
 //! [`zuno_mcp::Catalog`] and a [`zuno_mcp::McpServerController`] and handed the
-//! catalog to [`super::turn::TurnHost::open_with_runtime_and_mcp`]; `zuno run` and
-//! `zuno serve` reached the same constructor through
-//! [`super::turn::TurnHost::open_with_runtime`], which passes `None`. The result was
+//! catalog to [`super::turn::TurnHost::open_with_runtime_mcp_and_observers`];
+//! `zuno run` and `zuno serve` previously reached constructors that passed `None`.
+//! The result was
 //! silent rather than broken: the same configuration produced a working MCP tool in
 //! the TUI and **zero** MCP tools headlessly, with nothing said either way.
 //!

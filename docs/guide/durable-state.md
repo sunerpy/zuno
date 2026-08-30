@@ -168,6 +168,22 @@ its runner never started; a running job settles as `uncertain` and is never repl
 Do not complete a parent while active jobs or unconsumed reports remain. See
 [Orchestration](/orchestration) for report delivery.
 
+Durable background commands keep their authoritative process state and output
+under `.zuno/background`, but their model-facing completion is a deterministic
+session inbox row. The filesystem event is only a wake hint. Terminal state is
+scanned on session activation and periodically while the process is resident,
+so these crash points are recoverable without replaying the command:
+
+- status persisted, completion input not yet admitted;
+- input admitted, wake not yet attempted;
+- input promoted, process lost before model-visible consumption.
+
+The last case returns the original row to its admitted lane. Job-backed child,
+product-agent, workflow, and council reports perform that transition before the
+pending inbox scan, so the recovered report can wake an idle parent without a
+new user prompt. A consumed, cancelled, or failed input is terminal and is
+never synthesized again.
+
 ## See also
 
 - [Sessions and turns](/guide/sessions)

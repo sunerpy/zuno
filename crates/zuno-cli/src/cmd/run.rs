@@ -9,13 +9,19 @@
 
 use std::io::{IsTerminal as _, Read as _, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use zuno_engine::r#loop::{TurnEvent, event_channel};
+use zuno_engine::status::SessionRunRegistry;
 use zuno_llm::event::{ConnectionPhase, RequestContentBlock, StreamEvent};
 
-use crate::cmd::turn::{SessionChoice, TurnHost, TurnOptions, TurnPlan, persisted_session_agent};
+use super::child_turn::DetachedTurnObserver;
+use crate::cmd::turn::{
+    SessionChoice, TurnHost, TurnHostRuntimeDependencies, TurnOptions, TurnPlan,
+    persisted_session_agent,
+};
 use crate::command::{RunArgs, RunFormat};
 use crate::environment::StartupEnvironment;
 
@@ -23,6 +29,41 @@ type ProgressPulse<'a> = Option<&'a dyn Fn()>;
 
 const TEXT_ATTACHMENT_MAX_BYTES: usize = 50 * 1_024;
 const TEXT_ATTACHMENT_MAX_LINES: usize = 2_000;
+
+struct HeadlessDetachedTurnObserver {
+    events: Mutex<Option<zuno_engine::r#loop::TurnEventSender>>,
+}
+
+impl HeadlessDetachedTurnObserver {
+    fn new(events: zuno_engine::r#loop::TurnEventSender) -> Self {
+        Self {
+            events: Mutex::new(Some(events)),
+        }
+    }
+
+    fn close(&self) {
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+}
+
+#[async_trait]
+impl DetachedTurnObserver for HeadlessDetachedTurnObserver {
+    async fn event(&self, _session_id: &str, event: &TurnEvent) {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(events) = events
+            && let Err(error) = events.publish(event.clone()).await
+        {
+            tracing::debug!(%error, "detached turn outlived headless rendering");
+        }
+    }
+}
 
 pub(super) fn execute(
     args: &RunArgs,
@@ -67,17 +108,28 @@ pub(super) fn execute(
         None => Vec::new(),
     };
     report_progress(progress);
-    let mut host = runtime.block_on(TurnHost::open_with_mcp(
-        plan,
-        environment,
-        Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
-        mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
-    ))?;
+    let (sender, receiver) = event_channel();
+    let detached_observer = Arc::new(HeadlessDetachedTurnObserver::new(sender.clone()));
+    let mut host =
+        runtime.block_on(TurnHost::open_with_runtime_mcp_and_observers(
+            plan,
+            environment,
+            TurnHostRuntimeDependencies {
+                approval: Arc::new(crate::cmd::tool_runtime::HeadlessApproval),
+                question: None,
+                runs: SessionRunRegistry::new(),
+                mcp: mcp.as_ref().map(super::mcp_runtime::McpRuntime::catalog),
+                child_observer: None,
+                detached_observer: Some(
+                    Arc::clone(&detached_observer) as Arc<dyn DetachedTurnObserver>
+                ),
+            },
+        ))?;
     report_progress(progress);
     host.activate_extension_composition()?;
+    host.activate_background_notifications(runtime.handle());
     host.push_notes(mcp_notes);
 
-    let (sender, receiver) = event_channel();
     let (outcome, rendered) = runtime.block_on(async {
         tokio::join!(
             async {
@@ -98,6 +150,8 @@ pub(super) fn execute(
                     .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, sender.clone())
                     .await?
                 {}
+                environment.wait_background_jobs().await;
+                detached_observer.close();
                 drop(sender);
                 Ok::<(), String>(())
             },
@@ -106,8 +160,6 @@ pub(super) fn execute(
     });
     report_progress(progress);
     let shutdown = runtime.block_on(host.shutdown());
-    report_progress(progress);
-    runtime.block_on(environment.wait_background_jobs());
     report_progress(progress);
     if let Some(mcp) = mcp {
         runtime.block_on(mcp.shutdown());

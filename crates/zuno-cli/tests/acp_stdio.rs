@@ -1271,6 +1271,64 @@ impl Respond for BackgroundSubagentTurnResponder {
 }
 
 #[derive(Clone)]
+struct CompletingBackgroundSubagentTurnResponder;
+
+impl Respond for CompletingBackgroundSubagentTurnResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty());
+        if !has_tools {
+            return compatible_text_response("ACP completing background child title");
+        }
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let transcript = serde_json::to_string(&messages).expect("provider messages JSON");
+        let child_turn = messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .to_string()
+                    .contains("Finish after the parent has returned its waiting reply.")
+        });
+        if child_turn {
+            return compatible_text_response(
+                "background child completed after the parent turn ended",
+            )
+            .set_delay(Duration::from_secs(1));
+        }
+        if transcript.contains("background child completed after the parent turn ended") {
+            return compatible_text_response("parent resumed after background child completion");
+        }
+        let has_task_result = messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"] == "call_completing_background_task"
+        });
+        if has_task_result {
+            compatible_text_response("Background task is still running; I will wait.")
+        } else {
+            compatible_tool_response(
+                "call_completing_background_task",
+                "task",
+                json!({
+                    "objective": "Complete after the parent turn",
+                    "deliverable": "A result delivered to a later parent turn.",
+                    "instructions": "Finish after the parent has returned its waiting reply.",
+                    "success_evidence": "The parent emits a new reply without another user prompt.",
+                    "agent": "deep",
+                    "background": true,
+                    "reportDelivery": "nextStep"
+                }),
+            )
+        }
+    }
+}
+
+#[derive(Clone)]
 struct PlanTurnResponder;
 
 impl Respond for PlanTurnResponder {
@@ -3035,6 +3093,135 @@ async fn acp_close_cancels_and_joins_its_background_child_without_native_project
         .expect("list ACP background jobs");
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].status, zuno_db::job::JobStatus::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_background_child_completion_restarts_parent_after_prompt_response() {
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(CompletingBackgroundSubagentTurnResponder)
+        .mount(&provider)
+        .await;
+    let root = tempfile::tempdir().expect("ACP test root");
+    let mut config: Value =
+        serde_json::from_str(&config_with_second_model(&provider.uri())).expect("test config");
+    config["permission"] = json!({"mode":"allow_all"});
+    config["sandbox"] = json!({"mode":"danger-full-access"});
+    let config = serde_json::to_string(&config).expect("encode background child config");
+    let mut child = isolated_command_with_config(root.path(), &config)
+        .arg("acp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start zuno acp");
+    let mut stdin = child.stdin.take().expect("ACP stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("ACP stdout"));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "subagents": {}
+            }
+        }),
+    );
+    let created = request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        "session/new",
+        json!({"cwd": root.path(), "mcpServers": []}),
+    );
+    let parent_session_id = created["sessionId"]
+        .as_str()
+        .expect("parent session id")
+        .to_owned();
+    let (completed, updates) = request_with_updates(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "session/prompt",
+        json!({
+            "sessionId": &parent_session_id,
+            "prompt": [{"type":"text","text":"Start work and wait for its background result."}]
+        }),
+    );
+    assert_eq!(completed["stopReason"], "end_turn");
+    assert!(
+        updates.iter().any(|update| {
+            update["_meta"]["zuno"]["subagent"]["background"] == true
+                && update["_meta"]["zuno"]["subagent"]["state"] == "running"
+        }),
+        "the request-owned turn did not publish the running background job: {updates:#?}"
+    );
+    assert!(updates.iter().all(|update| {
+        update["sessionUpdate"] != "agent_message_chunk"
+            || update["content"]["text"].as_str().is_none_or(|text| {
+                !text.contains("parent resumed after background child completion")
+            })
+    }));
+
+    let (resumed_tx, resumed_rx) = mpsc::sync_channel(1);
+    let resumed_session_id = parent_session_id.clone();
+    std::thread::spawn(move || {
+        let mut detached_updates = Vec::new();
+        loop {
+            let params = read_session_update(&mut stdout);
+            let resumed = params["sessionId"] == resumed_session_id
+                && params["update"]["sessionUpdate"] == "agent_message_chunk"
+                && params["update"]["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| {
+                        text.contains("parent resumed after background child completion")
+                    });
+            detached_updates.push(params);
+            if resumed {
+                let _sent = resumed_tx.send((stdout, detached_updates));
+                break;
+            }
+        }
+    });
+    let (mut stdout, detached_updates) = match resumed_rx.recv_timeout(Duration::from_secs(8)) {
+        Ok(result) => result,
+        Err(error) => {
+            let _killed = child.kill();
+            panic!("background child did not resume the completed parent turn: {error}");
+        }
+    };
+    assert!(detached_updates.iter().any(|params| {
+        params["sessionId"] == parent_session_id
+            && params["update"]["sessionUpdate"] == "agent_message_chunk"
+            && params["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| {
+                    text.contains("parent resumed after background child completion")
+                })
+    }));
+
+    request(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "session/close",
+        json!({"sessionId": &parent_session_id}),
+    );
+    drop(stdin);
+    let status = child.wait().expect("wait for ACP process");
+    if !status.success() {
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("ACP stderr")
+            .read_to_string(&mut stderr)
+            .expect("read ACP stderr");
+        panic!("ACP process failed: {stderr}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

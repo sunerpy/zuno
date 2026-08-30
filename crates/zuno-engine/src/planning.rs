@@ -67,6 +67,8 @@ pub enum PlanningInputSource {
     Command,
     /// A settled child job report admitted into the parent inbox.
     ChildReport,
+    /// A terminal process-owned background execution admitted into the parent inbox.
+    BackgroundReport,
     /// Mid-turn steering already attached to an active execution.
     Steering,
     /// A host-generated retry or recovery continuation.

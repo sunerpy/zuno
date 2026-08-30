@@ -130,7 +130,8 @@ impl McpToolLoader for FrozenMcpToolLoader {
 /// **Deliberately not `Option`.** `task` went unregistered for exactly as long as it
 /// took nobody to pass a host, and an optional field turns that back into a runtime
 /// choice a test can only catch by looking. Required, the compiler catches it: the
-/// sole caller of [`assemble`] is [`super::turn::TurnHost::open_with_runtime_and_mcp`],
+/// sole caller of [`assemble`] is
+/// [`super::turn::TurnHost::open_with_runtime_mcp_and_observers`],
 /// which by construction can host a child turn, so there is no surface that legitimately
 /// assembles a turn's tools and cannot delegate.
 pub(crate) struct Delegation {

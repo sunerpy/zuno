@@ -16,6 +16,7 @@ use zuno_pty::BackgroundExecutionService;
 use zuno_tools::exposure::ExposureFlags;
 
 use crate::GlobalOptions;
+use crate::cmd::background_notification::BackgroundNotificationRegistry;
 use crate::cmd::child_turn::BackgroundJobSupervisor;
 
 /// The non-`ZUNO_*` marker inherited by child agents.
@@ -129,6 +130,7 @@ pub struct StartupEnvironment {
     extensions: std::sync::Arc<zuno_extension::ExtensionRegistry>,
     background_executions: Arc<Mutex<HashMap<PathBuf, Weak<BackgroundExecutionService>>>>,
     background_jobs: Arc<Mutex<HashMap<PathBuf, BackgroundJobSupervisor>>>,
+    background_notifications: BackgroundNotificationRegistry,
     /// All supported `ZUNO_*` values after CLI precedence is applied.
     pub flags: ZunoFlags,
 }
@@ -141,6 +143,9 @@ impl PartialEq for StartupEnvironment {
             && std::sync::Arc::ptr_eq(&self.extensions, &other.extensions)
             && Arc::ptr_eq(&self.background_executions, &other.background_executions)
             && Arc::ptr_eq(&self.background_jobs, &other.background_jobs)
+            && self
+                .background_notifications
+                .ptr_eq(&other.background_notifications)
     }
 }
 
@@ -177,6 +182,7 @@ impl StartupEnvironment {
             extensions: std::sync::Arc::new(zuno_extension::ExtensionRegistry::new()),
             background_executions: Arc::new(Mutex::new(HashMap::new())),
             background_jobs: Arc::new(Mutex::new(HashMap::new())),
+            background_notifications: BackgroundNotificationRegistry::default(),
             flags,
         }
     }
@@ -242,6 +248,15 @@ impl StartupEnvironment {
             .entry(directory.to_path_buf())
             .or_default()
             .clone()
+    }
+
+    /// Process-owned bridge from durable background execution state to session input.
+    ///
+    /// The registry outlives any one turn host. A short-lived HTTP or headless host can
+    /// therefore return while the process remains resident, and a later settlement still
+    /// reaches the same durable session inbox.
+    pub(crate) fn background_notifications(&self) -> BackgroundNotificationRegistry {
+        self.background_notifications.clone()
     }
 
     /// Request cancellation for all process-owned delegated work.
@@ -365,6 +380,16 @@ mod tests {
             &first.background_jobs,
             &restarted.background_jobs
         ));
+        assert!(
+            first
+                .background_notifications
+                .ptr_eq(&clone.background_notifications)
+        );
+        assert!(
+            !first
+                .background_notifications
+                .ptr_eq(&restarted.background_notifications)
+        );
     }
 
     #[tokio::test]
