@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="./docs/assets/zuno-logo.svg" alt="Zuno logo" width="160" />
+
 # Zuno
 
 ### An independent Rust AI coding agent with a native Harness Runtime for composing drivers, capabilities, and tool sets

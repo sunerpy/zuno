@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="../assets/zuno-logo.svg" alt="Zuno logo" width="160" />
+
 # Zuno
 
 ### 独立的 Rust AI 编程代理，可通过原生 Harness Runtime 组合不同的 Agent 驱动、能力和工具集

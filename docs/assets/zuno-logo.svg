@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 1024 1024"
+     role="img"
+     aria-labelledby="zuno-logo-title">
+  <title id="zuno-logo-title">Zuno logo</title>
+  <rect width="1024" height="1024" rx="224" fill="#0D0E12"/>
+  <path d="M326 724a284 284 0 1 1 372 0"
+        fill="none"
+        stroke="#9D7CD8"
+        stroke-width="92"
+        stroke-linecap="round"/>
+  <path d="M512 824V530M512 530 360 390M512 530V330M512 530l152-140"
+        fill="none"
+        stroke="#FAB283"
+        stroke-width="78"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+  <circle cx="360" cy="390" r="54" fill="#FAB283"/>
+  <circle cx="512" cy="330" r="54" fill="#FAB283"/>
+  <circle cx="664" cy="390" r="54" fill="#FAB283"/>
+  <circle cx="512" cy="530" r="66" fill="#0D0E12"/>
+  <circle cx="512" cy="530" r="34" fill="#FAB283"/>
+</svg>
