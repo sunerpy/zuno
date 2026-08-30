@@ -485,22 +485,6 @@ fn turn_variables(env: &ScriptedEnv, base_url: &str, models: &Path) -> BTreeMap<
         ),
         ("ZUNO_CONFIG_CONTENT".to_owned(), provider_config(base_url)),
     ]);
-    // PATH has to be forwarded explicitly. `invoke` clears the child environment,
-    // and `ScriptedEnv` does not carry PATH — deliberately, since a fixture that
-    // inherited it would stop being isolated. But the binary under test resolves
-    // `rg` through PATH and treats its absence as a startup error, so a smoke run
-    // without PATH always fails with
-    // `ripgrep (`rg`) is required for glob and grep` no matter what the runner
-    // installed. Measured on release run 33301037393, where the ripgrep install and
-    // `rg --version` both succeeded in earlier steps and the smoke still failed.
-    //
-    // Forwarded rather than reconstructed: which directory holds `rg` differs per
-    // platform and per installation method, and the caller already arranged for it
-    // to be reachable. This is the one inherited variable, and it grants no
-    // filesystem authority the sandbox would not otherwise mediate.
-    if let Ok(path) = std::env::var("PATH") {
-        variables.insert("PATH".to_owned(), path);
-    }
     variables
 }
 

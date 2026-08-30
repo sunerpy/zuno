@@ -687,6 +687,24 @@ jobs:
         shell: bash
         run: rg --version
 
+      # The bash check above cannot catch the failure this job kept hitting: Git Bash
+      # resolves an MSYS `/c/...` PATH entry happily, so `rg --version` passed while
+      # the native binary under test could not find `rg` at all — five releases in a
+      # row. This step asks WINDOWS to do the lookup, and then asks the artifact
+      # itself, so a broken PATH form fails here in seconds instead of surfacing
+      # forty minutes later as an apparent artifact defect.
+      - name: Verify ripgrep through native Windows resolution
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $hits = @(& "$env:SystemRoot\System32\where.exe" rg)
+          if ($LASTEXITCODE -ne 0 -or $hits.Count -eq 0) {
+            throw "native Windows PATH lookup cannot find rg"
+          }
+          & $hits[0] --version
+          # Exercises the same `Ripgrep::discover()` the headless run depends on.
+          & ".\unpacked\$env:BINARY_NAME.exe" debug rg files --glob '__zuno_no_match__' --limit 1
+
       # Linux only, and that is not an oversight: `zuno-sandbox` compiles an OS
       # confinement backend for `target_os = "linux"` alone
       # (crates/zuno-sandbox/src/lib.rs:15), so only these two legs can reach
