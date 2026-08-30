@@ -1,0 +1,914 @@
+# Release: build, smoke-test, and publish the cross-platform artifacts.
+#
+# ---------------------------------------------------------------------------
+# THE RULE THIS FILE EXISTS TO ENFORCE
+#
+#   Must not ship an artifact that was never executed.
+#
+# So the topology is build -> smoke -> publish, and `publish` lists BOTH earlier
+# jobs in `needs`. GitHub's default `needs` semantics require every listed job to
+# have succeeded, so a single failed or skipped smoke leg blocks publication of
+# all five archives. There is no path from a compiled binary to a release asset
+# that does not pass through a process that ran it.
+#
+# `crates/zuno-cli/tests/release_surface.rs` asserts from outside this file that the
+# two matrices name the same five targets, because a target added to `build` and
+# forgotten in `smoke` would otherwise ship unexecuted and CI would stay green.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHY ZIG, AND WHAT IT REPLACES
+#
+# This workspace compiles C in every build: `rusqlite`'s `bundled` feature builds
+# the SQLite amalgamation (required for byte-level `opencode.db` parity), and
+# `reqwest`'s `rustls` feature selects `aws-lc-rs`, whose `aws-lc-sys` compiles C
+# through cc/cmake. That is measured, not assumed — see
+# the project's engineering notes under "RESOLVED".
+#
+# A C dependency is cheap for a NATIVE build and expensive for a cross build: it
+# normally means assembling a per-target C cross-toolchain, or `cross`'s docker
+# images, or per-target apt packages. Zig ships a complete hermetic C
+# cross-compiler as ONE download, and `cargo-zigbuild` points rustc's linker at
+# it. So the two Linux/musl legs need no system cross-gcc, no docker, and no
+# apt-get.
+#
+# The `x86_64-apple-darwin` leg needs none of that either, and not because it is
+# native: Apple's own clang and SDK are multi-architecture, so `-arch x86_64` is
+# a flag rather than a second toolchain. That is why `use_zigbuild` stays false
+# for both darwin legs — there is nothing for Zig to supply.
+#
+# `release_surface.rs` also asserts this file installs no cross-gcc, invokes no
+# docker, and runs no `cross` — an assertion, because a future "fix" for a
+# link error is exactly where a per-target toolchain would sneak back in.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHAT SHIPS
+#
+# `zuno` (from `zuno-cli`) only. The workspace also builds `zuno-server`,
+# but `zuno serve` wraps `zuno_server::ServerBuilder` as a library rather
+# than spawning that binary (see `zuno-cli/src/command.rs`), so `zuno-server` is a
+# development and QA surface, not a user entry point. Shipping both would invite
+# users to run the wrong one. `zuno-example-plugin`, `zuno-acp-conformance`,
+# `zuno-log-probe` and `ts-baseline` are likewise test harnesses.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHEN THIS RUNS
+#
+# On a `v*` tag, and on manual dispatch. NOT on every push: a five-target matrix
+# with a full smoke leg each is far too slow for a per-commit gate, and CI already
+# exercises the same packaging and smoke path on the host leg for every push and
+# pull request (see ci.yml's `artifact` job). The manual `workflow_dispatch` path
+# runs the complete matrix WITHOUT creating a release, so the pipeline is
+# exercisable end to end before any tag exists — a release pipeline whose first
+# ever run is the real release is not a pipeline anybody has tested.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHERE EACH LEG RUNS, AND WHY NOT ON GITHUB
+#
+# Every job here runs on a CodeBuild-hosted GitHub Actions runner. None uses a
+# GitHub-hosted runner, because this account has no Actions minutes left — which
+# is why the pipeline had never run at all before this file was rewritten.
+# `release_surface.rs` asserts the absence, so the constraint is enforced rather
+# than remembered.
+#
+# Three runner projects, because CodeBuild picks the machine from the PROJECT and
+# a project has exactly one environment type:
+#
+#   zuno-runner          us-east-2  LINUX_CONTAINER               Linux legs, version, checksums, publish
+#   zuno-runner-windows  us-east-2  WINDOWS_SERVER_2022_CONTAINER x86_64-pc-windows-msvc
+#   zuno-runner-macos    us-west-2  MAC_ARM                       both darwin targets
+#
+# macOS sits in us-west-2 and the rest in us-east-2 for one measured reason:
+# CodeBuild macOS is reserved-capacity only (`MAC_ARM is not supported for
+# on-demand compute`), MAC_ARM accepts exactly one compute shape
+# (`BUILD_GENERAL1_LARGE`; XLARGE and attribute-based are both rejected), and a
+# new fleet of that shape in us-east-2 and us-east-1 comes up
+# status=ACTIVE / context=INSUFFICIENT_CAPACITY. us-west-2 came up clean. The
+# region split is capacity, not preference; the fleet name is `zuno-macos` in
+# both places so moving back is a one-line change if Ohio frees up.
+#
+# BOTH darwin targets share the one ARM macOS runner. `x86_64-apple-darwin` is
+# cross-compiled there and then EXECUTED there under Rosetta 2, which the image
+# ships (`/usr/libexec/rosetta/oahd` present, `arch -x86_64` succeeds). Measured
+# on macOS 26.2 / Xcode 26.2: a `Mach-O 64-bit executable x86_64` built on the
+# ARM host ran and printed `ran on x86_64`. So the smoke leg genuinely runs the
+# artifact rather than inspecting it. The honest caveat: Rosetta translates the
+# same machine code, so this proves the binary links and its logic runs, not that
+# it behaves identically on native Intel silicon.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# WHY aarch64-pc-windows-msvc IS NOT HERE
+#
+# It was dropped, and the drop is a consequence of the rule at the top of this
+# file rather than a convenience. CodeBuild has no ARM Windows compute in any
+# region: the reserved-capacity table lists Windows only as `reserved.x86-64.*`,
+# and the on-demand runner images are Windows Server 2019/2022 on x86_64 only.
+# An x86_64 Windows host cannot execute an ARM64 binary either — the emulation
+# only runs the other way, on ARM64 Windows. So the target could be cross-built
+# and never executed, which is precisely the artifact this pipeline refuses to
+# publish. The alternative was a GitHub-hosted `windows-11-arm` runner, which is
+# what left the pipeline unable to run in the first place.
+#
+# Nothing user-facing promised it: `scripts/install.sh` handles only Linux and
+# Darwin, and no document lists target triples. `Makefile`'s RELEASE_TARGETS and
+# `release_surface.rs`'s RELEASE_TARGETS were updated in the same commit.
+# ---------------------------------------------------------------------------
+
+name: Release
+
+on:
+  push:
+    # `main` drives the automated path: release-please opens or refreshes the release
+    # PR, and merging it is what produces the tag, the draft, and `release_created`.
+    branches:
+      - main
+    # Retained for a HUMAN-pushed tag and the documented backfill path only. A tag
+    # release-please creates with the built-in `GITHUB_TOKEN` does NOT re-trigger this
+    # workflow, which is exactly why the build jobs are downstream of the
+    # `release_please` job in this same run rather than in a sibling workflow.
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create a GitHub Release from the built artifacts (leave off for a dry run)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY_NAME: zuno
+  CLI_CRATE: zuno-cli
+
+jobs:
+  # -------------------------------------------------------------------------
+  # release_please: the entry point of the automated path.
+  #
+  # Ordinary pushes to the default branch only open or update the release PR.
+  # Merging that PR creates the tag AND a DRAFT Release, and emits
+  # `release_created` — which is what every heavy job below gates on. The draft is
+  # the coordination object: assets attach to it, and `publish` flips it public
+  # only after all five artifacts were built and all five were executed.
+  #
+  # WHY THIS LIVES IN THE SAME WORKFLOW: GitHub suppresses workflow runs for
+  # events created with the built-in `GITHUB_TOKEN`, so the tag release-please
+  # pushes cannot reliably trigger a sibling workflow listening on `push.tags`.
+  # Splitting the path would give a release that tags but never builds. The
+  # `push.tags` trigger is retained only for a human-pushed tag and the
+  # documented backfill path, not for the normal automated release.
+  #
+  # Skipped entirely on a tag push or a manual dispatch. Being skipped is not
+  # inert: a skip propagates down the whole ancestor graph, so every job below
+  # carries an explicit `!cancelled() && needs.<dep>.result == 'success'` condition
+  # to opt out of that propagation without loosening the gate. See the comment on
+  # `build` for the two runs that proved this.
+  # -------------------------------------------------------------------------
+  release_please:
+    name: Release PR
+    if: github.event_name == 'push' && github.ref_type == 'branch'
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-release-please
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # -------------------------------------------------------------------------
+  # version: resolve one version string every later job uses, and refuse a tag
+  # that disagrees with the manifest. An artifact named 0.2.0 built from a tree
+  # whose `Cargo.toml` says 0.1.0 is a lie that survives forever in a filename.
+  # -------------------------------------------------------------------------
+  version:
+    name: Resolve version
+    needs: release_please
+    # A status function is required because `release_please` is skipped on the tag and
+    # dispatch paths, and a skipped dependency would otherwise skip this job too.
+    # `!cancelled()` rather than `always()`, so cancelling the run still cancels this
+    # job. The condition then admits exactly three entries: a release-please release,
+    # a pushed `v*` tag, or a manual dispatch. An ordinary branch push that only
+    # refreshed the release PR stops here.
+    if: |
+      !cancelled() && (
+        needs.release_please.outputs.release_created == 'true'
+        || github.ref_type == 'tag'
+        || github.event_name == 'workflow_dispatch'
+      )
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-release-version
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      # On the release-please path the tag exists but this run started from the
+      # branch commit, so the build must be pinned to the tag release-please created
+      # rather than to whatever the branch points at by the time jobs schedule.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.release_please.outputs.tag_name || github.ref }}
+          persist-credentials: false
+
+      # `cargo metadata` below needs a toolchain, and the CodeBuild Linux image
+      # does not ship one — unlike the GitHub-hosted `ubuntu-*` images, where cargo
+      # is preinstalled and this step looked unnecessary. The job failed with
+      # `cargo: command not found` on the pipeline's first ever run.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.98.0"
+
+      - name: Resolve and cross-check the version
+        id: resolve
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.release_please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          manifest=$(
+            cargo metadata --locked --no-deps --format-version 1 \
+              | jq -r --arg name "$CLI_CRATE" '.packages[] | select(.name == $name) | .version'
+          )
+          if [ -z "$manifest" ]; then
+            echo "::error title=Version::could not read $CLI_CRATE's version from cargo metadata"
+            exit 1
+          fi
+          # release-please path: the tag it just created is authoritative, and the
+          # same manifest cross-check applies — release-please bumped `Cargo.toml`
+          # in the release PR, so a mismatch here means the bump did not land.
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            tag="${RELEASE_TAG#v}"
+            if [ "$tag" != "$manifest" ]; then
+              echo "::error title=Version::release-please tag ${RELEASE_TAG} disagrees with ${CLI_CRATE}'s manifest version ${manifest}"
+              exit 1
+            fi
+            {
+              echo "version=${manifest}"
+              echo "publish=true"
+              echo "ref=${RELEASE_TAG}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$manifest" ]; then
+              echo "::error title=Version::tag v${tag} disagrees with ${CLI_CRATE}'s manifest version ${manifest}"
+              exit 1
+            fi
+            {
+              echo "version=${manifest}"
+              echo "publish=true"
+              echo "ref=${GITHUB_REF_NAME}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            # Dry run: a version that can never be mistaken for a release.
+            {
+              echo "version=${manifest}-dev.${GITHUB_SHA::7}"
+              echo "publish=${{ inputs.publish }}"
+              echo "ref=${GITHUB_SHA}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  # -------------------------------------------------------------------------
+  # build: one archive per target. Adapted from the proven matrix at
+  # codegraph-rust's .github/workflows/release-please.yml.
+  # -------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    # A skip propagates through the WHOLE ancestor graph, not just the immediate
+    # `needs:` edge. `release_please` is skipped on the tag and dispatch paths, and
+    # `version` opting itself back in with `always()` does NOT clear that skip for
+    # its own dependents — so without this condition every job below was silently
+    # skipped on a pushed `v*` tag while the run still reported success. Observed on
+    # run 33323807478 for v0.0.1: `Resolve version` succeeded, and build, smoke,
+    # checksums and publish were all skipped with an unexpanded matrix.
+    # `!cancelled()` is what opts out of that propagation. `always()` also would, but
+    # it makes the job unschedulable-proof: it runs even when the RUN is cancelled,
+    # which turned this job's own no-op into a `cancelled` conclusion for the whole
+    # dry run (33324175922) and hid the fact that every other leg was green.
+    # A status function alone is never sufficient either, because it would build
+    # after a FAILED version resolution. The explicit `== 'success'` restores exactly
+    # the strictness the implicit `success()` had, so a failed or cancelled `version`
+    # still stops the pipeline.
+    if: ${{ !cancelled() && needs.version.result == 'success' }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            use_zigbuild: true
+            archive: tar.gz
+            runs_on:
+              - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-build-x86_64-linux
+          - target: aarch64-unknown-linux-musl
+            use_zigbuild: true
+            archive: tar.gz
+            runs_on:
+              - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-build-aarch64-linux
+          - target: x86_64-apple-darwin
+            use_zigbuild: false
+            archive: tar.gz
+            runs_on:
+              - codebuild-zuno-runner-macos-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-build-x86_64-darwin
+          - target: aarch64-apple-darwin
+            use_zigbuild: false
+            archive: tar.gz
+            runs_on:
+              - codebuild-zuno-runner-macos-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-build-aarch64-darwin
+          - target: x86_64-pc-windows-msvc
+            use_zigbuild: false
+            archive: zip
+            runs_on:
+              - codebuild-zuno-runner-windows-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-build-x86_64-windows
+    steps:
+      # The tag `version` resolved, so every archive is built from the exact source
+      # the Release points at. Falls back to `github.ref` on the dispatch dry run,
+      # where no tag is involved.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.version.outputs.ref || github.ref }}
+          persist-credentials: false
+
+      # rustup cannot install into the Windows container's default profile:
+      # `rustup toolchain install stable` died with `could not create component
+      # directory: 'C:\Users\ContainerAdministrator\.rustup\toolchains\...'` /
+      # `The specified path is invalid. (os error 161)`. The same write failure is
+      # why `rustup target add` appeared to succeed and then left rustc reporting
+      # `can't find crate for std`. Short roots on the system drive are writable.
+      - name: Relocate the Rust toolchain root (Windows container)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          "RUSTUP_HOME=C:\rustup" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_HOME=C:\cargo" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # No CodeBuild Windows environment ships a C toolchain, so `x86_64-pc-windows-msvc`
+      # cannot build until one is installed. Measured on three images — the 2022 and
+      # 2019 Windows containers and the `windows-ec2` AMI — none has MSVC, a Windows
+      # SDK, or even mingw's gcc/dlltool. The 2022 container's only `link.exe` is
+      # MSYS2's coreutils `link`, which is what rustc silently fell back to:
+      # `link: extra operand` on every build script.
+      #
+      # Chocolatey is on the container image and installs Build Tools in about six
+      # minutes. Once vswhere can see VC.Tools, rustc's own MSVC detection puts the real
+      # linker ahead of MSYS2's for the link step, so no vcvars shim is needed. The
+      # vswhere assertion is here so a silently degraded install fails at this step
+      # rather than surfacing later as an inscrutable linker error.
+      - name: Install MSVC build tools (Windows container)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          choco install visualstudio2022buildtools -y --no-progress --package-parameters `
+            "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --quiet --norestart"
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere is absent; VC.Tools did not install" }
+          $vs = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "vswhere reports no installation carrying VC.Tools.x86.x64" }
+          Write-Host "MSVC at $vs"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.98.0"
+          targets: ${{ matrix.target }}
+
+      # The image also carries a Chocolatey cargo 1.84.1, which is older than this
+      # workspace's `edition = "2024"` and wins on PATH — the build failed with
+      # `feature \`edition2024\` is required` while the toolchain installed above sat
+      # unused. Pin the freshly installed toolchain's own bin directory, and fail
+      # loudly if it is missing rather than silently building with the old cargo.
+      - name: Put the installed toolchain ahead of the image's cargo (Windows container)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $bin = "C:\rustup\toolchains\1.98.0-x86_64-pc-windows-msvc\bin"
+          if (-not (Test-Path "$bin\cargo.exe")) {
+            throw "no cargo.exe under $bin; the toolchain install did not land where expected"
+          }
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$bin\cargo.exe" --version
+          & "$bin\rustc.exe" --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-${{ matrix.target }}
+
+      # Zig is the whole reason the two musl legs need no per-target C
+      # toolchain: it is a hermetic C cross-compiler in one download, and
+      # cargo-zigbuild wires it in as rustc's linker. 0.13.0 is pinned because
+      # cargo-zigbuild tracks Zig's CLI, which is not yet stable.
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-zigbuild
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (zigbuild)
+        if: matrix.use_zigbuild
+        run: cargo zigbuild --locked --release -p ${{ env.CLI_CRATE }} --bin ${{ env.BINARY_NAME }} --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.use_zigbuild }}
+        run: cargo build --locked --release -p ${{ env.CLI_CRATE }} --bin ${{ env.BINARY_NAME }} --target ${{ matrix.target }}
+
+      # Recorded per leg so the evidence for "no cross toolchain" is in the log
+      # rather than only in a comment. `file` reports the ELF machine and whether
+      # the binary is static, which is what the musl legs claim.
+      - name: Describe the artifact
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${BINARY_NAME}"
+          ls -l "$binary"
+          file "$binary" || true
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/${BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" "${BINARY_NAME}"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" `
+            -DestinationPath "dist/${env:BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # -------------------------------------------------------------------------
+  # smoke: run every archive's binary on a runner of its own architecture.
+  #
+  # `runs_on` is chosen per target so the artifact is EXECUTED rather than merely
+  # inspected. The cases worth knowing:
+  #
+  #   * x86_64-unknown-linux-musl smokes on the x86_64 CodeBuild route: a static
+  #     musl binary runs on any Linux of the same architecture, glibc host included.
+  #   * aarch64-unknown-linux-musl is BUILT on x86_64 (zigbuild) and cannot run
+  #     there, so the ARM CodeBuild image label routes it to native aarch64. That
+  #     architecture-crossing handoff is why smoke is separate from build.
+  #   * x86_64-apple-darwin is cross-built on the ARM macOS runner and smoked on
+  #     that same runner through Rosetta 2 — see the header block for the
+  #     measurement and for what Rosetta does and does not prove.
+  #
+  # `zuno-smoke` is compiled from this checkout on the smoke runner, then pointed at
+  # the unpacked artifact. It runs `--version`, `--help`, and a headless `run`
+  # against a committed cassette, asserting the tool registry reached the wire and
+  # that the turn continued after the tool result. See
+  # `crates/zuno-testkit/src/bin/zuno-smoke.rs`.
+  # -------------------------------------------------------------------------
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    needs: [version, build]
+    # Restated per hop: see the comment on `build`. An intermediate job's status
+    # function does not clear an ancestor skip for the jobs beneath it.
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            runs_on:
+              - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-smoke-x86_64-linux
+          - target: aarch64-unknown-linux-musl
+            archive: tar.gz
+            runs_on:
+              - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-smoke-aarch64-linux
+              - image:arm-3.0
+              - instance-size:large
+          - target: x86_64-apple-darwin
+            archive: tar.gz
+            runs_on:
+              - codebuild-zuno-runner-macos-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-smoke-x86_64-darwin
+          - target: aarch64-apple-darwin
+            archive: tar.gz
+            runs_on:
+              - codebuild-zuno-runner-macos-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-smoke-aarch64-darwin
+          - target: x86_64-pc-windows-msvc
+            archive: zip
+            runs_on:
+              - codebuild-zuno-runner-windows-${{ github.run_id }}-${{ github.run_attempt }}
+              - zuno-release-smoke-x86_64-windows
+    steps:
+      # Same ref as `build`, so the smoke driver compiled here matches the source the
+      # artifact under test was built from.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ needs.version.outputs.ref || github.ref }}
+          persist-credentials: false
+
+      # Same Windows container path problem as the build job; see the comment there.
+      - name: Relocate the Rust toolchain root (Windows container)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          "RUSTUP_HOME=C:\rustup" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_HOME=C:\cargo" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # No CodeBuild Windows environment ships a C toolchain, so `x86_64-pc-windows-msvc`
+      # cannot build until one is installed. Measured on three images — the 2022 and
+      # 2019 Windows containers and the `windows-ec2` AMI — none has MSVC, a Windows
+      # SDK, or even mingw's gcc/dlltool. The 2022 container's only `link.exe` is
+      # MSYS2's coreutils `link`, which is what rustc silently fell back to:
+      # `link: extra operand` on every build script.
+      #
+      # Chocolatey is on the container image and installs Build Tools in about six
+      # minutes. Once vswhere can see VC.Tools, rustc's own MSVC detection puts the real
+      # linker ahead of MSYS2's for the link step, so no vcvars shim is needed. The
+      # vswhere assertion is here so a silently degraded install fails at this step
+      # rather than surfacing later as an inscrutable linker error.
+      - name: Install MSVC build tools (Windows container)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          choco install visualstudio2022buildtools -y --no-progress --package-parameters `
+            "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --quiet --norestart"
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw "vswhere is absent; VC.Tools did not install" }
+          $vs = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "vswhere reports no installation carrying VC.Tools.x86.x64" }
+          Write-Host "MSVC at $vs"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.98.0"
+
+      # The image also carries a Chocolatey cargo 1.84.1, which is older than this
+      # workspace's `edition = "2024"` and wins on PATH — the build failed with
+      # `feature \`edition2024\` is required` while the toolchain installed above sat
+      # unused. Pin the freshly installed toolchain's own bin directory, and fail
+      # loudly if it is missing rather than silently building with the old cargo.
+      - name: Put the installed toolchain ahead of the image's cargo (Windows container)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $bin = "C:\rustup\toolchains\1.98.0-x86_64-pc-windows-msvc\bin"
+          if (-not (Test-Path "$bin\cargo.exe")) {
+            throw "no cargo.exe under $bin; the toolchain install did not land where expected"
+          }
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$bin\cargo.exe" --version
+          & "$bin\rustc.exe" --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: smoke-${{ matrix.target }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+
+      - name: Unpack (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p unpacked
+          tar -xzf "dist/${BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.tar.gz" -C unpacked
+          chmod +x "unpacked/${BINARY_NAME}"
+
+      - name: Unpack (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path unpacked | Out-Null
+          Expand-Archive `
+            -Path "dist/${env:BINARY_NAME}-${{ needs.version.outputs.version }}-${{ matrix.target }}.zip" `
+            -DestinationPath unpacked -Force
+
+      - name: Build the smoke driver
+        run: cargo build --locked --release -p zuno-testkit --bin zuno-smoke
+
+      # The artifact under test refuses to start without ripgrep 14+ on PATH:
+      # `zuno-search` treats a missing `rg` as a startup error for the whole tool
+      # runtime, by design (docs/harness-runtime.md). No CodeBuild image ships one on
+      # any of these five platforms, and CI run 33227251936 showed the resulting
+      # failure mode — `the headless run exited non-zero` with `ripgrep (`rg`) is
+      # required for glob and grep` on stderr, which reads like an artifact defect
+      # rather than a missing runner dependency. Installed after the driver build so
+      # a resolution failure cannot be mistaken for a compile failure.
+      #
+      # NOT on Windows: that container cannot reach `static.crates.io`, so
+      # install-action's source build dies with
+      # `A socket operation was attempted to an unreachable network. (os error 10051)`
+      # — measured on release run 33286323014. The Windows leg downloads an upstream
+      # prebuilt archive instead, in the step below.
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        if: matrix.archive != 'zip'
+        with:
+          tool: ripgrep
+
+      # Windows only. `api.github.com` and `objects.githubusercontent.com` are already
+      # reachable from this container — `actions/checkout` and `download-artifact`
+      # both succeeded — so an upstream release asset works where crates.io does not.
+      #
+      # The checksum is pinned, not fetched alongside the archive: verifying a
+      # download against a hash served by the same host it came from proves only that
+      # the transfer was consistent. Bump both values together when moving versions.
+      - name: Install ripgrep from the upstream prebuilt archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        env:
+          RG_VERSION: '15.2.0'
+          RG_SHA256: '71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5'
+        run: |
+          set -euo pipefail
+          archive="ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc.zip"
+          url="https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${archive}"
+          curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused \
+               --location --silent --show-error --fail \
+               --output "$archive" "$url"
+          echo "${RG_SHA256}  ${archive}" | sha256sum --check --strict
+          unzip -q "$archive"
+          # `pwd -W`, not `$PWD`. Git Bash reports `$PWD` in POSIX form
+          # (`/c/codebuild/...`), and while that works for a `rg --version` check run
+          # from this same shell, the binary under test is a native Windows program
+          # and cannot resolve it — release run 33302361906 showed `rg --version`
+          # printing `ripgrep 15.2.0` in this step and the smoke still failing with
+          # `ripgrep (`rg`) is required for glob and grep` two steps later. `pwd -W`
+          # emits the `C:/...` form that both shells and native programs accept.
+          rg_dir="$(pwd -W)/ripgrep-${RG_VERSION}-x86_64-pc-windows-msvc"
+          # `-f`, not `-x`: the archive carries no Unix permission bits, so the
+          # extracted `rg.exe` is mode 0644 and `test -x` fails under Git Bash even
+          # though Windows runs it perfectly well. Verified locally against the real
+          # archive. The `rg --version` step below is what actually proves it runs.
+          test -f "$rg_dir/rg.exe"
+          # Later steps run in their own shells, so PATH has to persist through the
+          # environment file rather than this process.
+          echo "$rg_dir" >> "$GITHUB_PATH"
+
+      # `shell: bash` on purpose. Without it this step inherits pwsh on the Windows
+      # leg, where `rg --version` failed even though the preceding install-action
+      # step reported success — the PATH it exported was not visible to that pwsh
+      # session. Measured on release run 33286323014, where a working ripgrep still
+      # took the whole release down at this line. Git Bash ships on the Windows image
+      # and resolves the tool the same way the smoke driver later will.
+      - name: Verify ripgrep satisfies the runtime minimum
+        shell: bash
+        run: rg --version
+
+      # The bash check above cannot catch the failure this job kept hitting: Git Bash
+      # resolves an MSYS `/c/...` PATH entry happily, so `rg --version` passed while
+      # the native binary under test could not find `rg` at all — five releases in a
+      # row. This step asks WINDOWS to do the lookup, and then asks the artifact
+      # itself, so a broken PATH form fails here in seconds instead of surfacing
+      # forty minutes later as an apparent artifact defect.
+      - name: Verify ripgrep through native Windows resolution
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $hits = @(& "$env:SystemRoot\System32\where.exe" rg)
+          if ($LASTEXITCODE -ne 0 -or $hits.Count -eq 0) {
+            throw "native Windows PATH lookup cannot find rg"
+          }
+          & $hits[0] --version
+          # Exercises the same `Ripgrep::discover()` the headless run depends on.
+          & ".\unpacked\$env:BINARY_NAME.exe" debug rg files --glob '__zuno_no_match__' --limit 1
+
+      # Linux only, and that is not an oversight: `zuno-sandbox` compiles an OS
+      # confinement backend for `target_os = "linux"` alone
+      # (crates/zuno-sandbox/src/lib.rs:15), so only these two legs can reach
+      # `BubblewrapNotFound`. The darwin and windows legs answer `UnsupportedPlatform`
+      # instead and need no package. Same fail-closed reasoning as `ci.yml`: a missing
+      # backend must abort rather than run the smoke unconfined.
+      - name: Install bubblewrap for the OS sandbox backend
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The two Linux legs do NOT share a distribution. x86_64 runs the
+          # Ubuntu-based `standard` image, while aarch64 is routed to `image:arm-3.0`,
+          # which is Amazon Linux and has no `apt-get` at all — the previous
+          # apt-only version of this step failed there with
+          # `apt-get: command not found` followed by `bwrap: command not found`.
+          # Detect the package manager instead of assuming Debian.
+          if command -v apt-get >/dev/null 2>&1; then
+            SUDO=""
+            [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+            $SUDO apt-get update
+            $SUDO apt-get install -y --no-install-recommends bubblewrap
+          elif command -v dnf >/dev/null 2>&1; then
+            SUDO=""
+            [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+            $SUDO dnf install -y bubblewrap
+          elif command -v yum >/dev/null 2>&1; then
+            SUDO=""
+            [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+            $SUDO yum install -y bubblewrap
+          else
+            echo "::error title=Sandbox::no supported package manager found (tried apt-get, dnf, yum)"
+            exit 1
+          fi
+
+          bwrap --version
+
+          # Installing a bubblewrap is necessary but not sufficient: `zuno-sandbox`
+          # requires `--disable-userns` and `--assert-userns-disabled`, both added in
+          # 0.8.0. A distribution shipping 0.6.x installs cleanly and then fails the
+          # option probe at session start, which reads like an artifact defect rather
+          # than a runner one. Fail here, where the cause is unambiguous.
+          version=$(bwrap --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          major=${version%%.*}
+          rest=${version#*.}
+          minor=${rest%%.*}
+          if [ "$major" -eq 0 ] && [ "$minor" -lt 8 ]; then
+            echo "::error title=Sandbox::bubblewrap $version predates the required 0.8.0; zuno-sandbox needs --disable-userns and --assert-userns-disabled"
+            exit 1
+          fi
+          echo "bubblewrap $version satisfies the 0.8.0 minimum"
+
+      # The Linux legs run with the sandbox STRICT: bubblewrap was installed above,
+      # so a smoke failure there is a real defect and must not be masked.
+      - name: Smoke the unpacked artifact (linux)
+        if: contains(matrix.target, 'linux')
+        run: ./target/release/zuno-smoke --binary "unpacked/${BINARY_NAME}"
+
+      # macOS and Windows have no OS confinement backend, so a default session refuses
+      # to start there. The trusted opt-in lives in `zuno-smoke` itself and NOT as an
+      # environment variable on this step: `invoke` calls `env_clear()` and forwards
+      # only the map `turn_variables` builds, so anything set here never reaches the
+      # binary under test. Measured on release run 33266202995, where both darwin legs
+      # still failed with the platform error while that variable was set.
+      # See `provider_config` in crates/zuno-testkit/src/bin/zuno-smoke.rs.
+      - name: Smoke the unpacked artifact (macos)
+        if: contains(matrix.target, 'darwin')
+        run: ./target/release/zuno-smoke --binary "unpacked/${BINARY_NAME}"
+
+      - name: Smoke the unpacked artifact (windows)
+        if: matrix.archive == 'zip'
+        run: ./target/release/zuno-smoke.exe --binary "unpacked/${env:BINARY_NAME}.exe"
+
+  # -------------------------------------------------------------------------
+  # checksums: computed from the same merged `dist/` the release attaches, so the
+  # sums provably describe the uploaded bytes. `LC_ALL=C sort` on basenames gives
+  # a locale-independent, byte-ordered listing, and `sha256sum` runs with
+  # cwd=dist so each line carries the bare asset name.
+  # -------------------------------------------------------------------------
+  checksums:
+    name: Checksums
+    needs: [version, build, smoke]
+    # Restated per hop: see the comment on `build`.
+    if: |
+      !cancelled()
+      && needs.version.result == 'success'
+      && needs.build.result == 'success'
+      && needs.smoke.result == 'success'
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-release-checksums
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(*.tar.gz *.zip)
+          if [ "${#archives[@]}" -ne 5 ]; then
+            echo "::error title=Checksums::expected 5 archives, found ${#archives[@]}: ${archives[*]-none}"
+            exit 1
+          fi
+          mapfile -t sorted < <(printf '%s\n' "${archives[@]}" | LC_ALL=C sort)
+          : > SHA256SUMS
+          for archive in "${sorted[@]}"; do
+            sha256sum "$archive" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
+  # -------------------------------------------------------------------------
+  # publish: the only job that writes anything public, and the only one with
+  # `contents: write`. It lists build, smoke and checksums in `needs`, so it
+  # cannot run unless all five artifacts were built AND all five were executed.
+  #
+  # Skipped on a dry run: `version.outputs.publish` is false unless a `v*` tag was
+  # pushed or the dispatcher explicitly asked for it.
+  # -------------------------------------------------------------------------
+  publish:
+    name: Publish release
+    needs: [version, build, smoke, checksums]
+    # `!cancelled()` opts out of ancestor-graph skip propagation (see `build`); the
+    # four explicit `== 'success'` checks then restore what the implicit `success()`
+    # gave, so this job still cannot run unless all five archives were built AND all
+    # five were executed. The `publish` output check is the original dry-run gate and
+    # is unchanged.
+    if: |
+      !cancelled()
+      && needs.version.result == 'success'
+      && needs.build.result == 'success'
+      && needs.smoke.result == 'success'
+      && needs.checksums.result == 'success'
+      && needs.version.outputs.publish == 'true'
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-release-publish
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: checksums
+          path: dist
+
+      - name: Attach assets to the GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          # The resolved tag, not `github.ref_name`: on the release-please path this
+          # run started from the branch, so `github.ref_name` would name the branch
+          # and attach the assets to the wrong object (or create a stray release).
+          tag_name: ${{ needs.version.outputs.ref }}
+          # release-please already created this Release as a draft and it is the
+          # coordination object every job above attached to, so keep it rather than
+          # replacing it, and publish it here — this job runs only after all five
+          # artifacts were built, all five were executed, and checksums exist.
+          draft: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

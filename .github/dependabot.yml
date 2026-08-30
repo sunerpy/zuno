@@ -1,0 +1,26 @@
+version: 2
+
+# GitHub Actions only, on purpose.
+#
+# Every external Action in `.github/workflows/` is pinned to a full commit SHA, which
+# is the right default and also means a pin never updates itself. Dependabot is what
+# keeps those pins receiving runtime and security fixes.
+#
+# `cargo` is deliberately absent. Several dependencies in the workspace manifest are
+# pinned exactly (`=`) with a recorded reason — the pty layer, the process wrapper,
+# the tree-sitter grammars — and a bot proposing to move them fights a deliberate
+# decision on a weekly schedule. Advisory coverage does not depend on this file: CI's
+# `supply-chain` job runs `cargo deny --all-features check` against the live RUSTSEC
+# database on every push and pull request, and GitHub's own security alerts still open
+# advisories for `Cargo.lock` without a version-update entry here.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore(ci)"

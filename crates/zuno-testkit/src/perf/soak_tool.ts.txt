@@ -1,0 +1,34 @@
+type PerfState = typeof globalThis & {
+  __ocPerfInitialized?: boolean
+  __ocPerfLsps?: Bun.Subprocess[]
+  __ocPerfLargeResultDone?: boolean
+}
+
+export default {
+  description: "Get current weather for a city.",
+  args: { city: { type: "string", description: "City name" } },
+  execute: async ({ city }) => {
+    const state = globalThis as PerfState
+    if (!state.__ocPerfInitialized) {
+      state.__ocPerfInitialized = true
+      state.__ocPerfLsps = ["rust-analyzer", "typescript-language-server"].map((program) =>
+        Bun.spawn(program === "typescript-language-server" ? [program, "--stdio"] : [program], {
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "pipe",
+        }),
+      )
+      const pty = Bun.spawn(["script", "-qec", "yes p | head -c 104857600", "/dev/null"], {
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      await new Response(pty.stdout).arrayBuffer()
+      await pty.exited
+    }
+    if (!state.__ocPerfLargeResultDone) {
+      state.__ocPerfLargeResultDone = true
+      return JSON.stringify({ city, output: "x".repeat(50 * 1024 * 1024) })
+    }
+    return JSON.stringify({ city, temperature: 22, condition: "sunny" })
+  },
+}

@@ -1,0 +1,38 @@
+{
+  "apiVersion": "zuno.extension/v1",
+  "id": "review-kit",
+  "description": "Adds a review specialist, a reusable workflow, and review guidance.",
+  "agents": {
+    "release-reviewer": {
+      "description": "Reviews release safety and rollback evidence.",
+      "mode": "subagent",
+      "prompt": "Review the requested change. Use read, glob, grep, and lsp for repository evidence; use webfetch or web_search when current external evidence is required; use shell only for bounded environment or verification commands. Focus on authorization, durable state, rollback, and concrete verification. Do not delegate. Return findings before summaries.",
+      "permission": {
+        "mode": "standard",
+        "rules": {
+          "*": "deny",
+          "read": "allow",
+          "glob": "allow",
+          "grep": "allow",
+          "lsp": "allow",
+          "webfetch": "allow",
+          "web_search": "allow",
+          "shell": "ask"
+        }
+      }
+    }
+  },
+  "workflows": {
+    "release-review": {
+      "description": "Review a release candidate with the packaged specialist.",
+      "prompt": "Call the task tool once with subagent_type=\"release-reviewer\", background=false, and this prompt: Review this release candidate using repository files, relevant environment facts, and current network evidence when needed: $ARGUMENTS. Return the delegated findings to the user."
+    }
+  },
+  "skills": [
+    {
+      "name": "release-safety",
+      "description": "Use when reviewing a release, deployment, rollback plan, or production gate.",
+      "content": "Check immutable inputs, authorization boundaries, rollback evidence, observability, and the exact commands that completed successfully."
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+[package]
+name = "zuno-agent"
+description = "Agent definitions, presets, and the sub-agent task boundary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# ---------------------------------------------------------------------------
+# `zuno-agent` MUST NOT depend on `zuno-tools`.
+#
+# Todo 65 puts the `task` delegation tool in `zuno-tools`, and that tool has to
+# name this crate's roster to validate `subagent_type`. The edge therefore runs
+# `zuno-tools -> zuno-agent`, and adding the reverse edge — even as a dev-dependency
+# for a "do these tool ids exist" test — would make the pair mutually
+# dependent. `builtin::GOVERNED_TOOL_IDS` states this crate's tool vocabulary
+# locally instead; see its doc comment for where the cross-crate check belongs.
+# ---------------------------------------------------------------------------
+[dependencies]
+async-trait = { workspace = true }
+zuno-catalog = { workspace = true }
+zuno-config = { workspace = true }
+zuno-llm = { workspace = true }
+# For the plan document's data-directory fallback: `session.ts:333` reaches for
+# `Global.Path.data` when the project is not a repository, and `zuno-paths` is the
+# one place that resolves it.
+zuno-paths = { workspace = true }
+zuno-permission = { workspace = true }
+zuno-tool = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+zuno-error = { workspace = true }
+
+[lints]
+workspace = true

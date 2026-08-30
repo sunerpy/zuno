@@ -1,0 +1,3151 @@
+{
+  "$defs": {
+    "AgentColor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThemeColor",
+          "description": "A theme colour."
+        },
+        {
+          "description": "A `#rrggbb` hex code, validated on the way in.",
+          "type": "string"
+        }
+      ],
+      "description": "An agent's colour: a six-digit hex code, or a theme colour\n(`config/agent.ts:7-10`)."
+    },
+    "AgentConfig": {
+      "additionalProperties": true,
+      "description": "One entry of the `agents` map, or one Markdown agent definition's frontmatter.\n\nDeserialization performs the oracle's sweep: any key this struct does not name\nis copied into [`options`](Self::options) *and* kept verbatim in\n[`extra`](Self::extra).",
+      "properties": {
+        "color": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentColor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Display colour."
+        },
+        "delegates": {
+          "description": "Exact child-agent allowlist for direct delegation and workflows.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "When to use the agent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "disable": {
+          "description": "Remove this agent.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hidden": {
+          "description": "Hide the agent from the `@` autocomplete menu.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the agent may be used."
+        },
+        "model": {
+          "description": "Model in `provider/model` form.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "additionalProperties": true,
+          "description": "Provider options, including every swept unknown key.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "permission": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PermissionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-tool permissions for this agent."
+        },
+        "prompt": {
+          "description": "System prompt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentReasoning"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provider-neutral reasoning level, applied only with the configured model."
+        },
+        "requiredSkills": {
+          "description": "Skills loaded at the start of every turn for this agent.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "steps": {
+          "description": "Optional maximum tool-capable iterations before one text-only finalization request.\n\nWhen omitted, the agent has no fixed step limit.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "tools": {
+          "description": "Exact model-visible tool allowlist for this agent.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "top_p": {
+          "description": "Nucleus-sampling cutoff.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "variant": {
+          "description": "Default model variant, applied only with the agent's configured model.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AgentMode": {
+      "description": "Where an agent may be used (`config/agent.ts:26`).",
+      "oneOf": [
+        {
+          "const": "subagent",
+          "description": "Only reachable as a subagent.",
+          "type": "string"
+        },
+        {
+          "const": "primary",
+          "description": "Only reachable as a primary agent.",
+          "type": "string"
+        },
+        {
+          "const": "all",
+          "description": "Both.",
+          "type": "string"
+        }
+      ]
+    },
+    "AgentReasoning": {
+      "description": "Provider-neutral reasoning level selected for this agent.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Disable model reasoning when supported.",
+          "type": "string"
+        },
+        {
+          "const": "low",
+          "description": "Use a small reasoning budget.",
+          "type": "string"
+        },
+        {
+          "const": "medium",
+          "description": "Use the normal reasoning budget.",
+          "type": "string"
+        },
+        {
+          "const": "high",
+          "description": "Use a large reasoning budget.",
+          "type": "string"
+        },
+        {
+          "const": "xhigh",
+          "description": "Use the strongest broadly available effort.",
+          "type": "string"
+        },
+        {
+          "const": "max",
+          "description": "Use the strongest effort exposed by the model.",
+          "type": "string"
+        }
+      ]
+    },
+    "AgentWorkflowConfig": {
+      "additionalProperties": false,
+      "description": "A named, configuration-owned workflow template.",
+      "properties": {
+        "maxAgents": {
+          "description": "Maximum nodes admitted into one run. Defaults to twelve.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maxParallel": {
+          "description": "Maximum simultaneously running nodes. Defaults to four.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "nodes": {
+          "description": "The immutable DAG instantiated by the model-facing workflow tool.",
+          "items": {
+            "$ref": "#/$defs/WorkflowNodeConfig"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "type": "object"
+    },
+    "AttachmentConfig": {
+      "description": "Attachment processing (`config/attachment.ts:22-24`).",
+      "properties": {
+        "image": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageAttachmentConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Image attachment limits."
+        }
+      },
+      "type": "object"
+    },
+    "Autoupdate": {
+      "anyOf": [
+        {
+          "description": "Install updates automatically, or never.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/AutoupdateMode",
+          "description": "Announce updates only."
+        }
+      ],
+      "description": "Update behaviour (`config/config.ts:67-71`)."
+    },
+    "AutoupdateMode": {
+      "description": "The `\"notify\"` arm of [`Autoupdate`].",
+      "oneOf": [
+        {
+          "const": "notify",
+          "description": "Announce updates without installing them.",
+          "type": "string"
+        }
+      ]
+    },
+    "CommandConfig": {
+      "description": "One custom command (`config/command.ts:5-12`).",
+      "properties": {
+        "agent": {
+          "description": "Agent to run the command as.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "What the command does.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Model to run the command with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subtask": {
+          "description": "Run the command in a subtask instead of the current session.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "template": {
+          "description": "The prompt template. The only required field in the whole schema's leaves.",
+          "type": "string"
+        },
+        "variant": {
+          "description": "Model variant to run the command with.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "template"
+      ],
+      "type": "object"
+    },
+    "CompactionConfig": {
+      "description": "Context-compaction behaviour (`config/config.ts:151-172`).",
+      "properties": {
+        "auto": {
+          "description": "Compact automatically when the context fills. Defaults to true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "preserve_recent_tokens": {
+          "description": "Token ceiling for the verbatim tail.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "prune": {
+          "description": "Prune old tool outputs. Defaults to false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "reserved": {
+          "description": "Token buffer left free so compaction itself cannot overflow.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tail_turns": {
+          "description": "Recent user turns to keep verbatim. Defaults to 2.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "threshold_percent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CompactionThresholdPercent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Percentage of the usable context window that triggers automatic compaction.\nDefaults to 80."
+        }
+      },
+      "type": "object"
+    },
+    "CompactionThresholdPercent": {
+      "description": "A validated automatic-compaction percentage.",
+      "format": "uint8",
+      "maximum": 100,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "ConcurrencyConfig": {
+      "additionalProperties": false,
+      "description": "Optional per-layer concurrency overrides.",
+      "properties": {
+        "delegations": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrencyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum native or product-agent delegations executing at once."
+        },
+        "lsp_requests": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrencyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum independent LSP servers or file requests executing at once."
+        },
+        "mcp_connections": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrencyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum MCP servers connecting or disconnecting at once."
+        },
+        "tool_calls": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConcurrencyLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum independent model-issued tool calls executing at once."
+        }
+      },
+      "type": "object"
+    },
+    "ConcurrencyLimit": {
+      "description": "Small positive concurrency bound accepted at every runtime boundary.",
+      "format": "uint8",
+      "maximum": 64,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "EnterpriseConfig": {
+      "description": "Enterprise deployment settings (`config/config.ts:134-136`).",
+      "properties": {
+        "url": {
+          "description": "Enterprise URL.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ExperimentalConfig": {
+      "description": "Options under active development (`config/config.ts:173-188`).",
+      "properties": {
+        "batch_tool": {
+          "description": "Enable the batch tool.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "continue_loop_on_deny": {
+          "description": "Keep the agent loop running after a denied tool call.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "disable_paste_summary": {
+          "description": "Stop summarizing pasted text.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "mcp_timeout": {
+          "description": "Timeout in milliseconds for MCP requests.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "openTelemetry": {
+          "description": "Emit OpenTelemetry spans for model calls.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "policies": {
+          "description": "Policy statements applied to supported resources.",
+          "items": {
+            "$ref": "#/$defs/PolicyStatement"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "primary_tools": {
+          "description": "Tools only primary agents may use.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "FormatterConfig": {
+      "anyOf": [
+        {
+          "description": "Enable or disable every formatter at once.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/OrderedMap_of_FormatterEntry",
+          "description": "Per-formatter overrides, keyed by formatter name."
+        }
+      ],
+      "description": "The `formatter` key: a switch, or per-formatter overrides.\n\nOmitted disables formatting, `true` enables the built-ins, and an object\nenables the built-ins with the listed overrides applied."
+    },
+    "FormatterEntry": {
+      "description": "One formatter's overrides (`config/formatter.ts:5-10`).",
+      "properties": {
+        "command": {
+          "description": "The command to run, argv-style.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "disabled": {
+          "description": "Turn this formatter off.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra environment for the command.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "extensions": {
+          "description": "File extensions this formatter claims.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GitReference": {
+      "description": "A reference to a git repository (`config/reference.ts:5-10`).",
+      "properties": {
+        "branch": {
+          "description": "The branch to check out.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "Human description of the reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hidden": {
+          "description": "Hide the reference from pickers.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "repository": {
+          "description": "The repository to clone.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository"
+      ],
+      "type": "object"
+    },
+    "GoalConfig": {
+      "description": "Persistent goal runtime settings.",
+      "properties": {
+        "retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GoalRetryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Automatic recovery after a retryable terminal turn failure."
+        }
+      },
+      "type": "object"
+    },
+    "GoalRetryConfig": {
+      "description": "Exponential backoff settings for automatic goal recovery.",
+      "properties": {
+        "initial_delay_ms": {
+          "description": "Delay before the first retry, in milliseconds.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "jitter_percent": {
+          "description": "Symmetric jitter percentage for locally selected delays, in the inclusive range 0..=100.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_delay_ms": {
+          "description": "Maximum delay between retries, in milliseconds.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "poll_interval_ms": {
+          "description": "Maximum wait before checking for queued human input, in milliseconds.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ImageAttachmentConfig": {
+      "description": "Image attachment limits (`config/attachment.ts:6-19`).",
+      "properties": {
+        "auto_resize": {
+          "description": "Resize oversized images instead of rejecting them. Defaults to true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_base64_bytes": {
+          "description": "Maximum base64 payload in bytes. Defaults to 5242880.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_height": {
+          "description": "Maximum height before resizing or rejecting. Defaults to 2000.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_width": {
+          "description": "Maximum width before resizing or rejecting. Defaults to 2000.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "Interleaved": {
+      "anyOf": [
+        {
+          "description": "Switch interleaved reasoning on or off.",
+          "type": "boolean"
+        },
+        {
+          "description": "The stream field carrying reasoning.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/InterleavedField",
+          "description": "The same, spelled as an object."
+        }
+      ],
+      "description": "Interleaved-reasoning configuration (`config/provider.ts:22-30`).\n\nThe oracle's field arm is `Union([Literals([...]), String])`, which accepts any\nstring; the three literals are documentation, not a constraint."
+    },
+    "InterleavedField": {
+      "description": "The object arm of [`Interleaved`] (`config/provider.ts:26-28`).",
+      "properties": {
+        "field": {
+          "description": "The stream field carrying reasoning.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field"
+      ],
+      "type": "object"
+    },
+    "LocalKind": {
+      "description": "The `type: \"local\"` discriminator.",
+      "oneOf": [
+        {
+          "const": "local",
+          "description": "A server this process spawns.",
+          "type": "string"
+        }
+      ]
+    },
+    "LocalReference": {
+      "description": "A reference to a local directory (`config/reference.ts:12-16`).",
+      "properties": {
+        "description": {
+          "description": "Human description of the reference.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hidden": {
+          "description": "Hide the reference from pickers.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The directory to reference.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "LogLevel": {
+      "description": "Log level (`config/config.ts:27-30`).",
+      "oneOf": [
+        {
+          "const": "DEBUG",
+          "description": "Debug.",
+          "type": "string"
+        },
+        {
+          "const": "INFO",
+          "description": "Info.",
+          "type": "string"
+        },
+        {
+          "const": "WARN",
+          "description": "Warn.",
+          "type": "string"
+        },
+        {
+          "const": "ERROR",
+          "description": "Error.",
+          "type": "string"
+        }
+      ]
+    },
+    "LspConfig": {
+      "anyOf": [
+        {
+          "description": "Enable or disable every server at once.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/OrderedMap_of_LspEntry",
+          "description": "Per-server overrides, keyed by server id."
+        }
+      ],
+      "description": "The `lsp` key: a switch, or per-server overrides.\n\nOmitted disables LSP, `true` enables the built-ins, and an object enables the\nbuilt-ins with the listed overrides applied."
+    },
+    "LspEntry": {
+      "description": "One LSP server's configuration.\n\nThe oracle spells this as a union of `{ disabled: true }` and `{ command, ... }`.\nCollapsing it into one struct with the same requirement — `command` is\nmandatory unless the server is switched off — accepts and rejects exactly the\nsame documents while keeping every key the author wrote, which the union arm\norder would otherwise discard.",
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "disabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "extensions": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "initialization": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "McpLocal": {
+      "description": "A locally spawned MCP server (`config/mcp.ts:6-23`).",
+      "properties": {
+        "command": {
+          "description": "Command and arguments to run the server.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "description": "Working directory; relative paths resolve from the workspace directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "description": "Start the server, or not.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables for the server process.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "timeout": {
+          "description": "Request timeout in milliseconds; the runtime defaults to 5000.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/LocalKind",
+          "description": "Always `local`."
+        }
+      },
+      "required": [
+        "type",
+        "command"
+      ],
+      "type": "object"
+    },
+    "McpOauth": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpOauthConfig",
+          "description": "Explicit OAuth settings."
+        },
+        {
+          "$ref": "#/$defs/false",
+          "description": "The literal `false`."
+        }
+      ],
+      "description": "The `oauth` key: settings, or `false` to disable auto-detection\n(`config/mcp.ts:53-55`)."
+    },
+    "McpOauthConfig": {
+      "description": "OAuth settings for a remote MCP server (`config/mcp.ts:26-41`).",
+      "properties": {
+        "callbackPort": {
+          "description": "Port for the local callback server; the runtime defaults to 19876.\n\n`NonZeroU16` reproduces the oracle's `Int.isBetween(1, 65535)` exactly.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "clientId": {
+          "description": "Client id; absent means dynamic client registration (RFC 7591).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientSecret": {
+          "description": "Client secret, when the authorization server requires one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redirectUri": {
+          "description": "Full redirect URI, which overrides `callbackPort`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "description": "Scopes to request.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "McpRemote": {
+      "description": "A remote MCP server (`config/mcp.ts:44-59`).",
+      "properties": {
+        "enabled": {
+          "description": "Start the server, or not.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Headers sent with every request.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "oauth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpOauth"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "OAuth settings, or `false` to suppress OAuth auto-detection."
+        },
+        "timeout": {
+          "description": "Request timeout in milliseconds; the runtime defaults to 5000.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/RemoteKind",
+          "description": "Always `remote`."
+        },
+        "url": {
+          "description": "URL of the remote server.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "url"
+      ],
+      "type": "object"
+    },
+    "McpServerConfig": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/McpLocal",
+          "description": "A locally spawned server."
+        },
+        {
+          "$ref": "#/$defs/McpRemote",
+          "description": "A remote server."
+        },
+        {
+          "$ref": "#/$defs/McpToggle",
+          "description": "A switch for a server defined by another config layer."
+        }
+      ],
+      "description": "One entry of the `mcp` map.\n\nThe arms are tried in the oracle's union order — local, remote, then the\nenabled-only toggle — and the first that fits wins."
+    },
+    "McpToggle": {
+      "description": "A switch for a server another config layer defined\n(`config/config.ts:113-115`).",
+      "properties": {
+        "enabled": {
+          "description": "Start the server, or not.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "MemoryConfidence": {
+      "description": "A validated probability used by memory promotion.",
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "MemoryConfig": {
+      "anyOf": [
+        {
+          "description": "`false` disables the subsystem; `true` selects all defaults.",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/MemoryOptions",
+          "description": "Fine-grained settings for an enabled subsystem."
+        }
+      ],
+      "description": "Persistent memory: a master boolean, or component settings."
+    },
+    "MemoryOptions": {
+      "description": "Fine-grained settings under the `memory` top-level key.",
+      "properties": {
+        "auto_confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryConfidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Threshold used by `high_confidence`. Defaults to 0.9."
+        },
+        "global_char_limit": {
+          "description": "Character cap for global agent notes. Defaults to 2200.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "nudge_interval": {
+          "description": "Reflect every N delivered turns; zero disables only the periodic trigger.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project_char_limit": {
+          "description": "Character cap for project rules. Defaults to 3000.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "promotion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryPromotion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Candidate promotion policy. Defaults to `review`."
+        },
+        "reflection": {
+          "description": "Run post-response background reflection.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "resident": {
+          "description": "Inject frozen resident blocks into each session's system prompt.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tool": {
+          "description": "Expose the model-facing `memory` tool.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "MemoryPromotion": {
+      "description": "How durable memory candidates become resident entries.",
+      "oneOf": [
+        {
+          "const": "review",
+          "description": "Keep every candidate pending until a user approves it.",
+          "type": "string"
+        },
+        {
+          "const": "high_confidence",
+          "description": "Apply only candidates at or above `auto_confidence`.",
+          "type": "string"
+        },
+        {
+          "const": "automatic",
+          "description": "Apply every validated candidate immediately.",
+          "type": "string"
+        }
+      ]
+    },
+    "Modality": {
+      "description": "A modality a model accepts or emits (`config/provider.ts:56-59`).",
+      "oneOf": [
+        {
+          "const": "text",
+          "description": "Text.",
+          "type": "string"
+        },
+        {
+          "const": "audio",
+          "description": "Audio.",
+          "type": "string"
+        },
+        {
+          "const": "image",
+          "description": "Image.",
+          "type": "string"
+        },
+        {
+          "const": "video",
+          "description": "Video.",
+          "type": "string"
+        },
+        {
+          "const": "pdf",
+          "description": "PDF.",
+          "type": "string"
+        }
+      ]
+    },
+    "ModelConfig": {
+      "description": "One entry of a provider's `models` map (`config/provider.ts:13-80`).",
+      "properties": {
+        "attachment": {
+          "description": "Whether the model accepts attachments.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelCost"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Pricing."
+        },
+        "experimental": {
+          "description": "Whether the model is experimental.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "family": {
+          "description": "Model family.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra headers for requests to this model.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Model id override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interleaved": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Interleaved"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Interleaved-reasoning configuration."
+        },
+        "limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Token limits."
+        },
+        "modalities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelModalities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Input and output modalities."
+        },
+        "name": {
+          "description": "Display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "additionalProperties": true,
+          "description": "Model options handed to the provider SDK.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelProvider"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The native transport and API endpoint backing this model."
+        },
+        "reasoning": {
+          "description": "Whether the model reasons.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "release_date": {
+          "description": "Release date.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Lifecycle status."
+        },
+        "temperature": {
+          "description": "Whether the model honours `temperature`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tool_call": {
+          "description": "Whether the model can call tools.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "variants": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OrderedMap_of_ModelVariant"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Named variants."
+        }
+      },
+      "type": "object"
+    },
+    "ModelCost": {
+      "description": "Per-token pricing (`config/provider.ts:31-46`).",
+      "properties": {
+        "cache_read": {
+          "description": "Cache-read price.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cache_write": {
+          "description": "Cache-write price.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "context_over_200k": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelCostTier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Pricing that takes over past a 200k-token context."
+        },
+        "input": {
+          "description": "Input price.",
+          "format": "double",
+          "type": "number"
+        },
+        "output": {
+          "description": "Output price.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "ModelCostTier": {
+      "description": "The long-context pricing tier (`config/provider.ts:37-44`).",
+      "properties": {
+        "cache_read": {
+          "description": "Cache-read price.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cache_write": {
+          "description": "Cache-write price.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "input": {
+          "description": "Input price.",
+          "format": "double",
+          "type": "number"
+        },
+        "output": {
+          "description": "Output price.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
+    "ModelLimit": {
+      "description": "Token limits (`config/provider.ts:47-53`).",
+      "properties": {
+        "context": {
+          "description": "Total context window.",
+          "format": "double",
+          "type": "number"
+        },
+        "input": {
+          "description": "Maximum input tokens.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Maximum output tokens.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "context",
+        "output"
+      ],
+      "type": "object"
+    },
+    "ModelModalities": {
+      "description": "Input and output modalities (`config/provider.ts:54-61`).",
+      "properties": {
+        "input": {
+          "description": "Accepted modalities.",
+          "items": {
+            "$ref": "#/$defs/Modality"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Emitted modalities.",
+          "items": {
+            "$ref": "#/$defs/Modality"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ModelProvider": {
+      "additionalProperties": false,
+      "description": "The native transport and API endpoint backing a single model.",
+      "properties": {
+        "api": {
+          "description": "API endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "surface": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderSurface"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Request surface override for this model."
+        },
+        "transport": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderTransport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native request transport implemented by Zuno."
+        }
+      },
+      "type": "object"
+    },
+    "ModelStatus": {
+      "description": "A model's lifecycle status (`config/provider.ts:6`).",
+      "oneOf": [
+        {
+          "const": "alpha",
+          "description": "Alpha.",
+          "type": "string"
+        },
+        {
+          "const": "beta",
+          "description": "Beta.",
+          "type": "string"
+        },
+        {
+          "const": "deprecated",
+          "description": "Deprecated.",
+          "type": "string"
+        },
+        {
+          "const": "active",
+          "description": "Active.",
+          "type": "string"
+        }
+      ]
+    },
+    "ModelVariant": {
+      "additionalProperties": true,
+      "description": "One named variant of a model (`config/provider.ts:69-79`).\n\n`StructWithRest`: everything but `disabled` is variant-specific payload.",
+      "properties": {
+        "disabled": {
+          "description": "Disable this variant for the model.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_AgentConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/AgentConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_AgentWorkflowConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/AgentWorkflowConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_CommandConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/CommandConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_FormatterEntry": {
+      "additionalProperties": {
+        "$ref": "#/$defs/FormatterEntry"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_LspEntry": {
+      "additionalProperties": {
+        "$ref": "#/$defs/LspEntry"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_McpServerConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/McpServerConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_ModelConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_ModelVariant": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelVariant"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_PermissionAction": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PermissionAction"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_PermissionRule": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PermissionRule"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_PresetConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PresetConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_PresetModelConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PresetModelConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_ProductAgentConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProductAgentConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_ProviderConfig": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProviderConfig"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_ReferenceEntry": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ReferenceEntry"
+      },
+      "type": "object"
+    },
+    "OrderedMap_of_boolean": {
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "type": "object"
+    },
+    "PermissionAction": {
+      "description": "What to do when a tool asks (`config/permission.ts:5`).",
+      "oneOf": [
+        {
+          "const": "ask",
+          "description": "Prompt the user.",
+          "type": "string"
+        },
+        {
+          "const": "allow",
+          "description": "Run without prompting.",
+          "type": "string"
+        },
+        {
+          "const": "deny",
+          "description": "Refuse.",
+          "type": "string"
+        }
+      ]
+    },
+    "PermissionConfig": {
+      "additionalProperties": false,
+      "description": "The canonical permission configuration used by Zuno.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/PermissionMode",
+          "default": "standard",
+          "description": "How unresolved and side-effecting calls are admitted."
+        },
+        "rules": {
+          "$ref": "#/$defs/PermissionObject",
+          "default": {},
+          "description": "Ordered per-tool rules. Explicit denies remain terminal in every mode."
+        }
+      },
+      "type": "object"
+    },
+    "PermissionMode": {
+      "description": "Cross-cutting human-in-the-loop behavior for tool calls.",
+      "oneOf": [
+        {
+          "const": "standard",
+          "description": "Apply configured rules and the normal risk gates.",
+          "type": "string"
+        },
+        {
+          "const": "strict",
+          "description": "Require a fresh decision for every side-effecting call.",
+          "type": "string"
+        },
+        {
+          "const": "allow_all",
+          "description": "Skip HITL prompts while preserving explicit denies and sandbox validation.",
+          "type": "string"
+        }
+      ]
+    },
+    "PermissionObject": {
+      "$ref": "#/$defs/OrderedMap_of_PermissionRule",
+      "description": "Per-tool permission rules, in the author's key order."
+    },
+    "PermissionRule": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PermissionAction",
+          "description": "One action covering every invocation of the tool."
+        },
+        {
+          "$ref": "#/$defs/OrderedMap_of_PermissionAction",
+          "description": "Per-pattern actions, evaluated in the author's key order."
+        }
+      ],
+      "description": "A permission rule: one action for the whole tool, or per-pattern actions\n(`config/permission.ts:8-12`)."
+    },
+    "PolicyAction": {
+      "description": "An action a policy statement can govern.\n\n`packages/core/src/config/experimental.ts:9` builds this from\n`Catalog.PolicyActions`, which is `Literals([\"provider.use\"])` — one action,\nand anything else is rejected.",
+      "oneOf": [
+        {
+          "const": "provider.use",
+          "description": "Use of a provider.",
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyEffect": {
+      "description": "Whether a policy statement permits or refuses (`packages/core/src/policy.ts:8`).",
+      "oneOf": [
+        {
+          "const": "allow",
+          "description": "Permit.",
+          "type": "string"
+        },
+        {
+          "const": "deny",
+          "description": "Refuse.",
+          "type": "string"
+        }
+      ]
+    },
+    "PolicyStatement": {
+      "description": "One policy statement (`packages/core/src/policy.ts:11-15` plus the narrowed\n`action` from `config/experimental.ts:11-14`). Every field is required.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/PolicyAction",
+          "description": "The action governed."
+        },
+        "effect": {
+          "$ref": "#/$defs/PolicyEffect",
+          "description": "Permit or refuse."
+        },
+        "resource": {
+          "description": "The resource pattern the statement matches.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "effect",
+        "resource"
+      ],
+      "type": "object"
+    },
+    "PresetConfig": {
+      "additionalProperties": false,
+      "description": "One named team preset.\n\nAgent routes drive direct and delegated agent selection. Categories are optional\nsemantic shorthands for workflow nodes that should not hard-code an agent name.",
+      "properties": {
+        "agents": {
+          "$ref": "#/$defs/OrderedMap_of_PresetModelConfig",
+          "description": "Per-agent model choices."
+        },
+        "categories": {
+          "$ref": "#/$defs/OrderedMap_of_PresetModelConfig",
+          "description": "Semantic category model choices."
+        }
+      },
+      "type": "object"
+    },
+    "PresetModelConfig": {
+      "anyOf": [
+        {
+          "description": "A qualified `provider/model` id with no reasoning override.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/PresetModelOptions",
+          "description": "A qualified model plus its canonical reasoning level."
+        }
+      ],
+      "description": "One model choice inside a preset.\n\nA string is the concise form. The object form adds a provider-neutral reasoning\nlevel without exposing provider-specific option objects in the team preset."
+    },
+    "PresetModelOptions": {
+      "additionalProperties": false,
+      "description": "The expanded form of a preset model choice.",
+      "properties": {
+        "model": {
+          "description": "Model in `provider/model` form.",
+          "type": "string"
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentReasoning"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provider-neutral reasoning level for this route."
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "type": "object"
+    },
+    "ProductAgentConfig": {
+      "additionalProperties": false,
+      "description": "One named product-agent instance.",
+      "properties": {
+        "command": {
+          "description": "Executable or executable path. Defaults to the product's normal command.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "description": "Disabled unless explicitly true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Additional child-process environment values.\n\nOrdinary process variables, including proxy variables, are inherited even when\nthis map is absent. These entries only overlay that inherited environment.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ProductAgentKind",
+          "description": "Which native product implements this instance."
+        },
+        "permissionMode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProductAgentPermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native product permission policy."
+        },
+        "toolName": {
+          "description": "Static model-visible tool name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ProductAgentKind": {
+      "description": "A supported external coding-agent product.",
+      "oneOf": [
+        {
+          "const": "codex",
+          "description": "OpenAI Codex CLI through its app-server protocol.",
+          "type": "string"
+        },
+        {
+          "const": "claude-code",
+          "description": "Anthropic Claude Code through its non-interactive stream-json CLI.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProductAgentPermissionMode": {
+      "description": "Native permission vocabulary accepted by either supported product.\n\nValidation keeps product-specific values from crossing the boundary. One enum\nkeeps the JSON schema useful while [`ProductAgentConfig::validate`] enforces the\nactual Codex/Claude Code split.",
+      "oneOf": [
+        {
+          "const": "never",
+          "description": "Codex: never ask Zuno for approval.",
+          "type": "string"
+        },
+        {
+          "const": "unlessTrusted",
+          "description": "Codex: ask only for commands outside its trusted set.",
+          "type": "string"
+        },
+        {
+          "const": "onRequest",
+          "description": "Codex: request approval when its policy requires it.",
+          "type": "string"
+        },
+        {
+          "const": "dangerouslyBypassApprovals",
+          "description": "Codex: explicit full-access bypass.",
+          "type": "string"
+        },
+        {
+          "const": "manual",
+          "description": "Claude Code asks before protected operations. Zuno still disables interactive questions.",
+          "type": "string"
+        },
+        {
+          "const": "auto",
+          "description": "Claude Code selects its own non-interactive policy.",
+          "type": "string"
+        },
+        {
+          "const": "acceptEdits",
+          "description": "Claude Code may apply edits without asking.",
+          "type": "string"
+        },
+        {
+          "const": "dontAsk",
+          "description": "Claude Code refuses operations that would require a prompt.",
+          "type": "string"
+        },
+        {
+          "const": "bypassPermissions",
+          "description": "Claude Code's explicit permission bypass.",
+          "type": "string"
+        },
+        {
+          "const": "plan",
+          "description": "Claude Code's read-only planning policy.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProviderConfig": {
+      "additionalProperties": false,
+      "description": "One entry of the `provider` map (`config/provider.ts:82-126`).",
+      "properties": {
+        "api": {
+          "description": "Base API URL for the provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "blacklist": {
+          "description": "Models to drop.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "env": {
+          "description": "Environment variables that supply this provider's credentials.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Default extra HTTP headers for every model in this provider.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Provider id override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OrderedMap_of_ModelConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-model configuration and overrides."
+        },
+        "name": {
+          "description": "Display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderOptions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provider-level options, including SDK options this schema does not name."
+        },
+        "surface": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderSurface"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Default request surface for this provider's models."
+        },
+        "transport": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderTransport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native request transport implemented by Zuno."
+        },
+        "whitelist": {
+          "description": "Models to keep, to the exclusion of the rest.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ProviderOptions": {
+      "additionalProperties": true,
+      "description": "Provider options (`config/provider.ts:90-124`).\n\nThe oracle spells this `StructWithRest(..., [Record(String, Any)])`, so any key\nthe schema does not name is still valid and is handed to the provider SDK. That\nrest record is [`ProviderOptions::extra`].",
+      "properties": {
+        "apiKey": {
+          "description": "API key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "baseURL": {
+          "description": "Base URL override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chunkTimeout": {
+          "description": "Maximum gap between streamed SSE chunks, in milliseconds.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "enterpriseUrl": {
+          "description": "GitHub Enterprise URL, for copilot authentication.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "headerTimeout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timeout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Response-header timeout in milliseconds, or `false` for none."
+        },
+        "responsesTextBlocks": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResponsesTextBlocks"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How a Responses-compatible endpoint accepts text content inside one message.\n\nStandards-compatible endpoints accept multiple `input_text` blocks. Some\ngateways project a message onto one upstream text field and therefore need\nZuno to coalesce those blocks at the provider boundary."
+        },
+        "setCacheKey": {
+          "description": "Send `promptCacheKey` for this provider (default false).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "timeout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timeout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whole-request timeout in milliseconds, or `false` for none."
+        }
+      },
+      "type": "object"
+    },
+    "ProviderSurface": {
+      "description": "Native API surface selected independently from the wire transport.\n\n`transport: \"openai\"` says which protocol family Zuno implements. `surface`\nselects the concrete endpoint shape within that family, so a custom gateway can\nexplicitly use Responses instead of falling back to Chat Completions.",
+      "oneOf": [
+        {
+          "const": "chat",
+          "description": "OpenAI Chat Completions.",
+          "type": "string"
+        },
+        {
+          "const": "responses",
+          "description": "OpenAI Responses.",
+          "type": "string"
+        },
+        {
+          "const": "messages",
+          "description": "Anthropic Messages.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProviderTransport": {
+      "description": "Native provider transports implemented by the Rust workspace.",
+      "oneOf": [
+        {
+          "const": "anthropic",
+          "description": "Anthropic Messages.",
+          "type": "string"
+        },
+        {
+          "const": "bedrock",
+          "description": "AWS Bedrock Converse/Invoke transport.",
+          "type": "string"
+        },
+        {
+          "const": "bedrock-mantle",
+          "description": "Bedrock through the Mantle OpenAI-compatible endpoint.",
+          "type": "string"
+        },
+        {
+          "const": "google",
+          "description": "Google Generative AI.",
+          "type": "string"
+        },
+        {
+          "const": "google-vertex",
+          "description": "Google Vertex Gemini.",
+          "type": "string"
+        },
+        {
+          "const": "google-vertex-anthropic",
+          "description": "Anthropic Messages through Google Vertex.",
+          "type": "string"
+        },
+        {
+          "const": "openai",
+          "description": "OpenAI native Responses/Chat transport.",
+          "type": "string"
+        },
+        {
+          "const": "openai-compatible",
+          "description": "Generic OpenAI-compatible Chat/Responses transport.",
+          "type": "string"
+        },
+        {
+          "const": "openrouter",
+          "description": "OpenRouter's OpenAI-compatible transport and reasoning options.",
+          "type": "string"
+        }
+      ]
+    },
+    "ReferenceEntry": {
+      "anyOf": [
+        {
+          "description": "The shorthand form: a bare repository or path string.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/GitReference",
+          "description": "A git repository reference."
+        },
+        {
+          "$ref": "#/$defs/LocalReference",
+          "description": "A local directory reference."
+        }
+      ],
+      "description": "One entry of the `references` map.\n\nThe arms are disjoint: a string is a string, [`GitReference`] requires\n`repository`, and [`LocalReference`] requires `path`."
+    },
+    "RemoteKind": {
+      "description": "The `type: \"remote\"` discriminator.",
+      "oneOf": [
+        {
+          "const": "remote",
+          "description": "A server reached over HTTP.",
+          "type": "string"
+        }
+      ]
+    },
+    "ResponsesTextBlocks": {
+      "description": "Text-block shape accepted by an OpenAI Responses-compatible endpoint.",
+      "oneOf": [
+        {
+          "const": "multiple",
+          "description": "Preserve each typed text or resource projection as its own `input_text`.",
+          "type": "string"
+        },
+        {
+          "const": "single",
+          "description": "Join every projected text fragment into one stable `input_text` block.",
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxConfig": {
+      "additionalProperties": false,
+      "description": "Policy additions shared by every Shell call in one resolved profile.",
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Maximum Shell authority for this invocation. Absence defaults to\n`workspace-write`; read-only Agent contracts still narrow it."
+        },
+        "network": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxNetworkMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Network authority. Absence defaults to `deny` in confined modes and to\nhost networking in `danger-full-access`; that mode rejects explicit\n`deny` because it cannot enforce it."
+        },
+        "onUnavailable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxUnavailableAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Action when a confined backend is unavailable. Absence fails closed.\n\n`run-unconfined` is accepted only from a trusted configuration layer."
+        },
+        "protectedPaths": {
+          "description": "Paths reapplied read-only after writable roots are mounted.\n\nRelative paths resolve against the active workspace. Missing paths are\nignored until they exist.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "writableRoots": {
+          "description": "Existing directories writable in addition to the workspace for write-capable Agents.\n\nRelative paths resolve against the active workspace.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SandboxMode": {
+      "description": "Filesystem/process confinement selected for model-initiated Shell calls.",
+      "oneOf": [
+        {
+          "const": "read-only",
+          "description": "Read the host filesystem, but do not permit host writes.",
+          "type": "string"
+        },
+        {
+          "const": "workspace-write",
+          "description": "Write the active workspace and explicitly trusted extra roots.",
+          "type": "string"
+        },
+        {
+          "const": "danger-full-access",
+          "description": "Run as the Zuno user with the host filesystem, processes, and network.",
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxNetworkMode": {
+      "description": "Network authority available to model-initiated Shell calls.",
+      "oneOf": [
+        {
+          "const": "deny",
+          "description": "Create a private network namespace and deny network syscalls.",
+          "type": "string"
+        },
+        {
+          "const": "allow",
+          "description": "Inherit the host network namespace.",
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxUnavailableAction": {
+      "description": "Runtime action when a confined OS backend cannot be deployed.",
+      "oneOf": [
+        {
+          "const": "deny",
+          "description": "Refuse to publish or execute Shell without the requested confinement.",
+          "type": "string"
+        },
+        {
+          "const": "run-unconfined",
+          "description": "Run through the native process backend after an eligible deployment failure.",
+          "type": "string"
+        }
+      ]
+    },
+    "ServerConfig": {
+      "description": "Server configuration (`config/server.ts:6-18`).",
+      "properties": {
+        "cors": {
+          "description": "Additional origins to allow for CORS.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "hostname": {
+          "description": "Hostname to listen on.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mdns": {
+          "description": "Advertise the server over mDNS.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "mdnsDomain": {
+          "description": "mDNS domain; the runtime defaults to `zuno.local`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "description": "Port to listen on.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ShareMode": {
+      "description": "Session sharing behaviour (`config/config.ts:59-62`).",
+      "oneOf": [
+        {
+          "const": "manual",
+          "description": "Share only when asked.",
+          "type": "string"
+        },
+        {
+          "const": "auto",
+          "description": "Share every new session.",
+          "type": "string"
+        },
+        {
+          "const": "disabled",
+          "description": "Never share.",
+          "type": "string"
+        }
+      ]
+    },
+    "SkillsConfig": {
+      "additionalProperties": false,
+      "description": "Skill discovery and model-visible catalog settings.",
+      "properties": {
+        "includeInstructions": {
+          "description": "Whether turns receive the skill trigger policy and metadata catalog.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "maxContextTokens": {
+          "description": "Maximum approximate tokens used by the catalog. Values above 10,000 are\nclamped by the runtime.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "maxSelectedContextTokens": {
+          "description": "Maximum approximate tokens used by all fully selected Skill bodies in one\nsession prompt. Values above the runtime ceiling are clamped.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "paths": {
+          "description": "Additional paths to skill folders.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "urls": {
+          "description": "URLs to fetch skills from.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ThemeColor": {
+      "description": "A named theme colour (`config/agent.ts:9`).",
+      "oneOf": [
+        {
+          "const": "primary",
+          "description": "Primary.",
+          "type": "string"
+        },
+        {
+          "const": "secondary",
+          "description": "Secondary.",
+          "type": "string"
+        },
+        {
+          "const": "accent",
+          "description": "Accent.",
+          "type": "string"
+        },
+        {
+          "const": "success",
+          "description": "Success.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Warning.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Error.",
+          "type": "string"
+        },
+        {
+          "const": "info",
+          "description": "Info.",
+          "type": "string"
+        }
+      ]
+    },
+    "Timeout": {
+      "anyOf": [
+        {
+          "description": "Milliseconds to wait.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "$ref": "#/$defs/false",
+          "description": "The literal `false`."
+        }
+      ],
+      "description": "A timeout in milliseconds, or `false` to disable it\n(`config/provider.ts:101-116`)."
+    },
+    "ToolOutputConfig": {
+      "description": "Tool-output truncation thresholds (`config/config.ts:137-150`).",
+      "properties": {
+        "max_bytes": {
+          "description": "Bytes of output before truncation. Defaults to 51200.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_lines": {
+          "description": "Lines of output before truncation. Defaults to 2000.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "WatcherConfig": {
+      "description": "File-watcher configuration (`config/config.ts:49`).",
+      "properties": {
+        "ignore": {
+          "description": "Glob patterns the watcher ignores.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "WebSearchBackend": {
+      "description": "Hosted web-search providers supported by the built-in adapter.",
+      "oneOf": [
+        {
+          "const": "exa",
+          "description": "Exa MCP search.",
+          "type": "string"
+        },
+        {
+          "const": "parallel",
+          "description": "Parallel MCP search.",
+          "type": "string"
+        }
+      ]
+    },
+    "WebSearchConfig": {
+      "description": "Web-search settings owned by the active profile.",
+      "properties": {
+        "enabled": {
+          "description": "Master switch. Absence enables anonymous Exa by default.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_queries": {
+          "description": "Maximum queries accepted in one model call.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_results": {
+          "description": "Maximum sources returned after combining all queries.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WebSearchBackend"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Hosted provider selected for this profile."
+        },
+        "timeout_ms": {
+          "description": "Per-query provider time budget in milliseconds.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "WorkflowNodeConfig": {
+      "additionalProperties": false,
+      "description": "One node in a configured workflow DAG.",
+      "properties": {
+        "agent": {
+          "description": "Configured or built-in agent to run.",
+          "type": "string"
+        },
+        "dependsOn": {
+          "description": "Node ids that must complete successfully first.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "description": "Human-readable purpose shown in runtime projections.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Stable node id within the template.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "Optional node-specific instruction appended to the run prompt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "agent"
+      ],
+      "type": "object"
+    },
+    "false": {
+      "const": false
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Configuration accepted from zuno.json and zuno.jsonc layers. TUI-only settings such as theme and mouse belong in tui.json.",
+  "properties": {
+    "$schema": {
+      "description": "JSON schema reference for editor validation.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agents": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_AgentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Agent definitions and overrides, keyed by agent name.\n\nThe oracle names `plan`, `build`, `general`, `explore`, `title`, `summary`,\nand `compaction` explicitly and then adds `Record(String, AgentConfig)`\n(`config/config.ts:96-110`), so every value has the same type and the named\nkeys carry no extra meaning at parse time."
+    },
+    "attachment": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AttachmentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Attachment processing."
+    },
+    "autoupdate": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Autoupdate"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Update behaviour: `true`, `false`, or `\"notify\"`."
+    },
+    "command": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_CommandConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Custom commands, keyed by command name."
+    },
+    "compaction": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CompactionConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Context-compaction behaviour."
+    },
+    "concurrency": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ConcurrencyConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Bounded concurrency for independent runtime capabilities."
+    },
+    "default_agent": {
+      "description": "Agent to use when none is named. Must be a primary agent.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "disabled_providers": {
+      "description": "Providers to drop even when their credentials are present.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "enabled_providers": {
+      "description": "When set, the only providers to enable.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "enterprise": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EnterpriseConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Enterprise deployment settings."
+    },
+    "experimental": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExperimentalConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Options under active development."
+    },
+    "formatter": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FormatterConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Formatters: a switch, or per-formatter overrides."
+    },
+    "goal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GoalConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Persistent goal continuation and retry settings."
+    },
+    "instructions": {
+      "description": "Additional instruction files or glob patterns.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
+    "logLevel": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LogLevel"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Log level."
+    },
+    "lsp": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LspConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "LSP servers: a switch, or per-server overrides."
+    },
+    "mcp": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_McpServerConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "MCP servers."
+    },
+    "memory": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Persistent resident-memory configuration. Absent defaults to enabled."
+    },
+    "model": {
+      "description": "Default model, in `provider/model` form.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "permission": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PermissionConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Global permissions and cross-cutting HITL mode."
+    },
+    "preset": {
+      "description": "Active team model-routing preset.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "presets": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_PresetConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Named team model-routing presets."
+    },
+    "productAgent": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_ProductAgentConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Native Codex and Claude Code subagent instances."
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_ProviderConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Custom providers and model overrides."
+    },
+    "references": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_ReferenceEntry"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Named git or local directory references."
+    },
+    "sandbox": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SandboxConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Native OS sandbox policy for model-initiated Shell calls."
+    },
+    "server": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ServerConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Server configuration for `zuno serve` and the web command."
+    },
+    "share": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ShareMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Session sharing behaviour."
+    },
+    "shell": {
+      "description": "Default shell for terminals and the model-facing Shell tool.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "skills": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SkillsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Skill discovery and model-visible catalog settings."
+    },
+    "small_model": {
+      "description": "Model for cheap side tasks such as title generation.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "snapshot": {
+      "description": "Record filesystem snapshots so edits can be undone. Defaults to true.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "subagent_depth": {
+      "description": "Maximum subagent nesting depth. Defaults to 1.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "tool_output": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ToolOutputConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Thresholds for truncating tool output."
+    },
+    "tools": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Tool switches, keyed by tool name."
+    },
+    "username": {
+      "description": "Name to show for the user instead of the system username.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "watcher": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WatcherConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "File-watcher configuration."
+    },
+    "web_search": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WebSearchConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Web-search provider and runtime-owned batch limits."
+    },
+    "workflows": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OrderedMap_of_AgentWorkflowConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Named, immutable multi-agent workflow templates."
+    }
+  },
+  "title": "Zuno configuration",
+  "type": "object"
+}

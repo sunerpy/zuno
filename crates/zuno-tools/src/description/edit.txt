@@ -1,0 +1,17 @@
+Applies one or more exact string replacements to a file atomically.
+
+Usage:
+- Read this exact file before editing it. Zuno tracks a content digest for the current session and rejects stale edits after an external change.
+- The stale-read guard compares the exact bytes recorded by `read`; it does not depend on a Git repository, index, or status.
+- Put ordered operations in `edits`. Each operation sees the result of the preceding operation; if any operation fails, nothing is written.
+- When editing text from Read tool output, preserve the exact indentation after the line number prefix and never include the prefix in oldString or newString.
+- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
+- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
+- The edit fails if oldString is absent or non-unique unless replaceAll is true.
+- Use replaceAll for replacing and renaming strings across the file.
+- After a failed native patch or `git apply`, re-read the file before translating the smallest still-required change into exact edit operations. Never use `git reset --hard` or `git checkout --` to make stale text match.
+Example:
+{"filePath":"/workspace/src/lib.rs","edits":[
+  {"oldString":"fn old_name()","newString":"fn new_name()"},
+  {"oldString":"old_name()","newString":"new_name()","replaceAll":true}
+]}

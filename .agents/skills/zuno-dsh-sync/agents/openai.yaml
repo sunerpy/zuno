@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zuno DSH Sync"
+  short_description: "Review new DSH changes for selective Zuno adoption"
+  default_prompt: "Use $zuno-dsh-sync to compare the recorded DeepSeek Harness baseline with its latest upstream branch and propose tested Zuno ports."

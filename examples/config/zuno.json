@@ -1,0 +1,67 @@
+{
+  "model": "myopenai/primary-model",
+  "small_model": "myopenai/fast-model",
+  "preset": "house",
+  "presets": {
+    "house": {
+      "agents": {
+        "orchestrator": {
+          "model": "myopenai/primary-model",
+          "reasoning": "max"
+        },
+        "deep": {
+          "model": "myopenai/primary-model",
+          "reasoning": "high"
+        },
+        "explorer": "myopenai/fast-model"
+      },
+      "categories": {
+        "cheap": "myopenai/fast-model"
+      }
+    }
+  },
+  "permission": {
+    "mode": "standard",
+    "rules": {}
+  },
+  "concurrency": {
+    "tool_calls": 8,
+    "delegations": 8,
+    "mcp_connections": 8,
+    "lsp_requests": 4
+  },
+  "memory": {
+    "promotion": "review",
+    "auto_confidence": 0.9
+  },
+  "provider": {
+    "myopenai": {
+      "name": "My OpenAI gateway",
+      "transport": "openai",
+      "surface": "responses",
+      "env": ["MYOPENAI_API_KEY"],
+      "options": {
+        "baseURL": "https://gateway.example.com/v1"
+      },
+      "models": {
+        "primary-model": {
+          "name": "Primary model",
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 200000,
+            "output": 32000
+          }
+        },
+        "fast-model": {
+          "name": "Fast model",
+          "tool_call": true,
+          "limit": {
+            "context": 128000,
+            "output": 16000
+          }
+        }
+      }
+    }
+  }
+}

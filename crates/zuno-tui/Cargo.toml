@@ -1,0 +1,71 @@
+[package]
+name = "zuno-tui"
+description = "Terminal user interface: views, keybindings, themes, and the render loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# The render stack is declared here, not deferred to the TUI todo, because the
+# root manifest's dev/test `opt-level = 3` pins are matched against the resolved
+# dependency graph: a pin for a package nothing depends on is a cargo warning,
+# and this workspace treats warnings as failures.
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+crossterm = { workspace = true }
+zuno-engine = { workspace = true }
+zuno-llm = { workspace = true }
+zuno-observability = { workspace = true }
+zuno-permission = { workspace = true }
+zuno-pty = { workspace = true }
+zuno-tool = { workspace = true }
+zuno-types = { workspace = true }
+pulldown-cmark = { workspace = true }
+ratatui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+terminal-colorsaurus = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-bash = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-highlight = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-md = { workspace = true }
+tree-sitter-php = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-ruby = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-toml-ng = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-yaml = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+# `test-util` for the toast's own deadline, which is five seconds long: a test that
+# waited it out would be the slowest in the crate, and one that shortened the constant
+# would no longer be testing the shipped TTL. `tokio::time::pause` asserts the real
+# value in no time at all. Additive on the inherited entry, which is the pattern the
+# root manifest names for exactly this case; it adds no new package.
+tokio = { workspace = true, features = ["test-util"] }
+# The configuration-discovery tests write real files, because the failure this
+# module has to get right — a missing layer versus an unreadable one — is a
+# filesystem distinction that an in-memory fixture cannot reproduce.
+tempfile = { workspace = true }
+zuno-sandbox = { workspace = true }
+
+[lints]
+workspace = true

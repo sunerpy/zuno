@@ -1,0 +1,525 @@
+{
+  "anyapi": {
+    "api": "https://api.anyapi.ai/v1",
+    "doc": "https://docs.anyapi.ai",
+    "env": [
+      "ANYAPI_API_KEY"
+    ],
+    "id": "anyapi",
+    "models": {
+      "anthropic/claude-opus-4-6": {
+        "attachment": true,
+        "description": "High-end Claude for difficult coding, planning, and slower expert reasoning",
+        "experimental": {
+          "modes": {
+            "fast": {
+              "cost": {
+                "cache_read": 3,
+                "cache_write": 37.5,
+                "input": 30,
+                "output": 150
+              },
+              "provider": {
+                "body": {
+                  "speed": "fast"
+                },
+                "headers": {
+                  "anthropic-beta": "fast-mode-2026-02-01"
+                }
+              }
+            }
+          }
+        },
+        "family": "claude-opus",
+        "id": "anthropic/claude-opus-4-6",
+        "knowledge": "2025-05-31",
+        "last_updated": "2026-03-13",
+        "limit": {
+          "context": 1000000,
+          "output": 128000
+        },
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "pdf"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "Claude Opus 4.6",
+        "open_weights": false,
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "toggle"
+          },
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          {
+            "max": 127999,
+            "min": 1024,
+            "type": "budget_tokens"
+          }
+        ],
+        "release_date": "2026-02-05",
+        "temperature": true,
+        "tool_call": true
+      },
+      "openai/gpt-5.4": {
+        "attachment": true,
+        "description": "Agent-ready GPT for coding and computer-use workflows at a lower cost",
+        "experimental": {
+          "modes": {
+            "fast": {
+              "cost": {
+                "cache_read": 0.5,
+                "input": 5,
+                "output": 30
+              },
+              "provider": {
+                "body": {
+                  "service_tier": "priority"
+                }
+              }
+            }
+          }
+        },
+        "family": "gpt",
+        "id": "openai/gpt-5.4",
+        "knowledge": "2025-08-31",
+        "last_updated": "2026-03-05",
+        "limit": {
+          "context": 1050000,
+          "input": 922000,
+          "output": 128000
+        },
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "pdf"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "GPT-5.4",
+        "open_weights": false,
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "effort",
+            "values": [
+              "low",
+              "medium",
+              "high"
+            ]
+          }
+        ],
+        "release_date": "2026-03-05",
+        "structured_output": true,
+        "temperature": false,
+        "tool_call": true
+      }
+    },
+    "name": "AnyAPI",
+    "npm": "@ai-sdk/openai-compatible"
+  },
+  "deepseek": {
+    "api": "https://api.deepseek.com",
+    "doc": "https://api-docs.deepseek.com/quick_start/pricing",
+    "env": [
+      "DEEPSEEK_API_KEY"
+    ],
+    "id": "deepseek",
+    "models": {
+      "deepseek-chat": {
+        "attachment": true,
+        "cost": {
+          "cache_read": 0.0028,
+          "input": 0.14,
+          "output": 0.28
+        },
+        "description": "DeepSeek chat model for instruction following, coding, and analysis",
+        "family": "deepseek",
+        "id": "deepseek-chat",
+        "knowledge": "2025-09",
+        "last_updated": "2026-02-28",
+        "limit": {
+          "context": 1000000,
+          "output": 384000
+        },
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "DeepSeek Chat",
+        "open_weights": true,
+        "reasoning": false,
+        "release_date": "2025-12-01",
+        "temperature": true,
+        "tool_call": true
+      },
+      "deepseek-reasoner": {
+        "attachment": true,
+        "cost": {
+          "cache_read": 0.0028,
+          "input": 0.14,
+          "output": 0.28,
+          "reasoning": 0.28
+        },
+        "description": "DeepSeek reasoning model for multi-step analysis, math, coding, and tools",
+        "family": "deepseek-thinking",
+        "id": "deepseek-reasoner",
+        "interleaved": {
+          "field": "reasoning_content"
+        },
+        "knowledge": "2025-09",
+        "last_updated": "2026-02-28",
+        "limit": {
+          "context": 1000000,
+          "output": 384000
+        },
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "DeepSeek Reasoner",
+        "open_weights": true,
+        "reasoning": true,
+        "reasoning_options": [],
+        "release_date": "2025-12-01",
+        "temperature": true,
+        "tool_call": true
+      }
+    },
+    "name": "DeepSeek",
+    "npm": "@ai-sdk/openai-compatible"
+  },
+  "groq": {
+    "doc": "https://console.groq.com/docs/models",
+    "env": [
+      "GROQ_API_KEY"
+    ],
+    "id": "groq",
+    "models": {
+      "allam-2-7b": {
+        "attachment": false,
+        "cost": {
+          "input": 0,
+          "output": 0
+        },
+        "description": "ALLaM-2-7b instruction tuned model by SDAIA",
+        "id": "allam-2-7b",
+        "last_updated": "2025-01-23",
+        "limit": {
+          "context": 4096,
+          "output": 4096
+        },
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "ALLaM-2-7b",
+        "open_weights": true,
+        "reasoning": false,
+        "release_date": "2025-01-23",
+        "temperature": true,
+        "tool_call": false
+      },
+      "canopylabs/orpheus-v1-english": {
+        "attachment": false,
+        "description": "Speech generation model for controllable voice, narration, and audio delivery",
+        "family": "canopylabs",
+        "id": "canopylabs/orpheus-v1-english",
+        "last_updated": "2025-12-19",
+        "limit": {
+          "context": 4000,
+          "output": 50000
+        },
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "audio"
+          ]
+        },
+        "name": "Canopy Labs Orpheus V1 English",
+        "open_weights": false,
+        "reasoning": false,
+        "release_date": "2025-12-19",
+        "status": "beta",
+        "temperature": false,
+        "tool_call": false
+      }
+    },
+    "name": "Groq",
+    "npm": "@ai-sdk/groq"
+  },
+  "impossibl": {
+    "api": "https://api.impossibl.com/v1",
+    "doc": "https://impossibl.com/docs/models",
+    "env": [
+      "IMPOSSIBL_API_KEY"
+    ],
+    "id": "impossibl",
+    "models": {
+      "google/gemini-2.5-pro": {
+        "attachment": true,
+        "cost": {
+          "cache_read": 0.125,
+          "context_over_200k": {
+            "cache_read": 0.25,
+            "input": 2.5,
+            "output": 15
+          },
+          "input": 1.25,
+          "output": 10,
+          "tiers": [
+            {
+              "cache_read": 0.25,
+              "input": 2.5,
+              "output": 15,
+              "tier": {
+                "size": 200000,
+                "type": "context"
+              }
+            }
+          ]
+        },
+        "description": "Google's proven reasoning model for coding, math, and multimodal analysis",
+        "family": "gemini-pro",
+        "id": "google/gemini-2.5-pro",
+        "knowledge": "2025-01",
+        "last_updated": "2025-06-17",
+        "limit": {
+          "context": 1048576,
+          "output": 65536
+        },
+        "modalities": {
+          "input": [
+            "text",
+            "image",
+            "audio",
+            "video",
+            "pdf"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "Gemini 2.5 Pro",
+        "open_weights": false,
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "max": 32768,
+            "min": 128,
+            "type": "budget_tokens"
+          }
+        ],
+        "release_date": "2025-06-17",
+        "structured_output": true,
+        "temperature": true,
+        "tool_call": true
+      }
+    },
+    "name": "Impossibl",
+    "npm": "@ai-sdk/openai-compatible"
+  },
+  "inceptron": {
+    "api": "https://api.inceptron.io/v1",
+    "doc": "https://docs.inceptron.io",
+    "env": [
+      "INCEPTRON_API_KEY"
+    ],
+    "id": "inceptron",
+    "models": {
+      "moonshotai/Kimi-K2.6-Fast": {
+        "attachment": true,
+        "cost": {
+          "cache_read": 0.4,
+          "cache_write": 0,
+          "input": 1.32,
+          "output": 7
+        },
+        "description": "Multimodal Kimi workhorse for agent loops, coding tasks, and visual context",
+        "family": "kimi-k2",
+        "id": "moonshotai/Kimi-K2.6-Fast",
+        "interleaved": {
+          "field": "reasoning_content"
+        },
+        "knowledge": "2025-01",
+        "last_updated": "2026-04-21",
+        "limit": {
+          "context": 262144,
+          "output": 262144
+        },
+        "modalities": {
+          "input": [
+            "text",
+            "image"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "Kimi K2.6 Fast",
+        "open_weights": true,
+        "reasoning": true,
+        "reasoning_options": [],
+        "release_date": "2026-04-21",
+        "status": "alpha",
+        "structured_output": true,
+        "temperature": true,
+        "tool_call": true
+      }
+    },
+    "name": "Inceptron",
+    "npm": "@ai-sdk/openai-compatible"
+  },
+  "mistral": {
+    "doc": "https://docs.mistral.ai/getting-started/models/",
+    "env": [
+      "MISTRAL_API_KEY"
+    ],
+    "id": "mistral",
+    "models": {
+      "codestral-latest": {
+        "attachment": false,
+        "cost": {
+          "input": 0.3,
+          "output": 0.9
+        },
+        "description": "Mistral code model for completions, refactors, and developer IDE workflows",
+        "family": "codestral",
+        "id": "codestral-latest",
+        "knowledge": "2024-10",
+        "last_updated": "2025-01-04",
+        "limit": {
+          "context": 256000,
+          "output": 4096
+        },
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "Codestral (latest)",
+        "open_weights": true,
+        "reasoning": false,
+        "release_date": "2024-05-29",
+        "temperature": true,
+        "tool_call": true
+      },
+      "devstral-2512": {
+        "attachment": false,
+        "cost": {
+          "input": 0.4,
+          "output": 2
+        },
+        "description": "Mistral's coding-agent model for repository work, terminal tasks, and software fixes",
+        "family": "devstral",
+        "id": "devstral-2512",
+        "knowledge": "2025-12",
+        "last_updated": "2025-12-09",
+        "limit": {
+          "context": 262144,
+          "output": 262144
+        },
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "Devstral 2",
+        "open_weights": true,
+        "reasoning": false,
+        "release_date": "2025-12-09",
+        "status": "deprecated",
+        "temperature": true,
+        "tool_call": true
+      }
+    },
+    "name": "Mistral",
+    "npm": "@ai-sdk/mistral"
+  },
+  "zhipuai": {
+    "api": "https://open.bigmodel.cn/api/paas/v4",
+    "doc": "https://docs.z.ai/guides/overview/pricing",
+    "env": [
+      "ZHIPU_API_KEY"
+    ],
+    "id": "zhipuai",
+    "models": {
+      "glm-5": {
+        "attachment": false,
+        "cost": {
+          "cache_read": 0.2,
+          "cache_write": 0,
+          "input": 1,
+          "output": 3.2
+        },
+        "description": "General GLM flagship for coding, analysis, and tool-heavy engineering workflows",
+        "family": "glm",
+        "id": "glm-5",
+        "interleaved": {
+          "field": "reasoning_content"
+        },
+        "last_updated": "2026-02-11",
+        "limit": {
+          "context": 204800,
+          "output": 131072
+        },
+        "modalities": {
+          "input": [
+            "text"
+          ],
+          "output": [
+            "text"
+          ]
+        },
+        "name": "GLM-5",
+        "open_weights": true,
+        "reasoning": true,
+        "reasoning_options": [
+          {
+            "type": "toggle"
+          }
+        ],
+        "release_date": "2026-02-11",
+        "temperature": true,
+        "tool_call": true
+      }
+    },
+    "name": "Zhipu AI",
+    "npm": "@ai-sdk/openai-compatible"
+  }
+}

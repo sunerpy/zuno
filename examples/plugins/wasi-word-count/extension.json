@@ -1,0 +1,33 @@
+{
+  "apiVersion": "zuno.extension/v1",
+  "id": "wasi-word-count",
+  "description": "Example in-process WASI component with no filesystem, environment, or network grants.",
+  "runtime": {
+    "kind": "wasi",
+    "artifact": "plugin.wasm",
+    "capabilities": [],
+    "environment": [],
+    "fuel": 10000000,
+    "memoryMiB": 64,
+    "timeoutMs": 30000
+  },
+  "tools": {
+    "word_count": {
+      "description": "Count whitespace-delimited words in supplied text.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "effect": "readOnly",
+      "replay": "safe"
+    }
+  }
+}

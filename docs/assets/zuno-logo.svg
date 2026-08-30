@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 1024 1024"
+     role="img"
+     aria-labelledby="zuno-logo-title">
+  <title id="zuno-logo-title">Zuno logo</title>
+  <defs>
+    <linearGradient id="zuno-purple"
+                    x1="190"
+                    y1="70"
+                    x2="840"
+                    y2="900"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#A66FF8"/>
+      <stop offset="0.5" stop-color="#9D67F4"/>
+      <stop offset="1" stop-color="#925AF0"/>
+    </linearGradient>
+    <linearGradient id="zuno-peach"
+                    x1="260"
+                    y1="190"
+                    x2="700"
+                    y2="970"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFBD84"/>
+      <stop offset="0.52" stop-color="#FDAD76"/>
+      <stop offset="1" stop-color="#F9A36C"/>
+    </linearGradient>
+    <filter id="zuno-soft-shadow"
+            x="-15%"
+            y="-15%"
+            width="130%"
+            height="130%"
+            color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6" result="blur"/>
+      <feOffset in="blur" dy="4" result="offset"/>
+      <feFlood flood-color="#432568"
+               flood-opacity="0.16"
+               result="shadow-color"/>
+      <feComposite in="shadow-color"
+                   in2="offset"
+                   operator="in"
+                   result="shadow"/>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="zuno-hub-gap" clipPathUnits="userSpaceOnUse">
+      <path d="M0 0H1024V1024H0Z
+               M512 508
+               A66 66 0 1 0 512 640
+               A66 66 0 1 0 512 508Z"
+            fill-rule="evenodd"
+            clip-rule="evenodd"/>
+    </clipPath>
+  </defs>
+
+  <g filter="url(#zuno-soft-shadow)" shape-rendering="geometricPrecision">
+    <path d="M252 810A405 405 0 1 1 772 810"
+          fill="none"
+          stroke="url(#zuno-purple)"
+          stroke-width="100"
+          stroke-linecap="round"/>
+
+    <g clip-path="url(#zuno-hub-gap)"
+       fill="url(#zuno-peach)"
+       stroke="url(#zuno-peach)">
+      <path d="M512 574 309 395M512 574V269M512 574 715 395"
+            fill="none"
+            stroke-width="84"
+            stroke-linecap="round"
+            stroke-linejoin="round"/>
+      <circle cx="309" cy="395" r="82" stroke="none"/>
+      <circle cx="512" cy="269" r="75" stroke="none"/>
+      <circle cx="715" cy="395" r="82" stroke="none"/>
+      <path d="M447 574H577V898
+               A65 65 0 0 1 512 963
+               A65 65 0 0 1 447 898Z"
+            stroke="none"/>
+    </g>
+
+    <circle cx="512" cy="574" r="42" fill="url(#zuno-peach)"/>
+  </g>
+</svg>

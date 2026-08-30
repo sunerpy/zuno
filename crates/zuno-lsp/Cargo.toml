@@ -1,0 +1,33 @@
+[package]
+name = "zuno-lsp"
+description = "Language server client pool used for diagnostics and symbol lookup."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+zuno-catalog = { workspace = true }
+zuno-error = { workspace = true }
+zuno-process = { workspace = true }
+zuno-tool = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+which = { workspace = true }
+
+[dev-dependencies]
+zuno-config = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

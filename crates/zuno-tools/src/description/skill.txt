@@ -1,0 +1,4 @@
+Discover and read reusable skill instructions through progressive disclosure.
+Use action `list` to page through all model-visible skills, or action `search` with a concise task intent; optional search `limit` is 1-20. Metadata results include the exact `source` needed to distinguish same-named skills.
+Use action `load` with the selected `name` and `source`. Follow `next_cursor` until `complete` before acting; a partial SKILL.md is not usable guidance.
+Use action `read_resource` with the same `name` and `source`, a relative `path` such as `references/ci.md`, and any returned continuation cursor. Do not use shell, find, glob, or broad filesystem scans to rediscover an advertised skill or locate its referenced files.

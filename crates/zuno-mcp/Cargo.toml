@@ -1,0 +1,42 @@
+[package]
+name = "zuno-mcp"
+description = "Model Context Protocol client: stdio and remote transports, tools, resources, prompts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+futures = { workspace = true }
+zuno-auth = { workspace = true }
+zuno-catalog = { workspace = true }
+zuno-config = { workspace = true }
+zuno-error = { workspace = true }
+zuno-llm = { workspace = true }
+zuno-network = { workspace = true }
+zuno-paths = { workspace = true }
+zuno-permission = { workspace = true }
+zuno-process = { workspace = true }
+zuno-tool = { workspace = true }
+zuno-tools = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

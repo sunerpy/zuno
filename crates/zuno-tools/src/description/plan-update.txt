@@ -1,0 +1,8 @@
+Create or update the durable plan for the current session.
+When a plan already exists, expected_revision is required and must equal the revision returned by plan_get. A stale revision is rejected without changing the plan.
+Keep every step id stable across updates. Step ids and titles must be non-empty and unique.
+Pending steps require exactly one in_progress step. Completed steps are terminal and cannot regress. A fully completed plan has no in_progress step.
+If a commit, build, tag, deployment, or other verification input changes after a completed gate, append a new artifact-scoped verification step or epoch; never reuse or regress the old completed gate.
+Do not complete a step while a linked Job is queued, running, uncertain, or still has an unconsumed report. Reconcile its durable result first.
+Link the plan to the active goal with goal_id when one exists. Do not rewrite the user's goal or success criteria through this tool.
+This tool changes durable state and is never replayed implicitly after an uncertain failure.
