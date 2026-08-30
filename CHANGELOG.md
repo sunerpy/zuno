@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0](https://github.com/sunerpy/zuno/compare/v0.3.1...v0.4.0) (2026-08-30)
+
+
+### Features
+
+* accept direct goal objectives ([574cc01](https://github.com/sunerpy/zuno/commit/574cc01f3713c0280877fda5f77e53a7651156c6))
+* harden goal plan recovery ([76b8c5f](https://github.com/sunerpy/zuno/commit/76b8c5f5cf162ed9b8a29a35c32c21e6f00c0580))
+* resume sessions from background completions ([fb8aae8](https://github.com/sunerpy/zuno/commit/fb8aae808184cae50e530ba7c44b472b59c2f6f0))
+
+
+### Bug Fixes
+
+* **ci:** ripgrep 验证步骤固定使用 bash ([5d4c34e](https://github.com/sunerpy/zuno/commit/5d4c34ea937c0f4779475177878a03af064e4a3d))
+* **ci:** Windows 冒烟改用预编译 ripgrep 归档 ([b6e566d](https://github.com/sunerpy/zuno/commit/b6e566dc59784ba6e0e3bc01b32e0277f78f4688))
+* **ci:** 禁止 fork PR 在特权 runner 上执行 ([7ff37f6](https://github.com/sunerpy/zuno/commit/7ff37f6864d5a9e30f06ccfb995e389f94e3b64f))
+* **process:** reap resident payloads with pidfd ([3ffc421](https://github.com/sunerpy/zuno/commit/3ffc421813e12c6ef02bc7779cac97378ea05a59))
+
 ## [0.3.1](https://github.com/sunerpy/zuno/compare/v0.3.0...v0.3.1) (2026-08-29)
 
 
