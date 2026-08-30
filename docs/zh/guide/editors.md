@@ -318,7 +318,7 @@ dev: open acp logs
 
 `headerTimeout` 与 `chunkTimeout` 刻意超过 kiro-provider 对应的 300 秒请求超时与 180 秒流空闲超时。这让网关能在 ACP 客户端关闭请求之前返回它自己的类型化超时。
 
-`kiro-provider` v0.5.0 及以后版本还会区分可重试的流失败与致命的协议失败。Zuno 只重试 `upstream_stream_error`、`upstream_stream_incomplete`、`upstream_stream_idle_timeout` 和 `request_deadline_exceeded`；旧式的通用 `upstream_error` 不足以授权重试。每次调用都记录在 `session.provider.attempt.1` 之下，并复用同一份持久会话亲和性。由于 ACP 无法撤回一个已追加的消息块，Zuno 只在该次尝试被打上检查点之后才提交 provider 文本、推理和待处理的工具行。一次失败的部分尝试会被丢弃，而不是与它的替代者拼接在一起。
+`kiro-provider` v0.5.0 及以后版本还会区分可重试的流失败与致命的协议失败。Zuno 只重试 `upstream_stream_error`、`upstream_stream_incomplete`、`upstream_stream_idle_timeout`、`malformed_upstream_tool_arguments` 和 `request_deadline_exceeded`；旧式的通用 `upstream_error` 不足以授权重试。provider 只能在模型已经完成工具调用、但参数载荷不是合法 JSON 时使用 `malformed_upstream_tool_arguments`；工具调用的结构性错误仍须使用永久失败的 `invalid_upstream_tool_call`。每次调用都记录在 `session.provider.attempt.1` 之下，并复用同一份持久会话亲和性。由于 ACP 无法撤回一个已追加的消息块，Zuno 只在该次尝试被打上检查点之后才提交 provider 文本、推理和待处理的工具行。一次失败的部分尝试会被丢弃，而不是与它的替代者拼接在一起。
 
 ## 9. 验收检查
 

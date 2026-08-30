@@ -607,14 +607,18 @@ control signal.
 
 OpenAI-compatible error frames retain structured stream and protocol codes.
 `upstream_stream_error`, `upstream_stream_incomplete`,
-`upstream_stream_idle_timeout`, and `request_deadline_exceeded` are typed
-replacement-safe stream failures. They may discard partial text, reasoning, and
-unfinished tool calls before replaying the unchanged request. Protocol codes
-such as `upstream_protocol_error`, `invalid_upstream_reasoning`, and
-`invalid_upstream_tool_call` are terminal. The legacy generic
-`upstream_error` remains terminal because it mixed both recovery classes.
-An opaque transient error after partial output is also terminal for that
-request; only the structured stream variant authorizes replacement.
+`upstream_stream_idle_timeout`, `malformed_upstream_tool_arguments`, and
+`request_deadline_exceeded` are typed replacement-safe stream failures. They may
+discard partial text, reasoning, and unfinished tool calls before replaying the
+unchanged request. `malformed_upstream_tool_arguments` is reserved for a
+completed model tool-call argument payload that is not valid JSON, so no
+complete tool call from that attempt can be dispatched. Structural or
+ambiguous tool-call violations remain `invalid_upstream_tool_call`. Protocol
+codes such as `upstream_protocol_error`, `invalid_upstream_reasoning`, and
+`invalid_upstream_tool_call` are terminal. The legacy generic `upstream_error`
+remains terminal because it mixed both recovery classes. An opaque transient
+error after partial output is also terminal for that request; only the
+structured stream variant authorizes replacement.
 
 Every provider call in the bounded recovery sequence has a durable
 `session.provider.attempt.1` lifecycle. Its started and terminal events share

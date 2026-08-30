@@ -470,14 +470,18 @@ return its typed timeout before the ACP client closes the request.
 `kiro-provider` v0.5.0 and later also distinguish retryable stream failures from
 fatal protocol failures. Zuno retries only
 `upstream_stream_error`, `upstream_stream_incomplete`,
-`upstream_stream_idle_timeout`, and `request_deadline_exceeded`; the legacy
-generic `upstream_error` is not enough to authorize retry. Every call is recorded
-under `session.provider.attempt.1`, and the same durable session affinity is
-reused. Because ACP cannot retract an appended message chunk, Zuno commits
-provider text, reasoning, and pending tool rows only after the attempt is
-checkpointed. A failed partial attempt is discarded instead of being concatenated
-with its replacement. A durable accepted-question result is not attempt-scoped:
-its `in_progress` continuation marker survives `RetryRollback`, and its terminal
+`upstream_stream_idle_timeout`, `malformed_upstream_tool_arguments`, and
+`request_deadline_exceeded`; the legacy generic `upstream_error` is not enough
+to authorize retry. Providers should use
+`malformed_upstream_tool_arguments` only when a completed model tool-call
+argument payload is invalid JSON. Structural tool-call violations continue to
+use the terminal `invalid_upstream_tool_call` code. Every call is recorded under
+`session.provider.attempt.1`, and the same durable session affinity is reused.
+Because ACP cannot retract an appended message chunk, Zuno commits provider
+text, reasoning, and pending tool rows only after the attempt is checkpointed.
+A failed partial attempt is discarded instead of being concatenated with its
+replacement. A durable accepted-question result is not attempt-scoped: its
+`in_progress` continuation marker survives `RetryRollback`, and its terminal
 tool update is emitted with the successful replacement checkpoint.
 
 ## 9. Acceptance checks

@@ -934,6 +934,10 @@ mod tests {
                 ProviderStreamFailure::UpstreamStreamIdleTimeout,
             ),
             (
+                "malformed_upstream_tool_arguments",
+                ProviderStreamFailure::MalformedUpstreamToolArguments,
+            ),
+            (
                 "request_deadline_exceeded",
                 ProviderStreamFailure::RequestDeadlineExceeded,
             ),

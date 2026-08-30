@@ -61,7 +61,7 @@ fn recovery_decisions_need_no_access_to_rendered_text() {
         ),
         (
             ProviderError::Stream {
-                code: ProviderStreamFailure::UpstreamStreamIncomplete,
+                code: ProviderStreamFailure::MalformedUpstreamToolArguments,
                 source: None,
             },
             Recovery::Retry { after: None },

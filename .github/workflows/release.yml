@@ -172,9 +172,9 @@ jobs:
   #
   # Skipped entirely on a tag push or a manual dispatch. Being skipped is not
   # inert: a skip propagates down the whole ancestor graph, so every job below
-  # carries an explicit `always() && needs.<dep>.result == 'success'` condition to
-  # opt out of that propagation without loosening the gate. See the comment on
-  # `build` for the run that proved this.
+  # carries an explicit `!cancelled() && needs.<dep>.result == 'success'` condition
+  # to opt out of that propagation without loosening the gate. See the comment on
+  # `build` for the two runs that proved this.
   # -------------------------------------------------------------------------
   release_please:
     name: Release PR
@@ -205,13 +205,14 @@ jobs:
   version:
     name: Resolve version
     needs: release_please
-    # `always()` because `release_please` is skipped on the tag and dispatch paths,
-    # and a skipped dependency would otherwise skip this job too. The condition then
-    # admits exactly three entries: a release-please release, a pushed `v*` tag, or a
-    # manual dispatch. An ordinary branch push that only refreshed the release PR
-    # stops here.
+    # A status function is required because `release_please` is skipped on the tag and
+    # dispatch paths, and a skipped dependency would otherwise skip this job too.
+    # `!cancelled()` rather than `always()`, so cancelling the run still cancels this
+    # job. The condition then admits exactly three entries: a release-please release,
+    # a pushed `v*` tag, or a manual dispatch. An ordinary branch push that only
+    # refreshed the release PR stops here.
     if: |
-      always() && (
+      !cancelled() && (
         needs.release_please.outputs.release_created == 'true'
         || github.ref_type == 'tag'
         || github.event_name == 'workflow_dispatch'
@@ -307,11 +308,15 @@ jobs:
     # skipped on a pushed `v*` tag while the run still reported success. Observed on
     # run 33323807478 for v0.0.1: `Resolve version` succeeded, and build, smoke,
     # checksums and publish were all skipped with an unexpanded matrix.
-    # `always()` is what opts out of that propagation; it is never sufficient alone,
-    # because a bare `always()` would build after a FAILED version resolution. The
-    # explicit `== 'success'` restores exactly the strictness the implicit
-    # `success()` had, so a failed or cancelled `version` still stops the pipeline.
-    if: always() && needs.version.result == 'success'
+    # `!cancelled()` is what opts out of that propagation. `always()` also would, but
+    # it makes the job unschedulable-proof: it runs even when the RUN is cancelled,
+    # which turned this job's own no-op into a `cancelled` conclusion for the whole
+    # dry run (33324175922) and hid the fact that every other leg was green.
+    # A status function alone is never sufficient either, because it would build
+    # after a FAILED version resolution. The explicit `== 'success'` restores exactly
+    # the strictness the implicit `success()` had, so a failed or cancelled `version`
+    # still stops the pipeline.
+    if: ${{ !cancelled() && needs.version.result == 'success' }}
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
     strategy:
@@ -509,9 +514,9 @@ jobs:
   smoke:
     name: Smoke ${{ matrix.target }}
     needs: [version, build]
-    # Restated per hop: see the comment on `build`. An intermediate job's `always()`
-    # does not clear an ancestor skip for the jobs beneath it.
-    if: always() && needs.version.result == 'success' && needs.build.result == 'success'
+    # Restated per hop: see the comment on `build`. An intermediate job's status
+    # function does not clear an ancestor skip for the jobs beneath it.
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.build.result == 'success' }}
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 60
     strategy:
@@ -807,7 +812,7 @@ jobs:
     needs: [version, build, smoke]
     # Restated per hop: see the comment on `build`.
     if: |
-      always()
+      !cancelled()
       && needs.version.result == 'success'
       && needs.build.result == 'success'
       && needs.smoke.result == 'success'
@@ -858,13 +863,13 @@ jobs:
   publish:
     name: Publish release
     needs: [version, build, smoke, checksums]
-    # `always()` opts out of ancestor-graph skip propagation (see `build`); the four
-    # explicit `== 'success'` checks then restore what the implicit `success()` gave,
-    # so this job still cannot run unless all five archives were built AND all five
-    # were executed. The `publish` output check is the original dry-run gate and is
-    # unchanged.
+    # `!cancelled()` opts out of ancestor-graph skip propagation (see `build`); the
+    # four explicit `== 'success'` checks then restore what the implicit `success()`
+    # gave, so this job still cannot run unless all five archives were built AND all
+    # five were executed. The `publish` output check is the original dry-run gate and
+    # is unchanged.
     if: |
-      always()
+      !cancelled()
       && needs.version.result == 'success'
       && needs.build.result == 'success'
       && needs.smoke.result == 'success'

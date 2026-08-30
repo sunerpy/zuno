@@ -3025,7 +3025,7 @@ async fn loop_accepts_a_tool_only_assistant_step_as_non_empty() {
 }
 
 #[tokio::test]
-async fn loop_provider_retry_replaces_typed_partial_stream_and_persists_attempts() {
+async fn loop_provider_retry_replaces_malformed_tool_arguments_and_persists_attempts() {
     let mut connection = seeded();
     put_user(&connection, "msg_retry_user", 10, "retry once");
     let provider = Arc::new(FakeProvider::new(vec![
@@ -3038,11 +3038,11 @@ async fn loop_provider_retry_replaces_typed_partial_stream_and_persists_attempts
                 },
                 StreamEvent::ToolInputDelta {
                     id: "discarded-call".to_owned(),
-                    delta: r#"{"text":"must not run"}"#.to_owned(),
+                    delta: r#"{"text":"must not run""#.to_owned(),
                 },
             ],
             ProviderError::Stream {
-                code: ProviderStreamFailure::UpstreamStreamIncomplete,
+                code: ProviderStreamFailure::MalformedUpstreamToolArguments,
                 source: None,
             },
         ),
@@ -3131,7 +3131,7 @@ async fn loop_provider_retry_replaces_typed_partial_stream_and_persists_attempts
     assert_eq!(attempts[1]["partialOutput"], true);
     assert_eq!(
         attempts[1]["providerErrorCode"],
-        "upstream_stream_incomplete"
+        "malformed_upstream_tool_arguments"
     );
     assert_eq!(attempts[1]["retryable"], true);
     assert_eq!(attempts[1]["partialOutputRetryPermitted"], true);

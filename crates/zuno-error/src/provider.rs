@@ -16,6 +16,7 @@ pub enum ProviderStreamFailure {
     UpstreamStreamError,
     UpstreamStreamIncomplete,
     UpstreamStreamIdleTimeout,
+    MalformedUpstreamToolArguments,
     RequestDeadlineExceeded,
 }
 
@@ -26,6 +27,7 @@ impl ProviderStreamFailure {
             "upstream_stream_error" => Some(Self::UpstreamStreamError),
             "upstream_stream_incomplete" => Some(Self::UpstreamStreamIncomplete),
             "upstream_stream_idle_timeout" => Some(Self::UpstreamStreamIdleTimeout),
+            "malformed_upstream_tool_arguments" => Some(Self::MalformedUpstreamToolArguments),
             "request_deadline_exceeded" => Some(Self::RequestDeadlineExceeded),
             _ => None,
         }
@@ -37,6 +39,7 @@ impl ProviderStreamFailure {
             Self::UpstreamStreamError => "upstream_stream_error",
             Self::UpstreamStreamIncomplete => "upstream_stream_incomplete",
             Self::UpstreamStreamIdleTimeout => "upstream_stream_idle_timeout",
+            Self::MalformedUpstreamToolArguments => "malformed_upstream_tool_arguments",
             Self::RequestDeadlineExceeded => "request_deadline_exceeded",
         }
     }
@@ -394,14 +397,41 @@ mod tests {
     }
 
     #[test]
-    fn structured_stream_failures_allow_replacement_retry() {
-        let error = ProviderError::Stream {
-            code: ProviderStreamFailure::UpstreamStreamIncomplete,
-            source: None,
-        };
-        assert_eq!(error.recovery(), Recovery::Retry { after: None });
-        assert_eq!(error.structured_code(), Some("upstream_stream_incomplete"));
-        assert!(error.permits_partial_output_retry());
+    fn structured_stream_failures_round_trip_and_allow_replacement_retry() {
+        let cases = [
+            (
+                "upstream_stream_error",
+                ProviderStreamFailure::UpstreamStreamError,
+            ),
+            (
+                "upstream_stream_incomplete",
+                ProviderStreamFailure::UpstreamStreamIncomplete,
+            ),
+            (
+                "upstream_stream_idle_timeout",
+                ProviderStreamFailure::UpstreamStreamIdleTimeout,
+            ),
+            (
+                "malformed_upstream_tool_arguments",
+                ProviderStreamFailure::MalformedUpstreamToolArguments,
+            ),
+            (
+                "request_deadline_exceeded",
+                ProviderStreamFailure::RequestDeadlineExceeded,
+            ),
+        ];
+
+        for (wire_code, code) in cases {
+            assert_eq!(ProviderStreamFailure::from_code(wire_code), Some(code));
+            assert_eq!(code.as_str(), wire_code);
+
+            let error = ProviderError::Stream { code, source: None };
+            assert_eq!(error.recovery(), Recovery::Retry { after: None });
+            assert_eq!(error.structured_code(), Some(wire_code));
+            assert!(error.permits_partial_output_retry());
+        }
+
+        assert_eq!(ProviderStreamFailure::from_code("upstream_error"), None);
     }
 
     #[test]
