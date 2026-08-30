@@ -63,7 +63,7 @@ jobs:
       - zuno-ci-test
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # rust-toolchain.toml stays authoritative: a toolchain file outranks
       # `rustup default`, which is all this action sets. The input is named anyway
@@ -123,7 +123,7 @@ jobs:
       # grep" — measured on run 33227251936, where the same absence also broke the
       # `artifact` job's headless smoke. `--version` is the gate so a broken install
       # fails here instead of looking like a code failure later.
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: ripgrep
 
@@ -198,7 +198,7 @@ jobs:
       - zuno-ci-supply-chain
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
       - name: Install Rust toolchain
@@ -206,7 +206,7 @@ jobs:
         with:
           toolchain: "1.98.0"
 
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-deny
 
@@ -241,7 +241,7 @@ jobs:
       - zuno-ci-artifact
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
       - name: Install Rust toolchain
@@ -257,7 +257,7 @@ jobs:
       # in `test` for why the CodeBuild image needs it installed explicitly. This job
       # smokes a real release build, so the absence surfaces as `the headless run
       # exited non-zero` rather than as a test failure.
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: ripgrep
 
@@ -317,7 +317,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
       - name: Install Rust toolchain
