@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1](https://github.com/sunerpy/zuno/compare/v0.6.0...v0.6.1) (2026-08-30)
+
+
+### Bug Fixes
+
+* **acp:** keep elicitation continuation visibly active ([6d494ca](https://github.com/sunerpy/zuno/commit/6d494ca378b54a6f6aec03e3b08f456a18712a5e))
+* **ci:** close runtime consumer contract gaps ([75dae86](https://github.com/sunerpy/zuno/commit/75dae86be19683279e794817dc0de70e6968bc12))
+
 ## [0.6.0](https://github.com/sunerpy/zuno/compare/v0.5.0...v0.6.0) (2026-08-30)
 
 
