@@ -631,7 +631,14 @@ jobs:
         with:
           tool: ripgrep
 
+      # `shell: bash` on purpose. Without it this step inherits pwsh on the Windows
+      # leg, where `rg --version` failed even though the preceding install-action
+      # step reported success — the PATH it exported was not visible to that pwsh
+      # session. Measured on release run 33286323014, where a working ripgrep still
+      # took the whole release down at this line. Git Bash ships on the Windows image
+      # and resolves the tool the same way the smoke driver later will.
       - name: Verify ripgrep satisfies the runtime minimum
+        shell: bash
         run: rg --version
 
       # Linux only, and that is not an oversight: `zuno-sandbox` compiles an OS
