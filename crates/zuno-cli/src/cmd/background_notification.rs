@@ -219,7 +219,19 @@ async fn reconcile(
     session_id: &str,
     target: &NotificationTarget,
 ) {
-    if let Ok(_recovery) = target.runs.begin_recovery(session_id)
+    let has_promoted_reports = match target.jobs.has_promoted_reports_for(session_id) {
+        Ok(present) => present,
+        Err(error) => {
+            tracing::error!(
+                session_id,
+                %error,
+                "could not inspect promoted asynchronous reports"
+            );
+            return;
+        }
+    };
+    if has_promoted_reports
+        && let Ok(_recovery) = target.runs.begin_recovery(session_id)
         && let Err(error) = target.jobs.pending_reports_for(session_id)
     {
         tracing::error!(

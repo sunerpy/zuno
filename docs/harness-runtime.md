@@ -310,11 +310,13 @@ the durable child session id, with spawn and terminal state on the direct parent
 The parent prompt response waits for the child projection queue to drain. Historical
 children replay as `disconnected`; background children remain durable jobs.
 
-Child permissions and questions retain their immutable origin. A negotiated native ACP
-client receives them on the child route. A compatibility client receives them on the
-declared root route with the child id in typed metadata. Session-level permission grants
-are owned by that root and survive host replacement, but `session/close` clears them and
-cancels and joins only background jobs owned by the closing root.
+Child permission requests retain their immutable origin. A negotiated native ACP client
+receives them on the child route. A compatibility client receives them on the declared
+root route with the child id in typed metadata. Delegated children do not receive the
+synchronous `question` tool: they report blockers to the parent, and any later user
+elicitation initiated by the parent belongs to the root session. Session-level permission
+grants are owned by that root and survive host replacement, but `session/close` clears
+them and cancels and joins only background jobs owned by the closing root.
 
 ### Child capability authority and Skill loading
 
@@ -1343,7 +1345,9 @@ The recovery scan performs that Job transition before reading the ordinary
 pending inbox, so a report stranded in `promoted` can itself trigger the next
 turn without waiting for a new user prompt. Recovery holds a process-local
 reservation for the session while repairing the row, so a live turn cannot own
-the same promoted input concurrently.
+the same promoted input concurrently. The watcher takes that reservation only
+after a read-only probe confirms that a promoted Job report exists; an empty
+restart scan never transiently rejects a foreground user turn.
 Queued jobs that never started reconcile to `cancelled`; running jobs lost with
 the process reconcile to `uncertain` and are not replayed. Concurrent
 process-local wake attempts for one `(session_id, input_id)` are coalesced by an
@@ -1465,5 +1469,10 @@ commands, durable events, inbox, and frontend-neutral projections.
 `BackgroundExecutionProjection` prevent clients from rebuilding agent-loop state
 privately. Cursor replay closes gaps after disconnects; live delivery is only a
 wake/latency path. See [client interface architecture](design/client-interfaces.md).
+
+The headless CLI drains its bounded event channel concurrently with turn execution
+and closes both the detached observer and the producer on success or failure before
+host shutdown. A failed turn therefore cannot leave the renderer waiting forever
+for a sender retained only by the failed producer path.
 
 The design sources and explicit adopt/adapt/reject decisions are recorded in [the harness comparison](design/harness-comparison.md).

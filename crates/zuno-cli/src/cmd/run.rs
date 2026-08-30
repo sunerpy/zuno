@@ -133,27 +133,31 @@ pub(super) fn execute(
     let (outcome, rendered) = runtime.block_on(async {
         tokio::join!(
             async {
-                match args.command.as_deref() {
-                    Some(command) => {
-                        host.drive_command(command, &message, sender.clone())
-                            .await?
-                    }
-                    None => match file_content.as_deref() {
-                        Some(content) => {
-                            host.drive_content(&message, content, sender.clone())
+                let turn = async {
+                    match args.command.as_deref() {
+                        Some(command) => {
+                            host.drive_command(command, &message, sender.clone())
                                 .await?
                         }
-                        None => host.drive(&message, sender.clone()).await?,
-                    },
+                        None => match file_content.as_deref() {
+                            Some(content) => {
+                                host.drive_content(&message, content, sender.clone())
+                                    .await?
+                            }
+                            None => host.drive(&message, sender.clone()).await?,
+                        },
+                    }
+                    while host
+                        .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, sender.clone())
+                        .await?
+                    {}
+                    Ok::<(), String>(())
                 }
-                while host
-                    .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, sender.clone())
-                    .await?
-                {}
+                .await;
                 environment.wait_background_jobs().await;
                 detached_observer.close();
                 drop(sender);
-                Ok::<(), String>(())
+                turn
             },
             render_events(receiver, args.format, progress)
         )

@@ -69,6 +69,11 @@ Example:
 Read the current durable goal, including its objective, status, budget, usage, and remaining tokens. Use this before deciding whether a goal may be completed or reported blocked.
 >>>
 
+## goal_request_input | crates/zuno-goal/src/description/request-input.txt | 419 bytes | trailing-newline: yes
+<<<
+Pause the active Goal and create one durable request for information only the user can supply. Use this instead of the ordinary question tool during autonomous Goal work. Do not use it merely because work is difficult, slow, uncertain, or would benefit from preference; inspect available evidence and make safe in-scope assumptions first. The request survives process restart, and this turn ends after it is committed.
+>>>
+
 ## glob | crates/zuno-tools/src/description/glob.txt | 516 bytes | trailing-newline: no
 <<<
 - Fast file pattern matching tool that works with any codebase size

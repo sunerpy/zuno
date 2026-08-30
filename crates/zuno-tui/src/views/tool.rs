@@ -5,8 +5,8 @@
 //!
 //! [`crate::views::message`] renders a *transcript* — roles, rules, wrapping, scroll
 //! arithmetic. What a `grep` call should say about itself is a different question with
-//! a different answer per tool, and there are twenty-one of them. Keeping the two apart
-//! is what lets the per-tool table be read as a table.
+//! a different answer per tool. Keeping the two apart is what lets the per-tool table be
+//! read as a table.
 //!
 //! Directly under `src/views/`, not in a `views/tool/` subdirectory:
 //! [`crate::views::views_tests`]'s two discipline scans read `src/views/*.rs`
@@ -143,12 +143,12 @@ impl Summary {
 ///
 /// Reading the registry's *source* rather than depending on the crate is deliberate:
 /// `zuno-tui` does not link the tool stack, and pulling twenty transitive crates into
-/// the render layer to learn twenty-one strings is a worse trade than a scan. It is the
+/// the render layer to learn a short list of strings is a worse trade than a scan. It is the
 /// same technique [`crate::views::views_tests`] already uses for the colour and keybind
 /// disciplines.
 /// Runtime aliases such as `exec_command` and `google_search` reuse those rules but stay
 /// out of this registry-wire-id list, because the stale-rule half of that test is exact.
-pub const SUMMARISED: [&str; 26] = [
+pub const SUMMARISED: [&str; 27] = [
     // The 18 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
@@ -172,6 +172,7 @@ pub const SUMMARISED: [&str; 26] = [
     "memory_propose",
     "goal_get",
     "goal_propose",
+    "goal_request_input",
     "goal_update",
     "plan_get",
     "plan_update",
@@ -360,6 +361,9 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
             }))
         }
         "goal_propose" => text("objective").map(Summary::tail),
+        // This tool asks one goal-specific question. Unlike the generic `question` tool,
+        // its schema carries that question directly rather than in an array.
+        "goal_request_input" => text("question").map(Summary::tail),
         // The blocking condition is the informative half when there is one — `blocked`
         // without a reason is a state a reader cannot act on.
         "goal_update" => text("status").map(|status| {

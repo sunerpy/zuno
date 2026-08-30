@@ -671,6 +671,30 @@ impl AgentJobStore {
         self.query_pending_reports(Some(parent_session_id))
     }
 
+    /// Whether one parent has a terminal report stranded in the promoted lane.
+    ///
+    /// This is a read-only probe for callers that must acquire a process-local
+    /// recovery reservation before [`Self::pending_reports_for`] may repair the row.
+    pub fn has_promoted_reports_for(&self, parent_session_id: &str) -> Result<bool, DbError> {
+        let connection = self.pool.get()?;
+        let present = connection
+            .query_row(
+                "SELECT EXISTS ( \
+                   SELECT 1 FROM agent_job AS j \
+                   JOIN session_input AS i \
+                     ON i.id = j.report_input_id AND i.session_id = j.parent_session_id \
+                   WHERE j.parent_session_id = ?1 \
+                     AND j.report_delivery = 'next-step' \
+                     AND j.status IN ('completed', 'failed', 'cancelled', 'uncertain') \
+                     AND i.state = 'promoted' \
+                 )",
+                [parent_session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(open::map_error)?;
+        Ok(present != 0)
+    }
+
     fn query_pending_reports(
         &self,
         parent_session_id: Option<&str>,

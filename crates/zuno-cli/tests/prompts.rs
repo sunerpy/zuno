@@ -102,6 +102,11 @@ fn descriptions() -> Vec<Description> {
             text: zuno_goal::tools::GET_DESCRIPTION,
         },
         Description {
+            wire_id: zuno_goal::REQUEST_GOAL_INPUT_TOOL_ID,
+            file: "crates/zuno-goal/src/description/request-input.txt",
+            text: zuno_goal::tools::REQUEST_INPUT_DESCRIPTION,
+        },
+        Description {
             wire_id: "glob",
             file: "crates/zuno-tools/src/description/glob.txt",
             text: zuno_tools::glob::DESCRIPTION,

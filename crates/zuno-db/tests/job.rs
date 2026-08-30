@@ -916,6 +916,16 @@ fn promoted_but_unconsumed_reports_are_recovered_once_after_restart() {
             .as_ref(),
         Some(&snapshot)
     );
+    assert!(
+        store
+            .has_promoted_reports_for(PARENT)
+            .expect("probe promoted parent reports")
+    );
+    assert!(
+        !store
+            .has_promoted_reports_for("ses_other")
+            .expect("probe another parent")
+    );
     assert_eq!(
         store
             .pending_reports()
@@ -930,6 +940,11 @@ fn promoted_but_unconsumed_reports_are_recovered_once_after_restart() {
     assert_eq!(recovered[0].id, "input_1");
     assert_eq!(recovered[0].state, SubmissionState::Queued);
     assert_eq!(recovered[0].promoted_sequence, None);
+    assert!(
+        !store
+            .has_promoted_reports_for(PARENT)
+            .expect("recovered report leaves the promoted lane")
+    );
 
     assert_eq!(
         store

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// The `zuno-tools` sources that between them name every built-in wire id.
 ///
 /// Read as *text* rather than by depending on the crate. `zuno-tui` does not link the tool
-/// stack — adding `zuno-tools` to a render crate to learn twenty-one strings would pull its
+/// stack — adding `zuno-tools` to a render crate to learn a short list of strings would pull its
 /// whole transitive graph into every TUI build — and this is the technique
 /// [`crate::views::views_tests`] already uses to enforce the colour and keybind
 /// disciplines against sources it likewise does not import.
@@ -83,7 +83,7 @@ fn registry_wire_ids() -> Vec<String> {
 fn tool_summaries_cover_every_tool_the_registry_can_expose() {
     let ids = registry_wire_ids();
     // A floor, so the scan cannot pass by finding nothing — the same guard the colour and
-    // keybind scans carry. Seventeen slots plus `memory_propose` plus three goal tools is 21.
+    // keybind scans carry. The built-in slots plus state tools must stay well above 20.
     assert!(
         ids.len() >= 21,
         "the registry scan found only {} wire ids, so it is reading the wrong files and \
@@ -213,6 +213,11 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
             "add project: run cargo fmt",
         ),
         ("goal_propose", r#"{"objective":"ship P2-4"}"#, "ship P2-4"),
+        (
+            "goal_request_input",
+            r#"{"expected_revision":3,"question":"Which deployment region should be used?","header":"Region","options":[]}"#,
+            "Which deployment region should be used?",
+        ),
         (
             "goal_update",
             r#"{"status":"blocked","blocking_condition":"no key"}"#,

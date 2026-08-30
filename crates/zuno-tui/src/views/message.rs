@@ -173,9 +173,10 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         "plan_update" => ("≣", "Updating plan..."),
         "todo_get" => ("☑", "Reading work items..."),
         "todo_update" => ("☑", "Updating work items..."),
-        // The only tool that is about to block on the user, so it gets the one glyph that
-        // reads as a question.
+        // Tools that are about to block on the user share the one glyph that reads as a
+        // question; their labels still distinguish general and goal-specific elicitation.
         "question" => ("?", "Asking..."),
+        "goal_request_input" => ("?", "Clarifying the goal..."),
         "skill" => ("✦", "Loading skill..."),
         "lsp" => ("⌁", "Querying language server..."),
         // Leaving plan mode is a transition, and the tab arrow is this codebase's
@@ -188,8 +189,8 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         // model should not have made at all, and the two are worth telling apart.
         "invalid" => ("!", "Rejecting..."),
         "memory_propose" => ("≡", "Proposing memory..."),
-        // One glyph for all three goal tools: they read, set and amend one object, and
-        // three glyphs would imply three subjects.
+        // One glyph for the non-interactive goal tools: they read, set and amend one
+        // object, and separate glyphs would imply separate subjects.
         "goal_get" | "goal_propose" | "goal_update" => ("◎", "Reading the goal..."),
         _ => ("⚙", "Preparing..."),
     }

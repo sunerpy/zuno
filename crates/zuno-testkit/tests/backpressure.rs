@@ -183,6 +183,15 @@ const CHANNELS: &[ChannelGate] = &[
         "self.sender.send_modify(|generation| {",
     ),
     gate(
+        "background-notification-target",
+        "zuno-cli/src/cmd/background_notification.rs",
+        "let (target_sender, target_receiver) = watch::channel(target);",
+        "latest value",
+        Policy::LatestValue,
+        "zuno-cli/src/cmd/background_notification.rs",
+        ".send_replace(target);",
+    ),
+    gate(
         "pty-subscriber-output",
         "zuno-pty/src/session.rs",
         "let (sender, output) = mpsc::channel(options.capacity.max(1));",
@@ -415,7 +424,7 @@ fn source_channel_inventory_matches_the_declared_registry() {
         actual, expected,
         "channel registry differs from production source"
     );
-    assert_eq!(CHANNELS.len(), 38);
+    assert_eq!(CHANNELS.len(), 39);
 
     let crates = crates_root();
     for entry in CHANNELS {

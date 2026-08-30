@@ -801,11 +801,12 @@ fn request_with_elicitation(
                 response.get("error").is_none(),
                 "ACP request {method} failed: {response}"
             );
-            return (
-                response["result"].clone(),
-                updates,
-                elicitation.expect("session/prompt completed without elicitation/create"),
-            );
+            let elicitation = elicitation.unwrap_or_else(|| {
+                panic!(
+                    "{method} completed without elicitation/create: response={response:#} updates={updates:#?}"
+                )
+            });
+            return (response["result"].clone(), updates, elicitation);
         }
 
         match response.get("method").and_then(Value::as_str) {
@@ -1086,9 +1087,9 @@ impl Respond for SubagentTurnResponder {
 }
 
 #[derive(Clone)]
-struct SubagentQuestionTurnResponder;
+struct ParentOwnedQuestionTurnResponder;
 
-impl Respond for SubagentQuestionTurnResponder {
+impl Respond for ParentOwnedQuestionTurnResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
         let has_tools = body
@@ -1110,47 +1111,73 @@ impl Respond for SubagentQuestionTurnResponder {
                     .contains("Ask child for database.")
         });
         if child_turn {
-            let answered = messages.iter().any(|message| {
-                message["role"] == "tool" && message["tool_call_id"] == "call_question"
-            });
-            return if answered {
-                compatible_text_response("child selected SQLite")
-            } else {
-                compatible_tool_response(
-                    "call_question",
-                    "question",
-                    json!({
-                        "questions": [{
-                            "question": "Which database?",
-                            "header": "Database",
-                            "options": [
-                                {"label": "Postgres", "description": "Relational database"},
-                                {"label": "SQLite", "description": "Embedded database"}
-                            ]
-                        }]
-                    }),
-                )
-            };
+            let advertised_tools = body["tools"]
+                .as_array()
+                .expect("provider tools")
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                !advertised_tools.contains(&"question"),
+                "delegated children must report blockers instead of asking users directly: \
+                 {advertised_tools:#?}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .filter(|message| message["role"] == "tool")
+                    .all(|message| message["tool_call_id"] != "call_question"),
+                "the delegated child must not receive a synthetic question result: {messages:#?}"
+            );
+            return compatible_text_response("child needs parent to ask which database");
         }
-        let has_task_result = messages.iter().any(|message| {
+        if let Some(answer) = messages
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_question")
+        {
+            let content = answer["content"].to_string();
+            assert!(
+                content.contains("SQLite") && !content.contains("Unknown tool"),
+                "parent question must contain the accepted user answer: {answer:#}"
+            );
+            return compatible_text_response("parent received SQLite after asking the user");
+        }
+        if let Some(child_report) = messages.iter().find(|message| {
             message["role"] == "tool" && message["tool_call_id"] == "call_task_child_question"
-        });
-        if has_task_result {
-            compatible_text_response("parent received child answer")
-        } else {
-            compatible_tool_response(
-                "call_task_child_question",
-                "task",
+        }) {
+            assert!(
+                child_report["content"]
+                    .to_string()
+                    .contains("child needs parent to ask which database"),
+                "delegated child must report its blocker to the parent: {child_report:#}"
+            );
+            return compatible_tool_response(
+                "call_question",
+                "question",
                 json!({
-                    "objective": "Ask child question",
-                    "deliverable": "The selected database.",
-                    "instructions": "Ask child for database.",
-                    "success_evidence": "Return the accepted database choice.",
-                    "agent": "deep",
-                    "background": false
+                    "questions": [{
+                        "question": "Which database?",
+                        "header": "Database",
+                        "options": [
+                            {"label": "Postgres", "description": "Relational database"},
+                            {"label": "SQLite", "description": "Embedded database"}
+                        ]
+                    }]
                 }),
-            )
+            );
         }
+        compatible_tool_response(
+            "call_task_child_question",
+            "task",
+            json!({
+                "objective": "Ask child question",
+                "deliverable": "The selected database.",
+                "instructions": "Ask child for database.",
+                "success_evidence": "Report the blocker so the parent can ask the user.",
+                "agent": "deep",
+                "background": false
+            }),
+        )
     }
 }
 
@@ -2859,10 +2886,10 @@ async fn acp_prompt_streams_a_negotiated_foreground_subagent_on_its_child_sessio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_fallback_routes_child_elicitation_through_the_declared_root_session() {
+async fn acp_fallback_keeps_user_elicitation_on_the_parent_session() {
     let provider = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(SubagentQuestionTurnResponder)
+        .respond_with(ParentOwnedQuestionTurnResponder)
         .mount(&provider)
         .await;
     let root = tempfile::tempdir().expect("ACP test root");
@@ -2918,10 +2945,10 @@ async fn acp_fallback_routes_child_elicitation_through_the_declared_root_session
         &parent_session_id,
     );
     assert_eq!(completed["stopReason"], "end_turn");
-    let durable_child_id = elicitation["_meta"]["zuno"]["childSessionId"]
-        .as_str()
-        .expect("durable child id in fallback metadata");
-    assert_ne!(durable_child_id, parent_session_id);
+    assert!(
+        elicitation.pointer("/_meta/zuno/childSessionId").is_none(),
+        "the parent owns user elicitation after a child reports its blocker: {elicitation:#}"
+    );
     assert!(
         updates
             .iter()
@@ -2930,7 +2957,7 @@ async fn acp_fallback_routes_child_elicitation_through_the_declared_root_session
     );
     assert!(updates.iter().any(|update| {
         update["sessionUpdate"] == "agent_message_chunk"
-            && update["content"]["text"] == "parent received child answer"
+            && update["content"]["text"] == "parent received SQLite after asking the user"
     }));
 
     request(

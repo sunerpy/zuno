@@ -327,11 +327,13 @@ Background delegation deliberately stays on the stable task/job lifecycle,
 even when native subagents were negotiated. Closing a root session cancels and
 joins only that root's background jobs before releasing its runtime resources.
 
-Permissions and questions raised by a child use the child session id only in
-native mode. For clients without native-subagent support, Zuno sends the request
-on the known root session and includes the durable child id at
+Permission requests raised by a child use the child session id only in native
+mode. For clients without native-subagent support, Zuno sends the request on the
+known root session and includes the durable child id at
 `_meta.zuno.childSessionId`; this prevents a client from receiving an unknown
-session id while preserving attribution.
+session id while preserving attribution. Delegated children do not receive the
+`question` tool; they report blockers to the parent, which owns any subsequent
+user elicitation on the root session.
 
 ACP-provided client MCP, client filesystem RPC, and terminal RPC are not
 advertised. Zuno handles file and Shell work through its own tools, permission
