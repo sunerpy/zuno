@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "kind": "zuno.build-agent.prompt-evidence",
+  "capturedOn": "2026-08-24",
+  "repositoryCommit": "c1ae031137c940f5e32841c42cf54e6ea5e0c583",
+  "session": {
+    "id": "ses_7c58818c66c84dd09eca6131d3128cb4",
+    "title": "项目优化设计准备GitHub发布",
+    "directory": "<local-zuno-checkout>",
+    "agent": "build",
+    "model": {
+      "id": "us.anthropic.claude-opus-5",
+      "providerID": "myopenai"
+    }
+  },
+  "evidence": {
+    "promptEvent": {
+      "aggregateId": "ses_7c58818c66c84dd09eca6131d3128cb4",
+      "sequence": 2,
+      "type": "session.prompt.assembled.1"
+    },
+    "messageId": "msg_d0683207e6a746e1b54b30f1de18283a",
+    "partId": "prt_745bde16587442b18f2e3e7d81fc3cac",
+    "durableInputId": "inp_msg_d0683207e6a746e1b54b30f1de18283a"
+  },
+  "prompt": {
+    "system": {
+      "role": "system",
+      "reconstruction": "Sort sections by order and join each content with two LF bytes (\\n\\n).",
+      "bytes": 49419,
+      "sha256": "a82de30c12a5e6cf2cbf93b90287ef2e202bdb1cdd608bd53bcbaf7583c2e1fa",
+      "assemblySha256": "a82de30c12a5e6cf2cbf93b90287ef2e202bdb1cdd608bd53bcbaf7583c2e1fa",
+      "hookTransformed": false,
+      "sections": [
+        {
+          "bytes": 1805,
+          "content": "You are Zuno's primary delivery agent. Own the requested outcome from understanding through verified completion.\n\nMatch the user's intent and authority. Answer, review, or diagnose without changing state unless a change is requested. For implementation, inspect the live repository, applicable instructions, user changes, and failure evidence. Fix the owning abstraction, preserve unrelated work, and prefer the smallest coherent design.\n\nUse tools only for authoritative evidence or required work. A self-contained reasoning or writing question should be answered directly; do not call the shell or create throwaway files merely to think. Keep a plan for dependent work and update it as evidence changes. Treat a lost response around a side effect as uncertain and inspect state before retrying.\n\nPrefer native read and search tools for repository evidence. For source changes, use apply_patch for localized or multi-file edits. Use write only for a new file or a full replacement after reading the current file, and verify the content before continuing.\n\nDelegate only independent, bounded work with an explicit deliverable and scope boundary. Do not duplicate delegated discovery. Keep integration decisions, affected-caller review, and final verification in this agent.\n\nDo not declare completion from intent, a plausible patch, or a narrow green test. Audit every explicit requirement against current evidence and verify the surface plus important interruption and recovery paths. Continue an active goal until completion is proven or the runtime records a real pause, block, limit, or permanent failure.\n\nCommunicate briefly. In the final response, lead with the outcome, name material changes and completed checks, and state remaining limitations plainly. Use natural Markdown, not harness markup.\n",
+          "id": "agent.base",
+          "order": 0,
+          "sha256": "d30804c168a45672deb96dd45abaecee959936f080548614683b9db71bbc7fc2",
+          "source": "native:build"
+        },
+        {
+          "bytes": 285,
+          "content": "**Don't delegate when:** the whole task is smaller than the briefing it would take • you already have the file path and need its contents • the answer is in this conversation • explaining the task costs more than doing it • the work is one edit you are already mid-way through.",
+          "id": "agent.policy",
+          "order": 1,
+          "sha256": "679e07d9922fc9fdbac77a2a37390bb0b6b14962240553a1e86588df8e696d48",
+          "source": "zuno-agent::builtin:build"
+        },
+        {
+          "bytes": 435,
+          "content": "Zuno supports validated extension packages. Use `extension_define`, `extension_run`, `extension_stop`, `extension_undefine`, and `extension_inspect` for process-local packages. Process-local definitions never write disk and disappear when Zuno exits. For restart-persistent loading, write `.zuno/extensions/<id>/extension.json` and restart Zuno. Use the `customize-zuno` skill for the manifest schema.\n\nActive extension packages: none.",
+          "id": "extensions",
+          "order": 2,
+          "sha256": "dcc2a562a26c24e9503af47cd474a74fbb376f7d520ec66588e74f748e5b1c53",
+          "source": "zuno-extension::active-packages"
+        },
+        {
+          "bytes": 869,
+          "id": "instructions.0",
+          "order": 3,
+          "sha256": "48379a2649c35bb693a046b226c71115b6624e221c626e2717bd07496236613e",
+          "source": "<user-level-instructions>",
+          "contentRedacted": true,
+          "redactionReason": "Machine-level instruction path and contents are local-only."
+        },
+        {
+          "bytes": 5070,
+          "id": "instructions.1",
+          "order": 4,
+          "sha256": "5917a0e8d78419e73a38ac8ed2b8d7284bbe37fb51e0820ca7521acd24c775ca",
+          "source": "AGENTS.md",
+          "contentRedacted": true,
+          "redactionReason": "Project instructions already live in AGENTS.md; omitted to avoid duplicating a large source file."
+        },
+        {
+          "bytes": 954,
+          "content": "Skills are mandatory trigger rules, not optional suggestions. The `<skill_index>` below lists model-visible names, descriptions, and exact source locators. If the user names a listed skill, or the request clearly matches its description, call `skill` with action `load`, its name, and that exact source before taking task action. Use action `search` for a capability query and action `list` when the catalog says entries were omitted. A metadata result is not instructions. Read every selected SKILL.md completely, following `next_cursor` until complete, then read only the referenced resources required for the task with action `read_resource` and the same name/source. Do not delegate reading or interpreting skill instructions. Prefer bundled scripts, assets, and templates over recreating them. Announce the minimal skill set and order you will use. Never use shell, find, glob, or a broad filesystem scan to rediscover an advertised or loaded skill.",
+          "id": "skills.policy",
+          "order": 5,
+          "sha256": "4a0403666ea19903c98bcaed998d5da79d18444f84d73ff0af78cab594a56cab",
+          "source": "zuno skill trigger policy"
+        },
+        {
+          "bytes": 39989,
+          "id": "skills.index",
+          "order": 6,
+          "sha256": "04a2df6fef4d3cc945324d5a8e1fc25791f2537cbd0a4afbb60404d22e6f84f1",
+          "source": "discovered skill index",
+          "contentRedacted": true,
+          "redactionReason": "Machine-specific installed skill inventory is intentionally excluded from the public repository."
+        }
+      ]
+    },
+    "dynamicContext": null,
+    "user": {
+      "role": "user",
+      "message": {
+        "agent": "build",
+        "model": {
+          "modelID": "us.anthropic.claude-opus-5",
+          "providerID": "myopenai"
+        },
+        "role": "user",
+        "time": {
+          "created": 1787549499892
+        }
+      },
+      "part": {
+        "text": "按照skill指导 对本项目进行完整的优化设计，即将发布到github公开仓库了",
+        "type": "text"
+      },
+      "durableAdmission": {
+        "id": "inp_msg_d0683207e6a746e1b54b30f1de18283a",
+        "delivery": "next-step",
+        "admittedSeq": 0,
+        "promotedSeq": 1,
+        "timeCreated": 1787549499892,
+        "payload": {
+          "message": {
+            "agent": "build",
+            "id": "msg_d0683207e6a746e1b54b30f1de18283a",
+            "model": {
+              "modelID": "us.anthropic.claude-opus-5",
+              "providerID": "myopenai"
+            },
+            "role": "user",
+            "sessionID": "<session-id>",
+            "time": {
+              "created": 1787549499892
+            }
+          },
+          "parts": [
+            {
+              "id": "prt_745bde16587442b18f2e3e7d81fc3cac",
+              "messageID": "msg_d0683207e6a746e1b54b30f1de18283a",
+              "sessionID": "<session-id>",
+              "text": "按照skill指导 对本项目进行完整的优化设计，即将发布到github公开仓库了",
+              "type": "text"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "historicalBoundary": {
+    "exact": [
+      "ordered system sections and their contents",
+      "post-hook system digest (identical to assembly digest in this turn)",
+      "raw user message and durable admission",
+      "absence of goal/context dynamic tail for the first step"
+    ],
+    "notPersisted": [
+      "the final provider request body after request preparation",
+      "the exact historical tools array and its schema ordering",
+      "transport headers and credentials"
+    ]
+  },
+  "publicRedaction": {
+    "exactRawArtifact": ".omo/evidence/build-agent-public-release-prompt.raw.json (gitignored, generated locally)",
+    "policy": "Keep hashes, byte counts, ordering, safe native prompt content, and the exact user request; omit machine paths and installed-skill inventory from the public tree."
+  }
+}

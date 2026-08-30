@@ -1,0 +1,96 @@
+[package]
+name = "zuno-cli"
+description = "Command-line entry point and subcommand dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "zuno"
+path = "src/main.rs"
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+zuno-acp = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
+zuno-agent = { workspace = true }
+zuno-auth = { workspace = true }
+zuno-catalog = { workspace = true }
+zuno-config = { workspace = true }
+zuno-db = { workspace = true }
+zuno-engine = { workspace = true }
+zuno-error = { workspace = true }
+zuno-extension = { workspace = true }
+zuno-goal = { workspace = true }
+zuno-harness = { workspace = true }
+zuno-llm = { workspace = true }
+zuno-memory = { workspace = true }
+zuno-lsp = { workspace = true }
+zuno-mcp = { workspace = true }
+zuno-network = { workspace = true }
+zuno-observability = { workspace = true }
+zuno-orchestration = { workspace = true }
+zuno-paths = { workspace = true }
+zuno-permission = { workspace = true }
+zuno-process = { workspace = true }
+zuno-product-agent = { workspace = true }
+zuno-provider-anthropic = { workspace = true }
+zuno-provider-bedrock = { workspace = true }
+zuno-provider-compatible = { workspace = true }
+zuno-provider-google = { workspace = true }
+zuno-provider-openai = { workspace = true }
+zuno-pty = { workspace = true }
+zuno-runtime = { workspace = true }
+zuno-sandbox = { workspace = true }
+zuno-search = { workspace = true }
+zuno-server = { workspace = true }
+zuno-snapshot = { workspace = true }
+zuno-tool = { workspace = true }
+zuno-tools = { workspace = true }
+zuno-tui = { workspace = true }
+zuno-types = { workspace = true }
+zuno-watch = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+self-replace = { workspace = true }
+self_update = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+walkdir = { workspace = true }
+zip = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+portable-pty = { workspace = true }
+zuno-testkit = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }
+wiremock = { workspace = true }
+which = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,3 @@
+Read durable work items for the current session.
+Returns stable ids, revisions, goal and plan links, parent and dependency ids, owner, status, priority, timing, and token usage.
+Read the current items before todo_update so every update or removal can carry the matching expected_revision.

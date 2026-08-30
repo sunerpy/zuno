@@ -1,0 +1,5 @@
+---
+source: crates/zuno-catalog/tests/skill_render.rs
+expression: "render(&[], Form::Verbose)"
+---
+No skills are currently available.

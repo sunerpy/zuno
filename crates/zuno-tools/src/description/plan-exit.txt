@@ -1,0 +1,16 @@
+Use this tool when you have completed the planning phase and are ready to exit plan agent.
+
+This tool asks the user whether to switch to the orchestrator and start implementing the plan.
+
+Call this tool:
+- After you have written a complete plan to the plan file
+- After every material question is resolved and no unresolved implementation decision remains
+- When another agent can execute the plan without repeating discovery
+
+Do NOT call this tool:
+- Before you have created or finalized the plan
+- If you still have unanswered questions about the implementation
+- If the user has indicated they want to continue planning
+- Merely because you have reached the end of a turn
+
+Do not duplicate the approval question in chat; this tool owns that interaction. A cancellation or "No" keeps the session in plan mode.

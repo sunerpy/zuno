@@ -1,0 +1,1 @@
+Resolve an uncertain background job only after inspecting an authoritative external source. Records the authority and concrete evidence, never replays the original operation, and atomically replaces any unconsumed uncertain report with the final outcome.

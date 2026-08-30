@@ -1,0 +1,84 @@
+name: Publish docs
+
+# Pushes this repository's documentation into sunerpy/firlab, which builds and
+# publishes zuno.firlab.app.
+#
+# WHY THE SYNC PUSHES INSTEAD OF THE SITE PULLING
+#
+# Pushing keeps the credential in the repository that owns the content. The token
+# below grants write access to firlab and nothing else, so it cannot be used to
+# modify this repository or its releases. A puller would instead need a token in
+# firlab, whose only job is publishing, widening what a compromise there reaches.
+# Pushing also means a docs change and the site update share one commit boundary.
+#
+# WHAT THIS NEEDS
+#
+# A secret named `FIRLAB_DOCS_TOKEN`: a fine-grained personal access token scoped
+# to `sunerpy/firlab` ONLY, with `Contents: read and write`. It needs nothing else —
+# no access to this repository, no workflow scope, no organization permissions.
+# GitHub does not expose an API for creating personal access tokens, so this one is
+# created by hand.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/publish-docs.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: publish-docs
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Push docs to firlab
+    runs-on:
+      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - zuno-docs-publish
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Zuno
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          path: zuno
+          persist-credentials: false
+
+      - name: Checkout firlab
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: sunerpy/firlab
+          token: ${{ secrets.FIRLAB_DOCS_TOKEN }}
+          path: firlab
+
+      # firlab owns the sync script, so the copy rules live with the site that
+      # consumes them rather than being duplicated here. Running the site's own
+      # script also means a local dry run and this workflow produce the same tree.
+      - name: Sync documentation
+        run: ./firlab/docs/scripts/sync-zuno-docs.sh "$GITHUB_WORKSPACE/zuno"
+
+      - name: Commit and push
+        working-directory: firlab
+        env:
+          ZUNO_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "documentation is already up to date; nothing to push"
+            exit 0
+          fi
+
+          # Scoped to the synced tree. `sync-zuno-docs.sh` writes nowhere else, but
+          # staging explicitly means an unrelated change in that checkout could
+          # never be swept into this commit.
+          git add docs/src
+
+          git -c user.name='zuno-docs[bot]' \
+              -c user.email='zuno-docs@users.noreply.github.com' \
+              commit -m "docs(zuno): sync from zuno@${ZUNO_SHA:0:7}" \
+                     -m "Source: https://github.com/sunerpy/zuno/commit/${ZUNO_SHA}"
+
+          git push origin HEAD:main

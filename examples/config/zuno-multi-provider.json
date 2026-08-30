@@ -1,0 +1,334 @@
+{
+  "model": "myopenai/us.anthropic.claude-opus-5",
+  "small_model": "myopenai/global.anthropic.claude-haiku-4-5-20251001-v1:0",
+  "default_agent": "orchestrator",
+  "subagent_depth": 1,
+  "preset": "myopenai",
+  "presets": {
+    "hybrid": {
+      "agents": {
+        "orchestrator": {
+          "model": "myopenai/us.anthropic.claude-fable-5",
+          "reasoning": "xhigh"
+        },
+        "build": {
+          "model": "kiro-local/gpt-5.6-sol",
+          "reasoning": "max"
+        },
+        "plan": {
+          "model": "myopenai/us.anthropic.claude-fable-5",
+          "reasoning": "max"
+        },
+        "deep": {
+          "model": "kiro-local/claude-opus-5",
+          "reasoning": "high"
+        },
+        "fixer": {
+          "model": "kiro-local/claude-sonnet-5",
+          "reasoning": "medium"
+        },
+        "general": {
+          "model": "myopenai/us.anthropic.claude-fable-5",
+          "reasoning": "high"
+        },
+        "explorer": {
+          "model": "kiro-local/gpt-5.6-luna",
+          "reasoning": "low"
+        },
+        "librarian": {
+          "model": "myopenai/us.anthropic.claude-fable-5",
+          "reasoning": "medium"
+        },
+        "oracle": {
+          "model": "kiro-local/gpt-5.6-sol",
+          "reasoning": "max"
+        },
+        "looker": {
+          "model": "kiro-local/claude-sonnet-5",
+          "reasoning": "low"
+        }
+      }
+    },
+    "kiro-local": {
+      "agents": {
+        "orchestrator": {
+          "model": "kiro-local/claude-opus-5",
+          "reasoning": "xhigh"
+        },
+        "build": {
+          "model": "kiro-local/gpt-5.6-sol",
+          "reasoning": "max"
+        },
+        "plan": {
+          "model": "kiro-local/claude-opus-5",
+          "reasoning": "max"
+        },
+        "deep": {
+          "model": "kiro-local/claude-opus-5",
+          "reasoning": "high"
+        },
+        "fixer": {
+          "model": "kiro-local/claude-sonnet-5",
+          "reasoning": "medium"
+        },
+        "general": {
+          "model": "kiro-local/claude-opus-5",
+          "reasoning": "xhigh"
+        },
+        "explorer": {
+          "model": "kiro-local/gpt-5.6-luna",
+          "reasoning": "low"
+        },
+        "librarian": {
+          "model": "kiro-local/claude-sonnet-5",
+          "reasoning": "medium"
+        },
+        "oracle": {
+          "model": "kiro-local/gpt-5.6-sol",
+          "reasoning": "max"
+        },
+        "looker": {
+          "model": "kiro-local/claude-sonnet-5",
+          "reasoning": "low"
+        }
+      }
+    },
+    "myopenai": {
+      "agents": {
+        "orchestrator": {
+          "model": "myopenai/us.anthropic.claude-opus-5",
+          "reasoning": "xhigh"
+        },
+        "build": {
+          "model": "myopenai/gpt-5.6-sol",
+          "reasoning": "max"
+        },
+        "plan": {
+          "model": "myopenai/us.anthropic.claude-opus-5",
+          "reasoning": "max"
+        },
+        "deep": {
+          "model": "myopenai/gpt-5.6-sol",
+          "reasoning": "max"
+        },
+        "fixer": {
+          "model": "myopenai/us.anthropic.claude-opus-5",
+          "reasoning": "medium"
+        },
+        "general": {
+          "model": "myopenai/us.anthropic.claude-opus-5",
+          "reasoning": "xhigh"
+        },
+        "explorer": {
+          "model": "myopenai/gpt-5.6-sol",
+          "reasoning": "low"
+        },
+        "librarian": {
+          "model": "myopenai/us.anthropic.claude-opus-5",
+          "reasoning": "medium"
+        },
+        "oracle": {
+          "model": "myopenai/gpt-5.6-sol",
+          "reasoning": "max"
+        },
+        "looker": {
+          "model": "myopenai/us.anthropic.claude-opus-5",
+          "reasoning": "low"
+        }
+      }
+    }
+  },
+  "provider": {
+    "kiro-local": {
+      "name": "Kiro local gateway",
+      "env": ["ZUNO_KIRO_LOCAL_API_KEY"],
+      "transport": "openai",
+      "surface": "responses",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "maxTokens": null,
+        "timeout": false,
+        "headerTimeout": 330000,
+        "chunkTimeout": 210000
+      },
+      "models": {
+        "claude-opus-5": {
+          "name": "Claude Opus 5 via Kiro",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 1000000,
+            "output": 128000
+          },
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        },
+        "claude-opus-4-8": {
+          "name": "Claude Opus 4.8 via Kiro",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 1000000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        },
+        "claude-sonnet-5": {
+          "name": "Claude Sonnet 5 via Kiro",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 1000000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        },
+        "gpt-5.6-sol": {
+          "name": "GPT 5.6 Sol via Kiro",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 272000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        },
+        "gpt-5.6-luna": {
+          "name": "GPT 5.6 Luna via Kiro",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 272000,
+            "output": 64000
+          },
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        }
+      }
+    },
+    "myopenai": {
+      "name": "My OpenAI gateway",
+      "env": ["MYOPENAI_API_KEY"],
+      "transport": "openai",
+      "surface": "responses",
+      "options": {
+        "baseURL": "https://gateway.example.com/v1"
+      },
+      "models": {
+        "gpt-5.6-sol": {
+          "name": "GPT 5.6 Sol",
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 272000,
+            "output": 65536
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        },
+        "us.anthropic.claude-fable-5": {
+          "name": "Claude Fable 5 US",
+          "reasoning": true,
+          "tool_call": true,
+          "options": {
+            "reasoningEffort": "medium",
+            "reasoningSummary": "auto"
+          },
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        },
+        "us.anthropic.claude-opus-5": {
+          "name": "Claude Opus 5 US",
+          "reasoning": true,
+          "tool_call": true,
+          "limit": {
+            "context": 1024000,
+            "output": 65536
+          },
+          "variants": {
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "high" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "max" }
+          }
+        },
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0": {
+          "name": "Claude Haiku 4.5",
+          "tool_call": true,
+          "limit": {
+            "context": 200000,
+            "output": 64000
+          }
+        }
+      }
+    }
+  }
+}

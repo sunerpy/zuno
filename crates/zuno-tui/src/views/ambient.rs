@@ -1,0 +1,1972 @@
+//! Ambient state: token spend, language servers, MCP servers, and skills.
+//!
+//! # These are facts, not actions, so they get a panel rather than a view
+//!
+//! An LSP server's health and an MCP server's connection are things a user checks,
+//! not things a user does. Giving each its own full-screen surface would mean a
+//! keystroke to answer "is my MCP up", and a user who has to ask cannot notice the
+//! answer changed. So they are drawn continuously beside the transcript, and the
+//! only interaction is collapsing a section that has grown long.
+//!
+//! # Nothing here knows where a fact came from
+//!
+//! [`Ambient`] is plain data: strings, counts, and a three-way state. `zuno-tui`
+//! deliberately does not depend on `zuno-lsp`, `zuno-mcp` or `zuno-catalog`, so the
+//! host converts its own types into these and this module cannot reach back into
+//! execution. That is the same discipline the transcript follows with
+//! [`zuno_engine::r#loop::TurnEvent`], and it is why a sidebar can be asserted
+//! off-screen with no servers running.
+//!
+//! # The sidebar is dropped, never squeezed
+//!
+//! Below [`crate::views::SIDEBAR_MIN_WIDTH`] the panel is not drawn at all. A
+//! sidebar narrowed until its server names truncate tells the user less than no
+//! sidebar while costing the reply the columns it needed —
+//! [`crate::views::session::SessionScreen`] makes that call, and
+//! [`SIDEBAR_WIDTH`] is why the threshold is where it is.
+
+use crate::app::{AppEvent, Component, EventResult};
+use crate::views::selection::{TextPoint, TextSelection, slice_columns};
+use crate::views::subagent::Delegation;
+use crate::views::{ViewContext, display_width, fill, padded, truncate};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
+
+#[cfg(test)]
+#[path = "ambient_tests.rs"]
+mod tests;
+
+/// Columns the sidebar occupies when it is drawn.
+///
+/// Wide enough for `typescript-language-server` plus its state glyph without
+/// truncating, which is the longest name the shipped LSP registry can produce.
+pub const SIDEBAR_WIDTH: u16 = 34;
+
+/// The glyph that marks a git branch.
+///
+/// Declared here because this panel is where the field was first drawn, and
+/// [`crate::views::message::StatusView::BRANCH_GLYPH`] defers to it so the two surfaces
+/// that state the branch cannot drift to two different glyphs. Only the spacing differs
+/// between them, deliberately — see the footer that renders it.
+pub const BRANCH_GLYPH: &str = "⑂";
+
+/// The glyph marking a collapsible section that is open.
+pub const OPEN_GLYPH: &str = "▾";
+
+/// The glyph marking a collapsible section that is closed.
+pub const CLOSED_GLYPH: &str = "▸";
+
+/// How healthy a background service is, reduced to what a colour can carry.
+///
+/// Three states rather than each subsystem's own enum, because the panel's job is to
+/// let a user scan for trouble: an LSP that is `Degraded` and an MCP that
+/// `NeedsAuth` are the same colour of problem, and the specific word goes in the
+/// detail column beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    /// Answering.
+    Ready,
+    /// Working on it, or not yet started.
+    Pending,
+    /// Needs attention.
+    Faulted,
+    /// Deliberately switched off, which is not a fault.
+    Disabled,
+}
+
+impl Health {
+    /// The glyph drawn in the row's gutter.
+    #[must_use]
+    pub const fn glyph(self) -> &'static str {
+        match self {
+            Self::Ready => "●",
+            Self::Pending => "◐",
+            Self::Faulted => "✗",
+            Self::Disabled => "○",
+        }
+    }
+}
+
+/// One background service, as the panel shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Service {
+    /// Its name.
+    pub name: String,
+    /// Its health.
+    pub health: Health,
+    /// A short human-readable detail, such as a root path or a failure reason.
+    pub detail: String,
+}
+
+impl Service {
+    /// A service with no detail.
+    #[must_use]
+    pub fn new(name: impl Into<String>, health: Health) -> Self {
+        Self {
+            name: name.into(),
+            health,
+            detail: String::new(),
+        }
+    }
+
+    /// Attach a detail.
+    #[must_use]
+    pub fn detailed(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
+    }
+}
+
+/// One skill, as the panel shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSummary {
+    /// The skill's name, which is also the command it claims.
+    pub name: String,
+    /// Stable source locator used when more than one installed skill claims the name.
+    pub source: String,
+    /// Its one-line description.
+    pub description: String,
+    /// Whether this session successfully loaded the skill through the `skill` tool.
+    pub loaded: bool,
+}
+
+/// Every ambient fact the sidebar states.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ambient {
+    /// What this session is about, as the model named it after the opening exchange.
+    ///
+    /// [`None`] until it is named, and that state is drawn as *nothing* — no heading, no
+    /// placeholder row. A session acquires its name one small-model request after the
+    /// first prompt, so any stand-in would be on screen for about a second and would
+    /// occupy the row the real name is about to take; the panel would visibly reflow for
+    /// no information. It is also `None` for every session that could not be named,
+    /// which is the same absence and deliberately indistinguishable here — the reason is
+    /// reported on the transcript, where a user can act on it.
+    pub title: Option<String>,
+    /// The working directory, already abbreviated.
+    pub directory: Option<String>,
+    /// The checkout's branch.
+    pub branch: Option<String>,
+    /// The agent answering.
+    pub agent: Option<String>,
+    /// `provider/model`.
+    pub model: Option<String>,
+    /// Token accounting, folded by the transcript and handed over each frame.
+    pub tokens: zuno_types::TokenUsage,
+    /// Whether those token figures are durable, unavailable, or not reported yet.
+    pub usage_state: crate::views::message::UsageState,
+    /// Failed turns are counted separately from confirmed token usage.
+    pub failed_turns: u64,
+    /// Most recent prompt occupancy, kept separate from cumulative session usage.
+    pub context: Option<crate::views::message::ContextWindowUsage>,
+    /// Language servers.
+    pub lsp: Vec<Service>,
+    /// MCP servers.
+    pub mcp: Vec<Service>,
+    /// Discovered skills.
+    pub skills: Vec<SkillSummary>,
+    /// Foreground subagent calls projected from the durable transcript.
+    pub agents: Vec<Delegation>,
+    /// Durable goal, todo, job, and resident-memory state.
+    pub work: zuno_types::WorkStateProjection,
+    /// The build's version.
+    pub version: Option<String>,
+}
+
+/// The session name and a counter that advances when it changes.
+#[derive(Debug, Default)]
+struct Titled {
+    generation: u64,
+    title: Option<String>,
+}
+
+/// The session's name, published by whoever generates it and read by the panel.
+///
+/// # Why a projection and not a turn event
+///
+/// The name is produced by the turn prelude on the driver task while the panel is
+/// drawn on the render loop, so the value must cross task ownership. A projection
+/// carries that state without widening the turn event stream with presentation-only
+/// data.
+///
+/// # The counter exists because a wake alone paints nothing
+///
+/// Copied deliberately from [`crate::views::picker::McpProjection`], whose own header
+/// records the failure: a wake only reaches the terminal if some component reports
+/// `redraw`, so a projection that changed with nothing reporting it leaves the old frame
+/// on screen. The generation lets one observer answer "did this move" in constant time,
+/// and it advances **only** on a real change — a bump for an identical title would spend a
+/// frame repainting bytes that did not change.
+#[derive(Debug, Clone, Default)]
+pub struct SessionTitle(std::sync::Arc<std::sync::RwLock<Titled>>);
+
+impl SessionTitle {
+    /// A projection already holding `title`, for a session that was resumed.
+    #[must_use]
+    pub fn new(title: Option<String>) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(Titled {
+            generation: 0,
+            title,
+        })))
+    }
+
+    /// Publish `title`, advancing the generation only if it differs.
+    pub fn replace(&self, title: Option<String>) {
+        let mut titled = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if titled.title == title {
+            return;
+        }
+        titled.title = title;
+        titled.generation = titled.generation.wrapping_add(1);
+    }
+
+    /// How many content changes this projection has published.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    /// The generation and the title it belongs to, under one read.
+    ///
+    /// One lock for both, for the reason [`crate::views::picker::McpProjection::observe`]
+    /// documents: two calls could straddle a [`Self::replace`] and pair a stale generation
+    /// with a fresh title, which makes an observer record a frame it never painted.
+    #[must_use]
+    pub fn observe(&self) -> (u64, Option<String>) {
+        let titled = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (titled.generation, titled.title.clone())
+    }
+}
+
+/// Durable work state and a counter that advances only when it changes.
+#[derive(Debug, Default)]
+struct ProjectedWork {
+    generation: u64,
+    state: zuno_types::WorkStateProjection,
+}
+
+/// Shared client projection for goal, todo, job, and memory state.
+#[derive(Debug, Clone, Default)]
+pub struct WorkState(std::sync::Arc<std::sync::RwLock<ProjectedWork>>);
+
+impl WorkState {
+    #[must_use]
+    pub fn new(state: zuno_types::WorkStateProjection) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(ProjectedWork {
+            generation: 0,
+            state,
+        })))
+    }
+
+    pub fn replace(&self, state: zuno_types::WorkStateProjection) {
+        let mut projected = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if projected.state == state {
+            return;
+        }
+        projected.state = state;
+        projected.generation = projected.generation.wrapping_add(1);
+    }
+
+    /// Replace only the background-terminal slice from its independent event stream.
+    pub fn replace_background_executions(
+        &self,
+        executions: Vec<zuno_types::BackgroundExecutionProjection>,
+    ) {
+        let mut projected = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if projected.state.background_executions == executions {
+            return;
+        }
+        projected.state.background_executions = executions;
+        projected.generation = projected.generation.wrapping_add(1);
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    #[must_use]
+    pub fn observe(&self) -> (u64, zuno_types::WorkStateProjection) {
+        let projected = self
+            .0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (projected.generation, projected.state.clone())
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> zuno_types::WorkStateProjection {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state
+            .clone()
+    }
+}
+
+/// The most rows the session name may occupy.
+///
+/// Two, not one and not unbounded. The generator caps a title at 100 characters and this
+/// panel is [`SIDEBAR_WIDTH`] wide, so a long title needs four rows to be shown whole —
+/// and those rows come out of the server lists below it, which report state that changes.
+/// One row is the other failure: at roughly thirty columns it holds about four words,
+/// which is often not enough to tell two sessions in the same repository apart. Two rows
+/// covers an ordinary title outright and cuts the rest, which is the cheaper loss.
+pub const TITLE_MAX_ROWS: usize = 2;
+
+/// Break `text` into at most `rows` rows of `width` columns, marking a cut.
+///
+/// Prefers a whitespace break and falls back to a column break, which is not a
+/// nicety — a Chinese title contains no spaces at all, so a word-only wrapper returns
+/// the whole title as one over-long row and the panel then clips it at the frame edge,
+/// losing the tail with no mark that anything was dropped.
+///
+/// Counted in **columns** throughout, for the reason [`elide_left`] documents: a CJK
+/// title measures far fewer characters than the cells it occupies, so a character-counted
+/// wrapper produces rows that satisfy their own arithmetic and still overrun the panel.
+fn wrap(text: &str, width: usize, rows: usize) -> Vec<String> {
+    if width == 0 || rows == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut rest = text.trim();
+    while !rest.is_empty() && lines.len() < rows {
+        if display_width(rest) <= width {
+            lines.push(rest.to_owned());
+            return lines;
+        }
+        // The last row cannot continue anywhere, so it is elided rather than broken: a
+        // clean word break on the final row silently discards the remainder.
+        if lines.len() + 1 == rows {
+            lines.push(format!(
+                "{}{}",
+                truncate(rest, width.saturating_sub(1)),
+                crate::views::message::ELIDED
+            ));
+            return lines;
+        }
+        let head = truncate(rest, width);
+        // Back up to the last space *inside* the row, unless the row already ends on a
+        // boundary — `rest[head.len()..]` starting with whitespace means the cut is
+        // already between words and moving it would waste a column for nothing.
+        let taken = if rest[head.len()..].starts_with(char::is_whitespace) {
+            head.len()
+        } else {
+            head.rfind(char::is_whitespace).unwrap_or(head.len())
+        };
+        let (line, remainder) = rest.split_at(taken);
+        let line = line.trim_end();
+        if line.is_empty() {
+            // A single glyph wider than the row: emit the column break rather than
+            // looping forever on a break point that cannot advance.
+            lines.push(head.clone());
+            rest = rest[head.len()..].trim_start();
+            continue;
+        }
+        lines.push(line.to_owned());
+        rest = remainder.trim_start();
+    }
+    lines
+}
+
+/// The fewest columns a detail needs before it says more than the glyph beside it.
+///
+/// Below this the text is dropped rather than elided: a two-character stub of
+/// `configured` is a fragment a reader has to decode, and the health glyph already
+/// carries the state.
+pub const DETAIL_MIN_COLUMNS: usize = 6;
+
+/// Keep the last `width` columns of `text`, marking the cut with an ellipsis.
+///
+/// The tail is kept because that is what identifies a path or a failure message; a cut
+/// at the other end preserves the prefix every sibling shares.
+///
+/// `width` is **columns**, and the ellipsis is charged one of them. Counting characters
+/// instead returned a string that satisfied the caller's arithmetic and still overran the
+/// panel by one column per wide glyph: a Chinese failure reason came back "short enough",
+/// was laid out flush against the right edge, and had its tail — the part this function
+/// exists to preserve — clipped off the frame.
+#[must_use]
+pub fn elide_left(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return truncate(text, width);
+    }
+    // Walk back from the end, keeping the longest suffix that fits beside the mark. Char
+    // boundaries are the step, so a two-column glyph is either taken whole or not at all —
+    // half of one is not something a terminal can draw.
+    let mut kept = text.len();
+    for (index, _) in text.char_indices().rev() {
+        if 1 + display_width(&text[index..]) > width {
+            break;
+        }
+        kept = index;
+    }
+    format!("{}{}", crate::views::message::ELIDED, &text[kept..])
+}
+
+/// Abbreviate a token count for a row that has no space for the grouped form.
+///
+/// The status strip has one row shared with the turn state, so `12.3k` is worth more
+/// there than `12,345`; the sidebar shows the exact figure.
+#[must_use]
+pub fn compact(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=999_999 => format!("{:.1}k", value as f64 / 1_000.0),
+        _ => format!("{:.1}m", value as f64 / 1_000_000.0),
+    }
+}
+
+/// Render a system-owned elapsed duration compactly enough for sidebar rows.
+#[must_use]
+fn span_duration(span: &zuno_types::ExecutionSpan) -> String {
+    compact_duration(i64::try_from(span.elapsed_ms).unwrap_or(i64::MAX))
+}
+
+fn span_usage(span: &zuno_types::ExecutionSpan) -> String {
+    if span.accounting_known {
+        format!("{} tokens", compact(span.usage.total()))
+    } else {
+        String::from("— tokens")
+    }
+}
+
+pub(crate) fn compact_duration(milliseconds: i64) -> String {
+    if milliseconds < 1_000 {
+        return format!("{}ms", milliseconds.max(0));
+    }
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    format!("{}m {}s", seconds / 60, seconds % 60)
+}
+
+/// Which sidebar sections are expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expanded {
+    /// Whether the active-goal summary is open.
+    pub goal: bool,
+    /// Whether the durable plan is open.
+    pub plan: bool,
+    /// Whether the todo list is open.
+    pub todos: bool,
+    /// Whether the background terminal list is open.
+    pub background: bool,
+    /// Whether foreground delegated-agent calls are open.
+    pub agents: bool,
+    /// Whether the durable agent/workflow job list is open.
+    pub jobs: bool,
+    /// Whether memory candidates and entries are open.
+    pub memory: bool,
+    /// Whether the LSP list is open.
+    pub lsp: bool,
+    /// Whether the MCP list is open.
+    pub mcp: bool,
+    /// Whether the skill list is open.
+    pub skills: bool,
+}
+
+impl Default for Expanded {
+    /// LSP and MCP open, skills closed.
+    ///
+    /// Skills are numerous and static — a shipped install has dozens and they do not
+    /// change while the session runs — so their count is the interesting part and
+    /// their names are not. Servers are few and can break, so their names are.
+    fn default() -> Self {
+        Self {
+            goal: true,
+            plan: true,
+            todos: true,
+            background: true,
+            agents: true,
+            jobs: true,
+            memory: false,
+            lsp: true,
+            mcp: true,
+            skills: false,
+        }
+    }
+}
+
+/// One collapsible section of the panel.
+///
+/// Named rather than indexed because a hit map keyed by position would have to be read
+/// against the same row order that produced it, and the two would drift the first time a
+/// section moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    /// The active goal.
+    Goal,
+    /// The durable plan.
+    Plan,
+    /// The durable todo list.
+    Todos,
+    /// Background terminal processes.
+    Background,
+    /// Foreground delegated-agent calls.
+    Agents,
+    /// Background agent and workflow jobs.
+    Jobs,
+    /// Resident-memory candidates and entries.
+    Memory,
+    /// The language-server list.
+    Lsp,
+    /// The MCP server list.
+    Mcp,
+    /// The discovered-skill list.
+    Skills,
+}
+
+/// The panel's rows plus the index of each section heading among them.
+struct PanelRows {
+    lines: Vec<Line<'static>>,
+    headers: Vec<(usize, Section)>,
+}
+
+/// The ambient panel.
+pub struct SidebarView {
+    context: ViewContext,
+    ambient: Ambient,
+    expanded: Expanded,
+    offset: usize,
+    content_height: usize,
+    viewport_height: usize,
+    title_area: Option<Rect>,
+    body_area: Option<Rect>,
+    selection: Option<TextSelection>,
+    /// Where each section's heading was drawn in the frame that was drawn.
+    ///
+    /// Absolute screen rows, recorded by [`Component::render`] from the same `lines()`
+    /// output it paints and the same `Rect` it paints into. Derived once, in the one place
+    /// that knows both — a map maintained anywhere else would have to be told about a
+    /// resize, and the resize that forgot to tell it is a click landing on the wrong
+    /// section.
+    ///
+    /// Cleared by [`Self::forget_hit_targets`] whenever the owner does not draw the panel,
+    /// so a click at the sidebar's old coordinates cannot toggle a section the user can no
+    /// longer see.
+    hits: Vec<(Rect, Section)>,
+}
+
+impl SidebarView {
+    /// A panel over `context` with nothing resolved yet.
+    #[must_use]
+    pub fn new(context: ViewContext) -> Self {
+        Self {
+            context,
+            ambient: Ambient::default(),
+            expanded: Expanded::default(),
+            offset: 0,
+            content_height: 0,
+            viewport_height: 0,
+            title_area: None,
+            body_area: None,
+            selection: None,
+            hits: Vec::new(),
+        }
+    }
+
+    /// The facts, mutably, for the host that resolves them.
+    pub const fn ambient_mut(&mut self) -> &mut Ambient {
+        &mut self.ambient
+    }
+
+    /// The facts.
+    #[must_use]
+    pub const fn ambient(&self) -> &Ambient {
+        &self.ambient
+    }
+
+    /// Which sections are open.
+    #[must_use]
+    pub const fn expanded(&self) -> Expanded {
+        self.expanded
+    }
+
+    /// Open or close the LSP section.
+    pub const fn toggle_lsp(&mut self) {
+        self.expanded.lsp = !self.expanded.lsp;
+    }
+
+    /// Open or close the MCP section.
+    pub const fn toggle_mcp(&mut self) {
+        self.expanded.mcp = !self.expanded.mcp;
+    }
+
+    /// Open or close the skill section.
+    pub const fn toggle_skills(&mut self) {
+        self.expanded.skills = !self.expanded.skills;
+    }
+
+    /// Open or close `section`.
+    pub const fn toggle(&mut self, section: Section) {
+        match section {
+            Section::Goal => self.expanded.goal = !self.expanded.goal,
+            Section::Plan => self.expanded.plan = !self.expanded.plan,
+            Section::Todos => self.expanded.todos = !self.expanded.todos,
+            Section::Background => self.expanded.background = !self.expanded.background,
+            Section::Agents => self.expanded.agents = !self.expanded.agents,
+            Section::Jobs => self.expanded.jobs = !self.expanded.jobs,
+            Section::Memory => self.expanded.memory = !self.expanded.memory,
+            Section::Lsp => self.toggle_lsp(),
+            Section::Mcp => self.toggle_mcp(),
+            Section::Skills => self.toggle_skills(),
+        }
+    }
+
+    /// Toggle whichever section's heading occupies `(column, row)`, if any.
+    ///
+    /// Absolute frame coordinates, because that is what a `MouseEvent` carries and
+    /// translating at the boundary is what keeps the caller from having to know this
+    /// panel's geometry.
+    ///
+    /// The whole heading row is the target, rule column included: the row holds nothing but
+    /// the label and its summary, so there is no neighbouring control a generous target
+    /// could steal from — and a two-column triangle is a target most users miss.
+    ///
+    /// Answers `false` when nothing was hit, which is how the owner tells "consumed" from
+    /// "pass it on". It is also `false` for every coordinate while mouse capture is off,
+    /// because [`Component::render`] records no targets then.
+    pub fn click(&mut self, column: u16, row: u16) -> bool {
+        let Some(section) = self
+            .hits
+            .iter()
+            .find(|(area, _)| {
+                column >= area.left()
+                    && column < area.right()
+                    && row >= area.top()
+                    && row < area.bottom()
+            })
+            .map(|(_, section)| *section)
+        else {
+            return false;
+        };
+        self.toggle(section);
+        true
+    }
+
+    /// Whether `(column, row)` belongs to selectable sidebar text drawn last frame.
+    #[must_use]
+    pub fn contains(&self, column: u16, row: u16) -> bool {
+        [self.title_area, self.body_area]
+            .into_iter()
+            .flatten()
+            .any(|area| {
+                column >= area.left()
+                    && column < area.right()
+                    && row >= area.top()
+                    && row < area.bottom()
+            })
+    }
+
+    /// Begin a selection in the sidebar title or body.
+    pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.point_at(column, row, false) else {
+            return false;
+        };
+        self.selection = Some(TextSelection {
+            anchor: point,
+            head: point,
+        });
+        true
+    }
+
+    /// Extend the active selection, clamped to the sidebar title and body.
+    pub fn update_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.point_at(column, row, true) else {
+            return false;
+        };
+        let Some(selection) = &mut self.selection else {
+            return false;
+        };
+        selection.head = point;
+        true
+    }
+
+    /// Clear the sidebar selection.
+    pub const fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Text covered by the current sidebar selection.
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let mut selected = Vec::new();
+        let title_height = self.title_area.map_or(0, |area| usize::from(area.height));
+
+        if let Some(area) = self.title_area.filter(|area| area.width > 0) {
+            for (row, line) in self
+                .title_lines(area.width)
+                .into_iter()
+                .take(usize::from(area.height))
+                .enumerate()
+            {
+                let Some((left, right)) = selection.columns(row, area.width) else {
+                    continue;
+                };
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                selected.push(slice_columns(&text, left, right).trim_end().to_owned());
+            }
+        }
+
+        if let Some(area) = self.body_area.filter(|area| area.width > 0) {
+            for (row, line) in self.rows(area.width).lines.into_iter().enumerate() {
+                let content_row = title_height.saturating_add(row);
+                let Some((left, right)) = selection.columns(content_row, area.width) else {
+                    continue;
+                };
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                selected.push(slice_columns(&text, left, right).trim_end().to_owned());
+            }
+        }
+        let text = selected.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Move the independent sidebar viewport by whole rows.
+    pub fn scroll_lines(&mut self, delta: isize) -> bool {
+        let max = self.content_height.saturating_sub(self.viewport_height);
+        let target = isize::try_from(self.offset)
+            .unwrap_or(isize::MAX)
+            .saturating_add(delta)
+            .max(0);
+        let next = usize::try_from(target).unwrap_or(max).min(max);
+        if next == self.offset {
+            return false;
+        }
+        self.offset = next;
+        true
+    }
+
+    fn point_at(&self, column: u16, row: u16, clamp: bool) -> Option<TextPoint> {
+        let point_in = |area: Rect, row_offset: usize| {
+            if area.width == 0 || area.height == 0 {
+                return None;
+            }
+            if !clamp
+                && (column < area.left()
+                    || column >= area.right()
+                    || row < area.top()
+                    || row >= area.bottom())
+            {
+                return None;
+            }
+            let column = column.clamp(area.left(), area.right().saturating_sub(1)) - area.left();
+            let visible_row = row.clamp(area.top(), area.bottom().saturating_sub(1)) - area.top();
+            Some(TextPoint {
+                row: row_offset.saturating_add(usize::from(visible_row)),
+                column,
+            })
+        };
+        let title_height = self.title_area.map_or(0, |area| usize::from(area.height));
+
+        if let Some(area) = self
+            .title_area
+            .filter(|area| area.width > 0 && area.height > 0)
+            && row < area.bottom()
+        {
+            return point_in(area, 0);
+        }
+        if let Some(area) = self
+            .body_area
+            .filter(|area| area.width > 0 && area.height > 0)
+        {
+            return point_in(area, title_height.saturating_add(self.offset));
+        }
+        self.title_area.and_then(|area| point_in(area, 0))
+    }
+
+    /// Discard the recorded heading positions.
+    ///
+    /// Called by the owner on any frame that does not draw this panel — the user hid it, or
+    /// the pane fell under [`crate::views::SIDEBAR_MIN_WIDTH`]. Without it the last drawn
+    /// geometry would keep answering clicks aimed at whatever now occupies those columns.
+    pub fn forget_hit_targets(&mut self) {
+        self.hits.clear();
+        self.title_area = None;
+        self.body_area = None;
+        self.selection = None;
+    }
+
+    fn health_style(&self, health: Health) -> Style {
+        match health {
+            Health::Ready => self.context.success(),
+            Health::Pending => self.context.warning(),
+            Health::Faulted => self.context.error(),
+            Health::Disabled => self.context.muted(),
+        }
+    }
+
+    fn agent_style(&self, state: &str) -> Style {
+        match state {
+            "running" | "cancelling" => self.context.accent(),
+            "failed" => self.context.error(),
+            "blocked" | "uncertain" => self.context.warning(),
+            "cancelled" => self.context.muted(),
+            "completed" => self.context.text(),
+            _ => self.context.secondary(),
+        }
+    }
+
+    fn heading(&self, label: &str, summary: &str, open: Option<bool>, width: u16) -> Line<'static> {
+        let glyph = match open {
+            Some(true) => OPEN_GLYPH,
+            Some(false) => CLOSED_GLYPH,
+            None => " ",
+        };
+        let head = format!("{glyph} {label}");
+        let columns = usize::from(width);
+        let used = display_width(&head) + display_width(summary);
+        let gap = columns.saturating_sub(used).max(1);
+        Line::from(vec![
+            Span::styled(head, self.context.title()),
+            Span::styled(" ".repeat(gap), self.context.surface()),
+            Span::styled(summary.to_owned(), self.context.muted()),
+        ])
+    }
+
+    fn service_row(&self, service: &Service, width: u16) -> Line<'static> {
+        let columns = usize::from(width);
+        let marker = format!("  {} ", service.health.glyph());
+        let marker_columns = display_width(&marker);
+        if columns <= marker_columns {
+            return Line::from(Span::styled(
+                truncate(&marker, columns),
+                self.health_style(service.health),
+            ));
+        }
+        // State colour belongs to the compact glyph. The name is ordinary content, as
+        // in Codex's agent overview, so a healthy sidebar does not become a green wall.
+        let name = truncate(&service.name, columns - marker_columns);
+        let head_columns = marker_columns + display_width(&name);
+        let mut spans = vec![
+            Span::styled(marker, self.health_style(service.health)),
+            Span::styled(name, self.context.text()),
+        ];
+        // The detail is dropped, never abbreviated to a stub. A long server name leaves
+        // two or three columns, and `…d` is not a shorter way of saying `configured` —
+        // it is a fragment a reader has to decode, while the health glyph already
+        // carries the state the detail was repeating.
+        //
+        // Both the room and the pad are counted in columns. Counting characters made a
+        // CJK-named server lose its detail outright: `◐ 语言服务器` measured 9 characters
+        // where it occupies 14, so `正在启动中` was laid out starting past the right edge
+        // and the reason the server had not come up never reached the screen — the one
+        // thing the detail column exists to say.
+        let room = columns.saturating_sub(head_columns + 1);
+        let tail = if !service.detail.is_empty() && room >= DETAIL_MIN_COLUMNS {
+            elide_left(&service.detail, room)
+        } else {
+            String::new()
+        };
+        let pad = columns.saturating_sub(head_columns + display_width(&tail));
+        spans.push(Span::styled(" ".repeat(pad), self.context.surface()));
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail, self.context.muted()));
+        }
+        Line::from(spans)
+    }
+
+    /// What a section with nothing in it says, so every section says it the same way.
+    ///
+    /// `none` rather than `0`. [`Self::summarise`] already answers `none` for an empty
+    /// server list, so a panel that printed `Skills 0` two sections below `MCP none` made a
+    /// reader stop and work out whether the two were reporting the same thing. They are.
+    pub const EMPTY_SECTION: &'static str = "none";
+
+    /// How a section states a plain count, with zero spelled [`Self::EMPTY_SECTION`].
+    fn tally(total: usize) -> String {
+        if total == 0 {
+            return Self::EMPTY_SECTION.to_owned();
+        }
+        total.to_string()
+    }
+
+    fn summarise(services: &[Service]) -> String {
+        if services.is_empty() {
+            return Self::EMPTY_SECTION.to_owned();
+        }
+        let faulted = services
+            .iter()
+            .filter(|service| service.health == Health::Faulted)
+            .count();
+        let ready = services
+            .iter()
+            .filter(|service| service.health == Health::Ready)
+            .count();
+        if faulted > 0 {
+            return format!("{ready} up, {faulted} failed");
+        }
+        format!("{ready}/{}", services.len())
+    }
+
+    /// Whether a collapsible section may advertise itself as collapsible.
+    ///
+    /// `None` — which [`Self::heading`] draws as a blank, exactly like the non-collapsible
+    /// `Context` heading — whenever mouse capture is off, because a click is the only way
+    /// to actuate one. A `▾` a user cannot press is worse than no `▾`: it invites a gesture
+    /// the build has switched off and reports nothing when the gesture is made.
+    ///
+    /// Nothing is hidden by this. The state still holds, the summary still states the
+    /// count, and each section's contents have their own keyboard surface — the MCP list,
+    /// the status census and the skill selector — so the triangle is an affordance for a
+    /// space problem, not the only route to the facts behind it.
+    const fn disclosure(&self, open: bool) -> Option<bool> {
+        if self.context.config.mouse {
+            Some(open)
+        } else {
+            None
+        }
+    }
+
+    /// The rows this panel draws at `width`.
+    ///
+    /// Public for the same reason the transcript's is: a row list is the readable
+    /// surface to assert against, and the buffer test then proves the rows land.
+    #[must_use]
+    pub fn lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.title_lines(width);
+        lines.extend(self.rows(width).lines);
+        lines
+    }
+
+    /// The current session's fixed header.
+    ///
+    /// Kept outside [`Self::rows`] because that collection is the independently
+    /// scrollable body. Putting the title in it technically placed the name first, but
+    /// scrolling an expanded Skills section moved the name off-screen — exactly when a
+    /// user needs the panel to keep saying which session the remaining facts belong to.
+    fn title_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(name) = &self.ambient.title else {
+            return Vec::new();
+        };
+        let mut lines = wrap(name, usize::from(width), TITLE_MAX_ROWS)
+            .into_iter()
+            .map(|row| padded(&row, width, self.context.title()))
+            .collect::<Vec<_>>();
+        lines.push(padded("", width, self.context.surface()));
+        lines
+    }
+
+    /// The scrollable rows and, in the same pass, which of them is a section heading.
+    ///
+    /// One pass rather than a second method that recomputes the offsets: two collectors
+    /// over one fact is how this panel came to advertise `0 lsp` while twenty servers ran,
+    /// and here the drift would put a click on the row above the header it aimed at.
+    fn rows(&self, width: u16) -> PanelRows {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut headers: Vec<(usize, Section)> = Vec::new();
+        let blank = || padded("", width, self.context.surface());
+
+        lines.push(self.heading("Context", "", None, width));
+        if let Some(context) = self.ambient.context {
+            let percent = context.percent();
+            let estimate = if context.estimated { "≈" } else { "" };
+            let kind = if context.estimated {
+                "estimate"
+            } else {
+                "current prompt"
+            };
+            lines.push(padded(
+                &format!(
+                    "  {estimate}{} / {} {kind}",
+                    compact(context.prompt_tokens),
+                    compact(context.limit)
+                ),
+                width,
+                self.context.text(),
+            ));
+            lines.push(padded(
+                &format!("  {estimate}{percent:.1}% of model window"),
+                width,
+                if percent >= 80.0 {
+                    self.context.warning()
+                } else {
+                    self.context.secondary()
+                },
+            ));
+        } else if self.ambient.usage_state == crate::views::message::UsageState::Unavailable {
+            lines.push(padded("  — usage unavailable", width, self.context.muted()));
+        } else if self.ambient.usage_state == crate::views::message::UsageState::NotReported {
+            lines.push(padded(
+                "  no usage reported yet",
+                width,
+                self.context.muted(),
+            ));
+        } else {
+            lines.push(padded(
+                "  — current prompt unavailable",
+                width,
+                self.context.muted(),
+            ));
+        }
+        if self.ambient.failed_turns > 0 {
+            let plural = if self.ambient.failed_turns == 1 {
+                ""
+            } else {
+                "s"
+            };
+            lines.push(padded(
+                &format!("  ! {} failed turn{plural}", self.ambient.failed_turns),
+                width,
+                self.context.warning(),
+            ));
+        }
+
+        if let Some(goal) = &self.ambient.work.goal {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Goal));
+            let goal_status = goal.pause.as_ref().map_or_else(
+                || goal.status.clone(),
+                |pause| format!("{} · {}", goal.status, pause.reason),
+            );
+            lines.push(self.heading(
+                "Goal",
+                &goal_status,
+                self.disclosure(self.expanded.goal),
+                width,
+            ));
+            if self.expanded.goal {
+                for row in wrap(&goal.objective, usize::from(width).saturating_sub(2), 3) {
+                    lines.push(padded(&format!("  {row}"), width, self.context.text()));
+                }
+                for criterion in goal.success_criteria.iter().take(3) {
+                    for row in wrap(criterion, usize::from(width).saturating_sub(4), 2) {
+                        lines.push(padded(
+                            &format!("  · {row}"),
+                            width,
+                            self.context.secondary(),
+                        ));
+                    }
+                }
+                if let Some(reason) = goal.blocked_reason.as_deref() {
+                    for row in wrap(reason, usize::from(width).saturating_sub(4), 2) {
+                        lines.push(padded(&format!("  ! {row}"), width, self.context.warning()));
+                    }
+                }
+                if let Some(retry) = &goal.retry {
+                    lines.push(padded(
+                        &format!(
+                            "  retry #{} · {} · at {}",
+                            retry.attempt, retry.reason, retry.retry_at_ms
+                        ),
+                        width,
+                        self.context.warning(),
+                    ));
+                }
+                if let Some(backoff) = &goal.provider_backoff {
+                    lines.push(padded(
+                        &format!(
+                            "  provider retry {}/{} · {} · at {}",
+                            backoff.next_attempt,
+                            backoff.max_attempts,
+                            backoff.reason,
+                            backoff.retry_at_ms
+                        ),
+                        width,
+                        self.context.warning(),
+                    ));
+                }
+                for request in goal.pending_human_requests.iter().take(3) {
+                    let summary = request.summary.as_deref().unwrap_or(&request.id);
+                    for row in wrap(summary, usize::from(width).saturating_sub(4), 2) {
+                        lines.push(padded(
+                            &format!("  ? {} · {row}", request.kind),
+                            width,
+                            self.context.warning(),
+                        ));
+                    }
+                }
+                let usage = goal.token_budget.map_or_else(
+                    || span_usage(&goal.span),
+                    |budget| {
+                        if goal.span.accounting_known {
+                            format!(
+                                "{} / {} tokens",
+                                compact(goal.span.usage.total()),
+                                compact(budget.max(0) as u64)
+                            )
+                        } else {
+                            format!("— / {} tokens", compact(budget.max(0) as u64))
+                        }
+                    },
+                );
+                lines.push(padded(
+                    &format!("  {} · {usage}", span_duration(&goal.span)),
+                    width,
+                    self.context.secondary(),
+                ));
+            }
+        }
+
+        if let Some(plan) = &self.ambient.work.plan {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Plan));
+            let completed = plan
+                .steps
+                .iter()
+                .filter(|step| step.status == "completed")
+                .count();
+            lines.push(self.heading(
+                "Plan",
+                &format!("{completed}/{} complete", plan.steps.len()),
+                self.disclosure(self.expanded.plan),
+                width,
+            ));
+            if self.expanded.plan {
+                lines.push(padded(
+                    &format!("  {} · r{}", plan.title, plan.revision),
+                    width,
+                    self.context.text(),
+                ));
+                lines.push(padded(
+                    &format!(
+                        "  {} · {}",
+                        span_duration(&plan.span),
+                        span_usage(&plan.span)
+                    ),
+                    width,
+                    self.context.secondary(),
+                ));
+                for step in &plan.steps {
+                    let (glyph, style) = match step.status.as_str() {
+                        "completed" => ("✓", self.context.muted()),
+                        "in_progress" => ("◐", self.context.accent()),
+                        "blocked" => ("!", self.context.warning()),
+                        "cancelled" => ("×", self.context.muted()),
+                        _ => ("○", self.context.text()),
+                    };
+                    lines.push(padded(&format!("  {glyph} {}", step.title), width, style));
+                }
+            }
+        }
+
+        if !self.ambient.work.todos.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Todos));
+            let active = self
+                .ambient
+                .work
+                .todos
+                .iter()
+                .filter(|todo| todo.status == "in_progress")
+                .count();
+            lines.push(self.heading(
+                "Todos",
+                &format!("{active}/{} active", self.ambient.work.todos.len()),
+                self.disclosure(self.expanded.todos),
+                width,
+            ));
+            if self.expanded.todos {
+                for todo in &self.ambient.work.todos {
+                    let (glyph, style) = match todo.status.as_str() {
+                        "completed" => ("✓", self.context.muted()),
+                        "in_progress" => ("◐", self.context.accent()),
+                        "blocked" => ("!", self.context.warning()),
+                        "cancelled" => ("×", self.context.muted()),
+                        _ => ("○", self.context.text()),
+                    };
+                    let label = if todo.status == "in_progress" {
+                        todo.active_form.as_deref().unwrap_or(&todo.subject)
+                    } else {
+                        &todo.subject
+                    };
+                    lines.push(padded(&format!("  {glyph} {label}"), width, style));
+                    let details = match &todo.owner {
+                        Some(owner) => {
+                            format!("    {} · {owner} · r{}", todo.priority, todo.revision)
+                        }
+                        None => format!("    {} · r{}", todo.priority, todo.revision),
+                    };
+                    lines.push(padded(&details, width, self.context.muted()));
+                    lines.push(padded(
+                        &format!(
+                            "    {} · {}",
+                            span_duration(&todo.span),
+                            span_usage(&todo.span)
+                        ),
+                        width,
+                        self.context.secondary(),
+                    ));
+                }
+            }
+        }
+
+        if !self.ambient.work.background_executions.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Background));
+            let running = self
+                .ambient
+                .work
+                .background_executions
+                .iter()
+                .filter(|execution| execution.status == "running")
+                .count();
+            lines.push(self.heading(
+                "Background",
+                &format!(
+                    "{running}/{} running · /ps",
+                    self.ambient.work.background_executions.len()
+                ),
+                self.disclosure(self.expanded.background),
+                width,
+            ));
+            if self.expanded.background {
+                for execution in &self.ambient.work.background_executions {
+                    let (glyph, style) = match execution.status.as_str() {
+                        "running" => ("◐", self.context.accent()),
+                        "completed" => ("✓", self.context.text()),
+                        "cancelled" => ("×", self.context.muted()),
+                        "uncertain" => ("?", self.context.warning()),
+                        _ => ("!", self.context.error()),
+                    };
+                    lines.push(padded(
+                        &format!("  {glyph} {} · {}", execution.title, execution.status),
+                        width,
+                        style,
+                    ));
+                    let process = execution.pid.map_or_else(
+                        || span_duration(&execution.span),
+                        |pid| format!("pid {pid} · {}", span_duration(&execution.span)),
+                    );
+                    lines.push(padded(
+                        &format!("    {process}"),
+                        width,
+                        self.context.secondary(),
+                    ));
+                    for row in wrap(&execution.command, usize::from(width).saturating_sub(4), 1) {
+                        lines.push(padded(&format!("    {row}"), width, self.context.muted()));
+                    }
+                    if let Some(error) = execution.error.as_deref() {
+                        for row in wrap(error, usize::from(width).saturating_sub(4), 2) {
+                            lines.push(padded(
+                                &format!("    ! {row}"),
+                                width,
+                                self.context.error(),
+                            ));
+                        }
+                    }
+                }
+                lines.push(padded(
+                    "  /ps to inspect output",
+                    width,
+                    self.context.secondary(),
+                ));
+            }
+        }
+
+        if !self.ambient.agents.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Agents));
+            let running = self
+                .ambient
+                .agents
+                .iter()
+                .filter(|agent| matches!(agent.state.as_str(), "running" | "cancelling"))
+                .count();
+            let pending = self
+                .ambient
+                .agents
+                .iter()
+                .filter(|agent| agent.state == "pending")
+                .count();
+            let subagent_shortcut =
+                crate::views::pressable_label("session_child_first", &self.context)
+                    .unwrap_or_else(|| "/subagent".to_owned());
+            let summary = if pending == 0 {
+                format!(
+                    "{running} running · {} total · {subagent_shortcut}",
+                    self.ambient.agents.len()
+                )
+            } else {
+                format!(
+                    "{pending} pending · {running} running · {} total · {subagent_shortcut}",
+                    self.ambient.agents.len()
+                )
+            };
+            lines.push(self.heading(
+                "Agents",
+                &summary,
+                self.disclosure(self.expanded.agents),
+                width,
+            ));
+            if self.expanded.agents {
+                for agent in &self.ambient.agents {
+                    lines.push(padded(
+                        &format!("  {}", agent.headline(usize::from(width).saturating_sub(2))),
+                        width,
+                        self.agent_style(&agent.state),
+                    ));
+                    let location = agent
+                        .job_id
+                        .as_deref()
+                        .map(|id| format!("job {id}"))
+                        .or_else(|| {
+                            agent
+                                .session_id
+                                .as_deref()
+                                .map(|id| format!("session {id}"))
+                        })
+                        .unwrap_or_else(|| "foreground".to_owned());
+                    lines.push(padded(
+                        &format!("    {} · {location}", agent.state),
+                        width,
+                        self.context.secondary(),
+                    ));
+                }
+                lines.push(padded(
+                    &format!("  {subagent_shortcut} to inspect details"),
+                    width,
+                    self.context.secondary(),
+                ));
+            }
+        }
+
+        if !self.ambient.work.jobs.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Jobs));
+            let running = self
+                .ambient
+                .work
+                .jobs
+                .iter()
+                .filter(|job| job.status == "running")
+                .count();
+            let queued = self
+                .ambient
+                .work
+                .jobs
+                .iter()
+                .filter(|job| job.status == "queued")
+                .count();
+            let subagent_shortcut =
+                crate::views::pressable_label("session_child_first", &self.context)
+                    .unwrap_or_else(|| "/subagent".to_owned());
+            lines.push(self.heading(
+                "Jobs",
+                &format!(
+                    "{queued} queued · {running} running · {} total · {subagent_shortcut}",
+                    self.ambient.work.jobs.len(),
+                ),
+                self.disclosure(self.expanded.jobs),
+                width,
+            ));
+            if self.expanded.jobs {
+                for job in &self.ambient.work.jobs {
+                    let (glyph, style) = match job.status.as_str() {
+                        "queued" => ("○", self.context.secondary()),
+                        "running" => ("◐", self.context.accent()),
+                        "failed" => ("✗", self.context.error()),
+                        "uncertain" => ("?", self.context.warning()),
+                        "cancelled" => ("×", self.context.muted()),
+                        "completed" => ("✓", self.context.text()),
+                        _ => ("!", self.context.error()),
+                    };
+                    let subject = match &job.subject {
+                        zuno_types::JobSubjectProjection::ChildSession { session_id } => {
+                            format!("child {session_id}")
+                        }
+                        zuno_types::JobSubjectProjection::ProductAgent {
+                            product,
+                            instance,
+                            ..
+                        } => format!("{product} · {instance}"),
+                        zuno_types::JobSubjectProjection::Workflow { workflow, .. } => {
+                            format!("workflow · {workflow}")
+                        }
+                        zuno_types::JobSubjectProjection::Council { preset, .. } => {
+                            format!("council · {preset}")
+                        }
+                    };
+                    lines.push(padded(&format!("  {glyph} {subject}"), width, style));
+                    lines.push(padded(
+                        &format!(
+                            "    {} · {} · {}",
+                            job.status,
+                            span_duration(&job.span),
+                            span_usage(&job.span)
+                        ),
+                        width,
+                        self.context.secondary(),
+                    ));
+                    if !job.children.is_empty() {
+                        let completed = job
+                            .children
+                            .iter()
+                            .filter(|child| child.status == "completed")
+                            .count();
+                        let running = job
+                            .children
+                            .iter()
+                            .filter(|child| {
+                                matches!(child.status.as_str(), "in_progress" | "running")
+                            })
+                            .count();
+                        let noun = match job.subject {
+                            zuno_types::JobSubjectProjection::Council { .. } => "seats",
+                            _ => "nodes",
+                        };
+                        lines.push(padded(
+                            &format!(
+                                "    {completed}/{} {noun} done · {running} running",
+                                job.children.len()
+                            ),
+                            width,
+                            self.context.secondary(),
+                        ));
+                        for child in &job.children {
+                            let (glyph, style) = match child.status.as_str() {
+                                "completed" => ("✓", self.context.muted()),
+                                "in_progress" | "running" => ("◐", self.context.accent()),
+                                "blocked" => ("!", self.context.warning()),
+                                "failed" | "uncertain" => ("✗", self.context.error()),
+                                "cancelled" => ("×", self.context.muted()),
+                                _ => ("○", self.context.text()),
+                            };
+                            lines.push(padded(
+                                &format!("    {glyph} {} · {}", child.subject, child.status),
+                                width,
+                                style,
+                            ));
+                            let owner = child.owner.as_deref().unwrap_or("unassigned");
+                            lines.push(padded(
+                                &format!(
+                                    "      {owner} · {} · {}",
+                                    span_duration(&child.span),
+                                    span_usage(&child.span)
+                                ),
+                                width,
+                                self.context.secondary(),
+                            ));
+                        }
+                    }
+                }
+                let inspect_hint = if subagent_shortcut == "/subagent" {
+                    "  /subagent to inspect details".to_owned()
+                } else {
+                    format!("  {subagent_shortcut} or /subagent to inspect")
+                };
+                lines.push(padded(&inspect_hint, width, self.context.secondary()));
+            }
+        }
+
+        if !self.ambient.work.memory_candidates.is_empty()
+            || !self.ambient.work.memory_entries.is_empty()
+        {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Memory));
+            let review = self
+                .ambient
+                .work
+                .memory_candidates
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate.status,
+                        zuno_types::MemoryCandidateStatus::Pending
+                            | zuno_types::MemoryCandidateStatus::Failed
+                            | zuno_types::MemoryCandidateStatus::Uncertain
+                    )
+                })
+                .count();
+            let active = self
+                .ambient
+                .work
+                .memory_candidates
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate.status,
+                        zuno_types::MemoryCandidateStatus::Applying
+                            | zuno_types::MemoryCandidateStatus::Undoing
+                    )
+                })
+                .count();
+            let summary = if active == 0 {
+                format!(
+                    "{review} review · {} saved",
+                    self.ambient.work.memory_entries.len()
+                )
+            } else {
+                format!(
+                    "{review} review · {active} active · {} saved",
+                    self.ambient.work.memory_entries.len()
+                )
+            };
+            lines.push(self.heading(
+                "Memory",
+                &summary,
+                self.disclosure(self.expanded.memory),
+                width,
+            ));
+            if self.expanded.memory {
+                for candidate in self
+                    .ambient
+                    .work
+                    .memory_candidates
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            candidate.status,
+                            zuno_types::MemoryCandidateStatus::Pending
+                                | zuno_types::MemoryCandidateStatus::Applying
+                                | zuno_types::MemoryCandidateStatus::Undoing
+                                | zuno_types::MemoryCandidateStatus::Failed
+                                | zuno_types::MemoryCandidateStatus::Uncertain
+                        )
+                    })
+                {
+                    let content = candidate
+                        .content
+                        .as_deref()
+                        .or(candidate.old_text.as_deref())
+                        .unwrap_or(candidate.reason.as_str());
+                    let style = match candidate.status {
+                        zuno_types::MemoryCandidateStatus::Pending => self.context.warning(),
+                        zuno_types::MemoryCandidateStatus::Applying
+                        | zuno_types::MemoryCandidateStatus::Undoing => self.context.accent(),
+                        zuno_types::MemoryCandidateStatus::Failed
+                        | zuno_types::MemoryCandidateStatus::Uncertain => self.context.error(),
+                        _ => self.context.muted(),
+                    };
+                    lines.push(padded(
+                        &format!(
+                            "  {} {} · {}",
+                            candidate.scope.as_str(),
+                            candidate.action.as_str(),
+                            content
+                        ),
+                        width,
+                        style,
+                    ));
+                }
+                for entry in &self.ambient.work.memory_entries {
+                    lines.push(padded(
+                        &format!("  ✓ {} · {}", entry.scope.as_str(), entry.content),
+                        width,
+                        self.context.muted(),
+                    ));
+                }
+            }
+        }
+
+        if !self.ambient.lsp.is_empty() {
+            lines.push(blank());
+            headers.push((lines.len(), Section::Lsp));
+            lines.push(self.heading(
+                "LSP",
+                &Self::summarise(&self.ambient.lsp),
+                self.disclosure(self.expanded.lsp),
+                width,
+            ));
+            if self.expanded.lsp {
+                for service in &self.ambient.lsp {
+                    lines.push(self.service_row(service, width));
+                }
+            }
+        }
+
+        lines.push(blank());
+        headers.push((lines.len(), Section::Mcp));
+        lines.push(self.heading(
+            "MCP",
+            &Self::summarise(&self.ambient.mcp),
+            self.disclosure(self.expanded.mcp),
+            width,
+        ));
+        if self.expanded.mcp {
+            if self.ambient.mcp.is_empty() {
+                lines.push(padded("  none configured", width, self.context.muted()));
+            } else {
+                for service in &self.ambient.mcp {
+                    lines.push(self.service_row(service, width));
+                }
+            }
+        }
+
+        lines.push(blank());
+        headers.push((lines.len(), Section::Skills));
+        let loaded = self
+            .ambient
+            .skills
+            .iter()
+            .filter(|skill| skill.loaded)
+            .count();
+        let skill_summary = if self.ambient.skills.is_empty() {
+            Self::tally(0)
+        } else {
+            format!("{loaded}/{} loaded", self.ambient.skills.len())
+        };
+        lines.push(self.heading(
+            "Skills",
+            &skill_summary,
+            self.disclosure(self.expanded.skills),
+            width,
+        ));
+        if self.expanded.skills {
+            if self.ambient.skills.is_empty() {
+                lines.push(padded("  none discovered", width, self.context.muted()));
+            } else {
+                let mut loaded_skills = self
+                    .ambient
+                    .skills
+                    .iter()
+                    .filter(|skill| skill.loaded)
+                    .collect::<Vec<_>>();
+                let mut unloaded_skills = self
+                    .ambient
+                    .skills
+                    .iter()
+                    .filter(|skill| !skill.loaded)
+                    .collect::<Vec<_>>();
+                let by_name = |left: &&SkillSummary, right: &&SkillSummary| {
+                    left.name
+                        .to_ascii_lowercase()
+                        .cmp(&right.name.to_ascii_lowercase())
+                        .then_with(|| left.name.cmp(&right.name))
+                        .then_with(|| left.source.cmp(&right.source))
+                };
+                loaded_skills.sort_by(by_name);
+                unloaded_skills.sort_by(by_name);
+
+                if !loaded_skills.is_empty() {
+                    lines.push(padded(
+                        &format!("  Loaded ({})", loaded_skills.len()),
+                        width,
+                        self.context.accent().add_modifier(Modifier::BOLD),
+                    ));
+                    for skill in loaded_skills {
+                        let label = self.skill_label(skill);
+                        lines.push(padded(
+                            &format!("    ✓ {label} · loaded"),
+                            width,
+                            self.context.accent().add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
+                if !unloaded_skills.is_empty() {
+                    lines.push(padded(
+                        &format!("  Not loaded ({})", unloaded_skills.len()),
+                        width,
+                        self.context.muted().add_modifier(Modifier::BOLD),
+                    ));
+                    for skill in unloaded_skills {
+                        let label = self.skill_label(skill);
+                        lines.push(padded(
+                            &format!("    · {label}"),
+                            width,
+                            self.context.text(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        PanelRows { lines, headers }
+    }
+
+    fn skill_label(&self, skill: &SkillSummary) -> String {
+        let ambiguous = self
+            .ambient
+            .skills
+            .iter()
+            .filter(|candidate| candidate.name == skill.name)
+            .count()
+            > 1;
+        if ambiguous {
+            format!("{} · {}", skill.name, skill.source)
+        } else {
+            skill.name.clone()
+        }
+    }
+
+    /// The rows drawn at the very bottom of the panel, whatever the content above.
+    ///
+    /// Location and version are pinned there rather than at the top because they are
+    /// the two facts a user reads once and then stops looking at, and the top of the
+    /// panel is where the numbers that change belong.
+    #[must_use]
+    pub fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if let Some(directory) = &self.ambient.directory {
+            // The tail of a path is what identifies it, so an over-long one is cut at
+            // the front and marked. A path cut at the end keeps the part every sibling
+            // directory shares and discards the part that tells them apart.
+            lines.push(padded(
+                &elide_left(directory, usize::from(width)),
+                width,
+                self.context.muted(),
+            ));
+        }
+        if let Some(branch) = &self.ambient.branch {
+            // Its own condition, not nested under the directory. A branch is a fact about
+            // the checkout and stays true whether or not the host resolved a display path,
+            // and the nesting meant the one field that changes as a user works could be
+            // suppressed by the absence of the one that does not.
+            //
+            // Written `⑂ main`, spaced, where the status strip writes `⑂main` tight
+            // (`message.rs::BRANCH_GLYPH`). Both surfaces state the branch and the
+            // difference is deliberate: the strip compacts every segment because it shares
+            // one row with the turn state, while this panel owns the row and the space is
+            // what stops the glyph reading as part of the name.
+            lines.push(padded(
+                &format!("{BRANCH_GLYPH} {branch}"),
+                width,
+                self.context.muted(),
+            ));
+        }
+        if let Some(version) = &self.ambient.version {
+            let marker = "● ";
+            let label = truncate(
+                &format!("zuno {version}"),
+                usize::from(width).saturating_sub(display_width(marker)),
+            );
+            let used = display_width(marker) + display_width(&label);
+            lines.push(Line::from(vec![
+                Span::styled(marker, self.context.success()),
+                Span::styled(label, self.context.muted()),
+                Span::styled(
+                    " ".repeat(usize::from(width).saturating_sub(used)),
+                    self.context.surface(),
+                ),
+            ]));
+        }
+        lines
+    }
+}
+
+impl Component for SidebarView {
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        // Cleared before any early return, so a frame that draws nothing leaves no target
+        // behind. Every path below that does draw refills it.
+        self.hits.clear();
+        self.title_area = None;
+        self.body_area = None;
+        fill(frame.buffer_mut(), area, self.context.surface());
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // The left rule is the same split border the dialog host draws, so a panel and
+        // a prompt read as the same family of surface.
+        for y in area.top()..area.bottom() {
+            let cell = &mut frame.buffer_mut()[(area.left(), y)];
+            cell.set_style(
+                Style::new()
+                    .fg(self.context.palette().border_subtle.into())
+                    .bg(self.context.palette().background_panel.into()),
+            );
+            cell.set_symbol(ratatui::symbols::line::VERTICAL);
+        }
+        let inner = Rect {
+            x: area.left() + 2,
+            y: area.top(),
+            width: area.width.saturating_sub(3),
+            height: area.height,
+        };
+        if inner.width == 0 {
+            return;
+        }
+
+        let title = self.title_lines(inner.width);
+        let title_height = title.len().min(usize::from(inner.height));
+        let title_area = Rect {
+            height: u16::try_from(title_height).unwrap_or(inner.height),
+            ..inner
+        };
+        self.title_area = (title_area.width > 0 && title_area.height > 0).then_some(title_area);
+        let remaining = inner
+            .height
+            .saturating_sub(u16::try_from(title_height).unwrap_or(inner.height));
+        let footer_height = self
+            .footer_lines(inner.width)
+            .len()
+            .min(usize::from(remaining));
+        let body_height = inner
+            .height
+            .saturating_sub(u16::try_from(title_height).unwrap_or(inner.height))
+            .saturating_sub(u16::try_from(footer_height).unwrap_or(inner.height));
+        let provisional = self.rows(inner.width);
+        let scrollable = provisional.lines.len() > usize::from(body_height) && inner.width > 1;
+        let body_width = inner.width.saturating_sub(u16::from(scrollable));
+        let rows = if scrollable {
+            self.rows(body_width)
+        } else {
+            provisional
+        };
+        let footer = self.footer_lines(body_width);
+        let body = Rect {
+            y: inner
+                .y
+                .saturating_add(u16::try_from(title_height).unwrap_or(inner.height)),
+            width: body_width,
+            height: body_height,
+            ..inner
+        };
+        if title_height > 0 {
+            Paragraph::new(title.into_iter().take(title_height).collect::<Vec<_>>())
+                .style(self.context.surface())
+                .render(title_area, frame.buffer_mut());
+        }
+        self.body_area = Some(body);
+        self.content_height = rows.lines.len();
+        self.viewport_height = usize::from(body.height);
+        self.offset = self
+            .offset
+            .min(self.content_height.saturating_sub(self.viewport_height));
+        let body_rows = self.viewport_height;
+        // Recorded from `body_rows` — the count actually painted — not from `headers`. The
+        // panel is clipped by `take` whenever the pane is short, and a heading that was
+        // dropped has no row on screen for a click to land on. Recording it anyway would
+        // make the section below the fold answer to a click on whatever survived there.
+        if self.context.config.mouse {
+            self.hits = rows
+                .headers
+                .iter()
+                .filter(|(index, _)| {
+                    *index >= self.offset && *index < self.offset.saturating_add(body_rows)
+                })
+                .filter_map(|(index, section)| {
+                    let offset = u16::try_from(index.saturating_sub(self.offset)).ok()?;
+                    Some((
+                        Rect {
+                            y: body.y.checked_add(offset)?,
+                            height: 1,
+                            // The whole panel row, not just the heading's own columns: the
+                            // rule and the two-column indent belong to no other control.
+                            x: area.x,
+                            width: area.width,
+                        },
+                        *section,
+                    ))
+                })
+                .collect();
+        }
+        let visible = rows
+            .lines
+            .into_iter()
+            .skip(self.offset)
+            .take(body_rows)
+            .collect::<Vec<_>>();
+        Paragraph::new(visible)
+            .style(self.context.surface())
+            .render(body, frame.buffer_mut());
+
+        if let Some(selection) = self.selection {
+            let selected = self.context.selected();
+            if let Some(title) = self.title_area {
+                for visible_row in 0..title.height {
+                    let content_row = usize::from(visible_row);
+                    let Some((left, right)) = selection.columns(content_row, title.width) else {
+                        continue;
+                    };
+                    for column in left..right {
+                        frame.buffer_mut()[(title.x + column, title.y + visible_row)]
+                            .set_style(selected);
+                    }
+                }
+            }
+            for visible_row in 0..body.height {
+                let content_row = title_height
+                    .saturating_add(self.offset)
+                    .saturating_add(usize::from(visible_row));
+                let Some((left, right)) = selection.columns(content_row, body.width) else {
+                    continue;
+                };
+                for column in left..right {
+                    frame.buffer_mut()[(body.x + column, body.y + visible_row)].set_style(selected);
+                }
+            }
+        }
+
+        if scrollable && body.height > 0 {
+            let track_x = body.right();
+            let track = self.context.muted();
+            for row in body.top()..body.bottom() {
+                frame.buffer_mut()[(track_x, row)]
+                    .set_style(track)
+                    .set_symbol("│");
+            }
+            let thumb = usize::from(body.height)
+                .saturating_mul(self.viewport_height)
+                .checked_div(self.content_height.max(1))
+                .unwrap_or(1)
+                .max(1)
+                .min(usize::from(body.height));
+            let travel = usize::from(body.height).saturating_sub(thumb);
+            let max = self.content_height.saturating_sub(self.viewport_height);
+            let start = self
+                .offset
+                .saturating_mul(travel)
+                .checked_div(max)
+                .unwrap_or(0);
+            for row in start..start.saturating_add(thumb) {
+                let Ok(row) = u16::try_from(row) else {
+                    break;
+                };
+                frame.buffer_mut()[(track_x, body.y + row)]
+                    .set_style(self.context.accent())
+                    .set_symbol("█");
+            }
+        }
+
+        if footer.is_empty() {
+            return;
+        }
+        let Ok(height) = u16::try_from(footer.len()) else {
+            return;
+        };
+        if height > inner.height {
+            return;
+        }
+        let region = Rect {
+            y: inner.bottom() - height,
+            height,
+            width: body_width,
+            ..inner
+        };
+        Paragraph::new(footer)
+            .style(self.context.surface())
+            .render(region, frame.buffer_mut());
+    }
+
+    fn handle_event(&mut self, _event: &AppEvent) -> EventResult {
+        // Token usage reaches the panel through its owner, which already folds the
+        // provider stream for the transcript; folding it twice would be two copies of
+        // the same running total drifting apart.
+        EventResult::IGNORED
+    }
+}

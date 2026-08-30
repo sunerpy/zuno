@@ -1,0 +1,24 @@
+/target
+/examples/plugins/wasi-word-count/plugin.wasm
+
+# Release archives and the unpacked artifact `make smoke-artifact` exercises.
+# Build outputs, never source.
+/dist
+
+# Local agent working directories. These hold a maintainer's own plans,
+# measurement transcripts, and reference clones of the projects this design
+# draws on. They are private working material, never distributed source, and
+# nothing under `crates/` or `docs/` may depend on a path inside them.
+.omo/
+.zuno/
+
+*.pdb
+.DS_Store
+
+# CodeGraph's local index: a derived artifact of this checkout, like /target.
+# Rebuilt by `codegraph init`; never a source of truth.
+/.codegraph
+
+# Scratch directories reviewers and subagents create while probing this checkout
+# (LSP sandboxes, worktree-scoped temp dirs). Derived, never source.
+/.tmp-*

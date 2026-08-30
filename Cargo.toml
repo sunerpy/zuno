@@ -1,0 +1,350 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/sunerpy/zuno"
+authors = ["sunerpy <nkuzhangshn@gmail.com>"]
+publish = false
+
+# The central safety guarantee of this workspace. Every crate opts in via
+# `[lints] workspace = true`; a crate that omits that key silently loses the
+# guarantee, so the omission is treated as a review defect.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# ---------------------------------------------------------------------------
+# Shared dependencies.
+#
+# Every third-party version lives here exactly once. Member crates reference
+# them as `dep = { workspace = true }` and NEVER restate a version; a crate that
+# needs extra cargo features adds them additively alongside the inheritance,
+# e.g. `tokio = { workspace = true, features = ["test-util"] }`.
+#
+# This is deliberately the opposite of the reference implementation in
+# `claw-code`, which hoists only `serde_json` and then
+# re-declares `reqwest` and `tokio` five to six times across its crates with
+# divergent feature sets.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+
+# -- first-party crates (path-only; the workspace is not published) ----------
+zuno-acp = { path = "crates/zuno-acp" }
+zuno-agent = { path = "crates/zuno-agent" }
+zuno-auth = { path = "crates/zuno-auth" }
+zuno-catalog = { path = "crates/zuno-catalog" }
+zuno-cli = { path = "crates/zuno-cli" }
+zuno-config = { path = "crates/zuno-config" }
+zuno-db = { path = "crates/zuno-db" }
+zuno-engine = { path = "crates/zuno-engine" }
+zuno-error = { path = "crates/zuno-error" }
+zuno-extension = { path = "crates/zuno-extension" }
+zuno-goal = { path = "crates/zuno-goal" }
+zuno-harness = { path = "crates/zuno-harness" }
+zuno-llm = { path = "crates/zuno-llm" }
+zuno-lsp = { path = "crates/zuno-lsp" }
+zuno-mcp = { path = "crates/zuno-mcp" }
+zuno-memory = { path = "crates/zuno-memory" }
+zuno-network = { path = "crates/zuno-network" }
+zuno-observability = { path = "crates/zuno-observability" }
+zuno-orchestration = { path = "crates/zuno-orchestration" }
+zuno-paths = { path = "crates/zuno-paths" }
+zuno-permission = { path = "crates/zuno-permission" }
+zuno-process = { path = "crates/zuno-process" }
+zuno-product-agent = { path = "crates/zuno-product-agent" }
+zuno-provider-anthropic = { path = "crates/zuno-provider-anthropic" }
+zuno-provider-bedrock = { path = "crates/zuno-provider-bedrock" }
+zuno-provider-compatible = { path = "crates/zuno-provider-compatible" }
+zuno-provider-google = { path = "crates/zuno-provider-google" }
+zuno-provider-openai = { path = "crates/zuno-provider-openai" }
+zuno-pty = { path = "crates/zuno-pty" }
+zuno-runtime = { path = "crates/zuno-runtime" }
+zuno-search = { path = "crates/zuno-search" }
+zuno-sandbox = { path = "crates/zuno-sandbox" }
+zuno-server = { path = "crates/zuno-server" }
+zuno-snapshot = { path = "crates/zuno-snapshot" }
+zuno-testkit = { path = "crates/zuno-testkit" }
+zuno-tool = { path = "crates/zuno-tool" }
+zuno-tools = { path = "crates/zuno-tools" }
+zuno-tui = { path = "crates/zuno-tui" }
+zuno-types = { path = "crates/zuno-types" }
+zuno-watch = { path = "crates/zuno-watch" }
+
+# -- async runtime ----------------------------------------------------------
+async-trait = "0.1.91"
+futures = "0.3.33"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["io", "codec"] }
+
+# -- HTTP client ------------------------------------------------------------
+# `default-features = false` is mandatory: reqwest's default TLS is native-tls,
+# which links OpenSSL. TLS therefore comes from rustls only.
+#
+# NOTE for todo 91: reqwest 0.13 renamed the 0.12-era `rustls-tls` feature to
+# `rustls`, and that feature selects the `aws-lc-rs` crypto provider, which
+# builds C. See the project's engineering notes (task 1) — the
+# "no C toolchain in a default build" constraint is not satisfiable by any
+# production-grade Rust TLS stack and is todo 91's call, not a silent default.
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "form",
+  "json",
+  "stream",
+  "rustls",
+  "socks",
+  "charset",
+  "http2",
+] }
+url = "2.5.8"
+
+# -- serialization ----------------------------------------------------------
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.4"
+
+# -- errors and diagnostics -------------------------------------------------
+thiserror = "2.0.19"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+# -- allocator ---------------------------------------------------------------
+# Optional at the crate edge so `zuno-cli --no-default-features` remains the
+# system-allocator control used by the memory gates. The shipped/default CLI
+# enables it; MSVC stays on the platform allocator because tikv-jemallocator's
+# supported global-allocator configuration excludes that target environment.
+tikv-jemallocator = "=0.7.0"
+
+# -- CLI --------------------------------------------------------------------
+clap = { version = "4.6.5", features = ["derive", "env"] }
+clap_complete = "4.6.9"
+# GitHub release discovery, archive extraction, and platform-correct in-place
+# replacement for `zuno self-update`. The command verifies Zuno's published
+# SHA256SUMS itself before exposing the extracted executable to self-replace.
+# Keep reqwest + rustls explicit so this reuses the workspace's TLS stack and
+# never introduces native-tls/OpenSSL.
+self-replace = "1.5.0"
+self_update = { version = "=1.0.0-rc.6", default-features = false, features = [
+  "reqwest",
+  "rustls",
+  "github",
+  "progress-bar",
+  "archive-tar",
+  "archive-zip",
+  "compression-tar-gz",
+  "compression-zip-deflate",
+] }
+
+# -- HTTP server ------------------------------------------------------------
+axum = "0.8.9"
+hyper = { version = "1.11.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+tower = { version = "0.5.3", features = ["util", "timeout"] }
+tower-http = { version = "0.7.0", features = ["fs", "trace", "cors"] }
+
+# -- terminal UI ------------------------------------------------------------
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", features = ["serde"] }
+terminal-colorsaurus = "=1.0.3"
+# CommonMark parsing for the transcript's assistant bodies (plan §7.1). A *pull*
+# parser rather than an AST builder is what the renderer wants: the events arrive
+# in document order, so a body becomes rows in one pass with no intermediate tree
+# to own. `default-features = false` drops `getopts` (the crate's own CLI) and
+# `html` (which pulls `pulldown-cmark-escape` to emit HTML we never emit) — the
+# only added crate in the resolved graph is `unicase`, since `bitflags` and
+# `memchr` are already there.
+pulldown-cmark = { version = "0.13.3", default-features = false }
+
+# -- pseudo-terminals -------------------------------------------------------
+# One crate covering unix `openpty` and Windows ConPTY, compiled into the binary.
+# The oracle instead loads a per-platform native addon at runtime — `bun-pty`
+# (`core/src/pty/pty.bun.ts`) or `@lydell/node-pty` (`pty.node.ts`) — so there is
+# no `.node` file to ship here and no `hasNativeBinding()` case to degrade into.
+#
+# It is the *only* dependency that lets `zuno-pty` honour this workspace's
+# `unsafe_code = "forbid"`: creating a pty is `posix_openpt`/`grantpt` on unix and
+# `CreatePseudoConsole` on Windows, both of which are `unsafe` FFI. Verified by
+# building a probe crate that itself set `unsafe_code = "forbid"` against
+# portable-pty 0.9.0 — it compiled, spawned `sh`, read its output, observed exit
+# code 7, and resized, with no `unsafe` in the probe. A hand-rolled `forkpty` or a
+# raw `libc`/`nix` fd dance cannot satisfy that lint at all.
+#
+# Pinned exactly: the pty is the one subsystem where a patch-level behaviour
+# change (EOF timing, signal-to-exit-code mapping) would silently alter what a
+# session reports, and those are precisely the properties `zuno-pty`'s tests assert.
+portable-pty = "=0.9.0"
+
+nix = { version = "=0.30.1", features = ["user"] }
+process-wrap = { version = "=9.0.1", default-features = false, features = [
+  "job-object",
+  "std",
+] }
+rustix = { version = "=1.1.4", features = ["process"] }
+signal-hook = "=0.4.1"
+
+# -- filesystem, search, watching -------------------------------------------
+dirs = "6.0.0"
+globset = "0.4.20"
+ignore = "0.4.33"
+notify = "8.2.0"
+tree-sitter = "0.26.11"
+tree-sitter-bash = "0.25.1"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-highlight = "=0.26.11"
+tree-sitter-go = "=0.25.0"
+tree-sitter-java = "=0.23.5"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-json = "=0.24.8"
+tree-sitter-md = "=0.5.3"
+tree-sitter-php = "=0.24.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-powershell = "0.26.4"
+tree-sitter-ruby = "=0.23.1"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-yaml = "=0.7.2"
+walkdir = "2.5.0"
+which = "8.0.5"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+wasmtime = { version = "48.0.0", default-features = false, features = [
+  "anyhow",
+  "component-model",
+  "cranelift",
+  "runtime",
+  "std",
+  "wat",
+] }
+wasmtime-wasi = { version = "48.0.0", default-features = false, features = ["p2"] }
+
+# Already in the lockfile as `insta`'s own diff engine, so naming it directly adds
+# no crate and no new download. It gives the tool layer a maintained unified-diff
+# implementation instead of a hand-rolled Myers implementation.
+similar = "2.7.0"
+
+# -- storage ----------------------------------------------------------------
+# `bundled` compiles a pinned SQLite amalgamation, keeping pragma, FTS, migration,
+# and WAL behavior consistent across supported hosts. `cc` is therefore an
+# accepted build requirement; cross builds use `cargo-zigbuild`.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+# -- primitives -------------------------------------------------------------
+# Already in the tree: reqwest's `rustls` feature selects aws-lc-rs as rustls'
+# crypto provider (see the HTTP client note above), so pinning it here adds no
+# crate and no new C build — it only makes RSA-PKCS1-SHA256 reachable, which is
+# what lets GCP service-account JWTs be signed in process instead of by piping a
+# temp-file private key through the `openssl` binary. Keep this version in
+# lockstep with rustls' choice, or the build forks two copies of aws-lc-sys.
+#
+# `default-features = false` drops `ring-io` and `ring-sig-verify`, whose only
+# effect here would be to add a second `untrusted` major version to the lock for
+# a *ring*-compatibility shim this crate never calls. `Cargo.lock` therefore
+# gains no package at all from this dependency.
+aws-lc-rs = { version = "1.17.3", default-features = false, features = [
+  "aws-lc-sys",
+  "alloc",
+] }
+base64 = "0.23.1"
+# `zuno-memory`'s prompt-injection scanner runs on every memory write and needs a
+# matcher with a guaranteed linear-time bound. The crate compiles patterns to a
+# finite automaton and cannot backtrack, so adversarial near-misses cannot turn the
+# scan into a denial of service.
+regex = "1.13.1"
+hex = "0.4.3"
+libc = "0.2.189"
+seccompiler = "0.5.0"
+sha2 = "0.11.0"
+time = { version = "0.3.55", features = [
+  "formatting",
+  "parsing",
+  "macros",
+  "local-offset",
+] }
+uuid = { version = "1.24.0", features = ["v4", "v7", "serde"] }
+# Terminal cell width. A CJK glyph occupies two columns, so a row padded by
+# character count overflows its frame by one column per wide glyph — measured as
+# a skill description running past the right edge and wrapping the frame. Already
+# in the lock file through ratatui, so naming it here adds no download.
+unicode-width = "0.2.2"
+# Already in the resolved graph through `ratatui-core`, so naming it directly adds
+# no crate and no download. Needed because `chars()` splits a ZWJ emoji and a
+# combining mark into pieces a terminal cannot draw; the markdown renderer breaks
+# an over-long word at *cluster* boundaries instead.
+unicode-segmentation = "1.13.3"
+
+# -- test-only --------------------------------------------------------------
+insta = { version = "1.48.0", features = ["json", "yaml", "redactions"] }
+proptest = "1.11.0"
+tempfile = "3.27.0"
+wiremock = "0.6.5"
+
+# ---------------------------------------------------------------------------
+# Profiles.
+#
+# `line-tables-only` keeps file/line in panics and backtraces — which is what a
+# long-running agent actually needs from a debug build — while linking far
+# faster than full debuginfo.
+# ---------------------------------------------------------------------------
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+# Keep the terminal render stack optimized even in dev and test builds.
+#
+# Every TUI frame walks ratatui buffers cell-by-cell and re-measures visible
+# text with unicode-width / unicode-segmentation / unicode-truncate. At
+# opt-level = 0 those inner loops dominate the frame budget and read as
+# input-line lag while a response streams. These are stable third-party crates
+# that almost never recompile, so pinning them costs one compile and removes the
+# lag. Technique taken from `jcode`.
+[profile.dev.package.ratatui]
+opt-level = 3
+[profile.test.package.ratatui]
+opt-level = 3
+
+[profile.dev.package.ratatui-core]
+opt-level = 3
+[profile.test.package.ratatui-core]
+opt-level = 3
+
+[profile.dev.package.ratatui-widgets]
+opt-level = 3
+[profile.test.package.ratatui-widgets]
+opt-level = 3
+
+[profile.dev.package.ratatui-crossterm]
+opt-level = 3
+[profile.test.package.ratatui-crossterm]
+opt-level = 3
+
+[profile.dev.package.crossterm]
+opt-level = 3
+[profile.test.package.crossterm]
+opt-level = 3
+
+[profile.dev.package.unicode-width]
+opt-level = 3
+[profile.test.package.unicode-width]
+opt-level = 3
+
+[profile.dev.package.unicode-segmentation]
+opt-level = 3
+[profile.test.package.unicode-segmentation]
+opt-level = 3
+
+[profile.dev.package.unicode-truncate]
+opt-level = 3
+[profile.test.package.unicode-truncate]
+opt-level = 3

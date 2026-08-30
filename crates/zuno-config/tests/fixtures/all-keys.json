@@ -1,0 +1,342 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "shell": "/bin/zsh",
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": "deny",
+    "onUnavailable": "run-unconfined",
+    "writableRoots": ["../shared-cache"],
+    "protectedPaths": [".zuno", ".agents"]
+  },
+  "logLevel": "DEBUG",
+  "server": {
+    "port": 4096,
+    "hostname": "127.0.0.1",
+    "mdns": true,
+    "mdnsDomain": "zuno.local",
+    "cors": ["https://example.com"]
+  },
+  "command": {
+    "review": {
+      "template": "Review $ARGUMENTS",
+      "description": "Review a diff",
+      "agent": "plan",
+      "model": "anthropic/claude-sonnet-4-5",
+      "variant": "thinking",
+      "subtask": true
+    }
+  },
+  "skills": {
+    "paths": ["./skills", "~/.agents/skills"],
+    "urls": ["https://example.com/.well-known/skills/"],
+    "includeInstructions": true,
+    "maxContextTokens": 8000,
+    "maxSelectedContextTokens": 16000
+  },
+  "references": {
+    "shorthand": "github.com/sst/opencode",
+    "gitform": {
+      "repository": "https://github.com/sst/opencode.git",
+      "branch": "dev",
+      "description": "upstream",
+      "hidden": false
+    },
+    "localform": {
+      "path": "../sibling-repo",
+      "description": "the sibling",
+      "hidden": true
+    }
+  },
+  "watcher": {
+    "ignore": ["node_modules/**", "target/**"]
+  },
+  "snapshot": false,
+  "share": "manual",
+  "autoupdate": "notify",
+  "disabled_providers": ["openai"],
+  "enabled_providers": ["anthropic", "google"],
+  "model": "anthropic/claude-sonnet-4-5",
+  "small_model": "anthropic/claude-haiku-4-5",
+  "preset": "house",
+  "presets": {
+    "house": {
+      "agents": {
+        "orchestrator": {
+          "model": "anthropic/claude-sonnet-4-5",
+          "reasoning": "max"
+        },
+        "explore": "anthropic/claude-haiku-4-5"
+      },
+      "categories": {
+        "cheap": "anthropic/claude-haiku-4-5"
+      }
+    }
+  },
+  "default_agent": "build",
+  "subagent_depth": 0,
+  "username": "ada",
+  "agents": {
+    "build": {
+      "model": "anthropic/claude-sonnet-4-5",
+      "variant": "thinking",
+      "temperature": 0.2,
+      "top_p": 0.9,
+      "prompt": "{file:./prompts/build.md}",
+      "disable": false,
+      "description": "Write code",
+      "mode": "primary",
+      "hidden": false,
+      "options": { "reasoningEffort": "medium" },
+      "color": "#ff5733",
+      "steps": 120,
+      "requiredSkills": ["codegraph"],
+      "permission": {
+        "mode": "standard",
+        "rules": {
+          "edit": "allow",
+          "shell": { "git push": "ask", "*": "allow" }
+        }
+      }
+    },
+    "explore": {
+      "description": "Read-only survey",
+      "mode": "subagent",
+      "color": "accent",
+      "permission": {
+        "mode": "standard",
+        "rules": { "*": "deny" }
+      }
+    }
+  },
+  "workflows": {
+    "release-hardening": {
+      "maxParallel": 2,
+      "maxAgents": 2,
+      "nodes": [
+        {"id": "scan", "agent": "explore"},
+        {"id": "implement", "agent": "build", "dependsOn": ["scan"]}
+      ]
+    }
+  },
+  "provider": {
+    "anthropic": {
+      "api": "https://api.anthropic.com",
+      "name": "Anthropic",
+      "env": ["ANTHROPIC_API_KEY"],
+      "id": "anthropic",
+      "transport": "anthropic",
+      "surface": "messages",
+      "headers": { "X-Provider-Route": "anthropic" },
+      "whitelist": ["claude-sonnet-4-5"],
+      "blacklist": ["claude-2"],
+      "options": {
+        "apiKey": "{env:ANTHROPIC_API_KEY}",
+        "baseURL": "https://api.anthropic.com/v1",
+        "enterpriseUrl": "https://github.example.com",
+        "setCacheKey": true,
+        "timeout": 120000,
+        "headerTimeout": false,
+        "chunkTimeout": 30000,
+        "customSdkKnob": { "nested": true }
+      },
+      "models": {
+        "claude-sonnet-4-5": {
+          "id": "claude-sonnet-4-5",
+          "name": "Claude Sonnet 4.5",
+          "family": "claude",
+          "release_date": "2025-09-29",
+          "attachment": true,
+          "reasoning": true,
+          "temperature": true,
+          "tool_call": true,
+          "interleaved": { "field": "reasoning_content" },
+          "cost": {
+            "input": 3.0,
+            "output": 15.0,
+            "cache_read": 0.3,
+            "cache_write": 3.75,
+            "context_over_200k": {
+              "input": 6.0,
+              "output": 22.5,
+              "cache_read": 0.6,
+              "cache_write": 7.5
+            }
+          },
+          "limit": { "context": 1000000.0, "input": 900000.0, "output": 64000.0 },
+          "modalities": {
+            "input": ["text", "image", "pdf"],
+            "output": ["text"]
+          },
+          "experimental": false,
+          "status": "active",
+          "provider": {
+            "transport": "anthropic",
+            "surface": "messages",
+            "api": "https://api.anthropic.com"
+          },
+          "options": { "thinking": { "type": "enabled", "budgetTokens": 32000 } },
+          "headers": { "anthropic-beta": "context-1m-2025-08-07" },
+          "variants": {
+            "thinking": {
+              "disabled": false,
+              "options": { "reasoningEffort": "high" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "productAgent": {
+    "codex": {
+      "kind": "codex",
+      "enabled": true,
+      "command": "codex",
+      "toolName": "subagent_codex",
+      "permissionMode": "never",
+      "env": {
+        "HTTPS_PROXY": "http://127.0.0.1:7890"
+      }
+    }
+  },
+  "mcp": {
+    "local-one": {
+      "type": "local",
+      "command": ["uvx", "mcpdoc"],
+      "cwd": "./tools",
+      "environment": { "HTTP_PROXY": "http://127.0.0.1:1080" },
+      "enabled": true,
+      "timeout": 5000
+    },
+    "remote-one": {
+      "type": "remote",
+      "url": "https://knowledge-mcp.global.api.aws",
+      "enabled": true,
+      "headers": { "X-Api-Key": "{env:MCP_KEY}" },
+      "oauth": {
+        "clientId": "abc",
+        "clientSecret": "shh",
+        "scope": "mcp:read",
+        "callbackPort": 19876,
+        "redirectUri": "http://127.0.0.1:19876/mcp/oauth/callback"
+      },
+      "timeout": 10000
+    },
+    "remote-no-oauth": {
+      "type": "remote",
+      "url": "https://example.com/mcp",
+      "oauth": false
+    },
+    "inherited-off": { "enabled": false }
+  },
+  "formatter": {
+    "prettier": {
+      "disabled": false,
+      "command": ["prettier", "--write", "$FILE"],
+      "environment": { "NODE_OPTIONS": "--max-old-space-size=4096" },
+      "extensions": [".ts", ".tsx"]
+    }
+  },
+  "lsp": {
+    "rust": {
+      "command": ["rust-analyzer"],
+      "extensions": [".rs"],
+      "disabled": false,
+      "env": { "RA_LOG": "info" },
+      "initialization": { "cargo": { "allFeatures": true } }
+    },
+    "typescript": { "disabled": true },
+    "my-custom-server": {
+      "command": ["my-lsp", "--stdio"],
+      "extensions": [".mylang"]
+    }
+  },
+  "instructions": ["CONTRIBUTING.md", "docs/**/*.md"],
+  "permission": {
+    "mode": "strict",
+    "rules": {
+      "read": "allow",
+      "edit": { "src/**": "allow", "*": "ask" },
+      "glob": "allow",
+      "grep": "allow",
+      "list": "allow",
+      "shell": { "git status": "allow", "*": "ask" },
+      "task": "allow",
+      "external_directory": "ask",
+      "plan_get": "allow",
+      "plan_update": "allow",
+      "todo_get": "allow",
+      "todo_update": "allow",
+      "question": "ask",
+      "webfetch": "ask",
+      "web_search": "ask",
+      "lsp": "allow",
+      "doom_loop": "deny",
+      "skill": "allow"
+    }
+  },
+  "tools": {
+    "shell": true,
+    "webfetch": false
+  },
+  "attachment": {
+    "image": {
+      "auto_resize": true,
+      "max_width": 2000,
+      "max_height": 2000,
+      "max_base64_bytes": 5242880
+    }
+  },
+  "enterprise": { "url": "https://opencode.example.com" },
+  "web_search": {
+    "enabled": true,
+    "provider": "exa",
+    "max_queries": 4,
+    "max_results": 8,
+    "timeout_ms": 25000
+  },
+  "goal": {
+    "retry": {
+      "initial_delay_ms": 2000,
+      "max_delay_ms": 300000,
+      "jitter_percent": 20,
+      "poll_interval_ms": 250
+    }
+  },
+  "tool_output": { "max_lines": 2000, "max_bytes": 51200 },
+  "compaction": {
+    "auto": true,
+    "threshold_percent": 80,
+    "prune": false,
+    "tail_turns": 2,
+    "preserve_recent_tokens": 20000,
+    "reserved": 8000
+  },
+  "concurrency": {
+    "tool_calls": 8,
+    "delegations": 8,
+    "mcp_connections": 8,
+    "lsp_requests": 4
+  },
+  "memory": {
+    "resident": true,
+    "tool": true,
+    "reflection": true,
+    "global_char_limit": 2200,
+    "project_char_limit": 3000,
+    "nudge_interval": 10,
+    "promotion": "review",
+    "auto_confidence": 0.9
+  },
+  "experimental": {
+    "disable_paste_summary": true,
+    "batch_tool": true,
+    "openTelemetry": false,
+    "primary_tools": ["task"],
+    "continue_loop_on_deny": true,
+    "mcp_timeout": 15000,
+    "policies": [
+      { "action": "provider.use", "effect": "deny", "resource": "openai/*" },
+      { "action": "provider.use", "effect": "allow", "resource": "anthropic/*" }
+    ]
+  }
+}

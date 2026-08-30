@@ -1,0 +1,802 @@
+[
+  {
+    "id": "arguments-happy",
+    "template": "Input: $ARGUMENTS",
+    "arguments": "extra args",
+    "expanded": "Input: extra args",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "extra",
+      "args"
+    ]
+  },
+  {
+    "id": "arguments-empty",
+    "template": "Input: $ARGUMENTS",
+    "arguments": "",
+    "expanded": "Input:",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": []
+  },
+  {
+    "id": "arguments-whitespace-only",
+    "template": "Input: $ARGUMENTS",
+    "arguments": "   ",
+    "expanded": "Input:",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": []
+  },
+  {
+    "id": "third-of-two",
+    "template": "A=[$1] B=[$2] C=[$3]",
+    "arguments": "one two",
+    "expanded": "A=[one] B=[two] C=[]",
+    "hints": [
+      "$1",
+      "$2",
+      "$3"
+    ],
+    "tokens": [
+      "one",
+      "two"
+    ]
+  },
+  {
+    "id": "third-of-two-plus-args",
+    "template": "A=[$1] B=[$2] C=[$3] ALL=[$ARGUMENTS]",
+    "arguments": "one two",
+    "expanded": "A=[one] B=[two] C=[] ALL=[one two]",
+    "hints": [
+      "$1",
+      "$2",
+      "$3",
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "one",
+      "two"
+    ]
+  },
+  {
+    "id": "greedy-last-absorbs",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "one two three four",
+    "expanded": "A=[one] B=[two three four]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "one",
+      "two",
+      "three",
+      "four"
+    ]
+  },
+  {
+    "id": "single-placeholder-greedy",
+    "template": "only: $1",
+    "arguments": "one two three",
+    "expanded": "only: one two three",
+    "hints": [
+      "$1"
+    ],
+    "tokens": [
+      "one",
+      "two",
+      "three"
+    ]
+  },
+  {
+    "id": "descending-order",
+    "template": "B=[$2] A=[$1]",
+    "arguments": "one two three",
+    "expanded": "B=[two three] A=[one]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "one",
+      "two",
+      "three"
+    ]
+  },
+  {
+    "id": "repeated-placeholder",
+    "template": "$1 and $1 and $2",
+    "arguments": "x y z",
+    "expanded": "x and x and y z",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "x",
+      "y",
+      "z"
+    ]
+  },
+  {
+    "id": "gap-in-placeholders",
+    "template": "A=[$1] C=[$3]",
+    "arguments": "one two three four",
+    "expanded": "A=[one] C=[three four]",
+    "hints": [
+      "$1",
+      "$3"
+    ],
+    "tokens": [
+      "one",
+      "two",
+      "three",
+      "four"
+    ]
+  },
+  {
+    "id": "no-placeholder-with-args",
+    "template": "NO PLACEHOLDERS HERE",
+    "arguments": "trailing input",
+    "expanded": "NO PLACEHOLDERS HERE\n\ntrailing input",
+    "hints": [],
+    "tokens": [
+      "trailing",
+      "input"
+    ]
+  },
+  {
+    "id": "no-placeholder-no-args",
+    "template": "NO PLACEHOLDERS HERE",
+    "arguments": "",
+    "expanded": "NO PLACEHOLDERS HERE",
+    "hints": [],
+    "tokens": []
+  },
+  {
+    "id": "no-placeholder-blank-args",
+    "template": "NO PLACEHOLDERS HERE",
+    "arguments": "  \t ",
+    "expanded": "NO PLACEHOLDERS HERE",
+    "hints": [],
+    "tokens": []
+  },
+  {
+    "id": "tenth-placeholder",
+    "template": "T=[$10] ONE=[$1]",
+    "arguments": "a b c d e f g h i j k",
+    "expanded": "T=[j k] ONE=[a]",
+    "hints": [
+      "$1",
+      "$10"
+    ],
+    "tokens": [
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h",
+      "i",
+      "j",
+      "k"
+    ]
+  },
+  {
+    "id": "zero-placeholder",
+    "template": "Z=[$0] ONE=[$1]",
+    "arguments": "one two",
+    "expanded": "Z=[undefined] ONE=[one two]",
+    "hints": [
+      "$0",
+      "$1"
+    ],
+    "tokens": [
+      "one",
+      "two"
+    ]
+  },
+  {
+    "id": "bare-dollar-amount",
+    "template": "COST IS $5.00 and $x and $",
+    "arguments": "one two",
+    "expanded": "COST IS .00 and $x and $",
+    "hints": [
+      "$5"
+    ],
+    "tokens": [
+      "one",
+      "two"
+    ]
+  },
+  {
+    "id": "bare-dollar-no-args",
+    "template": "COST IS $5.00 and $x and $",
+    "arguments": "",
+    "expanded": "COST IS .00 and $x and $",
+    "hints": [
+      "$5"
+    ],
+    "tokens": []
+  },
+  {
+    "id": "double-quoted-token",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "\"hello world\" second",
+    "expanded": "A=[hello world] B=[second]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "hello world",
+      "second"
+    ]
+  },
+  {
+    "id": "single-quoted-token",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "'hello world' second",
+    "expanded": "A=[hello world] B=[second]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "hello world",
+      "second"
+    ]
+  },
+  {
+    "id": "image-token",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "[Image 3] caption",
+    "expanded": "A=[[Image 3]] B=[caption]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "[Image 3]",
+      "caption"
+    ]
+  },
+  {
+    "id": "unbalanced-quote",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "\"unclosed second",
+    "expanded": "A=[unclosed] B=[second]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "unclosed",
+      "second"
+    ]
+  },
+  {
+    "id": "lone-quote-token",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "\" second",
+    "expanded": "A=[second] B=[]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "second"
+    ]
+  },
+  {
+    "id": "collapsing-whitespace",
+    "template": "A=[$1] B=[$2] C=[$3]",
+    "arguments": "one    two\tthree",
+    "expanded": "A=[one] B=[two] C=[three]",
+    "hints": [
+      "$1",
+      "$2",
+      "$3"
+    ],
+    "tokens": [
+      "one",
+      "two",
+      "three"
+    ]
+  },
+  {
+    "id": "arguments-raw-not-tokens",
+    "template": "P=[$1] ALL=[$ARGUMENTS]",
+    "arguments": "\"quoted arg\"  spaced",
+    "expanded": "P=[quoted arg spaced] ALL=[\"quoted arg\"  spaced]",
+    "hints": [
+      "$1",
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "quoted arg",
+      "spaced"
+    ]
+  },
+  {
+    "id": "leading-trailing-trim",
+    "template": "   $ARGUMENTS   ",
+    "arguments": "mid",
+    "expanded": "mid",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "mid"
+    ]
+  },
+  {
+    "id": "trim-empties-template",
+    "template": "   $1   ",
+    "arguments": "",
+    "expanded": "",
+    "hints": [
+      "$1"
+    ],
+    "tokens": []
+  },
+  {
+    "id": "placeholder-adjacent-text",
+    "template": "pre$1post",
+    "arguments": "VAL",
+    "expanded": "preVALpost",
+    "hints": [
+      "$1"
+    ],
+    "tokens": [
+      "VAL"
+    ]
+  },
+  {
+    "id": "many-placeholders",
+    "template": "$1|$2|$3|$4|$5",
+    "arguments": "a b",
+    "expanded": "a|b|||",
+    "hints": [
+      "$1",
+      "$2",
+      "$3",
+      "$4",
+      "$5"
+    ],
+    "tokens": [
+      "a",
+      "b"
+    ]
+  },
+  {
+    "id": "arguments-inside-word",
+    "template": "x$ARGUMENTSy",
+    "arguments": "MID",
+    "expanded": "xMIDy",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "MID"
+    ]
+  },
+  {
+    "id": "multiline-template",
+    "template": "line1 $1\nline2 $2\nline3",
+    "arguments": "a b c",
+    "expanded": "line1 a\nline2 b c\nline3",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "id": "dollar-arguments-lowercase",
+    "template": "$arguments and $ARGUMENTS",
+    "arguments": "up",
+    "expanded": "$arguments and up",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "up"
+    ]
+  },
+  {
+    "id": "big-number-placeholder",
+    "template": "$999",
+    "arguments": "a b",
+    "expanded": "",
+    "hints": [
+      "$999"
+    ],
+    "tokens": [
+      "a",
+      "b"
+    ]
+  },
+  {
+    "id": "review-builtin-shape",
+    "template": "Input: $ARGUMENTS\n\nRun: `git show $ARGUMENTS`",
+    "arguments": "abc123",
+    "expanded": "Input: abc123\n\nRun: `git show abc123`",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "abc123"
+    ]
+  },
+  {
+    "id": "hint-sort-lexicographic",
+    "template": "$2 and $10",
+    "arguments": "a b c d e f g h i j k l",
+    "expanded": "b and j k l",
+    "hints": [
+      "$10",
+      "$2"
+    ],
+    "tokens": [
+      "a",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+      "g",
+      "h",
+      "i",
+      "j",
+      "k",
+      "l"
+    ]
+  },
+  {
+    "id": "image-token-lowercase",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "[image 12] tail",
+    "expanded": "A=[[image 12]] B=[tail]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "[image 12]",
+      "tail"
+    ]
+  },
+  {
+    "id": "image-token-only",
+    "template": "A=[$1]",
+    "arguments": "[Image 12]",
+    "expanded": "A=[[Image 12]]",
+    "hints": [
+      "$1"
+    ],
+    "tokens": [
+      "[Image 12]"
+    ]
+  },
+  {
+    "id": "apostrophe-mid-token",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "don't stop",
+    "expanded": "A=[don] B=[t stop]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "don",
+      "t",
+      "stop"
+    ]
+  },
+  {
+    "id": "empty-template-with-args",
+    "template": "",
+    "arguments": "just this",
+    "expanded": "just this",
+    "hints": [],
+    "tokens": [
+      "just",
+      "this"
+    ]
+  },
+  {
+    "id": "empty-template-no-args",
+    "template": "",
+    "arguments": "",
+    "expanded": "",
+    "hints": [],
+    "tokens": []
+  },
+  {
+    "id": "quoted-arguments-raw",
+    "template": "$ARGUMENTS",
+    "arguments": "\"a b\"",
+    "expanded": "\"a b\"",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "a b"
+    ]
+  },
+  {
+    "id": "escaped-dollar-digit-word",
+    "template": "$1a $2b",
+    "arguments": "x y z",
+    "expanded": "xa y zb",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "x",
+      "y",
+      "z"
+    ]
+  },
+  {
+    "id": "consecutive-placeholders",
+    "template": "$1$2$3",
+    "arguments": "a b c d",
+    "expanded": "abc d",
+    "hints": [
+      "$1",
+      "$2",
+      "$3"
+    ],
+    "tokens": [
+      "a",
+      "b",
+      "c",
+      "d"
+    ]
+  },
+  {
+    "id": "newline-in-arguments",
+    "template": "A=[$1] ALL=[$ARGUMENTS]",
+    "arguments": "one\ntwo",
+    "expanded": "A=[one two] ALL=[one\ntwo]",
+    "hints": [
+      "$1",
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "one",
+      "two"
+    ]
+  },
+  {
+    "id": "unicode-arguments",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "日本語 テスト 三つ",
+    "expanded": "A=[日本語] B=[テスト 三つ]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "日本語",
+      "テスト",
+      "三つ"
+    ]
+  },
+  {
+    "id": "unicode-arguments-only",
+    "template": "$ARGUMENTS",
+    "arguments": "héllo wörld",
+    "expanded": "héllo wörld",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "héllo",
+      "wörld"
+    ]
+  },
+  {
+    "id": "zero-alone-with-args",
+    "template": "only: $0",
+    "arguments": "a b c",
+    "expanded": "only: c",
+    "hints": [
+      "$0"
+    ],
+    "tokens": [
+      "a",
+      "b",
+      "c"
+    ]
+  },
+  {
+    "id": "zero-alone-no-args",
+    "template": "only: $0",
+    "arguments": "",
+    "expanded": "only:",
+    "hints": [
+      "$0"
+    ],
+    "tokens": []
+  },
+  {
+    "id": "double-zero",
+    "template": "Z=[$00] ONE=[$1]",
+    "arguments": "one two",
+    "expanded": "Z=[undefined] ONE=[one two]",
+    "hints": [
+      "$00",
+      "$1"
+    ],
+    "tokens": [
+      "one",
+      "two"
+    ]
+  },
+  {
+    "id": "leading-zero-placeholder",
+    "template": "A=[$01] B=[$2]",
+    "arguments": "one two three",
+    "expanded": "A=[one] B=[two three]",
+    "hints": [
+      "$01",
+      "$2"
+    ],
+    "tokens": [
+      "one",
+      "two",
+      "three"
+    ]
+  },
+  {
+    "id": "huge-number-placeholder",
+    "template": "$99999999999999999999",
+    "arguments": "a b",
+    "expanded": "",
+    "hints": [
+      "$99999999999999999999"
+    ],
+    "tokens": [
+      "a",
+      "b"
+    ]
+  },
+  {
+    "id": "non-ascii-digit-placeholder",
+    "template": "$٣ and $1",
+    "arguments": "a b",
+    "expanded": "$٣ and a b",
+    "hints": [
+      "$1"
+    ],
+    "tokens": [
+      "a",
+      "b"
+    ]
+  },
+  {
+    "id": "arguments-then-numbered",
+    "template": "$ARGUMENTS then $1",
+    "arguments": "a b",
+    "expanded": "a b then a b",
+    "hints": [
+      "$1",
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "a",
+      "b"
+    ]
+  },
+  {
+    "id": "empty-quoted-token",
+    "template": "A=[$1] B=[$2]",
+    "arguments": "\"\" second",
+    "expanded": "A=[] B=[second]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "",
+      "second"
+    ]
+  },
+  {
+    "id": "dollar-dollar-in-arguments",
+    "template": "ALL=[$ARGUMENTS]",
+    "arguments": "cost $$ high",
+    "expanded": "ALL=[cost $ high]",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "cost",
+      "$$",
+      "high"
+    ]
+  },
+  {
+    "id": "dollar-amp-in-arguments",
+    "template": "ALL=[$ARGUMENTS]",
+    "arguments": "$& weird",
+    "expanded": "ALL=[$ARGUMENTS weird]",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "$&",
+      "weird"
+    ]
+  },
+  {
+    "id": "dollar-backtick-arguments",
+    "template": "pre ALL=[$ARGUMENTS] post",
+    "arguments": "x $` y",
+    "expanded": "pre ALL=[x pre ALL=[ y] post",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "x",
+      "$`",
+      "y"
+    ]
+  },
+  {
+    "id": "dollar-quote-arguments",
+    "template": "pre ALL=[$ARGUMENTS] post",
+    "arguments": "x $' y",
+    "expanded": "pre ALL=[x ] post y] post",
+    "hints": [
+      "$ARGUMENTS"
+    ],
+    "tokens": [
+      "x",
+      "$",
+      "y"
+    ]
+  },
+  {
+    "id": "dollar-dollar-positional",
+    "template": "P=[$1]",
+    "arguments": "$$ tail",
+    "expanded": "P=[$$ tail]",
+    "hints": [
+      "$1"
+    ],
+    "tokens": [
+      "$$",
+      "tail"
+    ]
+  },
+  {
+    "id": "dollar-amp-positional",
+    "template": "P=[$1] Q=[$2]",
+    "arguments": "$& tail",
+    "expanded": "P=[$&] Q=[tail]",
+    "hints": [
+      "$1",
+      "$2"
+    ],
+    "tokens": [
+      "$&",
+      "tail"
+    ]
+  }
+]

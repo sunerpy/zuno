@@ -1,0 +1,1 @@
+Inspect a background task by the jobID returned from task. Returns its durable running, completed, failed, or cancelled state together with the child session, delivery mode, result, and error.

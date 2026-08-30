@@ -1,0 +1,8 @@
+self-hosted-runner:
+  labels:
+    - zuno-ci-*
+    - zuno-release-*
+    # Documentation publishing is neither CI nor a release: it pushes Markdown to
+    # the site repository and gates nothing that ships. Its own prefix keeps the
+    # three purposes distinguishable in CodeBuild's build history.
+    - zuno-docs-*

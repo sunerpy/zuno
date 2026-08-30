@@ -1,0 +1,114 @@
+{
+  "formatVersion": 1,
+  "fetchedAt": "2026-08-26T15:56:51Z",
+  "sources": {
+    "agentClientProtocolRepository": "https://github.com/agentclientprotocol/agent-client-protocol",
+    "protocolV1Documentation": "https://agentclientprotocol.com/protocol/v1/overview",
+    "zedExternalAgentsDocumentation": "https://zed.dev/docs/ai/external-agents"
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "snapshotPath": "LICENSE",
+    "sourceUrl": "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/272bf799f35a258c6a4107a0410ed361e83683d3/LICENSE",
+    "sha256": "f250d08cee4549b22b3b4aaaf3a743473336fd280316df5d0340717e5127a221"
+  },
+  "acp": {
+    "observedMainCommit": "b2731d52792d9c51fe49dcdb61f71c6908060e3e",
+    "crate": {
+      "tag": "v1.7.0",
+      "tagObject": "d46e61d959c356e86468ee7bf87544cfa0933b3a",
+      "commit": "272bf799f35a258c6a4107a0410ed361e83683d3",
+      "releaseUrl": "https://github.com/agentclientprotocol/agent-client-protocol/releases/tag/v1.7.0"
+    },
+    "stableSchema": {
+      "tag": "schema-v1.21.0",
+      "tagObject": "fe2db5aa7c7f5565424515075c00a66f8f6715d8",
+      "commit": "272bf799f35a258c6a4107a0410ed361e83683d3",
+      "releaseUrl": "https://github.com/agentclientprotocol/agent-client-protocol/releases/tag/schema-v1.21.0",
+      "assets": [
+        {
+          "name": "meta.json",
+          "snapshotPath": "assets/stable/meta.json",
+          "sha256": "061edb6efa8fb2aa2792459a86ec7268de5fe665bba48b2ffe7939df01481f88",
+          "size": 1159,
+          "releaseAssetId": 522712168,
+          "url": "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/schema-v1.21.0/meta.json"
+        },
+        {
+          "name": "meta.unstable.json",
+          "snapshotPath": "assets/stable/meta.unstable.json",
+          "sha256": "3026898232badf413624010d1343e20bef853e6705c62d6b56387cf9de6b0543",
+          "size": 1852,
+          "releaseAssetId": 522712173,
+          "url": "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/schema-v1.21.0/meta.unstable.json"
+        },
+        {
+          "name": "schema.json",
+          "snapshotPath": "assets/stable/schema.json",
+          "sha256": "caf62ff962ada396878372ced11efb2c6764e59d90919a38583c319948931a42",
+          "size": 246569,
+          "releaseAssetId": 522712159,
+          "url": "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/schema-v1.21.0/schema.json"
+        },
+        {
+          "name": "schema.unstable.json",
+          "snapshotPath": "assets/stable/schema.unstable.json",
+          "sha256": "7f77702b34e0a0558e77220e9007bf8ee161a976bb8ac5021aba1b7e7b2c5708",
+          "size": 370113,
+          "releaseAssetId": 522712162,
+          "url": "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/schema-v1.21.0/schema.unstable.json"
+        }
+      ]
+    },
+    "v2PreviewSchema": {
+      "tag": "schema-v2.0.0-alpha.3",
+      "tagObject": "0e76bb95191f54961301464dc93cf8d4d53071ec",
+      "commit": "272bf799f35a258c6a4107a0410ed361e83683d3",
+      "releaseUrl": "https://github.com/agentclientprotocol/agent-client-protocol/releases/tag/schema-v2.0.0-alpha.3",
+      "assets": [
+        {
+          "name": "meta.json",
+          "snapshotPath": "assets/v2-preview/meta.json",
+          "sha256": "ad94c01f2736416776fd53d66e3aaf89242ab72d99832664f39d6ab41e049736",
+          "size": 769,
+          "releaseAssetId": 522712224,
+          "url": "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/schema-v2.0.0-alpha.3/meta.json"
+        },
+        {
+          "name": "meta.unstable.json",
+          "snapshotPath": "assets/v2-preview/meta.unstable.json",
+          "sha256": "2c274308d2a773628bf6316b7f6c535cf87d2c1ceb495d02be9ee899dce0f0bc",
+          "size": 1462,
+          "releaseAssetId": 522712222,
+          "url": "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/schema-v2.0.0-alpha.3/meta.unstable.json"
+        },
+        {
+          "name": "schema.json",
+          "snapshotPath": "assets/v2-preview/schema.json",
+          "sha256": "36e8270fb12d4d067005cc02f729f5433930e6834ab4a72260838ee096d62378",
+          "size": 288134,
+          "releaseAssetId": 522712223,
+          "url": "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/schema-v2.0.0-alpha.3/schema.json"
+        },
+        {
+          "name": "schema.unstable.json",
+          "snapshotPath": "assets/v2-preview/schema.unstable.json",
+          "sha256": "bbdf4ad0e4a07751860afbaf3de800a5c7f9f714f3621f8e667f232709dc497d",
+          "size": 417056,
+          "releaseAssetId": 522712225,
+          "url": "https://github.com/agentclientprotocol/agent-client-protocol/releases/download/schema-v2.0.0-alpha.3/schema.unstable.json"
+        }
+      ]
+    }
+  },
+  "zed": {
+    "repository": "https://github.com/zed-industries/zed",
+    "commit": "ac099b4a809a564f06907125e7a536c33cb60084",
+    "observedMainCommit": "ac099b4a809a564f06907125e7a536c33cb60084",
+    "sourcePath": "crates/agent_servers/src/acp.rs",
+    "requestedProtocolVersion": "V1",
+    "sourceLine": 993,
+    "sourceUrl": "https://github.com/zed-industries/zed/blob/ac099b4a809a564f06907125e7a536c33cb60084/crates/agent_servers/src/acp.rs#L993",
+    "licenseBoundary": "Reference metadata only. No Zed GPL source is copied into this snapshot."
+  }
+}

@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: fmt
+        name: format repository files
+        entry: make hook-fmt
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: test-fast
+        name: run fast repository tests
+        entry: make hook-test
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
