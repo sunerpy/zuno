@@ -64,11 +64,27 @@ Recovery is selected from typed errors:
 | Authentication failures, user interruption, human input, permissions, or an uncertain side effect | Pause with a typed reason |
 | Invalid provider protocol, unsupported typed input, unavailable agent or model, corrupt durable state | Block |
 
-Inspect and manage it with `/goal` in the terminal application, which shows, creates,
-edits, pauses, resumes, blocks, completes, and cancels against the durable store. Goal status
-also shows the typed pause, cross-turn retry, provider backoff checkpoint, and pending human
-requests. Completion is rejected while any Plan step, WorkItem, Job, next-step report, or
-Goal-owned human request remains unfinished.
+Inspect and manage it with `/goal` in the terminal application:
+
+```text
+/goal
+/goal create <objective>
+/goal edit <objective>
+/goal pause
+/goal resume
+/goal block <reason>
+/goal complete
+/goal cancel
+/goal history
+```
+
+The first token after `/goal` is always an action. To create a goal, use
+`/goal create <objective>`; `/goal <objective>` treats the first word of the objective
+as an action and is rejected. `/goal help` prints the compact command summary.
+
+Goal status also shows the typed pause, cross-turn retry, provider backoff checkpoint,
+and pending human requests. Completion is rejected while any Plan step, WorkItem, Job,
+next-step report, or Goal-owned human request remains unfinished.
 
 ### Human requests and autonomy
 

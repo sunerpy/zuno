@@ -1,7 +1,7 @@
 # Quick start
 
-From nothing to a first successful run. Five steps, and the two that usually fail are
-provider configuration and the sandbox probe, so they come first.
+This guide verifies the binary, sandbox, provider, credentials, and model catalog
+before the first writable task.
 
 ## 1. Confirm the binary and its paths
 
@@ -136,7 +136,7 @@ zuno run --agent plan "summarize how configuration precedence works in this repo
 works end to end on a host with working confinement. A read-only Agent deliberately does
 not use `run-unconfined`.
 
-Now do real work:
+Run a writable task:
 
 ```sh
 zuno run "add pagination to the /users endpoint and run the tests"

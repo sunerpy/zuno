@@ -92,7 +92,7 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | 命令 | 用途 |
 | --- | --- |
 | `/compact` | 通过持久压缩流水线压缩历史 |
-| `/goal` | 查看或管理持久的会话 goal |
+| `/goal [action]` | 查看或管理持久 Goal；使用 `/goal help` 查看语法 |
 | `/plan` | 进入 Plan 模式，或在已处于规划中时确认开始工作 |
 | `/start-plan` | 立即进入只读的 Plan 模式 |
 | `/start-work` | 复核持久 plan 并确认开始实现 |

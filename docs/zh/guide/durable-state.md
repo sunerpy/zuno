@@ -46,7 +46,23 @@ Goal 是续跑的授权来源。一个活跃的 goal 会持续下去，直到它
 | 认证失败、用户中断、事件消费者已关闭 | 暂停，等待人工处理 |
 | provider 协议无效、不支持的类型化输入、Agent 或模型不可用、持久状态损坏 | 阻塞 |
 
-在终端应用中用 `/goal` 检查与管理它，该命令针对持久存储执行查看、创建、编辑、暂停、恢复、阻塞、完成和取消。
+在终端应用中用 `/goal` 检查与管理它：
+
+```text
+/goal
+/goal create <目标>
+/goal edit <目标>
+/goal pause
+/goal resume
+/goal block <原因>
+/goal complete
+/goal cancel
+/goal history
+```
+
+`/goal` 后的第一个词始终是 action。创建 Goal 必须写成
+`/goal create <目标>`；直接输入 `/goal <目标>` 会把目标的第一个词当作 action，因而被拒绝。
+`/goal help` 可以查看精简用法。
 
 ## Plan
 

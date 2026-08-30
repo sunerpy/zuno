@@ -116,7 +116,7 @@ cannot shadow a runtime control.
 | Command | Purpose |
 | --- | --- |
 | `/compact` | Compact history through the durable compaction pipeline |
-| `/goal` | View or manage the durable session goal |
+| `/goal [action]` | View or manage the durable session goal; use `/goal help` for syntax |
 | `/plan` | Enter Plan mode, or confirm starting work when already planning |
 | `/start-plan` | Enter read-only Plan mode immediately |
 | `/start-work` | Review the durable plan and confirm implementation |

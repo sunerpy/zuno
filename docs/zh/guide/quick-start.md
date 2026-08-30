@@ -1,6 +1,6 @@
 # 快速开始
 
-从零到第一次成功运行。一共五步，其中最常失败的两步是 provider 配置和沙箱探测，所以把它们放在前面。
+本指南依次验证二进制、沙箱、Provider、凭据和模型目录，再运行第一个可写任务。
 
 ## 1. 确认二进制文件及其路径
 
@@ -119,7 +119,7 @@ zuno run --agent plan "summarize how configuration precedence works in this repo
 无关。在约束后端可用的宿主上，它是端到端确认整条路径能走通的最安全方式。只读 Agent
 刻意不会使用 `run-unconfined`。
 
-现在做真正的工作：
+运行一个可写任务：
 
 ```sh
 zuno run "add pagination to the /users endpoint and run the tests"

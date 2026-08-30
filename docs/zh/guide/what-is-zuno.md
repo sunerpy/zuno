@@ -1,116 +1,90 @@
 # Zuno 是什么？
 
-Zuno 是一个以单个 Rust 可执行文件运行的编码 Agent。你交给它一个目标，它会读代码、改文件、执行命令，并汇报自己验证过什么。
+Zuno 是一个以 Rust 可执行文件交付的本地编程 Agent。它可以检查仓库、修改文件、执行命令、
+委派有边界的工作，并汇报已经完成的验证。
 
-它与大多数编码 Agent 的区别集中在三件事上：**目标是有预算、可恢复的持久对象**；**一个专职 Agent 团队而不是一个全能提示词**；以及**编排结构由配置拥有，模型不能在运行时改写它**。
+它重点解决的是工作的连续性：Provider 请求失败、进程退出或切换客户端后，任务仍应保留
+已记录的状态和权限边界。
 
-## 一、目标模式：让长任务能被追踪和收敛
+## 持久工作状态
 
-多数 Agent 的"任务"只存在于一次对话里。Zuno 的 Goal 是一个持久对象，带三样东西：
+Zuno 会话以事件形式存储在 SQLite 中。用户输入、组装后的 Prompt、工具结果、重试通知和
+子 Agent 报告，都会在下一次模型请求需要它们之前落盘。
 
-| 字段 | 作用 |
+Goal、Plan、Todo 和后台 Job 是彼此独立的持久记录：
+
+- Goal 定义结果和可选预算；
+- Plan 记录有顺序的实施步骤；
+- Todo 跟踪更小的工作项；
+- Job 跟踪委派 Agent 和后台命令。
+
+可恢复的 Provider、流、网络和数据库错误使用持久化重试时间。Zuno 重启后会重建该时间，
+而不是重新开始一套重试循环。工具若在副作用附近出现不确定结果，只会记录并等待检查，
+不会被机械重放。
+
+参见 [Goal、Plan 与 Todo](/zh/guide/durable-state)和
+[会话与回合](/zh/guide/sessions)。
+
+## Agent 决定权限边界
+
+所选 Agent 决定本次运行有哪些工具和委派路径。
+
+| Agent | 用途 |
 | --- | --- |
-| `objective` | 具体目标，创建后模型不能悄悄缩小它 |
-| `success_criteria` | 完成的判定条件，创建后模型无法改写 |
-| `token_budget` | token 上限，超出即停止而不是无限烧下去 |
+| `orchestrator` | 默认主 Agent，拆解工作并验证委派结果 |
+| `build` | 端到端实现与验证 |
+| `plan` | 只读调查与规划 |
+| `deep` | 困难的跨领域实现，不递归委派 |
 
-关键在于**终止条件是受约束的**。一个活跃 Goal 会持续推进，直到它真的完成、被显式暂停、达到预算，或遇到类型化的永久失败。模型想标记完成，必须拿出授权证据；想标记阻塞，必须给出具体的 `blocking_condition`，而且同一个真实僵局要连续三个回合都存在。
+其他专职 Agent 负责探索、资料检索、评审、视觉检查和聚焦修复。Agent 契约可以移除工具或
+委派对象，但不能取得超过父运行时的权限，因此子会话无法获得父级没有的工具。
 
-```sh
-zuno run "把 /users 接口迁移到分页，并让集成测试通过"
-```
+Council 和 Workflow 的拓扑来自配置：席位、quorum、并发、路由、截止时间和重试策略都在
+模型提出问题之前确定。
 
-这条命令背后不只是一次提问。目标、计划、待办项、后台作业都是 SQLite 里的持久记录，进程死掉后可以从中重建工作现场 —— 包括重试的截止时间。所以"下一步我会……"这类文字不构成进展，只有持久状态的变化才算。
+参见 [Agent](/zh/guide/agents)和[编排与委派](/zh/guide/orchestration)。
 
-进一步阅读：[Goal、Plan 与 Todo](/zh/guide/durable-state)。
+## Shell 执行有多道独立门禁
 
-## 二、一个专职 Agent 团队，而不是一个全能提示词
+Shell 请求依次经过工具参数校验、权限策略、命令风险检查和执行后端。这些控制彼此不能替代。
 
-`zuno agent list` 列出 14 个内置 Agent。其中 4 个（`compaction`、`council-synth`、`summary`、`title`）服务于运行时内部任务；下面 10 个是你实际会选择的角色。它们不是同一个提示词的不同措辞，而是**能力边界不同的角色**：
+在 Linux 上，`read-only` 和 `workspace-write` 使用 bubblewrap、capability drop 与 seccomp。
+请求的约束无法部署时，Zuno 默认拒绝命令。受信配置可以直接选择
+`danger-full-access`，也可以只在符合条件的沙箱不可用错误下允许
+`workspace-write` 降级。只读 Agent 不使用该降级。
 
-| Agent | 定位 |
-| --- | --- |
-| `orchestrator` | 默认主 Agent，负责拆解与委派，保留架构决策与最终验收 |
-| `build` | 端到端交付 |
-| `plan` | 只读规划，写入类工具根本不会注册 |
-| `deep` | 承担困难的跨领域实现，且不再递归委派 |
-| `explorer`、`librarian`、`oracle`、`looker`、`fixer`、`general` | 专职子 Agent，各有明确的正负向职责 |
+macOS 与 Windows 尚未实现受限后端；具备写能力的 Agent 可以在这些平台显式选择原生执行。
 
-这套划分之所以有意义，是因为**Agent 契约只能收窄权限，永远不能放宽**。选一个只读 Agent 就是一项保证，而不是一个可以被配置反转的默认值：
+参见[权限与沙箱](/zh/guide/permissions)。
 
-```sh
-# 无论 sandbox.mode 怎么配，这次都不可能写文件
-zuno run --agent plan "审计重试预算的起算时机"
-```
+## 一套运行时，多个客户端
 
-委派同样有真实边界：子 Agent 拿不到父级不具备的工具，`delegates` 精确限定它能调用谁，`subagent_depth` 限制层数。子 Agent 的报告是父级需要验证的**证据**，不是可以直接采信的结论。
+TUI、headless runner、ACP server 和 HTTP server 使用相同的会话命令、持久事件、inbox 和
+projection。客户端断开不会产生另一套 Agent 生命周期。
 
-进一步阅读：[Agent](/zh/guide/agents)、[编排与委派](/zh/guide/orchestration)。
+运行时由类型化 Rust `Component` 组合。组件通过 `HarnessProfile` 注册服务和副作用；
+替换 Profile 时，新 Profile 完整校验后才会发布，挂载失败则按逆序回滚。
 
-## 三、编排由配置拥有
+扩展可以提供 Agent、Workflow、Skill、WASI Component 或受控进程工具。Zuno 不加载 Rust
+动态库。唯一必需的外部运行工具是 `rg`（ripgrep）14 或更新版本，用于 `glob` 和 `grep`。
 
-Council 让多个隔离的席位各自独立评估同一个问题，然后综合结论。它的席位、模型路由、法定人数（quorum）、并发上限、重试策略、端到端超时、预留的综合时间和输出上限**全部由配置决定** —— 模型在调用时只能提出问题，不能改写这些参数。
+参见 [Harness 运行时](/zh/operate/harness-runtime)、[插件与扩展](/zh/guide/plugins)以及
+[Harness 对比](https://github.com/sunerpy/zuno/blob/main/docs/design/harness-comparison.md)。
 
-Workflow 同理：`maxAgents`（默认 12）、`maxParallel`（默认 4）和节点 DAG 是不可变模板。
+## 当前边界
 
-这个取舍是刻意的。把编排参数交给模型，就等于让它在压力下自行放宽约束；固定在配置里，行为才可复现、可审计。
-
-## 设计谱系
-
-Zuno 把 DeepSeek Harness、Codex、oh-my-openagent、pi-agent、OpenCode 与 Claw Code 当作**设计来源，而不是兼容目标**。
-
-其中影响最深的是 DeepSeek Harness 的"一切皆插件"。在 Zuno 里，这个 ABI 具体化为原生 Rust `Component`：它准备类型化服务与延迟副作用，为每个启动的副作用返回精确的异步 disposer，并参与事务化的 `HarnessProfile` 替换。一项能力只有在接口、提供方、消费方三者齐备时才算完整。
-
-由此得到几条贯穿全项目的规则：
-
-- **注册即副作用。** 挂载返回的 disposer 精确移除它注册过的东西，profile 替换失败时按相反顺序回滚。
-- **模型可见即被记录。** 任何能改变一次模型请求的输入，都必须能从持久会话事件中重建。
-- **组合优于分支。** 部署选择进入经过校验的 profile 字段，而不是主循环里不断增长的条件判断。
-
-完整的借鉴与拒绝清单见 [Harness 对比](https://github.com/sunerpy/zuno/blob/main/docs/design/harness-comparison.md)。
-
-## 单个二进制的实际含义
-
-Linux 是静态 musl 产物，macOS 与 Windows 是原生构建。执行路径里没有 Node、Python 或包管理器，也没有需要与 Agent 版本对齐的运行时。
-
-只有一个外部依赖：`rg`（ripgrep）主版本 14 或更新。因为 `glob` 与 `grep` 驱动的是真正的 ripgrep，而不是再实现一遍它的目录遍历器 —— 缺失或版本不符时工具运行时直接报启动错误，不静默降级。
-
-扩展也是原生的：声明式包（Agent、workflow、Skill）、显式 WASI 授权下的 WebAssembly 组件，或受限子进程。Zuno 不加载 Rust 动态库 —— Rust 没有稳定的插件 ABI，而卸载一个库无法证明它的线程、回调和借用值都已消失。
-
-## 与聊天形态工具的差别
-
-一个能调工具的聊天界面是为对话优化的；Zuno 为一个能在中断后存活的工作单元优化。
-
-| 关注点 | 聊天形态的工具 | Zuno |
-| --- | --- | --- |
-| 任务 | 一次对话的隐含意图 | 带成功条件与预算的持久 Goal |
-| 分工 | 一个全能提示词 | 10 个可选的、能力边界不同的 Agent |
-| 委派 | 同一上下文里的另一段提示词 | 拥有自身持久状态与能力上限的子会话 |
-| 编排 | 模型自行决定 | 席位、quorum、并发由配置固定 |
-| 历史 | 内存对话或托管线程 | 持久 SQLite 事件，可重放可续跑 |
-| 重试 | 客户端循环，重启即丢 | 落盘的指数退避截止时间 |
-| 工具重复执行 | 失败即重试 | 默认至多一次，只有只读或幂等工具可声明可重放 |
-| 命令安全 | 请求模型不要造成破坏 | OS 约束加一道独立权限门 |
-
-差别在副作用附近发生超时时最明显：Zuno 把该结果记录为**不确定**，要求检查权威状态，而不是机械重跑并指望第一次什么都没做。
-
-## Zuno 不做什么
-
-- **不做托管服务。** 没有控制台、随包 Web 应用或托管 GitHub Agent。那些命令名注册的唯一目的是说明用什么替代，并以失败退出。见[被排除的命令](/zh/cli/excluded)。
-- **不追求兼容其他 Agent。** 与 OpenCode、Codex、Claude Code 之间没有配置、插件、hook 或工具参数兼容性。它们是设计参考。
-- **不用增量迁移链。** 项目尚未发布，schema 变更提升格式版本，开发数据库直接重建。见[数据库生命周期](/zh/operate/migration)。
-- **不做自卸载。** 用当初安装它的方式移除这个二进制。
-- **macOS 与 Windows 尚无受约束沙箱。** 约束后端目前只有 Linux 实现，其他平台默认失败即拒绝；具备写能力的 Agent 可以通过受信的显式选择使用原生执行。见[权限与沙箱](/zh/guide/permissions)。
+- Zuno 仍处于预发布开发阶段，数据和扩展格式可能变化。
+- 它是本地 CLI 与 Server，不是托管式编程服务。
+- 它使用 Zuno 自己的配置和协议，不提供其他编程 Agent 的兼容层。
+- 受限 Shell 目前只在 Linux 上实现。
+- Provider 与模型需要显式配置。
 
 ## 从哪里开始
 
-想先跑起来：[安装](/zh/guide/installation) → [快速开始](/zh/guide/quick-start)。
-
-想先理解执行模型：[Goal、Plan 与 Todo](/zh/guide/durable-state) 与 [Agent](/zh/guide/agents) 这两页信息密度最高。
-
-## 参见
-
-- [Goal、Plan 与 Todo](/zh/guide/durable-state)
-- [Agent](/zh/guide/agents)
-- [编排与委派](/zh/guide/orchestration)
-- [权限与沙箱](/zh/guide/permissions)
+| 目标 | 页面 |
+| --- | --- |
+| 安装并运行 Zuno | [快速开始](/zh/guide/quick-start) |
+| 理解会话和恢复 | [会话与回合](/zh/guide/sessions) |
+| 选择 Agent | [Agent](/zh/guide/agents) |
+| 配置命令权限 | [权限与沙箱](/zh/guide/permissions) |
+| 接入 Provider | [Provider 与凭据](/zh/config/providers) |

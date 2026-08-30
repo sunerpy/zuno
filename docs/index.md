@@ -3,11 +3,13 @@ layout: home
 
 hero:
   name: Zuno
-  text: Zero code. Any task.
+  text: Durable work. Explicit boundaries.
   tagline: >
-    A single-binary coding agent CLI in Rust. Goals with budgets and real termination
-    conditions, a roster of specialist agents instead of one all-purpose prompt, and
-    orchestration the model cannot rewrite at runtime.
+    A local Rust coding agent that keeps goals, tool results, retries, and
+    delegation state across restarts.
+  image:
+    src: /zuno-logo.svg
+    alt: Zuno logo
   actions:
     - theme: brand
       text: Quick start
@@ -20,53 +22,33 @@ hero:
       link: https://github.com/sunerpy/zuno
 
 features:
-  - title: Goals that converge instead of drifting
+  - title: Work that resumes
     details: >
-      A goal carries an objective the model cannot narrow, success criteria it cannot
-      rewrite, and a token ceiling. Marking it done needs authoritative evidence;
-      reporting blocked needs a concrete condition that survived three turns.
+      Prompts, tool results, plans, retries, and child reports are stored as
+      durable session state. A restarted process can continue from recorded work.
     link: /guide/durable-state
-    linkText: Goals, plans and todos
+    linkText: Goals and work state
 
-  - title: A specialist roster, not one prompt
+  - title: Roles with fixed authority
     details: >
-      Ten selectable agents with different capability ceilings. A contract can only
-      narrow authority, never widen it, so choosing the read-only agent is a guarantee
-      rather than a default configuration can reverse.
+      Build, planning, deep implementation, and specialist agents expose different
+      tool ceilings. Configuration can narrow those ceilings, but cannot widen them.
     link: /guide/agents
     linkText: Agents
 
-  - title: Orchestration owned by configuration
+  - title: Controlled command execution
     details: >
-      Council seats, quorum, concurrency, retry policy and deadlines are configuration.
-      The model supplies the question and cannot relax its own constraints under
-      pressure.
-    link: /orchestration
-    linkText: Orchestration
+      Permission rules, command-risk checks, and OS confinement are separate gates.
+      Restricted modes fail closed unless trusted policy explicitly selects native execution.
+    link: /guide/permissions
+    linkText: Permissions and sandboxing
 
-  - title: Delegation with real boundaries
+  - title: One native runtime
     details: >
-      A child never obtains a tool its parent lacks, delegates names exactly who it may
-      call, and its report is evidence the parent verifies rather than a conclusion to
-      adopt.
-    link: /orchestration
-    linkText: Delegation
-
-  - title: One binary, one external dependency
-    details: >
-      Static musl on Linux, native builds elsewhere. No Node, no Python, no runtime to
-      keep aligned. The single requirement is ripgrep 14+, because glob and grep drive
-      real ripgrep rather than a reimplementation.
-    link: /guide/installation
-    linkText: Install
-
-  - title: Native components, not a plugin ABI
-    details: >
-      DeepSeek Harness's "everything is a plugin" made concrete as a Rust Component:
-      typed services, an exact disposer per started effect, and transactional profile
-      replacement. No Rust dynamic libraries, because unloading one proves nothing.
-    link: /plugins
-    linkText: Plugins and extensions
+      TUI, headless, ACP, and HTTP clients share the same Rust runtime, durable
+      events, tools, and extension lifecycle.
+    link: /harness-runtime
+    linkText: Harness Runtime
 ---
 
 ## Install
@@ -87,45 +69,39 @@ cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
 
 :::
 
-Then start the terminal application:
+Zuno requires ripgrep 14 or newer. Linux hosts also need bubblewrap 0.8.0 or newer
+for confined Shell modes. The installer verifies the selected release archive against
+its `SHA256SUMS`.
+
+## Start a run
+
+Configure a provider, then use the read-only `plan` agent to verify the model and tool
+path before allowing writes:
 
 ```sh
-zuno
+zuno debug config
+zuno models myopenai --verbose
+zuno run --agent plan "summarize this repository's architecture"
 ```
 
-## Pick the agent, not the prompt
-
-Most of what you configure in Zuno is *who* does the work. An agent's contract fixes
-its ceiling before the turn starts, so the choice is a property of the run rather than
-a request the model may reinterpret.
+For delivery work:
 
 ```sh
-# Read-only investigation. No write tool is registered at all, whatever the config says.
-zuno run --agent plan "why does the retry budget start before the first attempt?"
-
-# End-to-end delivery, with the tests as the gate.
-zuno run "add pagination to the /users endpoint and run the tests"
-
-# Hard cross-cutting work that should not fan out further.
-zuno run --agent deep "make session recovery survive a mid-turn provider failure"
-
-# Continue the most recent session rather than starting a new one.
-zuno run --continue "now cap the page size at 100"
+zuno run "add pagination to the users endpoint and run the tests"
 ```
 
-Underneath, a turn is a durable unit of work: the assembled prompt is written to SQLite
-before the request leaves, every tool result is logged as an event, and the session can
-be replayed or resumed after the process dies. That is the floor the guarantees above
-stand on, not the selling point.
+Bare `zuno` opens the terminal application. See [Quick start](/guide/quick-start) for
+provider configuration, credentials, and sandbox checks.
 
-## Where to go next
+## Find the right page
 
-| If you want to | Read |
+| Task | Page |
 | --- | --- |
-| Understand the design before installing | [What is Zuno?](/guide/what-is-zuno) |
-| Get running in a few minutes | [Quick start](/guide/quick-start) |
-| Connect a provider | [Providers and credentials](/reference/providers) |
-| Look up a configuration key | [Configuration reference](/reference/configuration) |
+| Understand the execution model | [What is Zuno?](/guide/what-is-zuno) |
+| Configure a provider | [Providers and credentials](/reference/providers) |
+| Look up a setting | [Configuration reference](/reference/configuration) |
+| Choose an agent | [Agents](/guide/agents) |
+| Configure Shell authority | [Permissions and sandboxing](/guide/permissions) |
+| Use Zuno from an editor | [Editors and ACP](/reference/zed-acp) |
 | Look up a command | [CLI reference](/cli/) |
-| Work inside an editor | [Editors and ACP](/reference/zed-acp) |
 | Diagnose a failure | [FAQ](/faq) |
