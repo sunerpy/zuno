@@ -422,6 +422,7 @@ impl Tool for PluginTool {
             output: result.output,
             metadata: result.metadata,
             attachments: Vec::new(),
+            presentation: None,
             continuation: zuno_tool::ToolContinuation::Continue,
         })
     }

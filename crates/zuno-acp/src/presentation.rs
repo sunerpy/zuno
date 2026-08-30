@@ -5,6 +5,7 @@
 //! render without reverse-engineering a tool's JSON envelope.
 
 use serde_json::{Map, Value, json};
+use zuno_tool::{QuestionResultPresentation, ToolResultPresentation};
 
 pub(crate) fn decorate_tool_call(update: &mut Value, name: &str, raw_input: Option<&Value>) {
     match name {
@@ -32,12 +33,18 @@ pub(crate) fn decorate_completed_tool_update(
     update: &mut Value,
     name: &str,
     raw_input: Option<&Value>,
+    result_presentation: Option<&ToolResultPresentation>,
     metadata: Option<&Map<String, Value>>,
     output: &str,
     is_error: bool,
 ) {
     match name {
         "question" => {
+            let live_metadata =
+                result_presentation.map(|ToolResultPresentation::Question(question)| {
+                    question_result_metadata(question)
+                });
+            let metadata = live_metadata.as_ref().or(metadata);
             let status = metadata
                 .and_then(|metadata| metadata.get("questionStatus"))
                 .and_then(Value::as_str)
@@ -81,6 +88,20 @@ pub(crate) fn decorate_completed_tool_update(
         }
         _ => {}
     }
+}
+
+fn question_result_metadata(result: &QuestionResultPresentation) -> Map<String, Value> {
+    let mut metadata = Map::new();
+    metadata.insert(
+        "questionStatus".to_owned(),
+        Value::String(result.status().as_str().to_owned()),
+    );
+    metadata.insert("questionCount".to_owned(), json!(result.question_count()));
+    metadata.insert("elapsedMs".to_owned(), json!(result.elapsed_ms()));
+    if let Some(answers) = result.answers() {
+        metadata.insert("answers".to_owned(), json!(answers));
+    }
+    metadata
 }
 
 fn replace_primary_content(update: &mut Value, card: &str) {

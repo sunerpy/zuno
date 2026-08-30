@@ -25,8 +25,9 @@ use zuno_llm::registry::{
 };
 use zuno_permission::{PermissionAction, Rule};
 use zuno_tool::{
-    AllowAll, METADATA_HUMAN_REQUEST_ID_KEY, Tool, ToolConcurrencyPolicy, ToolContext,
-    ToolContinuation, ToolOutput, ToolReplayPolicy,
+    AllowAll, METADATA_HUMAN_REQUEST_ID_KEY, QuestionResultPresentation, QuestionResultStatus,
+    Tool, ToolConcurrencyPolicy, ToolContext, ToolContinuation, ToolOutput, ToolReplayPolicy,
+    ToolResultPresentation,
 };
 
 const SESSION_ID: &str = "ses_dispatch_loop";
@@ -238,6 +239,38 @@ impl Tool for WaitingForHumanTool {
         Ok(ToolOutput::text("Waiting for human input", "Goal paused.")
             .with_metadata(METADATA_HUMAN_REQUEST_ID_KEY, "que_dispatch_wait")
             .with_continuation(ToolContinuation::WaitingForHuman))
+    }
+}
+
+struct PresentedResultTool;
+
+#[async_trait]
+impl Tool for PresentedResultTool {
+    fn id(&self) -> &str {
+        "presented"
+    }
+
+    fn description(&self) -> &str {
+        "Return a typed client presentation."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("Answered", "accepted").with_presentation(
+            ToolResultPresentation::Question(QuestionResultPresentation::new(
+                QuestionResultStatus::Answered,
+                Some(vec![vec!["SQLite".to_owned()]]),
+                1,
+                12,
+            )),
+        ))
     }
 }
 
@@ -746,6 +779,80 @@ async fn a_human_request_stops_after_its_result_is_durable() {
         1,
         "waiting must not spend a provider request asking the model to narrate the pause"
     );
+}
+
+#[tokio::test]
+async fn typed_result_presentation_precedes_the_completed_dispatch_event() {
+    let mut connection = seeded();
+    let provider = Arc::new(ScriptedProvider::new(named_provider_events(
+        "presented",
+        &[("call-presented", "answer")],
+    )));
+    let providers = registry(provider);
+    let dispatcher = ToolRegistryDispatcher::new(
+        vec![Arc::new(PresentedResultTool)],
+        vec![Rule {
+            permission: "*".to_owned(),
+            pattern: "*".to_owned(),
+            action: PermissionAction::Allow,
+        }],
+        Arc::new(AllowAll),
+        zuno_engine::dispatch::AuthorizationPolicy::Standard,
+        McpToolStatus::Ready,
+    );
+    let resolver = Resolver;
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+    let turn = run_turn(
+        RunTurnRequest::new(
+            SESSION_ID,
+            "turn-typed-result-presentation",
+            DynamicContext::default(),
+        ),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, events) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(
+        outcome.expect("presented tool turn succeeds"),
+        TurnOutcome::Completed { .. }
+    ));
+
+    let presented_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                TurnEvent::ToolResultPresented {
+                    call_id,
+                    presentation: ToolResultPresentation::Question(question),
+                    ..
+                } if call_id == "call-presented"
+                    && question.status() == QuestionResultStatus::Answered
+                    && question.answers() == Some(&[vec!["SQLite".to_owned()]][..])
+            )
+        })
+        .expect("typed presentation event");
+    let completed_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                TurnEvent::ToolDispatchCompleted {
+                    call_id,
+                    is_error: false,
+                    ..
+                } if call_id == "call-presented"
+            )
+        })
+        .expect("completed dispatch event");
+    assert!(presented_index < completed_index);
 }
 
 #[tokio::test]

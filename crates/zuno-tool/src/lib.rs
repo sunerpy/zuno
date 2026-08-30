@@ -81,8 +81,8 @@ pub use crate::context::{
 };
 pub use crate::output::{
     Attachment, FileDiff, LimitExceeded, METADATA_FILE_DIFFS_KEY, METADATA_HUMAN_REQUEST_ID_KEY,
-    METADATA_WRITTEN_PATHS_KEY, OutputLimits, SizeMeasurement, SizeVerdict, ToolContinuation,
-    ToolOutput,
+    METADATA_WRITTEN_PATHS_KEY, OutputLimits, QuestionResultPresentation, QuestionResultStatus,
+    SizeMeasurement, SizeVerdict, ToolContinuation, ToolOutput, ToolResultPresentation,
 };
 pub use crate::schema::{ACCEPT_LARGE_OUTPUT_KEY, INTENT_KEY};
 pub use crate::store::{StoredOutput, ToolOutputStore};

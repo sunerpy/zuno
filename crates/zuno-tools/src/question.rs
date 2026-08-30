@@ -40,7 +40,10 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use zuno_error::ToolError;
-use zuno_tool::{ToolContext, ToolEffect, ToolOutput, TypedTool};
+use zuno_tool::{
+    QuestionResultPresentation, QuestionResultStatus, ToolContext, ToolEffect, ToolOutput,
+    ToolResultPresentation, TypedTool,
+};
 
 /// The id the model calls. Registry key and wire id agree (`registry.ts:218`).
 pub const WIRE_ID: &str = "question";
@@ -177,37 +180,6 @@ impl QuestionRequest {
 /// `Schema.Array(Schema.String)` (`v1/question.ts:41`) — empty means unanswered.
 pub type Answer = Vec<String>;
 
-/// The terminal state persisted on a completed question card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuestionStatus {
-    Answered,
-    Cancelled,
-    Expired,
-    Failed,
-}
-
-impl QuestionStatus {
-    /// Stable metadata spelling used by transcript replays and non-TUI clients.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Answered => "answered",
-            Self::Cancelled => "cancelled",
-            Self::Expired => "expired",
-            Self::Failed => "failed",
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Answered => "Answered",
-            Self::Cancelled => "Cancelled",
-            Self::Expired => "Expired",
-            Self::Failed => "Failed",
-        }
-    }
-}
-
 /// An authoritative result from the client that owned the human prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuestionOutcome {
@@ -220,12 +192,12 @@ pub enum QuestionOutcome {
 impl QuestionOutcome {
     /// The terminal status represented by this outcome.
     #[must_use]
-    pub const fn status(&self) -> QuestionStatus {
+    pub const fn status(&self) -> QuestionResultStatus {
         match self {
-            Self::Answered(_) => QuestionStatus::Answered,
-            Self::Cancelled => QuestionStatus::Cancelled,
-            Self::Expired => QuestionStatus::Expired,
-            Self::Failed => QuestionStatus::Failed,
+            Self::Answered(_) => QuestionResultStatus::Answered,
+            Self::Cancelled => QuestionResultStatus::Cancelled,
+            Self::Expired => QuestionResultStatus::Expired,
+            Self::Failed => QuestionResultStatus::Failed,
         }
     }
 }
@@ -379,7 +351,7 @@ impl QuestionTool {
 
     /// The durable completed-card title for a terminal question outcome.
     #[must_use]
-    pub fn title(status: QuestionStatus, count: usize, elapsed: Duration) -> String {
+    pub fn title(status: QuestionResultStatus, count: usize, elapsed: Duration) -> String {
         let plural = if count == 1 { "" } else { "s" };
         format!(
             "{} · {count} question{plural} · {}",
@@ -447,6 +419,10 @@ impl TypedTool for QuestionTool {
             .await?;
         let elapsed = started.elapsed();
         let status = outcome.status();
+        let presentation_answers = match &outcome {
+            QuestionOutcome::Answered(answers) => Some(answers.clone()),
+            QuestionOutcome::Cancelled | QuestionOutcome::Expired | QuestionOutcome::Failed => None,
+        };
 
         let output = match outcome {
             QuestionOutcome::Answered(answers) => {
@@ -483,7 +459,15 @@ impl TypedTool for QuestionTool {
         Ok(output
             .with_metadata("questionStatus", status.as_str())
             .with_metadata("questionCount", params.questions.len() as u64)
-            .with_metadata("elapsedMs", elapsed_ms))
+            .with_metadata("elapsedMs", elapsed_ms)
+            .with_presentation(ToolResultPresentation::Question(
+                QuestionResultPresentation::new(
+                    status,
+                    presentation_answers,
+                    params.questions.len(),
+                    elapsed_ms,
+                ),
+            )))
     }
 }
 
@@ -634,6 +618,16 @@ mod tests {
             answers_from_metadata(&output.metadata).expect("decodable"),
             vec![vec!["SQLite".to_owned()]]
         );
+        let Some(ToolResultPresentation::Question(presentation)) = output.presentation.as_ref()
+        else {
+            panic!("question output must carry a typed presentation");
+        };
+        assert_eq!(presentation.status(), QuestionResultStatus::Answered);
+        assert_eq!(
+            presentation.answers(),
+            Some(&[vec!["SQLite".to_owned()]][..])
+        );
+        assert_eq!(presentation.question_count(), 1);
     }
 
     #[tokio::test]
@@ -688,15 +682,15 @@ mod tests {
     #[test]
     fn the_title_marks_terminal_status_count_and_elapsed_time() {
         assert_eq!(
-            QuestionTool::title(QuestionStatus::Answered, 0, Duration::ZERO),
+            QuestionTool::title(QuestionResultStatus::Answered, 0, Duration::ZERO),
             "Answered · 0 questions · <1s"
         );
         assert_eq!(
-            QuestionTool::title(QuestionStatus::Cancelled, 1, Duration::from_secs(18)),
+            QuestionTool::title(QuestionResultStatus::Cancelled, 1, Duration::from_secs(18)),
             "Cancelled · 1 question · 18s"
         );
         assert_eq!(
-            QuestionTool::title(QuestionStatus::Expired, 2, Duration::from_secs(62)),
+            QuestionTool::title(QuestionResultStatus::Expired, 2, Duration::from_secs(62)),
             "Expired · 2 questions · 1m 02s"
         );
     }

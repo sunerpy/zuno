@@ -49,7 +49,7 @@ use zuno_orchestration::{
 };
 use zuno_tool::{
     FileDiff, METADATA_HUMAN_REQUEST_ID_KEY, ToolConcurrencyPolicy, ToolContinuation,
-    ToolDefinition, ToolOutput, ToolReplayPolicy, ToolUiIntent,
+    ToolDefinition, ToolOutput, ToolReplayPolicy, ToolResultPresentation, ToolUiIntent,
 };
 
 use crate::hooks::{HookMessageWithParts, NoopHooks, RequestHookInput, TurnHooks};
@@ -295,6 +295,16 @@ pub enum TurnEvent {
         title: String,
         output: String,
         interruption: ToolInterruption,
+    },
+    /// A typed client presentation supplied by the tool that owns the result
+    /// semantics.
+    ///
+    /// Emitted immediately before [`Self::ToolDispatchCompleted`]. Arbitrary tool
+    /// metadata remains private; surfaces receive only this declared contract.
+    ToolResultPresented {
+        step: u32,
+        call_id: String,
+        presentation: ToolResultPresentation,
     },
     ToolDispatchCompleted {
         step: u32,
@@ -2408,6 +2418,15 @@ async fn run_turn_in_span(
                             })
                             .await?;
                     } else {
+                        if let Some(presentation) = dispatch.output.presentation.clone() {
+                            events
+                                .send(TurnEvent::ToolResultPresented {
+                                    step,
+                                    call_id: call.id.clone(),
+                                    presentation,
+                                })
+                                .await?;
+                        }
                         events
                             .send(TurnEvent::ToolDispatchCompleted {
                                 step,

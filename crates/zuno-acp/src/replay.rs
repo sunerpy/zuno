@@ -415,6 +415,7 @@ fn tool_updates(part: &PartRecord, policy: &ReplayPolicy) -> Vec<Value> {
         diff: diff.as_ref(),
         written_paths: &written_paths,
         is_error: status == "error",
+        presentation: None,
         metadata: Some(&metadata),
     };
     let interruption = metadata

@@ -605,8 +605,14 @@ failed streamed tool call cannot dispatch a side effect. ACP is append-only and
 cannot retract an already published text chunk. Its live projector therefore
 holds provider text, reasoning, and pending tool updates until
 `AssistantCheckpointed`; `RetryRollback` clears the provisional attempt and only
-the replacement attempt is published. Other clients may continue consuming the
-engine's lossless live events directly.
+the replacement attempt is published. A completed structured question is
+different: the accepted answer and tool result are already durable before the
+continuation provider request begins. ACP reasserts that same tool call as
+`in_progress` with typed `continuationPending` metadata, keeps it across provider
+rollback, and emits the real `completed` update before the next successful
+checkpoint. Failure, interruption, or event-stream closure settles the durable
+tool result without publishing provisional assistant content. Other clients may
+continue consuming the engine's lossless live events directly.
 
 OpenAI-compatible transports resolve three independent provider options:
 

@@ -553,6 +553,16 @@ fn event_json(event: TurnEvent) -> Value {
                 "uncertain":interruption.uncertain(),
             })
         }
+        TurnEvent::ToolResultPresented {
+            step,
+            call_id,
+            presentation,
+        } => json!({
+            "type":"tool_result_presented",
+            "step":step,
+            "callID":call_id,
+            "presentation":presentation,
+        }),
         TurnEvent::ToolDispatchCompleted {
             step,
             call_id,

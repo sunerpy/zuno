@@ -334,6 +334,18 @@ fn turn_event(event: &TurnEvent) -> NewEvent {
                 "uncertain": interruption.uncertain(),
             })),
         ),
+        TurnEvent::ToolResultPresented {
+            step,
+            call_id,
+            presentation,
+        } => (
+            "tool.result.presented",
+            object(json!({
+                "step": step,
+                "callID": call_id,
+                "presentation": presentation,
+            })),
+        ),
         TurnEvent::ToolDispatchCompleted {
             step,
             call_id,
@@ -673,5 +685,33 @@ mod tests {
         assert_eq!(interrupted.properties["mode"], "forced");
         assert_eq!(interrupted.properties["forced"], true);
         assert_eq!(interrupted.properties["uncertain"], true);
+    }
+
+    #[test]
+    fn typed_tool_result_presentation_has_a_stable_native_event() {
+        let presented = turn_event(&TurnEvent::ToolResultPresented {
+            step: 2,
+            call_id: "call_question".to_owned(),
+            presentation: serde_json::from_value(serde_json::json!({
+                "question": {
+                    "status": "answered",
+                    "answers": [["SQLite"]],
+                    "questionCount": 1,
+                    "elapsedMs": 12,
+                }
+            }))
+            .expect("typed question presentation"),
+        });
+
+        assert_eq!(presented.event_type, "tool.result.presented");
+        assert_eq!(presented.properties["callID"], "call_question");
+        assert_eq!(
+            presented.properties["presentation"]["question"]["status"],
+            "answered"
+        );
+        assert_eq!(
+            presented.properties["presentation"]["question"]["answers"][0][0],
+            "SQLite"
+        );
     }
 }

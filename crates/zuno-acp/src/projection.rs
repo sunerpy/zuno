@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 use zuno_engine::r#loop::{INTERRUPTED_TURN_NOTICE, ToolDiff, ToolInterruption, TurnEvent};
 use zuno_llm::event::StreamEvent;
+use zuno_tool::{QuestionResultStatus, ToolResultPresentation};
 
 use crate::presentation::{decorate_completed_tool_update, decorate_tool_call};
 
@@ -12,6 +13,7 @@ pub struct TurnEventProjector {
     raw_inputs: HashMap<String, String>,
     tool_names: HashMap<String, String>,
     visible_tools: HashSet<String>,
+    result_presentations: HashMap<String, ToolResultPresentation>,
 }
 
 /// ACP projection that exposes provider output only after its attempt is durable.
@@ -23,6 +25,8 @@ pub struct TurnEventProjector {
 pub struct AttemptBufferedTurnEventProjector {
     projector: TurnEventProjector,
     pending: Vec<Value>,
+    deferred_completions: Vec<Value>,
+    answered_questions: HashSet<String>,
     buffering: bool,
 }
 
@@ -44,6 +48,34 @@ impl AttemptBufferedTurnEventProjector {
     #[must_use]
     pub fn project(&mut self, event: &TurnEvent) -> Vec<Value> {
         match event {
+            TurnEvent::ToolResultPresented {
+                call_id,
+                presentation,
+                ..
+            } => {
+                if matches!(
+                    presentation,
+                    ToolResultPresentation::Question(question)
+                        if question.status() == QuestionResultStatus::Answered
+                ) {
+                    self.answered_questions.insert(call_id.clone());
+                }
+                let _ = self.projector.project(event);
+                Vec::new()
+            }
+            TurnEvent::ToolDispatchCompleted {
+                call_id, is_error, ..
+            } if !*is_error && self.answered_questions.remove(call_id) => {
+                let Some(mut completed) = self.projector.project(event) else {
+                    return Vec::new();
+                };
+                set_question_continuation_pending(&mut completed, false);
+                let mut continuing = completed.clone();
+                continuing["status"] = json!("in_progress");
+                set_question_continuation_pending(&mut continuing, true);
+                self.deferred_completions.push(completed);
+                vec![continuing]
+            }
             TurnEvent::ProviderRequestStarted { .. } => {
                 self.pending.clear();
                 self.projector.reset_attempt();
@@ -63,7 +95,24 @@ impl AttemptBufferedTurnEventProjector {
                     self.pending.push(update);
                 }
                 self.buffering = false;
-                std::mem::take(&mut self.pending)
+                let mut committed = std::mem::take(&mut self.deferred_completions);
+                committed.append(&mut self.pending);
+                committed
+            }
+            TurnEvent::TurnCompleted { .. }
+            | TurnEvent::TurnInterrupted { .. }
+            | TurnEvent::TurnFailed { .. }
+            | TurnEvent::TurnWaitingForHuman { .. }
+            | TurnEvent::SessionCommandCompleted { .. }
+            | TurnEvent::SessionCommandFailed { .. } => {
+                self.pending.clear();
+                self.answered_questions.clear();
+                self.buffering = false;
+                let mut committed = std::mem::take(&mut self.deferred_completions);
+                if let Some(update) = self.projector.project(event) {
+                    committed.push(update);
+                }
+                committed
             }
             _ if self.buffering => {
                 if let Some(update) = self.projector.project(event) {
@@ -73,6 +122,17 @@ impl AttemptBufferedTurnEventProjector {
             }
             _ => self.projector.project(event).into_iter().collect(),
         }
+    }
+
+    /// Settle durable client-visible results when an event stream ends without a
+    /// terminal event. Attempt-scoped provider output remains discarded.
+    #[must_use]
+    pub fn finish(&mut self) -> Vec<Value> {
+        self.pending.clear();
+        self.answered_questions.clear();
+        self.buffering = false;
+        self.projector.reset_attempt();
+        std::mem::take(&mut self.deferred_completions)
     }
 }
 
@@ -99,6 +159,7 @@ impl TurnEventProjector {
         self.raw_inputs.clear();
         self.tool_names.clear();
         self.visible_tools.clear();
+        self.result_presentations.clear();
     }
 
     #[must_use]
@@ -199,6 +260,7 @@ impl TurnEventProjector {
                 self.raw_inputs.remove(call_id);
                 self.tool_names.remove(call_id);
                 self.visible_tools.remove(call_id);
+                self.result_presentations.remove(call_id);
                 let kind = kind.as_str();
                 Some(json!({
                     "sessionUpdate": "tool_call_update",
@@ -228,6 +290,7 @@ impl TurnEventProjector {
                     .map(|value| json_or_string(&value));
                 self.tool_names.remove(call_id);
                 self.visible_tools.remove(call_id);
+                self.result_presentations.remove(call_id);
                 Some(interrupted_tool_update(
                     CompletedToolUpdate {
                         call_id,
@@ -239,10 +302,20 @@ impl TurnEventProjector {
                         diff: None,
                         written_paths: &[],
                         is_error: true,
+                        presentation: None,
                         metadata: None,
                     },
                     *interruption,
                 ))
+            }
+            TurnEvent::ToolResultPresented {
+                call_id,
+                presentation,
+                ..
+            } => {
+                self.result_presentations
+                    .insert(call_id.clone(), presentation.clone());
+                None
             }
             TurnEvent::ToolDispatchCompleted {
                 call_id,
@@ -261,6 +334,7 @@ impl TurnEventProjector {
                     .map(|value| json_or_string(&value));
                 self.tool_names.remove(call_id);
                 self.visible_tools.remove(call_id);
+                let presentation = self.result_presentations.remove(call_id);
                 Some(completed_tool_update(CompletedToolUpdate {
                     call_id,
                     display_name,
@@ -271,6 +345,7 @@ impl TurnEventProjector {
                     diff: diff.as_ref(),
                     written_paths,
                     is_error: *is_error,
+                    presentation: presentation.as_ref(),
                     metadata: None,
                 }))
             }
@@ -290,6 +365,7 @@ impl TurnEventProjector {
                 self.raw_inputs.remove(tool_use_id);
                 self.tool_names.remove(tool_use_id);
                 self.visible_tools.remove(tool_use_id);
+                self.result_presentations.remove(tool_use_id);
                 Some(json!({
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": tool_use_id,
@@ -371,6 +447,7 @@ pub(crate) struct CompletedToolUpdate<'a> {
     pub diff: Option<&'a ToolDiff>,
     pub written_paths: &'a [String],
     pub is_error: bool,
+    pub presentation: Option<&'a ToolResultPresentation>,
     pub metadata: Option<&'a serde_json::Map<String, Value>>,
 }
 
@@ -386,6 +463,7 @@ pub(crate) fn completed_tool_update(input: CompletedToolUpdate<'_>) -> Value {
         diff,
         written_paths,
         is_error,
+        presentation,
         metadata,
     } = input;
     let title = shell_command(name, raw_input).unwrap_or({
@@ -418,8 +496,22 @@ pub(crate) fn completed_tool_update(input: CompletedToolUpdate<'_>) -> Value {
         update["locations"] = Value::Array(locations);
     }
     add_shell_interpreter(&mut update, name, display_name);
-    decorate_completed_tool_update(&mut update, name, raw_input, metadata, output, is_error);
+    decorate_completed_tool_update(
+        &mut update,
+        name,
+        raw_input,
+        presentation,
+        metadata,
+        output,
+        is_error,
+    );
     update
+}
+
+fn set_question_continuation_pending(update: &mut Value, pending: bool) {
+    if update["_meta"]["zuno"]["question"].is_object() {
+        update["_meta"]["zuno"]["question"]["continuationPending"] = Value::Bool(pending);
+    }
 }
 
 pub(crate) fn interrupted_tool_update(

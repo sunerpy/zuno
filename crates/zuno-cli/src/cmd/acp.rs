@@ -2774,6 +2774,9 @@ async fn project_turn(
             _ => {}
         }
     }
+    for update in projector.finish() {
+        client.session_update(session_id, update).await?;
+    }
     Ok(ProjectedTurn::Missing)
 }
 

@@ -265,7 +265,16 @@ Structured `question` calls use ACP form controls rather than a generic prompt:
 - submitting `Other` takes precedence over selected options, matching the Zuno
   TUI, while an empty optional form is reported as unanswered.
 
-After completion and on historical replay, the question remains a static tool
+After a form answer is accepted, Zuno immediately updates the same question
+tool call as `in_progress`. Its typed metadata records the authoritative
+`answered` outcome and sets `continuationPending: true`, so Zed keeps a visible
+activity row while the next provider request has no checkpointed output. At the
+next assistant checkpoint, Zuno sends the question's `completed` update first
+and then the committed continuation output. A terminal failure, interruption,
+or closed event stream also settles the question card while discarding any
+provisional provider text.
+
+After settlement and on historical replay, the question remains a static tool
 card showing its prompt, choices, status, and—when durable answer metadata is
 available—the selected values. `rawInput` and `rawOutput` remain available in
 tool details; loading history never reopens an elicitation request.
@@ -461,7 +470,9 @@ under `session.provider.attempt.1`, and the same durable session affinity is
 reused. Because ACP cannot retract an appended message chunk, Zuno commits
 provider text, reasoning, and pending tool rows only after the attempt is
 checkpointed. A failed partial attempt is discarded instead of being concatenated
-with its replacement.
+with its replacement. A durable accepted-question result is not attempt-scoped:
+its `in_progress` continuation marker survives `RetryRollback`, and its terminal
+tool update is emitted with the successful replacement checkpoint.
 
 ## 9. Acceptance checks
 
@@ -480,9 +491,10 @@ After configuration:
    summary survives a session reload;
 7. execute one configured command or unambiguous Skill;
 8. attach an image, selection, and branch diff and confirm they reach the turn;
-9. send a read-only repository question and confirm the committed reasoning,
-   answer, and pending tool rows appear once; inject one retryable stream failure
-   and confirm the failed partial attempt is absent;
+9. answer a structured question and confirm its tool row stays `in_progress`
+   until the continuation checkpoint, then becomes `completed` before the next
+   assistant output; inject one retryable stream failure and confirm the failed
+   partial attempt is absent while the accepted-question marker remains;
 10. delegate a foreground child and confirm either the negotiated child-session
     stream or the complete stable task card, depending on client capability;
 11. delegate a background child, close the root thread, and confirm the job is

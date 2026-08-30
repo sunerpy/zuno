@@ -87,6 +87,108 @@ impl ToolContinuation {
     }
 }
 
+/// Terminal outcome of a structured question tool call.
+///
+/// This is separate from free-form tool metadata so live clients do not need to
+/// parse private JSON keys or rendered output to decide how a question settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionResultStatus {
+    Answered,
+    Cancelled,
+    Expired,
+    Failed,
+}
+
+impl QuestionResultStatus {
+    /// Stable spelling shared by durable metadata and client projections.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Short human-readable label used in transcript titles.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Answered => "Answered",
+            Self::Cancelled => "Cancelled",
+            Self::Expired => "Expired",
+            Self::Failed => "Failed",
+        }
+    }
+}
+
+/// Typed, host-facing result of a structured question.
+///
+/// The same information is also persisted in the tool result metadata. This
+/// typed form is intentionally carried beside the live result so a client
+/// projector can render an exact answer without receiving the tool's entire
+/// private metadata map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuestionResultPresentation {
+    status: QuestionResultStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answers: Option<Vec<Vec<String>>>,
+    question_count: usize,
+    elapsed_ms: u64,
+}
+
+impl QuestionResultPresentation {
+    /// Creates a typed question result.
+    #[must_use]
+    pub fn new(
+        status: QuestionResultStatus,
+        answers: Option<Vec<Vec<String>>>,
+        question_count: usize,
+        elapsed_ms: u64,
+    ) -> Self {
+        Self {
+            status,
+            answers,
+            question_count,
+            elapsed_ms,
+        }
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> QuestionResultStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub fn answers(&self) -> Option<&[Vec<String>]> {
+        self.answers.as_deref()
+    }
+
+    #[must_use]
+    pub const fn question_count(&self) -> usize {
+        self.question_count
+    }
+
+    #[must_use]
+    pub const fn elapsed_ms(&self) -> u64 {
+        self.elapsed_ms
+    }
+}
+
+/// Typed client presentation attached to one successful tool result.
+///
+/// Variants belong here rather than in a surface adapter: the producing tool is
+/// the only component that can state the result authoritatively, while ACP, TUI,
+/// and future clients may choose different renderings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolResultPresentation {
+    Question(QuestionResultPresentation),
+}
+
 /// One text file modification produced by a tool call.
 ///
 /// Paths are absolute at this boundary because ACP clients resolve edits outside the
@@ -191,9 +293,10 @@ impl Attachment {
 
 /// The result of a successful tool execution.
 ///
-/// Mirrors the oracle's `ExecuteResult` (`tool.ts:48-53`) field for field: a `title`
-/// for the transcript, the `output` the model reads, free-form `metadata`, and any
-/// `attachments`.
+/// Its durable/model-facing fields mirror the oracle's `ExecuteResult`
+/// (`tool.ts:48-53`): a `title` for the transcript, the `output` the model reads,
+/// free-form `metadata`, and any `attachments`. Host continuation and typed live
+/// presentation remain outside that durable payload.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutput {
     /// The one-line summary shown in the transcript.
@@ -206,6 +309,10 @@ pub struct ToolOutput {
     /// Files produced by this call.
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// Typed host-facing presentation for results whose lifecycle cannot be
+    /// reconstructed safely from prose.
+    #[serde(skip)]
+    pub presentation: Option<ToolResultPresentation>,
     /// Host-owned continuation behavior after a successful dispatch.
     #[serde(default, skip_serializing_if = "ToolContinuation::is_continue")]
     pub continuation: ToolContinuation,
@@ -220,6 +327,7 @@ impl ToolOutput {
             output: output.into(),
             metadata: Map::new(),
             attachments: Vec::new(),
+            presentation: None,
             continuation: ToolContinuation::Continue,
         }
     }
@@ -235,6 +343,13 @@ impl ToolOutput {
     #[must_use]
     pub fn with_attachment(mut self, attachment: Attachment) -> Self {
         self.attachments.push(attachment);
+        self
+    }
+
+    /// Attaches one typed client presentation, chaining.
+    #[must_use]
+    pub fn with_presentation(mut self, presentation: ToolResultPresentation) -> Self {
+        self.presentation = Some(presentation);
         self
     }
 
@@ -541,6 +656,21 @@ mod tests {
         assert_eq!(measurement.lines, 2);
         assert_eq!(measurement.bytes, 3);
         assert!(!measurement.is_oversized());
+    }
+
+    #[test]
+    fn typed_presentation_is_live_only_and_not_part_of_durable_tool_output() {
+        let output = ToolOutput::text("question", "accepted").with_presentation(
+            ToolResultPresentation::Question(QuestionResultPresentation::new(
+                QuestionResultStatus::Answered,
+                Some(vec![vec!["SQLite".to_owned()]]),
+                1,
+                12,
+            )),
+        );
+
+        let durable = serde_json::to_value(output).expect("serialize durable tool output");
+        assert!(durable.get("presentation").is_none());
     }
 
     #[test]

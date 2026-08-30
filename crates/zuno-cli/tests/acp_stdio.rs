@@ -2652,12 +2652,38 @@ async fn acp_prompt_round_trips_question_tool_through_stable_elicitation() {
     );
     assert_eq!(completed["stopReason"], "end_turn");
     assert_eq!(elicitation["toolCallId"], "call_question");
-    assert!(
-        updates.iter().any(|update| {
+    let continuing_index = updates
+        .iter()
+        .position(|update| {
+            update["sessionUpdate"] == "tool_call_update"
+                && update["toolCallId"] == "call_question"
+                && update["status"] == "in_progress"
+                && update["_meta"]["zuno"]["question"]["status"] == "answered"
+                && update["_meta"]["zuno"]["question"]["continuationPending"] == true
+        })
+        .unwrap_or_else(|| panic!("missing post-answer continuation update: {updates:?}"));
+    let settled_index = updates
+        .iter()
+        .position(|update| {
+            update["sessionUpdate"] == "tool_call_update"
+                && update["toolCallId"] == "call_question"
+                && update["status"] == "completed"
+                && update["_meta"]["zuno"]["question"]["status"] == "answered"
+                && update["_meta"]["zuno"]["question"]["continuationPending"] == false
+        })
+        .unwrap_or_else(|| panic!("missing checkpointed question completion: {updates:?}"));
+    let reply_index = updates
+        .iter()
+        .position(|update| {
             update["sessionUpdate"] == "agent_message_chunk"
                 && update["content"]["text"] == "Configured SQLite"
-        }),
-        "missing streamed assistant text after elicitation: {updates:?}"
+        })
+        .unwrap_or_else(|| {
+            panic!("missing streamed assistant text after elicitation: {updates:?}")
+        });
+    assert!(
+        continuing_index < settled_index && settled_index < reply_index,
+        "question activity must remain live until the continuation checkpoint: {updates:?}"
     );
 
     let received = provider

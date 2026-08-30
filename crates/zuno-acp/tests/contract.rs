@@ -4,7 +4,10 @@ use zuno_acp::{
 };
 use zuno_engine::r#loop::{ToolBlockKind, ToolDiff, ToolInterruption, TurnEvent};
 use zuno_llm::event::{PromptAccounting, StreamEvent};
-use zuno_tool::{FileDiff, ToolUiIntent};
+use zuno_tool::{
+    FileDiff, QuestionResultPresentation, QuestionResultStatus, ToolResultPresentation,
+    ToolUiIntent,
+};
 
 #[test]
 fn adapter_exposes_exactly_the_stable_v1_21_agent_methods() {
@@ -243,7 +246,7 @@ fn shell_tool_projects_a_copyable_command_and_separate_interpreter_identity() {
 }
 
 #[test]
-fn live_question_completion_keeps_the_authoritative_answer_text_until_replay() {
+fn live_question_completion_uses_the_typed_authoritative_answer() {
     let mut projector = TurnEventProjector::new();
     let _ = projector.project(&TurnEvent::Provider {
         step: 1,
@@ -276,6 +279,20 @@ fn live_question_completion_keeps_the_authoritative_answer_text_until_replay() {
         name: "question".to_owned(),
         ui_intent: ToolUiIntent::Generic,
     });
+    assert!(
+        projector
+            .project(&TurnEvent::ToolResultPresented {
+                step: 1,
+                call_id: "call-question".to_owned(),
+                presentation: ToolResultPresentation::Question(QuestionResultPresentation::new(
+                    QuestionResultStatus::Answered,
+                    Some(vec![vec!["SQLite".to_owned()]]),
+                    1,
+                    12,
+                ),),
+            })
+            .is_none()
+    );
 
     let completed = projector
         .project(&TurnEvent::ToolDispatchCompleted {
@@ -297,26 +314,286 @@ fn live_question_completion_keeps_the_authoritative_answer_text_until_replay() {
         .expect("completed question projection");
 
     assert_eq!(completed["title"], "Answered · 1 question · <1s");
-    assert_eq!(
-        completed["_meta"]["zuno"]["question"]["status"],
-        "completed"
-    );
+    assert_eq!(completed["_meta"]["zuno"]["question"]["status"], "answered");
     let content = completed["content"]
         .as_array()
         .expect("question completion content");
-    assert_eq!(content.len(), 2);
+    assert_eq!(content.len(), 1);
     let card = content[0]["content"]["text"]
         .as_str()
         .expect("question card");
     assert!(card.contains("Which database?"), "{card}");
+    assert!(card.contains("Selected: SQLite"), "{card}");
+    assert_eq!(completed["_meta"]["zuno"]["question"]["questionCount"], 1);
+    assert_eq!(completed["_meta"]["zuno"]["question"]["elapsedMs"], 12);
     assert!(
-        !card.contains("Selected: none"),
-        "live events cannot claim an answer was absent without durable metadata: {card}"
-    );
-    assert!(
-        content[1]["content"]["text"]
+        completed["rawOutput"]
             .as_str()
             .is_some_and(|text| text.contains("\"Which database?\"=\"SQLite\""))
+    );
+}
+
+#[test]
+fn answered_question_remains_in_progress_until_the_continuation_is_checkpointed() {
+    let mut projector = AttemptBufferedTurnEventProjector::new();
+    let question_input = serde_json::to_string(&json!({
+        "questions": [{
+            "header": "Database",
+            "question": "Which database?",
+            "options": [
+                {"label": "Postgres", "description": "Relational"},
+                {"label": "SQLite", "description": "Embedded"}
+            ]
+        }]
+    }))
+    .expect("question input");
+
+    assert!(
+        projector
+            .project(&TurnEvent::ProviderRequestStarted {
+                step: 1,
+                message_count: 1,
+                estimated_prompt_tokens: 12,
+            })
+            .is_empty()
+    );
+    for event in [
+        TurnEvent::Provider {
+            step: 1,
+            event: StreamEvent::ToolUseStart {
+                id: "call-question".to_owned(),
+                name: "question".to_owned(),
+            },
+        },
+        TurnEvent::Provider {
+            step: 1,
+            event: StreamEvent::ToolInputDelta {
+                id: "call-question".to_owned(),
+                delta: question_input,
+            },
+        },
+        TurnEvent::ToolCallStarted {
+            step: 1,
+            call_id: "call-question".to_owned(),
+            display_name: "Question".to_owned(),
+            name: "question".to_owned(),
+            ui_intent: ToolUiIntent::Generic,
+        },
+    ] {
+        assert!(projector.project(&event).is_empty());
+    }
+    let admitted = projector.project(&TurnEvent::AssistantCheckpointed {
+        step: 1,
+        message_id: "msg-question".to_owned(),
+        interrupted: false,
+    });
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0]["status"], "pending");
+
+    let running = projector.project(&TurnEvent::ToolDispatchStarted {
+        step: 1,
+        call_id: "call-question".to_owned(),
+        display_name: "Question".to_owned(),
+        name: "question".to_owned(),
+        ui_intent: ToolUiIntent::Generic,
+    });
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0]["status"], "in_progress");
+
+    assert!(
+        projector
+            .project(&TurnEvent::ToolResultPresented {
+                step: 1,
+                call_id: "call-question".to_owned(),
+                presentation: ToolResultPresentation::Question(QuestionResultPresentation::new(
+                    QuestionResultStatus::Answered,
+                    Some(vec![vec!["SQLite".to_owned()]]),
+                    1,
+                    292_976,
+                ),),
+            })
+            .is_empty()
+    );
+    let continuing = projector.project(&TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: "call-question".to_owned(),
+        display_name: "Question".to_owned(),
+        name: "question".to_owned(),
+        title: "Answered · 1 question · 4m 52s".to_owned(),
+        output: concat!(
+            "User has answered your questions: ",
+            "\"Which database?\"=\"SQLite\". ",
+            "You can now continue with the user's answers in mind."
+        )
+        .to_owned(),
+        diff: None,
+        written_paths: Vec::new(),
+        is_error: false,
+    });
+    assert_eq!(continuing.len(), 1);
+    assert_eq!(continuing[0]["status"], "in_progress");
+    assert_eq!(
+        continuing[0]["_meta"]["zuno"]["question"]["status"],
+        "answered"
+    );
+    assert_eq!(
+        continuing[0]["_meta"]["zuno"]["question"]["continuationPending"],
+        true
+    );
+    assert!(
+        continuing[0]["content"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|card| card.contains("Selected: SQLite"))
+    );
+
+    assert!(
+        projector
+            .project(&TurnEvent::ProviderRequestStarted {
+                step: 2,
+                message_count: 3,
+                estimated_prompt_tokens: 48,
+            })
+            .is_empty()
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 2,
+                event: StreamEvent::TextDelta("discarded".to_owned()),
+            })
+            .is_empty()
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 2,
+                event: StreamEvent::RetryRollback { attempt: 2, max: 3 },
+            })
+            .is_empty()
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 2,
+                event: StreamEvent::TextDelta("Configured SQLite".to_owned()),
+            })
+            .is_empty()
+    );
+
+    let committed = projector.project(&TurnEvent::AssistantCheckpointed {
+        step: 2,
+        message_id: "msg-continuation".to_owned(),
+        interrupted: false,
+    });
+    assert_eq!(committed.len(), 2);
+    assert_eq!(committed[0]["sessionUpdate"], "tool_call_update");
+    assert_eq!(committed[0]["status"], "completed");
+    assert_eq!(
+        committed[0]["_meta"]["zuno"]["question"]["continuationPending"],
+        false
+    );
+    assert_eq!(committed[1]["sessionUpdate"], "agent_message_chunk");
+    assert_eq!(committed[1]["content"]["text"], "Configured SQLite");
+    assert!(
+        committed
+            .iter()
+            .all(|update| update["content"]["text"] != "discarded")
+    );
+}
+
+#[test]
+fn event_stream_close_settles_a_deferred_question_without_partial_output() {
+    let mut projector = AttemptBufferedTurnEventProjector::new();
+    assert!(
+        projector
+            .project(&TurnEvent::ToolResultPresented {
+                step: 1,
+                call_id: "call-question".to_owned(),
+                presentation: ToolResultPresentation::Question(QuestionResultPresentation::new(
+                    QuestionResultStatus::Answered,
+                    Some(vec![vec!["SQLite".to_owned()]]),
+                    1,
+                    5,
+                ),),
+            })
+            .is_empty()
+    );
+    let continuing = projector.project(&TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: "call-question".to_owned(),
+        display_name: "Question".to_owned(),
+        name: "question".to_owned(),
+        title: "Answered · 1 question · <1s".to_owned(),
+        output: "accepted".to_owned(),
+        diff: None,
+        written_paths: Vec::new(),
+        is_error: false,
+    });
+    assert_eq!(continuing[0]["status"], "in_progress");
+
+    assert!(
+        projector
+            .project(&TurnEvent::ProviderRequestStarted {
+                step: 2,
+                message_count: 3,
+                estimated_prompt_tokens: 48,
+            })
+            .is_empty()
+    );
+    assert!(
+        projector
+            .project(&TurnEvent::Provider {
+                step: 2,
+                event: StreamEvent::TextDelta("must not escape".to_owned()),
+            })
+            .is_empty()
+    );
+
+    let settled = projector.finish();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(settled[0]["status"], "completed");
+    assert_eq!(settled[0]["rawOutput"], "accepted");
+    assert!(
+        settled
+            .iter()
+            .all(|update| update["content"]["text"] != "must not escape")
+    );
+}
+
+#[test]
+fn a_non_answered_question_completion_is_not_extended() {
+    let mut projector = AttemptBufferedTurnEventProjector::new();
+    assert!(
+        projector
+            .project(&TurnEvent::ToolResultPresented {
+                step: 1,
+                call_id: "call-question".to_owned(),
+                presentation: ToolResultPresentation::Question(QuestionResultPresentation::new(
+                    QuestionResultStatus::Cancelled,
+                    None,
+                    1,
+                    5,
+                ),),
+            })
+            .is_empty()
+    );
+    let completed = projector.project(&TurnEvent::ToolDispatchCompleted {
+        step: 1,
+        call_id: "call-question".to_owned(),
+        display_name: "Question".to_owned(),
+        name: "question".to_owned(),
+        title: "Cancelled · 1 question · <1s".to_owned(),
+        output: "The user cancelled this question request.".to_owned(),
+        diff: None,
+        written_paths: Vec::new(),
+        is_error: false,
+    });
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["status"], "completed");
+    assert!(
+        completed[0]["_meta"]["zuno"]["question"]
+            .get("continuationPending")
+            .is_none()
     );
 }
 

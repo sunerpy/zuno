@@ -50,7 +50,7 @@ use zuno_llm::event::{
     ConnectionPhase, FinishReason, Message, RequestContentBlock, StreamEvent, ThoughtSignature,
 };
 use zuno_testkit::perf::{W_REAL_SUBJECT, verify_pinned_database};
-use zuno_tool::ToolUiIntent;
+use zuno_tool::{ToolResultPresentation, ToolUiIntent};
 
 /// Repetitions every measured quantity is reported over.
 ///
@@ -219,6 +219,10 @@ fn turn_event_payloads() -> Vec<VariantPayload> {
             )>(),
         ),
         payload(
+            "ToolResultPresented",
+            size_of::<(u32, String, ToolResultPresentation)>(),
+        ),
+        payload(
             "ToolDispatchCompleted",
             size_of::<(
                 u32,
@@ -267,6 +271,7 @@ fn turn_event_variant_name(event: &TurnEvent) -> &'static str {
         TurnEvent::ToolDispatchStarted { .. } => "ToolDispatchStarted",
         TurnEvent::ToolDispatchBlocked { .. } => "ToolDispatchBlocked",
         TurnEvent::ToolDispatchInterrupted { .. } => "ToolDispatchInterrupted",
+        TurnEvent::ToolResultPresented { .. } => "ToolResultPresented",
         TurnEvent::ToolDispatchCompleted { .. } => "ToolDispatchCompleted",
         TurnEvent::ToolResultAppended { .. } => "ToolResultAppended",
         TurnEvent::StepCompleted { .. } => "StepCompleted",
