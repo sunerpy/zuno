@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0](https://github.com/sunerpy/zuno/compare/v0.0.1...v0.1.0) (2026-08-30)
+
+
+### Features
+
+* initial release ([2129c5c](https://github.com/sunerpy/zuno/commit/2129c5c29e8384a64ff3aa5e2139bdd3c2100735))
+
 ## 0.0.1
 
 First published release. Zuno is in pre-release development: configuration, data
