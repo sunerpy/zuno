@@ -763,7 +763,10 @@ Detached turns use the same engine events as request-owned turns. TUI routes roo
 events back to the mounted transcript, ACP sends ordinary root
 `session/update` notifications, and the HTTP server commits and fans out the
 same durable event projection. Child-session events retain their child observer.
-No client owns a private continuation loop.
+After the detached event stream drains, ACP reads the authoritative work state
+from the host and sends the root session's final durable Plan projection when a
+Plan exists. This terminal projection is best-effort and cannot change the
+already committed turn outcome. No client owns a private continuation loop.
 
 Interactive TUI input uses the same durable boundary. When idle, `Enter`
 starts a turn. During an active turn, `Enter` admits a FIFO `queue` item for the

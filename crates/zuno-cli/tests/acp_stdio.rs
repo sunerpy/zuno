@@ -3221,7 +3221,7 @@ async fn acp_close_cancels_and_joins_its_background_child_without_native_project
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_background_child_completion_restarts_parent_after_prompt_response() {
+async fn acp_detached_parent_projects_final_plan_after_background_child_completion() {
     let provider = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(CompletingBackgroundSubagentTurnResponder)
@@ -3295,17 +3295,21 @@ async fn acp_background_child_completion_restarts_parent_after_prompt_response()
     let resumed_session_id = parent_session_id.clone();
     std::thread::spawn(move || {
         let mut detached_updates = Vec::new();
+        let mut resumed = false;
+        let mut projected_plan = false;
         loop {
             let params = read_session_update(&mut stdout);
-            let resumed = params["sessionId"] == resumed_session_id
+            resumed |= params["sessionId"] == resumed_session_id
                 && params["update"]["sessionUpdate"] == "agent_message_chunk"
                 && params["update"]["content"]["text"]
                     .as_str()
                     .is_some_and(|text| {
                         text.contains("parent resumed after background child completion")
                     });
+            projected_plan |= params["sessionId"] == resumed_session_id
+                && params["update"]["sessionUpdate"] == "plan";
             detached_updates.push(params);
-            if resumed {
+            if resumed && projected_plan {
                 let _sent = resumed_tx.send((stdout, detached_updates));
                 break;
             }
@@ -3315,7 +3319,10 @@ async fn acp_background_child_completion_restarts_parent_after_prompt_response()
         Ok(result) => result,
         Err(error) => {
             let _killed = child.kill();
-            panic!("background child did not resume the completed parent turn: {error}");
+            panic!(
+                "background child did not resume the completed parent turn and project its final \
+                 plan: {error}"
+            );
         }
     };
     assert!(detached_updates.iter().any(|params| {
@@ -3327,6 +3334,49 @@ async fn acp_background_child_completion_restarts_parent_after_prompt_response()
                     text.contains("parent resumed after background child completion")
                 })
     }));
+    let resumed_index = detached_updates
+        .iter()
+        .position(|params| {
+            params["sessionId"] == parent_session_id
+                && params["update"]["sessionUpdate"] == "agent_message_chunk"
+                && params["update"]["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| {
+                        text.contains("parent resumed after background child completion")
+                    })
+        })
+        .expect("missing resumed parent message");
+    let (plan_index, plan_update) = detached_updates
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, params)| {
+            params["sessionId"] == parent_session_id && params["update"]["sessionUpdate"] == "plan"
+        })
+        .expect("missing final durable plan projection");
+    assert!(
+        plan_index > resumed_index,
+        "the final durable plan projection must follow detached turn events"
+    );
+    assert!(
+        plan_update["update"]["entries"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty()),
+        "the final durable plan projection must contain entries"
+    );
+    let projected_revision = plan_update["update"]["_meta"]["zuno"]["revision"]
+        .as_i64()
+        .expect("the final durable plan projection must carry its durable revision");
+    let location = zuno_paths::DbLocation::File(root.path().join("zuno-acp.db"));
+    let pool = Arc::new(zuno_db::Pool::open(&location).expect("open ACP work-state pool"));
+    let durable_plan = zuno_tools::WorkStateStore::new(pool)
+        .plan(&parent_session_id)
+        .expect("read final durable plan")
+        .expect("background continuation must retain its plan");
+    assert_eq!(
+        projected_revision, durable_plan.revision,
+        "ACP must project the final durable plan revision"
+    );
 
     request(
         &mut stdin,
