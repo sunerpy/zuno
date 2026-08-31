@@ -164,6 +164,7 @@ impl Agent for ConformanceAgent {
             }
             "session/load" | "session/resume" => {
                 required_string(&params, "cwd")?;
+                require_array(&params, "mcpServers")?;
                 let (_, session) = self.require_session(&params)?;
                 Ok(Self::lifecycle_response(&session))
             }
@@ -277,7 +278,7 @@ fn initialize(params: &Value) -> Result<Value, RpcError> {
         "protocolVersion": 1,
         "agentCapabilities": {
             "loadSession": true,
-            "mcpCapabilities": { "http": true, "sse": true },
+            "mcpCapabilities": { "stdio": true, "http": true, "sse": false },
             "promptCapabilities": { "embeddedContext": true, "image": true },
             "sessionCapabilities": {
                 "close": {}, "fork": {}, "list": {}, "resume": {},

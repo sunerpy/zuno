@@ -111,6 +111,14 @@ pub struct McpRemote {
     /// Request timeout in milliseconds; the runtime defaults to 5000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<NonZeroU32>,
+    /// Internal transport policy for process-local mounts such as ACP.
+    ///
+    /// User configuration keeps the historical negotiation behavior. ACP
+    /// declarations set this to `true` because ACP advertises Streamable HTTP
+    /// support but explicitly does not advertise legacy SSE.
+    #[serde(skip, default)]
+    #[schemars(skip)]
+    pub streamable_http_only: bool,
 }
 
 /// A switch for a server another config layer defined

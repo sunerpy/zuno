@@ -1293,6 +1293,15 @@ Codex's ordinary MCP topology. They terminate with bounded `SIGTERM` to
 `SIGKILL` escalation. Zuno inserts no `__zuno_child_guard` process in front of
 or beside MCP.
 
+An ACP session may add required stdio or Streamable HTTP MCP servers to its own
+profile bundle. The complete declaration is validated on new/load/resume;
+stdio commands are absolute and use the session directory as cwd, HTTP
+headers are strictly validated, and SSE is unsupported. All required servers
+connect and discover before their tools publish atomically. Partial startup,
+session close, load failure, profile replacement, and ACP process exit dispose
+the exact started set in reverse order. Client commands, environment values,
+and headers remain process-local and redacted rather than durable session data.
+
 Other resident and interactive hosts retain dedicated guards where a surviving
 per-tree owner or terminal foreground transfer is required. The direct child
 returned by `guarded_argv` is the guard, not the payload; owners request

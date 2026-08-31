@@ -16,7 +16,7 @@ use zuno_llm::event::{FinishReason, RequestContentBlock};
 use zuno_tool::PermissionAsker;
 
 use super::child_turn::{ChildTurnObserver, DetachedTurnObserver};
-use super::mcp_runtime::McpRuntime;
+use super::mcp_runtime::{McpRuntime, RequiredMcpServers};
 use super::turn::{
     CatalogModelChoice, ExtensionComposition, SessionChoice, SessionCommandError, TurnHost,
     TurnHostRuntimeDependencies, TurnOptions, TurnPlan, persisted_session_agent,
@@ -147,7 +147,8 @@ fn initialize(params: &Value) -> Result<Value, zuno_acp::RpcError> {
                 "embeddedContext": true,
             },
             "mcpCapabilities": {
-                "http": false,
+                "stdio": true,
+                "http": true,
                 "sse": false,
             },
             "sessionCapabilities": {
@@ -213,7 +214,9 @@ impl ProductionAcpAgent {
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
         let cwd = lifecycle_directory(params)?;
-        require_empty_roots_and_client_mcp(params)?;
+        require_empty_additional_directories(params)?;
+        let mcp_servers = zuno_acp::parse_mcp_servers(params.get("mcpServers"))
+            .map_err(|error| zuno_acp::RpcError::invalid_params(error.to_string()))?;
         let options = TurnOptions {
             directory: Some(cwd),
             model: None,
@@ -229,7 +232,7 @@ impl ProductionAcpAgent {
         };
         let session_slot = self.reserve_session_slot()?;
         let session = self
-            .open_session(options, client.clone(), session_slot)
+            .open_session(options, client.clone(), session_slot, mcp_servers, true)
             .await?;
         let session_id = session.id.clone();
         let response = session.lifecycle_response().await?;
@@ -267,7 +270,9 @@ impl ProductionAcpAgent {
     ) -> Result<Value, zuno_acp::RpcError> {
         let session_id = required_string(params, "sessionId")?;
         let cwd = lifecycle_directory(params)?;
-        require_empty_roots_and_client_mcp(params)?;
+        require_empty_additional_directories(params)?;
+        let mcp_servers = zuno_acp::parse_mcp_servers(params.get("mcpServers"))
+            .map_err(|error| zuno_acp::RpcError::invalid_params(error.to_string()))?;
         let pool = durable_pool()?;
         let stored = zuno_db::session::Store::new(&pool)
             .get(&session_id)
@@ -280,54 +285,65 @@ impl ProductionAcpAgent {
             )));
         }
 
-        let existing = self.state.sessions.lock().await.get(&session_id).cloned();
-        let session = if let Some(session) = existing {
-            session
-        } else {
-            let choice = SessionChoice::Existing(session_id.clone());
-            let options = TurnOptions {
-                directory: Some(cwd),
-                model: None,
-                agent: persisted_session_agent(&choice),
-                preset: None,
-                session: choice,
-                title: None,
-                effort: None,
-                variant: None,
-                thinking: false,
-                tool_authority: None,
-                extension_composition: ExtensionComposition::Active,
-            };
-            match self.reserve_session_slot() {
-                Ok(session_slot) => {
-                    let session = self.open_dormant_session(options, session_slot).await?;
-                    let mut sessions = self.state.sessions.lock().await;
-                    if let Some(existing) = sessions.get(&session_id).cloned() {
-                        existing
-                    } else {
-                        sessions.insert(session_id.clone(), Arc::clone(&session));
-                        session
-                    }
-                }
-                Err(error) => self
-                    .state
-                    .sessions
-                    .lock()
-                    .await
-                    .get(&session_id)
-                    .cloned()
-                    .ok_or(error)?,
-            }
+        let previous = self.state.sessions.lock().await.remove(&session_id);
+        if let Some(previous) = previous {
+            previous
+                .shutdown()
+                .await
+                .map_err(zuno_acp::RpcError::internal)?;
         };
+        let choice = SessionChoice::Existing(session_id.clone());
+        let options = TurnOptions {
+            directory: Some(cwd),
+            model: None,
+            agent: persisted_session_agent(&choice),
+            preset: None,
+            session: choice,
+            title: None,
+            effort: None,
+            variant: None,
+            thinking: false,
+            tool_authority: None,
+            extension_composition: ExtensionComposition::Active,
+        };
+        let session_slot = self.reserve_session_slot()?;
+        let session = self
+            .open_dormant_session(options, session_slot, mcp_servers)
+            .await?;
+        if let Err(error) = session.ensure_active(&self.state, client.clone()).await {
+            let _shutdown = session.shutdown().await;
+            return Err(error);
+        }
+        self.state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), Arc::clone(&session));
         if replay {
-            session
+            if let Err(error) = session
                 .replay(&client, self.state.native_subagents.load(Ordering::Acquire))
-                .await?;
+                .await
+            {
+                self.state.sessions.lock().await.remove(&session_id);
+                let _shutdown = session.shutdown().await;
+                return Err(error);
+            }
         } else {
             session.mark_replay_satisfied().await?;
         }
-        session.defer_available_commands(&client).await?;
-        session.lifecycle_response().await
+        if let Err(error) = session.defer_available_commands(&client).await {
+            self.state.sessions.lock().await.remove(&session_id);
+            let _shutdown = session.shutdown().await;
+            return Err(error);
+        }
+        match session.lifecycle_response().await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.state.sessions.lock().await.remove(&session_id);
+                let _shutdown = session.shutdown().await;
+                Err(error)
+            }
+        }
     }
 
     fn list_sessions(&self, params: &Value) -> Result<Value, zuno_acp::RpcError> {
@@ -476,6 +492,8 @@ impl ProductionAcpAgent {
         options: TurnOptions,
         client: zuno_acp::ClientConnection,
         session_slot: OwnedSemaphorePermit,
+        mcp_servers: Vec<zuno_acp::AcpMcpServer>,
+        replayed: bool,
     ) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
         let _composition = self.state.composition_gate.lock().await;
         let plan = TurnPlan::resolve(&options, &self.state.environment)
@@ -493,6 +511,7 @@ impl ProductionAcpAgent {
             self.state.runs.clone(),
             AcpSurfaceContext::from_state(self.state.as_ref(), client),
             None,
+            &mcp_servers,
         )
         .await
         .map_err(zuno_acp::RpcError::internal)?;
@@ -502,7 +521,7 @@ impl ProductionAcpAgent {
             id,
             control,
             prompt_active: AtomicBool::new(false),
-            replayed: AtomicBool::new(true),
+            replayed: AtomicBool::new(replayed),
             closed: AtomicBool::new(false),
             replay_gate: Mutex::new(()),
             mount_gate: Mutex::new(()),
@@ -510,6 +529,7 @@ impl ProductionAcpAgent {
             background_notification_directory,
             background_notifications,
             _session_slot: session_slot,
+            mcp_servers: Arc::from(mcp_servers),
             dormant: Mutex::new(None),
             resources: Mutex::new(Some(resources)),
         }))
@@ -519,6 +539,7 @@ impl ProductionAcpAgent {
         &self,
         options: TurnOptions,
         session_slot: OwnedSemaphorePermit,
+        mcp_servers: Vec<zuno_acp::AcpMcpServer>,
     ) -> Result<Arc<AcpSession>, zuno_acp::RpcError> {
         let session_id = match &options.session {
             SessionChoice::Existing(session_id) => session_id.clone(),
@@ -554,6 +575,7 @@ impl ProductionAcpAgent {
             background_notification_directory,
             background_notifications,
             _session_slot: session_slot,
+            mcp_servers: Arc::from(mcp_servers),
             dormant: Mutex::new(Some(DormantSession {
                 options,
                 configuration,
@@ -592,6 +614,7 @@ struct AcpSession {
     background_notification_directory: PathBuf,
     background_notifications: super::background_notification::BackgroundNotificationRegistry,
     _session_slot: OwnedSemaphorePermit,
+    mcp_servers: Arc<[zuno_acp::AcpMcpServer]>,
     dormant: Mutex<Option<DormantSession>>,
     resources: Mutex<Option<SessionResources>>,
 }
@@ -703,12 +726,59 @@ impl AcpSurfaceContext {
     }
 }
 
+fn required_mcp_servers(
+    servers: &[zuno_acp::AcpMcpServer],
+    workspace: &std::path::Path,
+) -> RequiredMcpServers {
+    use zuno_config::schema::mcp::{
+        LocalKind, McpLocal, McpOauth, McpRemote, McpServerConfig, RemoteKind,
+    };
+    use zuno_config::schema::ordered::False;
+
+    let workspace = workspace.to_string_lossy().into_owned();
+    let entries = servers
+        .iter()
+        .map(|server| match server {
+            zuno_acp::AcpMcpServer::Stdio(server) => {
+                let mut command = Vec::with_capacity(1 + server.args().len());
+                command.push(server.command().to_string_lossy().into_owned());
+                command.extend(server.args().iter().cloned());
+                (
+                    server.name().to_owned(),
+                    McpServerConfig::Local(McpLocal {
+                        kind: LocalKind::Local,
+                        command,
+                        cwd: Some(workspace.clone()),
+                        environment: Some(server.environment().clone()),
+                        enabled: Some(true),
+                        timeout: None,
+                    }),
+                )
+            }
+            zuno_acp::AcpMcpServer::Http(server) => (
+                server.name().to_owned(),
+                McpServerConfig::Remote(McpRemote {
+                    kind: RemoteKind::Remote,
+                    url: server.url().as_str().to_owned(),
+                    enabled: Some(true),
+                    headers: Some(server.headers().clone()),
+                    oauth: Some(McpOauth::Disabled(False)),
+                    timeout: None,
+                    streamable_http_only: true,
+                }),
+            ),
+        })
+        .collect();
+    RequiredMcpServers::new(entries)
+}
+
 async fn open_session_resources(
     plan: TurnPlan,
     environment: &StartupEnvironment,
     runs: SessionRunRegistry,
     surface: AcpSurfaceContext,
     build_agent: Option<&str>,
+    client_mcp: &[zuno_acp::AcpMcpServer],
 ) -> Result<SessionResources, String> {
     let AcpSurfaceContext {
         client,
@@ -721,9 +791,18 @@ async fn open_session_resources(
         .worktree()
         .unwrap_or_else(|| plan.directory())
         .to_path_buf();
-    let mut mcp = McpRuntime::from_config(plan.config(), &workspace);
+    let required_mcp = required_mcp_servers(client_mcp, plan.directory());
+    let mut mcp = McpRuntime::from_config_with_required(plan.config(), &workspace, required_mcp)?;
     let notes = match mcp.as_ref() {
-        Some(mcp) => mcp.connect().await,
+        Some(runtime) => match runtime.connect_required().await {
+            Ok(notes) => notes,
+            Err(error) => {
+                if let Some(runtime) = mcp.take() {
+                    runtime.shutdown().await;
+                }
+                return Err(error);
+            }
+        },
         None => Vec::new(),
     };
     let session_route = Arc::new(zuno_acp::AcpSessionRoute::new(native_subagents));
@@ -903,10 +982,10 @@ async fn open_session_resources(
 
 async fn shutdown_session_resources(mut resources: SessionResources) -> Result<(), String> {
     let host = resources.host.shutdown().await;
+    let subagents = shutdown_subagent_bridge(&mut resources.subagents).await;
     if let Some(mcp) = resources.mcp.take() {
         mcp.shutdown().await;
     }
-    let subagents = shutdown_subagent_bridge(&mut resources.subagents).await;
     match (host, subagents) {
         (Ok(()), None) => Ok(()),
         (Err(host), None) => Err(host),
@@ -923,51 +1002,6 @@ async fn shutdown_subagent_bridge(
     match bridge.take() {
         Some(bridge) => bridge.shutdown().await.err(),
         None => None,
-    }
-}
-
-async fn restore_session_after_failure(
-    slot: &mut Option<SessionResources>,
-    session_id: &str,
-    options: TurnOptions,
-    state: &AcpState,
-    client: zuno_acp::ClientConnection,
-    build_agent: &str,
-    cause: String,
-) -> zuno_acp::RpcError {
-    let rollback = async {
-        let plan = TurnPlan::resolve(&options, &state.environment).await?;
-        let resources = open_session_resources(
-            plan,
-            &state.environment,
-            state.runs.clone(),
-            AcpSurfaceContext::from_state(state, client),
-            Some(build_agent),
-        )
-        .await?;
-        if resources.host.session_id() == session_id {
-            return Ok(resources);
-        }
-        let actual = resources.host.session_id().to_owned();
-        let cleanup = shutdown_session_resources(resources).await;
-        Err(match cleanup {
-            Ok(()) => format!(
-                "rollback produced ACP session {actual}, expected {session_id}"
-            ),
-            Err(cleanup) => format!(
-                "rollback produced ACP session {actual}, expected {session_id}; rollback cleanup failed: {cleanup}"
-            ),
-        })
-    }
-    .await;
-    match rollback {
-        Ok(resources) => {
-            *slot = Some(resources);
-            zuno_acp::RpcError::internal(cause)
-        }
-        Err(rollback) => zuno_acp::RpcError::internal(format!(
-            "{cause}; rollback failed and session {session_id} is closed: {rollback}"
-        )),
     }
 }
 
@@ -1017,6 +1051,55 @@ impl AcpSession {
 
     fn closed_error(&self) -> zuno_acp::RpcError {
         zuno_acp::RpcError::invalid_params(format!("session {} is closed", self.id))
+    }
+
+    async fn restore_after_reconfiguration_failure(
+        &self,
+        slot: &mut Option<SessionResources>,
+        options: TurnOptions,
+        state: &AcpState,
+        client: zuno_acp::ClientConnection,
+        build_agent: &str,
+        cause: String,
+    ) -> zuno_acp::RpcError {
+        let rollback = async {
+            let plan = TurnPlan::resolve(&options, &state.environment).await?;
+            let resources = open_session_resources(
+                plan,
+                &state.environment,
+                state.runs.clone(),
+                AcpSurfaceContext::from_state(state, client),
+                Some(build_agent),
+                &self.mcp_servers,
+            )
+            .await?;
+            if resources.host.session_id() == self.id {
+                return Ok(resources);
+            }
+            let actual = resources.host.session_id().to_owned();
+            let cleanup = shutdown_session_resources(resources).await;
+            Err(match cleanup {
+                Ok(()) => format!(
+                    "rollback produced ACP session {actual}, expected {}",
+                    self.id
+                ),
+                Err(cleanup) => format!(
+                    "rollback produced ACP session {actual}, expected {}; rollback cleanup failed: {cleanup}",
+                    self.id
+                ),
+            })
+        }
+        .await;
+        match rollback {
+            Ok(resources) => {
+                *slot = Some(resources);
+                zuno_acp::RpcError::internal(cause)
+            }
+            Err(rollback) => zuno_acp::RpcError::internal(format!(
+                "{cause}; rollback failed and session {} is closed: {rollback}",
+                self.id
+            )),
+        }
     }
 
     async fn current_configuration(&self) -> Result<SessionConfiguration, zuno_acp::RpcError> {
@@ -1146,21 +1229,22 @@ impl AcpSession {
             state.runs.clone(),
             AcpSurfaceContext::from_state(state, client.clone()),
             Some(&build_agent),
+            &self.mcp_servers,
         )
         .await
         {
             Ok(candidate) => candidate,
             Err(error) => {
-                return Err(restore_session_after_failure(
-                    &mut slot,
-                    &self.id,
-                    rollback_options,
-                    state,
-                    client,
-                    &build_agent,
-                    format!("ACP session reconfiguration failed: {error}"),
-                )
-                .await);
+                return Err(self
+                    .restore_after_reconfiguration_failure(
+                        &mut slot,
+                        rollback_options,
+                        state,
+                        client,
+                        &build_agent,
+                        format!("ACP session reconfiguration failed: {error}"),
+                    )
+                    .await);
             }
         };
         if candidate.host.session_id() != self.id {
@@ -1176,16 +1260,16 @@ impl AcpSession {
                     self.id
                 ),
             };
-            return Err(restore_session_after_failure(
-                &mut slot,
-                &self.id,
-                rollback_options,
-                state,
-                client,
-                &build_agent,
-                cause,
-            )
-            .await);
+            return Err(self
+                .restore_after_reconfiguration_failure(
+                    &mut slot,
+                    rollback_options,
+                    state,
+                    client,
+                    &build_agent,
+                    cause,
+                )
+                .await);
         }
         let persistence = match prepared.persistence {
             ConfigurationPersistence::None => Ok(()),
@@ -1200,16 +1284,16 @@ impl AcpSession {
                     "could not persist ACP session configuration: {error}; candidate cleanup failed: {cleanup}"
                 ),
             };
-            return Err(restore_session_after_failure(
-                &mut slot,
-                &self.id,
-                rollback_options,
-                state,
-                client,
-                &build_agent,
-                cause,
-            )
-            .await);
+            return Err(self
+                .restore_after_reconfiguration_failure(
+                    &mut slot,
+                    rollback_options,
+                    state,
+                    client,
+                    &build_agent,
+                    cause,
+                )
+                .await);
         }
         let configuration = candidate.configuration.clone();
         *slot = Some(candidate);
@@ -1657,6 +1741,7 @@ impl AcpSession {
             state.runs.clone(),
             AcpSurfaceContext::from_state(state, client),
             Some(&dormant.configuration.build_agent),
+            &self.mcp_servers,
         )
         .await
         {
@@ -2919,27 +3004,17 @@ fn lifecycle_directory(params: &Value) -> Result<PathBuf, zuno_acp::RpcError> {
     Ok(cwd)
 }
 
-fn require_empty_roots_and_client_mcp(params: &Value) -> Result<(), zuno_acp::RpcError> {
-    for (field, label) in [
-        ("additionalDirectories", "additional workspace directories"),
-        ("mcpServers", "client-provided MCP servers"),
-    ] {
-        let Some(value) = params.get(field) else {
-            if field == "mcpServers" {
-                return Err(zuno_acp::RpcError::invalid_params(
-                    "mcpServers must be an array",
-                ));
-            }
-            continue;
-        };
-        let values = value.as_array().ok_or_else(|| {
-            zuno_acp::RpcError::invalid_params(format!("{field} must be an array"))
-        })?;
-        if !values.is_empty() {
-            return Err(zuno_acp::RpcError::invalid_params(format!(
-                "{label} are not advertised by this ACP adapter; configure them in Zuno"
-            )));
-        }
+fn require_empty_additional_directories(params: &Value) -> Result<(), zuno_acp::RpcError> {
+    let Some(value) = params.get("additionalDirectories") else {
+        return Ok(());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        zuno_acp::RpcError::invalid_params("additionalDirectories must be an array")
+    })?;
+    if !values.is_empty() {
+        return Err(zuno_acp::RpcError::invalid_params(
+            "additional workspace directories are not advertised by this ACP adapter",
+        ));
     }
     Ok(())
 }

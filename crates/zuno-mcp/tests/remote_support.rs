@@ -13,6 +13,7 @@ pub fn remote_config(url: String) -> McpRemote {
         headers: None,
         oauth: None,
         timeout: None,
+        streamable_http_only: false,
     }
 }
 
