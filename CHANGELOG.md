@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.3](https://github.com/sunerpy/zuno/compare/v0.0.2...v0.0.3) (2026-08-31)
+
+
+### Bug Fixes
+
+* **release:** harden autonomous delivery and optimize CI ([a04fb26](https://github.com/sunerpy/zuno/commit/a04fb26ee71a843bf2884b3d381a957e8a066ed1))
+
 ## [0.0.2](https://github.com/sunerpy/zuno/compare/v0.0.1...v0.0.2) (2026-08-31)
 
 
