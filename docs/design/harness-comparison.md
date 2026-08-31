@@ -130,13 +130,30 @@ real, and validate from narrow checks toward the user-facing surface. Zuno keeps
 those principles in a concise role prompt; sandbox, approval, durability, and
 completion remain runtime contracts.
 
-Codex's memory writer separates rollout extraction from workspace consolidation.
-Zuno adapts the learning goal but keeps a narrower mutation boundary: durable
-delivered-turn admission selects an isolated reviewer, the reviewer receives the
-current resident snapshot, and every consolidation is still an atomic
-`MemoryCandidate` add/replace/remove operation. Zuno therefore retains source
-provenance, deduplication, promotion policy, undo, and uncertain non-replay
-instead of allowing a model to rewrite a memory directory directly.
+Codex's memory writer separates rollout extraction from later consolidation.
+Zuno adapts that foreground/background split into durable `ExperienceRecord`
+extraction followed by interval-bucketed pattern mining. Model-visible retrieval
+uses prompt receipts with stable source identities and digests, while resident
+Memory remains an atomic `MemoryCandidate` add/replace/remove operation.
+
+OpenAI trace grading and dataset regression, DSPy's metric-oriented optimization,
+and Warp's candidate-diff presentation inform the Skill path. Zuno narrows them
+to an immutable cassette suite: baseline and candidate share one
+`AttemptSnapshot`, cited failures must improve, protection cases cannot
+critically regress, and the overall metric cannot decline. Passing evaluation
+still does not apply the file.
+
+LangMem's foreground/background distinction informs fast post-turn recording and
+slow consolidation. Zuno does not adopt an ambient mutable memory agent: every
+extraction job, Experience, pattern, Memory proposal, Skill diff, evaluation,
+and filesystem effect has a durable typed identity.
+
+DeepSeek Harness's message-feedback sidecar is adapted as a revisioned,
+compare-and-set service, but Zuno additionally appends an immutable audit event
+for every change. DSH's code-review Skill maintenance workflow also validates
+candidate diffs against evidence and stops on source drift. Zuno keeps those
+properties in the runtime while rejecting any silent Skill overwrite: review,
+offline evaluation, and CAS-protected apply are separate states.
 
 ### oh-my-openagent
 

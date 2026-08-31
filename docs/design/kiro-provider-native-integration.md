@@ -140,7 +140,7 @@ The turn host supplies the identity:
   id;
 - every delegated child uses its own child session id;
 - resume and process restart reuse the same durable id;
-- title, summary, compaction, reflection, and Council calls have an explicit
+- title, summary, compaction, learning extraction, and Council calls have an explicit
   purpose and no main-session affinity unless their design later declares an
   independent durable identity.
 
@@ -266,7 +266,7 @@ The remaining 2026-08-28 provider changes do not require Zuno adaptation:
 - `zuno-llm` tests cover typed purpose, identity validation, and inaccessible
   routing state.
 - Engine tests prove one identity across a main tool loop, a distinct child
-  identity, isolated title/summary/compaction/reflection/Council requests, and
+  identity, isolated title/summary/compaction/learning/Council requests, and
   durable routing provenance.
 - Both OpenAI Responses adapters test exact metadata projection, collision
   rejection, unrelated metadata preservation, and absence on Chat where
@@ -292,7 +292,7 @@ The Zuno-owned session-affinity slice is complete only when:
 - same Zuno session, including restart, logs `affinity_bound=true` and stable
   account/conversation hashes;
 - different root and child sessions remain isolated;
-- title, summary, compaction, reflection, and Council do not join the main
+- title, summary, compaction, learning extraction, and Council do not join the main
   provider conversation;
 - cancellation, usage, retry classification, proxy settings, and provider
   errors continue through existing typed interfaces;

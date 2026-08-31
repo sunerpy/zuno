@@ -163,6 +163,22 @@ cancellation, logs, usage, and process lifecycle remain one shared path.
 | Separate Files and streaming timeouts | `already-covered` as a design rule | Keep independent timeouts for independent operations when the image provider is implemented. |
 | Permission-default change introduced before rc.1 and reverted before rc.2 | `reject` | Do not copy transient release-line behavior. Review the final permission invariant instead. |
 
+## 2026-08-31 targeted learning review
+
+`dsh_delta.py` fetched `origin/master` successfully and compared the recorded
+`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` baseline with
+`0a53fb55bea101816fa226bb964ae2bed71c343b` (`dsh-v0.1.2-alpha.2`). The full
+delta contains 1,313 commits and 6,808 changed files. This review classified
+only the feedback and Skill-maintenance changes needed by Zuno's user-learning
+flywheel; the baseline JSON was not advanced because the remaining material
+delta has not been reviewed.
+
+| DSH idea | Classification | Zuno action |
+| --- | --- | --- |
+| Per-assistant-message feedback sidecar with persisted-target validation and compare-and-set revisions | `adapt` | Keep a typed `FeedbackService` and stale-revision rejection. Zuno additionally appends `learning.feedback.changed` to the durable session audit log instead of making feedback projection-only state. |
+| Code-review Skill maintenance produces a complete candidate, diff, evidence manifest, independent review, gates, and a source-blob drift check | `adapt` | Store complete `SkillCandidate` content, diff, Experience evidence, source identity/digest, immutable cassette evaluation, explicit human review, and CAS apply. Zuno does not create a PR or rerun real side effects. |
+| Direct or silent replacement of a Skill from learned output | `reject` | A candidate cannot apply automatically. Built-in/read-only sources create a differently named project companion, source drift becomes `stale`, and applied changes can only be removed through reviewed revocation or explicit undo. |
+
 ## Next Review
 
 Run the delta script against `origin/master`. Every changed file group must receive a decision before updating the JSON baseline.
