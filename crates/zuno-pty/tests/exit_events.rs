@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The exit event's visibility contract, asserted under real contention.
 //!
 //! `zuno-pty` has now produced two flakes from one root pattern: a state change

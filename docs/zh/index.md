@@ -101,6 +101,7 @@ zuno run "为 users 接口增加分页并运行测试"
 | 配置 Shell 权限 | [权限与沙箱](/zh/guide/permissions) |
 | 在编辑器中使用 | [编辑器与 ACP](/zh/guide/editors) |
 | 查询命令 | [CLI 参考](/zh/cli/) |
+| 理解发布产物 | [发布流水线](/zh/operate/release-pipeline) |
 | 排查故障 | [常见问题](/zh/operate/faq) |
 
 ## 中文文档范围

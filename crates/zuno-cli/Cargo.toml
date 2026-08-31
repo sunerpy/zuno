@@ -80,7 +80,7 @@ uuid = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true }
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+[target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]

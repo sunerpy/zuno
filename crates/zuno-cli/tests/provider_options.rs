@@ -49,7 +49,7 @@ use std::path::PathBuf;
 use std::process::Output;
 use std::time::Duration;
 
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv};
+use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
 
 /// A recorded tool-free text completion — the smallest thing a turn can complete on.
 const CASSETTE: &str = "openai-chat/streams-text";
@@ -116,7 +116,7 @@ fn provider_config(
         options.insert("apiKey".to_owned(), serde_json::json!(key));
     }
 
-    serde_json::json!({
+    trusted_platform_config(serde_json::json!({
         "formatter": false,
         "lsp": false,
         "provider": {
@@ -139,7 +139,7 @@ fn provider_config(
                 }
             }
         }
-    })
+    }))
     .to_string()
 }
 

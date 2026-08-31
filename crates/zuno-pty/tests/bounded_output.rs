@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The per-session output bound, measured against a real 100 MB producer.
 //!
 //! [`buffer`]'s own unit test proves the ring is bounded when driven directly. This

@@ -18,7 +18,8 @@ zuno self-update --tag v0.0.1 --force --yes
 
 ## 发布与完整性契约
 
-更新器只支持由 `.github/workflows/release.yml` 发布的那些目标：
+更新器只支持由 `.github/workflows/release-candidate.yml` 验证并由
+`.github/workflows/release.yml` 晋级发布的那些目标：
 
 | 宿主 | 发布目标 | 归档格式 |
 | --- | --- | --- |

@@ -88,6 +88,36 @@ pub use crate::files::{
 pub use crate::layout::{APP, DEBUG_PATHS_KEYS, Layout};
 pub use crate::project::{GLOBAL_PROJECT_ID, Repository, ResolvedProject, Vcs};
 
+/// Renders a native path without Windows' internal verbatim namespace prefix.
+///
+/// `std::fs::canonicalize` produces `\\?\C:\...` (or `\\?\UNC\...`) on
+/// Windows. That spelling is useful to Win32 but is not a user-facing path and
+/// must not leak into prompts, diagnostics, durable tool metadata, or client
+/// protocols.
+#[must_use]
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.to_owned();
+        }
+    }
+    text.into_owned()
+}
+
+/// Renders a path for durable and wire-visible metadata.
+///
+/// Forward slashes keep the representation stable across TUI, server, ACP and
+/// future clients while remaining accepted by Windows path APIs.
+#[must_use]
+pub fn wire_path(path: &Path) -> String {
+    display_path(path).replace('\\', "/")
+}
+
 /// The process-wide layout, resolved from the environment on first use.
 ///
 /// Resolved once and cached, which is the same timing as the oracle's
@@ -96,6 +126,30 @@ pub use crate::project::{GLOBAL_PROJECT_ID, Repository, ResolvedProject, Vcs};
 pub fn global() -> &'static Layout {
     static GLOBAL: OnceLock<Layout> = OnceLock::new();
     GLOBAL.get_or_init(Layout::from_process_env)
+}
+
+#[cfg(test)]
+mod path_presentation_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_paths_keep_their_content_in_wire_form() {
+        let path = Path::new("root").join("nested").join("file.txt");
+        assert_eq!(wire_path(&path), "root/nested/file.txt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_paths_never_cross_the_display_boundary() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\agent\repo")),
+            r"C:\Users\agent\repo"
+        );
+        assert_eq!(
+            wire_path(Path::new(r"\\?\UNC\server\share\repo")),
+            "//server/share/repo"
+        );
+    }
 }
 
 /// `Global.Path.home`.

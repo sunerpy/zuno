@@ -50,6 +50,24 @@ fn api_cancel() -> HardInterruptRequest {
     HardInterruptRequest::new(HardInterruptSource::Api, HardInterruptReason::UserCancel)
 }
 
+#[cfg(windows)]
+fn native_pty_command(script: &str) -> (String, Vec<String>) {
+    (
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned()),
+        vec![
+            "/D".to_owned(),
+            "/S".to_owned(),
+            "/C".to_owned(),
+            script.to_owned(),
+        ],
+    )
+}
+
+#[cfg(not(windows))]
+fn native_pty_command(script: &str) -> (String, Vec<String>) {
+    ("sh".to_owned(), vec!["-c".to_owned(), script.to_owned()])
+}
+
 #[derive(Debug, Default)]
 struct BlockingMutationExecutor {
     prompt_started: Arc<AtomicBool>,
@@ -1923,27 +1941,35 @@ async fn api_pty_list_and_create_use_the_real_pty_service() {
     assert_eq!(empty.status(), StatusCode::OK);
     assert_eq!(response_json(empty).await["data"], json!([]));
 
+    let script = if cfg!(windows) { "exit /B 0" } else { "exit 0" };
+    let (command, args) = native_pty_command(script);
     let created = app
         .oneshot(request(
             Method::POST,
             "/api/pty",
-            Some(json!({"command":"sh","args":["-c","exit 0"]})),
+            Some(json!({"command": &command, "args": &args})),
         ))
         .await
         .expect("PTY create responds");
     assert_eq!(created.status(), StatusCode::OK);
     let body = response_json(created).await;
-    assert_eq!(body["data"]["command"], "sh");
+    assert_eq!(body["data"]["command"], command);
 }
 
 #[tokio::test]
 async fn api_pty_connect_requires_a_single_use_unexpired_ticket_without_echoing_it() {
     let state = ApiState::memory("/repo").expect("in-memory API state initializes");
+    let script = if cfg!(windows) {
+        "ping -n 31 127.0.0.1 >NUL"
+    } else {
+        "sleep 30"
+    };
+    let (command, args) = native_pty_command(script);
     let info = state
         .pty()
         .create(CreateInput {
-            command: Some("sh".to_owned()),
-            args: Some(vec!["-c".to_owned(), "sleep 30".to_owned()]),
+            command: Some(command),
+            args: Some(args),
             ..CreateInput::default()
         })
         .expect("fixture PTY starts");
@@ -2116,11 +2142,23 @@ async fn api_pty_websocket_ticket_streams_real_terminal_input_and_output() {
     let directory = tempfile::tempdir().expect("temporary PTY directory");
     let state = ApiState::memory(directory.path().to_string_lossy())
         .expect("in-memory API state initializes");
+    #[cfg(unix)]
+    let (command, args, input) = (
+        "/bin/sh".to_owned(),
+        vec!["-i".to_owned()],
+        "printf 'WS-READY\\n'\n",
+    );
+    #[cfg(windows)]
+    let (command, args, input) = (
+        std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_owned()),
+        vec!["/D".to_owned(), "/Q".to_owned()],
+        "echo WS-READY\r\n",
+    );
     let info = state
         .pty()
         .create(CreateInput {
-            command: Some("/bin/sh".to_owned()),
-            args: Some(vec!["-i".to_owned()]),
+            command: Some(command),
+            args: Some(args),
             ..CreateInput::default()
         })
         .expect("interactive fixture PTY starts");
@@ -2173,7 +2211,7 @@ async fn api_pty_websocket_ticket_streams_real_terminal_input_and_output() {
         "upgrade response: {head}"
     );
 
-    write_masked_text_frame(&mut socket, "printf 'WS-READY\\n'\n").await;
+    write_masked_text_frame(&mut socket, input).await;
     let output = tokio::time::timeout(Duration::from_secs(5), async {
         let mut output = Vec::new();
         loop {

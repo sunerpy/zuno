@@ -212,7 +212,7 @@ impl FileDiff {
     #[must_use]
     pub fn new(path: &std::path::Path, old_text: Option<String>, new_text: String) -> Option<Self> {
         let diff = Self {
-            path: path.to_string_lossy().into_owned(),
+            path: zuno_paths::wire_path(path),
             old_text,
             new_text,
         };
@@ -404,7 +404,7 @@ impl ToolOutput {
     /// nothing about what the model is shown. Existing entries are preserved, and a
     /// key holding a non-array is replaced, since no reader could use it.
     pub fn record_output_path(&mut self, path: &std::path::Path) {
-        let entry = Value::String(path.to_string_lossy().into_owned());
+        let entry = Value::String(zuno_paths::wire_path(path));
         match self.metadata.get_mut(METADATA_OUTPUT_PATHS_KEY) {
             Some(Value::Array(paths)) => paths.push(entry),
             Some(_) | None => {
@@ -433,7 +433,7 @@ impl ToolOutput {
     /// Deletions are deliberately not recorded — see [`METADATA_WRITTEN_PATHS_KEY`].
     #[must_use]
     pub fn with_written_path(mut self, path: &std::path::Path) -> Self {
-        let entry = Value::String(path.to_string_lossy().into_owned());
+        let entry = Value::String(zuno_paths::wire_path(path));
         match self.metadata.get_mut(METADATA_WRITTEN_PATHS_KEY) {
             Some(Value::Array(paths)) => {
                 if !paths.contains(&entry) {
@@ -751,19 +751,20 @@ mod tests {
 
     #[test]
     fn file_diffs_are_typed_validated_and_durable() {
-        let diff = FileDiff::new(
-            Path::new("/work/demo.rs"),
-            Some("old\n".to_owned()),
-            "new\n".to_owned(),
-        )
-        .expect("absolute changed file is valid");
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let changed = workspace.path().join("demo.rs");
+        let created = workspace.path().join("new.rs");
+        let changed_path = zuno_paths::wire_path(&changed);
+        let created_path = zuno_paths::wire_path(&created);
+        let diff = FileDiff::new(&changed, Some("old\n".to_owned()), "new\n".to_owned())
+            .expect("absolute changed file is valid");
         let output = ToolOutput::text("edit", "ok").with_file_diff(diff.clone());
 
         assert_eq!(output.file_diffs(), vec![diff.clone()]);
         assert_eq!(
             output.metadata[METADATA_FILE_DIFFS_KEY],
             serde_json::json!([{
-                "path": "/work/demo.rs",
+                "path": changed_path,
                 "oldText": "old\n",
                 "newText": "new\n",
             }])
@@ -773,11 +774,11 @@ mod tests {
             METADATA_FILE_DIFFS_KEY,
             serde_json::json!([
                 {"path": "relative.rs", "oldText": "old", "newText": "new"},
-                {"path": "/work/new.rs", "newText": "created"},
+                {"path": created_path, "newText": "created"},
             ]),
         );
         assert_eq!(restored.file_diffs().len(), 1);
-        assert_eq!(restored.file_diffs()[0].path(), "/work/new.rs");
+        assert_eq!(restored.file_diffs()[0].path(), created_path);
     }
     #[test]
     fn tool_output_round_trips() {

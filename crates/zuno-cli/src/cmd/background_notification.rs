@@ -453,19 +453,19 @@ mod tests {
     use std::collections::BTreeMap;
     #[cfg(unix)]
     use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use zuno_db::job::{JobSettlement, JobSubject, NewAgentJob, ReportDelivery};
-    use zuno_pty::{
-        BackgroundExecutionId, BackgroundExecutionInput, BackgroundExecutionPurpose,
-        BackgroundExecutionRetention, BackgroundExecutionStatus,
-    };
-    use zuno_sandbox::{
-        ExecutionAuthority, NetworkAccess, PrepareRequest, PreparedCommand, SandboxCapabilities,
-        SandboxMode, SandboxPolicy, SandboxResolutionKind,
-    };
+    use zuno_pty::{BackgroundExecutionId, BackgroundExecutionPurpose, BackgroundExecutionStatus};
+    #[cfg(unix)]
+    use zuno_pty::{BackgroundExecutionInput, BackgroundExecutionRetention};
+    use zuno_sandbox::{ExecutionAuthority, NetworkAccess, SandboxMode, SandboxResolutionKind};
+    #[cfg(unix)]
+    use zuno_sandbox::{PrepareRequest, PreparedCommand, SandboxCapabilities, SandboxPolicy};
 
     use super::*;
 

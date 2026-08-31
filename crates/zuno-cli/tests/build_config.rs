@@ -1,4 +1,4 @@
-//! §8.2 — the linker, and why this workspace configures none.
+//! §8.2 — linker selection, and why this workspace does not override it.
 //!
 //! # What was measured
 //!
@@ -30,7 +30,7 @@
 //! measurement taken on this project — means it is not adopted on the strength of
 //! someone else's number.
 //!
-//! # Why no `.cargo/config.toml` linker entry
+//! # Why no `.cargo/config.toml` linker-selection entry
 //!
 //! Two costs and no measured benefit. An unconditional `-fuse-ld=mold` fails the
 //! build outright on every machine without mold, and cargo config has no way to
@@ -148,6 +148,57 @@ fn build_no_cargo_config_overrides_the_measured_linker() {
         "{} no longer carries the jemalloc tuning, so this assertion is reading \
          the wrong file and would pass vacuously",
         path.display()
+    );
+}
+
+#[test]
+fn build_windows_uses_the_platform_allocator_instead_of_linking_jemalloc() {
+    let root = workspace_root();
+    let manifest = std::fs::read_to_string(root.join("crates/zuno-cli/Cargo.toml"))
+        .expect("read zuno-cli manifest");
+    let main =
+        std::fs::read_to_string(root.join("crates/zuno-cli/src/main.rs")).expect("read CLI entry");
+
+    assert!(
+        manifest.contains("[target.'cfg(unix)'.dependencies]"),
+        "tikv-jemallocator must remain a Unix-only dependency so Windows GNU and \
+         MSVC builds use their supported platform allocators"
+    );
+    assert!(
+        main.contains("#[cfg(all(feature = \"jemalloc\", unix))]"),
+        "the global allocator must have the same Unix boundary as its dependency"
+    );
+    assert!(
+        !manifest.contains("cfg(not(target_env = \"msvc\"))")
+            && !main.contains("not(target_env = \"msvc\")"),
+        "Windows GNU was accidentally pulled back into the unsupported jemalloc path"
+    );
+}
+
+#[test]
+fn build_windows_zuno_reserves_enough_main_thread_stack_for_session_startup() {
+    let path = workspace_root().join("crates/zuno-cli/build.rs");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+
+    for required in [
+        "CARGO_CFG_TARGET_OS",
+        "CARGO_CFG_TARGET_ENV",
+        "Ok(\"windows\")",
+        "Ok(\"msvc\")",
+        "8 * 1024 * 1024",
+        "cargo::rustc-link-arg-bin=zuno=/STACK:",
+    ] {
+        assert!(
+            text.contains(required),
+            "{} lost the native-Windows main-stack contract `{required}`",
+            path.display()
+        );
+    }
+    assert!(
+        !text.contains("cargo::rustc-link-arg=/STACK:"),
+        "the stack reserve must remain scoped to the zuno binary; applying it to every \
+         crate would invalidate the complete Windows compiler cache"
     );
 }
 

@@ -1,7 +1,8 @@
 # Developer and CI entry points.
 #
-# `make ci` runs every gate CI enforces, and CI invokes these same targets, so
-# "green locally" and "green in CI" cannot drift into meaning different things.
+# `make ci` runs the host-side source gates that CI invokes. `make pre-ci` adds
+# the packaged-host smoke and a Linux-to-Windows cross Clippy/link pass so
+# avoidable platform failures are found before the native GitHub-hosted jobs.
 #
 # OFFLINE BY DEFAULT. This repository's gates run with `--offline` throughout
 # because the registry here is a mirror that cannot
@@ -16,7 +17,8 @@
 
 .PHONY: all help \
 		fmt fmt-check fmt-rust fmt-rust-check fmt-oxfmt fmt-oxfmt-check \
-		lint check test test-par test-fast hook-fmt hook-test hooks ci \
+		lint lint-windows-cross check test test-nextest test-par test-fast \
+		hook-fmt hook-test hooks ci pre-ci \
 		deny metadata \
         build release release-target package smoke smoke-artifact \
         clean
@@ -49,9 +51,10 @@ TARGET ?=
 
 # The targets the release pipeline ships. Listed here so `make help` can show
 # them next to the command that builds one; the authoritative matrix lives in
-# `.github/workflows/release.yml` and
+# `.github/workflows/release-candidate.yml` and
 # `crates/zuno-cli/tests/release_surface.rs` asserts the two agree.
-# `aarch64-pc-windows-msvc` is absent deliberately — see release.yml's header.
+# `aarch64-pc-windows-msvc` is absent deliberately — see the release pipeline
+# design record.
 RELEASE_TARGETS := \
   x86_64-unknown-linux-musl \
   aarch64-unknown-linux-musl \
@@ -89,22 +92,40 @@ fmt-oxfmt-check:
 lint:
 	$(CARGO) clippy --workspace --all-targets $(OFFLINE) -- -D warnings
 
+lint-windows-cross:
+	ZUNO_CARGO_OFFLINE=$(if $(strip $(OFFLINE)),1,0) \
+		.github/scripts/lint-windows-cross.sh
+
 check:
 	$(CARGO) check --workspace --all-targets $(OFFLINE)
 
 test:
-	$(CARGO) test --workspace $(OFFLINE)
+	$(CARGO) test --workspace --no-fail-fast $(OFFLINE)
 
-# Same tests as `test`, run concurrently across suites. A LOCAL FAST PATH ONLY:
-# `ci` still depends on `test`, so the gate is unchanged and this cannot make CI
-# green by running less.
+# The cross-platform CI runner. nextest compiles the workspace once and schedules
+# test binaries concurrently; Cargo still owns doctests because nextest does not
+# execute them.
+test-nextest:
+	@$(CARGO) nextest --version > /dev/null 2>&1 \
+	  || { echo "cargo-nextest is required; install cargo-nextest 0.9.103"; exit 1; }
+	$(CARGO) nextest run --workspace --no-fail-fast --no-tests=warn $(OFFLINE)
+	$(CARGO) test --workspace --doc --no-fail-fast $(OFFLINE)
+
+# Same non-ignored test surface as `test`, run concurrently. Prefer the maintained
+# cross-platform runner used by CI; retain the measured in-repository scheduler
+# as an offline fallback for developer machines without cargo-nextest.
 #
-# `cargo test` builds in parallel but runs its 224 suites one at a time. With a
-# warm target that build is a 0.7s no-op and the run is 219.9s, so the loop is
-# bound by serialised execution. This target reaches the same 4280 passed / 0
-# failed / 8 ignored in 53.2s median. See docs/perf-methodology.md.
+# Historical baseline: `cargo test` built in parallel but ran 224 suites one at
+# a time, taking 219.9s with a warm target; the in-tree scheduler reached the
+# same 4280 passed / 0 failed / 8 ignored in 53.2s median. The current pinned
+# nextest validation is recorded separately in docs/perf-methodology.md.
 test-par:
-	./scripts/test-parallel.sh
+	@if $(CARGO) nextest --version > /dev/null 2>&1; then \
+		$(MAKE) test-nextest; \
+	else \
+		echo "cargo-nextest unavailable; using scripts/test-parallel.sh"; \
+		./scripts/test-parallel.sh; \
+	fi
 
 test-fast:
 	$(CARGO) test -p $(CLI_CRATE) --test docs --test release_surface $(OFFLINE)
@@ -137,9 +158,14 @@ deny:
 		echo "      the CI 'Supply chain' job runs it regardless, so this is a local convenience only"; \
 	fi
 
-# Everything CI enforces, in the order that makes a failure easiest to read.
-ci: metadata fmt-check lint test deny
-	@echo "OK    metadata + fmt + clippy + tests + cargo-deny"
+# Host-side source gates, in the order that makes a failure easiest to read.
+ci: metadata fmt-check lint test-par deny
+	@echo "OK    metadata + fmt + clippy + parallel tests + cargo-deny"
+
+# Local predictive gate before opening or updating a pull request. Native
+# Windows/MSVC execution and hosted-runner networking remain CI-only evidence.
+pre-ci: ci check smoke-artifact lint-windows-cross
+	@echo "OK    host CI + check + packaged smoke + Windows cfg/Clippy/link preflight"
 
 # ─── Build ──────────────────────────────────────────────────────────────────
 
@@ -225,14 +251,17 @@ clean:
 
 help:
 	@echo "Gates:"
-	@echo "  ci              metadata + fmt-check + lint + test + deny"
+	@echo "  ci              host metadata + fmt-check + lint + parallel tests + deny"
+	@echo "  pre-ci          ci + check + packaged smoke + Windows cross-Clippy/link"
 	@echo "  fmt             cargo fmt --all"
 	@echo "                  + oxfmt YAML/JSON/Markdown"
 	@echo "  fmt-check       verify Rust and oxfmt formatting"
 	@echo "  lint            cargo clippy --workspace --all-targets -D warnings"
+	@echo "  lint-windows-cross  Windows cfg/Clippy and test-link preflight with Zig"
 	@echo "  check           cargo check --workspace --all-targets"
-	@echo "  test            cargo test --workspace"
-	@echo "  test-par        same tests, concurrent across suites (local fast path)"
+	@echo "  test            cargo test --workspace --no-fail-fast"
+	@echo "  test-nextest    workspace tests concurrent across binaries + doctests"
+	@echo "  test-par        nextest when installed; measured in-tree fallback otherwise"
 	@echo "  test-fast       focused docs/release tests + installer syntax"
 	@echo "  hook-fmt        commit-time formatting gate"
 	@echo "  hook-test       push-time fast test gate"

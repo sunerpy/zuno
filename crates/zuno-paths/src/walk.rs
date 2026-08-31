@@ -83,50 +83,64 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tree() -> tempfile::TempDir {
+    fn fixture_path(base: &Path, relative: &str) -> PathBuf {
+        relative
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .fold(base.to_path_buf(), |path, component| path.join(component))
+    }
+
+    fn tree() -> (tempfile::TempDir, String) {
         let root = tempfile::tempdir().expect("tempdir");
-        let deep = root.path().join("a/b/c");
+        let marker = format!(
+            ".zuno-walk-test-{}",
+            root.path()
+                .file_name()
+                .expect("temporary directory has a basename")
+                .to_string_lossy()
+        );
+        let deep = fixture_path(root.path(), "a/b/c");
         fs::create_dir_all(&deep).expect("create tree");
-        fs::create_dir_all(root.path().join("a/.opencode")).expect("create a/.opencode");
-        fs::create_dir_all(root.path().join("a/b/c/.opencode")).expect("create c/.opencode");
-        fs::write(root.path().join("a/b/zuno.json"), "{}").expect("write json");
-        fs::write(root.path().join("a/b/zuno.jsonc"), "{}").expect("write jsonc");
-        root
+        fs::create_dir_all(root.path().join("a").join(&marker)).expect("create a marker");
+        fs::create_dir_all(root.path().join("a/b/c").join(&marker)).expect("create c marker");
+        fs::write(fixture_path(root.path(), "a/b/zuno.json"), "{}").expect("write json");
+        fs::write(fixture_path(root.path(), "a/b/zuno.jsonc"), "{}").expect("write jsonc");
+        (root, marker)
     }
 
     #[test]
     fn collects_nearest_first_up_to_the_root() {
-        let root = tree();
-        let found = up(&[".opencode"], &root.path().join("a/b/c"), None);
+        let (root, marker) = tree();
+        let found = up(&[&marker], &fixture_path(root.path(), "a/b/c"), None);
         assert_eq!(
             found,
             vec![
-                root.path().join("a/b/c/.opencode"),
-                root.path().join("a/.opencode")
+                root.path().join("a/b/c").join(&marker),
+                root.path().join("a").join(&marker)
             ]
         );
     }
 
     #[test]
     fn stop_is_inclusive_and_bounds_the_walk() {
-        let root = tree();
+        let (root, marker) = tree();
         let found = up(
-            &[".opencode"],
-            &root.path().join("a/b/c"),
-            Some(&root.path().join("a/b")),
+            &[&marker],
+            &fixture_path(root.path(), "a/b/c"),
+            Some(&fixture_path(root.path(), "a/b")),
         );
-        assert_eq!(found, vec![root.path().join("a/b/c/.opencode")]);
+        assert_eq!(found, vec![root.path().join("a/b/c").join(&marker)]);
 
         let including_stop = up(
-            &[".opencode"],
-            &root.path().join("a/b/c"),
-            Some(&root.path().join("a")),
+            &[&marker],
+            &fixture_path(root.path(), "a/b/c"),
+            Some(&fixture_path(root.path(), "a")),
         );
         assert_eq!(
             including_stop,
             vec![
-                root.path().join("a/b/c/.opencode"),
-                root.path().join("a/.opencode")
+                root.path().join("a/b/c").join(&marker),
+                root.path().join("a").join(&marker)
             ]
         );
     }
@@ -135,34 +149,34 @@ mod tests {
     /// reaches the filesystem root instead of stopping early.
     #[test]
     fn unrelated_stop_does_not_bound_the_walk() {
-        let root = tree();
+        let (root, marker) = tree();
         let found = up(
-            &[".opencode"],
-            &root.path().join("a/b/c"),
+            &[&marker],
+            &fixture_path(root.path(), "a/b/c"),
             Some(Path::new("/definitely/not/an/ancestor")),
         );
         assert_eq!(
             found,
             vec![
-                root.path().join("a/b/c/.opencode"),
-                root.path().join("a/.opencode")
+                root.path().join("a/b/c").join(&marker),
+                root.path().join("a").join(&marker)
             ]
         );
     }
 
     #[test]
     fn targets_are_probed_in_the_given_order() {
-        let root = tree();
+        let (root, _marker) = tree();
         let found = up(
             &["zuno.jsonc", "zuno.json"],
-            &root.path().join("a/b"),
-            Some(&root.path().join("a/b")),
+            &fixture_path(root.path(), "a/b"),
+            Some(&fixture_path(root.path(), "a/b")),
         );
         assert_eq!(
             found,
             vec![
-                root.path().join("a/b/zuno.jsonc"),
-                root.path().join("a/b/zuno.json")
+                fixture_path(root.path(), "a/b/zuno.jsonc"),
+                fixture_path(root.path(), "a/b/zuno.json")
             ]
         );
     }
@@ -176,10 +190,10 @@ mod tests {
 
     #[test]
     fn up_first_takes_the_nearest_hit() {
-        let root = tree();
+        let (root, marker) = tree();
         assert_eq!(
-            up_first(&[".opencode"], &root.path().join("a/b/c"), None),
-            Some(root.path().join("a/b/c/.opencode"))
+            up_first(&[&marker], &fixture_path(root.path(), "a/b/c"), None),
+            Some(root.path().join("a/b/c").join(&marker))
         );
     }
 

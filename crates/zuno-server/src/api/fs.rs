@@ -71,8 +71,8 @@ const FIND_EXCLUDED: &[&str] = &[".git", "node_modules", "target", ".jj", ".hg",
 /// (`packages/schema/src/filesystem.ts:14-18`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Entry {
-    /// The path relative to the session directory. A directory carries a trailing
-    /// separator, which is upstream's marker rather than a cosmetic choice
+    /// The `/`-separated path relative to the session directory. A directory carries
+    /// a trailing slash, which is upstream's marker rather than a cosmetic choice
     /// (`filesystem.ts:100`).
     pub path: String,
     /// `file` or `directory`; upstream drops every other kind.
@@ -470,7 +470,7 @@ fn relative_to(root: &Path, absolute: &Path) -> Option<String> {
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join(std::path::MAIN_SEPARATOR_STR);
+        .join("/");
     (!joined.is_empty()).then_some(joined)
 }
 
@@ -491,10 +491,10 @@ fn locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
     }
 }
 
-/// Appends the platform separator to a directory path, as upstream does.
+/// Appends the wire-format `/` separator to a directory path, as upstream does.
 fn with_directory_suffix(path: String, kind: EntryKind) -> String {
     match kind {
-        EntryKind::Directory => path + std::path::MAIN_SEPARATOR_STR,
+        EntryKind::Directory => path + "/",
         EntryKind::File => path,
     }
 }
@@ -579,5 +579,19 @@ mod tests {
         assert_eq!(score("a-l-p-h-a.txt", "alpha"), Some(9));
         assert_eq!(score("beta.txt", "alpha"), None);
         assert_eq!(score("anything", ""), Some(0));
+    }
+
+    #[test]
+    fn wire_paths_use_forward_slashes_on_every_host() {
+        let root = Path::new("root");
+        let nested = root.join("nested").join("deep.txt");
+        assert_eq!(
+            relative_to(root, &nested).as_deref(),
+            Some("nested/deep.txt")
+        );
+        assert_eq!(
+            with_directory_suffix("nested".to_owned(), EntryKind::Directory),
+            "nested/"
+        );
     }
 }

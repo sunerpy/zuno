@@ -193,7 +193,13 @@ mod tests {
             GcSchedule::every(Duration::from_millis(5)),
         );
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while passes.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the loop repeats twice even under a loaded test runner");
         handle.shutdown().await;
         let observed = passes.load(Ordering::SeqCst);
         assert!(observed >= 2, "the loop repeats: {observed} passes");

@@ -1171,7 +1171,7 @@ fn assess_destructive_target(
     if is_catastrophic_target(&expanded, context) {
         findings.push(catastrophic_finding(
             "targets a protected system, home, credential, or device path".to_owned(),
-            expanded.display().to_string(),
+            zuno_paths::wire_path(&expanded),
         ));
         return;
     }
@@ -1186,7 +1186,7 @@ fn assess_destructive_target(
     }
     findings.push(confirm_finding(
         "irreversibly removes or overwrites data".to_owned(),
-        Some(expanded.display().to_string()),
+        Some(zuno_paths::wire_path(&expanded)),
     ));
 }
 
@@ -1278,7 +1278,7 @@ fn assess_redirect_target(raw: &str, context: &RiskContext, findings: &mut Vec<R
     if is_catastrophic_target(&expanded, context) {
         findings.push(catastrophic_finding(
             "output redirection would overwrite a protected path or device node".to_owned(),
-            expanded.display().to_string(),
+            zuno_paths::wire_path(&expanded),
         ));
         return;
     }
@@ -1289,20 +1289,20 @@ fn assess_redirect_target(raw: &str, context: &RiskContext, findings: &mut Vec<R
     match std::fs::symlink_metadata(&expanded) {
         Ok(_) => findings.push(confirm_finding(
             "output redirection would replace an existing path".to_owned(),
-            Some(expanded.display().to_string()),
+            Some(zuno_paths::wire_path(&expanded)),
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if outside_working_dir && !is_inside_system_temp(&expanded) {
                 findings.push(confirm_finding(
                     "output redirection would create a file outside the working directory"
                         .to_owned(),
-                    Some(expanded.display().to_string()),
+                    Some(zuno_paths::wire_path(&expanded)),
                 ));
             }
         }
         Err(_) => findings.push(confirm_finding(
             "output redirection target could not be inspected safely".to_owned(),
-            Some(expanded.display().to_string()),
+            Some(zuno_paths::wire_path(&expanded)),
         )),
     }
 }

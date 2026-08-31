@@ -931,13 +931,17 @@ mod tests {
 
     #[test]
     fn paths_accept_file_uris_and_workspace_relative_values() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let relative = workspace.path().join("src").join("lib.rs");
         assert_eq!(
-            resolve_path(Path::new("/workspace"), "src/lib.rs").expect("relative path"),
-            Path::new("/workspace/src/lib.rs")
+            resolve_path(workspace.path(), "src/lib.rs").expect("relative path"),
+            relative
         );
+        let absolute = workspace.path().join("absolute.rs");
+        let uri = url::Url::from_file_path(&absolute).expect("absolute file URI");
         assert_eq!(
-            resolve_path(Path::new("/workspace"), "file:///tmp/lib.rs").expect("file URI"),
-            Path::new("/tmp/lib.rs")
+            resolve_path(workspace.path(), uri.as_str()).expect("file URI"),
+            absolute
         );
     }
 

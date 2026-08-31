@@ -736,7 +736,10 @@ fn child_report_does_not_seed_a_plan_for_an_atomic_parent_session() {
 #[test]
 fn production_turn_runs_the_host_planning_classifier_after_input_is_durable() {
     let turn = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
     )
     .expect("turn.rs is readable");
     let persisted = turn
@@ -1695,8 +1698,8 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
 fn production_prompt_composition_honours_the_memory_master_switch() {
     let directory = tempfile::TempDir::new().expect("temporary memory paths");
     let paths = zuno_memory::ScopePaths::at(
-        directory.path().join("global/MEMORY.md"),
-        directory.path().join("project/RULES.md"),
+        directory.path().join("global").join("MEMORY.md"),
+        directory.path().join("project").join("RULES.md"),
     );
     let mut seeded = zuno_memory::MemoryStore::open(
         zuno_memory::Scope::Project,
@@ -1733,8 +1736,8 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo");
     let paths = zuno_memory::ScopePaths::at(
-        root.path().join("global/MEMORY.md"),
-        repo.join(".zuno/RULES.md"),
+        root.path().join("global").join("MEMORY.md"),
+        repo.join(".zuno").join("RULES.md"),
     );
     for (scope, marker) in [
         (zuno_memory::Scope::Global, "GLOBAL_MEMORY"),
@@ -1755,7 +1758,8 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
         .with(
             zuno_paths::env::XDG_CONFIG_HOME,
             root.path()
-                .join("home/.config")
+                .join("home")
+                .join(".config")
                 .to_string_lossy()
                 .into_owned(),
         );
@@ -1814,11 +1818,15 @@ async fn prompt_assembly_records_agent_memory_instructions_and_skills_in_order()
     );
     assert_eq!(
         assembly.sections()[5].source(),
-        root.path().join("global/MEMORY.md").display().to_string()
+        root.path()
+            .join("global")
+            .join("MEMORY.md")
+            .display()
+            .to_string()
     );
     assert_eq!(
         assembly.sections()[6].source(),
-        repo.join(".zuno/RULES.md").display().to_string()
+        repo.join(".zuno").join("RULES.md").display().to_string()
     );
     assert_eq!(
         assembly.sections()[2].source(),
@@ -5436,7 +5444,9 @@ fn failed_provider_request_keeps_confirmed_goal_usage_and_marks_the_turn_unknown
 /// the way they would drift is a second composition root or a direct loop call.
 #[test]
 fn only_this_module_composes_a_turn() {
-    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("cmd");
     let composition = [
         "ToolRegistryDispatcher::new",
         ".service::<dyn AgentDriver>()",
@@ -5482,8 +5492,11 @@ fn only_this_module_composes_a_turn() {
         directory.display()
     );
 
-    let driver =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../zuno-engine/src/driver.rs");
+    let driver = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("zuno-engine")
+        .join("src")
+        .join("driver.rs");
     let driver = std::fs::read_to_string(&driver).expect("the default driver source is readable");
     assert_eq!(
         driver.matches("run_turn(").count(),
@@ -7302,6 +7315,13 @@ mod instruction_prompt {
     use super::*;
     use std::path::Path;
 
+    fn fixture_path(base: &Path, relative: &str) -> PathBuf {
+        relative
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .fold(base.to_path_buf(), |path, component| path.join(component))
+    }
+
     fn env_for(root: &Path) -> Env {
         Env::empty()
             .with(
@@ -7310,7 +7330,9 @@ mod instruction_prompt {
             )
             .with(
                 zuno_paths::env::XDG_CONFIG_HOME,
-                root.join("home/.config").to_string_lossy().into_owned(),
+                fixture_path(root, "home/.config")
+                    .to_string_lossy()
+                    .into_owned(),
             )
     }
 
@@ -7347,7 +7369,7 @@ mod instruction_prompt {
     #[tokio::test]
     async fn the_global_rule_file_reaches_the_system_prompt() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
-        let global = root.path().join("home/.config/zuno/AGENTS.md");
+        let global = fixture_path(root.path(), "home/.config/zuno/AGENTS.md");
         write(&global, "GLOBAL_RULE_MARKER");
         std::fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
 
@@ -7379,7 +7401,7 @@ mod instruction_prompt {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
-        write(&repo.join("sub/AGENTS.md"), "SUB_RULE_MARKER");
+        write(&fixture_path(&repo, "sub/AGENTS.md"), "SUB_RULE_MARKER");
 
         let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
 
@@ -7405,7 +7427,7 @@ mod instruction_prompt {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "ROOT_RULE_MARKER");
-        write(&repo.join("sub/CLAUDE.md"), "SUB_CLAUDE_MARKER");
+        write(&fixture_path(&repo, "sub/CLAUDE.md"), "SUB_CLAUDE_MARKER");
 
         let (resolver, notes) = inject(&options(root.path(), repo.join("sub"), Vec::new())).await;
 
@@ -7426,9 +7448,12 @@ mod instruction_prompt {
     async fn configured_instruction_entries_reach_the_prompt() {
         let root = tempfile::TempDir::new().expect("temporary instruction root");
         let repo = root.path().join("repo");
-        write(&repo.join("docs/house-style.md"), "CONFIGURED_RULE_MARKER");
         write(
-            &root.path().join("home/tilde-rules.md"),
+            &fixture_path(&repo, "docs/house-style.md"),
+            "CONFIGURED_RULE_MARKER",
+        );
+        write(
+            &fixture_path(root.path(), "home/tilde-rules.md"),
             "TILDE_RULE_MARKER",
         );
 
@@ -7526,7 +7551,10 @@ mod instruction_prompt {
                 "r".repeat(INSTRUCTION_PROMPT_BUDGET)
             ),
         );
-        write(&root.path().join("home/small.md"), "SMALL_RULE_MARKER");
+        write(
+            &fixture_path(root.path(), "home/small.md"),
+            "SMALL_RULE_MARKER",
+        );
 
         let (resolver, notes) =
             inject(&options(root.path(), repo, vec!["~/small.md".to_owned()])).await;
@@ -7578,7 +7606,10 @@ mod instruction_prompt {
 #[test]
 fn instruction_files_are_injected_once_between_memory_and_the_skill_catalogue() {
     let turn = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
     )
     .expect("turn.rs is readable");
 
@@ -7629,7 +7660,9 @@ fn instruction_files_are_injected_once_between_memory_and_the_skill_catalogue() 
 /// passes every other test in this workspace.
 #[test]
 fn the_headless_surfaces_wire_every_capability_the_tui_has() {
-    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("cmd");
     let read = |name: &str| {
         std::fs::read_to_string(cmd.join(name)).unwrap_or_else(|_| panic!("{name} is readable"))
     };
@@ -7680,7 +7713,9 @@ fn the_headless_surfaces_wire_every_capability_the_tui_has() {
 
 #[test]
 fn every_extension_contribution_reaches_its_native_consumer() {
-    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let cmd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("cmd");
     let turn = std::fs::read_to_string(cmd.join("turn.rs")).expect("turn.rs is readable");
     let tui = std::fs::read_to_string(cmd.join("tui.rs")).expect("tui.rs is readable");
 
@@ -8582,7 +8617,10 @@ fn an_unknown_explicit_variant_is_rejected_before_the_provider_request() {
 #[test]
 fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
     let turn = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/turn.rs"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("cmd")
+            .join("turn.rs"),
     )
     .expect("turn.rs is readable");
 
@@ -8681,8 +8719,8 @@ mod reflection_runtime {
         let memory = Arc::new(MemoryService::new(
             Arc::clone(&pool),
             ScopePaths::at(
-                directory.path().join("global/MEMORY.md"),
-                directory.path().join("project/RULES.md"),
+                directory.path().join("global").join("MEMORY.md"),
+                directory.path().join("project").join("RULES.md"),
             ),
             ScopeLimits::default(),
             PromotionPolicy::Review,

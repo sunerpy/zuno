@@ -37,6 +37,7 @@ configuration, not here.
 
 - [Troubleshooting and FAQ](faq.md)
 - [Self-update](reference/self-update.md)
+- [Release pipeline](operate/release-pipeline.md)
 - [Portable environment bundles](reference/portable-bundles.md)
 - [Operational logging](logging.md)
 - [Session retention](session-retention.md)

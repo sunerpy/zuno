@@ -621,10 +621,10 @@ fn is_remote(entry: &str) -> bool {
 /// never has a trailing separator, because it came from a config string joined
 /// against `$HOME` or written absolute by the user.
 fn basename(entry: &str) -> &str {
-    match entry.rsplit_once('/') {
-        Some((_, name)) => name,
-        None => entry,
-    }
+    Path::new(entry)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(entry)
 }
 
 /// `instruction.ts:137-147` — a `~/` entry is expanded against `$HOME`, an
@@ -759,12 +759,21 @@ mod tests {
     use std::fs;
     use zuno_paths::env::{HOME, XDG_CONFIG_HOME, ZUNO_CONFIG_DIR};
 
+    fn fixture_path(base: &Path, relative: &str) -> PathBuf {
+        relative
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .fold(base.to_path_buf(), |path, component| path.join(component))
+    }
+
     fn env_for(root: &Path) -> Env {
         Env::empty()
             .with(HOME, root.join("home").to_string_lossy().into_owned())
             .with(
                 XDG_CONFIG_HOME,
-                root.join("home/.config").to_string_lossy().into_owned(),
+                fixture_path(root, "home/.config")
+                    .to_string_lossy()
+                    .into_owned(),
             )
     }
 
@@ -815,9 +824,12 @@ mod tests {
     #[test]
     fn the_global_probe_is_zuno_only() {
         let root = tempfile::tempdir().expect("tempdir");
-        let config_agents = root.path().join("home/.config/zuno/AGENTS.md");
+        let config_agents = fixture_path(root.path(), "home/.config/zuno/AGENTS.md");
         write(&config_agents, "global agents");
-        write(&root.path().join("home/.claude/CLAUDE.md"), "global claude");
+        write(
+            &fixture_path(root.path(), "home/.claude/CLAUDE.md"),
+            "global claude",
+        );
         fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
 
         let found = Instructions::discover(&options_for(
@@ -837,7 +849,7 @@ mod tests {
     #[test]
     fn a_profile_appends_rules_without_hiding_the_base_global_agents() {
         let root = tempfile::tempdir().expect("tempdir");
-        let base_agents = root.path().join("home/.config/zuno/AGENTS.md");
+        let base_agents = fixture_path(root.path(), "home/.config/zuno/AGENTS.md");
         let profile = root.path().join("profile");
         let profile_agents = profile.join("AGENTS.md");
         write(&base_agents, "base global agents");
@@ -862,7 +874,7 @@ mod tests {
     #[test]
     fn a_profile_without_agents_keeps_the_base_global_agents() {
         let root = tempfile::tempdir().expect("tempdir");
-        let base_agents = root.path().join("home/.config/zuno/AGENTS.md");
+        let base_agents = fixture_path(root.path(), "home/.config/zuno/AGENTS.md");
         let profile = root.path().join("profile");
         write(&base_agents, "base global agents");
         fs::create_dir_all(&profile).expect("mkdir profile");
@@ -885,7 +897,7 @@ mod tests {
     #[test]
     fn claude_global_is_never_loaded_implicitly() {
         let root = tempfile::tempdir().expect("tempdir");
-        let claude = root.path().join("home/.claude/CLAUDE.md");
+        let claude = fixture_path(root.path(), "home/.claude/CLAUDE.md");
         write(&claude, "global claude");
         fs::create_dir_all(root.path().join("repo")).expect("mkdir repo");
 
@@ -903,8 +915,8 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "root agents");
-        write(&repo.join("sub/AGENTS.md"), "sub agents");
-        write(&repo.join("sub/AGENTS.local.md"), "sub local");
+        write(&fixture_path(&repo, "sub/AGENTS.md"), "sub agents");
+        write(&fixture_path(&repo, "sub/AGENTS.local.md"), "sub local");
 
         let found = Instructions::discover(&options_for(root.path(), repo.join("sub"), Vec::new()));
         let project: Vec<&Path> = found
@@ -917,7 +929,7 @@ mod tests {
             project,
             vec![
                 resolve(&repo.join("AGENTS.md")).as_path(),
-                resolve(&repo.join("sub/AGENTS.local.md")).as_path(),
+                resolve(&fixture_path(&repo, "sub/AGENTS.local.md")).as_path(),
             ]
         );
     }
@@ -928,7 +940,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         write(&repo.join("AGENTS.md"), "root agents");
-        write(&repo.join("sub/CLAUDE.md"), "sub claude");
+        write(&fixture_path(&repo, "sub/CLAUDE.md"), "sub claude");
 
         let found = Instructions::discover(&options_for(root.path(), repo.join("sub"), Vec::new()));
         let project: Vec<&Path> = found
@@ -945,7 +957,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         write(&repo.join("CLAUDE.md"), "root claude");
-        write(&repo.join("sub/CLAUDE.md"), "sub claude");
+        write(&fixture_path(&repo, "sub/CLAUDE.md"), "sub claude");
 
         let found = Instructions::discover(&options_for(root.path(), repo.join("sub"), Vec::new()));
         assert!(found.paths().is_empty());
@@ -967,9 +979,9 @@ mod tests {
     fn configured_entries_resolve_as_globs_tildes_and_urls() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        write(&repo.join("docs/a.md"), "a");
-        write(&repo.join("docs/b.md"), "b");
-        write(&root.path().join("home/rules.md"), "home rules");
+        write(&fixture_path(&repo, "docs/a.md"), "a");
+        write(&fixture_path(&repo, "docs/b.md"), "b");
+        write(&fixture_path(root.path(), "home/rules.md"), "home rules");
 
         let found = Instructions::discover(&options_for(
             root.path(),
@@ -990,9 +1002,9 @@ mod tests {
         assert_eq!(
             configured,
             vec![
-                resolve(&repo.join("docs/a.md")).as_path(),
-                resolve(&repo.join("docs/b.md")).as_path(),
-                resolve(&root.path().join("home/rules.md")).as_path(),
+                resolve(&fixture_path(&repo, "docs/a.md")).as_path(),
+                resolve(&fixture_path(&repo, "docs/b.md")).as_path(),
+                resolve(&fixture_path(root.path(), "home/rules.md")).as_path(),
             ]
         );
         assert_eq!(
@@ -1041,14 +1053,14 @@ mod tests {
     fn find_probes_one_directory_in_cascade_order() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        write(&repo.join("sub/AGENTS.md"), "sub agents");
-        write(&repo.join("sub/AGENTS.local.md"), "sub local");
-        write(&repo.join("other/CLAUDE.md"), "other claude");
+        write(&fixture_path(&repo, "sub/AGENTS.md"), "sub agents");
+        write(&fixture_path(&repo, "sub/AGENTS.local.md"), "sub local");
+        write(&fixture_path(&repo, "other/CLAUDE.md"), "other claude");
 
         let options = options_for(root.path(), repo.clone(), Vec::new());
         assert_eq!(
             Instructions::find(&options, &repo.join("sub")),
-            Some(resolve(&repo.join("sub/AGENTS.local.md")))
+            Some(resolve(&fixture_path(&repo, "sub/AGENTS.local.md")))
         );
         assert_eq!(Instructions::find(&options, &repo.join("other")), None);
         assert_eq!(Instructions::find(&options, &repo.join("nope")), None);
@@ -1086,8 +1098,8 @@ mod tests {
     fn the_upward_walk_attaches_a_parent_exactly_once() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        write(&repo.join("pkg/AGENTS.md"), "pkg rules");
-        write(&repo.join("pkg/src/main.rs"), "fn main() {}");
+        write(&fixture_path(&repo, "pkg/AGENTS.md"), "pkg rules");
+        write(&fixture_path(&repo, "pkg/src/main.rs"), "fn main() {}");
 
         let options = options_for(root.path(), repo.clone(), Vec::new());
         let system = Instructions::discover(&options);
@@ -1096,18 +1108,21 @@ mod tests {
 
         let first = system.nearby(
             &options,
-            &repo.join("pkg/src/main.rs"),
+            &fixture_path(&repo, "pkg/src/main.rs"),
             &already,
             &mut claims,
         );
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].path(), resolve(&repo.join("pkg/AGENTS.md")));
+        assert_eq!(
+            first[0].path(),
+            resolve(&fixture_path(&repo, "pkg/AGENTS.md"))
+        );
         assert_eq!(first[0].origin(), Origin::Nearby);
         assert_eq!(claims.len(), 1);
 
         let second = system.nearby(
             &options,
-            &repo.join("pkg/src/lib.rs"),
+            &fixture_path(&repo, "pkg/src/lib.rs"),
             &already,
             &mut claims,
         );
@@ -1120,7 +1135,7 @@ mod tests {
         assert!(claims.is_empty());
         let after_clear = system.nearby(
             &options,
-            &repo.join("pkg/src/lib.rs"),
+            &fixture_path(&repo, "pkg/src/lib.rs"),
             &already,
             &mut claims,
         );
@@ -1133,19 +1148,19 @@ mod tests {
     fn the_upward_walk_skips_system_paths() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        write(&repo.join("pkg/AGENTS.md"), "pkg rules");
-        write(&repo.join("pkg/src/main.rs"), "fn main() {}");
+        write(&fixture_path(&repo, "pkg/AGENTS.md"), "pkg rules");
+        write(&fixture_path(&repo, "pkg/src/main.rs"), "fn main() {}");
 
         let options = options_for(root.path(), repo.join("pkg"), Vec::new());
         let system = Instructions::discover(&options);
-        assert!(system.contains(&repo.join("pkg/AGENTS.md")));
+        assert!(system.contains(&fixture_path(&repo, "pkg/AGENTS.md")));
 
         let mut claims = UpwardClaims::new();
         assert!(
             system
                 .nearby(
                     &options,
-                    &repo.join("pkg/src/main.rs"),
+                    &fixture_path(&repo, "pkg/src/main.rs"),
                     &HashSet::new(),
                     &mut claims
                 )
@@ -1157,18 +1172,18 @@ mod tests {
     fn the_upward_walk_skips_already_read_paths() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        write(&repo.join("pkg/AGENTS.md"), "pkg rules");
-        write(&repo.join("pkg/src/main.rs"), "fn main() {}");
+        write(&fixture_path(&repo, "pkg/AGENTS.md"), "pkg rules");
+        write(&fixture_path(&repo, "pkg/src/main.rs"), "fn main() {}");
 
         let options = options_for(root.path(), repo.clone(), Vec::new());
         let system = Instructions::discover(&options);
-        let already: HashSet<PathBuf> = [resolve(&repo.join("pkg/AGENTS.md"))].into();
+        let already: HashSet<PathBuf> = [resolve(&fixture_path(&repo, "pkg/AGENTS.md"))].into();
         let mut claims = UpwardClaims::new();
         assert!(
             system
                 .nearby(
                     &options,
-                    &repo.join("pkg/src/main.rs"),
+                    &fixture_path(&repo, "pkg/src/main.rs"),
                     &already,
                     &mut claims
                 )
@@ -1183,14 +1198,14 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         write(&root.path().join("AGENTS.md"), "outside");
-        write(&repo.join("pkg/AGENTS.md"), "pkg rules");
+        write(&fixture_path(&repo, "pkg/AGENTS.md"), "pkg rules");
 
         let options = options_for(root.path(), repo.clone(), Vec::new());
         let system = Instructions::discover(&options);
         let mut claims = UpwardClaims::new();
         let found = system.nearby(
             &options,
-            &repo.join("pkg/AGENTS.md"),
+            &fixture_path(&repo, "pkg/AGENTS.md"),
             &HashSet::new(),
             &mut claims,
         );
@@ -1201,16 +1216,16 @@ mod tests {
     fn a_deep_read_attaches_every_intermediate_level_once() {
         let root = tempfile::tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        write(&repo.join("a/AGENTS.md"), "a");
-        write(&repo.join("a/b/AGENTS.md"), "b");
-        write(&repo.join("a/b/c/note.txt"), "note");
+        write(&fixture_path(&repo, "a/AGENTS.md"), "a");
+        write(&fixture_path(&repo, "a/b/AGENTS.md"), "b");
+        write(&fixture_path(&repo, "a/b/c/note.txt"), "note");
 
         let options = options_for(root.path(), repo.clone(), Vec::new());
         let system = Instructions::discover(&options);
         let mut claims = UpwardClaims::new();
         let found = system.nearby(
             &options,
-            &repo.join("a/b/c/note.txt"),
+            &fixture_path(&repo, "a/b/c/note.txt"),
             &HashSet::new(),
             &mut claims,
         );
@@ -1218,8 +1233,8 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                resolve(&repo.join("a/b/AGENTS.md")).as_path(),
-                resolve(&repo.join("a/AGENTS.md")).as_path(),
+                resolve(&fixture_path(&repo, "a/b/AGENTS.md")).as_path(),
+                resolve(&fixture_path(&repo, "a/AGENTS.md")).as_path(),
             ]
         );
         assert_eq!(claims.len(), 2);
@@ -1269,7 +1284,10 @@ mod tests {
     fn with_layout_overrides_the_resolved_layout() {
         let root = tempfile::tempdir().expect("tempdir");
         let elsewhere = root.path().join("elsewhere");
-        write(&elsewhere.join("zuno/AGENTS.md"), "override global");
+        write(
+            &fixture_path(&elsewhere, "zuno/AGENTS.md"),
+            "override global",
+        );
         fs::create_dir_all(root.path().join("repo")).expect("mkdir");
 
         let layout = Layout::resolve(
@@ -1285,7 +1303,7 @@ mod tests {
         let found = Instructions::discover(&options);
         assert_eq!(
             found.paths()[0].path(),
-            resolve(&elsewhere.join("zuno/AGENTS.md"))
+            resolve(&fixture_path(&elsewhere, "zuno/AGENTS.md"))
         );
     }
 
@@ -1311,6 +1329,8 @@ mod tests {
     fn basename_takes_the_last_segment() {
         assert_eq!(basename("/repo/docs/AGENTS.md"), "AGENTS.md");
         assert_eq!(basename("AGENTS.md"), "AGENTS.md");
+        #[cfg(windows)]
+        assert_eq!(basename(r"C:\repo\docs\AGENTS.md"), "AGENTS.md");
     }
 
     #[test]

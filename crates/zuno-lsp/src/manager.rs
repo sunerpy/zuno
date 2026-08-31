@@ -984,6 +984,27 @@ mod tests {
     use zuno_catalog::lsp_config::ResolvedLsp;
     use zuno_config::schema::lsp::LspConfig;
 
+    fn test_python() -> Option<PathBuf> {
+        for candidate in ["python3", "python"] {
+            let Ok(paths) = which::which_all(candidate) else {
+                continue;
+            };
+            for path in paths {
+                let usable = std::process::Command::new(&path)
+                    .args(["-c", "import json, pathlib, sys, time"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if usable {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
     fn write_server(path: &Path) {
         fs::write(
             path,
@@ -1068,6 +1089,7 @@ while True:
     fn barrier_manager(
         temp: &tempfile::TempDir,
         concurrency: usize,
+        python: &Path,
     ) -> (Manager, PathBuf, PathBuf) {
         let script = temp.path().join("barrier_server.py");
         let barrier = temp.path().join("barrier");
@@ -1078,7 +1100,7 @@ while True:
         let config: LspConfig = serde_json::from_value(json!({
             "one": {
                 "command": [
-                    "python3",
+                    python.to_string_lossy(),
                     script.to_string_lossy(),
                     "one",
                     barrier.to_string_lossy()
@@ -1087,7 +1109,7 @@ while True:
             },
             "two": {
                 "command": [
-                    "python3",
+                    python.to_string_lossy(),
                     script.to_string_lossy(),
                     "two",
                     barrier.to_string_lossy()
@@ -1149,11 +1171,11 @@ while True:
 
     #[tokio::test]
     async fn different_servers_start_and_answer_requests_concurrently_in_stable_order() {
-        if which::which("python3").is_err() {
+        let Some(python) = test_python() else {
             return;
-        }
+        };
         let temp = tempfile::tempdir().expect("temporary workspace");
-        let (manager, source, barrier) = barrier_manager(&temp, 2);
+        let (manager, source, barrier) = barrier_manager(&temp, 2, &python);
 
         let starting = {
             let manager = manager.clone();
@@ -1191,11 +1213,11 @@ while True:
 
     #[tokio::test]
     async fn concurrency_one_restores_serial_lsp_startup_and_requests() {
-        if which::which("python3").is_err() {
+        let Some(python) = test_python() else {
             return;
-        }
+        };
         let temp = tempfile::tempdir().expect("temporary workspace");
-        let (manager, source, barrier) = barrier_manager(&temp, 1);
+        let (manager, source, barrier) = barrier_manager(&temp, 1, &python);
 
         let starting = {
             let manager = manager.clone();
@@ -1243,9 +1265,9 @@ while True:
 
     #[tokio::test]
     async fn a_killed_server_publishes_degraded_before_restarting() {
-        if which::which("python3").is_err() {
+        let Some(python) = test_python() else {
             return;
-        }
+        };
         let temp = tempfile::tempdir().expect("temporary workspace");
         let script = temp.path().join("server.py");
         let source = temp.path().join("file.mine");
@@ -1253,7 +1275,7 @@ while True:
         fs::write(&source, "content\n").expect("write source file");
         let config: LspConfig = serde_json::from_value(json!({
             "test": {
-                "command": ["python3", script.to_string_lossy(), "--stdio"],
+                "command": [python.to_string_lossy(), script.to_string_lossy(), "--stdio"],
                 "extensions": [".mine"]
             }
         }))

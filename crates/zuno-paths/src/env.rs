@@ -69,6 +69,15 @@ pub struct Env {
     vars: BTreeMap<String, String>,
 }
 
+fn environment_key(key: impl Into<String>) -> String {
+    let key = key.into();
+    if cfg!(windows) {
+        key.to_uppercase()
+    } else {
+        key
+    }
+}
+
 impl Env {
     /// Snapshot the current process environment.
     ///
@@ -82,7 +91,7 @@ impl Env {
         let vars = std::env::vars_os()
             .map(|(key, value)| {
                 (
-                    key.to_string_lossy().into_owned(),
+                    environment_key(key.to_string_lossy().into_owned()),
                     value.to_string_lossy().into_owned(),
                 )
             })
@@ -106,7 +115,7 @@ impl Env {
     {
         let vars = pairs
             .into_iter()
-            .map(|(key, value)| (key.into(), value.into()))
+            .map(|(key, value)| (environment_key(key.into()), value.into()))
             .collect();
         Self { vars }
     }
@@ -114,21 +123,21 @@ impl Env {
     /// Set `key`, consuming and returning `self` so calls chain.
     #[must_use]
     pub fn with(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.vars.insert(key.into(), value.into());
+        self.vars.insert(environment_key(key), value.into());
         self
     }
 
     /// Unset `key`, consuming and returning `self` so calls chain.
     #[must_use]
     pub fn without(mut self, key: &str) -> Self {
-        self.vars.remove(key);
+        self.vars.remove(&environment_key(key));
         self
     }
 
     /// The raw value, present even when empty — JavaScript's `??` semantics.
     #[must_use]
     pub fn value(&self, key: &str) -> Option<&str> {
-        self.vars.get(key).map(String::as_str)
+        self.vars.get(&environment_key(key)).map(String::as_str)
     }
 
     /// The value only when it is non-empty — JavaScript's `||` semantics.
@@ -227,5 +236,15 @@ mod tests {
         let env = Env::empty().with("ZUNO_DB", "database.sqlite");
         assert_eq!(env.value("ZUNO_DB"), Some("database.sqlite"));
         assert_eq!(env.value("OPENCODE_DB"), None);
+    }
+
+    #[test]
+    fn environment_key_case_matches_the_host_contract() {
+        let env = Env::empty().with("Path", "value");
+        if cfg!(windows) {
+            assert_eq!(env.value("PATH"), Some("value"));
+        } else {
+            assert_eq!(env.value("PATH"), None);
+        }
     }
 }

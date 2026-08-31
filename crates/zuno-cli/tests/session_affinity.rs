@@ -12,7 +12,7 @@ use std::process::Output;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv};
+use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const FINAL_MARKER: &str = "ZUNO_SESSION_AFFINITY_OK";
@@ -86,7 +86,7 @@ fn read_tool_response(path: &Path) -> MockResponse {
 }
 
 fn provider_config(base_url: &str) -> String {
-    json!({
+    trusted_platform_config(json!({
         "formatter": false,
         "lsp": false,
         "model": "test/test-model",
@@ -117,7 +117,7 @@ fn provider_config(base_url: &str) -> String {
                 "options": {"baseURL": format!("{base_url}/v1")}
             }
         }
-    })
+    }))
     .to_string()
 }
 

@@ -65,7 +65,7 @@ impl TypedTool for WriteTool {
                     "write",
                     format!(
                         "Path is a directory, not a file: {}",
-                        target.canonical.display()
+                        zuno_paths::wire_path(&target.canonical)
                     ),
                 ));
             }
@@ -125,7 +125,7 @@ impl TypedTool for WriteTool {
             report_formatting(
                 report_diff(
                     ToolOutput::text(label.clone(), "Wrote file successfully.")
-                        .with_metadata("filepath", json!(target.canonical))
+                        .with_metadata("filepath", zuno_paths::wire_path(&target.canonical))
                         .with_metadata("exists", json!(existing.is_some()))
                         .with_metadata("formatted", outcome.changed)
                         .with_written_path(&target.canonical),

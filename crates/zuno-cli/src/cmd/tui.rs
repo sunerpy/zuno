@@ -145,10 +145,12 @@ const PROMPT_HISTORY_CHANNEL_CAPACITY: usize = 16;
 
 struct ContainedEditorLauncher;
 
+#[cfg(unix)]
 struct ContainedEditorProcess {
     child: tokio::process::Child,
 }
 
+#[cfg(unix)]
 impl EditorProcess for ContainedEditorProcess {
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
@@ -282,7 +284,7 @@ pub(super) fn execute(args: &TuiArgs, environment: &StartupEnvironment) -> Resul
                 return Ok(());
             }
             Ok(TuiRunOutcome::Remount(next)) => {
-                request = next;
+                request = *next;
             }
         }
     }
@@ -307,7 +309,7 @@ fn shutdown_tui_background_jobs(
 
 enum TuiRunOutcome {
     Exit(super::turn::PreparedSessionIdentity),
-    Remount(RemountRequest),
+    Remount(Box<RemountRequest>),
 }
 
 #[derive(Clone, Copy)]
@@ -887,7 +889,7 @@ fn execute_once(
     });
     outcome?;
     if let Some(next) = remount.take() {
-        return Ok(TuiRunOutcome::Remount(next));
+        return Ok(TuiRunOutcome::Remount(Box::new(next)));
     }
     Ok(TuiRunOutcome::Exit(exit_identity))
 }
@@ -3767,9 +3769,13 @@ fn to_string(error: impl std::fmt::Display) -> String {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
+    #[cfg(target_os = "linux")]
     use std::io::{Read as _, Write};
+    use std::sync::Mutex;
+    #[cfg(target_os = "linux")]
+    use std::sync::PoisonError;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Mutex, PoisonError};
+    #[cfg(target_os = "linux")]
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 

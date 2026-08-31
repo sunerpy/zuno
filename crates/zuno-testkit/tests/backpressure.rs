@@ -1,18 +1,28 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc, watch};
 use zuno_engine::r#loop::{TURN_EVENT_CHANNEL_CAPACITY, TurnEvent, event_channel};
 
 const PROGRESS_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
 const HOST_SESSION_COUNT: usize = 2;
+#[cfg(target_os = "linux")]
 const GUARDED_HOST_KIND_COUNT: usize = 2;
+#[cfg(target_os = "linux")]
 const GUARDED_PROCESSES_PER_HOST: usize = 3;
+#[cfg(target_os = "linux")]
 const DIRECT_MCP_PROCESSES_PER_HOST: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -106,6 +106,27 @@ pub use crate::run::{Provenance, RunOutcome, VersionGap};
 pub use crate::subject::{SUBJECT_BIN, SUBJECT_PACKAGE, Subject};
 pub use crate::terminal_owner::{FakeTerminalOwner, TerminalTranscript, TerminalTransition};
 
+/// Add the explicit trusted fallback needed by production-path tests on a host
+/// where Zuno has no OS sandbox backend.
+///
+/// Product defaults remain fail-closed. This helper is only for tests that
+/// launch a real Zuno process inside an already-isolated CI runner and whose
+/// subject is provider routing, durable state, or another behavior unrelated to
+/// sandbox availability. An explicit sandbox configuration is never replaced.
+#[must_use]
+pub fn trusted_platform_config(mut config: serde_json::Value) -> serde_json::Value {
+    if !cfg!(target_os = "linux")
+        && let Some(object) = config.as_object_mut()
+        && !object.contains_key("sandbox")
+    {
+        object.insert(
+            "sandbox".to_owned(),
+            serde_json::json!({"onUnavailable": "run-unconfined"}),
+        );
+    }
+    config
+}
+
 /// Compare two [`RunOutcome`]s, labelling each side with its own provenance.
 ///
 /// Prefer this over calling [`diff_normalized`] with hand-written labels: it is
@@ -172,6 +193,22 @@ mod tests {
         assert!(rendered.contains("installed-binary"), "{rendered}");
         assert!(rendered.contains("pinned source 1.18.13"), "{rendered}");
         assert!(rendered.contains("zuno"), "{rendered}");
+    }
+
+    #[test]
+    fn trusted_platform_config_preserves_an_explicit_policy() {
+        let config = serde_json::json!({"sandbox": {"mode": "danger-full-access"}});
+        assert_eq!(trusted_platform_config(config.clone()), config);
+    }
+
+    #[test]
+    fn trusted_platform_config_only_relaxes_unsupported_hosts() {
+        let configured = trusted_platform_config(serde_json::json!({"formatter": false}));
+        if cfg!(target_os = "linux") {
+            assert!(configured.get("sandbox").is_none());
+        } else {
+            assert_eq!(configured["sandbox"]["onUnavailable"], "run-unconfined");
+        }
     }
 }
 

@@ -1,11 +1,16 @@
 mod support;
 
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use zuno_error::ToolError;
+#[cfg(unix)]
 use zuno_tool::{NeverInterrupted, PermissionAsk, PermissionAsker, ToolContext};
 use zuno_tools::risk::{GateOutcome, RiskContext, assess_command, gate};
-use zuno_tools::shell::{ShellParams, ShellSyntax};
+#[cfg(unix)]
+use zuno_tools::shell::ShellParams;
+use zuno_tools::shell::ShellSyntax;
 
 fn risk_context() -> RiskContext {
     RiskContext {
@@ -324,7 +329,7 @@ fn risk_new_file_in_the_system_temp_directory_is_not_an_overwrite() {
         home_dir: None,
     };
     let assessment = assess_command(
-        &format!("printf puzzle > '{}'", target.display()),
+        &format!("printf puzzle > '{}'", zuno_paths::wire_path(&target)),
         ShellSyntax::Bash,
         &context,
     )
@@ -348,9 +353,9 @@ fn risk_absent_forced_temp_file_cleanup_is_not_treated_as_data_loss() {
     };
     let command = format!(
         "cp target/release/zuno '{}' && strip '{}' && rm -f '{}'",
-        target.display(),
-        target.display(),
-        target.display()
+        zuno_paths::wire_path(&target),
+        zuno_paths::wire_path(&target),
+        zuno_paths::wire_path(&target)
     );
     let assessment =
         assess_command(&command, ShellSyntax::Bash, &context).expect("the command must parse");
@@ -363,7 +368,7 @@ fn risk_absent_forced_temp_file_cleanup_is_not_treated_as_data_loss() {
 
     std::fs::write(&target, b"keep").expect("existing target");
     let existing = assess_command(
-        &format!("rm -f '{}'", target.display()),
+        &format!("rm -f '{}'", zuno_paths::wire_path(&target)),
         ShellSyntax::Bash,
         &context,
     )
@@ -386,11 +391,13 @@ fn risk_absent_forced_temp_file_cleanup_is_not_treated_as_data_loss() {
     );
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct RecordingDenial {
     asks: Mutex<Vec<PermissionAsk>>,
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl PermissionAsker for RecordingDenial {
     async fn ask(
@@ -493,6 +500,7 @@ async fn risk_gate_runs_before_explicit_background_dispatch() {
     assert!(!directory.path().join(".zuno/background").exists());
 }
 
+#[cfg(unix)]
 fn tool_context_with(permission: Arc<dyn PermissionAsker>) -> ToolContext {
     ToolContext::new(
         "ses_risk",

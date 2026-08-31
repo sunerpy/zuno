@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! The proof the interactive surface can execute a turn.
 //!
 //! Todo 105's whole subject is a seam, so this test is deliberately the crudest and

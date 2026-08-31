@@ -13,28 +13,120 @@ fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zuno"))
 }
 
+fn acp_stderr() -> Stdio {
+    #[cfg(windows)]
+    {
+        // A session/new crash closes stdout before the request helper can
+        // report a JSON-RPC error. Inherit stderr on native Windows so the
+        // process-level cause is retained in the per-suite CI diagnostic log.
+        Stdio::inherit()
+    }
+    #[cfg(not(windows))]
+    {
+        Stdio::piped()
+    }
+}
+
 fn isolated_command(root: &std::path::Path) -> Command {
     isolated_command_with_config(root, TEST_CONFIG)
 }
 
 fn isolated_command_with_config(root: &std::path::Path, config: &str) -> Command {
+    let config: Value =
+        serde_json::from_str(config).expect("isolated ACP config must be valid JSON");
+    let config = trusted_acp_process_config(config).to_string();
+    let home = root.join("home");
+    let data = root.join("data");
+    let config_home = root.join("config");
+    let cache = root.join("cache");
+    let state = root.join("state");
+    let temp = root.join("temp");
+    for directory in [&home, &data, &config_home, &cache, &state, &temp] {
+        std::fs::create_dir_all(directory).expect("create isolated ACP directory");
+    }
+    #[cfg(windows)]
+    let roaming = root.join("appdata").join("roaming");
+    #[cfg(windows)]
+    let local = root.join("appdata").join("local");
+    #[cfg(windows)]
+    for directory in [&roaming, &local] {
+        std::fs::create_dir_all(directory).expect("create isolated Windows ACP directory");
+    }
+
     let mut command = binary();
     command
         .current_dir(root)
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
-        .env("HOME", root.join("home"))
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("XDG_STATE_HOME", root.join("state"))
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_STATE_HOME", &state)
+        .env("TMPDIR", &temp)
         .env("ZUNO_DB", root.join("zuno-acp.db"))
         .env("ZUNO_AUTH_CONTENT", "{}")
         .env("ZUNO_CONFIG_CONTENT", config)
         .env("ZUNO_DISABLE_AUTOUPDATE", "true")
         .env("ZUNO_DISABLE_MODELS_FETCH", "true")
         .env("ZUNO_DISABLE_LSP_DOWNLOAD", "true");
+    #[cfg(windows)]
     command
+        .env("USERPROFILE", &home)
+        .env("APPDATA", roaming)
+        .env("LOCALAPPDATA", local)
+        .env("TEMP", &temp)
+        .env("TMP", &temp);
+    command
+}
+
+fn trusted_acp_process_config(config: Value) -> Value {
+    let mut config = zuno_testkit::trusted_platform_config(config);
+    if !cfg!(target_os = "linux") {
+        // These protocol tests already run inside an isolated runner. Keep the
+        // production read-only Agents read-only, but hide Shell from the ones this
+        // suite executes so unsupported hosts can exercise Plan and child-session
+        // protocol behavior without pretending to provide a native read-only OS
+        // sandbox.
+        let object = config
+            .as_object_mut()
+            .expect("isolated ACP config must be an object");
+        let agents = object
+            .entry("agents")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("isolated ACP agents config must be an object");
+        for (name, tools) in [
+            (
+                "plan",
+                json!([
+                    "read",
+                    "glob",
+                    "grep",
+                    "lsp",
+                    "webfetch",
+                    "web_search",
+                    "question",
+                    "plan_exit",
+                    "goal_get",
+                    "plan_get",
+                    "plan_update",
+                    "todo_get",
+                    "todo_update",
+                    "skill"
+                ]),
+            ),
+            ("explorer", json!(["read", "glob", "grep", "lsp", "skill"])),
+        ] {
+            agents
+                .entry(name)
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .unwrap_or_else(|| panic!("isolated ACP {name} config must be an object"))
+                .insert("tools".to_owned(), tools);
+        }
+    }
+    config
 }
 
 fn config_with_second_model(base_url: &str) -> String {
@@ -509,7 +601,7 @@ fn acp_initialize_uses_stable_v1_without_fake_authentication() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
 
@@ -1422,7 +1514,7 @@ fn acp_session_lifecycle_uses_the_durable_zuno_store() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let cwd = root.path().to_string_lossy().into_owned();
@@ -1605,7 +1697,7 @@ async fn acp_compact_is_native_and_persists_a_summary_without_model_prompt_dispa
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -1736,7 +1828,7 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -1939,7 +2031,7 @@ async fn acp_load_is_cold_and_duplicate_load_does_not_replay_again() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2122,7 +2214,7 @@ fn acp_connection_bounds_open_sessions_and_releases_capacity_on_close() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2205,7 +2297,7 @@ fn acp_reasoning_levels_follow_the_active_models_declared_variants() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2326,7 +2418,7 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2388,7 +2480,9 @@ async fn acp_prompt_drives_the_durable_turn_and_streams_updates() {
     );
     let resource_path = root.path().join("notes.md");
     std::fs::write(&resource_path, "# Design notes\n").expect("write ACP resource link target");
-    let resource_uri = format!("file://{}", resource_path.display());
+    let resource_uri = url::Url::from_file_path(&resource_path)
+        .expect("ACP resource path must convert to a file URI")
+        .to_string();
     let (completed, updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
@@ -2511,7 +2605,7 @@ async fn acp_images_and_embedded_context_reach_the_provider_and_durable_replay()
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2636,7 +2730,7 @@ async fn acp_plan_round_trips_question_tool_through_stable_elicitation() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2772,7 +2866,7 @@ async fn acp_prompt_streams_a_negotiated_foreground_subagent_on_its_child_sessio
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -2910,7 +3004,7 @@ async fn acp_fallback_reports_child_blocker_without_synchronous_elicitation() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3007,7 +3101,7 @@ async fn acp_fallback_routes_child_permission_through_the_declared_root_session(
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3102,7 +3196,7 @@ async fn acp_close_cancels_and_joins_its_background_child_without_native_project
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3237,7 +3331,7 @@ async fn acp_detached_parent_projects_final_plan_after_background_child_completi
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3412,7 +3506,7 @@ async fn acp_prompt_projects_the_final_durable_plan_before_responding() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3511,7 +3605,7 @@ async fn acp_write_round_trips_strict_permission_and_native_creation_diff() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3584,13 +3678,16 @@ async fn acp_write_round_trips_strict_permission_and_native_creation_diff() {
         .iter()
         .find(|content| content["type"] == "diff")
         .expect("native creation diff");
-    assert_eq!(diff["path"], target.to_string_lossy().as_ref());
+    let target_wire = zuno_paths::wire_path(
+        &std::fs::canonicalize(&target).expect("created ACP target canonicalizes"),
+    );
+    assert_eq!(diff["path"], target_wire);
     assert_eq!(diff["oldText"], Value::Null);
     assert_eq!(diff["newText"], "created through ACP\n");
     assert!(written["locations"].as_array().is_some_and(|locations| {
         locations
             .iter()
-            .any(|location| location["path"] == target.to_string_lossy().as_ref())
+            .any(|location| location["path"] == target_wire)
     }));
     assert!(updates.iter().any(|update| {
         update["sessionUpdate"] == "agent_message_chunk"
@@ -3627,7 +3724,7 @@ async fn acp_danger_full_access_emits_no_tool_approval_request() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3690,7 +3787,7 @@ fn acp_load_replays_durable_content_tools_plan_and_usage() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");
@@ -3858,7 +3955,7 @@ fn acp_load_replays_negotiated_child_sessions_on_their_own_routes() {
         .arg("acp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(acp_stderr())
         .spawn()
         .expect("start zuno acp");
     let mut stdin = child.stdin.take().expect("ACP stdin");

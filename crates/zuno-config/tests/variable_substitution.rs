@@ -29,13 +29,21 @@ impl Site {
     }
 
     fn write(&self, relative: &str, content: &str) -> PathBuf {
-        let path = self.root.path().join(relative);
+        let path = self.path(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fixture parent");
+        }
         fs::write(&path, content).expect("write fixture");
         path
     }
 
     fn path(&self, relative: &str) -> PathBuf {
-        self.root.path().join(relative)
+        relative
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .fold(self.root.path().to_path_buf(), |path, component| {
+                path.join(component)
+            })
     }
 
     fn home_env(&self) -> Env {
@@ -97,7 +105,10 @@ fn variable_expands_env_and_tilde_file_into_a_parsable_config() {
 #[test]
 fn variable_absent_file_reference_names_the_path_instead_of_substituting_empty() {
     let site = Site::new();
-    let config = site.write("zuno.json", r#"{"instructions":["{file:/nonexistent}"]}"#);
+    let reference = "/nonexistent";
+    let token = format!("{{file:{reference}}}");
+    let document = format!(r#"{{"instructions":["{token}"]}}"#);
+    let config = site.write("zuno.json", &document);
 
     let process = Env::empty();
     let error = Substitution::for_file(&config)
@@ -107,7 +118,14 @@ fn variable_absent_file_reference_names_the_path_instead_of_substituting_empty()
 
     assert_eq!(
         detail(&error),
-        "bad file reference: \"{file:/nonexistent}\" /nonexistent does not exist"
+        format!(
+            "bad file reference: \"{token}\" {} does not exist",
+            PathBuf::from(zuno_paths::node_path::resolve(
+                &zuno_paths::node_path::dirname(&config.to_string_lossy()),
+                &[reference],
+            ))
+            .display()
+        )
     );
     let ConfigError::Invalid { path, .. } = &error else {
         panic!("expected Invalid");
@@ -120,7 +138,7 @@ fn variable_absent_file_reference_names_the_path_instead_of_substituting_empty()
         Substitution::for_file(&config)
             .with_process_env(&process)
             .on_missing(Missing::Empty)
-            .apply(r#"{"instructions":["{file:/nonexistent}"]}"#)
+            .apply(&document)
             .expect("swallowed"),
         r#"{"instructions":[""]}"#
     );

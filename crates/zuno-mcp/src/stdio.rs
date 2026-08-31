@@ -1278,7 +1278,8 @@ mod tests {
 
     #[test]
     fn stdio_command_resolves_cwd_and_applies_configured_environment_last() {
-        let workspace = Path::new("/workspace/project");
+        let fixture = tempfile::tempdir().expect("workspace fixture");
+        let workspace = fixture.path().join("project");
         let config = McpLocal {
             kind: LocalKind::Local,
             command: vec!["opencode".to_owned(), "mcp".to_owned()],
@@ -1290,11 +1291,11 @@ mod tests {
             enabled: None,
             timeout: None,
         };
-        let command = build_command(workspace, &config).expect("valid command");
+        let command = build_command(&workspace, &config).expect("valid command");
         let command = command.as_std();
         assert_eq!(
             command.get_current_dir(),
-            Some(Path::new("/workspace/project/server"))
+            Some(workspace.join("server").as_path())
         );
         let environments: BTreeMap<_, _> = command
             .get_envs()

@@ -1,11 +1,12 @@
 mod support;
 
+#[cfg(unix)]
 use serde_json::json;
+#[cfg(unix)]
 use std::sync::Arc;
-use zuno_tool::{
-    ACCEPT_LARGE_OUTPUT_KEY, AllowAll, NeverInterrupted, OutputLimits, Tool, ToolContext,
-    ToolOutput, ToolOutputStore,
-};
+use zuno_tool::{ACCEPT_LARGE_OUTPUT_KEY, OutputLimits, ToolOutput, ToolOutputStore};
+#[cfg(unix)]
+use zuno_tool::{AllowAll, NeverInterrupted, Tool, ToolContext};
 use zuno_tools::output_policy::OutputPolicy;
 
 fn limits() -> OutputLimits {
@@ -15,6 +16,7 @@ fn limits() -> OutputLimits {
     }
 }
 
+#[cfg(unix)]
 fn context() -> ToolContext {
     ToolContext::new(
         "ses_output_policy",

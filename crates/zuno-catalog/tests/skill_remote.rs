@@ -68,13 +68,15 @@ impl Tree {
     }
 
     fn cache_root(&self) -> PathBuf {
-        self.home().join(".cache/zuno/skills")
+        self.home().join(".cache").join("zuno").join("skills")
     }
 
     fn local_skill(&self, name: &str) {
         let path = self
             .home()
-            .join(".config/zuno/skill")
+            .join(".config")
+            .join("zuno")
+            .join("skill")
             .join(name)
             .join("SKILL.md");
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
@@ -145,11 +147,12 @@ async fn an_index_entry_without_skill_md_is_warned_about_and_never_downloaded() 
     assert_eq!(
         skills.get("usable").expect("present").location,
         tree.cache_root()
-            .join("usable/SKILL.md")
+            .join("usable")
+            .join("SKILL.md")
             .to_string_lossy()
             .into_owned()
     );
-    assert!(tree.cache_root().join("usable/helper.md").is_file());
+    assert!(tree.cache_root().join("usable").join("helper.md").is_file());
     assert!(
         !tree.cache_root().join("unusable").exists(),
         "an unusable entry must not be fetched at all"
@@ -483,8 +486,8 @@ async fn an_index_entry_pointing_outside_the_cache_is_refused() {
 
     assert!(skills.get("evil").is_some(), "the safe file still loads");
     assert!(
-        !tree.home().join(".cache/escaped.md").exists()
-            && !tree.cache_root().join("../escaped.md").exists()
+        !tree.home().join(".cache").join("escaped.md").exists()
+            && !tree.cache_root().join("..").join("escaped.md").exists()
     );
     assert_eq!(
         skills

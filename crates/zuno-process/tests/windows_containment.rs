@@ -1,11 +1,23 @@
 #![cfg(windows)]
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+#[test]
+fn conpty_launches_the_terminal_program_directly_after_guard_activation() {
+    let executable = env!("CARGO_BIN_EXE_zuno-process-fixture");
+    zuno_process::activate_guard_executable(executable).expect("activate fixture guard");
+
+    let (program, arguments) = zuno_process::guarded_terminal_argv("cmd.exe", ["/Q", "/D"]);
+
+    assert_eq!(program, "cmd.exe");
+    assert_eq!(arguments, vec![OsString::from("/Q"), OsString::from("/D")]);
+}
 
 #[test]
 fn top_level_exit_terminates_a_live_job_descendant() {
@@ -33,13 +45,21 @@ fn top_level_exit_terminates_a_live_job_descendant() {
 
 fn wait_for_descendant_pid(ready: &Path) -> u32 {
     let started = Instant::now();
+    let mut last_contents = None;
     loop {
         if let Ok(contents) = fs::read_to_string(ready) {
-            return contents.trim().parse().expect("descendant PID");
+            let mut ids = contents.split_whitespace();
+            if let (Some(parent), Some(descendant), None) = (ids.next(), ids.next(), ids.next())
+                && parent.parse::<u32>().is_ok()
+                && let Ok(descendant) = descendant.parse::<u32>()
+            {
+                return descendant;
+            }
+            last_contents = Some(contents);
         }
         assert!(
             started.elapsed() < TIMEOUT,
-            "payload did not publish its descendant PID"
+            "payload did not publish a complete descendant PID; last contents: {last_contents:?}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }

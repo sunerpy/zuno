@@ -15,6 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
+
 /// Crates that link OpenSSL, or select something that does.
 ///
 /// `openssl-probe` is deliberately ABSENT. It only *locates* the host certificate
@@ -49,12 +52,10 @@ const REQUIRED_TLS_CRATES: &[&str] = &["reqwest", "rustls", "rustls-webpki"];
 
 /// The targets the release pipeline builds, smoke-tests, and publishes.
 ///
-/// `aarch64-pc-windows-msvc` is deliberately absent. CodeBuild has no ARM Windows
-/// compute in any region and an x86_64 Windows host cannot execute an ARM64
-/// binary, so that target could only ever have been built and never run — the one
-/// thing this pipeline exists to refuse. Its only other home was a GitHub-hosted
-/// `windows-11-arm` runner, and the exhausted Actions minutes there are why the
-/// release pipeline had never completed a single run. See release.yml's header.
+/// `aarch64-pc-windows-msvc` remains absent because the public installers and
+/// release contract have never advertised it. Adding a target is an explicit
+/// product decision and requires a native execute-and-smoke leg in the candidate
+/// matrix, not merely a compiler that can emit its bytes.
 const RELEASE_TARGETS: [&str; 5] = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
@@ -62,16 +63,6 @@ const RELEASE_TARGETS: [&str; 5] = [
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc",
 ];
-
-/// The CodeBuild runner projects the workflows may route jobs to.
-///
-/// Three rather than one because CodeBuild takes the machine from the project and
-/// a project has exactly one environment type: Linux, Windows, and macOS need one
-/// each. Held as a list so [`codebuild_label_sets`] sees every routed job — a
-/// helper that recognised only the Linux project would silently stop counting the
-/// macOS and Windows legs, and the uniqueness invariant below would then be
-/// asserted over a subset while reading as though it covered everything.
-const RUNNER_PROJECTS: [&str; 3] = ["zuno-runner", "zuno-runner-macos", "zuno-runner-windows"];
 
 /// The one cassette the artifact smoke test replays.
 const SMOKE_CASSETTE: &str = "openai-chat/drives-a-tool-loop-end-to-end";
@@ -778,39 +769,6 @@ fn matrix_targets(text: &str, job: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// The label a job uses to route itself to `project`'s CodeBuild runner.
-fn project_label(project: &str) -> String {
-    format!("codebuild-{project}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}")
-}
-
-fn codebuild_label_sets(text: &str) -> Vec<Vec<String>> {
-    let project_labels: Vec<String> = RUNNER_PROJECTS.iter().map(|p| project_label(p)).collect();
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut sets = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        let Some(label) = trimmed.strip_prefix("- ") else {
-            continue;
-        };
-        if !project_labels.iter().any(|known| known == label) {
-            continue;
-        }
-
-        let indentation = line.len() - trimmed.len();
-        let labels = lines[index..]
-            .iter()
-            .take_while(|candidate| {
-                candidate.len() - candidate.trim_start().len() == indentation
-                    && candidate.trim_start().starts_with("- ")
-            })
-            .map(|candidate| candidate.trim_start()[2..].to_owned())
-            .collect();
-        sets.push(labels);
-    }
-    sets
-}
-
 fn matrix_entry<'a>(text: &'a str, job: &str, target: &str) -> Vec<&'a str> {
     let body = job_body(text, job);
     let target_header = format!("- target: {target}");
@@ -830,188 +788,162 @@ fn matrix_entry<'a>(text: &'a str, job: &str, target: &str) -> Vec<&'a str> {
 
 #[test]
 fn the_release_matrix_builds_every_target_the_project_ships() {
-    let text = workflow("release.yml");
-    let built = matrix_targets(&text, "build");
+    let text = workflow("release-candidate.yml");
+    let built = matrix_targets(&text, "artifact");
     let expected: BTreeSet<String> = RELEASE_TARGETS.iter().map(|t| (*t).to_owned()).collect();
     assert_eq!(
         built, expected,
-        "release.yml's `build` matrix does not name exactly the five shipped targets"
-    );
-}
-
-/// The assertion behind "must not ship an artifact that was never executed".
-///
-/// The two matrices are separate because the `aarch64-unknown-linux-musl` archive
-/// is cross-linked on x86_64 and can only be *run* on an arm64 runner, so the
-/// smoke leg has to be a different job on a different machine. That separation is
-/// also the failure mode this test exists for: a target added to `build` and
-/// forgotten in `smoke` would ship unexecuted with CI still green.
-#[test]
-fn every_built_target_is_also_smoke_tested() {
-    let text = workflow("release.yml");
-    let built = matrix_targets(&text, "build");
-    let smoked = matrix_targets(&text, "smoke");
-    assert_eq!(
-        built.len(),
-        RELEASE_TARGETS.len(),
-        "expected {} build targets, parsed {built:?}",
-        RELEASE_TARGETS.len()
-    );
-    let unexecuted: Vec<&String> = built.difference(&smoked).collect();
-    assert!(
-        unexecuted.is_empty(),
-        "release.yml builds {unexecuted:?} but never runs the resulting binary. \
-         An artifact that was never executed must not ship: add it to the `smoke` \
-         matrix with a runner of its own architecture."
-    );
-    let unbuilt: Vec<&String> = smoked.difference(&built).collect();
-    assert!(
-        unbuilt.is_empty(),
-        "release.yml smoke-tests {unbuilt:?}, which nothing builds; that job would \
-         fail on a missing artifact"
+        "release-candidate.yml's artifact matrix does not name exactly the five shipped targets"
     );
 }
 
 #[test]
-fn release_toolchains_are_installed_once_and_reused_by_smoke_drivers() {
-    let text = workflow("release.yml");
-    let version = job_body(&text, "version").join("\n");
+fn each_candidate_target_smokes_before_upload() {
+    let text = workflow("release-candidate.yml");
+    let jobs = job_names(&text);
     assert!(
-        !version.contains("dtolnay/rust-toolchain") && !version.contains("cargo metadata"),
-        "the version resolver must read Cargo.toml without installing Rust:\n{version}"
+        !jobs.contains("smoke"),
+        "release candidate still has a global smoke job, recreating the matrix barrier"
     );
-    for required in ["awk '", "workspace\\.package", "Cargo.toml"] {
-        assert!(
-            version.contains(required),
-            "the toolchain-free version resolver is missing {required:?}:\n{version}"
-        );
-    }
 
-    let build = job_body(&text, "build").join("\n");
-    assert_eq!(
-        build.matches("dtolnay/rust-toolchain@").count(),
-        1,
-        "each build matrix leg must install Rust exactly once"
-    );
-    assert_eq!(
-        build
-            .matches("name: Install MSVC build tools (Windows container)")
-            .count(),
-        1,
-        "the Windows build leg must install MSVC exactly once"
+    let artifact = job_body(&text, "artifact").join("\n");
+    let smoke = artifact
+        .find("Smoke packaged artifact")
+        .expect("artifact job contains its smoke steps");
+    let attest = artifact
+        .find("Attest packaged artifact")
+        .expect("artifact job attests the smoked archive");
+    let upload = artifact
+        .find("Upload smoked target")
+        .expect("artifact job uploads the certified bytes");
+    assert!(
+        smoke < attest && attest < upload,
+        "the artifact job must smoke, then attest, then upload; positions were \
+         smoke={smoke}, attest={attest}, upload={upload}"
     );
     for required in [
-        "Build the smoke driver (zigbuild)",
-        "Build the smoke driver (native)",
-        "name: smoke-${{ matrix.target }}",
-        "path: smoke/*",
+        "--binary unpacked/zuno",
+        "--binary \"unpacked/zuno.exe\"",
+        "name: candidate-${{ matrix.target }}",
+        "retention-days: 7",
     ] {
         assert!(
-            build.contains(required),
-            "the build job does not prepare the reusable smoke driver field {required:?}"
-        );
-    }
-
-    let smoke = job_body(&text, "smoke").join("\n");
-    for forbidden in [
-        "dtolnay/rust-toolchain@",
-        "Install MSVC build tools",
-        "Swatinem/rust-cache@",
-        "cargo build --locked",
-        "cargo zigbuild --locked",
-    ] {
-        assert!(
-            !smoke.contains(forbidden),
-            "the smoke job repeats build toolchain work {forbidden:?}:\n{smoke}"
-        );
-    }
-    for required in [
-        "name: smoke-${{ matrix.target }}",
-        "path: smoke",
-        "./smoke/zuno-smoke",
-        ".\\smoke\\zuno-smoke.exe",
-        "--cassette-root \"$GITHUB_WORKSPACE/packaging/smoke/cassettes\"",
-        "--models \"$GITHUB_WORKSPACE/crates/zuno-llm/tests/fixtures/models-dev-pinned.json\"",
-        "--cassette-root \"$env:GITHUB_WORKSPACE\\packaging\\smoke\\cassettes\"",
-        "--models \"$env:GITHUB_WORKSPACE\\crates\\zuno-llm\\tests\\fixtures\\models-dev-pinned.json\"",
-    ] {
-        assert!(
-            smoke.contains(required),
-            "the smoke job does not consume the reusable driver correctly; missing \
-             {required:?}"
+            artifact.contains(required),
+            "the per-target build/smoke/upload contract is missing {required:?}"
         );
     }
 }
 
 #[test]
-fn every_codebuild_job_has_a_unique_label_set() {
-    // Was 11 when only Linux jobs ran on CodeBuild. The four non-Linux release
-    // legs that used to sit on GitHub-hosted runners are now two macOS build legs,
-    // two macOS smoke legs, one Windows build leg and one Windows smoke leg — six
-    // more routed jobs, less the two `aarch64-pc-windows-msvc` legs that were
-    // dropped because no CodeBuild machine can execute that artifact.
-    //
-    // 17 after the seven-second supply-chain check moved into the existing `test`
-    // job. Release still has separate build and execution legs because the
-    // aarch64 Linux artifact crosses from the x86_64 build machine to a native ARM
-    // runner, but the smoke legs consume precompiled drivers and install no Rust
-    // or MSVC toolchain.
-    const EXPECTED_MIGRATED_JOBS: usize = 17;
+fn release_binary_and_smoke_driver_share_one_cargo_invocation() {
+    let text = workflow("release-candidate.yml");
+    let artifact = job_body(&text, "artifact").join("\n");
+    assert_eq!(
+        artifact.matches("dtolnay/rust-toolchain@").count(),
+        1,
+        "each matrix leg must install its target with one Rust action"
+    );
+    for command in ["cargo zigbuild --locked", "cargo build --locked"] {
+        let start = artifact
+            .find(command)
+            .unwrap_or_else(|| panic!("artifact job has no {command} invocation"));
+        let tail = &artifact[start..];
+        let end = tail.find("\n\n").unwrap_or(tail.len());
+        let invocation = &tail[..end];
+        for required in ["-p zuno-cli --bin zuno", "-p zuno-testkit --bin zuno-smoke"] {
+            assert!(
+                invocation.contains(required),
+                "{command} does not build both release binaries together:\n{invocation}"
+            );
+        }
+    }
+    for forbidden in ["Install MSVC build tools", "choco install visualstudio"] {
+        assert!(
+            !artifact.contains(forbidden),
+            "GitHub's Windows image already carries MSVC; found {forbidden:?}"
+        );
+    }
+}
 
+#[test]
+fn public_workflows_use_only_standard_github_hosted_runners() {
     let workflows = [
         ("ci.yml", workflow("ci.yml")),
         ("release.yml", workflow("release.yml")),
+        ("release-candidate.yml", workflow("release-candidate.yml")),
+        ("publish-docs.yml", workflow("publish-docs.yml")),
     ];
-    let mut named_sets = Vec::new();
     for (name, text) in &workflows {
-        for labels in codebuild_label_sets(text) {
-            println!("{name}: {}", labels.join(" + "));
-            named_sets.push((name, labels));
+        let code = text
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_ascii_lowercase();
+        for forbidden in ["codebuild-", "runs-on: self-hosted", "zuno-runner-"] {
+            assert!(
+                !code.contains(forbidden),
+                "{name} still depends on {forbidden:?}"
+            );
         }
     }
 
-    assert_eq!(
-        named_sets.len(),
-        EXPECTED_MIGRATED_JOBS,
-        "expected one CodeBuild label set for each job or matrix leg"
-    );
+    let candidate = &workflows[2].1;
+    for (target, runner) in [
+        ("x86_64-unknown-linux-musl", "runner: ubuntu-24.04"),
+        ("aarch64-unknown-linux-musl", "runner: ubuntu-24.04-arm"),
+        ("x86_64-apple-darwin", "runner: macos-15-intel"),
+        ("aarch64-apple-darwin", "runner: macos-15"),
+        ("x86_64-pc-windows-msvc", "runner: windows-2022"),
+    ] {
+        let entry = matrix_entry(candidate, "artifact", target).join("\n");
+        assert!(
+            entry.contains(runner),
+            "{target} is not routed to its native standard runner; missing {runner:?}"
+        );
+    }
+}
 
-    let known_project_labels: Vec<String> =
-        RUNNER_PROJECTS.iter().map(|p| project_label(p)).collect();
-    let mut routing_labels = BTreeSet::new();
-    let mut complete_sets = BTreeSet::new();
-    for (workflow_name, labels) in &named_sets {
-        let first = labels.first().map(String::as_str).unwrap_or_default();
+#[test]
+fn linux_ci_loads_the_reviewed_bubblewrap_profile_without_weakening_user_namespaces() {
+    let setup =
+        std::fs::read_to_string(workspace_root().join(".github/scripts/setup-linux-sandbox.sh"))
+            .expect("sandbox setup script is readable");
+    for required in [
+        "apparmor-profiles",
+        "bwrap-userns-restrict",
+        "apparmor_parser -r",
+        "--unshare-pid --unshare-uts --unshare-ipc",
+        "--unshare-net",
+    ] {
         assert!(
-            known_project_labels.iter().any(|known| known == first),
-            "{workflow_name} routes a job to {first:?}, which is not one of the \
-             CodeBuild runner projects {RUNNER_PROJECTS:?}"
+            setup.contains(required),
+            "Linux CI sandbox setup is missing the reviewed deployment check {required:?}"
         );
-        let routing_label = labels
-            .get(1)
-            .unwrap_or_else(|| panic!("{workflow_name} has no unique second label in {labels:?}"));
+    }
+    for forbidden in [
+        "apparmor_restrict_unprivileged_userns=0",
+        "unprivileged_userns_clone=1",
+        "chmod u+s",
+        "setcap ",
+    ] {
         assert!(
-            routing_label.starts_with("zuno-ci-") || routing_label.starts_with("zuno-release-"),
-            "{workflow_name}'s second label is not a Zuno job identity: {labels:?}"
-        );
-        assert!(
-            routing_labels.insert(routing_label.clone()),
-            "duplicate CodeBuild routing label {routing_label:?}"
-        );
-        assert!(
-            complete_sets.insert(labels.clone()),
-            "duplicate CodeBuild label set {labels:?}"
+            !setup.contains(forbidden),
+            "Linux CI sandbox setup weakens host policy with {forbidden:?}"
         );
     }
 
-    assert_eq!(
-        workflows[1]
-            .1
-            .matches("runs-on: ${{ matrix.runs_on }}")
-            .count(),
-        2,
-        "both release matrices must select their per-entry label arrays"
-    );
+    for workflow_name in ["ci.yml", "release-candidate.yml"] {
+        let text = workflow(workflow_name);
+        assert!(
+            text.contains(".github/scripts/setup-linux-sandbox.sh"),
+            "{workflow_name} does not use the shared, probed Linux sandbox setup"
+        );
+        assert!(
+            !text.contains("apparmor_restrict_unprivileged_userns=0"),
+            "{workflow_name} disables Ubuntu's user-namespace restriction"
+        );
+    }
 }
 
 #[test]
@@ -1035,11 +967,6 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
         );
     }
 
-    let jobs = job_names(&text);
-    assert!(
-        !jobs.contains("supply-chain"),
-        "the seven-second supply-chain check still starts a separate Rust runner"
-    );
     let test = job_body(&text, "test").join("\n");
     for required in ["tool: cargo-deny", "cargo deny --all-features check"] {
         assert!(
@@ -1047,162 +974,160 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
             "the consolidated test job lost the supply-chain gate {required:?}"
         );
     }
-}
-
-/// The release path must not depend on a GitHub-hosted runner.
-///
-/// This is the assertion that would have caught the state this file was written
-/// out of: `release.yml` named `macos-15-intel`, `macos-latest`, `windows-latest`
-/// and `windows-11-arm`, this account has no Actions minutes, and `publish` needs
-/// every build and smoke leg — so the pipeline could never once reach publication,
-/// and nothing failed loudly enough to say so. A hosted label is easy to
-/// reintroduce while debugging a runner problem, which is exactly when it must be
-/// refused.
-///
-/// Scoped to `release.yml` on purpose. `ci.yml` keeps one hosted `windows` job
-/// behind `if: vars.HOSTED_RUNNERS == 'true'`, off by default, and that job
-/// gates nothing that ships.
-#[test]
-fn the_release_path_uses_no_github_hosted_runner() {
-    let text = workflow("release.yml");
-    const HOSTED_LABELS: &[&str] = &[
-        "macos-latest",
-        "macos-15",
-        "macos-14",
-        "macos-13",
-        "windows-latest",
-        "windows-2022",
-        "windows-2019",
-        "windows-11-arm",
-        "ubuntu-latest",
-        "ubuntu-24.04",
-        "ubuntu-22.04",
-    ];
-
-    let mut offenders = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let code = line.split('#').next().unwrap_or_default();
-        for hosted in HOSTED_LABELS {
-            if code
-                .split_whitespace()
-                .any(|word| word.trim_start_matches("- ").trim_matches(['"', '\'']) == *hosted)
-            {
-                offenders.push(format!("  release.yml:{}: {}", index + 1, line.trim()));
-            }
-        }
-    }
-    assert!(
-        offenders.is_empty(),
-        "release.yml routes a job to a GitHub-hosted runner:\n{}\n\
-         This repository's Actions minutes are exhausted, so such a job never \
-         starts, and `publish` needs every build and smoke leg — one hosted label \
-         means no release can ever be published. Route it to one of \
-         {RUNNER_PROJECTS:?} instead.",
-        offenders.join("\n")
-    );
-
-    // The positive half: no hosted label proves nothing if the file stopped
-    // selecting runners at all, or if a whole matrix leg vanished.
-    for project in RUNNER_PROJECTS {
-        let label = project_label(project);
-        assert!(
-            text.contains(&label),
-            "release.yml never routes to {project}; with the hosted runners gone \
-             there would be no machine for that platform's legs at all"
-        );
-    }
-}
-
-#[test]
-fn release_matrices_use_the_effective_runner_fields() {
-    let linux_project_label = project_label("zuno-runner");
-    let project_label = linux_project_label.as_str();
-
-    let text = workflow("release.yml");
-    for job in ["build", "smoke"] {
-        let legacy_fields: Vec<_> = job_body(&text, job)
-            .into_iter()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                trimmed.starts_with("os:") || trimmed.starts_with("runner:")
-            })
-            .collect();
-        assert!(
-            legacy_fields.is_empty(),
-            "release.yml's `{job}` matrix retains fields that do not select the runner: \
-             {legacy_fields:?}; `runs_on` is the effective field"
-        );
-    }
-
-    let x86_smoke = matrix_entry(&text, "smoke", "x86_64-unknown-linux-musl").join("\n");
-    for required in [project_label, "zuno-release-smoke-x86_64-linux"] {
-        assert!(
-            x86_smoke.contains(required),
-            "the x86_64 Linux smoke leg is missing CodeBuild label {required:?}"
-        );
-    }
-
-    let arm_smoke = matrix_entry(&text, "smoke", "aarch64-unknown-linux-musl").join("\n");
-    for required in [
-        project_label,
-        "zuno-release-smoke-aarch64-linux",
-        "image:arm-3.0",
-        "instance-size:large",
+    for forbidden in [
+        "HOSTED_RUNNERS",
+        "head.repo.full_name == github.repository",
+        "codebuild-",
     ] {
         assert!(
-            arm_smoke.contains(required),
-            "the aarch64 Linux smoke leg is missing CodeBuild label {required:?}"
+            !text.contains(forbidden),
+            "public-repository CI still carries the obsolete restriction {forbidden:?}"
+        );
+    }
+    for job in ["windows-clippy", "windows-test"] {
+        assert!(
+            job_body(&text, job)
+                .join("\n")
+                .contains("runs-on: windows-2022"),
+            "the public repository's {job} gate is not always enabled"
         );
     }
 }
 
-/// Also from "must not ship an artifact that was never executed": publication has
-/// to depend on the smoke job, not merely coexist with it.
 #[test]
-fn publication_depends_on_the_smoke_job() {
-    let text = workflow("release.yml");
-    let publish_needs = job_needs(&text, "publish");
-    assert!(
-        !publish_needs.is_empty(),
-        "release.yml's publish job declares no `needs:`, so nothing gates it"
-    );
-    for required in ["build", "smoke"] {
+fn release_controller_dispatches_exact_source_and_never_compiles() {
+    let release = workflow("release.yml");
+    let dispatch = job_body(&release, "dispatch_candidate").join("\n");
+    for required in [
+        "gh workflow run release-candidate.yml",
+        "--ref \"$HEAD_REF\"",
+        "-f expected_head_sha=\"$HEAD_SHA\"",
+        "-f mode=automatic",
+    ] {
         assert!(
-            publish_needs.contains(required),
-            "release.yml's publish job does not need `{required}` (needs: \
-             {publish_needs:?}); an unexecuted artifact could then be published"
+            dispatch.contains(required),
+            "release controller lost exact candidate dispatch field {required:?}"
+        );
+    }
+    for forbidden in [
+        "dtolnay/rust-toolchain@",
+        "cargo build",
+        "cargo zigbuild",
+        "setup-zig",
+        "Install MSVC",
+    ] {
+        assert!(
+            !release.contains(forbidden),
+            "release controller recompiles during promotion via {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn candidate_merge_explicitly_wakes_release_finalization() {
+    let text = workflow("release-candidate.yml");
+    let prepare = job_body(&text, "prepare").join("\n");
+    for required in [
+        "state=pending",
+        "context='zuno/release-candidate'",
+        "actions/runs/${GITHUB_RUN_ID}",
+    ] {
+        assert!(
+            prepare.contains(required),
+            "candidate does not publish durable pending identity; missing {required:?}"
+        );
+    }
+
+    let merge = job_body(&text, "merge").join("\n");
+    for required in [
+        "--match-head-commit \"$EXPECTED_HEAD_SHA\"",
+        "--auto",
+        "gh workflow run release.yml",
+        "--ref main",
+        "-f candidate_run_id=\"$GITHUB_RUN_ID\"",
+        "-f candidate_head_sha=\"$EXPECTED_HEAD_SHA\"",
+    ] {
+        assert!(
+            merge.contains(required),
+            "the GITHUB_TOKEN merge cannot wake finalization without {required:?}"
+        );
+    }
+    for required in [
+        "strict_required_status_checks_policy == true",
+        ".context == \"zuno/pr-gate\"",
+        "rules/branches/main",
+    ] {
+        assert!(
+            merge.contains(required),
+            "automatic merge does not fail closed on repository governance; missing {required:?}"
+        );
+    }
+}
+
+#[test]
+fn publication_uses_one_exact_candidate_run() {
+    let text = workflow("release.yml");
+    let promote = job_body(&text, "promote").join("\n");
+    for required in [
+        "name: release-candidate",
+        "run-id: ${{ needs.resolve_release.outputs.candidate_run_id }}",
+        ".github/scripts/verify-release-candidate.sh",
+        "gh attestation verify",
+        "--signer-digest \"$SOURCE_SHA\"",
+        "--source-digest \"$SOURCE_SHA\"",
+        "--deny-self-hosted-runners",
+        "gh release upload",
+        "gh release edit \"$TAG\"",
+    ] {
+        assert!(
+            promote.contains(required),
+            "promotion is missing strict candidate check {required:?}"
+        );
+    }
+    for forbidden in ["pattern:", "merge-multiple:", "latest artifact"] {
+        assert!(
+            !promote.contains(forbidden),
+            "promotion can select an ambiguous candidate via {forbidden:?}"
+        );
+    }
+
+    let resolve = job_body(&text, "resolve_release").join("\n");
+    for required in [
+        ".github/workflows/release-candidate.yml",
+        ".conclusion",
+        ".head_sha",
+        ".run_attempt",
+        "git rev-parse 'HEAD^{tree}'",
+    ] {
+        assert!(
+            resolve.contains(required),
+            "candidate run/source identity check is missing {required:?}"
         );
     }
 }
 
 #[test]
 fn publication_includes_the_checksum_manifest_required_by_self_update() {
-    let text = workflow("release.yml");
-    let checksum_needs = job_needs(&text, "checksums");
-    for required in ["build", "smoke"] {
+    let candidate = workflow("release-candidate.yml");
+    let aggregate = job_body(&candidate, "aggregate").join("\n");
+    for required in [
+        ".github/scripts/assemble-release-candidate.sh",
+        "name: release-candidate",
+        "retention-days: 7",
+    ] {
         assert!(
-            checksum_needs.contains(required),
-            "the checksums job must depend on `{required}`: {checksum_needs:?}"
+            aggregate.contains(required),
+            "sealed candidate does not retain checksum input {required:?}"
         );
     }
-
-    let publish_needs = job_needs(&text, "publish");
-    assert!(
-        publish_needs.contains("checksums"),
-        "publish can run without the checksum job: {publish_needs:?}"
-    );
-    let checksums = job_body(&text, "checksums").join("\n");
-    for required in ["sha256sum \"$archive\"", "SHA256SUMS"] {
+    let release = workflow("release.yml");
+    let promote = job_body(&release, "promote").join("\n");
+    for required in ["candidate/SHA256SUMS", "SHA256SUMS"] {
         assert!(
-            checksums.contains(required),
-            "the checksums job does not produce {required:?}"
+            promote.contains(required),
+            "published release omits checksum surface {required:?}"
         );
     }
-    let publish = job_body(&text, "publish").join("\n");
-    assert!(
-        publish.contains("dist/SHA256SUMS"),
-        "the GitHub Release does not attach SHA256SUMS"
-    );
 }
 
 /// The constraint the corrected plan wording actually states: no *per-target* C
@@ -1218,15 +1143,13 @@ fn publication_includes_the_checksum_manifest_required_by_self_update() {
 /// indistinguishable from the cross mechanism this rules out.
 #[test]
 fn the_musl_legs_use_zig_and_no_cross_toolchain() {
-    let text = workflow("release.yml");
-    let build = job_body(&text, "build").join("\n");
+    let text = workflow("release-candidate.yml");
+    let build = job_body(&text, "artifact").join("\n");
     let mut offenders = Vec::new();
     for (index, line) in build.lines().enumerate() {
         let code = line.split('#').next().unwrap_or_default();
         let lowered = code.to_ascii_lowercase();
         let banned = [
-            ("apt-get", "a per-target apt package"),
-            ("apt install", "a per-target apt package"),
             ("docker ", "a docker image"),
             ("cross build", "the `cross` docker wrapper"),
             ("gcc-aarch64", "a system cross-gcc"),
@@ -1237,7 +1160,7 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
         for (needle, what) in banned {
             if lowered.contains(needle) {
                 offenders.push(format!(
-                    "  release.yml build job, line {}: {what} (matched {needle:?})\n    {}",
+                    "  release-candidate.yml artifact job, line {}: {what} (matched {needle:?})\n    {}",
                     index + 1,
                     line.trim()
                 ));
@@ -1246,7 +1169,7 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
     }
     assert!(
         offenders.is_empty(),
-        "release.yml's build job reaches for a per-target C cross-toolchain. Zig plus \
+        "release candidate reaches for a per-target C cross-toolchain. Zig plus \
          cargo-zigbuild is a hermetic C cross-compiler in one download and is the \
          only cross mechanism this pipeline may use:\n{}",
         offenders.join("\n")
@@ -1257,76 +1180,211 @@ fn the_musl_legs_use_zig_and_no_cross_toolchain() {
     for required in ["mlugg/setup-zig", "cargo-zigbuild", "cargo zigbuild"] {
         assert!(
             text.contains(required),
-            "release.yml does not mention `{required}`; the two musl legs cannot \
+            "release-candidate.yml does not mention `{required}`; the two musl legs cannot \
              cross-compile this workspace's C dependencies without Zig"
         );
     }
-    for (musl, routing_label) in [
-        (
-            "x86_64-unknown-linux-musl",
-            "zuno-release-build-x86_64-linux",
-        ),
-        (
-            "aarch64-unknown-linux-musl",
-            "zuno-release-build-aarch64-linux",
-        ),
+    for (musl, runner) in [
+        ("x86_64-unknown-linux-musl", "runner: ubuntu-24.04"),
+        ("aarch64-unknown-linux-musl", "runner: ubuntu-24.04-arm"),
     ] {
-        let entry = matrix_entry(&text, "build", musl).join("\n");
-        for required in ["use_zigbuild: true", routing_label] {
+        let entry = matrix_entry(&text, "artifact", musl).join("\n");
+        for required in ["use_zigbuild: true", runner] {
             assert!(
                 entry.contains(required),
-                "release.yml's `{musl}` build entry is missing {required:?}; it \
-                 would not use Zig on its dedicated CodeBuild route"
+                "release-candidate.yml's `{musl}` entry is missing {required:?}"
             );
         }
     }
+}
 
-    // Narrowing the scan above to `build` is only safe while the one job still
-    // allowed to install packages uses that only for the artifact's own runtime
-    // dependency. A toolchain package appearing here would be the same mistake
-    // wearing a different job name.
-    //
-    // Every package manager the workflow can reach is checked, not just apt. The
-    // two Linux legs run different distributions — Ubuntu for x86_64, Amazon Linux
-    // for the `image:arm-3.0` aarch64 route — so the install step branches, and a
-    // guard that only understood apt would have silently stopped covering half the
-    // matrix the moment that branch was added.
-    const SANDBOX_PACKAGE: &str = "bubblewrap";
-    const INSTALL_VERBS: &[&str] = &[
-        "apt-get install",
-        "apt install",
-        "dnf install",
-        "yum install",
-    ];
-    for line in job_body(&text, "smoke") {
-        let code = line
-            .split('#')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        // Only the install verb matters. `apt-get update` names no package, and
-        // accepting its presence as justification is what made an earlier version of
-        // this assertion vacuous: the injected `apt-get update && apt-get install
-        // musl-tools` satisfied it on the update half alone.
-        let Some(installed) = INSTALL_VERBS
-            .iter()
-            .find_map(|verb| code.split_once(verb).map(|(_, rest)| rest))
-        else {
-            continue;
-        };
-        let packages: Vec<&str> = installed
-            .split_whitespace()
-            .filter(|word| !word.starts_with('-') && *word != "&&")
-            .collect();
+#[test]
+fn candidate_manifest_records_the_identity_required_for_promotion() {
+    let root = workspace_root();
+    let assemble =
+        std::fs::read_to_string(root.join(".github/scripts/assemble-release-candidate.sh"))
+            .expect("read candidate assembler");
+    let verify = std::fs::read_to_string(root.join(".github/scripts/verify-release-candidate.sh"))
+        .expect("read candidate verifier");
+    for required in [
+        "schema_version",
+        "repository",
+        "workflow_ref",
+        "workflow_sha",
+        "run_id",
+        "run_attempt",
+        "release_pr_number",
+        "head_sha",
+        "release_pr_head_sha",
+        "tree_sha",
+        "version",
+        "tag",
+        "test_conclusion",
+        "attestation_id",
+        "smoke_conclusion",
+    ] {
         assert!(
-            !packages.is_empty() && packages.iter().all(|pkg| *pkg == SANDBOX_PACKAGE),
-            "release.yml's smoke job installs package(s) {packages:?}; only \
-             {SANDBOX_PACKAGE:?} is justified here (the OS sandbox backend the smoked \
-             binary requires). A toolchain package in this job is the same per-target \
-             cross mechanism the build job forbids, wearing a different job name:\n    {}",
-            line.trim()
+            assemble.contains(required),
+            "candidate manifest does not record {required:?}"
         );
     }
+    for required in [
+        "EXPECTED_RUN_ID",
+        "EXPECTED_RUN_ATTEMPT",
+        "EXPECTED_PR_NUMBER",
+        "EXPECTED_HEAD_SHA",
+        "EXPECTED_PR_HEAD_SHA",
+        "EXPECTED_TREE_SHA",
+        ".workflow_sha == $head_sha",
+        ".mode == \"automatic\" or .mode == \"backfill\"",
+        "sha256sum --check --strict SHA256SUMS",
+        "manifest target set is incomplete or duplicated",
+    ] {
+        assert!(
+            verify.contains(required),
+            "candidate verifier does not enforce {required:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn candidate_verifier_accepts_exact_bytes_and_rejects_tampering() {
+    let workspace = workspace_root();
+    let candidate = tempfile::tempdir().expect("temporary candidate");
+    let evidence_dir = candidate.path().join("evidence");
+    std::fs::create_dir(&evidence_dir).expect("create evidence directory");
+
+    for target in RELEASE_TARGETS {
+        let suffix = if target.contains("windows") {
+            "zip"
+        } else {
+            "tar.gz"
+        };
+        let archive = format!("zuno-0.0.4-{target}.{suffix}");
+        let bytes = format!("candidate bytes for {target}\n");
+        std::fs::write(candidate.path().join(&archive), bytes.as_bytes())
+            .expect("write candidate archive");
+        let digest = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let evidence = serde_json::json!({
+            "target": target,
+            "archive": archive,
+            "size": bytes.len(),
+            "sha256": digest,
+            "build_conclusion": "success",
+            "smoke_conclusion": "success",
+            "runner": "github-hosted",
+            "attestation_id": format!("attestation-{target}"),
+            "attestation_url": format!("https://example.invalid/{target}")
+        });
+        std::fs::write(
+            evidence_dir.join(format!("{target}.json")),
+            serde_json::to_vec_pretty(&evidence).expect("encode evidence"),
+        )
+        .expect("write target evidence");
+    }
+
+    let assemble = Command::new("bash")
+        .arg(workspace.join(".github/scripts/assemble-release-candidate.sh"))
+        .env("CANDIDATE_ROOT", candidate.path())
+        .env("CANDIDATE_REPOSITORY", "sunerpy/zuno")
+        .env(
+            "CANDIDATE_WORKFLOW_REF",
+            "sunerpy/zuno/.github/workflows/release-candidate.yml@refs/heads/release",
+        )
+        .env(
+            "CANDIDATE_WORKFLOW_SHA",
+            "2222222222222222222222222222222222222222",
+        )
+        .env("CANDIDATE_RUN_ID", "42")
+        .env("CANDIDATE_RUN_ATTEMPT", "1")
+        .env("CANDIDATE_PR_NUMBER", "7")
+        .env("CANDIDATE_MODE", "automatic")
+        .env(
+            "CANDIDATE_HEAD_SHA",
+            "2222222222222222222222222222222222222222",
+        )
+        .env(
+            "CANDIDATE_PR_HEAD_SHA",
+            "2222222222222222222222222222222222222222",
+        )
+        .env(
+            "CANDIDATE_TREE_SHA",
+            "3333333333333333333333333333333333333333",
+        )
+        .env("CANDIDATE_VERSION", "0.0.4")
+        .status()
+        .expect("run candidate assembler");
+    assert!(
+        assemble.success(),
+        "candidate assembler rejected valid evidence"
+    );
+
+    let verify = || {
+        Command::new("bash")
+            .arg(workspace.join(".github/scripts/verify-release-candidate.sh"))
+            .env("CANDIDATE_ROOT", candidate.path())
+            .env("EXPECTED_REPOSITORY", "sunerpy/zuno")
+            .env("EXPECTED_RUN_ID", "42")
+            .env("EXPECTED_RUN_ATTEMPT", "1")
+            .env("EXPECTED_PR_NUMBER", "7")
+            .env(
+                "EXPECTED_HEAD_SHA",
+                "2222222222222222222222222222222222222222",
+            )
+            .env(
+                "EXPECTED_PR_HEAD_SHA",
+                "2222222222222222222222222222222222222222",
+            )
+            .env(
+                "EXPECTED_TREE_SHA",
+                "3333333333333333333333333333333333333333",
+            )
+            .env("EXPECTED_VERSION", "0.0.4")
+            .env("EXPECTED_TAG", "v0.0.4")
+            .status()
+            .expect("run candidate verifier")
+    };
+    assert!(
+        verify().success(),
+        "candidate verifier rejected exact bytes"
+    );
+
+    let manifest_path = candidate.path().join("candidate-manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("read candidate manifest"))
+            .expect("decode candidate manifest");
+    manifest["mode"] = serde_json::Value::String("dry-run".to_owned());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode dry-run manifest"),
+    )
+    .expect("write dry-run manifest");
+    assert!(
+        !verify().success(),
+        "candidate verifier accepted a dry-run candidate for publication"
+    );
+    manifest["mode"] = serde_json::Value::String("automatic".to_owned());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("restore automatic manifest"),
+    )
+    .expect("restore automatic manifest");
+
+    std::fs::write(
+        candidate
+            .path()
+            .join("zuno-0.0.4-x86_64-unknown-linux-musl.tar.gz"),
+        b"tampered",
+    )
+    .expect("tamper with candidate");
+    assert!(
+        !verify().success(),
+        "candidate verifier accepted bytes changed after sealing"
+    );
 }
 
 /// The gap GitHub Actions cannot close from inside a workflow: the `needs:` list
@@ -1383,8 +1441,12 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         // The plan's five.
         "fmt",
         "lint",
+        "lint-windows-cross",
         "test",
+        "test-nextest",
+        "test-par",
         "ci",
+        "pre-ci",
         "release",
         // Invoked by name from .github/workflows/ci.yml.
         "fmt-check",
@@ -1402,11 +1464,258 @@ fn the_makefile_exposes_every_target_the_plan_and_ci_require() {
         .lines()
         .find(|line| line.starts_with("ci:"))
         .expect("the Makefile declares a `ci` target");
-    for prerequisite in ["fmt-check", "lint", "test", "deny"] {
+    for prerequisite in ["fmt-check", "lint", "test-par", "deny"] {
         assert!(
             ci_line.contains(prerequisite),
             "`make ci` does not run `{prerequisite}` ({ci_line}); the local gate \
-             and the CI gate would then check different things"
+            and the CI gate would then check different things"
+        );
+    }
+
+    let pre_ci_line = text
+        .lines()
+        .find(|line| line.starts_with("pre-ci:"))
+        .expect("the Makefile declares a `pre-ci` target");
+    for prerequisite in ["ci", "check", "smoke-artifact", "lint-windows-cross"] {
+        assert!(
+            pre_ci_line.contains(prerequisite),
+            "`make pre-ci` does not run `{prerequisite}` ({pre_ci_line}); avoidable \
+             artifact or Windows failures would still be discovered only by hosted CI"
+        );
+    }
+
+    let test_recipe = text
+        .lines()
+        .skip_while(|line| *line != "test:")
+        .nth(1)
+        .expect("the `test` target has a recipe");
+    assert!(
+        test_recipe.contains("cargo test --workspace --no-fail-fast")
+            || test_recipe.contains("$(CARGO) test --workspace --no-fail-fast"),
+        "`make test` must report failures from every test binary in one run ({test_recipe})"
+    );
+
+    for required in [
+        "test-nextest:",
+        "$(CARGO) nextest run --workspace --no-fail-fast --no-tests=warn",
+        "$(CARGO) test --workspace --doc --no-fail-fast",
+        "cargo-nextest unavailable; using scripts/test-parallel.sh",
+    ] {
+        assert!(
+            text.contains(required),
+            "the concurrent workspace gate lost {required:?}"
+        );
+    }
+
+    let ci = workflow("ci.yml");
+    let windows = job_body(&ci, "windows-test").join("\n");
+    for required in [
+        "run: ./scripts/test-parallel.sh",
+        "timeout-minutes: 20",
+        "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+        "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: \"off\"",
+        "JOBS: \"4\"",
+        "RUN_DOCTESTS: \"0\"",
+        "THREADS: \"1\"",
+        "SUITE_TIMEOUT: \"300\"",
+        "name: Upload Windows test diagnostics",
+        "if: failure()",
+        "target/test-parallel/cargo-env.json",
+        "target/test-parallel/artifacts.json",
+        "target/test-parallel/suites.tsv",
+        "target/test-parallel/codes.tsv",
+        "target/test-parallel/logs/",
+    ] {
+        assert!(
+            windows.contains(required),
+            "native Windows CI lost the bounded binary-parallel full-suite contract \
+             {required:?}"
+        );
+    }
+    assert!(
+        !windows.contains("cargo nextest"),
+        "native Windows CI must not spawn one process per test case; use the binary-level \
+         scheduler instead"
+    );
+    assert!(
+        !ci.contains("cargo test --workspace --no-fail-fast"),
+        "hosted CI regressed to Cargo's serial test-binary execution"
+    );
+
+    let scheduler = std::fs::read_to_string(workspace_root().join("scripts/test-parallel.sh"))
+        .expect("the binary-parallel test scheduler is readable");
+    for required in [
+        "RUN_DOCTESTS=${RUN_DOCTESTS:-1}",
+        "--no-run",
+        "--timings",
+        "--message-format=json",
+        r#"2> >(tee "$WORK/build.log" >&2)"#,
+        "ThreadPoolExecutor",
+        "as_completed",
+        "SUITE_TIMEOUT=${SUITE_TIMEOUT:-300}",
+        r#""$candidate" -c 'import json, os, sys'"#,
+        r#"PYTHON=$(command -v "$candidate")"#,
+        "runner_python_for_cargo",
+        "Cargo runner path must not contain whitespace",
+        "cargo-env.json",
+        "json.dump(dict(os.environ)",
+        "shutil.which(\"rg\"",
+        "[rg, \"--version\"]",
+        "cygpath -m",
+        "taskkill",
+        "os.killpg",
+        "isolated_suites = {'startup'}",
+        "running isolated timing suite",
+        "parallel_rows = [",
+        "ThreadPoolExecutor(max_workers=jobs)",
+        "futures = [pool.submit(run, indexed) for indexed in parallel_rows]",
+        "f'--test-threads={threads}'",
+        r#"if [[ "$RUN_DOCTESTS" == "1" ]]"#,
+        "--doc",
+        "skipping doctests explicitly",
+    ] {
+        assert!(
+            scheduler.contains(required),
+            "the binary-parallel scheduler lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "exclusive_suites",
+        "running exclusive suite",
+        "suite_threads",
+    ] {
+        assert!(
+            !scheduler.contains(forbidden),
+            "the Windows scheduler regressed to the old serial-tail implementation: \
+             {forbidden:?}"
+        );
+    }
+    for forbidden in ["'acp_stdio'", "'windows_lifecycle'"] {
+        assert!(
+            !scheduler.contains(forbidden),
+            "functional native-Windows suite {forbidden:?} must remain in the bounded \
+             worker pool; only the startup timing benchmark is isolated"
+        );
+    }
+    for forbidden in ["dumpenv.sh", "cargo-env.txt"] {
+        assert!(
+            !scheduler.contains(forbidden),
+            "the scheduler regressed to the Git Bash environment format that corrupts \
+             native Windows process environments: {forbidden:?}"
+        );
+    }
+}
+
+#[test]
+fn ci_reuses_compiler_and_registry_caches_without_persisting_target_directories() {
+    for name in ["ci.yml", "release-candidate.yml"] {
+        let workflow = workflow(name);
+        for required in [
+            "CARGO_INCREMENTAL: 0",
+            "SCCACHE_GHA_ENABLED: \"true\"",
+            "RUSTC_WRAPPER: sccache",
+            "shared-key: cargo-home-${{ runner.os }}-${{ runner.arch }}",
+            "cache-targets: false",
+            "mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba",
+            "version: \"v0.16.0\"",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "{name} lost the compiler-cache contract {required:?}"
+            );
+        }
+        assert!(
+            !workflow.contains("tool: sccache")
+                && !workflow.contains(".github/scripts/setup-sccache.sh")
+                && !workflow.contains("sccache --show-stats"),
+            "{name} must use the official cache action's setup and post-run statistics"
+        );
+    }
+
+    let ci = workflow("ci.yml");
+    let linux = job_body(&ci, "test").join("\n");
+    for required in ["make lint", "make test-nextest"] {
+        assert!(
+            linux.contains(required),
+            "Linux Clippy and tests must share one job-local target directory; missing \
+             {required:?}"
+        );
+    }
+
+    let windows_clippy = job_body(&ci, "windows-clippy").join("\n");
+    let windows_test = job_body(&ci, "windows-test").join("\n");
+    let clippy_fetch = windows_clippy.find("cargo fetch --locked");
+    let clippy_run =
+        windows_clippy.find("cargo clippy --locked --workspace --all-targets -- -D warnings");
+    assert!(
+        clippy_fetch
+            .zip(clippy_run)
+            .is_some_and(|(fetch, clippy)| fetch < clippy)
+            && !windows_clippy.contains("test-parallel.sh"),
+        "Windows Clippy must populate its cold Cargo cache and remain an independent \
+         parallel job"
+    );
+    let test_fetch = windows_test.find("cargo fetch --locked");
+    let test_run = windows_test.find("run: ./scripts/test-parallel.sh");
+    assert!(
+        test_fetch
+            .zip(test_run)
+            .is_some_and(|(fetch, test)| fetch < test)
+            && !windows_test.contains("cargo clippy")
+            && windows_test.contains("tool: ripgrep")
+            && windows_test.contains("run: rg --version"),
+        "Windows test execution must populate its cold Cargo cache, install its required \
+         runtime dependency, and remain an independent parallel job"
+    );
+    assert!(
+        windows_test.contains("RUN_DOCTESTS: \"0\"")
+            && windows_test.contains("CARGO_PROFILE_TEST_DEBUG: \"0\"")
+            && windows_test.contains("CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: \"off\"")
+            && !windows_test.contains("cargo test --workspace --doc"),
+        "Windows must retain Cargo's built-in test-directory contract while reducing debug \
+         link work, and the Linux source gate must own the doctest surface exactly once"
+    );
+
+    let candidate = workflow("release-candidate.yml");
+    let tests = job_body(&candidate, "test").join("\n");
+    for required in ["make lint", "make test-nextest"] {
+        assert!(
+            tests.contains(required),
+            "candidate Clippy and tests must share one job-local target directory; missing \
+             {required:?}"
+        );
+    }
+}
+
+#[test]
+fn local_pre_ci_catches_windows_cfg_failures_without_a_second_runner_service() {
+    let script =
+        std::fs::read_to_string(workspace_root().join(".github/scripts/lint-windows-cross.sh"))
+            .expect("the Windows cross-Clippy preflight is readable");
+
+    for required in [
+        "x86_64-pc-windows-gnu",
+        "zig cc -target x86_64-windows-gnu",
+        "zig dlltool",
+        "cargo-zigbuild",
+        "zigbuild",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--tests",
+        "-D warnings",
+        "AWS_LC_SYS_NO_JITTER_ENTROPY=1",
+    ] {
+        assert!(
+            script.contains(required),
+            "the local Windows preflight lost {required:?}"
+        );
+    }
+    for forbidden in ["docker ", "codebuild", "aws "] {
+        assert!(
+            !script.to_ascii_lowercase().contains(forbidden),
+            "the local Windows preflight reintroduced an external runner dependency via \
+             {forbidden:?}"
         );
     }
 }

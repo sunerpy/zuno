@@ -354,22 +354,50 @@ mod tests {
         Layout::resolve_with(&env, None)
     }
 
+    fn expected_debug_paths(entries: &[(&str, String)]) -> String {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{key:<width$} {}\n",
+                    PathBuf::from(value).display(),
+                    width = DEBUG_PATHS_KEY_WIDTH
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn resolves_the_default_zuno_layout() {
         let resolved = layout(&[(HOME, "/config")]);
         assert_eq!(
             resolved.debug_paths_dump(),
-            concat!(
-                "home       /config\n",
-                "data       /config/.local/share/zuno\n",
-                "bin        /config/.cache/zuno/bin\n",
-                "log        /config/.local/share/zuno/log\n",
-                "repos      /config/.local/share/zuno/repos\n",
-                "cache      /config/.cache/zuno\n",
-                "config     /config/.config/zuno\n",
-                "state      /config/.local/state/zuno\n",
-                "tmp        /tmp/zuno\n",
-            )
+            expected_debug_paths(&[
+                ("home", "/config".to_owned()),
+                (
+                    "data",
+                    node_path::join_all(["/config", ".local/share", APP])
+                ),
+                (
+                    "bin",
+                    node_path::join_all(["/config", ".cache", APP, "bin"]),
+                ),
+                (
+                    "log",
+                    node_path::join_all(["/config", ".local/share", APP, "log"]),
+                ),
+                (
+                    "repos",
+                    node_path::join_all(["/config", ".local/share", APP, "repos"]),
+                ),
+                ("cache", node_path::join_all(["/config", ".cache", APP])),
+                ("config", node_path::join_all(["/config", ".config", APP])),
+                (
+                    "state",
+                    node_path::join_all(["/config", ".local/state", APP]),
+                ),
+                ("tmp", node_path::join("/tmp", APP)),
+            ])
         );
     }
 
@@ -384,17 +412,17 @@ mod tests {
         ]);
         assert_eq!(
             resolved.debug_paths_dump(),
-            concat!(
-                "home       /config\n",
-                "data       /tmp/x/data/zuno\n",
-                "bin        /tmp/x/cache/zuno/bin\n",
-                "log        /tmp/x/data/zuno/log\n",
-                "repos      /tmp/x/data/zuno/repos\n",
-                "cache      /tmp/x/cache/zuno\n",
-                "config     /tmp/x/config/zuno\n",
-                "state      /tmp/x/state/zuno\n",
-                "tmp        /tmp/zuno\n",
-            )
+            expected_debug_paths(&[
+                ("home", "/config".to_owned()),
+                ("data", node_path::join("/tmp/x/data", APP)),
+                ("bin", node_path::join_all(["/tmp/x/cache", APP, "bin"]),),
+                ("log", node_path::join_all(["/tmp/x/data", APP, "log"]),),
+                ("repos", node_path::join_all(["/tmp/x/data", APP, "repos"]),),
+                ("cache", node_path::join("/tmp/x/cache", APP)),
+                ("config", node_path::join("/tmp/x/config", APP)),
+                ("state", node_path::join("/tmp/x/state", APP)),
+                ("tmp", node_path::join("/tmp", APP)),
+            ])
         );
     }
 

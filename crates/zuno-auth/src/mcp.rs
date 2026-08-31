@@ -765,7 +765,7 @@ mod tests {
             ("remove", |store| store.remove(SERVER).expect("remove")),
         ];
 
-        for (label, write) in writes {
+        for (_label, write) in writes {
             #[cfg(unix)]
             if store.path().exists() {
                 std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o666))
@@ -779,7 +779,7 @@ mod tests {
                     .permissions()
                     .mode()
                     & 0o777;
-                assert_eq!(mode, 0o600, "after {label}");
+                assert_eq!(mode, 0o600, "after {_label}");
             }
         }
     }

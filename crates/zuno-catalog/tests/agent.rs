@@ -247,6 +247,7 @@ fn discovery_order_is_sorted_so_a_directory_listing_cannot_decide_a_winner()
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_agent_directory_is_followed_without_looping() -> Result<(), Box<dyn Error>> {
     // The oracle scans with `symlink: true`. Following symlinks makes a cycle

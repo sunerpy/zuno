@@ -661,7 +661,7 @@ async fn council_seats_overlap_keep_stable_order_and_preserve_dissent() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn council_quorum_survives_a_timed_out_non_quorum_seat_and_synthesizes() {
     let fixture = Fixture::new();
     let request = council_request(
@@ -759,7 +759,7 @@ async fn council_below_quorum_keeps_typed_partial_results_on_failed_job() {
     assert_eq!(result["seats"][2]["status"], json!("completed"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn council_deadline_marks_the_seat_timed_out_without_synthesis() {
     let fixture = Fixture::new();
     let request = council_request(

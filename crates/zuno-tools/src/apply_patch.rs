@@ -332,7 +332,7 @@ impl ApplyPatchTool {
                     "apply_patch",
                     format!(
                         "apply_patch verification failed: file appears in more than one operation: {}",
-                        source.canonical.display()
+                        zuno_paths::wire_path(&source.canonical)
                     ),
                 ));
             }
@@ -343,7 +343,7 @@ impl ApplyPatchTool {
                             "apply_patch",
                             format!(
                                 "apply_patch verification failed: file already exists: {}",
-                                source.canonical.display()
+                                zuno_paths::wire_path(&source.canonical)
                             ),
                         ));
                     }
@@ -393,7 +393,7 @@ impl ApplyPatchTool {
                             "apply_patch",
                             format!(
                                 "apply_patch verification failed: destination appears in more than one operation: {}",
-                                target.canonical.display()
+                                zuno_paths::wire_path(&target.canonical)
                             ),
                         ));
                     }

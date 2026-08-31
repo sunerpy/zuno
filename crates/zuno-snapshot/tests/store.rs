@@ -592,7 +592,13 @@ fn gc_reclaims_a_snapshot_superseded_more_than_the_prune_window_ago() {
 
 #[test]
 fn a_hostile_worktree_path_is_not_interpreted_by_a_shell() {
+    #[cfg(unix)]
     let hostile = "it's a $(touch pwned) \"work\" tree";
+    // Quotes are not legal Windows filename characters. Command substitution,
+    // spaces, apostrophes and parentheses remain hostile shell input while also
+    // naming a real NTFS directory.
+    #[cfg(windows)]
+    let hostile = "it's a $(touch pwned) work tree";
     let fixture = Fixture::new(hostile);
     let canary = fixture.worktree.parent().expect("parent").join("pwned");
     let store = fixture.store();
@@ -684,16 +690,23 @@ fn discovery_keys_the_store_on_the_projects_root_commit() {
         location.project_id, root_commit,
         "a remote-less repository is keyed on its root commit"
     );
-    assert_eq!(location.worktree, fixture.worktree);
+    assert_eq!(
+        location
+            .worktree
+            .canonicalize()
+            .expect("canonical discovered worktree"),
+        fixture
+            .worktree
+            .canonicalize()
+            .expect("canonical fixture worktree")
+    );
     assert!(location.git);
 
+    let worktree_hash = zuno_paths::Layout::worktree_hash(&location.worktree);
     let store = Store::open(location);
     assert_eq!(
         store.git_dir(),
-        fixture
-            .root
-            .join(&root_commit)
-            .join(zuno_paths::Layout::worktree_hash(&fixture.worktree))
+        fixture.root.join(&root_commit).join(worktree_hash)
     );
 
     let hash = store.track().expect("track").expect("enabled");
@@ -756,6 +769,10 @@ fn writable(original: &fs::Permissions) -> fs::Permissions {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::permissions_set_readonly_false,
+    reason = "this branch has no Unix mode bits; clearing the platform read-only attribute is the portable inverse"
+)]
 fn writable(original: &fs::Permissions) -> fs::Permissions {
     let mut relaxed = original.clone();
     relaxed.set_readonly(false);

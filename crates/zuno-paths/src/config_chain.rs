@@ -173,16 +173,16 @@ mod tests {
                 "home/.zuno",
                 "xdgconfig/zuno",
             ] {
-                fs::create_dir_all(path.join(directory)).expect("create directory");
+                fs::create_dir_all(fixture_path(path, directory)).expect("create directory");
             }
-            fs::write(path.join("repo/zuno.json"), "{}").expect("write root json");
-            fs::write(path.join("repo/a/b/zuno.json"), "{}").expect("write mid json");
-            fs::write(path.join("repo/a/b/zuno.jsonc"), "{}").expect("write mid jsonc");
+            fs::write(fixture_path(path, "repo/zuno.json"), "{}").expect("write root json");
+            fs::write(fixture_path(path, "repo/a/b/zuno.json"), "{}").expect("write mid json");
+            fs::write(fixture_path(path, "repo/a/b/zuno.jsonc"), "{}").expect("write mid jsonc");
             Self { root }
         }
 
         fn path(&self, relative: &str) -> PathBuf {
-            self.root.path().join(relative)
+            fixture_path(self.root.path(), relative)
         }
 
         fn layout(&self, extra: &[(&str, &str)]) -> Layout {
@@ -197,6 +197,13 @@ mod tests {
             }
             Layout::resolve_with(&env, None)
         }
+    }
+
+    fn fixture_path(base: &Path, relative: &str) -> PathBuf {
+        relative
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .fold(base.to_path_buf(), |path, component| path.join(component))
     }
 
     fn project_marker_membership(old_present: bool, new_present: bool) -> (bool, bool) {

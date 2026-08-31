@@ -44,16 +44,33 @@ itself killed with an uncatchable signal, no destructor can run and direct MCP
 descendants may survive. Zuno does not hide that operating-system limit behind an
 always-resident helper solely for MCP.
 
-LSP, PTY, foreground editor, process extension, product-agent, and shell paths
-retain their dedicated guards where terminal ownership or a surviving per-tree
-owner is part of the contract. On Linux those guards use `PR_SET_PDEATHSIG` and
-wait on the payload's `pidfd`, so natural exit is a kernel-reported readiness
-event rather than a lossy userspace `SIGCHLD` wake. Termination signals set an
-atomic shutdown flag; the pidfd wait has a bounded interval so a signal arriving
-between the flag check and the blocking syscall cannot strand the guard. If the
-kernel or container policy does not permit `pidfd_open`, the same loop falls back
-to bounded child and parent checks. Other Unix platforms use the bounded
-parent-liveness path, and Windows retains Job Object containment.
+LSP, foreground editor, process extension, product-agent, and shell paths retain
+their dedicated guards where terminal ownership or a surviving per-tree owner is
+part of the contract. Unix PTYs use the foreground guard too. On Linux those
+guards use `PR_SET_PDEATHSIG` and wait on the payload's `pidfd`, so natural exit
+is a kernel-reported readiness event rather than a lossy userspace `SIGCHLD`
+wake. Termination signals set an atomic shutdown flag; the pidfd wait has a
+bounded interval so a signal arriving between the flag check and the blocking
+syscall cannot strand the guard. If the kernel or container policy does not
+permit `pidfd_open`, the same loop falls back to bounded child and parent checks.
+Other Unix platforms use the bounded parent-liveness path.
+
+Windows ConPTY is a separate ownership topology:
+
+```text
+zuno PTY owner -> requested ConPTY child -> descendants
+```
+
+The requested terminal program is the direct ConPTY child even when the Zuno
+guard executable is active. Nesting the resident Windows Job Object guard inside
+ConPTY prevented input delivery and kept an already-exited command observable as
+running. The PTY owner already has the direct PID, closes the ConPTY writer and
+master in exit order, and uses `taskkill /T` through
+`request_contained_process_shutdown` for explicit teardown. Other Windows
+resident hosts retain Job Object containment. The portable ConPTY backend asks
+its host for an inherited cursor position with `ESC[6n` before the child accepts
+ordinary input. Zuno consumes that one startup query and answers `ESC[1;1R`;
+the control exchange is not retained or forwarded as terminal output.
 
 Shell has an additional security layer before this lifecycle ownership begins.
 `zuno-sandbox` compiles raw argv plus immutable authority into
@@ -83,6 +100,17 @@ transfer and restore terminal foreground process-group ownership.
 - Linux pidfd denial or absence falls back to bounded lifecycle checks instead
   of weakening process-tree cleanup.
 - Natural MCP exit and explicit cancellation clean its complete process group.
+- Windows ConPTY launches the requested program directly rather than nesting a
+  Job Object guard inside the pseudoterminal; PTY teardown terminates the direct
+  child's complete process tree.
+- On Windows, a ConPTY child waiter closes Zuno's input writer and master handle
+  after `child.wait()` and before waiting for reader drain. Waiting for EOF while
+  either host-side handle remains alive is a circular wait; publishing exit
+  before the reader drains can instead lose final output.
+- On Windows, the PTY owner answers and removes the backend's one inherited-cursor
+  startup query before exposing output. Failure to answer can block `cmd.exe` and
+  PowerShell before their first command; failure to write the response preserves
+  the query in retained output and emits a diagnostic instead of hiding it.
 - Dedicated guards still clean their own payload groups after Linux parent
   `SIGKILL`; direct MCP explicitly makes no such promise.
 - `crates/zuno-process/tests/containment.rs` pins topology, idle waiting, clean

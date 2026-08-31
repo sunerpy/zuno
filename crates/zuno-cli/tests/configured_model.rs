@@ -8,17 +8,26 @@
 //! The unset case protects the deterministic catalog fallback this fix must preserve.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::Output;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
-use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv};
+use zuno_testkit::{MockProvider, MockResponse, Scenario, ScriptedEnv, trusted_platform_config};
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const TUI_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const VIEWPORT_ROWS: u16 = 30;
+#[cfg(unix)]
 const VIEWPORT_COLUMNS: u16 = 100;
 
 fn binary() -> PathBuf {
@@ -28,6 +37,7 @@ fn binary() -> PathBuf {
 #[derive(Clone, Copy, Debug)]
 enum Surface {
     Cli,
+    #[cfg(unix)]
     Tui,
 }
 
@@ -112,7 +122,7 @@ fn config(configured: Option<&str>, aaa_base_url: &str, zzz_base_url: &str) -> S
     if let Some(configured) = configured {
         value["model"] = serde_json::json!(configured);
     }
-    value.to_string()
+    trusted_platform_config(value).to_string()
 }
 
 fn preset_config(aaa_base_url: &str, zzz_base_url: &str) -> String {
@@ -155,10 +165,12 @@ async fn run_cli(env: &ScriptedEnv, variables: BTreeMap<String, String>) -> Outp
         .expect("launch the production CLI")
 }
 
+#[cfg(unix)]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(unix)]
 fn run_tui(
     env: &ScriptedEnv,
     variables: BTreeMap<String, String>,
@@ -246,6 +258,9 @@ async fn route_with_config(
     zzz: &MockProvider,
     wanted: &str,
 ) -> RouteOutcome {
+    #[cfg(not(unix))]
+    let _ = wanted;
+
     let env = ScriptedEnv::new().expect("isolated environment");
     let variables = variables(&env, config);
     let aaa_before = aaa.captured().await.len();
@@ -261,6 +276,7 @@ async fn route_with_config(
             );
             String::from_utf8_lossy(&output.stdout).into_owned()
         }
+        #[cfg(unix)]
         Surface::Tui => {
             let wanted = wanted.to_owned();
             tokio::task::spawn_blocking(move || run_tui(&env, variables, &wanted))
@@ -355,11 +371,13 @@ async fn cli_honors_configured_model_when_zzz_is_alpha() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(unix)]
 async fn tui_honors_configured_model_when_zzz_is_beta() {
     assert_configured_model(Surface::Tui, "ALPHA", "BETA").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(unix)]
 async fn tui_honors_configured_model_when_zzz_is_alpha() {
     assert_configured_model(Surface::Tui, "BETA", "ALPHA").await;
 }
@@ -375,6 +393,7 @@ async fn cli_routes_the_default_orchestrator_through_the_active_preset() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(unix)]
 async fn tui_keeps_deterministic_catalog_fallback_when_model_is_unset() {
     assert_deterministic_fallback(Surface::Tui).await;
 }

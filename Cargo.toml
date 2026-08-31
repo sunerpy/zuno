@@ -118,8 +118,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 # -- allocator ---------------------------------------------------------------
 # Optional at the crate edge so `zuno-cli --no-default-features` remains the
 # system-allocator control used by the memory gates. The shipped/default CLI
-# enables it; MSVC stays on the platform allocator because tikv-jemallocator's
-# supported global-allocator configuration excludes that target environment.
+# enables it on Unix; Windows stays on the platform allocator because
+# tikv-jemallocator does not provide a supported Windows global-allocator build.
 tikv-jemallocator = "=0.7.0"
 
 # -- CLI --------------------------------------------------------------------

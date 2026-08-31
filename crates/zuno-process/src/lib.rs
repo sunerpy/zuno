@@ -5,7 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// First argv token marking an invocation as a hidden guard request.
 ///
@@ -17,6 +19,7 @@ const SUPERVISE_FOREGROUND_MODE: &str = "supervise-foreground";
 const MONITOR_FOREGROUND_MODE: &str = "monitor-foreground";
 const EXEC_MODE: &str = "exec";
 const EXEC_FOREGROUND_MODE: &str = "exec-foreground";
+#[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(any(windows, unix))]
 const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -27,6 +30,7 @@ const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// holds — the ordinary cost is one syscall. The bound covers the case that is not
 /// scheduler latency, a member stuck in uninterruptible I/O, where hanging would be
 /// worse than the hazard because a TUI with a waiting user sits above this.
+#[cfg(unix)]
 const GROUP_QUIET_BUDGET: Duration = Duration::from_millis(500);
 static GUARD_EXECUTABLE: OnceLock<PathBuf> = OnceLock::new();
 
@@ -118,14 +122,48 @@ where
     guarded_argv_for_mode(program, arguments, SUPERVISE_FOREGROUND_MODE)
 }
 
-/// Requests shutdown from a direct child returned by [`guarded_argv`].
+/// Rewrites a command for execution inside a native pseudoterminal.
+///
+/// Unix PTYs retain the foreground guard because the guard owns process-group
+/// foreground transfer and parent-death cleanup. Windows ConPTY is itself the
+/// terminal containment boundary: inserting the resident Job Object guard as
+/// the ConPTY child prevents interactive input and natural exit from settling.
+/// The Windows route therefore launches the requested program directly and the
+/// PTY owner terminates its tree through [`request_contained_process_shutdown`].
+pub fn guarded_terminal_argv<I, S>(
+    program: impl AsRef<OsStr>,
+    arguments: I,
+) -> (OsString, Vec<OsString>)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    #[cfg(windows)]
+    {
+        (
+            program.as_ref().to_os_string(),
+            arguments
+                .into_iter()
+                .map(|argument| argument.as_ref().to_os_string())
+                .collect(),
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        guarded_foreground_argv(program, arguments)
+    }
+}
+
+/// Requests shutdown from a direct child returned by a guarded launch helper.
 ///
 /// With an active resident guard, the guard receives a catchable signal so it can
 /// stop and reap the process group it owns. Before guard activation, library-only
 /// consumers launch the program directly; an isolated process-group leader is then
 /// killed as a group, while a non-leader is killed individually so Zuno never
-/// signals its own process group. The request is idempotent when the process already
-/// exited.
+/// signals its own process group. Windows terminal launches are deliberately
+/// direct even after guard activation, and this function terminates their complete
+/// process tree. The request is idempotent when the process already exited.
 pub fn request_contained_process_shutdown(pid: u32) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -933,6 +971,7 @@ fn terminate_process_group_member(pid: u32, signal: rustix::process::Signal) {
     }
 }
 
+#[cfg(unix)]
 fn with_cleanup_error(error: io::Error, cleanup: io::Result<ExitStatus>) -> io::Error {
     match cleanup {
         Ok(_) => error,
@@ -954,7 +993,7 @@ fn supervise_foreground(request: GuardRequest) -> io::Result<ExitStatus> {
 
 #[cfg(windows)]
 fn supervise_windows(request: GuardRequest) -> io::Result<ExitStatus> {
-    use process_wrap::std::{ChildWrapper as _, CommandWrap, JobObject};
+    use process_wrap::std::{CommandWrap, JobObject};
 
     let mut command = Command::new(request.program);
     command

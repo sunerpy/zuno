@@ -472,15 +472,17 @@ impl TuiConfig {
 /// `packages/tui/src/config/index.tsx:83-86`, supplied by
 /// `packages/opencode/src/config/tui.ts:216` as `process.platform !== "win32"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), derive(Default))]
 pub struct ResolveOptions {
     /// Whether the host can be suspended with `SIGTSTP`.
     pub terminal_suspend: bool,
 }
 
+#[cfg(unix)]
 impl Default for ResolveOptions {
     fn default() -> Self {
         Self {
-            terminal_suspend: cfg!(unix),
+            terminal_suspend: true,
         }
     }
 }

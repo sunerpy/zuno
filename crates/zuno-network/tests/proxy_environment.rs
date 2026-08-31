@@ -139,6 +139,13 @@ fn serve_once(body: &'static str) -> (SocketAddr, thread::JoinHandle<()>) {
                 Err(error) => panic!("accept one HTTP request: {error}"),
             }
         };
+        // Windows propagates a listener's nonblocking mode to accepted
+        // sockets. Return this connection to blocking mode before applying the
+        // bounded read timeout, otherwise the first read can race the client
+        // and fail with WSAEWOULDBLOCK.
+        stream
+            .set_nonblocking(false)
+            .expect("make accepted test HTTP stream blocking");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("bound test request read");

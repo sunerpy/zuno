@@ -1286,15 +1286,20 @@ Codex's ordinary MCP topology. They terminate with bounded `SIGTERM` to
 or beside MCP.
 
 Other resident and interactive hosts retain dedicated guards where a surviving
-per-tree owner or terminal foreground transfer is required. The direct child
-returned by `guarded_argv` is the guard, not the payload; owners request
+per-tree owner or Unix terminal foreground transfer is required. The direct
+child returned by `guarded_argv` is the guard, not the payload; owners request
 shutdown through `request_contained_process_shutdown` and reap it only after
 the contained group settles. On Linux the guard uses the parent-death signal and
 waits on the payload pidfd for immediate, race-free natural-exit observation,
-with bounded lifecycle checks when pidfd is unavailable. Direct MCP relies on
-owner close/Drop and therefore does not promise descendant cleanup after an
-uncatchable owner `SIGKILL`. The pinned Codex comparison and the split ownership
-decision are recorded in
+with bounded lifecycle checks when pidfd is unavailable. Windows ConPTY is the
+exception: `guarded_terminal_argv` launches the requested program directly
+because nesting the resident Job Object guard inside ConPTY prevents reliable
+input and natural-exit completion. The PTY owner closes its writer and master,
+answers the backend's one inherited-cursor startup query before forwarding
+terminal output, and explicitly terminates the direct child's tree on shutdown.
+Direct MCP relies on owner close/Drop and therefore does not promise descendant
+cleanup after an uncatchable owner `SIGKILL`. The pinned Codex comparison and the
+split ownership decision are recorded in
 [Resident process containment](design/process-containment.md).
 
 ## Background command execution
