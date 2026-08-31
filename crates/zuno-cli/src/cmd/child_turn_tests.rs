@@ -179,6 +179,9 @@ impl Fixture {
             model: None,
             effort: None,
             provider_options: serde_json::Map::new(),
+            subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
+            requested_model: None,
+            requested_effort: None,
             background: false,
             report_delivery: ReportDelivery::NextStep,
         }
@@ -271,6 +274,56 @@ fn child_continuation_preserves_exact_provider_options() {
         encoded["continuation"]["providerOptions"]["vendorExtension"]["nested"][0],
         "kept"
     );
+}
+
+#[test]
+fn child_continuation_freezes_model_effort_and_policy_but_reads_legacy_specs() {
+    let fixture = Fixture::new();
+    let mut request = fixture.request("ses_owner");
+    request.effort = Some(zuno_llm::effort::ReasoningEffort::High);
+    let original = ChildSessionSpec::resolved(
+        &request,
+        "worker",
+        "provider/model",
+        Some(zuno_llm::effort::ReasoningEffort::High),
+    );
+
+    original
+        .validate_continuation(&original)
+        .expect("an exact explicit model and effort pair may continue");
+
+    let mut changed_model = original.clone();
+    changed_model.model = "provider/other".to_owned();
+    assert!(
+        original
+            .validate_continuation(&changed_model)
+            .expect_err("continuation may not switch models")
+            .contains("effective provider/model")
+    );
+
+    let mut changed_effort = original.clone();
+    changed_effort.effort = None;
+    assert!(
+        original
+            .validate_continuation(&changed_effort)
+            .expect_err("an explicit model may not silently omit its frozen effort")
+            .contains("reasoning")
+    );
+
+    let mut changed_policy = original.clone();
+    changed_policy.subagent_model_policy_sha256 = Some("changed-policy".to_owned());
+    assert!(
+        original
+            .validate_continuation(&changed_policy)
+            .expect_err("continuation may not gain different model authority")
+            .contains("subagent model policy")
+    );
+
+    let mut legacy = original.clone();
+    legacy.subagent_model_policy_sha256 = None;
+    legacy
+        .validate_continuation(&original)
+        .expect("historical child metadata without the new digest remains readable");
 }
 
 #[derive(Default)]
@@ -954,6 +1007,9 @@ async fn resumed_child_rejects_identity_drift_without_rewriting_durable_metadata
     let mut changed_reasoning = original.clone();
     changed_reasoning.effort = Some(zuno_llm::effort::ReasoningEffort::Low);
     candidates.push(("reasoning", changed_reasoning));
+    let mut changed_policy = original.clone();
+    changed_policy.subagent_model_policy_sha256 = Some("changed-policy".to_owned());
+    candidates.push(("subagent model policy", changed_policy));
     let mut changed_capability = original.clone();
     changed_capability
         .parent_attempt

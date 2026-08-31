@@ -366,10 +366,20 @@ them and cancels and joins only background jobs owned by the closing root.
 A child resolves through the same configuration, model catalog, MCP catalog,
 Skill discovery roots, permission ceiling, and sandbox configuration as its
 parent composition. In the absence of a per-Agent or preset route, the child
-inherits the parent session model and reasoning choice. The model-facing `task`
-surface cannot override model, effort, category, MCP, Skill, or sandbox policy;
-configured host workflows use the same validated routing layer without adding
-those fields to the model contract.
+inherits the parent session model and reasoning choice. By default the
+model-facing `task` surface cannot override model, effort, category, MCP, Skill,
+or sandbox policy. `subagent_model_selection.enabled` may expose optional
+`model` and `effort` fields under a separate host-global exact allowlist;
+category, MCP, Skill, and sandbox policy remain host-owned.
+
+The enabled state and canonical sorted allowlist are validated against the
+active model catalog and persisted as a durable session policy event with a
+digest. Every Attempt references that digest and each child inherits the same
+snapshot, so later configuration edits cannot change an existing session.
+Explicit effort requires an explicit allowed model and must resolve to a variant
+that model actually declares. A `task_id` continuation may omit both fields or
+repeat the first frozen values exactly; any change is rejected before child
+execution.
 
 A native child does not recompute an independent tool superset from the current
 configuration. The parent Attempt persists the exact provider-visible tool schemas used

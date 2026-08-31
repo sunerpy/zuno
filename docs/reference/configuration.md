@@ -472,11 +472,14 @@ The expanded form accepts `reasoning` values `off`, `low`, `medium`, `high`,
 
 For direct `task` delegation with `agent`, model precedence is
 `agents.<target>.model`, the active preset's Agent route, then the parent
-session model. The model-facing tool does not accept `model`, `effort`, or
-`category` overrides. Host-owned workflow and Council category routes use the
-active preset's category route, then the parent session model; the `general`
-Agent route is deliberately not consulted. Reasoning comes from the winning
-route, then the model/provider default.
+session model. By default the model-facing tool does not accept `model`,
+`effort`, or `category` overrides. An enabled
+`subagent_model_selection` policy adds an explicit allowed model ahead of that
+precedence and permits only a variant that model declares; `category` remains
+host-owned. Host-owned workflow and Council category routes use the active
+preset's category route, then the parent session model; the `general` Agent
+route is deliberately not consulted. Reasoning comes from the winning route,
+then the model/provider default.
 
 The top-level turn follows the same specificity principle for its selected
 Agent. An unavailable route produces a visible diagnostic before falling
@@ -938,6 +941,52 @@ automatically replayed.
 `memory: false` disables resident injection, proposal tools, and reflection.
 `/memory` reviews, edits, approves, rejects, removes, and undoes durable changes.
 See [auditable memory and reflection](../design/memory-learning.md).
+
+## Image attachment admission
+
+`attachment.image` owns the shared TUI, headless, ACP, and server image
+admission policy:
+
+```json
+{
+  "attachment": {
+    "image": {
+      "auto_resize": true,
+      "max_source_bytes": 20971520,
+      "max_width": 2000,
+      "max_height": 2000,
+      "max_pixels": 4000000,
+      "max_encoded_bytes": 5242880
+    }
+  }
+}
+```
+
+All values are hard positive limits. `auto_resize: false` rejects a source that
+must be resized; it does not weaken the byte, dimension, or pixel checks.
+`max_base64_bytes` is not accepted. See
+[Images and file references](attachments.md) for normalization, durable object,
+legacy replay, export, and GC behavior.
+
+## Child model selection policy
+
+`subagent_model_selection` is host-global but frozen into each durable session:
+
+```json
+{
+  "subagent_model_selection": {
+    "enabled": false,
+    "allowed_models": ["provider/model"]
+  }
+}
+```
+
+The default keeps the `task` schema free of model and effort fields. Enabling
+the policy requires a non-empty unique allowlist whose exact entries all resolve
+in the active model catalog. Zuno persists the canonical sorted policy and its
+digest; existing sessions and children do not change when configuration is
+edited later. See
+[Model routing](../config/models.md#optional-child-model-and-effort-allowlist).
 
 ## Inspecting the result
 

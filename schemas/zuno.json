@@ -2553,6 +2553,26 @@
       },
       "type": "object"
     },
+    "SubagentModelSelectionConfig": {
+      "additionalProperties": false,
+      "description": "Host-global child model selection policy, frozen into each durable session.",
+      "properties": {
+        "allowed_models": {
+          "default": [],
+          "description": "Exact `provider/model` identities the model may select.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Expose optional `model` and `effort` fields on the `task` tool.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "ThemeColor": {
       "description": "A named theme colour (`config/agent.ts:9`).",
       "oneOf": [
@@ -3102,6 +3122,17 @@
         "integer",
         "null"
       ]
+    },
+    "subagent_model_selection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SubagentModelSelectionConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Host-owned allowlist for model-facing child model and effort selection."
     },
     "tool_output": {
       "anyOf": [

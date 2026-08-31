@@ -26,12 +26,12 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 
 ## 顶层结构
 
-一共有四十个键。按它们决定什么来分组：
+一共有四十一个键。按它们决定什么来分组：
 
 | 分组 | 键 |
 | --- | --- |
 | 模型路由 | `model`、`small_model`、`preset`、`presets`、`provider`、`enabled_providers`、`disabled_providers` |
-| Agent 与委派 | `agents`、`default_agent`、`subagent_depth`、`workflows`、`productAgent` |
+| Agent 与委派 | `agents`、`default_agent`、`subagent_depth`、`subagent_model_selection`、`workflows`、`productAgent` |
 | 权限 | `permission`、`sandbox`、`shell` |
 | 指令与 Skill | `instructions`、`skills`、`command`、`memory` |
 | 上下文 | `compaction`、`tool_output`、`attachment`、`references` |

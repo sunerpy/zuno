@@ -211,6 +211,7 @@ fn trace_seed() -> Arc<AttemptSeed> {
             prompt_policy_sha256: sha256_text("build prompt policy"),
         },
         preset: None,
+        subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         parent_attempt: None,
         workflow: None,
         workflow_node: None,

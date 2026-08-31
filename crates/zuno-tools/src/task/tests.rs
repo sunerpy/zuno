@@ -67,6 +67,53 @@ fn tool(host: Arc<RecordingHost>) -> TaskTool {
     TaskTool::new(host, facts()).with_session_model(ModelChoice::new(MODEL_A))
 }
 
+fn selectable_policy(models: &[&str]) -> SubagentModelPolicy {
+    SubagentModelPolicy::new(true, models.iter().map(|model| (*model).to_owned()))
+        .expect("selectable test policy")
+}
+
+fn selectable_facts() -> Arc<FixedFacts> {
+    let mut options = Map::new();
+    options.insert(
+        "reasoningEffort".to_owned(),
+        Value::String("high".to_owned()),
+    );
+    let mut variants = BTreeMap::new();
+    variants.insert("high".to_owned(), options);
+    Arc::new(
+        FixedFacts::new()
+            .with(
+                MODEL_A,
+                ModelFacts {
+                    family: ProviderFamily::OpenAi,
+                    reasoning: true,
+                    effort: EffortCapabilities::default(),
+                    variants,
+                },
+            )
+            .with_reasoning(MODEL_B, ProviderFamily::OpenAi),
+    )
+}
+
+fn selectable_tool(host: Arc<RecordingHost>) -> SelectableTaskTool {
+    TaskTool::new(host, selectable_facts())
+        .with_session_model(ModelChoice::new(MODEL_B))
+        .with_subagent_model_policy(selectable_policy(&[MODEL_A]))
+        .selectable()
+}
+
+fn selectable_params(model: Option<&str>, effort: Option<&str>) -> SelectableTaskParams {
+    SelectableTaskParams {
+        contract: contract("look around"),
+        agent: "explorer".to_owned(),
+        background: None,
+        report_delivery: None,
+        task_id: None,
+        model: model.map(str::to_owned),
+        effort: effort.map(str::to_owned),
+    }
+}
+
 fn context(permission: Arc<dyn PermissionAsker>) -> ToolContext {
     ToolContext::new(
         PARENT,
@@ -358,6 +405,56 @@ fn the_advertised_schema_is_a_typed_delegation_contract() {
         properties["constraints"]["properties"]["must_not"]["items"]["type"],
         "string"
     );
+    assert!(
+        properties.get("model").is_none() && properties.get("effort").is_none(),
+        "the default-disabled policy must preserve the existing task schema"
+    );
+}
+
+#[test]
+fn an_enabled_policy_advertises_optional_model_and_effort_fields() {
+    let definition = erase(selectable_tool(Arc::new(RecordingHost::new()))).definition();
+    let properties = &definition.parameters["properties"];
+
+    assert_eq!(
+        properties["model"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    assert_eq!(
+        properties["effort"]["type"],
+        serde_json::json!(["string", "null"])
+    );
+    let required = definition.parameters["required"]
+        .as_array()
+        .expect("required fields");
+    assert!(!required.contains(&Value::String("model".to_owned())));
+    assert!(!required.contains(&Value::String("effort".to_owned())));
+}
+
+#[test]
+fn subagent_model_policy_is_canonical_and_rejects_ambiguous_authority() {
+    let first = selectable_policy(&[MODEL_B, MODEL_A]);
+    let second = selectable_policy(&[MODEL_A, MODEL_B]);
+    assert_eq!(first, second);
+    let mut expected = vec![MODEL_A.to_owned(), MODEL_B.to_owned()];
+    expected.sort();
+    assert_eq!(first.allowed_models(), expected);
+
+    assert_eq!(
+        SubagentModelPolicy::new(true, Vec::<String>::new()),
+        Err(SubagentModelPolicyError::EmptyEnabledAllowlist)
+    );
+    assert_eq!(
+        SubagentModelPolicy::new(true, [MODEL_A.to_owned(), MODEL_A.to_owned()]),
+        Err(SubagentModelPolicyError::Duplicate(MODEL_A.to_owned()))
+    );
+    for invalid in ["", "model", "/model", "provider/", "provider/model/extra"] {
+        assert_eq!(
+            SubagentModelPolicy::new(true, [invalid.to_owned()]),
+            Err(SubagentModelPolicyError::InvalidModel),
+            "{invalid}"
+        );
+    }
 }
 
 #[test]
@@ -529,6 +626,85 @@ async fn a_vision_gated_target_is_unreachable_until_the_catalog_offers_one() {
         )
         .await
         .expect("the gated target is present with one");
+}
+
+// -- durable model-selection authority -------------------------------------
+
+#[tokio::test]
+async fn enabled_model_selection_requires_an_allowlisted_available_declared_pair() {
+    let cases = [
+        (
+            selectable_params(None, Some("high")),
+            "`effort` requires an explicit allowlisted `model`",
+        ),
+        (
+            selectable_params(Some(MODEL_B), None),
+            "is not authorized for this session",
+        ),
+        (
+            selectable_params(Some(MODEL_A), Some("missing")),
+            "is not a variant declared by",
+        ),
+    ];
+
+    for (params, expected) in cases {
+        let host = Arc::new(RecordingHost::new());
+        let error = selectable_tool(Arc::clone(&host))
+            .run(params, allowed())
+            .await
+            .expect_err("invalid explicit authority must be refused");
+        assert!(matches!(error, ToolError::InvalidArgs { .. }));
+        assert!(message(&error).contains(expected), "{}", message(&error));
+        assert!(
+            host.dispatched().is_empty(),
+            "invalid model authority must not create a child"
+        );
+    }
+
+    let host = Arc::new(RecordingHost::new());
+    let unavailable = TaskTool::new(host.clone(), selectable_facts())
+        .with_session_model(ModelChoice::new(MODEL_B))
+        .with_subagent_model_policy(selectable_policy(&["acme/retired"]))
+        .selectable()
+        .run(selectable_params(Some("acme/retired"), None), allowed())
+        .await
+        .expect_err("an allowlisted but unresolved model must be refused");
+    assert!(message(&unavailable).contains("is not present in the resolved model catalog"));
+    assert!(host.dispatched().is_empty());
+}
+
+#[tokio::test]
+async fn enabled_model_selection_dispatches_the_exact_frozen_choice() {
+    let host = Arc::new(RecordingHost::new());
+    let mut params = selectable_params(Some(MODEL_A), Some("high"));
+    params.task_id = Some("ses_earlier".to_owned());
+    selectable_tool(Arc::clone(&host))
+        .run(params, allowed())
+        .await
+        .expect("the exact allowlisted pair dispatches");
+
+    let request = &host.dispatched()[0];
+    assert_eq!(request.resume_session_id.as_deref(), Some("ses_earlier"));
+    assert_eq!(request.model, Some(ModelChoice::new(MODEL_A)));
+    assert_eq!(request.effort, Some(ReasoningEffort::High));
+    assert_eq!(request.provider_options["reasoningEffort"], "high");
+    assert_eq!(request.requested_model.as_deref(), Some(MODEL_A));
+    assert_eq!(request.requested_effort.as_deref(), Some("high"));
+    assert_eq!(request.subagent_model_policy, selectable_policy(&[MODEL_A]));
+}
+
+#[tokio::test]
+async fn an_enabled_policy_without_an_explicit_model_keeps_existing_routing() {
+    let host = Arc::new(RecordingHost::new());
+    selectable_tool(Arc::clone(&host))
+        .run(selectable_params(None, None), allowed())
+        .await
+        .expect("omitting model keeps the existing delegation ladder");
+
+    let request = &host.dispatched()[0];
+    assert_eq!(request.model, Some(ModelChoice::new(MODEL_B)));
+    assert_eq!(request.requested_model, None);
+    assert_eq!(request.requested_effort, None);
 }
 
 // -- the precedence ladder -------------------------------------------------

@@ -152,6 +152,8 @@ pub(crate) struct Delegation {
     pub(crate) limits: zuno_tools::task::DelegationLimits,
     /// Whether the catalog holds a vision-capable model, which gates one target.
     pub(crate) vision_available: bool,
+    /// Exact session-frozen authority for model-facing child model selection.
+    pub(crate) subagent_model_policy: zuno_tools::task::SubagentModelPolicy,
 }
 
 /// Assemble the registry for `agent` and project it onto `provider_id`/`model_id`.
@@ -254,6 +256,7 @@ pub(crate) fn assemble(
         presets,
         limits,
         vision_available,
+        subagent_model_policy,
     } = selection.delegation;
     if let Some(delegates) = selected_profile.capabilities().delegation_targets() {
         let allowed = delegates
@@ -291,13 +294,19 @@ pub(crate) fn assemble(
         .with_session_model(session_model)
         .with_presets(presets)
         .with_limits(limits)
-        .with_vision_available(vision_available);
+        .with_vision_available(vision_available)
+        .with_subagent_model_policy(subagent_model_policy.clone());
     for (agent, model) in agent_models {
         task = task.with_agent_override(agent, model);
     }
     if selection.manifest.contains(BuiltinSlot::Task) {
+        let task_tool = if subagent_model_policy.enabled() {
+            erase(task.clone().selectable())
+        } else {
+            erase(task.clone())
+        };
         builder
-            .register_builtin(BuiltinSlot::Task, erase(task.clone()))
+            .register_builtin(BuiltinSlot::Task, task_tool)
             .map_err(|error| error.to_string())?;
     }
     if !selection.capability.workflows.is_empty() {

@@ -38,12 +38,12 @@ true of `delegates`, `requiredSkills`, `writableRoots`, and `instructions`.
 
 ## The top-level shape
 
-Forty keys exist. Grouped by what they decide:
+Forty-one keys exist. Grouped by what they decide:
 
 | Group | Keys |
 | --- | --- |
 | Model routing | `model`, `small_model`, `preset`, `presets`, `provider`, `enabled_providers`, `disabled_providers` |
-| Agents and delegation | `agents`, `default_agent`, `subagent_depth`, `workflows`, `productAgent` |
+| Agents and delegation | `agents`, `default_agent`, `subagent_depth`, `subagent_model_selection`, `workflows`, `productAgent` |
 | Authority | `permission`, `sandbox`, `shell` |
 | Instructions and Skills | `instructions`, `skills`, `command`, `memory` |
 | Context | `compaction`, `tool_output`, `attachment`, `references` |

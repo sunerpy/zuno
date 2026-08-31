@@ -67,6 +67,42 @@ Schema 是从 Rust 类型生成的，因此它与运行时实际接受的内容�
 
 `productAgent` 配置以原生协议接入的产品 Agent。它们拥有自己的凭据与权限边界，默认关闭。
 
+## 图像附件接纳
+
+`attachment.image` 是 TUI、无界面、ACP 与 Server 共用的图像接纳策略：
+
+```json
+{
+  "attachment": {
+    "image": {
+      "auto_resize": true,
+      "max_source_bytes": 20971520,
+      "max_width": 2000,
+      "max_height": 2000,
+      "max_pixels": 4000000,
+      "max_encoded_bytes": 5242880
+    }
+  }
+}
+```
+
+所有值都是正数硬上限。`auto_resize: false` 会拒绝必须缩放的源，不会放宽字节、尺寸或像素检查。`max_base64_bytes` 不被接受。规范化、持久对象、旧记录重放、export 与 GC 语义见[图像与文件引用](/zh/guide/attachments)。
+
+## 子模型选择策略
+
+`subagent_model_selection` 由宿主全局持有，但会冻结到每个持久 session：
+
+```json
+{
+  "subagent_model_selection": {
+    "enabled": false,
+    "allowed_models": ["provider/model"]
+  }
+}
+```
+
+默认值让 `task` schema 不包含 model/effort 字段。启用后要求 allowlist 非空、无重复，并且每个确切条目都能在当前模型目录解析。Zuno 持久化规范化排序后的策略及 digest；之后修改配置不会改变已有 session 或其子级。详见[模型路由](/zh/config/models#可选的子模型与-effort-allowlist)。
+
 ## 并发
 
 `concurrency` 控制同时运行的工作量上限。它约束的是编排层的并行度，而不是单次工具调用内部的并发。

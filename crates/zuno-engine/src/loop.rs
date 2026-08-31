@@ -4056,20 +4056,41 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
         permission_sha256: sha256_text("untracked permission rules"),
         prompt_policy_sha256: sha256_text(&agent.system_prompt),
     };
-    let (capability, agent_identity, preset, parent_attempt, workflow, workflow_node) =
-        agent.orchestration_seed.as_deref().map_or_else(
-            || (fallback_capability, fallback_agent, None, None, None, None),
-            |seed| {
-                (
-                    seed.capability.clone(),
-                    seed.agent.clone(),
-                    seed.preset.clone(),
-                    seed.parent_attempt.clone(),
-                    seed.workflow.clone(),
-                    seed.workflow_node.clone(),
-                )
-            },
-        );
+    let (
+        capability,
+        agent_identity,
+        preset,
+        subagent_model_policy_sha256,
+        parent_attempt,
+        workflow,
+        workflow_node,
+    ) = agent.orchestration_seed.as_deref().map_or_else(
+        || {
+            (
+                fallback_capability,
+                fallback_agent,
+                None,
+                sha256_json(&json!({
+                    "enabled": false,
+                    "allowedModels": [],
+                })),
+                None,
+                None,
+                None,
+            )
+        },
+        |seed| {
+            (
+                seed.capability.clone(),
+                seed.agent.clone(),
+                seed.preset.clone(),
+                seed.subagent_model_policy_sha256.clone(),
+                seed.parent_attempt.clone(),
+                seed.workflow.clone(),
+                seed.workflow_node.clone(),
+            )
+        },
+    );
     let selected_skills = agent
         .prompt_assembly
         .sections()
@@ -4133,6 +4154,7 @@ fn attempt_snapshot(input: AttemptSnapshotInput<'_>) -> AttemptSnapshot {
             reasoning_sha256: sha256_json(&Value::Object(model.reasoning_options.clone())),
             preset,
         },
+        subagent_model_policy_sha256,
         selected_skills,
         prompt: PromptReceiptIdentity {
             event_id: prompt_receipt_id.map(str::to_owned),

@@ -76,6 +76,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "presets",
     "default_agent",
     "subagent_depth",
+    "subagent_model_selection",
     "username",
     "agents",
     "workflows",
@@ -166,6 +167,9 @@ pub struct Config {
     /// Maximum subagent nesting depth. Defaults to 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_depth: Option<u32>,
+    /// Host-owned allowlist for model-facing child model and effort selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_model_selection: Option<SubagentModelSelectionConfig>,
     /// Name to show for the user instead of the system username.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -231,6 +235,18 @@ pub struct Config {
     /// Options under active development.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalConfig>,
+}
+
+/// Host-global child model selection policy, frozen into each durable session.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentModelSelectionConfig {
+    /// Expose optional `model` and `effort` fields on the `task` tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exact `provider/model` identities the model may select.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
 }
 
 impl Config {

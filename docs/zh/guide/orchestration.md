@@ -181,7 +181,7 @@ off, low, medium, high, xhigh, max
 
 ### 直接委派的路由
 
-面向模型的 `task` 工具不接受 `model`、`effort` 或 `category`。生效的模型与推理级别由所选 Agent、当前 preset 和父会话决定。这让路由与权限留在经过校验的宿主配置里，而不是允许一段提示词选择任意 provider 或推理策略。
+默认情况下，面向模型的 `task` 工具不接受 `model`、`effort` 或 `category`。生效的模型与推理级别由所选 Agent、当前 preset 和父会话决定。宿主可以显式启用带精确目录 allowlist 的 `subagent_model_selection`；只有这时 schema 才增加可选 `model` 与 `effort`。持久策略阻止提示词选择任意 provider 或模型未声明的推理 variant。类别路由仍由宿主持有。
 
 ## 推荐的可切换配置
 
@@ -282,13 +282,14 @@ off, low, medium, high, xhigh, max
 
 对带 `agent` 的 `task`，Zuno 按此顺序选择子级模型：
 
-1. `agents.<target>.model`；
-2. `presets.<active>.agents.<target>`；
-3. 父会话模型。
+1. 若提供，则使用被 session 持久 `subagent_model_selection` 策略授权的显式模型；
+2. `agents.<target>.model`；
+3. `presets.<active>.agents.<target>`；
+4. 父会话模型。
 
 不可用或未限定的模型会产生一条可见的路由诊断，并落到下一个已配置的候选项。模型 id 必须使用 `provider/model` 形式，并且存在于解析出的目录中。
 
-推理或 variant 的解析使用胜出的那条 Agent 路由上附带的 reasoning 或 variant，然后是所选模型/provider 的默认值。
+显式 effort 只能和显式授权模型一起提供，并且必须映射到该模型声明的 variant。没有显式模型时，现有 Agent/preset 推理路由仍然权威。选中的 model、effort 与 policy digest 会冻结进子级身份；使用 `task_id` 续跑不能改变它们。
 
 直接委派示例：
 
@@ -312,7 +313,7 @@ off, low, medium, high, xhigh, max
 }
 ```
 
-未知字段会导致 schema 校验失败，包括已被移除的 `description`、`prompt`、`subagent_type`、`category`、`model`、`effort` 和 `load_skills`。Zuno 不会转换旧形态。
+未知字段会导致 schema 校验失败，包括已被移除的 `description`、`prompt`、`subagent_type`、`category` 和 `load_skills`。除非该 session 的持久 `subagent_model_selection` 策略已经启用，否则 `model` 与 `effort` 也不在 schema 中并会被拒绝。Zuno 不会转换旧形态。
 
 ## 宿主拥有的类别路由
 
@@ -493,9 +494,9 @@ zuno debug permissions
 
 配置 `presets.<active>.categories.<category>`。宿主拥有的类别路由不会使用 `general` Agent 已配置的或 preset 的 Agent 路由。
 
-### 「子级忽略了 task 中的 model 或 effort 字段」
+### 「task schema 中没有 model 或 effort 字段」
 
-那些字段不属于 `task` 的 schema。请改为配置 `agents.<name>.model`、`agents.<name>.reasoning`，或当前的 preset 路由。
+这是默认行为。请配置 `agents.<name>.model`、`agents.<name>.reasoning` 或当前 preset 路由。如果确实需要让模型选择，请在创建 session 之前启用带非空精确 allowlist 的 `subagent_model_selection`；已有 session 会保持启动时冻结的策略快照。
 
 ### 「自定义的评审者无法作为目标」
 

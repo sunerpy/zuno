@@ -233,6 +233,8 @@ struct ChildSessionSpec {
     model: String,
     effort: Option<zuno_llm::effort::ReasoningEffort>,
     provider_options: Map<String, Value>,
+    #[serde(default)]
+    subagent_model_policy_sha256: Option<String>,
     background: bool,
 }
 
@@ -253,6 +255,7 @@ impl ChildSessionSpec {
             model: model.to_owned(),
             effort,
             provider_options: request.provider_options.clone(),
+            subagent_model_policy_sha256: Some(request.subagent_model_policy.digest().to_owned()),
             background: request.background,
         }
     }
@@ -274,6 +277,11 @@ impl ChildSessionSpec {
         }
         if self.provider_options != candidate.provider_options {
             return Err("child continuation provider options changed".to_owned());
+        }
+        if self.subagent_model_policy_sha256.is_some()
+            && self.subagent_model_policy_sha256 != candidate.subagent_model_policy_sha256
+        {
+            return Err("child continuation subagent model policy changed".to_owned());
         }
         if self.workflow != candidate.workflow || self.workflow_node != candidate.workflow_node {
             return Err("child continuation workflow identity changed".to_owned());
@@ -307,6 +315,7 @@ fn validate_parent_attempt_authority(
         || stored.owner.parent_attempt != candidate.owner.parent_attempt
         || stored.agent != candidate.agent
         || stored.model != candidate.model
+        || stored.subagent_model_policy_sha256 != candidate.subagent_model_policy_sha256
         || stored.tools != candidate.tools
     {
         return Err("child continuation parent Attempt authority changed".to_owned());
@@ -1512,28 +1521,56 @@ impl DelegatedTurnRunner for ProductionDelegatedTurnRunner {
         let parent_attempt = request.parent_attempt.as_deref().ok_or_else(|| {
             "delegated child turn is missing the immutable parent Attempt snapshot".to_owned()
         })?;
+        request
+            .subagent_model_policy
+            .validate()
+            .map_err(to_string)?;
+        if parent_attempt.subagent_model_policy_sha256 != request.subagent_model_policy.digest() {
+            return Err(
+                "delegated child turn subagent model policy does not match the parent Attempt"
+                    .to_owned(),
+            );
+        }
+        let resumed = request.resume_session_id.is_some();
+        let restored =
+            if resumed && request.requested_model.is_none() && request.requested_effort.is_none() {
+                Some(self.children.get_or_restore(&self.database, session_id)?)
+            } else {
+                None
+            };
+        let model = restored
+            .as_ref()
+            .map(|stored| stored.model.clone())
+            .or_else(|| request.model.as_ref().map(|model| model.model.clone()));
+        let effort = restored
+            .as_ref()
+            .map_or(request.effort, |stored| stored.effort);
+        let provider_options = restored.as_ref().map_or_else(
+            || request.provider_options.clone(),
+            |stored| stored.provider_options.clone(),
+        );
         let options = TurnOptions {
             directory: Some(self.directory.clone()),
-            model: request.model.as_ref().map(|model| model.model.clone()),
+            model,
             agent: Some(request.agent.clone()),
             preset: None,
             session: SessionChoice::Existing(session_id.to_owned()),
             title: request.description.clone(),
-            effort: request.effort,
+            effort,
             variant: None,
             thinking: false,
             tool_authority: Some(Arc::from(parent_attempt.tools.clone())),
             extension_composition: super::turn::ExtensionComposition::Active,
         };
         let mut plan = TurnPlan::resolve(&options, &self.environment).await?;
-        plan.inherit_request_parameters(request.provider_options.clone());
+        plan.use_subagent_model_policy(request.subagent_model_policy.clone())?;
+        plan.inherit_request_parameters(provider_options);
         let spec = ChildSessionSpec::resolved(
             request,
             plan.agent_name(),
             &plan.qualified_model(),
             plan.effort(),
         );
-        let resumed = request.resume_session_id.is_some();
         if resumed {
             checkpoint_child_session_spec(
                 &self.database,
@@ -2368,6 +2405,9 @@ fn task_report_metadata_for_job(
         model: None,
         effort: None,
         provider_options: Map::new(),
+        subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
+        requested_model: None,
+        requested_effort: None,
         background: true,
         report_delivery: match job.report_delivery {
             DbReportDelivery::NextStep => ToolReportDelivery::NextStep,

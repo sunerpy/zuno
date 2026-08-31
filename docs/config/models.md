@@ -97,13 +97,47 @@ For host-owned workflow and Council category routes:
 2. the parent session model.
 
 The `general` agent route is deliberately not consulted for category routing, so a
-broad agent route cannot quietly capture workflow nodes. The model-facing delegation
-tool does not accept `model`, `effort`, or `category` overrides; routing is a
-configuration decision, not a per-call one.
+broad agent route cannot quietly capture workflow nodes. By default the
+model-facing delegation tool accepts no `model`, `effort`, or `category`
+override. An administrator may expose the separately gated child model policy
+below; category routing remains host-owned.
 
 Reasoning comes from the winning route, then the model or provider default. The
 selected preset is frozen with the turn plan, so editing configuration cannot mutate
 an in-flight attempt.
+
+## Optional child model and effort allowlist
+
+Model-facing child selection is disabled by default:
+
+```json
+{
+  "subagent_model_selection": {
+    "enabled": false,
+    "allowed_models": ["provider/model"]
+  }
+}
+```
+
+When disabled, the `task` schema is unchanged and does not contain `model` or
+`effort`. When enabled, `allowed_models` must be non-empty, contain no duplicate
+exact `provider/model` identities, and every entry must resolve in the active
+model catalog while the profile is prepared.
+
+Zuno sorts the allowlist and persists it with the enabled state and a digest as
+a session policy event. Every provider Attempt references that digest, and
+child sessions inherit the same snapshot. Editing host configuration later does
+not change an existing session.
+
+An explicit `task.model` must be an exact member of the durable allowlist.
+`task.effort` may appear only with an explicit model and must name a variant
+that model actually declares. Invalid or unauthorized selections fail as
+`InvalidArgs` before a child session is created. Omitting `model` preserves the
+ordinary Agent/preset delegation route.
+
+A continuation using `task_id` may omit both fields or repeat the original
+frozen model and effort exactly. It cannot switch either value or acquire a
+different policy after the child exists.
 
 ## Reasoning levels and variants
 

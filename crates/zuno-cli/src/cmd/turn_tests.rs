@@ -870,6 +870,7 @@ fn test_delegation() -> tool_runtime::Delegation {
         presets: zuno_agent::model_policy::PresetLibrary::new(),
         limits: zuno_tools::task::DelegationLimits::default(),
         vision_available: false,
+        subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
     }
 }
 
@@ -1093,6 +1094,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         },
         catalog_models: Vec::new(),
         reasoning_efforts: std::collections::BTreeMap::new(),
+        subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
         required_skills: Vec::new(),
         capability: test_capability(),
@@ -1314,6 +1316,7 @@ fn orchestration_seed(capability: &CapabilitySnapshot) -> Arc<AttemptSeed> {
             prompt_policy_sha256: sha256_text("build prompt policy"),
         },
         preset: None,
+        subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         parent_attempt: None,
         workflow: None,
         workflow_node: None,
@@ -1342,6 +1345,7 @@ fn parent_attempt(capability: CapabilitySnapshot) -> AttemptSnapshot {
             reasoning_sha256: sha256_text("max"),
             preset: None,
         },
+        subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         selected_skills: Vec::new(),
         prompt: zuno_orchestration::PromptReceiptIdentity {
             event_id: Some("evt-parent".to_owned()),
@@ -2833,6 +2837,44 @@ fn a_config_specified_model_selects_with_no_catalog_at_all() {
     );
 }
 
+#[test]
+fn subagent_model_selection_resolves_every_enabled_allowlist_entry_at_activation() {
+    let mut config = self_specified_config();
+    config.subagent_model_selection = Some(zuno_config::schema::SubagentModelSelectionConfig {
+        enabled: true,
+        allowed_models: vec!["private/house-model".to_owned()],
+    });
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+
+    let policy =
+        resolve_subagent_model_policy(&config, &catalog).expect("configured model resolves");
+    assert!(policy.enabled());
+    assert_eq!(policy.allowed_models(), &["private/house-model".to_owned()]);
+
+    config
+        .subagent_model_selection
+        .as_mut()
+        .expect("selection config")
+        .allowed_models = vec!["private/missing".to_owned()];
+    let unresolved =
+        resolve_subagent_model_policy(&config, &catalog).expect_err("missing model must fail");
+    assert!(unresolved.contains("contains unresolved model `private/missing`"));
+
+    config
+        .subagent_model_selection
+        .as_mut()
+        .expect("selection config")
+        .allowed_models = Vec::new();
+    assert!(
+        resolve_subagent_model_policy(&config, &catalog)
+            .expect_err("enabled empty allowlist must fail")
+            .contains("requires a non-empty allowlist")
+    );
+}
+
 /// The other half: a model nobody defines still fails immediately, and names the fix.
 #[test]
 fn a_model_no_config_defines_fails_immediately_and_names_the_fix() {
@@ -2887,6 +2929,105 @@ fn an_empty_catalog_with_no_request_still_explains_the_policy() {
         "a loaded catalog that lists nothing is a configuration problem, not a \
          policy one: {loaded}"
     );
+}
+
+fn subagent_policy_fixture(session_id: &str) -> Arc<zuno_db::Pool> {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+    let mut connection = pool.open_connection().expect("open connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('project_subagent_policy', '/workspace', 1, 1, '[]')",
+            [],
+        )
+        .expect("seed project");
+    connection
+        .execute(
+            "INSERT INTO session (
+                 id, project_id, slug, directory, title, version, time_created, time_updated
+             ) VALUES (?1, 'project_subagent_policy', 'subagent-policy', '/workspace',
+                 'Subagent policy', 'zuno', 1, 1)",
+            [session_id],
+        )
+        .expect("seed session");
+    pool
+}
+
+#[test]
+fn durable_subagent_policy_is_canonical_and_ignores_later_config_choices() {
+    let session_id = "ses_subagent_policy";
+    let pool = subagent_policy_fixture(session_id);
+    let durable = zuno_tools::task::SubagentModelPolicy::new(
+        true,
+        ["provider/z-model".to_owned(), "provider/a-model".to_owned()],
+    )
+    .expect("durable policy");
+    zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool))
+        .append(
+            session_id,
+            subagent_model_policy_event(&durable).expect("policy event"),
+        )
+        .expect("append policy");
+
+    let later_config =
+        zuno_tools::task::SubagentModelPolicy::new(true, ["provider/other-model".to_owned()])
+            .expect("later policy");
+    let restored = load_subagent_model_policy(&pool, session_id)
+        .expect("load durable policy")
+        .expect("policy exists");
+
+    assert_eq!(restored, durable);
+    assert_ne!(restored, later_config);
+    assert_eq!(
+        restored.allowed_models(),
+        &["provider/a-model".to_owned(), "provider/z-model".to_owned()]
+    );
+}
+
+#[test]
+fn corrupt_or_duplicate_durable_subagent_policies_are_permanent_failures() {
+    let corrupt_session = "ses_subagent_policy_corrupt";
+    let corrupt_pool = subagent_policy_fixture(corrupt_session);
+    zuno_db::event_log::SessionEventLog::new(Arc::clone(&corrupt_pool))
+        .append(
+            corrupt_session,
+            zuno_db::event_log::NewSessionEvent::new(
+                SUBAGENT_MODEL_POLICY_EVENT,
+                serde_json::json!({
+                    "policy": {
+                        "enabled": true,
+                        "allowedModels": ["provider/model"],
+                        "digest": "not-the-policy-digest"
+                    }
+                })
+                .as_object()
+                .cloned()
+                .expect("event properties"),
+            )
+            .expect("corrupt event"),
+        )
+        .expect("append corrupt event");
+    let corrupt = load_subagent_model_policy(&corrupt_pool, corrupt_session)
+        .expect_err("a corrupt durable policy must block the session");
+    assert!(corrupt.contains("digest is invalid"), "{corrupt}");
+
+    let duplicate_session = "ses_subagent_policy_duplicate";
+    let duplicate_pool = subagent_policy_fixture(duplicate_session);
+    let policy = zuno_tools::task::SubagentModelPolicy::default();
+    let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&duplicate_pool));
+    for _ in 0..2 {
+        events
+            .append(
+                duplicate_session,
+                subagent_model_policy_event(&policy).expect("policy event"),
+            )
+            .expect("append duplicate policy event");
+    }
+    let duplicate = load_subagent_model_policy(&duplicate_pool, duplicate_session)
+        .expect_err("multiple immutable policy snapshots must block the session");
+    assert!(duplicate.contains("multiple durable subagent model policies"));
 }
 
 #[test]
