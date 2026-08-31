@@ -3,7 +3,10 @@ mod support;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use zuno_pty::{BackgroundExecutionId, BackgroundExecutionService, BackgroundExecutionStatus};
+use zuno_pty::{
+    BackgroundExecutionId, BackgroundExecutionPurpose, BackgroundExecutionService,
+    BackgroundExecutionStatus,
+};
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext};
 use zuno_tools::shell::ShellParams;
 use zuno_tools::timeout::{MAX_FOREGROUND_TIMEOUT_MS, normalize_foreground_timeout};
@@ -25,6 +28,7 @@ fn params(command: impl Into<String>, timeout: Option<u64>) -> ShellParams {
         timeout,
         workdir: None,
         background: false,
+        background_purpose: BackgroundExecutionPurpose::Command,
         expected_git_head: None,
     }
 }

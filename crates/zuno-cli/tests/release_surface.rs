@@ -835,7 +835,7 @@ fn the_release_matrix_builds_every_target_the_project_ships() {
     let expected: BTreeSet<String> = RELEASE_TARGETS.iter().map(|t| (*t).to_owned()).collect();
     assert_eq!(
         built, expected,
-        "release.yml's `build` matrix does not name exactly the six shipped targets"
+        "release.yml's `build` matrix does not name exactly the five shipped targets"
     );
 }
 
@@ -873,6 +873,77 @@ fn every_built_target_is_also_smoke_tested() {
 }
 
 #[test]
+fn release_toolchains_are_installed_once_and_reused_by_smoke_drivers() {
+    let text = workflow("release.yml");
+    let version = job_body(&text, "version").join("\n");
+    assert!(
+        !version.contains("dtolnay/rust-toolchain") && !version.contains("cargo metadata"),
+        "the version resolver must read Cargo.toml without installing Rust:\n{version}"
+    );
+    for required in ["awk '", "workspace\\.package", "Cargo.toml"] {
+        assert!(
+            version.contains(required),
+            "the toolchain-free version resolver is missing {required:?}:\n{version}"
+        );
+    }
+
+    let build = job_body(&text, "build").join("\n");
+    assert_eq!(
+        build.matches("dtolnay/rust-toolchain@").count(),
+        1,
+        "each build matrix leg must install Rust exactly once"
+    );
+    assert_eq!(
+        build
+            .matches("name: Install MSVC build tools (Windows container)")
+            .count(),
+        1,
+        "the Windows build leg must install MSVC exactly once"
+    );
+    for required in [
+        "Build the smoke driver (zigbuild)",
+        "Build the smoke driver (native)",
+        "name: smoke-${{ matrix.target }}",
+        "path: smoke/*",
+    ] {
+        assert!(
+            build.contains(required),
+            "the build job does not prepare the reusable smoke driver field {required:?}"
+        );
+    }
+
+    let smoke = job_body(&text, "smoke").join("\n");
+    for forbidden in [
+        "dtolnay/rust-toolchain@",
+        "Install MSVC build tools",
+        "Swatinem/rust-cache@",
+        "cargo build --locked",
+        "cargo zigbuild --locked",
+    ] {
+        assert!(
+            !smoke.contains(forbidden),
+            "the smoke job repeats build toolchain work {forbidden:?}:\n{smoke}"
+        );
+    }
+    for required in [
+        "name: smoke-${{ matrix.target }}",
+        "path: smoke",
+        "./smoke/zuno-smoke",
+        ".\\smoke\\zuno-smoke.exe",
+        "--cassette-root \"$GITHUB_WORKSPACE/packaging/smoke/cassettes\"",
+        "--models \"$GITHUB_WORKSPACE/crates/zuno-llm/tests/fixtures/models-dev-pinned.json\"",
+        "--cassette-root \"$env:GITHUB_WORKSPACE\\packaging\\smoke\\cassettes\"",
+        "--models \"$env:GITHUB_WORKSPACE\\crates\\zuno-llm\\tests\\fixtures\\models-dev-pinned.json\"",
+    ] {
+        assert!(
+            smoke.contains(required),
+            "the smoke job does not consume the reusable driver correctly; missing \
+             {required:?}"
+        );
+    }
+}
+
+#[test]
 fn every_codebuild_job_has_a_unique_label_set() {
     // Was 11 when only Linux jobs ran on CodeBuild. The four non-Linux release
     // legs that used to sit on GitHub-hosted runners are now two macOS build legs,
@@ -880,10 +951,12 @@ fn every_codebuild_job_has_a_unique_label_set() {
     // more routed jobs, less the two `aarch64-pc-windows-msvc` legs that were
     // dropped because no CodeBuild machine can execute that artifact.
     //
-    // 18 since the `release_please` job became the entry point of the automated
-    // release path. It runs on CodeBuild like every other Linux job, so it carries a
-    // routing label set of its own.
-    const EXPECTED_MIGRATED_JOBS: usize = 18;
+    // 17 after the seven-second supply-chain check moved into the existing `test`
+    // job. Release still has separate build and execution legs because the
+    // aarch64 Linux artifact crosses from the x86_64 build machine to a native ARM
+    // runner, but the smoke legs consume precompiled drivers and install no Rust
+    // or MSVC toolchain.
+    const EXPECTED_MIGRATED_JOBS: usize = 17;
 
     let workflows = [
         ("ci.yml", workflow("ci.yml")),
@@ -939,6 +1012,41 @@ fn every_codebuild_job_has_a_unique_label_set() {
         2,
         "both release matrices must select their per-entry label arrays"
     );
+}
+
+#[test]
+fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
+    let text = workflow("ci.yml");
+    let trigger_region = text
+        .split_once("\njobs:")
+        .map(|(before_jobs, _)| before_jobs)
+        .expect("ci.yml declares jobs");
+    assert!(
+        trigger_region
+            .lines()
+            .all(|line| line.trim_end() != "push:"),
+        "ci.yml still runs on the protected main merge commit and duplicates the \
+         pull-request result"
+    );
+    for required in ["pull_request:", "workflow_dispatch:"] {
+        assert!(
+            trigger_region.lines().any(|line| line.trim() == required),
+            "ci.yml is missing the {required} trigger"
+        );
+    }
+
+    let jobs = job_names(&text);
+    assert!(
+        !jobs.contains("supply-chain"),
+        "the seven-second supply-chain check still starts a separate Rust runner"
+    );
+    let test = job_body(&text, "test").join("\n");
+    for required in ["tool: cargo-deny", "cargo deny --all-features check"] {
+        assert!(
+            test.contains(required),
+            "the consolidated test job lost the supply-chain gate {required:?}"
+        );
+    }
 }
 
 /// The release path must not depend on a GitHub-hosted runner.

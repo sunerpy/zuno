@@ -5,9 +5,9 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 use zuno_pty::{
-    BUFFER_LIMIT, BackgroundExecutionId, BackgroundExecutionInput, BackgroundExecutionRetention,
-    BackgroundExecutionService, BackgroundExecutionStatus, MAX_RETAINED_TERMINAL_EXECUTIONS,
-    ReplayCursor,
+    BUFFER_LIMIT, BackgroundExecutionId, BackgroundExecutionInput, BackgroundExecutionPurpose,
+    BackgroundExecutionRetention, BackgroundExecutionService, BackgroundExecutionStatus,
+    MAX_RETAINED_TERMINAL_EXECUTIONS, ReplayCursor,
 };
 use zuno_sandbox::{
     NetworkAccess, PrepareRequest, PreparedCommand, SandboxCapabilities, SandboxMode, SandboxPolicy,
@@ -55,6 +55,7 @@ fn input(
         session_id: "ses_background".to_owned(),
         title: command.clone(),
         command,
+        purpose: BackgroundExecutionPurpose::Command,
         hard_ceiling,
         retention: BackgroundExecutionRetention::Durable,
     }
@@ -255,6 +256,28 @@ async fn terminal_retention_removes_the_oldest_state_and_both_files() {
     );
 }
 
+#[tokio::test]
+async fn remote_observer_purpose_survives_terminal_persistence_and_reopen() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let service = BackgroundExecutionService::open(directory.path()).expect("background service");
+    let mut observer = input(directory.path(), "printf observed", Duration::from_secs(2));
+    observer.purpose = BackgroundExecutionPurpose::RemoteObserver;
+    let started = service.start(observer).expect("observer starts");
+    let settled = service
+        .wait(&started.id, None)
+        .await
+        .expect("observer settles")
+        .info;
+    assert_eq!(settled.purpose, BackgroundExecutionPurpose::RemoteObserver);
+    drop(service);
+
+    let reopened =
+        BackgroundExecutionService::open(directory.path()).expect("background service reopens");
+    let restored = reopened.get(&started.id).expect("observer is restored");
+    assert_eq!(restored.purpose, BackgroundExecutionPurpose::RemoteObserver);
+    assert!(restored.purpose.requires_authoritative_refresh());
+}
+
 #[test]
 fn persisted_running_state_reconciles_to_uncertain_without_replay() {
     let directory = tempfile::tempdir().expect("workspace");
@@ -294,6 +317,11 @@ fn persisted_running_state_reconciles_to_uncertain_without_replay() {
     let info = service.get(&id).expect("recovered execution");
 
     assert_eq!(info.status, BackgroundExecutionStatus::Uncertain);
+    assert_eq!(
+        info.purpose,
+        BackgroundExecutionPurpose::Command,
+        "older format-3 rows without purpose must retain ordinary command semantics"
+    );
     assert_eq!(info.authority.schema_version, 3);
     assert_eq!(info.authority.requested_mode(), SandboxMode::WorkspaceWrite);
     assert_eq!(info.output_file, output_file);
@@ -372,6 +400,7 @@ fn persisted_v2_authority_recovers_with_requested_equal_to_effective() {
         info.authority.resolution_kind,
         zuno_sandbox::SandboxResolutionKind::Legacy
     );
+    assert_eq!(info.purpose, BackgroundExecutionPurpose::Command);
 }
 
 async fn wait_for_file(path: &Path) {

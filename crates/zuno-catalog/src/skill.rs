@@ -927,6 +927,7 @@ mod tests {
                 "deepwork",
                 "codemap",
                 "verification-planning",
+                "github-delivery",
                 "ui-design"
             ]
         );

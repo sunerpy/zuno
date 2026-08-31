@@ -1,6 +1,6 @@
 # Harness design comparison
 
-Status: 2026-08-27.
+Status: 2026-08-31.
 
 This document records which ideas Zuno adopts from other agent harnesses. The source projects are references, not runtime compatibility targets.
 
@@ -8,6 +8,8 @@ This document records which ideas Zuno adopts from other agent harnesses. The so
 
 - [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 - [OpenAI Codex](https://github.com/openai/codex)
+- [Codex GitHub Action guidance](https://learn.chatgpt.com/docs/github-action)
+- [Codex non-interactive mode guidance](https://learn.chatgpt.com/docs/non-interactive-mode)
 - [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
 - [pi-agent in pi-mono](https://github.com/badlogic/pi-mono)
 - [OpenCode](https://github.com/sst/opencode)
@@ -111,6 +113,16 @@ longer repository procedure and runs shared gates after cohesive commit
 batches. Runtime permissions, durability, and verification remain authoritative
 if model guidance is ignored.
 
+Codex's CI guidance also separates repository-owned prompts and read-only
+analysis from credentialed writes, uses least-privilege permissions, retains
+machine-readable output or patch artifacts, and treats the write job as a
+separate gate. Zuno adapts that method in the on-demand `github-delivery` Skill.
+The runtime contributes one additional durable invariant: a remote observer is a
+typed background purpose. Its local process result can wake the parent, but only
+a fresh query of the remote run/ref plus required job and artifact evidence can
+complete the owning Plan gate. A green summary with skipped or absent required
+work remains unverified.
+
 The directly selectable `deep` mode also adapts the outcome-oriented discipline
 in Codex's base instructions at `openai/codex@e9a446d`: inspect before guessing,
 fix root causes with focused changes, continue until the requested outcome is
@@ -175,6 +187,7 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | Stable client projections | adopt | cursor replay plus snapshots shared by TUI/server/ACP/future GUI |
 | Goal persistence | adopt and extend | separate goal DB, typed recovery reason, persisted exponential backoff |
 | Concise agent and tool prompt contracts | adapt | Evidence-oriented role contracts, explicit delegation ownership, bounded edit/write fallback, goal terminal audits, cancellable question semantics, and byte-pinned tool descriptions |
+| GitHub, Actions, and release delivery guidance | adapt | On-demand `github-delivery` Skill, typed `remoteObserver` background purpose, authoritative run/ref refresh, strict required-job conclusions, least-privilege workflow guidance, and exact artifact/checksum evidence |
 | Durable memory extraction and consolidation | adapt | Per-session delivered-turn cadence, isolated small-model review with the resident snapshot, and audited add/replace/remove candidates instead of direct model-owned file rewrites |
 | Tool replay after failure | adapt | `Never` by default; explicit `Safe` only for read-only/idempotent tools |
 | Codex and Claude Code product subagents | adapt | Native app-server/stream-json providers, static configured tools, durable jobs, explicit cancellation, and uncertain non-replay |

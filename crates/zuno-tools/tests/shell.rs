@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use zuno_error::ToolError;
 use zuno_permission::{PermissionAction, Rule, evaluate};
+use zuno_pty::BackgroundExecutionPurpose;
 use zuno_tool::{
     ACCEPT_LARGE_OUTPUT_KEY, AllowAll, InterruptHandle, NeverInterrupted, Tool, ToolContext,
 };
@@ -60,6 +61,7 @@ fn params(command: impl Into<String>) -> ShellParams {
         timeout: None,
         workdir: None,
         background: false,
+        background_purpose: BackgroundExecutionPurpose::Command,
         expected_git_head: None,
     }
 }
@@ -185,12 +187,34 @@ fn shell_description_bounds_git_apply_and_defines_non_destructive_recovery() {
         "`--3way` or `--reject`",
         "`git reset --hard`",
         "`git checkout --`",
+        "`backgroundPurpose: \"remoteObserver\"`",
+        "re-query the authoritative remote state by stable identifier",
     ] {
         assert!(
             description.contains(clause),
             "shell description is missing `{clause}`:\n{description}"
         );
     }
+}
+
+#[test]
+fn shell_schema_exposes_the_typed_remote_observer_purpose() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let tool = support::sandbox::shell_tool(workspace.path());
+    let definition = tool.definition();
+    let schema = definition.parameters.to_string();
+
+    assert!(
+        definition.parameters["properties"]
+            .get("backgroundPurpose")
+            .is_some(),
+        "Shell omitted the backgroundPurpose field: {}",
+        definition.parameters
+    );
+    assert!(
+        schema.contains("remoteObserver"),
+        "Shell did not publish the typed remoteObserver value: {schema}"
+    );
 }
 
 #[test]
@@ -381,6 +405,29 @@ async fn shell_background_mode_returns_before_the_command_finishes() {
     assert_eq!(output.title, command);
     assert_eq!(output.metadata["shell"], "sh");
     assert_eq!(output.metadata["background"], true);
+    assert_eq!(output.metadata["background_purpose"], "command");
+    assert_eq!(output.metadata["requires_authoritative_refresh"], false);
+    wait_for_file(&marker).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_marks_remote_observers_for_authoritative_refresh_after_wake() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let marker = dir.path().join("observer-finished");
+    let command = format!("sleep 0.05; touch '{}'", marker.display());
+    let mut input = params(command);
+    input.background = true;
+    input.background_purpose = BackgroundExecutionPurpose::RemoteObserver;
+    let tool = support::sandbox::configured_shell_tool(dir.path(), Some("/bin/sh"));
+
+    let output = tool
+        .run(input, context(Arc::new(zuno_tool::NeverInterrupted)))
+        .await
+        .expect("remote observer starts");
+
+    assert_eq!(output.metadata["background_purpose"], "remoteObserver");
+    assert_eq!(output.metadata["requires_authoritative_refresh"], true);
     wait_for_file(&marker).await;
 }
 

@@ -840,6 +840,10 @@ pub(crate) trait ChildTurnObserver: Send + Sync + 'static {
 #[async_trait]
 pub(crate) trait DetachedTurnObserver: Send + Sync + 'static {
     async fn event(&self, session_id: &str, event: &TurnEvent);
+
+    /// Publishes the authoritative durable work projection after every detached
+    /// event has drained. Projection remains best-effort and never owns the turn.
+    async fn work_state(&self, _session_id: &str, _work: &zuno_types::WorkStateProjection) {}
 }
 
 #[async_trait]
@@ -2159,8 +2163,20 @@ async fn drive_detached_and_drain(
         drop(sender);
         outcome
     };
-    let drain = forward_detached_events(session_id.to_owned(), receiver, observer);
+    let drain = forward_detached_events(session_id.to_owned(), receiver, observer.clone());
     let (outcome, ()) = tokio::join!(drive, drain);
+    if let Some(observer) = observer {
+        match host.work_state() {
+            Ok(work) => observer.work_state(session_id, &work).await,
+            Err(error) => {
+                tracing::debug!(
+                    session_id,
+                    %error,
+                    "failed to read final detached turn work state for projection"
+                );
+            }
+        }
+    }
     outcome
 }
 

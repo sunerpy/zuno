@@ -215,6 +215,8 @@ fn render_info(info: BackgroundExecutionInfo) -> Value {
         "sessionID": info.session_id,
         "title": info.title,
         "command": info.command,
+        "purpose": info.purpose.as_str(),
+        "requiresAuthoritativeRefresh": info.purpose.requires_authoritative_refresh(),
         "cwd": info.cwd,
         "status": info.status.as_str(),
         "pid": info.pid,

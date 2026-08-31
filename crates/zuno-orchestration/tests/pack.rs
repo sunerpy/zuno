@@ -5,7 +5,7 @@ use zuno_orchestration::{
     COUNCILS, PACK_ID, PACK_VERSION, SKILLS, council, councils, pack, skill, skills,
 };
 
-const EXPECTED_NAMES: [&str; 9] = [
+const EXPECTED_NAMES: [&str; 10] = [
     "customize-zuno",
     "develop-zuno",
     "deepwork",
@@ -14,6 +14,7 @@ const EXPECTED_NAMES: [&str; 9] = [
     "reflect",
     "worktree",
     "git-workflow",
+    "github-delivery",
     "ui-design",
 ];
 
@@ -209,6 +210,7 @@ fn focused_workflow_skills_stay_within_their_prompt_budgets() {
     for (name, minimum, maximum) in [
         ("deepwork", 80, 110),
         ("git-workflow", 120, 155),
+        ("github-delivery", 180, 245),
         ("verification-planning", 80, 105),
     ] {
         let entry = skill(name).expect("skill descriptor");
@@ -257,9 +259,39 @@ fn git_workflow_batches_commit_preparation_instead_of_rechecking_every_hunk() {
 }
 
 #[test]
+fn github_delivery_requires_machine_readable_remote_and_release_evidence() {
+    let workflow = skill("github-delivery").expect("github-delivery descriptor");
+    for clause in [
+        "separate authorized side effects",
+        "machine-readable state",
+        "every required job must actually conclude `success`",
+        "full-SHA action pins",
+        "separate gated job",
+        "`background: true`",
+        "`backgroundPurpose: \"remoteObserver\"`",
+        "re-query authoritative",
+        "run/attempt or ref",
+        "built from the exact ref",
+        "consumer-facing install",
+        "Never convert a planned",
+    ] {
+        assert!(
+            workflow.content.contains(clause),
+            "github-delivery is missing `{clause}`:\n{}",
+            workflow.content
+        );
+    }
+    assert!(workflow.provenance.inspiration.contains("OpenAI Codex"));
+    assert_eq!(workflow.required_tools, &["read"]);
+    assert!(workflow.allowed_profiles.contains(&"plan"));
+    assert!(workflow.allowed_profiles.contains(&"build"));
+}
+
+#[test]
 fn reusable_design_method_is_a_skill_but_product_workflows_remain_user_owned() {
     assert!(skill("dual-review").is_none());
     assert!(skill("auto-release").is_none());
+    assert!(skill("github-delivery").is_some());
     let design = skill("ui-design").expect("ui-design descriptor");
     assert!(design.required_tools.contains(&"read"));
     assert!(design.required_tools.contains(&"skill"));

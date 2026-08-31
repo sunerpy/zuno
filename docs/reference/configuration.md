@@ -845,9 +845,10 @@ continued turn. Required names resolve only after profile and Agent visibility
 filtering and must identify one source; missing and ambiguous names fail child
 startup.
 
-Zuno also compiles nine original first-party Skills into the
+Zuno also compiles ten original first-party Skills into the
 `zuno-orchestration` pack: `customize-zuno`, `develop-zuno`, `deepwork`, `codemap`,
-`verification-planning`, `reflect`, `worktree`, `git-workflow`, and `ui-design`.
+`verification-planning`, `reflect`, `worktree`, `git-workflow`, `github-delivery`, and
+`ui-design`.
 Each has a stable
 `builtin://zuno-orchestration/...` source, content hash, provenance, allowed
 Agent profiles, and required-tool declaration. The active profile and its

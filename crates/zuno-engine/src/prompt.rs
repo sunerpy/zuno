@@ -187,10 +187,13 @@ impl RuntimePromptPolicy {
                  pending work.",
             );
         }
-        if has("bg") {
+        if has("bg") && has("shell") {
             execution.push_str(
-                " Use one background process for async work; its durable report resumes the \
-                 session. Never overlap watchers or poll loops.",
+                " Use one durable background process for async work; prose that you are waiting is \
+                 not state. Start a remote observer with Shell `background: true` and \
+                 `backgroundPurpose: remoteObserver`; terminal status only wakes this session. \
+                 Inspect `bg`, then re-query authoritative remote state by stable ID or ref before \
+                 completion. Never overlap watchers or poll loops.",
             );
         }
 
@@ -217,17 +220,24 @@ impl RuntimePromptPolicy {
                  before retrying any side effect whose outcome is uncertain.",
             ));
         }
-        sections.push(RuntimePromptSection::new(
-            "runtime.verification",
-            if tools.is_empty() {
-                "Do not declare completion from intent or plausibility. Report the evidence you \
+        let mut verification = String::from(if tools.is_empty() {
+            "Do not declare completion from intent or plausibility. Report the evidence you \
                  could inspect, identify what remains unverified, and state any blocker explicitly."
-            } else {
-                "Do not declare completion from intent, a patch, one narrow check, or another \
+        } else {
+            "Do not declare completion from intent, a patch, one narrow check, or another \
                  Agent's claim. Verify the requested behavior and recovery path. Evidence applies \
                  only to the exact artifact and inputs inspected; if they change, append a Plan \
                  gate and verify again. State blockers."
-            },
+        });
+        if has("shell") {
+            verification.push_str(
+                " For CI, overall success does not prove skipped, cancelled, or absent required \
+                 children ran unless policy marks them optional.",
+            );
+        }
+        sections.push(RuntimePromptSection::new(
+            "runtime.verification",
+            verification,
         ));
         if can_delegate {
             let targets = self.delegation_targets.as_ref().map(|targets| {
@@ -945,6 +955,26 @@ mod tests {
             "asynchronous commands must keep one durable observer"
         );
         assert!(
+            text.contains("backgroundPurpose") && text.contains("remoteObserver"),
+            "remote workflow observers need an explicit typed completion contract"
+        );
+        assert!(
+            text.contains("background: true"),
+            "a durable remote observer must explicitly use background execution"
+        );
+        assert!(
+            text.contains("terminal status only wakes this session"),
+            "a local observer exit must not be treated as authoritative remote completion"
+        );
+        assert!(
+            text.contains("re-query authoritative remote state by stable ID or ref"),
+            "a resumed turn must refresh the remote system before declaring completion"
+        );
+        assert!(
+            text.contains("skipped, cancelled, or absent required children ran"),
+            "workflow-level success must not hide unexecuted required work"
+        );
+        assert!(
             text.contains("Before a substantial tool batch"),
             "tool-capable turns must keep the user informed before material work"
         );
@@ -967,7 +997,7 @@ mod tests {
             .map(|section| section.content().len().div_ceil(4))
             .sum::<usize>();
         assert!(
-            estimated_tokens <= 700,
+            estimated_tokens <= 800,
             "runtime policy consumed {estimated_tokens} estimated tokens"
         );
 
@@ -986,6 +1016,21 @@ mod tests {
             read_only
                 .iter()
                 .all(|section| section.id() != "runtime.persistence")
+        );
+        let read_only_text = read_only
+            .iter()
+            .map(RuntimePromptSection::content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!read_only_text.contains("backgroundPurpose"));
+        assert!(!read_only_text.contains("absent required children"));
+
+        let bg_only = policy.sections(["bg"], false);
+        assert!(
+            bg_only
+                .iter()
+                .all(|section| !section.content().contains("backgroundPurpose")),
+            "a bg-only surface must not describe an unavailable Shell argument"
         );
 
         let no_tools = policy.sections(std::iter::empty::<&str>(), false);

@@ -38,6 +38,13 @@ arguments, cancellation, bounded decoding, and stable ordering. Ripgrep 14 or ne
 be available; a missing one is a startup error for the tool runtime rather than a silent
 fallback to a slower walker.
 
+For a Shell command that only observes remote work, set
+`backgroundPurpose: "remoteObserver"`. This value is persisted with the background
+execution and projected through `bg` and the durable completion input. It does not
+change permissions or make the remote system part of the local process result; it
+requires the resumed Agent to refresh authoritative remote state before claiming that a
+CI run, deployment, or release completed.
+
 ## Effect classification
 
 Every invocation classifies as one of four effects, and the default is the strict one:

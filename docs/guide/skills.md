@@ -92,9 +92,9 @@ cannot shadow a runtime control such as `/compact` or `/plan`.
 
 ## Built-in Skills
 
-Zuno compiles nine first-party Skills into the `zuno-orchestration` pack:
+Zuno compiles ten first-party Skills into the `zuno-orchestration` pack:
 `customize-zuno`, `develop-zuno`, `deepwork`, `codemap`, `verification-planning`,
-`reflect`, `worktree`, `git-workflow`, and `ui-design`.
+`reflect`, `worktree`, `git-workflow`, `github-delivery`, and `ui-design`.
 
 Each has a stable `builtin://zuno-orchestration/...` source, a content hash, provenance,
 allowed agent profiles, and a required-tool declaration. They are compiled into the
@@ -104,6 +104,12 @@ ambiguity instead.
 
 The active profile and its declared tool visibility filter the advertised set. Selecting a
 Skill can never widen the runtime capability snapshot.
+
+`github-delivery` is the generic remote-delivery method: exact commit/ref identity,
+machine-readable Actions state, least-privilege workflow authoring, one durable remote
+observer, required-job conclusions, artifact/checksum evidence, and consumer smoke tests.
+It deliberately does not encode a repository's branch, approval, signing, or versioning
+policy.
 
 ## Skills in delegated turns
 

@@ -6,7 +6,8 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use zuno_pty::{
-    BackgroundExecutionInput, BackgroundExecutionRetention, BackgroundExecutionService,
+    BackgroundExecutionInput, BackgroundExecutionPurpose, BackgroundExecutionRetention,
+    BackgroundExecutionService,
 };
 use zuno_tool::{AllowAll, NeverInterrupted, ToolContext, ToolEffect, ToolReplayPolicy, TypedTool};
 use zuno_tools::{BackgroundAction, BackgroundParams, BackgroundTool};
@@ -28,6 +29,7 @@ fn input(directory: &std::path::Path, session_id: &str, command: &str) -> Backgr
         session_id: session_id.to_owned(),
         title: command.to_owned(),
         command: command.to_owned(),
+        purpose: BackgroundExecutionPurpose::Command,
         hard_ceiling: Duration::from_secs(5),
         retention: BackgroundExecutionRetention::Durable,
     }
@@ -38,13 +40,9 @@ async fn list_output_wait_and_cancel_share_one_execution() {
     let directory = tempfile::tempdir().expect("workspace");
     let service =
         Arc::new(BackgroundExecutionService::open(directory.path()).expect("background service"));
-    let execution = service
-        .start(input(
-            directory.path(),
-            "ses_owner",
-            "printf started; sleep 30",
-        ))
-        .expect("background command");
+    let mut observer = input(directory.path(), "ses_owner", "printf started; sleep 30");
+    observer.purpose = BackgroundExecutionPurpose::RemoteObserver;
+    let execution = service.start(observer).expect("background command");
     let tool = BackgroundTool::new(Arc::clone(&service));
 
     let listed = tool
@@ -60,6 +58,12 @@ async fn list_output_wait_and_cancel_share_one_execution() {
         .await
         .expect("list");
     assert!(listed.output.contains(execution.id.as_str()));
+    assert!(listed.output.contains("\"purpose\": \"remoteObserver\""));
+    assert!(
+        listed
+            .output
+            .contains("\"requiresAuthoritativeRefresh\": true")
+    );
 
     let hidden = tool
         .run(

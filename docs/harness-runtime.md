@@ -53,10 +53,10 @@ The generated developer instructions use stable ids and sources:
 | section | purpose | presence |
 | --- | --- | --- |
 | `runtime.intent` | Follow the current user request or delegated objective without inventing broader authority. | Always. |
-| `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, use one durable background observer for asynchronous work, and stop once evidence is complete. | Always; tool communication and termination guidance are added only when tools exist, Plan guidance only when `plan_update` exists, and background guidance only when `bg` exists. |
+| `runtime.execution` | Choose the smallest coherent workflow, batch independent reads, avoid unchanged re-reads or repeated checks, use one durable background observer for asynchronous work, distinguish a local observer exit from remote completion, and stop once evidence is complete. | Always; tool communication and termination guidance are added only when tools exist, Plan guidance only when `plan_update` exists, and background-start guidance only when both `shell` and `bg` exist. |
 | `runtime.sandbox` | State that Shell is using host authority, including requested/effective mode and the typed reason that confinement was unavailable. | Only while a trusted unavailable-sandbox fallback is active. |
 | `runtime.editing` | Preserve unrelated changes, edit the owning abstraction, and inspect uncertain side effects before retry. | Only when an effective edit/write surface or workspace-writing Shell exists. |
-| `runtime.verification` | Require observed evidence scoped to the exact artifact and inputs, and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available. |
+| `runtime.verification` | Require observed evidence scoped to the exact artifact and inputs, reject overall workflow success that hides unexecuted required children, and disclose blockers or unverified claims. | Always, with wording adjusted when no tools are available and child-workflow guidance added when Shell exists. |
 | `runtime.delegation` | Require bounded non-overlapping delegation and durable result reconciliation. | Only when `task` and at least one valid target are effective. |
 | `runtime.persistence` | Treat Goal, Plan, Todo, inbox, and Job state as authoritative continuation state, including host-owned Job-to-Plan links. | When durable work state is active or its tools are effective. |
 
@@ -64,6 +64,26 @@ Each section is recorded with source `zuno-runtime:<section-id>`, exact content,
 estimated tokens, and a SHA-256 digest. A prompt cannot describe an editor,
 delegation target, or durable-state tool that was removed by role policy,
 allowlists, permission visibility, a provider capability, or a request hook.
+
+Remote delivery guidance is split along the same ownership boundary. The
+`github-delivery` Skill carries GitHub-, Actions-, artifact-, and release-specific
+method only when relevant. The runtime owns the generic safety contract: a Shell
+command that only observes remote work uses `background: true` with
+`backgroundPurpose: "remoteObserver"`. Its durable terminal report wakes the
+session, but does not prove the remote workflow or release succeeded. The
+resumed turn must inspect the retained output and re-query authoritative remote
+state by a stable run, attempt, ref, or release identifier. Required child jobs
+that were skipped, cancelled, missing, or never expanded are not execution
+evidence unless an explicit repository policy marks them optional.
+
+This adapts the official Codex
+[GitHub Action](https://learn.chatgpt.com/docs/github-action) and
+[non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)
+guidance: repository-owned prompts, least privilege, machine-readable output,
+retained artifacts, and separation between read-only analysis and credentialed
+writes. Zuno keeps organization-specific branch, approval, signing, and release
+policy in repository instructions or user Skills rather than compiling an
+`auto-release` workflow.
 
 After request hooks, runtime context, replayed history, attachments, and the
 final tool schemas have been applied, the engine estimates the complete
@@ -763,7 +783,10 @@ Detached turns use the same engine events as request-owned turns. TUI routes roo
 events back to the mounted transcript, ACP sends ordinary root
 `session/update` notifications, and the HTTP server commits and fans out the
 same durable event projection. Child-session events retain their child observer.
-No client owns a private continuation loop.
+After the detached event stream drains, ACP reads the authoritative work state
+from the host and sends the root session's final durable Plan projection when a
+Plan exists. This terminal projection is best-effort and cannot change the
+already committed turn outcome. No client owns a private continuation loop.
 
 Interactive TUI input uses the same durable boundary. When idle, `Enter`
 starts a turn. During an active turn, `Enter` admits a FIFO `queue` item for the

@@ -672,6 +672,26 @@ impl DetachedTurnObserver for AcpDetachedTurnObserver {
             children.event(session_id, event);
         }
     }
+
+    async fn work_state(&self, session_id: &str, work: &zuno_types::WorkStateProjection) {
+        if !self
+            .root_session_id
+            .get()
+            .is_some_and(|root| root == session_id)
+        {
+            return;
+        }
+        let Some(update) = zuno_acp::durable_plan_update(work) else {
+            return;
+        };
+        if let Err(error) = self.client.session_update(session_id, update).await {
+            tracing::debug!(
+                session_id,
+                %error,
+                "detached root turn outlived its final ACP plan projection"
+            );
+        }
+    }
 }
 
 impl AcpSurfaceContext {
