@@ -168,9 +168,11 @@ the compatible transport's 120-second idle default. Set `headerTimeout: false`
 only when the endpoint has an authoritative upstream deadline and an unbounded
 header wait is intentional.
 
-These transport limits are independent from provider retry recovery. Zuno starts
-the retry recovery budget only after a retryable provider failure; it never uses
-that budget to terminate the first request or an active replay. Current
+These transport limits are independent from provider retry recovery. Zuno anchors
+the retry recovery deadline when the original provider request starts. The
+original request remains governed by its transport and stream-idle policies, but
+rollback, jittered backoff, and every replacement attempt must complete before
+that absolute deadline; an active replay is cancelled when it expires. Current
 `kiro-provider` preserves consecutive all-text blocks in its
 canonical request and concatenates them byte-for-byte with no inserted separator
 only at Kiro's scalar text boundary. Do not set

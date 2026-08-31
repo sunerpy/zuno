@@ -90,8 +90,9 @@ pub struct GoalPauseState {
 pub enum InteractionPolicy {
     /// A Plan turn may ask ordinary clarifying questions.
     PlanClarification,
-    /// Non-Goal work may ask ordinary on-demand questions.
-    WorkOnDemand,
+    /// Non-Goal work proceeds autonomously and asks a direct turn-boundary
+    /// question only when no safe in-scope default exists.
+    WorkAutonomous,
     /// Active Goal work may only create a durable Goal request and yield.
     GoalAutonomous,
     /// A child agent reports blockers to its parent instead of contacting a user.
@@ -102,7 +103,7 @@ impl InteractionPolicy {
     /// Whether the ordinary synchronous `question` tool may be registered.
     #[must_use]
     pub const fn allows_question(self) -> bool {
-        matches!(self, Self::PlanClarification | Self::WorkOnDemand)
+        matches!(self, Self::PlanClarification)
     }
 
     /// Whether `goal_request_input` may be registered.
@@ -131,6 +132,7 @@ mod tests {
         assert!(InteractionPolicy::GoalAutonomous.allows_goal_request_input());
         assert!(!InteractionPolicy::GoalAutonomous.allows_question());
         assert!(InteractionPolicy::PlanClarification.allows_question());
+        assert!(!InteractionPolicy::WorkAutonomous.allows_question());
         assert!(!InteractionPolicy::SubagentReportOnly.allows_question());
     }
 }

@@ -67,14 +67,15 @@ Write-capable Agents receive workspace write authority only under
 `workspace-write`; Git metadata remains protected unless the specific command
 passes the separate Git mutation authorization.
 
-`permission.mode: "allow_all"` skips every Zuno tool-approval prompt without
-changing sandbox mode. TUI `--auto` remains narrower and cannot satisfy a
-human-only request. Selecting `danger-full-access` intentionally combines native
-host execution with an effective permission mode of `allow_all`, so Zuno does
-not open approval cards in TUI, ACP, server, or headless surfaces. Explicit
-permission denies and the Shell risk gate's catastrophic hard denials remain
-terminal; they fail directly instead of asking. Structured user questions are
-not approvals and may still be shown.
+`permission.mode: "allow_all"` skips Zuno tool-approval prompts without changing
+sandbox mode, including confirmable Shell-risk asks. TUI `--auto` remains narrower
+and cannot satisfy a human-only request. Selecting `danger-full-access`
+intentionally combines native host execution with an effective permission mode
+of `allow_all`. Explicit permission denies, Git history freshness guards,
+force-push lease requirements, and the Shell risk gate's catastrophic hard
+denials remain terminal. Structured questions are not approvals and are exposed
+only in Plan; ordinary Work asks directly at the turn boundary only when no safe
+default exists.
 
 Confined macOS and Windows modes currently return a typed unsupported-platform
 error. They do not register Shell under the default `deny`; trusted

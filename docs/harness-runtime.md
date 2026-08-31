@@ -599,11 +599,12 @@ identity, credentials, or upstream account and conversation identifiers.
 ### Provider timeout and retry boundaries
 
 An active provider request and recovery after a failed request are separate
-lifecycles. The retry recovery budget starts when the first retryable provider
-failure is observed. It bounds rollback emission, backoff, and admission of a
-later replay, but never interrupts the first request or an already-running
-replay. Cancellation continues to interrupt either operation through the turn's
-control signal.
+lifecycles under one absolute recovery deadline. The deadline is anchored when
+the initial request starts. That initial request remains governed by its
+transport and stream-idle policies, but rollback emission, jittered backoff, and
+every later replay must complete before the deadline. Expiry cancels an active
+replay and persists a typed attempt failure. User cancellation continues to
+interrupt either operation through the turn's control signal.
 
 OpenAI-compatible error frames retain structured stream and protocol codes.
 `upstream_stream_error`, `upstream_stream_incomplete`,
@@ -820,11 +821,14 @@ idempotent transition, so a crash between those operations remains recoverable.
 TUI, server, and ACP re-present pending rows after restart. Their process-local
 channels only wake consumers after durable state exists.
 
-Interaction registration is host policy. Plan and ordinary non-Goal Work may
-receive synchronous `question`; autonomous Goal turns receive only
+Interaction registration is host policy. Plan may receive synchronous
+`question`; ordinary non-Goal Work does not park a tool future and instead
+finishes with one direct question only when evidence and safe reversible defaults
+cannot resolve a material choice. Autonomous Goal turns receive only
 `goal_request_input`; delegated children receive neither and must report their
 blocker to the parent. A headless Goal without a human-request surface does not
-receive a request tool it cannot complete.
+receive a request tool it cannot complete. Permission and destructive-operation
+approval remain separate typed interactions and must occur before the side effect.
 
 The conversation surface separates reply identity from transient work state. The
 identity row contains the resolved agent, catalog model display name, and configured
@@ -981,7 +985,7 @@ the context limit, and the latest accounting mode.
 
 ## Durable goal recovery
 
-An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Before every wait it commits a `provider_retry_backoff` checkpoint with the request id, turn id, failed and next attempt, typed reason, selected delay, and deadline. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. After a process restart, Zuno waits out any remaining checkpoint deadline and starts a new turn and provider request instead of attempting to revive the old transport. If the bounded sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
+An active goal uses two recovery layers. The provider request layer retries a bounded sequence in place and rolls back unpublished partial output before another request. Its absolute recovery deadline is anchored when the original request starts. The original request remains governed by transport and stream-idle limits, while rollback, locally jittered backoff, and every replacement attempt must finish before that deadline; expiry cancels an active replay and persists its attempt as a typed deadline failure. Before every wait Zuno commits a `provider_retry_backoff` checkpoint with the request id, turn id, failed and next attempt, typed reason, selected delay, and wait deadline. Its in-place backoff is interruptible by both hard cancellation and durable live steering; waking it does not replay the stale provider request. After a process restart, Zuno waits out any remaining checkpoint deadline and starts a new turn and provider request instead of attempting to revive the old transport. If the bounded sequence still ends in a recoverable error, the goal controller writes a `goal_retry` row before waiting and starts a fresh agent turn when its persisted deadline arrives. There is no cross-turn retry-count ceiling for recoverable failures: the delay grows exponentially, reaches the configured cap, and the goal remains active until it completes, is paused, reaches its token budget, or encounters a permanent failure.
 
 The retry row is tied to the exact `goal_id` and stores the attempt, typed reason, selected delay, schedule time, and next eligible time. Reopening the same session reconstructs the wait from SQLite. Queued user input has priority over an automatic turn, and long waits are split by `poll_interval_ms` so an interactive surface can notice that input promptly.
 

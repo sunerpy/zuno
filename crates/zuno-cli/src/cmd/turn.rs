@@ -2772,7 +2772,7 @@ impl TurnHost {
             }) {
                 zuno_goal::InteractionPolicy::GoalAutonomous
             } else {
-                zuno_goal::InteractionPolicy::WorkOnDemand
+                zuno_goal::InteractionPolicy::WorkAutonomous
             };
 
             let memory_root = worktree.as_deref().unwrap_or(&plan.directory);

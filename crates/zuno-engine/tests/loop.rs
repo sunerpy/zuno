@@ -3144,6 +3144,92 @@ async fn loop_provider_retry_replaces_malformed_tool_arguments_and_persists_atte
     assert_ne!(attempts[0]["attemptID"], attempts[2]["attemptID"]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn loop_provider_retry_deadline_cancels_and_persists_an_active_replay() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_retry_deadline_user",
+        10,
+        "retry until deadline",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::failed(
+            Vec::new(),
+            ProviderError::Transient {
+                status: Some(503),
+                source: None,
+            },
+        ),
+        ScriptedResponse::hanging(vec![StreamEvent::TextDelta(
+            "discarded replay output".to_owned(),
+        )]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = FakeDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-retry-deadline"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+
+    assert!(matches!(
+        outcome,
+        Err(TurnError::ProviderRetryDeadlineExceeded {
+            attempt: 2,
+            elapsed,
+        }) if elapsed == Duration::from_secs(180)
+    ));
+    assert_eq!(provider.requests().len(), 2);
+    assert!(
+        dispatcher.calls().is_empty(),
+        "discarded replay output must not dispatch a tool"
+    );
+
+    let mut statement = connection
+        .prepare(
+            "SELECT data FROM event \
+             WHERE aggregate_id = ?1 AND type = 'session.provider.attempt.1' ORDER BY seq",
+        )
+        .expect("prepare provider deadline attempts");
+    let attempts = statement
+        .query_map([SESSION_ID], |row| row.get::<_, String>(0))
+        .expect("query provider deadline attempts")
+        .map(|row| {
+            serde_json::from_str::<Value>(&row.expect("provider deadline attempt"))
+                .expect("provider deadline attempt JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 4, "{attempts:#?}");
+    assert_eq!(attempts[0]["status"], "started");
+    assert_eq!(attempts[0]["attempt"], 1);
+    assert_eq!(attempts[1]["status"], "failed");
+    assert_eq!(attempts[1]["attempt"], 1);
+    assert_eq!(attempts[2]["status"], "started");
+    assert_eq!(attempts[2]["attempt"], 2);
+    assert_eq!(attempts[3]["status"], "failed");
+    assert_eq!(attempts[3]["attempt"], 2);
+    assert_eq!(
+        attempts[3]["turnErrorKind"],
+        Value::String("provider_retry_deadline".to_owned())
+    );
+    assert_eq!(attempts[3]["retryable"], true);
+    assert_eq!(attempts[3]["partialOutput"], true);
+    assert_eq!(attempts[3]["elapsedMs"], 180_000);
+    assert_eq!(attempts[2]["attemptID"], attempts[3]["attemptID"]);
+}
+
 #[tokio::test]
 async fn loop_provider_retry_is_bounded_and_surfaces_the_final_transient_failure() {
     let mut connection = seeded();

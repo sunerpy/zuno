@@ -1936,6 +1936,29 @@ async fn run_turn_in_span(
                             result,
                         )
                     }
+                    ProviderAttemptObservation::DeadlineExceeded {
+                        attempt,
+                        max,
+                        elapsed,
+                    } => {
+                        let generated_output = accumulator
+                            .lock()
+                            .expect("step accumulator lock")
+                            .has_generated_output();
+                        append_provider_attempt_deadline(
+                            attempt_connection,
+                            &request,
+                            ProviderAttemptRecord {
+                                step,
+                                request_id: &request_id,
+                                assistant_message_id: &assistant_id,
+                                attempt,
+                                max_attempts: max,
+                            },
+                            generated_output,
+                            elapsed,
+                        )
+                    }
                     ProviderAttemptObservation::BackoffScheduled {
                         failed_attempt,
                         next_attempt,
@@ -3816,6 +3839,33 @@ fn append_provider_attempt_terminal(
             insert_provider_attempt_error(&mut properties, error);
         }
     }
+    append_with_connection(
+        connection,
+        &request.session_id,
+        NewSessionEvent::new("session.provider.attempt", properties)?,
+    )?;
+    Ok(())
+}
+
+fn append_provider_attempt_deadline(
+    connection: &mut Connection,
+    request: &RunTurnRequest,
+    attempt: ProviderAttemptRecord<'_>,
+    generated_output: bool,
+    elapsed: Duration,
+) -> Result<(), TurnError> {
+    let mut properties = provider_attempt_properties(request, attempt);
+    properties.insert("status".to_owned(), Value::String("failed".to_owned()));
+    properties.insert("partialOutput".to_owned(), Value::Bool(generated_output));
+    properties.insert(
+        "turnErrorKind".to_owned(),
+        Value::String("provider_retry_deadline".to_owned()),
+    );
+    properties.insert("retryable".to_owned(), Value::Bool(true));
+    properties.insert(
+        "elapsedMs".to_owned(),
+        Value::from(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+    );
     append_with_connection(
         connection,
         &request.session_id,

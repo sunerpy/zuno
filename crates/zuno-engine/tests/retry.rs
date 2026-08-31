@@ -8,15 +8,24 @@ use std::time::Duration;
 use zuno_engine::r#loop::{TurnError, TurnRecovery, TurnRetryReason};
 use zuno_engine::retry::{
     MAX_CONTEXT_LIMIT_RETRIES, MAX_EMPTY_POST_TOOL_CONTINUATION_ATTEMPTS,
-    MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, PROVIDER_RETRY_MAX_ATTEMPTS, ProviderAttemptObservation,
-    ProviderRetryError, ProviderRetryPolicy, RecoveryAttempt, RecoveryBudget, RecoveryBudgets,
-    RetryError, retry_provider, retry_provider_with_sleep, retry_provider_with_wake_observed,
+    MAX_INCOMPLETE_CONTINUATION_ATTEMPTS, PROVIDER_RETRY_MAX_ATTEMPTS, PROVIDER_RETRY_MAX_ELAPSED,
+    ProviderAttemptObservation, ProviderRetryError, ProviderRetryPolicy, ProviderRetryPolicyError,
+    RETRY_INITIAL_DELAY, RETRY_MAX_DELAY_WITHOUT_PROVIDER, RecoveryAttempt, RecoveryBudget,
+    RecoveryBudgets, RetryError, retry_provider, retry_provider_with_sleep,
+    retry_provider_with_wake_observed,
 };
 use zuno_error::{ProviderError, ProviderProtocolFailure, ProviderStreamFailure};
 use zuno_llm::event::StreamEvent;
 
 fn policy(max_attempts: u32) -> ProviderRetryPolicy {
-    ProviderRetryPolicy::new(NonZeroU32::new(max_attempts).expect("non-zero test policy"))
+    ProviderRetryPolicy::with_timing(
+        NonZeroU32::new(max_attempts).expect("non-zero test policy"),
+        PROVIDER_RETRY_MAX_ELAPSED,
+        RETRY_INITIAL_DELAY,
+        RETRY_MAX_DELAY_WITHOUT_PROVIDER,
+        0,
+    )
+    .expect("deterministic provider retry policy")
 }
 
 #[test]
@@ -167,7 +176,7 @@ async fn first_provider_attempt_is_not_part_of_the_retry_recovery_budget() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn recovery_deadline_does_not_interrupt_an_active_replay() {
+async fn recovery_deadline_interrupts_an_active_replay() {
     let attempts = Rc::new(Cell::new(0_u32));
     let seen = Rc::clone(&attempts);
     let started = tokio::time::Instant::now();
@@ -190,9 +199,15 @@ async fn recovery_deadline_does_not_interrupt_an_active_replay() {
     )
     .await;
 
-    assert_eq!(result.expect("an active replay may complete"), "recovered");
+    assert!(matches!(
+        result,
+        Err(ProviderRetryError::DeadlineExceeded {
+            attempt: 2,
+            elapsed
+        }) if elapsed == Duration::from_secs(180)
+    ));
     assert_eq!(attempts.get(), 2);
-    assert_eq!(started.elapsed(), Duration::from_secs(183));
+    assert_eq!(started.elapsed(), Duration::from_secs(180));
 }
 
 #[tokio::test(start_paused = true)]
@@ -223,14 +238,14 @@ async fn recovery_deadline_prevents_starting_another_replay() {
         Err(ProviderRetryError::DeadlineExceeded {
             attempt: 2,
             elapsed
-        }) if elapsed == Duration::from_secs(183)
+        }) if elapsed == Duration::from_secs(180)
     ));
     assert_eq!(
         attempts.get(),
         2,
         "the expired budget must reject attempt 3"
     );
-    assert_eq!(started.elapsed(), Duration::from_secs(183));
+    assert_eq!(started.elapsed(), Duration::from_secs(180));
 }
 
 fn assert_budget<F>(budget: RecoveryBudget, limit: u32, mut record: F)
@@ -495,6 +510,7 @@ async fn durable_backoff_observation_precedes_every_wait_or_wake() {
                 trace.borrow_mut().push(match observation {
                     ProviderAttemptObservation::Started { .. } => "started",
                     ProviderAttemptObservation::Finished { .. } => "finished",
+                    ProviderAttemptObservation::DeadlineExceeded { .. } => "deadline",
                     ProviderAttemptObservation::BackoffScheduled { .. } => "backoff",
                 });
                 Ok::<(), std::convert::Infallible>(())
@@ -511,6 +527,80 @@ async fn durable_backoff_observation_precedes_every_wait_or_wake() {
             "started", "provider", "finished", "rollback", "backoff", "wake"
         ],
         "the durable deadline hook must run after rollback and before any wait can be interrupted"
+    );
+}
+
+#[test]
+fn retry_local_delay_is_positive_capped_and_jittered() {
+    let policy = ProviderRetryPolicy::new(NonZeroU32::new(3).expect("non-zero"));
+    let transient = ProviderError::Transient {
+        status: Some(503),
+        source: None,
+    };
+    assert_eq!(
+        policy.delay_after(1, &transient, 0),
+        Duration::from_millis(1_600)
+    );
+    assert_eq!(
+        policy.delay_after(1, &transient, u64::MAX),
+        Duration::from_millis(2_400)
+    );
+    assert_eq!(
+        policy.delay_after(5, &transient, u64::MAX),
+        RETRY_MAX_DELAY_WITHOUT_PROVIDER,
+        "positive jitter must remain capped"
+    );
+
+    let peer = ProviderError::RateLimited {
+        retry_after: Some(Duration::from_secs(7)),
+    };
+    assert_eq!(
+        policy.delay_after(1, &peer, 0),
+        Duration::from_secs(7),
+        "negative jitter must not shorten Retry-After"
+    );
+    assert_eq!(
+        policy.delay_after(1, &peer, u64::MAX),
+        Duration::from_secs(7),
+        "positive jitter must not alter Retry-After"
+    );
+}
+
+#[test]
+fn retry_policy_rejects_invalid_timing() {
+    let attempts = NonZeroU32::new(3).expect("non-zero");
+    assert_eq!(
+        ProviderRetryPolicy::with_timing(
+            attempts,
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            0,
+        )
+        .expect_err("zero elapsed budget is invalid"),
+        ProviderRetryPolicyError::ZeroDuration
+    );
+    assert_eq!(
+        ProviderRetryPolicy::with_timing(
+            attempts,
+            Duration::from_secs(3),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            0,
+        )
+        .expect_err("max below initial is invalid"),
+        ProviderRetryPolicyError::MaxDelayBeforeInitial
+    );
+    assert_eq!(
+        ProviderRetryPolicy::with_timing(
+            attempts,
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            101,
+        )
+        .expect_err("jitter above one hundred is invalid"),
+        ProviderRetryPolicyError::JitterPercentOutOfRange { actual: 101 }
     );
 }
 

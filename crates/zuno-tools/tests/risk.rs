@@ -204,6 +204,67 @@ fn risk_bounded_destructive_command_requires_human_confirmation() {
 }
 
 #[test]
+fn risk_git_history_rewrites_require_fresh_confirmation_and_head_precondition() {
+    for command in [
+        "git commit --amend --no-edit",
+        "git rebase main",
+        "git tag --force v1.0.0",
+    ] {
+        let assessment = assess_command(command, ShellSyntax::Bash, &risk_context())
+            .expect("the command must parse");
+        assert!(
+            assessment.requires_expected_git_head(),
+            "local rewrite did not require an exact HEAD guard: {command:?}"
+        );
+        assert!(
+            matches!(gate(&assessment), GateOutcome::Confirm { .. }),
+            "local rewrite did not require fresh approval: {command:?}"
+        );
+    }
+    for command in [
+        "git -C . commit --amend --no-edit",
+        "git --git-dir=.git commit --amend --no-edit",
+        "git --work-tree=. rebase main",
+        "env GIT_DIR=.git git commit --amend --no-edit",
+        "GIT_WORK_TREE=. git rebase main",
+    ] {
+        assert_risk_denied(command);
+    }
+    for command in [
+        "git rebase --abort",
+        "git rebase --continue",
+        "git status --short",
+    ] {
+        let assessment = assess_command(command, ShellSyntax::Bash, &risk_context())
+            .expect("the command must parse");
+        assert!(!assessment.requires_expected_git_head(), "{command:?}");
+    }
+}
+
+#[test]
+fn risk_force_push_requires_an_explicit_atomic_remote_oid_lease() {
+    let oid = "0123456789abcdef0123456789abcdef01234567";
+    let guarded = risk_gate(&format!(
+        "git push --force-with-lease=refs/heads/main:{oid} origin main"
+    ));
+    assert!(
+        matches!(guarded, GateOutcome::Confirm { .. }),
+        "an explicit lease still needs fresh approval: {guarded:?}"
+    );
+
+    for command in [
+        "git push --force origin main",
+        "git push -f origin main",
+        "git push --force-with-lease origin main",
+        "git push --force-with-lease=refs/heads/main origin main",
+        "git push --force-with-lease=refs/heads/main:0123456789abcdef0123456789abcdef01234567 --force-with-lease origin main",
+        "git push origin +main:main",
+    ] {
+        assert_risk_denied(command);
+    }
+}
+
+#[test]
 fn risk_unknown_dynamic_delete_target_requires_confirmation_instead_of_guessing() {
     for command in [
         "rm -rf \"$UNSET_VAR/\"",
@@ -366,6 +427,7 @@ async fn risk_existing_redirect_target_requires_fresh_human_approval() {
                 timeout: None,
                 workdir: None,
                 background: false,
+                expected_git_head: None,
             },
             tool_context_with(permission.clone()),
         )
@@ -411,6 +473,7 @@ async fn risk_gate_runs_before_explicit_background_dispatch() {
                 timeout: None,
                 workdir: None,
                 background: true,
+                expected_git_head: None,
             },
             tool_context_with(permission.clone()),
         )

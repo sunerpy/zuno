@@ -108,10 +108,12 @@ session with `_meta.zuno.childSessionId`, so it never has to accept an unknown
 route. Reusable permission grants are still owned by the root ACP session and
 are cleared when it closes.
 
-An autonomous Goal is different from an ordinary interactive turn. It may yield
-`WaitingForHuman` through `goal_request_input`, but it does not receive the
-synchronous `question` tool. Plan may ask clarifying questions. A delegated child
-contacts neither client surface directly and reports blockers to its parent.
+An autonomous Goal may yield `WaitingForHuman` through `goal_request_input`, but
+it does not receive the synchronous `question` tool. Plan may ask structured
+clarifying questions. Ordinary Work also does not receive that tool: it proceeds
+with safe evidence-backed defaults and, only when genuinely blocked, finishes the
+turn with one direct question. A delegated child contacts neither client surface
+directly and reports blockers to its parent.
 
 ## TUI
 

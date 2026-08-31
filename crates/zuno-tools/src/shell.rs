@@ -1,5 +1,7 @@
 use crate::output_policy::OutputPolicy;
-use crate::risk::{GateOutcome, RiskContext, assess_and_gate};
+use crate::risk::{
+    GIT_REPOSITORY_ENVIRONMENT_VARIABLES, GateOutcome, RiskAssessment, RiskContext, assess_and_gate,
+};
 use crate::timeout::{
     background_started_output, normalize_foreground_timeout, timeout_promoted_output,
 };
@@ -11,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tree_sitter::{Node, Parser};
@@ -78,6 +81,9 @@ pub struct ShellParams {
     /// Start the command and return immediately while its lifecycle continues asynchronously.
     #[serde(default)]
     pub background: bool,
+    /// Exact full object id expected at `HEAD` before rewriting local Git history.
+    #[serde(default)]
+    pub expected_git_head: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,17 +255,18 @@ impl ShellTool {
         let cwd = self.resolve_workdir(params.workdir.as_deref())?;
         let analysis = analyze_command(&params.command, self.syntax())?;
         let risk_context = RiskContext::from_env(Some(cwd.clone()));
-        let risk_confirmation =
-            match assess_and_gate(&params.command, self.syntax(), &risk_context)? {
-                GateOutcome::Allow => None,
-                GateOutcome::Confirm { reason, target } => Some((reason, target)),
-                GateOutcome::Deny { reason } => {
-                    return Err(ToolError::Failed {
-                        tool: TOOL_ID.to_owned(),
-                        source: Box::new(io::Error::new(io::ErrorKind::PermissionDenied, reason)),
-                    });
-                }
-            };
+        let (risk_assessment, risk_gate) =
+            assess_and_gate(&params.command, self.syntax(), &risk_context)?;
+        let risk_confirmation = match risk_gate {
+            GateOutcome::Allow => None,
+            GateOutcome::Confirm { reason, target } => Some((reason, target)),
+            GateOutcome::Deny { reason } => {
+                return Err(ToolError::Failed {
+                    tool: TOOL_ID.to_owned(),
+                    source: Box::new(io::Error::new(io::ErrorKind::PermissionDenied, reason)),
+                });
+            }
+        };
         let authorization = self
             .authorize(
                 &params.command,
@@ -273,6 +280,15 @@ impl ShellTool {
             return Err(interrupted());
         }
         let env = self.environment(&cwd, &ctx).await?;
+        validate_expected_git_head(
+            &risk_assessment,
+            params.expected_git_head.as_deref(),
+            &cwd,
+            &env,
+        )?;
+        if ctx.is_interrupted() {
+            return Err(interrupted());
+        }
         let command = params.command.clone();
         let foreground_timeout_ms = normalize_foreground_timeout(params.timeout);
         let retention = if params.background {
@@ -629,6 +645,67 @@ fn with_sandbox_metadata(output: ToolOutput, authority: &ExecutionAuthority) -> 
             authority.resolution_kind == SandboxResolutionKind::UnavailableFallback,
         )
         .with_metadata("sandboxFallbackReason", json!(authority.fallback_reason))
+}
+
+fn validate_expected_git_head(
+    assessment: &RiskAssessment,
+    expected: Option<&str>,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<(), ToolError> {
+    if !assessment.requires_expected_git_head() {
+        return Ok(());
+    }
+    if let Some(variable) = env.keys().find(|key| {
+        GIT_REPOSITORY_ENVIRONMENT_VARIABLES
+            .iter()
+            .any(|variable| key.eq_ignore_ascii_case(variable))
+    }) {
+        return Err(invalid(format!(
+            "{variable} may not be set for a local Git history rewrite; select the repository \
+             with the Shell workdir"
+        )));
+    }
+    let expected = expected.ok_or_else(|| {
+        invalid(
+            "expectedGitHead is required for commit --amend, rebase, and forced tag movement; \
+             inspect `git rev-parse HEAD` immediately before this call",
+        )
+    })?;
+    if !matches!(expected.len(), 40 | 64) || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid(
+            "expectedGitHead must be a full 40- or 64-character hexadecimal object id",
+        ));
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(failed)?;
+    if !output.status.success() {
+        return Err(failed(io::Error::other(format!(
+            "could not verify Git HEAD before history rewrite: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))));
+    }
+    let actual = String::from_utf8(output.stdout)
+        .map_err(failed)?
+        .trim()
+        .to_owned();
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(failed(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Git HEAD changed before the history rewrite: expected {expected}, found {actual}; \
+                 inspect the new history and prepare a fresh command"
+            ),
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1091,10 +1168,10 @@ fn is_dynamic_path(path: &str) -> bool {
         || path.contains('[')
 }
 
-fn invalid(message: &'static str) -> ToolError {
+fn invalid(message: impl Into<String>) -> ToolError {
     ToolError::InvalidArgs {
         tool: TOOL_ID.to_owned(),
-        source: Box::new(io::Error::new(io::ErrorKind::InvalidInput, message)),
+        source: Box::new(io::Error::new(io::ErrorKind::InvalidInput, message.into())),
     }
 }
 

@@ -30,15 +30,17 @@ pub const RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 
 pub const RETRY_MAX_DELAY_WITHOUT_PROVIDER: Duration = Duration::from_secs(30);
 
+/// Symmetric jitter applied only to locally selected retry delays.
+pub const PROVIDER_RETRY_JITTER_PERCENT: u8 = 20;
+
 /// Maximum provider calls in one recovery sequence.
 pub const PROVIDER_RETRY_MAX_ATTEMPTS: u32 = 3;
 
-/// Wall-clock budget for coordinating one provider recovery sequence.
+/// Absolute wall-clock budget for coordinating one provider recovery sequence.
 ///
-/// The budget starts only after the first retryable provider failure. Active
-/// provider attempts are governed by their transport and stream-idle policies;
-/// this budget limits rollback emission, backoff, and admission of another
-/// replay without killing a healthy long-running attempt.
+/// The deadline is anchored when the initial request starts. The initial request
+/// remains governed by transport and stream-idle policies, but every replacement
+/// attempt, rollback, and wait must finish before this deadline.
 pub const PROVIDER_RETRY_MAX_ELAPSED: Duration = MAX_PROVIDER_WAIT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +154,9 @@ impl RecoveryBudgets {
 pub struct ProviderRetryPolicy {
     max_attempts: NonZeroU32,
     max_elapsed: Duration,
+    initial_delay: Duration,
+    max_delay: Duration,
+    jitter_percent: u8,
 }
 
 impl ProviderRetryPolicy {
@@ -160,7 +165,39 @@ impl ProviderRetryPolicy {
         Self {
             max_attempts,
             max_elapsed: PROVIDER_RETRY_MAX_ELAPSED,
+            initial_delay: RETRY_INITIAL_DELAY,
+            max_delay: RETRY_MAX_DELAY_WITHOUT_PROVIDER,
+            jitter_percent: PROVIDER_RETRY_JITTER_PERCENT,
         }
+    }
+
+    /// Construct a validated policy with explicit timing for composition roots
+    /// and deterministic tests.
+    pub fn with_timing(
+        max_attempts: NonZeroU32,
+        max_elapsed: Duration,
+        initial_delay: Duration,
+        max_delay: Duration,
+        jitter_percent: u8,
+    ) -> Result<Self, ProviderRetryPolicyError> {
+        if max_elapsed.is_zero() || initial_delay.is_zero() || max_delay.is_zero() {
+            return Err(ProviderRetryPolicyError::ZeroDuration);
+        }
+        if max_delay < initial_delay {
+            return Err(ProviderRetryPolicyError::MaxDelayBeforeInitial);
+        }
+        if jitter_percent > 100 {
+            return Err(ProviderRetryPolicyError::JitterPercentOutOfRange {
+                actual: jitter_percent,
+            });
+        }
+        Ok(Self {
+            max_attempts,
+            max_elapsed,
+            initial_delay,
+            max_delay,
+            jitter_percent,
+        })
     }
 
     #[must_use]
@@ -174,15 +211,29 @@ impl ProviderRetryPolicy {
     }
 
     #[must_use]
-    pub fn delay_after(self, failed_attempt: u32, error: &ProviderError) -> Duration {
+    pub fn delay_after(self, failed_attempt: u32, error: &ProviderError, entropy: u64) -> Duration {
         error
             .retry_after()
             .filter(|delay| !delay.is_zero())
             .map_or_else(
-                || fallback_delay(failed_attempt),
+                || {
+                    let base =
+                        exponential_delay(self.initial_delay, self.max_delay, failed_attempt);
+                    jittered_delay(base, self.max_delay, self.jitter_percent, entropy)
+                },
                 |delay| delay.min(self.max_elapsed).max(Duration::from_millis(1)),
             )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ProviderRetryPolicyError {
+    #[error("provider retry durations must be greater than zero")]
+    ZeroDuration,
+    #[error("provider retry max delay must be greater than or equal to the initial delay")]
+    MaxDelayBeforeInitial,
+    #[error("provider retry jitter percent {actual} is outside 0..=100")]
+    JitterPercentOutOfRange { actual: u8 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -217,6 +268,12 @@ pub enum ProviderAttemptObservation<'a, T> {
         attempt: u32,
         max: u32,
         result: &'a Result<T, ProviderError>,
+    },
+    /// A replacement attempt was cancelled by the absolute recovery deadline.
+    DeadlineExceeded {
+        attempt: u32,
+        max: u32,
+        elapsed: Duration,
     },
     /// Rollback was emitted and this exact deadline must commit before sleeping.
     BackoffScheduled {
@@ -452,13 +509,30 @@ where
     ObserveError: Error + 'static,
 {
     let max = policy.max_attempts().get();
-    let mut recovery_started = None;
+    let recovery_started = tokio::time::Instant::now();
+    let deadline = recovery_started + policy.max_elapsed();
     let mut attempt = 1_u32;
 
     loop {
         observe(ProviderAttemptObservation::Started { attempt, max })
             .map_err(|source| ProviderRetryObservedError::Observation { source })?;
-        let result = operation(attempt).await;
+        let result = if attempt == 1 {
+            operation(attempt).await
+        } else {
+            match tokio::time::timeout_at(deadline, operation(attempt)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let elapsed = recovery_started.elapsed();
+                    observe(ProviderAttemptObservation::DeadlineExceeded {
+                        attempt,
+                        max,
+                        elapsed,
+                    })
+                    .map_err(|source| ProviderRetryObservedError::Observation { source })?;
+                    return Err(ProviderRetryError::DeadlineExceeded { attempt, elapsed }.into());
+                }
+            }
+        };
         observe(ProviderAttemptObservation::Finished {
             attempt,
             max,
@@ -478,14 +552,12 @@ where
                 .into());
             }
             Err(error) => {
-                let started = *recovery_started.get_or_insert_with(tokio::time::Instant::now);
-                let deadline = started + policy.max_elapsed();
-                let delay = policy.delay_after(attempt, &error);
+                let delay = policy.delay_after(attempt, &error, retry_entropy());
                 let next_attempt = attempt + 1;
                 if delay >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
                     return Err(ProviderRetryError::DeadlineExceeded {
                         attempt,
-                        elapsed: started.elapsed(),
+                        elapsed: recovery_started.elapsed(),
                     }
                     .into());
                 }
@@ -500,7 +572,7 @@ where
                 .map_err(|_| {
                     ProviderRetryObservedError::Retry(ProviderRetryError::DeadlineExceeded {
                         attempt,
-                        elapsed: started.elapsed(),
+                        elapsed: recovery_started.elapsed(),
                     })
                 })?
                 .map_err(|source| {
@@ -526,7 +598,7 @@ where
                 let delay = tokio::time::timeout_at(deadline, wait).await.map_err(|_| {
                     ProviderRetryObservedError::Retry(ProviderRetryError::DeadlineExceeded {
                         attempt,
-                        elapsed: started.elapsed(),
+                        elapsed: recovery_started.elapsed(),
                     })
                 })?;
                 if let RetryDelay::Woken(output) = delay {
@@ -543,10 +615,31 @@ enum RetryDelay<T> {
     Woken(T),
 }
 
-fn fallback_delay(failed_attempt: u32) -> Duration {
+fn exponential_delay(initial: Duration, maximum: Duration, failed_attempt: u32) -> Duration {
     let exponent = failed_attempt.saturating_sub(1).min(31);
     let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
-    RETRY_INITIAL_DELAY
-        .saturating_mul(multiplier)
-        .min(RETRY_MAX_DELAY_WITHOUT_PROVIDER)
+    initial.saturating_mul(multiplier).min(maximum)
+}
+
+fn jittered_delay(base: Duration, maximum: Duration, jitter_percent: u8, entropy: u64) -> Duration {
+    if jitter_percent == 0 {
+        return base.min(maximum);
+    }
+    let base_ms = base.as_millis();
+    let span = base_ms
+        .saturating_mul(u128::from(jitter_percent))
+        .saturating_div(100);
+    let width = span.saturating_mul(2);
+    let position = width
+        .saturating_mul(u128::from(entropy))
+        .checked_div(u128::from(u64::MAX))
+        .unwrap_or_default();
+    let jittered_ms = base_ms.saturating_sub(span).saturating_add(position);
+    let capped_ms = jittered_ms.max(1).min(maximum.as_millis());
+    Duration::from_millis(u64::try_from(capped_ms).unwrap_or(u64::MAX))
+}
+
+fn retry_entropy() -> u64 {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    u64::from_le_bytes(bytes[..8].try_into().expect("UUID has eight leading bytes"))
 }

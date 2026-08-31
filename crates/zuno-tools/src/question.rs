@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn the_description_is_the_oracles_file() {
         assert!(DESCRIPTION.starts_with(
-            "Use this tool when you need to ask the user questions during execution."
+            "Use this tool only during Plan when an undiscoverable user decision is required"
         ));
         assert!(
             DESCRIPTION.contains("cannot be discovered from available evidence"),

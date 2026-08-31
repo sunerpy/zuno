@@ -26,10 +26,13 @@ A goal is the continuation authority. An active goal continues until it complete
 explicitly paused or blocked, reaches its budget, or hits a typed permanent failure. That
 is what makes long work resumable instead of stopping whenever a turn ends.
 
-Recovery is layered. Before every provider-request backoff, the request layer commits a
-`provider_retry_backoff` checkpoint containing the request, turn, failed and next attempt,
-typed reason, selected delay, and deadline. A restart never revives that old HTTP request.
-It observes the remaining deadline, then starts a fresh Goal turn. If the bounded
+Recovery is layered. The provider recovery deadline is anchored when the original request
+starts. Its initial request remains transport-governed, while locally jittered backoff and
+every replacement attempt must complete before that absolute deadline; expiry cancels and
+records an active replay. Before every provider-request backoff, the request layer commits
+a `provider_retry_backoff` checkpoint containing the request, turn, failed and next attempt,
+typed reason, selected delay, and wait deadline. A restart never revives that old HTTP
+request. It observes the remaining wait, then starts a fresh Goal turn. If the bounded
 provider sequence still ends in a recoverable error, the Goal controller writes a
 `goal_retry` row before waiting and likewise starts a fresh turn when its persisted deadline
 arrives.
@@ -114,6 +117,12 @@ and admits its model-visible response to the durable FIFO inbox together. Goal r
 a later idempotent step, so a crash after the answer commit cannot lose the response or
 duplicate it. On restart, clients re-present pending requests from SQLite. Their in-process
 channels only wake already-running consumers.
+
+Ordinary non-Goal Work likewise does not receive the synchronous question tool. It uses
+evidence-backed reversible defaults and continues. If an undiscoverable choice has no safe
+default and materially changes the result, the Agent finishes the turn with one direct
+question before performing the affected side effect. Plan retains structured question
+forms for decision-complete planning.
 
 A side-effecting tool whose response is lost has an uncertain outcome. The Goal pauses with
 `uncertain_side_effect`, requires authoritative-state inspection, and never mechanically

@@ -135,9 +135,26 @@ pub enum RiskLevel {
     Catastrophic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskKind {
+    Generic,
+    GitHistoryRewrite,
+    GitPublishedHistoryRewrite,
+}
+
+pub(crate) const GIT_REPOSITORY_ENVIRONMENT_VARIABLES: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_INDEX_FILE",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RiskFinding {
     pub level: RiskLevel,
+    pub kind: RiskKind,
     pub reason: String,
     pub target: Option<String>,
 }
@@ -172,6 +189,15 @@ impl RiskAssessment {
             explanation.push('\n');
         }
         explanation
+    }
+
+    /// Whether the command rewrites local Git history and therefore must name
+    /// the exact HEAD value observed before the Shell call.
+    #[must_use]
+    pub fn requires_expected_git_head(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| finding.kind == RiskKind::GitHistoryRewrite)
     }
 }
 
@@ -395,7 +421,7 @@ pub fn assess_and_gate(
     command: &str,
     syntax: ShellSyntax,
     context: &RiskContext,
-) -> Result<GateOutcome, ToolError> {
+) -> Result<(RiskAssessment, GateOutcome), ToolError> {
     let assessment = assess_command(command, syntax, context)?;
     let outcome = gate(&assessment);
     match &outcome {
@@ -421,7 +447,7 @@ pub fn assess_and_gate(
             "destructive-command gate verdict"
         ),
     }
-    Ok(outcome)
+    Ok((assessment, outcome))
 }
 
 fn assess_resource(
@@ -485,15 +511,7 @@ fn assess_resource(
     if program == "find" {
         return assess_find(tokens, syntax, context, depth, findings);
     }
-    if program == "git" && tokens.get(1).is_some_and(|token| unquote(token) == "clean") {
-        let target = context
-            .working_dir
-            .as_deref()
-            .map_or_else(|| ".".to_owned(), |cwd| cwd.display().to_string());
-        findings.push(confirm_finding(
-            "`git clean` irreversibly removes untracked files".to_owned(),
-            Some(target),
-        ));
+    if program == "git" && assess_git(&resource.source, tokens, context, findings) {
         return Ok(());
     }
 
@@ -516,6 +534,214 @@ fn assess_resource(
         assess_destructive_target(&target, context, absent_temp_file_cleanup, findings);
     }
     Ok(())
+}
+
+fn assess_git(
+    source: &str,
+    tokens: &[String],
+    context: &RiskContext,
+    findings: &mut Vec<RiskFinding>,
+) -> bool {
+    let Some((subcommand, args)) = git_subcommand(tokens) else {
+        return false;
+    };
+    let repository_override =
+        git_uses_repository_override(tokens) || source_uses_git_repository_environment(source);
+    match subcommand.as_str() {
+        "clean" => {
+            let target = context
+                .working_dir
+                .as_deref()
+                .map_or_else(|| ".".to_owned(), |cwd| cwd.display().to_string());
+            findings.push(confirm_finding(
+                "`git clean` irreversibly removes untracked files".to_owned(),
+                Some(target),
+            ));
+            true
+        }
+        "commit" if has_git_option(args, "--amend", None) => {
+            assess_local_git_history_rewrite(
+                repository_override,
+                "`git commit --amend` replaces the current commit",
+                findings,
+            );
+            true
+        }
+        "rebase" if !is_rebase_recovery(args) => {
+            assess_local_git_history_rewrite(
+                repository_override,
+                "`git rebase` rewrites local commit history",
+                findings,
+            );
+            true
+        }
+        "tag" if has_git_option(args, "--force", Some('f')) => {
+            assess_local_git_history_rewrite(
+                repository_override,
+                "`git tag --force` moves an existing tag",
+                findings,
+            );
+            true
+        }
+        "push" => assess_git_push(args, findings),
+        _ => false,
+    }
+}
+
+fn source_uses_git_repository_environment(source: &str) -> bool {
+    let source = source.to_ascii_uppercase();
+    GIT_REPOSITORY_ENVIRONMENT_VARIABLES
+        .iter()
+        .any(|variable| source.contains(&format!("{variable}=")))
+}
+
+fn assess_local_git_history_rewrite(
+    repository_override: bool,
+    reason: &str,
+    findings: &mut Vec<RiskFinding>,
+) {
+    if repository_override {
+        findings.push(RiskFinding {
+            level: RiskLevel::Catastrophic,
+            kind: RiskKind::Generic,
+            reason: format!(
+                "{reason}; repository-changing Git global options are refused because \
+                 `expectedGitHead` is bound to the Shell workdir; select the repository with \
+                 `workdir` instead"
+            ),
+            target: None,
+        });
+    } else {
+        findings.push(git_history_finding(reason.to_owned()));
+    }
+}
+
+fn git_uses_repository_override(tokens: &[String]) -> bool {
+    let mut index = 1;
+    while let Some(raw) = tokens.get(index) {
+        let token = unquote(raw);
+        if token == "--" || !token.starts_with('-') || token == "-" {
+            return false;
+        }
+        if matches!(
+            token.as_str(),
+            "-C" | "--git-dir" | "--work-tree" | "--namespace"
+        ) || token.starts_with("-C")
+            || token.starts_with("--git-dir=")
+            || token.starts_with("--work-tree=")
+            || token.starts_with("--namespace=")
+        {
+            return true;
+        }
+        let consumes_value = matches!(token.as_str(), "-c" | "--config-env" | "--exec-path");
+        index += 1 + usize::from(consumes_value && !token.contains('='));
+    }
+    false
+}
+
+fn git_subcommand(tokens: &[String]) -> Option<(String, &[String])> {
+    if tokens
+        .first()
+        .is_none_or(|token| command_name(token) != "git")
+    {
+        return None;
+    }
+    let mut index = 1;
+    while let Some(raw) = tokens.get(index) {
+        let token = unquote(raw);
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') || token == "-" {
+            return Some((token.to_ascii_lowercase(), &tokens[index + 1..]));
+        }
+        let consumes_value = matches!(
+            token.as_str(),
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+        );
+        index += 1 + usize::from(consumes_value && !token.contains('='));
+    }
+    tokens
+        .get(index)
+        .map(|token| (unquote(token).to_ascii_lowercase(), &tokens[index + 1..]))
+}
+
+fn has_git_option(args: &[String], long: &str, short: Option<char>) -> bool {
+    args.iter().map(|token| unquote(token)).any(|token| {
+        token == long
+            || token.starts_with(&format!("{long}="))
+            || short.is_some_and(|short| {
+                token
+                    .strip_prefix('-')
+                    .filter(|flags| !flags.starts_with('-'))
+                    .is_some_and(|flags| flags.contains(short))
+            })
+    })
+}
+
+fn is_rebase_recovery(args: &[String]) -> bool {
+    [
+        "--abort",
+        "--continue",
+        "--skip",
+        "--quit",
+        "--show-current-patch",
+    ]
+    .iter()
+    .any(|option| has_git_option(args, option, None))
+}
+
+fn assess_git_push(args: &[String], findings: &mut Vec<RiskFinding>) -> bool {
+    let rendered = args.iter().map(|token| unquote(token)).collect::<Vec<_>>();
+    let unsafe_force = rendered.iter().any(|token| {
+        token == "--force"
+            || token == "-f"
+            || token
+                .strip_prefix('-')
+                .filter(|flags| !flags.starts_with('-'))
+                .is_some_and(|flags| flags.contains('f'))
+            || (!token.starts_with('-') && token.starts_with('+'))
+    });
+    let leases = rendered
+        .iter()
+        .filter(|token| token.starts_with("--force-with-lease"))
+        .collect::<Vec<_>>();
+    let valid_explicit_lease = |token: &&String| {
+        token
+            .strip_prefix("--force-with-lease=")
+            .and_then(|value| value.split_once(':'))
+            .is_some_and(|(reference, expected)| !reference.is_empty() && exact_git_oid(expected))
+    };
+    let explicit_lease = leases.iter().any(valid_explicit_lease);
+    let malformed_lease = leases.iter().any(|token| !valid_explicit_lease(token));
+    if unsafe_force || malformed_lease {
+        findings.push(RiskFinding {
+            level: RiskLevel::Catastrophic,
+            kind: RiskKind::GitPublishedHistoryRewrite,
+            reason: "published Git history may only be rewritten with an explicit atomic lease \
+                     such as `--force-with-lease=refs/heads/main:<expected-full-oid>`"
+                .to_owned(),
+            target: None,
+        });
+        return true;
+    }
+    if explicit_lease {
+        findings.push(RiskFinding {
+            level: RiskLevel::Confirm,
+            kind: RiskKind::GitPublishedHistoryRewrite,
+            reason: "`git push --force-with-lease` rewrites published history after checking the \
+                     caller-supplied remote object id"
+                .to_owned(),
+            target: None,
+        });
+        return true;
+    }
+    false
+}
+
+fn exact_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn env_without_child_command(tokens: &[String]) -> bool {
@@ -1337,6 +1563,7 @@ fn unquote(text: &str) -> String {
 fn catastrophic_finding(reason: String, target: String) -> RiskFinding {
     RiskFinding {
         level: RiskLevel::Catastrophic,
+        kind: RiskKind::Generic,
         reason,
         target: Some(target),
     }
@@ -1345,8 +1572,18 @@ fn catastrophic_finding(reason: String, target: String) -> RiskFinding {
 fn confirm_finding(reason: String, target: Option<String>) -> RiskFinding {
     RiskFinding {
         level: RiskLevel::Confirm,
+        kind: RiskKind::Generic,
         reason,
         target,
+    }
+}
+
+fn git_history_finding(reason: String) -> RiskFinding {
+    RiskFinding {
+        level: RiskLevel::Confirm,
+        kind: RiskKind::GitHistoryRewrite,
+        reason,
+        target: None,
     }
 }
 

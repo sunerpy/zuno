@@ -20,7 +20,7 @@
 | `webfetch` | 获取一个 URL | 只读 |
 | `web_search` | 批量网络搜索 | 只读 |
 | `skill` | 发现并加载可复用指令 | 只读 |
-| `question` | 向用户提出一个结构化问题 | 用户中介型 |
+| `question` | 在 Plan 中向用户提出结构化澄清问题 | 用户中介型 |
 
 持久工作状态会额外加入 `plan_get`、`plan_update`、`todo_get`、`todo_update` 以及 `goal_get`/`goal_update`。启用记忆时会出现 `memory_propose`，当前 Agent 能够触达时会出现 `council_run`。
 

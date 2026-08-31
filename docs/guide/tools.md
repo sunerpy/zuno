@@ -23,7 +23,7 @@ The default model-visible surface is deliberately small:
 | `webfetch` | Retrieve one URL | Read-only |
 | `web_search` | Batch web search | Read-only |
 | `skill` | Discover and load reusable instructions | Read-only |
-| `question` | Ask the user a structured question | User-mediated |
+| `question` | Ask a structured clarification during Plan | User-mediated |
 
 Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, and
 `goal_get`/`goal_update`. `memory_propose` appears when memory is enabled, and

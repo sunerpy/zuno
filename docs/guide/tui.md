@@ -146,8 +146,9 @@ reach `council_run`, so the picker cannot advertise a run the dispatcher would r
 ## Permission prompts and questions
 
 Tool-owned human input replaces the composer region rather than adding a transcript card.
-A permission prompt reports awaiting approval; a structured question reports awaiting
-answer.
+A permission prompt reports awaiting approval; a Plan structured question reports awaiting
+answer. Ordinary Work does not park this interaction and asks directly at a turn boundary
+only when no safe default exists.
 
 Permission choices accept Left and Right, the Up and Down aliases, Enter, and mouse
 selection; explicit expansion moves the prompt to a larger overlay. Questions show

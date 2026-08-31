@@ -4,13 +4,16 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use zuno_error::ToolError;
 use zuno_permission::{PermissionAction, Rule, evaluate};
-use zuno_tool::{ACCEPT_LARGE_OUTPUT_KEY, AllowAll, InterruptHandle, Tool, ToolContext};
+use zuno_tool::{
+    ACCEPT_LARGE_OUTPUT_KEY, AllowAll, InterruptHandle, NeverInterrupted, Tool, ToolContext,
+};
 use zuno_tool::{OutputLimits, ToolOutputStore};
 use zuno_tools::shell::{ShellEnvHook, ShellEnvInput, ShellParams, ShellSyntax, analyze_command};
 
@@ -57,7 +60,115 @@ fn params(command: impl Into<String>) -> ShellParams {
         timeout: None,
         workdir: None,
         background: false,
+        expected_git_head: None,
     }
+}
+
+fn git(workspace: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git stdout")
+        .trim()
+        .to_owned()
+}
+
+fn initialize_git_repository(workspace: &Path) -> String {
+    git(workspace, &["init", "--quiet"]);
+    git(workspace, &["config", "user.name", "Zuno Test"]);
+    git(workspace, &["config", "user.email", "zuno@example.invalid"]);
+    std::fs::write(workspace.join("tracked.txt"), b"initial\n").expect("tracked file");
+    git(workspace, &["add", "tracked.txt"]);
+    git(workspace, &["commit", "--quiet", "-m", "initial"]);
+    git(workspace, &["rev-parse", "HEAD"])
+}
+
+struct RedirectGitRepository {
+    git_dir: String,
+}
+
+#[async_trait]
+impl ShellEnvHook for RedirectGitRepository {
+    async fn env(&self, _input: ShellEnvInput) -> Result<BTreeMap<String, String>, ToolError> {
+        Ok(BTreeMap::from([(
+            "GIT_DIR".to_owned(),
+            self.git_dir.clone(),
+        )]))
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_history_rewrite_requires_the_fresh_approved_head() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let original_head = initialize_git_repository(workspace.path());
+    let tool = support::sandbox::shell_tool(workspace.path());
+
+    let missing = tool
+        .run(
+            params("git commit --amend --no-edit"),
+            context(Arc::new(NeverInterrupted)),
+        )
+        .await
+        .expect_err("history rewrite without expectedGitHead must fail");
+    assert!(
+        format!("{missing:?}").contains("expectedGitHead is required"),
+        "{missing:?}"
+    );
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), original_head);
+
+    let mut stale = params("git commit --amend --no-edit");
+    stale.expected_git_head = Some("0000000000000000000000000000000000000000".to_owned());
+    let mismatch = tool
+        .run(stale, context(Arc::new(NeverInterrupted)))
+        .await
+        .expect_err("stale expectedGitHead must fail");
+    assert!(
+        format!("{mismatch:?}").contains("Git HEAD changed"),
+        "{mismatch:?}"
+    );
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), original_head);
+
+    let mut guarded = params("git commit --amend --quiet -m amended");
+    guarded.expected_git_head = Some(original_head.clone());
+    tool.run(guarded, context(Arc::new(NeverInterrupted)))
+        .await
+        .expect("matching expectedGitHead admits the approved rewrite");
+    assert_ne!(git(workspace.path(), &["rev-parse", "HEAD"]), original_head);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_history_rewrite_refuses_a_repository_redirect_from_the_effective_environment() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    let original_head = initialize_git_repository(workspace.path());
+    let redirected = tempfile::tempdir().expect("redirected repository");
+    initialize_git_repository(redirected.path());
+    let tool = support::sandbox::shell_tool(workspace.path()).with_env_hook(Arc::new(
+        RedirectGitRepository {
+            git_dir: redirected.path().join(".git").display().to_string(),
+        },
+    ));
+    let mut guarded = params("git commit --amend --quiet -m redirected");
+    guarded.expected_git_head = Some(original_head.clone());
+
+    let error = tool
+        .run(guarded, context(Arc::new(NeverInterrupted)))
+        .await
+        .expect_err("the effective environment must not redirect a history rewrite");
+    assert!(
+        format!("{error:?}").contains("GIT_DIR may not be set"),
+        "{error:?}"
+    );
+    assert_eq!(git(workspace.path(), &["rev-parse", "HEAD"]), original_head);
 }
 
 #[test]

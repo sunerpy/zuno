@@ -34,7 +34,7 @@ Good `AGENTS.md` content is usually hard-earned context that took reading multip
 
 ## Questions
 
-Only ask the user questions if the repo cannot answer something important. Use the `question` tool for one short batch at most.
+Only ask the user if the repository cannot answer something important and no safe default exists. Finish with one short direct question before making the affected choice; ordinary Work does not park a structured question tool.
 
 Good questions:
 - undocumented team conventions

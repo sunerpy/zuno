@@ -4146,7 +4146,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
-            interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
             todo_store: Arc::new(
@@ -4189,7 +4189,12 @@ fn interaction_tool_ids(
     let directory = tempfile::TempDir::new().expect("temporary tool workspace");
     let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
     let config = zuno_config::schema::Config::default();
-    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+    let selected_agent_name = if policy == zuno_goal::InteractionPolicy::PlanClarification {
+        "plan"
+    } else {
+        "build"
+    };
+    let selected_agent = agent_profile(agent(selected_agent_name), directory.path(), &config);
     let question = attached_human_surface.then(|| {
         Arc::new(zuno_tools::question::ScriptedAnswers::default())
             as Arc<dyn zuno_tools::question::QuestionAsker>
@@ -4236,6 +4241,13 @@ fn interaction_tool_ids(
 
 #[test]
 fn interaction_tools_follow_plan_goal_and_subagent_boundaries() {
+    let work = interaction_tool_ids(zuno_goal::InteractionPolicy::WorkAutonomous, true);
+    assert!(
+        work.iter()
+            .all(|tool| tool != zuno_tools::question::WIRE_ID),
+        "ordinary Work must finish with a direct question instead of parking a synchronous tool"
+    );
+
     let plan = interaction_tool_ids(zuno_goal::InteractionPolicy::PlanClarification, true);
     assert!(
         plan.iter()
@@ -4308,7 +4320,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
-            interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
             todo_store: Arc::new(
@@ -4382,7 +4394,7 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
-            interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: None,
             todo_store: Arc::new(
@@ -4481,7 +4493,7 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
-            interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: Arc::clone(&background_executions),
             sandbox: Some(Arc::new(UnavailableTestSandbox)),
             todo_store: Arc::new(
@@ -4653,7 +4665,7 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
-            interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: Some(Arc::new(UnavailableTestSandbox)),
             todo_store: Arc::new(
@@ -4771,7 +4783,7 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
-            interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
             todo_store: Arc::new(
@@ -4836,7 +4848,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
-                interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+                interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
                 sandbox: test_sandbox(),
                 todo_store: Arc::new(
@@ -4939,7 +4951,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
             question: None,
-            interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
             sandbox: test_sandbox(),
             todo_store: Arc::new(
@@ -6224,7 +6236,7 @@ mod production_registry {
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
-                interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+                interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
                 sandbox: test_sandbox(),
                 todo_store: Arc::new(
@@ -6625,7 +6637,7 @@ mod production_registry {
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
                 question: None,
-                interaction_policy: zuno_goal::InteractionPolicy::WorkOnDemand,
+                interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
                 sandbox: test_sandbox(),
                 todo_store: Arc::new(

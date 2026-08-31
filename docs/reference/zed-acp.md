@@ -501,10 +501,11 @@ After configuration:
    summary survives a session reload;
 7. execute one configured command or unambiguous Skill;
 8. attach an image, selection, and branch diff and confirm they reach the turn;
-9. answer a structured question and confirm its tool row stays `in_progress`
-   until the continuation checkpoint, then becomes `completed` before the next
-   assistant output; inject one retryable stream failure and confirm the failed
-   partial attempt is absent while the accepted-question marker remains;
+9. while still in Plan, answer a structured question and confirm its tool row
+   stays `in_progress` until the continuation checkpoint, then becomes
+   `completed` before the next assistant output; inject one retryable stream
+   failure and confirm the failed partial attempt is absent while the
+   accepted-question marker remains;
 10. delegate a foreground child and confirm either the negotiated child-session
     stream or the complete stable task card, depending on client capability;
 11. delegate a background child, close the root thread, and confirm the job is

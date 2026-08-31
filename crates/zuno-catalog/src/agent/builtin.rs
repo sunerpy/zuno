@@ -342,7 +342,6 @@ impl Builtin {
     pub fn permission_overlay(&self) -> Option<PermissionConfig> {
         let rules: Vec<(&str, PermissionRule)> = match self.name {
             "orchestrator" => vec![
-                ("question", allow()),
                 ("plan_enter", allow()),
                 ("task", allow()),
                 ("plan_get", allow()),
@@ -352,7 +351,6 @@ impl Builtin {
             ],
             "build" => vec![
                 ("task", deny()),
-                ("question", allow()),
                 ("plan_enter", allow()),
                 ("plan_get", allow()),
                 ("plan_update", allow()),
@@ -393,7 +391,6 @@ impl Builtin {
                 ("todo_update", allow()),
                 ("skill", allow()),
                 ("execute", allow()),
-                ("question", allow()),
             ],
             "general" => vec![
                 ("*", deny()),
@@ -642,7 +639,7 @@ mod tests {
         assert_eq!(get("build").expect("build").mode, AgentMode::Primary);
         assert_eq!(get("plan").expect("plan").mode, AgentMode::Primary);
         assert_eq!(get("deep").expect("deep").mode, AgentMode::All);
-        assert_eq!(
+        assert_ne!(
             get("deep")
                 .expect("deep")
                 .permission_overlay()
