@@ -119,7 +119,8 @@ Agent、Workflow、Skill、WASI Component 和受控进程工具共用同一套 P
 
 组件模型见 [Harness Runtime](../harness-runtime.md)，扩展包格式与能力授权见
 [插件与扩展](../plugins.md)。设计取舍记录在
-[Harness 对比](../design/harness-comparison.md)，客户端共享边界见
+[Harness 对比](../design/harness-comparison.md)与
+[DSH alpha.2 采用分类账](../design/dsh-alpha2-adoption-ledger.md)，客户端共享边界见
 [Client interfaces](../design/client-interfaces.md)。
 
 ## 文档

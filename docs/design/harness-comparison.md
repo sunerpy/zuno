@@ -24,13 +24,24 @@ The local upstream checkout and GitHub tags were compared at these exact commits
 | `dsh-v0.1.0-rc.8` | `141eb6fef83422698aef7a981029e843e8161534` | 2026-08-19 | Baseline for the current plugin architecture, durable session events, capability roles, and client projections. |
 | `dsh-v0.1.1-rc.1` | `528c682e061696f5a160f363f236ecbf53cbd006` | 2026-08-21 | Exhausted same-turn retry remains visible in conversation history; stable session snapshot envelopes; multiline question answers; subagent continuation cleanup; authentication alignment; web session and static-route fixes. |
 | `dsh-v0.1.1-rc.2` | `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` | 2026-08-21 | One canonical image admission/request pipeline, deterministic image normalization and encoding, durable attachments, DeepSeek Files fallback, and a deliberate rollback of an unsafe permission-default change. |
+| `dsh-v0.1.2-alpha.2` | `0a53fb55bea101816fa226bb964ae2bed71c343b` | 2026-08-31 | Public-target web fetch hardening, safe search diagnostics, image lifecycle refinements, session-scoped ACP MCP, gated child model selection, headless reasoning progress, loopback browser authentication, and broad client/runtime refactoring. |
 
-The release sequence reinforces four rules for Zuno:
+The full 1,313-commit and 6,808-file classification, including rejected and
+watch-only groups, is recorded in the
+[alpha.2 adoption ledger](dsh-alpha2-adoption-ledger.md).
+
+The release sequence reinforces these rules for Zuno:
 
 1. Persist the failure users must understand, even when a lower retry layer has already exhausted its attempts.
 2. Make client state a stable projection of durable events rather than a collection of UI-local guesses.
 3. Put normalization, limits, fallback, and transport ownership in one capability implementation.
 4. Revert a questionable security default instead of preserving it for compatibility during pre-release development.
+5. Treat public HTTP validation, DNS pinning, redirect handling, and proxy
+   selection as one transport capability.
+6. Keep attachment bytes in a content-addressed host object lifecycle and lower
+   them to a provider request only at the provider boundary.
+7. Freeze delegation authority in durable session policy instead of letting a
+   later configuration edit rewrite an existing child.
 
 ## Project lessons
 
@@ -190,12 +201,20 @@ Claw Code is a useful Rust terminal-agent reference for process ergonomics, focu
 | GitHub, Actions, and release delivery guidance | adapt | On-demand `github-delivery` Skill, typed `remoteObserver` background purpose, authoritative run/ref refresh, strict required-job conclusions, least-privilege workflow guidance, and exact artifact/checksum evidence |
 | Durable memory extraction and consolidation | adapt | Per-session delivered-turn cadence, isolated small-model review with the resident snapshot, and audited add/replace/remove candidates instead of direct model-owned file rewrites |
 | Tool replay after failure | adapt | `Never` by default; explicit `Safe` only for read-only/idempotent tools |
+| Public web fetch targets | adapt | Direct/no-proxy `PublicHttpClient`, all-address public validation, DNS pinning, and per-hop manual redirect validation |
+| Credential-bearing search endpoints | adapt | Private wire URL, scrubbed diagnostic endpoint, URL-free causes, and sentinel leak tests |
+| Durable normalized image objects | adapt | `zuno-attachment`, content-addressed private objects, admission/request policies, legacy inline read support, and late provider inlining |
+| ACP session MCP | adapt | Validated stdio/HTTP declarations, isolated session `ProfileBundle`, atomic tool publication, and exact reverse teardown |
+| Child model selection | adapt | Disabled-by-default exact allowlist frozen as a durable session policy digest |
+| Headless reasoning | adapt | Explicit `--show-reasoning`, stderr-only stable blocks, no signed/encrypted reasoning, and no JSON combination |
+| Loopback browser authentication | adapt | Explicit `--browser-auth`, one-time launch token, authority-bound signed cookie, Origin enforcement, and bootstrap-query redaction |
 | Codex and Claude Code product subagents | adapt | Native app-server/stream-json providers, static configured tools, durable jobs, explicit cancellation, and uncertain non-replay |
 | Bounded specialist roster | adopt | `orchestrator`, `build`, `plan`, `deep`, `fixer`, `general`, `explorer`, `librarian`, `oracle`, `looker` |
 | Team model presets and orchestration Skills | adapt | Schema-generated Agent/category routes frozen per turn, plus an original static `zuno-orchestration` Skill pack; native permission, scheduling, persistence, and lifecycle remain the only runtime authorities |
 | Provider-specific batch search | reject | concurrency belongs in the shared consumer above single-query providers |
 | UI-owned agent behavior | reject | clients render events and submit commands; they do not run a private loop |
 | Cross-project compatibility | reject | Zuno-native config, data, commands, tools, events, and extension interfaces |
+| Provider Files API for images | reject | Keep `ImageRequestPolicy` as an extension point; do not add a provider-owned attachment lifecycle in this cycle |
 
 ## Next comparison cycle
 
