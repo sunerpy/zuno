@@ -19,8 +19,9 @@ use std::time::Duration;
 use tree_sitter::{Node, Parser};
 use zuno_error::ToolError;
 use zuno_pty::{
-    BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionRetention,
-    BackgroundExecutionService, BackgroundExecutionStatus, CommandShell, CommandShellKind,
+    BackgroundExecutionInfo, BackgroundExecutionInput, BackgroundExecutionPurpose,
+    BackgroundExecutionRetention, BackgroundExecutionService, BackgroundExecutionStatus,
+    CommandShell, CommandShellKind,
 };
 use zuno_sandbox::{
     ExecutionAuthority, NetworkAccess, PrepareRequest, SandboxBackend, SandboxMode, SandboxPolicy,
@@ -81,6 +82,9 @@ pub struct ShellParams {
     /// Start the command and return immediately while its lifecycle continues asynchronously.
     #[serde(default)]
     pub background: bool,
+    /// Mark a command that only observes remote work so completion triggers an authoritative refresh.
+    #[serde(default)]
+    pub background_purpose: BackgroundExecutionPurpose,
     /// Exact full object id expected at `HEAD` before rewriting local Git history.
     #[serde(default)]
     pub expected_git_head: Option<String>,
@@ -109,6 +113,12 @@ pub struct ShellAnalysis {
 struct ShellAuthorization {
     writable_roots: Vec<PathBuf>,
     git_metadata_writable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellExecutionLifecycle {
+    purpose: BackgroundExecutionPurpose,
+    retention: BackgroundExecutionRetention,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,7 +306,11 @@ impl ShellTool {
         } else {
             BackgroundExecutionRetention::Ephemeral
         };
-        let input = self.execution_input(&command, &cwd, env, &ctx, retention, &authorization)?;
+        let lifecycle = ShellExecutionLifecycle {
+            purpose: params.background_purpose,
+            retention,
+        };
+        let input = self.execution_input(&command, &cwd, env, &ctx, lifecycle, &authorization)?;
         let (execution, mut lease) = self
             .background_executions
             .start_leased(input)
@@ -525,7 +539,7 @@ impl ShellTool {
         cwd: &Path,
         env: BTreeMap<String, String>,
         ctx: &ToolContext,
-        retention: BackgroundExecutionRetention,
+        lifecycle: ShellExecutionLifecycle,
         authorization: &ShellAuthorization,
     ) -> Result<BackgroundExecutionInput, ToolError> {
         let arguments = match self.shell.kind() {
@@ -564,8 +578,9 @@ impl ShellTool {
             session_id: ctx.session_id.clone(),
             title: command.to_owned(),
             command: command.to_owned(),
+            purpose: lifecycle.purpose,
             hard_ceiling: self.hard_ceiling,
-            retention,
+            retention: lifecycle.retention,
         })
     }
 

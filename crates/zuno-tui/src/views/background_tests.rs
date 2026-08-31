@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
-use zuno_pty::{BackgroundExecutionInput, BackgroundExecutionRetention};
+use zuno_pty::{
+    BackgroundExecutionInput, BackgroundExecutionPurpose, BackgroundExecutionRetention,
+};
 use zuno_sandbox::{
     NetworkAccess, PrepareRequest, PreparedCommand, SandboxCapabilities, SandboxMode, SandboxPolicy,
 };
@@ -58,6 +60,7 @@ fn running() -> (
             session_id: "session-a".to_owned(),
             title: "preview server".to_owned(),
             command: "printf ready; sleep 30".to_owned(),
+            purpose: BackgroundExecutionPurpose::Command,
             hard_ceiling: Duration::from_secs(60),
             retention: BackgroundExecutionRetention::Durable,
         })

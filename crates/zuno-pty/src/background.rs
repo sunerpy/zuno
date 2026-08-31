@@ -12,6 +12,7 @@
 //! [`MAX_RETAINED_TERMINAL_EXECUTIONS`].
 
 use crate::{BUFFER_LIMIT, ReplayCursor, ScrollbackBuffer};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, Write as _};
@@ -118,6 +119,34 @@ impl BackgroundExecutionStatus {
     }
 }
 
+/// What a background process can prove when it reaches terminal state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum BackgroundExecutionPurpose {
+    /// The process outcome is the requested local command outcome.
+    #[default]
+    Command,
+    /// The process only observes work owned by a remote system.
+    RemoteObserver,
+}
+
+impl BackgroundExecutionPurpose {
+    /// Stable client- and model-facing spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::RemoteObserver => "remoteObserver",
+        }
+    }
+
+    /// Whether the resumed Agent must refresh another system before claiming completion.
+    #[must_use]
+    pub const fn requires_authoritative_refresh(self) -> bool {
+        matches!(self, Self::RemoteObserver)
+    }
+}
+
 /// One command's durable metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +155,9 @@ pub struct BackgroundExecutionInfo {
     pub session_id: String,
     pub title: String,
     pub command: String,
+    /// The completion authority selected at the tool boundary.
+    #[serde(default)]
+    pub purpose: BackgroundExecutionPurpose,
     pub cwd: PathBuf,
     pub status: BackgroundExecutionStatus,
     pub pid: Option<u32>,
@@ -174,6 +206,7 @@ pub struct BackgroundExecutionInput {
     pub session_id: String,
     pub title: String,
     pub command: String,
+    pub purpose: BackgroundExecutionPurpose,
     pub hard_ceiling: Duration,
     pub retention: BackgroundExecutionRetention,
 }
@@ -456,6 +489,7 @@ impl BackgroundExecutionService {
             session_id: input.session_id,
             title: input.title,
             command: input.command,
+            purpose: input.purpose,
             cwd: prepared.cwd,
             status: BackgroundExecutionStatus::Running,
             pid,

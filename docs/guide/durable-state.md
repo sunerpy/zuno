@@ -241,9 +241,14 @@ pending inbox scan, so the recovered report can wake an idle parent without a
 new user prompt. A consumed, cancelled, or failed input is terminal and is
 never synthesized again.
 
-For a long-running CI watcher or release command, start one background execution
-and let its durable terminal report resume the session. Use `bg output` for
-specific evidence; do not launch overlapping watchers or hand-written poll loops.
+For a long-running CI watcher or release observer, start one background Shell
+execution with `backgroundPurpose: "remoteObserver"` and let its durable terminal
+report resume the session. Prose such as "the task is still running; I will wait"
+does not create continuation state. The observer's process exit is only a wake
+signal: use `bg output`, then re-query the remote workflow or release by stable
+run/attempt, ref, or release id. Do not launch overlapping watchers or hand-written
+poll loops, and do not treat an overall green run as proof that skipped, cancelled,
+missing, or unexpanded required jobs executed.
 
 ## See also
 

@@ -17,7 +17,10 @@ use tokio::task::JoinHandle;
 use zuno_db::inbox::{InputDelivery, NewSessionInput, SessionInbox, SessionInput, SubmissionState};
 use zuno_db::job::AgentJobStore;
 use zuno_engine::status::SessionRunRegistry;
-use zuno_pty::{BackgroundExecutionEvent, BackgroundExecutionInfo, BackgroundExecutionService};
+use zuno_pty::{
+    BackgroundExecutionEvent, BackgroundExecutionInfo, BackgroundExecutionPurpose,
+    BackgroundExecutionService,
+};
 
 use super::child_turn::{ParentReportWake, wake_parent_report};
 
@@ -385,6 +388,8 @@ fn execution_input(info: &BackgroundExecutionInfo) -> NewSessionInput {
             "status": info.status.as_str(),
             "title": info.title,
             "command": info.command,
+            "purpose": info.purpose.as_str(),
+            "requiresAuthoritativeRefresh": info.purpose.requires_authoritative_refresh(),
             "exitCode": info.exit_code,
             "timedOut": info.timed_out,
             "error": info.error,
@@ -407,10 +412,24 @@ fn execution_report_text(info: &BackgroundExecutionInfo) -> String {
         .as_deref()
         .map(|error| format!("\nRecorded error: {error}"))
         .unwrap_or_default();
+    let continuation = match info.purpose {
+        BackgroundExecutionPurpose::Command => String::from(
+            "Inspect the durable output with the `bg` tool when needed, then continue the parent \
+             task.",
+        ),
+        BackgroundExecutionPurpose::RemoteObserver => String::from(
+            "This process was registered as a remote observer. Its terminal status is only a wake \
+             signal, not proof that the remote workflow, job, or release reached the requested \
+             state. Inspect durable output with the `bg` tool, then re-query authoritative remote \
+             state using a stable repository, run/attempt, or ref identifier. Reconcile every \
+             required child job and artifact before updating the Plan or declaring completion; a \
+             skipped, cancelled, or missing required child is not success unless an explicit \
+             policy permits it.",
+        ),
+    };
     format!(
         "Background command `{}` ({}) reached terminal status `{}`{exit}.{error}\n\
-         The earlier assistant turn may have ended while it was running. Inspect the durable \
-         output with the `bg` tool when needed, then continue the parent task. Do not rerun a \
+         The earlier assistant turn may have ended while it was running. {continuation} Do not rerun a \
          command with possible side effects unless authoritative state proves that replay is safe.",
         info.id,
         info.title,
@@ -440,8 +459,8 @@ mod tests {
     use async_trait::async_trait;
     use zuno_db::job::{JobSettlement, JobSubject, NewAgentJob, ReportDelivery};
     use zuno_pty::{
-        BackgroundExecutionId, BackgroundExecutionInput, BackgroundExecutionRetention,
-        BackgroundExecutionStatus,
+        BackgroundExecutionId, BackgroundExecutionInput, BackgroundExecutionPurpose,
+        BackgroundExecutionRetention, BackgroundExecutionStatus,
     };
     use zuno_sandbox::{
         ExecutionAuthority, NetworkAccess, PrepareRequest, PreparedCommand, SandboxCapabilities,
@@ -520,6 +539,7 @@ mod tests {
             session_id: "ses_parent".to_owned(),
             title: "tests".to_owned(),
             command: "cargo test".to_owned(),
+            purpose: BackgroundExecutionPurpose::Command,
             cwd: directory.clone(),
             status: BackgroundExecutionStatus::Completed,
             pid: None,
@@ -573,6 +593,29 @@ mod tests {
         assert!(!is_async_notification(
             &json!({"kind":"humanRequestAnswer","text":"answer"})
         ));
+    }
+
+    #[test]
+    fn remote_observer_completion_requires_authoritative_remote_refresh() {
+        let mut info = info();
+        info.title = "watch release run".to_owned();
+        info.command = "gh run watch 123456".to_owned();
+        info.purpose = BackgroundExecutionPurpose::RemoteObserver;
+
+        let input = execution_input(&info);
+        let text = input.prompt["text"]
+            .as_str()
+            .expect("model-facing report text");
+
+        assert_eq!(input.prompt["purpose"], "remoteObserver");
+        assert_eq!(input.prompt["requiresAuthoritativeRefresh"], true);
+        assert!(text.contains("only a wake signal"), "{text}");
+        assert!(
+            text.contains("re-query authoritative remote state"),
+            "{text}"
+        );
+        assert!(text.contains("run/attempt, or ref identifier"), "{text}");
+        assert!(text.contains("skipped, cancelled, or missing"), "{text}");
     }
 
     #[tokio::test]
@@ -1006,6 +1049,7 @@ mod tests {
             session_id: "ses_parent".to_owned(),
             title: "notification test".to_owned(),
             command: command.to_owned(),
+            purpose: BackgroundExecutionPurpose::Command,
             hard_ceiling: Duration::from_secs(2),
             retention: BackgroundExecutionRetention::Durable,
         }

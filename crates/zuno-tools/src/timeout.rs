@@ -52,6 +52,11 @@ pub fn timeout_promoted_output(
 
     ToolOutput::text(command.clone(), output)
         .with_metadata("background", true)
+        .with_metadata("background_purpose", execution.purpose.as_str())
+        .with_metadata(
+            "requires_authoritative_refresh",
+            execution.purpose.requires_authoritative_refresh(),
+        )
         .with_metadata("task_id", execution.id.as_str())
         .with_metadata("command", command)
         .with_metadata(
@@ -88,6 +93,11 @@ pub fn background_started_output(
 
     ToolOutput::text(command.clone(), output)
         .with_metadata("background", true)
+        .with_metadata("background_purpose", execution.purpose.as_str())
+        .with_metadata(
+            "requires_authoritative_refresh",
+            execution.purpose.requires_authoritative_refresh(),
+        )
         .with_metadata("pid", json!(execution.pid))
         .with_metadata("task_id", execution.id.as_str())
         .with_metadata("command", command)

@@ -6717,6 +6717,7 @@ version = "0.0.2"
 dependencies = [
  "nix 0.30.1",
  "portable-pty",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",

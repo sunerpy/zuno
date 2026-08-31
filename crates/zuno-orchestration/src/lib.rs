@@ -167,6 +167,12 @@ const NATIVE_PROVENANCE: SkillProvenance = SkillProvenance {
     upstream_revision: CAPABILITY_REVIEW_REVISION,
 };
 
+const CODEX_GITHUB_PROVENANCE: SkillProvenance = SkillProvenance {
+    inspiration: "OpenAI Codex GitHub Action and non-interactive CI guidance, adapted to Zuno's native durable runtime.",
+    license_review: LICENSE_REVIEW,
+    upstream_revision: "OpenAI Codex documentation reviewed 2026-08-31; zuno@dccd8c49317c2035fc57512c27cb7cb3c4e249f7",
+};
+
 macro_rules! pack_source_id {
     ($resource:literal) => {
         concat!(
@@ -190,7 +196,7 @@ macro_rules! pack_location {
 }
 
 /// Every Skill shipped by the first-party pack, in stable presentation order.
-pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
+pub const SKILLS: [BuiltinSkillDescriptor; 10] = [
     BuiltinSkillDescriptor {
         name: "customize-zuno",
         description: "Inspect or change Zuno configuration, providers, authentication, permissions, Agents, workflows, Skills, MCP servers, or extensions.",
@@ -284,6 +290,17 @@ pub const SKILLS: [BuiltinSkillDescriptor; 9] = [
         required_tools: &["read", "shell"],
         content_sha256: "43b7bf1bfb989c13b6352af40531587e480f62151ec7cb94fa7a6206e0d299ab",
         provenance: NATIVE_PROVENANCE,
+    },
+    BuiltinSkillDescriptor {
+        name: "github-delivery",
+        description: "Plan, inspect, or execute GitHub pull request, Actions, CI, tag, artifact, or release delivery with strict evidence and permissions.",
+        content: include_str!("skills/github-delivery.md"),
+        source_id: pack_source_id!("skill/github-delivery"),
+        location: pack_location!("github-delivery"),
+        allowed_profiles: USER_FACING_PROFILES,
+        required_tools: &["read"],
+        content_sha256: "8767494e8544f2a9cba582da9299699757b62bf213186021c7fc610cdbad830e",
+        provenance: CODEX_GITHUB_PROVENANCE,
     },
     BuiltinSkillDescriptor {
         name: "ui-design",
