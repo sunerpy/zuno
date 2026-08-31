@@ -13,7 +13,8 @@ use zuno_error::ToolError;
 use zuno_llm::cache::McpToolStatus;
 use zuno_permission::{PermissionAction, Rule};
 use zuno_tool::{
-    PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolContext, ToolEffect, ToolOutput,
+    PermissionAsk, PermissionAsker, PermissionOrigin, Tool, ToolConcurrencyPolicy, ToolContext,
+    ToolEffect, ToolOutput, ToolReplayPolicy,
 };
 
 #[derive(Default)]
@@ -158,6 +159,64 @@ impl Tool for RecordingTool {
                 .push("execute".to_owned());
         }
         Ok(ToolOutput::text(self.id, args["command"].to_string()))
+    }
+}
+
+struct ActionPolicyTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for ActionPolicyTool {
+    fn id(&self) -> &str {
+        "mixed"
+    }
+
+    fn description(&self) -> &str {
+        "Exercise argument-dependent scheduling and replay policy."
+    }
+
+    fn raw_parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "write"]
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        })
+    }
+
+    fn replay_policy_for(&self, args: &Value) -> ToolReplayPolicy {
+        if args["action"] == "read" {
+            ToolReplayPolicy::Safe
+        } else {
+            ToolReplayPolicy::Never
+        }
+    }
+
+    fn concurrency_policy_for(&self, args: &Value) -> ToolConcurrencyPolicy {
+        if args["action"] == "read" {
+            ToolConcurrencyPolicy::ParallelSafe
+        } else {
+            ToolConcurrencyPolicy::Exclusive
+        }
+    }
+
+    fn effect(&self, args: &Value) -> ToolEffect {
+        if args["action"] == "read" {
+            ToolEffect::ReadOnly
+        } else {
+            ToolEffect::SideEffecting
+        }
+    }
+
+    async fn execute(&self, _args: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("mixed", "executed"))
     }
 }
 
@@ -422,6 +481,23 @@ impl ToolHooks for MutatingHooks {
         output: &mut ToolOutput,
     ) -> Result<(), String> {
         output.title = "hooked title".to_owned();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct EscalatingActionHooks;
+
+#[async_trait]
+impl ToolHooks for EscalatingActionHooks {
+    async fn before(
+        &self,
+        _tool: &str,
+        _session_id: &str,
+        _call_id: &str,
+        args: &mut Value,
+    ) -> Result<(), String> {
+        args["action"] = json!("write");
         Ok(())
     }
 }
@@ -866,6 +942,40 @@ async fn production_dispatch_rewrites_arguments_before_permission_and_execution(
     assert_eq!(result.output.output, "\"hooked\"");
     assert_eq!(result.output.title, "hooked title");
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_hook_cannot_escalate_an_argument_dependent_policy_after_scheduling() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = dispatcher(
+        vec![Arc::new(ActionPolicyTool {
+            calls: Arc::clone(&calls),
+        })],
+        Vec::new(),
+        Arc::new(RecordingApprover::default()),
+    )
+    .with_hooks(Arc::new(EscalatingActionHooks));
+    let request = request(
+        &dispatcher,
+        "call-policy-escalation",
+        "mixed",
+        json!({"action": "read"}),
+    );
+    assert_eq!(
+        dispatcher.concurrency_policy(&request),
+        ToolConcurrencyPolicy::ParallelSafe
+    );
+
+    let result = dispatcher.dispatch(request).await;
+
+    assert!(result.is_error);
+    assert!(
+        result
+            .output
+            .output
+            .contains("changed its concurrency policy after scheduling")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

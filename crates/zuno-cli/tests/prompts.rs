@@ -152,9 +152,14 @@ fn descriptions() -> Vec<Description> {
             text: zuno_tools::read::DESCRIPTION,
         },
         Description {
-            wire_id: "session_search",
-            file: "crates/zuno-tools/src/description/session-search.txt",
-            text: zuno_tools::session_search::DESCRIPTION,
+            wire_id: "history",
+            file: "crates/zuno-continuity/src/description/history.txt",
+            text: include_str!("../../zuno-continuity/src/description/history.txt"),
+        },
+        Description {
+            wire_id: "notes",
+            file: "crates/zuno-continuity/src/description/notes.txt",
+            text: include_str!("../../zuno-continuity/src/description/notes.txt"),
         },
         Description {
             wire_id: "skill",

@@ -29,6 +29,28 @@ Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, an
 `goal_get`/`goal_update`. `memory_propose` appears when memory is enabled, and
 `council_run` when the active agent can reach it.
 
+Optional continuity tools appear only when enabled by `continuity` and retained
+by the final tool and permission filters:
+
+| Tool | Actions | Scope |
+| --- | --- | --- |
+| `history` | `list_windows`, `list_items`, `read_item`, `search_contents` | Normalized evidence from the current session |
+| `notes` | `list_files_by_prefix`, `read_file`, `search_contents`, `append_to_file`, `write_file` | Logical documents for the current session and Agent |
+
+History windows are delimited only by successful compactions. Returned content
+excludes reasoning, encrypted values, synthetic internal prompt text, and binary
+attachment bytes, and must be treated as data rather than instructions.
+
+Notes never expose a host path. A scope may contain at most 100 documents,
+256 KiB per document, and 1 MiB in total. Both write actions require the exact
+`expected_revision`; use `0` only to create a document. The trusted tool
+`call_id`, request digest, and revision make a repeated delivery idempotent while
+rejecting stale concurrent writes.
+
+The host's durable Plan is independent from model tool visibility. Disabling
+`plan_update` hides model mutation but does not disable host Plan creation or
+restart recovery.
+
 `edit`, `execute`, and `lsp` exist as registered slots but are not part of the default
 surface. `edit` remains available to explicitly constructed profiles; the default editing
 path is `apply_patch` plus `write`.
@@ -65,12 +87,18 @@ resource reads, `webfetch`, and `web_search` do not receive the extra strict pro
 Shell, file writes, durable state changes, delegation, product agents, extension
 lifecycle mutations, and unknown MCP tools do.
 
+Mixed tools are resolved from their validated action. Every `history` action and
+the three Notes read actions are `ReadOnly`; Notes append and replacement are
+`SideEffecting`. An absent or unknown Notes action fails closed as
+`SideEffecting`.
+
 ## Replay policy
 
 Tool execution is at-most-once by default. `Never` is inherited unless an implementation
 explicitly declares `Safe`, and the current safe set is read-only or idempotent
-inspection: file reads, glob, grep, skill lookup, session search, job status, LSP
-inspection, goal status, and web search or fetch.
+inspection: file reads, glob, grep, skill lookup, current-session history, Notes reads,
+job status, LSP inspection, goal status, and web search or fetch. Notes writes remain
+`Never`.
 
 | Policy | Behaviour after a failure |
 | --- | --- |

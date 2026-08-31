@@ -31,6 +31,8 @@ fn registry_sources() -> Vec<PathBuf> {
         workspace.join("crates/zuno-tools/src/memory.rs"),
         workspace.join("crates/zuno-tools/src/work_state.rs"),
         workspace.join("crates/zuno-goal/src/tools.rs"),
+        workspace.join("crates/zuno-continuity/src/history.rs"),
+        workspace.join("crates/zuno-continuity/src/notes.rs"),
     ]
 }
 
@@ -211,6 +213,16 @@ fn tool_summary_quotes_the_argument_that_identifies_each_call() {
             "memory_propose",
             r#"{"target":"project","action":"add","content":"run cargo fmt"}"#,
             "add project: run cargo fmt",
+        ),
+        (
+            "history",
+            r#"{"action":"search_contents","query":"release evidence"}"#,
+            "search_contents · release evidence",
+        ),
+        (
+            "notes",
+            r#"{"action":"read_file","name":"work/ci.md"}"#,
+            "read_file · work/ci.md",
         ),
         ("goal_propose", r#"{"objective":"ship P2-4"}"#, "ship P2-4"),
         (

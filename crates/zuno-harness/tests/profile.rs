@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use zuno_engine::driver::{AgentDriver, DefaultAgentDriver};
 use zuno_harness::{
-    ProductCapabilityKind, ToolContributions, ToolManifest, default_profile,
-    default_profile_with_tools, named_capability_key, orchestration_capabilities_bundle, profile,
-    profile_with_tools, skill_capability_key,
+    HostPlanningCapability, ProductCapabilityKind, ToolContributions, ToolManifest,
+    default_profile, default_profile_with_tools, named_capability_key,
+    orchestration_capabilities_bundle, profile, profile_with_tools, skill_capability_key,
 };
 use zuno_orchestration::{
     CapabilityContents, CapabilitySnapshot, PackIdentity, ProfileDescriptor,
@@ -92,6 +92,10 @@ async fn the_default_profile_publishes_only_complete_default_host_tools() {
             .tools()
             .is_empty()
     );
+    assert!(
+        runtime.service::<HostPlanningCapability>().is_some(),
+        "the default host owns durable planning independently of plan_update visibility"
+    );
 }
 
 #[tokio::test]
@@ -117,6 +121,10 @@ async fn a_custom_harness_selects_its_driver_and_tool_surface_without_loop_chang
         [BuiltinSlot::Read, BuiltinSlot::Task]
     );
     assert_eq!(runtime.active_profile_id().as_deref(), Some("benchmark"));
+    assert!(
+        runtime.service::<HostPlanningCapability>().is_none(),
+        "custom profiles must opt into host planning rather than inheriting a loop heuristic"
+    );
 }
 
 #[tokio::test]

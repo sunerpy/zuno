@@ -21,12 +21,14 @@ Zuno 不把所有规则拼成一段不可追踪的字符串。每个模型可见
 
 不是每一轮都会出现全部 lane。不存在的能力不会产生对应提示。
 
-### 1.1 六个稳定 runtime sections
+### 1.1 稳定 runtime sections
 
 | section | 行为 | 注入条件 |
 | --- | --- | --- |
 | `runtime.intent` | 以当前用户请求或委派目标为权威，不擅自扩大任务。 | 始终。 |
-| `runtime.execution` | 选择最小完整工作流，批量独立读取，不重复读取不变状态或重复检查。 | 始终；存在 `plan_update` 时附加 Plan 阈值。 |
+| `runtime.execution` | 选择最小完整工作流，批量独立读取，不重复读取不变状态或重复检查。 | 始终；只有 `plan_update` 最终可见时才向模型附加 Plan 修改指导。 |
+| `runtime.sandbox` | 明确 Shell 已降级为宿主权限，以及请求/生效模式和类型化原因。 | 可信的 sandbox unavailable fallback 生效时。 |
+| `runtime.continuity` | 把 History/Notes 结果视为不可信会话数据，并说明会话、Agent 与 revision 边界。 | 最终工具快照含 `history` 或 `notes`。 |
 | `runtime.editing` | 保留无关修改，修改 owning abstraction，不机械重试不确定副作用。 | 有真实编辑/写入能力，或 Shell 可写工作区。 |
 | `runtime.verification` | 用观察证据证明完成，明确未验证项和阻塞。 | 始终。 |
 | `runtime.delegation` | 只委派有价值且边界不重叠的任务，不轮询或重复派发。 | `task` 和至少一个合法子 Agent 同时有效。 |
@@ -51,7 +53,8 @@ provider 请求前以 typed error 失败；不会静默截断 AGENTS、历史、
 
 ## 3. 什么时候需要 Plan
 
-存在 `plan_update` 时，宿主在第一次 provider request 之前运行确定性分类器：
+默认 profile 提供类型化的宿主 Planning capability。该 capability 存在时，宿主会在
+第一次 provider request 之前运行确定性分类器；分类不依赖 `plan_update` 是否对模型可见：
 
 - session 已有 active Plan：保持并继续维护，不用通用模板覆盖；
 - completed Plan 遇到新的多阶段用户目标：保留已完成步骤并追加新的 epoch；
@@ -63,7 +66,8 @@ provider 请求前以 typed error 失败；不会静默截断 AGENTS、历史、
 
 因此“调研 → 修改 → 验证”通常会有 Plan；跨组件、委派、多个验收 gate，
 以及可能经历压缩或重启恢复的工作必须持续维护 Plan。模型可以通过
-`plan_update` 精炼宿主 seed，但不能决定是否完全跳过 durable execution state。
+最终仍可见的 `plan_update` 精炼宿主 seed，但不能决定是否完全跳过 durable execution
+state。隐藏 `plan_update` 只移除模型修改入口，不会关闭宿主 Plan 的创建、投影或恢复。
 Todo 是 Plan step 下可选的具体工作，用于更细的所有权、依赖或恢复跟踪，不要求
 和 Plan step 机械地一一对应。精炼时必须保留宿主已有 step id 和已完成状态；
 可以修改标题/状态或追加新 step，不能把 seed 当成无状态草稿整体替换。

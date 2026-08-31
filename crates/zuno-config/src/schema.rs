@@ -93,6 +93,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "goal",
     "tool_output",
     "compaction",
+    "continuity",
     "concurrency",
     "memory",
     "experimental",
@@ -222,6 +223,9 @@ pub struct Config {
     /// Context-compaction behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
+    /// Optional model-facing access to durable session history and notes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuity: Option<ContinuityConfig>,
     /// Bounded concurrency for independent runtime capabilities.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<ConcurrencyConfig>,
@@ -273,6 +277,15 @@ impl Config {
         self.concurrency.as_ref().map_or_else(
             ResolvedConcurrencyConfig::default,
             ConcurrencyConfig::resolved,
+        )
+    }
+
+    /// Resolve model-facing continuity tools; absence is deliberately disabled.
+    #[must_use]
+    pub fn resolved_continuity(&self) -> ResolvedContinuityConfig {
+        self.continuity.as_ref().map_or_else(
+            ResolvedContinuityConfig::default,
+            ContinuityConfig::resolved,
         )
     }
 
@@ -549,6 +562,54 @@ pub struct CompactionConfig {
     /// Token buffer left free so compaction itself cannot overflow.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved: Option<u32>,
+}
+
+/// Model-facing continuity: a master boolean, or independently selected tools.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContinuityConfig {
+    /// `false` disables both tools; `true` enables both.
+    Enabled(bool),
+    /// Fine-grained selection. Unspecified fields remain disabled.
+    Options(ContinuityOptions),
+}
+
+impl ContinuityConfig {
+    /// Resolve the master switch and absent object fields.
+    #[must_use]
+    pub fn resolved(&self) -> ResolvedContinuityConfig {
+        match self {
+            Self::Enabled(enabled) => ResolvedContinuityConfig {
+                history: *enabled,
+                notes: *enabled,
+            },
+            Self::Options(options) => ResolvedContinuityConfig {
+                history: options.history.unwrap_or(false),
+                notes: options.notes.unwrap_or(false),
+            },
+        }
+    }
+}
+
+/// Fine-grained switches under the `continuity` top-level key.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContinuityOptions {
+    /// Expose normalized history from the current session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history: Option<bool>,
+    /// Expose session-and-agent scoped working notes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<bool>,
+}
+
+/// Fully defaulted continuity settings consumed by runtime composition roots.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResolvedContinuityConfig {
+    /// Whether the current session's normalized history tool is enabled.
+    pub history: bool,
+    /// Whether the current session-and-agent notes tool is enabled.
+    pub notes: bool,
 }
 
 /// Default percentage of the usable context window consumed before auto compaction.

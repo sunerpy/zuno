@@ -47,11 +47,26 @@ Agent 具有显式的正向职责、负向委派边界、权限以及结构化�
 
 ## Plan 与 Work 状态迁移
 
-持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」这类文字不构成进展。
+持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」这类文字不构成进展。默认 profile 发布类型化的宿主 Planning capability；即使最终工具过滤隐藏了 `plan_update`，宿主仍会创建、持久化并在重启后恢复 Plan。隐藏工具只会移除模型修改入口。
 
 ## 原生会话命令、压缩与硬中断
 
 会话命令、上下文压缩与硬中断都是原生能力，不依赖模型配合。
+
+## 原生 History 与 Notes
+
+`zuno-continuity` 是通过 `ProfileBundle` 与 `ToolContributions` 挂载的原生组件，默认关闭。
+`history` 只读取当前会话，并以成功压缩作为窗口边界；reasoning、加密值、合成内部提示
+正文和二进制附件字节不会返回。`notes` 使用逻辑文档名，按 `session_id + Agent` 隔离。
+
+Notes 每个作用域最多 100 个文档，单文档 256 KiB，总计 1 MiB。写入必须带精确
+`expected_revision`，并用可信 `call_id`、请求摘要和 revision 做幂等与并发冲突保护。
+读取采用 `Safe + ParallelSafe + ReadOnly`，写入采用
+`Never + Exclusive + SideEffecting`；非法 action 按最严格策略失败即拒绝。
+
+组件自有的 `session_note` 与 `session_note_operation` 是 format 5 上的增量表。它们随
+session 级联删除，并进入 session export/import、sanitize 与 prune。TUI、server、ACP
+和 child turn 都消费同一套运行时工具快照，不拥有私有连续性逻辑。
 
 ## 持久 Goal 恢复
 

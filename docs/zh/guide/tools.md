@@ -24,6 +24,23 @@
 
 持久工作状态会额外加入 `plan_get`、`plan_update`、`todo_get`、`todo_update` 以及 `goal_get`/`goal_update`。启用记忆时会出现 `memory_propose`，当前 Agent 能够触达时会出现 `council_run`。
 
+可选的连续性工具只有在 `continuity` 开启，并且通过最终工具与权限过滤后才会出现：
+
+| 工具 | action | 作用域 |
+| --- | --- | --- |
+| `history` | `list_windows`、`list_items`、`read_item`、`search_contents` | 当前会话的规范化证据 |
+| `notes` | `list_files_by_prefix`、`read_file`、`search_contents`、`append_to_file`、`write_file` | 当前会话与 Agent 的逻辑文档 |
+
+History 只把成功压缩作为窗口边界。返回内容排除 reasoning、加密值、合成的内部提示
+正文和二进制附件字节，并且只能作为数据而不是指令处理。
+
+Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档最多 256 KiB，总计最多
+1 MiB。两个写 action 都必须携带精确的 `expected_revision`；只有新建文档时使用
+`0`。可信 `call_id`、请求摘要和 revision 让重复投递保持幂等，同时拒绝过期的并发写入。
+
+宿主持久 Plan 不依赖模型工具是否可见。禁用 `plan_update` 只会隐藏模型的修改入口，
+不会关闭宿主创建 Plan 或重启恢复。
+
 `edit`、`execute` 和 `lsp` 作为已注册的槽位存在，但不属于默认工具面。`edit` 仍可供显式构造的 profile 使用；默认的编辑路径是 `apply_patch` 加 `write`。
 
 `glob` 与 `grep` 驱动官方的 `rg` 可执行文件，Zuno 只贡献带类型的参数、取消、有界解码和稳定排序。必须有 ripgrep 14 或更新版本可用；缺失时工具运行时报启动错误，而不是静默回退到更慢的遍历器。
@@ -43,9 +60,16 @@
 
 原生读取、`glob`、`grep`、skill 与会话与 job 检查、只读 LSP、MCP 资源读取、`webfetch` 和 `web_search` 不会收到额外的 strict 询问。Shell、文件写入、持久状态变更、委派、产品 Agent、扩展生命周期变更以及未知的 MCP 工具会收到。
 
+混合型工具按通过校验后的 action 决定策略。所有 `history` action 和三个 Notes 读取
+action 都是 `ReadOnly`；Notes 追加与替换是 `SideEffecting`。缺少或未知的 Notes
+action 会按 `SideEffecting` 失败即拒绝。
+
 ## 重放策略
 
-工具执行默认是至多一次。除非某个实现显式声明 `Safe`，否则继承 `Never`，而当前的安全集合都是只读或幂等的检查类操作：文件读取、glob、grep、skill 查找、会话搜索、job 状态、LSP 检查、goal 状态，以及网络搜索或获取。
+工具执行默认是至多一次。除非某个实现显式声明 `Safe`，否则继承 `Never`，而当前的
+安全集合都是只读或幂等的检查类操作：文件读取、glob、grep、skill 查找、当前会话
+History、Notes 读取、job 状态、LSP 检查、goal 状态，以及网络搜索或获取。Notes
+写入保持 `Never`。
 
 | 策略 | 失败后的行为 |
 | --- | --- |

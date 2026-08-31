@@ -228,6 +228,57 @@ fn memory_false_dominates_every_enabled_default() {
 }
 
 #[test]
+fn continuity_is_disabled_by_default_and_supports_bool_or_object_selection() {
+    assert_eq!(
+        Config::default().resolved_continuity(),
+        ResolvedContinuityConfig {
+            history: false,
+            notes: false,
+        }
+    );
+    assert_eq!(
+        parse(r#"{"continuity":true}"#)
+            .expect("boolean continuity")
+            .resolved_continuity(),
+        ResolvedContinuityConfig {
+            history: true,
+            notes: true,
+        }
+    );
+    assert_eq!(
+        parse(r#"{"continuity":{"history":true}}"#)
+            .expect("object continuity")
+            .resolved_continuity(),
+        ResolvedContinuityConfig {
+            history: true,
+            notes: false,
+        }
+    );
+    assert_eq!(
+        parse(r#"{"continuity":false}"#)
+            .expect("disabled continuity")
+            .resolved_continuity(),
+        ResolvedContinuityConfig {
+            history: false,
+            notes: false,
+        }
+    );
+}
+
+#[test]
+fn continuity_rejects_unknown_fields_and_non_boolean_values() {
+    let unknown = parse(r#"{"continuity":{"history":true,"recall":true}}"#)
+        .expect_err("unknown continuity fields must fail");
+    assert_eq!(issue_path(&unknown), "continuity.recall");
+
+    for value in [r#""yes""#, "1", "[]"] {
+        let error = parse(&format!(r#"{{"continuity":{value}}}"#))
+            .expect_err("continuity accepts only a boolean or options object");
+        assert_eq!(issue_path(&error), "continuity");
+    }
+}
+
+#[test]
 fn permission_mode_defaults_to_standard_and_legacy_authorization_is_rejected() {
     assert_eq!(
         Config::default().permission_mode(),
@@ -1156,16 +1207,20 @@ fn legacy_permission_shorthands_are_rejected() {
 
 #[test]
 fn action_only_permissions_reject_per_pattern_rules() {
-    let error = parse_value(json!({
-        "permission": { "rules": { "webfetch": { "*": "allow" } } }
-    }))
-    .expect_err("webfetch takes a bare action");
-    assert_eq!(issue_path(&error), "permission.rules.webfetch");
-    assert!(issue_detail(&error).contains("webfetch"));
-    parse_value(json!({
-        "permission": { "rules": { "shell": { "git push": "ask" } } }
-    }))
-    .expect("shell does take per-pattern rules");
+    for key in ["webfetch", "history"] {
+        let error = parse_value(json!({
+            "permission": { "rules": { (key): { "*": "allow" } } }
+        }))
+        .expect_err("action-only tools take a bare action");
+        assert_eq!(issue_path(&error), format!("permission.rules.{key}"));
+        assert!(issue_detail(&error).contains(key));
+    }
+    for key in ["shell", "notes"] {
+        parse_value(json!({
+            "permission": { "rules": { (key): { "*": "ask" } } }
+        }))
+        .expect("resource-addressed tools take per-pattern rules");
+    }
 }
 
 #[test]

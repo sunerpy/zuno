@@ -173,6 +173,8 @@ pub fn tool_affordance(name: &str) -> (&'static str, &'static str) {
         "plan_update" => ("≣", "Updating plan..."),
         "todo_get" => ("☑", "Reading work items..."),
         "todo_update" => ("☑", "Updating work items..."),
+        "history" => ("↶", "Reading session history..."),
+        "notes" => ("≡", "Accessing working notes..."),
         // Tools that are about to block on the user share the one glyph that reads as a
         // question; their labels still distinguish general and goal-specific elicitation.
         "question" => ("?", "Asking..."),

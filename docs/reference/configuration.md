@@ -564,6 +564,39 @@ Zuno can compact older conversation history before the model window is exhausted
 - `/compact` persists the summary through the same durable compaction pipeline,
   so subsequent turns and resumed clients see the same retained history.
 
+## Session continuity tools
+
+Model access to older current-session evidence and durable working notes is
+disabled by default. Enable both tools with:
+
+```json
+{
+  "continuity": {
+    "history": true,
+    "notes": true
+  }
+}
+```
+
+`"continuity": true` is the equivalent shorthand, while `false` or an omitted
+key disables both tools. In the object form, an omitted field defaults to
+`false`, so either capability can be enabled independently.
+
+- `history` exposes normalized current-session messages across successful
+  compaction boundaries. It does not expose reasoning, encrypted fields,
+  synthetic internal prompt text, or binary attachment bytes.
+- `notes` exposes logical documents scoped by current `session_id` and Agent.
+  It never accepts a host filesystem path.
+
+This configuration only contributes candidate tools. The active Agent tool
+allowlist, the top-level `tools` map, request hooks, and `permission.rules`
+may still hide or deny them. Enabling continuity does not change the database
+format version; Notes creates additive component-owned tables when first used.
+
+Hiding `"tools": {"plan_update": false}` removes only the model-facing Plan
+mutation tool. The default profile's typed host-planning capability still
+creates, persists, and restores durable Plans.
+
 ## Plugin packages
 
 Plugins are package directories, not `zuno.json` fields. Install them globally

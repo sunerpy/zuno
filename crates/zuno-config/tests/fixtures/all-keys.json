@@ -311,6 +311,10 @@
     "preserve_recent_tokens": 20000,
     "reserved": 8000
   },
+  "continuity": {
+    "history": true,
+    "notes": true
+  },
   "concurrency": {
     "tool_calls": 8,
     "delegations": 8,

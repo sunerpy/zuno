@@ -67,6 +67,17 @@ zuno debug prompt --session ses_1a2b3c --step 2 --show-sensitive
 
 历史图像的字节不会进入压缩请求。取而代之的是一个稳定标签，例如 `[Attached diagram.png (image/png)]`，而原始的持久文件部分保持不动，以便做权威重放。
 
+## 可选连续性
+
+启用 `continuity.history` 后，模型可以按成功压缩窗口检查当前会话的规范化证据。该工具
+不会跨越 session 边界，也不会返回 reasoning、加密内容、合成内部提示正文或二进制
+附件字节。
+
+启用 `continuity.notes` 后，逻辑工作文档按 `session_id + Agent` 存储。它们属于 session
+生命周期而不是宿主文件系统：删除 session 时级联删除，prune 会计数并移除，session
+export/import 会保留 Notes 及其幂等 ledger。sanitize export 会脱敏文档身份与正文，
+并移除该 ledger。
+
 ## 中断
 
 硬中断是会话作用域的，并且在回合交接过程中是可线性化的。如果上一次运行的守卫已经释放，但一个已准入的后续输入还没获得自己的守卫，注册表会为下一个守卫布防，而不是丢弃这次中断：新回合以中断信号已置位的状态启动，发出终态中断事件，并且不发出任何 provider 请求。

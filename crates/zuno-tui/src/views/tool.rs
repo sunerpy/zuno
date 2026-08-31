@@ -148,7 +148,7 @@ impl Summary {
 /// disciplines.
 /// Runtime aliases such as `exec_command` and `google_search` reuse those rules but stay
 /// out of this registry-wire-id list, because the stale-rule half of that test is exact.
-pub const SUMMARISED: [&str; 27] = [
+pub const SUMMARISED: [&str; 29] = [
     // The 18 `BuiltinSlot` positions, in `BUILTIN_ORDER`.
     "invalid",
     "question",
@@ -178,6 +178,9 @@ pub const SUMMARISED: [&str; 27] = [
     "plan_update",
     "todo_get",
     "todo_update",
+    // Optional native continuity contributions.
+    "history",
+    "notes",
 ];
 
 /// What `name` should say about itself, given the arguments the model wrote.
@@ -295,6 +298,22 @@ pub fn summary(name: &str, arguments: &str) -> Option<Summary> {
         }
         "plan_update" => text("title").map(Summary::tail),
         "plan_get" | "todo_get" => None,
+        "history" => {
+            let action = text("action")?;
+            let subject = first_text(&["query", "window_id", "item_id"]);
+            Some(Summary::tail(match subject {
+                Some(subject) => format!("{action} · {subject}"),
+                None => action,
+            }))
+        }
+        "notes" => {
+            let action = text("action")?;
+            let subject = first_text(&["name", "prefix", "query"]);
+            Some(Summary::tail(match subject {
+                Some(subject) => format!("{action} · {subject}"),
+                None => action,
+            }))
+        }
         // The count plus the first changed item. A bare count says nothing about the work,
         // and the whole change set is not a summary — it is the thing being summarised.
         "todo_update" => {

@@ -261,6 +261,142 @@ fn host_planning_classifier_persists_multi_stage_work_before_the_provider() {
     );
 }
 
+#[tokio::test]
+async fn hiding_plan_update_does_not_disable_host_plan_creation_or_recovery() {
+    let directory = tempfile::TempDir::new().expect("temporary workspace");
+    let goal_spill = tempfile::TempDir::new().expect("temporary goal spill directory");
+    let config_root = tempfile::TempDir::new().expect("temporary config root");
+    let home = config_root.path().join("home");
+    let xdg = config_root.path().join("xdg");
+    std::fs::create_dir_all(&home).expect("create home");
+    std::fs::create_dir_all(&xdg).expect("create XDG root");
+    let config_env = Env::from_pairs([
+        ("HOME".to_owned(), home.display().to_string()),
+        ("XDG_CONFIG_HOME".to_owned(), xdg.display().to_string()),
+        (
+            "ZUNO_CONFIG_CONTENT".to_owned(),
+            r#"{"tools":{"plan_update":false}}"#.to_owned(),
+        ),
+    ]);
+    let config =
+        zuno_config::discovery::discover_with(&zuno_config::discovery::DiscoveryOptions::new(
+            directory.path(),
+            None::<std::path::PathBuf>,
+            config_env,
+        ))
+        .expect("discover hidden plan tool");
+    let selected_agent = agent_profile(agent("build"), directory.path(), &config);
+    let visible = tool_runtime::assemble(
+        directory.path(),
+        None,
+        &Env::empty(),
+        &config,
+        &selected_agent,
+        tool_runtime::ToolSelection {
+            provider_id: "provider",
+            model_id: "model",
+            manifest: Arc::new(zuno_harness::ToolManifest::standard()),
+            contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            question: None,
+            interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
+            background_executions: test_background_executions(directory.path()),
+            sandbox: test_sandbox(),
+            todo_store: Arc::new(
+                zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("in-memory todo store"),
+            ),
+            goal_store: Arc::new(
+                GoalStore::open_memory(goal_spill.path().to_owned()).expect("in-memory goal store"),
+            ),
+            mcp_loader: None,
+            skills: Arc::new(zuno_catalog::skill::Skills::default()),
+            capability: test_capability(),
+            delegation: test_delegation(),
+            product_agents: test_product_agents(),
+            workflows: test_workflows(),
+            councils: test_councils(),
+            job_controller: test_job_controller(),
+            memory: None,
+            tool_authority: None,
+        },
+    )
+    .expect("assemble final tool snapshot");
+    assert!(
+        visible
+            .tools
+            .iter()
+            .all(|tool| tool.id() != zuno_tools::PLAN_UPDATE_TOOL_ID),
+        "the model-facing plan mutation tool must be hidden"
+    );
+
+    let profile_runtime = HarnessRuntime::new("host-planning-hidden-tool");
+    profile_runtime
+        .activate_profile(zuno_harness::default_profile())
+        .await
+        .expect("activate default profile");
+    let session_runtime = profile_runtime.child("session");
+    assert!(host_planning_available(&session_runtime));
+
+    let database_path = directory.path().join("host-plan.db");
+    let location = zuno_paths::DbLocation::File(database_path);
+    let pool = Arc::new(zuno_db::Pool::open(&location).expect("open file database"));
+    {
+        let mut connection = pool.get().expect("schema connection");
+        zuno_db::migration::apply(&mut connection).expect("apply schema");
+        connection
+            .execute_batch(
+                "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+                 VALUES ('project-hidden-plan', '/workspace', 1, 1, '[]');
+                 INSERT INTO session
+                   (id, project_id, slug, directory, title, version, time_created, time_updated)
+                 VALUES
+                   ('ses-hidden-plan', 'project-hidden-plan', 'plan', '/workspace',
+                    'plan', '1', 1, 1);",
+            )
+            .expect("seed planning session");
+    }
+    let outcome = ensure_host_plan(
+        &pool,
+        HostPlanningRequest {
+            session_id: "ses-hidden-plan",
+            agent: "build",
+            prompt: "Investigate the failure, implement the fix, and verify the result.",
+            source: PlanningInputSource::User,
+            content: PlanningContentFacts::empty(),
+            plan_available: host_planning_available(&session_runtime),
+            goal_id: None,
+        },
+    )
+    .expect("host creates plan with the model tool hidden");
+    assert!(outcome.changed);
+    drop(pool);
+    profile_runtime.shutdown().await.expect("shutdown profile");
+
+    let restarted_profile = HarnessRuntime::new("host-planning-restarted");
+    restarted_profile
+        .activate_profile(zuno_harness::default_profile())
+        .await
+        .expect("reactivate default profile");
+    let restarted_session = restarted_profile.child("session");
+    assert!(host_planning_available(&restarted_session));
+    let reopened = Arc::new(zuno_db::Pool::open(&location).expect("reopen file database"));
+    let recovered = zuno_tools::WorkStateStore::new(reopened)
+        .plan("ses-hidden-plan")
+        .expect("read recovered plan")
+        .expect("persisted host plan");
+    assert_eq!(
+        recovered
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        ["investigate", "implement", "verify"]
+    );
+    restarted_profile
+        .shutdown()
+        .await
+        .expect("shutdown restarted profile");
+}
+
 #[test]
 fn host_planning_classifier_appends_a_new_epoch_after_terminal_work() {
     let pool = Arc::new(
