@@ -1087,9 +1087,9 @@ impl Respond for SubagentTurnResponder {
 }
 
 #[derive(Clone)]
-struct ParentOwnedQuestionTurnResponder;
+struct ParentReportsChildBlockerTurnResponder;
 
-impl Respond for ParentOwnedQuestionTurnResponder {
+impl Respond for ParentReportsChildBlockerTurnResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).expect("provider request JSON");
         let has_tools = body
@@ -1131,17 +1131,6 @@ impl Respond for ParentOwnedQuestionTurnResponder {
             );
             return compatible_text_response("child needs parent to ask which database");
         }
-        if let Some(answer) = messages
-            .iter()
-            .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_question")
-        {
-            let content = answer["content"].to_string();
-            assert!(
-                content.contains("SQLite") && !content.contains("Unknown tool"),
-                "parent question must contain the accepted user answer: {answer:#}"
-            );
-            return compatible_text_response("parent received SQLite after asking the user");
-        }
         if let Some(child_report) = messages.iter().find(|message| {
             message["role"] == "tool" && message["tool_call_id"] == "call_task_child_question"
         }) {
@@ -1151,20 +1140,7 @@ impl Respond for ParentOwnedQuestionTurnResponder {
                     .contains("child needs parent to ask which database"),
                 "delegated child must report its blocker to the parent: {child_report:#}"
             );
-            return compatible_tool_response(
-                "call_question",
-                "question",
-                json!({
-                    "questions": [{
-                        "question": "Which database?",
-                        "header": "Database",
-                        "options": [
-                            {"label": "Postgres", "description": "Relational database"},
-                            {"label": "SQLite", "description": "Embedded database"}
-                        ]
-                    }]
-                }),
-            );
+            return compatible_text_response("Which database should be used: Postgres or SQLite?");
         }
         compatible_tool_response(
             "call_task_child_question",
@@ -2648,7 +2624,7 @@ async fn acp_images_and_embedded_context_reach_the_provider_and_durable_replay()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_prompt_round_trips_question_tool_through_stable_elicitation() {
+async fn acp_plan_round_trips_question_tool_through_stable_elicitation() {
     let provider = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(QuestionTurnResponder)
@@ -2691,10 +2667,17 @@ async fn acp_prompt_round_trips_question_tool_through_stable_elicitation() {
         .as_str()
         .expect("session id")
         .to_owned();
-    let (completed, updates, elicitation) = request_with_elicitation(
+    request(
         &mut stdin,
         &mut stdout,
         3,
+        "session/set_mode",
+        json!({"sessionId": &session_id, "modeId": "plan"}),
+    );
+    let (completed, updates, elicitation) = request_with_elicitation(
+        &mut stdin,
+        &mut stdout,
+        4,
         "session/prompt",
         json!({
             "sessionId": &session_id,
@@ -2911,10 +2894,10 @@ async fn acp_prompt_streams_a_negotiated_foreground_subagent_on_its_child_sessio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn acp_fallback_keeps_user_elicitation_on_the_parent_session() {
+async fn acp_fallback_reports_child_blocker_without_synchronous_elicitation() {
     let provider = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ParentOwnedQuestionTurnResponder)
+        .respond_with(ParentReportsChildBlockerTurnResponder)
         .mount(&provider)
         .await;
     let root = tempfile::tempdir().expect("ACP test root");
@@ -2958,7 +2941,7 @@ async fn acp_fallback_keeps_user_elicitation_on_the_parent_session() {
         .as_str()
         .expect("parent session id")
         .to_owned();
-    let (completed, updates, elicitation) = request_with_elicitation(
+    let (completed, updates) = request_with_updates(
         &mut stdin,
         &mut stdout,
         3,
@@ -2967,12 +2950,14 @@ async fn acp_fallback_keeps_user_elicitation_on_the_parent_session() {
             "sessionId": &parent_session_id,
             "prompt": [{"type":"text","text":"Delegate a child question."}]
         }),
-        &parent_session_id,
     );
     assert_eq!(completed["stopReason"], "end_turn");
     assert!(
-        elicitation.pointer("/_meta/zuno/childSessionId").is_none(),
-        "the parent owns user elicitation after a child reports its blocker: {elicitation:#}"
+        updates.iter().all(|update| {
+            update["sessionUpdate"] != "tool_call" || update["toolCallId"] != "call_question"
+        }),
+        "ordinary work must report the blocker directly instead of parking on elicitation: \
+         {updates:#?}"
     );
     assert!(
         updates
@@ -2982,7 +2967,7 @@ async fn acp_fallback_keeps_user_elicitation_on_the_parent_session() {
     );
     assert!(updates.iter().any(|update| {
         update["sessionUpdate"] == "agent_message_chunk"
-            && update["content"]["text"] == "parent received SQLite after asking the user"
+            && update["content"]["text"] == "Which database should be used: Postgres or SQLite?"
     }));
 
     request(
