@@ -25,8 +25,8 @@ impl SessionCommand {
         Self::Compact,
         Self::Goal,
         Self::Learn,
-        Self::Reflect,
         Self::Plan,
+        Self::Reflect,
         Self::StartPlan,
         Self::StartWork,
     ];
@@ -110,8 +110,8 @@ mod tests {
                 "compact",
                 "goal",
                 "learn",
-                "reflect",
                 "plan",
+                "reflect",
                 "start-plan",
                 "start-work"
             ]

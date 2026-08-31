@@ -1774,8 +1774,8 @@ fn acp_goal_and_plan_commands_are_native_and_do_not_enter_model_input() {
             "compact",
             "goal",
             "learn",
-            "reflect",
             "plan",
+            "reflect",
             "start-plan",
             "start-work"
         ]

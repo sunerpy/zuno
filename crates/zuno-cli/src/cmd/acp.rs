@@ -3202,8 +3202,8 @@ mod tests {
                 "compact",
                 "goal",
                 "learn",
-                "reflect",
                 "plan",
+                "reflect",
                 "start-plan",
                 "start-work",
                 "review",
@@ -3220,7 +3220,7 @@ mod tests {
             advertised[2]["input"]["hint"],
             "remember|issue|solved|forget|promote|feedback ..."
         );
-        assert_eq!(advertised[3]["input"]["hint"], "turn | session");
+        assert_eq!(advertised[4]["input"]["hint"], "turn | session");
         assert_eq!(advertised[7]["input"]["hint"], "question");
     }
 

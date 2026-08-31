@@ -352,12 +352,24 @@ fn views_sidebar_projects_learning_review_state_from_shared_work_state() {
         .collect::<Vec<_>>()
         .join("\n");
     let normalized = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        view.ambient().work.learning.experiences[0].kind,
+        zuno_types::ExperienceKind::UnresolvedIssue
+    );
+    assert_eq!(
+        view.ambient().work.learning.patterns[0].independent_sessions,
+        3
+    );
+    assert_eq!(
+        view.ambient().work.learning.skill_candidates[0].status,
+        zuno_types::SkillCandidateStatus::PendingReview
+    );
     for expected in [
         "Learning",
         "1 experiences · 2 review · /learn",
-        "Release still fails · unresolved_issue",
-        "pattern · Verify remote artifacts · 3 sessions",
-        "Skill · learned-release-check · pending_review",
+        "Release still fails · unresolv",
+        "pattern · Verify remote artifact",
+        "Skill · learned-release-check",
     ] {
         assert!(
             normalized.contains(expected),
