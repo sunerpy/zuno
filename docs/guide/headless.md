@@ -183,10 +183,12 @@ zuno serve --port 4096
 zuno acp --check
 ```
 
-The server adds no authentication on your behalf. Binding to `0.0.0.0` or advertising over
-mDNS exposes it beyond the local host, so restrict the bind address and CORS origins to
-what the deployment needs. For ACP, stdout carries protocol framing, so send diagnostics to
-stderr with `--print-logs`. See [Editors and ACP](/reference/zed-acp).
+The server supports Basic Auth through `ZUNO_SERVER_PASSWORD` and the explicit
+loopback-only `--browser-auth` bootstrap. Browser auth prints one launch URI,
+consumes its token once, and issues an authority-bound signed cookie. It never
+makes a non-loopback listener acceptable. For ACP, stdout carries protocol
+framing, so send diagnostics to stderr with `--print-logs`. See
+[Editors and ACP](/reference/zed-acp).
 
 ## See also
 

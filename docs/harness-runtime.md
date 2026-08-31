@@ -1580,4 +1580,20 @@ and closes both the detached observer and the producer on success or failure bef
 host shutdown. A failed turn therefore cannot leave the renderer waiting forever
 for a sender retained only by the failed producer path.
 
+`zuno run --show-reasoning` is an explicit presentation option. It writes only
+provider `ReasoningDelta` content to stderr between stable start/end markers,
+while final answer text remains on stdout. Signed thinking and encrypted
+reasoning are never rendered. A missing start is opened lazily on the first
+delta, and every error or stream end closes an open block. JSON mode rejects the
+flag and retains the existing structured event output.
+
+`zuno serve --browser-auth` is an explicit loopback-only HTTP surface. Each
+process launch creates one 256-bit token and prints its bootstrap URI exactly
+once outside tracing. Atomic exchange sets an authority-bound 30-day HMAC cookie
+using the private persistent `$DATA/server/browser-auth.key`; the token is then
+unusable. Basic Auth and the cookie compose with OR semantics, but unsafe
+cookie-authorized methods require an exact current-authority Origin. The
+bootstrap query is removed before access logging, and non-loopback resolution
+rejects the mode even when Basic Auth is configured.
+
 The design sources and explicit adopt/adapt/reject decisions are recorded in [the harness comparison](design/harness-comparison.md).

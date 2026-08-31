@@ -113,6 +113,10 @@ WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、sch
 
 客户端界面消费持久事件、收件箱状态和投影。TUI、server、ACP 以及未来的 GUI 客户端不得获得私有的 Agent 循环行为。
 
+`zuno run --show-reasoning` 只把 provider 明确提供的 reasoning delta 用稳定区块写入 stderr，最终答案继续只写 stdout；signed/encrypted reasoning 永不显示，且不能与 JSON 格式组合。
+
+`zuno serve --browser-auth` 是显式的纯回环模式：单次 256-bit 启动 token 换取绑定 authority 的 30 天签名 Cookie；Basic Auth 与 Cookie 任一有效即可授权，Cookie 的非安全方法还要求精确 Origin。bootstrap query 在访问日志前被脱敏。
+
 ## 参见
 
 - [Harness Runtime（英文完整版）](https://github.com/sunerpy/zuno/blob/main/docs/harness-runtime.md) —— 逐节权威契约

@@ -482,6 +482,12 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .with_port(args.port)
             .with_auth(auth)
             .with_default_directory(&directory);
+        let server_config = if args.browser_auth {
+            server_config
+                .with_browser_auth(zuno_paths::data().join("server").join("browser-auth.key"))
+        } else {
+            server_config
+        };
         let state = ApiState::open_default(&directory)
             .map_err(|error| error.to_string())?
             .with_configured_shell(harness_config.shell.clone())
@@ -515,13 +521,16 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             services.events.clone(),
         ));
         let services = services.with_mutations(mutations);
-        let server = ServerBuilder::new(server_config)
+        let mut server = ServerBuilder::new(server_config)
             .with_services(services)
             .with_routes(api::router(state.clone()).merge(events_router(events)))
             .bind()
             .await
             .map_err(|error| error.to_string())?;
         println!("{}", server_readiness_message(server.local_addr()));
+        if let Some(uri) = server.take_browser_bootstrap_uri() {
+            println!("Browser authentication: {uri}");
+        }
         std::io::stdout()
             .flush()
             .map_err(|error| error.to_string())?;

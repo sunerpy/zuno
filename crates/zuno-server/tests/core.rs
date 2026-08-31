@@ -2,7 +2,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Extension;
 use axum::http::{Request, StatusCode, header};
-use axum::routing::get;
+use axum::routing::{get, post};
 use tower::ServiceExt;
 use zuno_server::{
     AuthConfig, Delivery, EventFanout, RequestDirectory, ServerBuilder, ServerConfig, ServerError,
@@ -139,6 +139,161 @@ async fn core_non_loopback_without_password_is_refused_before_binding() {
     assert!(message.contains("--hostname"), "{message}");
     assert!(message.contains("expose"), "{message}");
     assert!(message.contains("ZUNO_SERVER_PASSWORD"), "{message}");
+}
+
+#[tokio::test]
+async fn core_browser_auth_rejects_non_loopback_even_with_basic_auth() {
+    let temp = tempfile::tempdir().expect("browser auth fixture");
+    let config = ServerConfig::default()
+        .with_hostname("0.0.0.0")
+        .with_auth(AuthConfig::new(Some("secret".to_owned()), None))
+        .with_browser_auth(temp.path().join("browser-auth.key"));
+    let error = match ServerBuilder::new(config).bind().await {
+        Ok(_) => panic!("browser authentication must remain loopback-only"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ServerError::BrowserAuthNonLoopback { .. }));
+}
+
+#[tokio::test]
+async fn core_browser_auth_exchanges_once_and_enforces_cookie_origin() {
+    let temp = tempfile::tempdir().expect("browser auth fixture");
+    let config = ServerConfig::default()
+        .with_auth(AuthConfig::new(Some("secret".to_owned()), None))
+        .with_browser_auth(temp.path().join("server/browser-auth.key"));
+    let routes = Router::new().route("/mutate", post(|| async { "mutated\n" }));
+    let mut server = ServerBuilder::new(config)
+        .with_routes(routes)
+        .bind()
+        .await
+        .expect("loopback browser-auth server binds");
+    let address = server.local_addr();
+    let origin = format!("http://{address}");
+    let bootstrap = server
+        .take_browser_bootstrap_uri()
+        .expect("one bootstrap URI");
+    assert!(server.take_browser_bootstrap_uri().is_none());
+    let token = bootstrap
+        .split_once("?token=")
+        .map(|(_, token)| token)
+        .expect("bootstrap token")
+        .to_owned();
+    let task = tokio::spawn(server.serve());
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("HTTP client");
+
+    assert_eq!(
+        client
+            .get(format!("{origin}/health"))
+            .send()
+            .await
+            .expect("unauthorized health request")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let duplicate = client
+        .get(format!("{origin}/auth/browser?token={token}&token={token}"))
+        .send()
+        .await
+        .expect("duplicate token request");
+    assert_eq!(duplicate.status(), StatusCode::UNAUTHORIZED);
+
+    let exchange = client
+        .get(&bootstrap)
+        .send()
+        .await
+        .expect("bootstrap exchange");
+    assert_eq!(exchange.status(), StatusCode::SEE_OTHER);
+    assert_eq!(exchange.headers()[header::LOCATION], "/health");
+    assert_eq!(exchange.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(exchange.headers()[header::REFERRER_POLICY], "no-referrer");
+    let cookie = exchange.headers()[header::SET_COOKIE]
+        .to_str()
+        .expect("set-cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned();
+    assert!(!format!("{:?}", exchange.headers()).contains(&token));
+
+    assert_eq!(
+        client
+            .get(&bootstrap)
+            .send()
+            .await
+            .expect("replayed bootstrap request")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(format!("{origin}/health"))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .expect("cookie health request")
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .post(format!("{origin}/mutate"))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .expect("missing-origin mutation")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(format!("{origin}/mutate"))
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, "http://127.0.0.1:1")
+            .send()
+            .await
+            .expect("wrong-origin mutation")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(format!("{origin}/mutate"))
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, &origin)
+            .send()
+            .await
+            .expect("same-origin mutation")
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .post(format!("{origin}/mutate"))
+            .header(header::AUTHORIZATION, "Basic enVubzpzZWNyZXQ=")
+            .send()
+            .await
+            .expect("basic-auth mutation")
+            .status(),
+        StatusCode::OK,
+        "Basic Auth remains sufficient without an Origin header"
+    );
+    assert_eq!(
+        client
+            .get(format!("{origin}/health"))
+            .header(header::COOKIE, format!("{cookie}; {cookie}"))
+            .send()
+            .await
+            .expect("duplicate-cookie request")
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    task.abort();
+    let _ = task.await;
 }
 
 #[tokio::test]

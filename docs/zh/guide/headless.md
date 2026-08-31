@@ -153,7 +153,7 @@ zuno serve --port 4096
 zuno acp --check
 ```
 
-Server 不会替你添加任何认证。绑定到 `0.0.0.0` 或通过 mDNS 广播会把它暴露到本机之外，所以请把绑定地址和 CORS 来源限制到部署实际需要的范围。对 ACP 来说，stdout 承载协议分帧，因此请用 `--print-logs` 把诊断信息送到 stderr。参见[编辑器与 ACP](/zh/guide/editors)。
+Server 支持通过 `ZUNO_SERVER_PASSWORD` 启用 Basic Auth，也支持显式的回环专用 `--browser-auth` bootstrap。浏览器认证只打印一次启动 URI，token 只能消费一次，随后签发绑定 authority 的签名 Cookie；它绝不会让非回环监听变得可接受。对 ACP 来说，stdout 承载协议分帧，因此请用 `--print-logs` 把诊断信息送到 stderr。参见[编辑器与 ACP](/zh/guide/editors)。
 
 ## 参见
 

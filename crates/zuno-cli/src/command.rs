@@ -296,6 +296,9 @@ pub struct ServeArgs {
     pub mdns_domain: String,
     #[arg(long)]
     pub cors: Vec<String>,
+    /// Enable one-time loopback browser bootstrap and signed session cookies.
+    #[arg(long, default_value_t = false)]
+    pub browser_auth: bool,
 }
 
 #[derive(Debug, Clone, Args)]

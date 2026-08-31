@@ -6,8 +6,9 @@
 服务器 owner 在进程内包装 `zuno_server::ServerBuilder`。它不会派生一个单独的 `zuno-server`
 可执行文件，也不会重复实现监听器行为。
 
-绑定到 `0.0.0.0` 或通过 mDNS 广告监听器，都会把它暴露到本机之外。服务器不会代你添加
-认证，所以要把绑定地址和 CORS 来源限制到部署真正需要的范围。
+`ZUNO_SERVER_PASSWORD` 启用 HTTP Basic Auth；`ZUNO_SERVER_USERNAME` 默认是 `zuno`。没有非空密码时，只要 hostname 解析结果中包含非回环地址，Zuno 就拒绝监听。
+
+`--browser-auth` 是为本地浏览器显式启用的独立模式。即使同时配置了 Basic Auth，也只有全部解析地址都是回环时才接受。启动时会打印一个含 256-bit 单次 token 的 bootstrap URI；交换成功后设置 30 天有效、绑定 authority 的签名 `HttpOnly; SameSite=Strict; Path=/` Cookie，并 303 跳转到 `/health`。访问日志看不到 token query。Basic 凭据或浏览器 Cookie 任一有效即可授权；使用 Cookie 的非安全方法还必须携带与当前 authority 完全匹配的 `Origin`。
 
 ## 用法
 
@@ -27,6 +28,7 @@ zuno serve [OPTIONS]
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
 | `--mdns-domain <MDNS_DOMAIN>` | | `zuno.local` |
 | `--cors <CORS>` | | |
+| `--browser-auth` | 启用单次回环浏览器 bootstrap 与签名 session Cookie | |
 | `--sandbox <SANDBOX>` | 为本次调用选择 Shell 约束。可选值：`read-only`、`workspace-write`、`danger-full-access` | |
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
@@ -45,17 +47,27 @@ zuno serve
 zuno serve --port 4096
 ```
 
+启动一个回环浏览器 session。打开输出中标为 `Browser authentication` 的 URI；它在本次进程启动中只能使用一次。
+
+```sh
+zuno serve --port 4096 --browser-auth
+```
+
+非回环部署使用 Basic Auth。
+
+```sh
+ZUNO_SERVER_USERNAME=zuno \
+ZUNO_SERVER_PASSWORD='replace-with-a-secret' \
+  zuno serve --hostname 192.0.2.10 --port 4096
+```
+
 在排查连接失败的客户端时，在 stderr 上观察服务器自身的日志流。
 
 ```sh
 zuno serve --port 4096 --print-logs --log-level DEBUG
 ```
 
-在受信网络上，用自定义域名通过 mDNS 广告监听器以便被发现。
-
-```sh
-zuno serve --port 4096 --mdns --mdns-domain zuno.local
-```
+`--mdns`、`--mdns-domain` 与 `--cors` 已保留，但当前 Rust server runtime 尚未实现。
 
 ## 参见
 
