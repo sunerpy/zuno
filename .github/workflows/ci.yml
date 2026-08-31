@@ -1,33 +1,44 @@
-# CI: every gate `make ci` runs locally, plus the ones that need a clean machine.
+# CI: every gate `make ci` runs on pull requests, plus the ones that need a clean
+# machine.
 #
-# The contract with the Makefile is deliberate: `fmt-check`, `lint`, `test`,
-# `deny` and `artifact` below invoke the SAME make targets a developer runs, so
-# "green locally" and "green in CI" cannot drift into meaning different things.
+# The contract with the Makefile is deliberate: `fmt-check`, `lint`, `test`, and
+# `artifact` below invoke the SAME make targets a developer runs. The online
+# supply-chain step uses the same cargo-deny policy as `make deny`, but refreshes
+# RUSTSEC instead of forcing the local offline mode. "Green locally" and "green
+# in CI" therefore differ only where current advisory data is the point.
 #
-# Two jobs exist here that `make ci` cannot fully cover on a developer machine:
+# One separate job exists here that `make ci` cannot fully cover on a developer
+# machine:
 #
-#   * `artifact` proves the packaging and smoke path works on every push, not only
-#     when someone cuts a tag. The release workflow's six-target matrix is far too
-#     slow for a per-commit gate, but its host leg is not — and a release pipeline
-#     whose smoke step is first exercised during the real release is untested.
+#   * `artifact` proves the packaging and smoke path works on every pull request,
+#     not only when someone cuts a tag. The release workflow's five-target matrix
+#     is far too slow for a per-change gate, but its host leg is not — and a
+#     release pipeline whose smoke step is first exercised during the real release
+#     is untested.
 #   * `windows` catches the platform-specific failures a Linux developer cannot
-#     see: path separators, and the two Windows targets the release ships. It is
+#     see: path separators and the Windows target the release ships. It is
 #     the one job here that cannot run on CodeBuild, so it is opt-in — see the
 #     comment above the job for why, and what turns it back on.
 #
-# Every gating job runs on the `zuno-runner` CodeBuild-hosted runner, which
+# `cargo deny` remains a named step in `test` instead of starting a second runner
+# and installing a second Rust toolchain for a check that took seven seconds on
+# release 0.0.2. Every gating job runs on the `zuno-runner` CodeBuild-hosted runner, which
 # consumes no GitHub Actions minutes. That is the required path, and it is
 # complete on its own: nothing GitHub-hosted can hold the merge gate red.
+#
+# `main` is protected by an active pull-request ruleset with no bypass actors.
+# Running this workflow again on the merge commit therefore repeats the exact
+# checked tree without protecting an additional write path. Release PRs already
+# receive this pull-request workflow; their merge is validated by release.yml's
+# cross-platform build/smoke pipeline instead of launching both workflows.
 
 name: CI
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -79,6 +90,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-deny
+
       # `--locked` first and on its own: a lock file that cannot be reproduced
       # makes every later failure look like a code problem, and a plain
       # `cargo build` silently repairs it. Learned the hard way merging wave 7.
@@ -95,6 +110,12 @@ jobs:
       # Windows-only transitive deps an offline resolve otherwise trips over.
       - name: Populate the cargo registry for the offline gates
         run: cargo fetch --locked
+
+      # Online on purpose: cargo-deny refreshes the RUSTSEC advisory database.
+      # Keeping this as a named step preserves a legible supply-chain gate without
+      # paying for a second checkout, Rust installation, and runner startup.
+      - name: Supply chain
+        run: cargo deny --all-features check
 
       # oxfmt is an npm package with per-platform native bindings and
       # `engines: ^20.19.0 || >=22.12.0`. The CodeBuild image defaults to Node 18,
@@ -180,50 +201,14 @@ jobs:
       - name: Test suite
         run: make test
 
-  # The supply-chain gate is its own job so a licence or advisory failure is
-  # legible at a glance instead of buried in a 3000-test log.
-  supply-chain:
-    name: Supply chain
-    # SECURITY: never run on a fork's pull request. This job is routed to a
-    # CodeBuild runner whose container is `privilegedMode=true` and whose service
-    # role can read the `zuno-github` CodeConnection token. That token's scope is
-    # the GitHub App installation, not this repository, so executing an outside
-    # contributor's code there would hand them a credential reaching further than
-    # the pull request they opened. GitHub withholds secrets from fork pull
-    # requests automatically; it cannot withhold a runner's own IAM role, so the
-    # gate has to be here. Review a fork's changes, then run them from a branch.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on:
-      - codebuild-zuno-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - zuno-ci-supply-chain
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # Same version rust-toolchain.toml pins, for the reason spelled out in `test`.
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
-        with:
-          toolchain: "1.98.0"
-
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
-        with:
-          tool: cargo-deny
-
-      # Online here on purpose: cargo-deny fetches the RUSTSEC advisory database,
-      # and the whole point of the advisories check is to be current. `make deny`
-      # is the offline-capable local equivalent.
-      - name: cargo deny
-        run: cargo deny --all-features check
-
   # -------------------------------------------------------------------------
   # artifact: the release pipeline's packaging + smoke path, on the host leg.
   #
-  # Same three checks the release workflow runs against all six archives —
+  # Same three checks the release workflow runs against all five archives —
   # `--version`, `--help`, and a headless `run` against a committed cassette —
   # against a real release build that was packaged and unpacked first. Cheap
-  # enough for every push, and it means a break in the smoke driver or the
-  # cassette surfaces on the pull request that caused it.
+  # enough for every pull request, and it means a break in the smoke driver or
+  # the cassette surfaces before the change can reach the protected branch.
   # -------------------------------------------------------------------------
   artifact:
     name: Artifact smoke (host)
@@ -379,7 +364,7 @@ jobs:
         github.event_name != 'pull_request'
         || github.event.pull_request.head.repo.full_name == github.repository
       )
-    needs: [test, supply-chain, artifact, windows]
+    needs: [test, artifact, windows]
     steps:
       - name: Check every required job succeeded
         env:
