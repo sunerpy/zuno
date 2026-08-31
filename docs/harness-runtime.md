@@ -1462,6 +1462,12 @@ The first failed query cancels its siblings and waits for every request to settl
 
 Provider adapters normalize transport output into `SearchResult` and `SearchSource`; they do not own batch scheduling or model-facing presentation.
 
+Credential-bearing provider wire URLs are private implementation data. Search
+diagnostics retain only provider, scheme, host, path, status, and an error
+category. Reqwest errors remove their URL before entering a cause chain, and
+query text, authorization headers, and API keys are forbidden from `Debug`,
+`Display`, `ToolError`, tracing, response bodies, and retry notices.
+
 ## Network egress
 
 `zuno-network` owns the outbound HTTP construction policy shared by providers,

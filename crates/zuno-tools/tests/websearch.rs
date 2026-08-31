@@ -232,6 +232,129 @@ async fn exa_key_is_only_attached_to_the_endpoint() {
 }
 
 #[tokio::test]
+async fn credential_bearing_endpoint_is_redacted_from_the_complete_error_chain() {
+    const SENTINEL: &str = "sentinel-exa-key-must-never-escape";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let endpoint = format!(
+        "{}/mcp?exaApiKey={SENTINEL}&query=private-search",
+        server.uri()
+    );
+    let error = run(
+        WebSearchTool::with_config(config(&[
+            (ENV_PROVIDER, "exa"),
+            (ENV_EXA_API_KEY, SENTINEL),
+        ]))
+        .with_endpoint(endpoint),
+        json!({ "queries": ["private-search"] }),
+        context("ses_redaction"),
+    )
+    .await
+    .expect_err("provider failure");
+
+    let debug = format!("{error:?}");
+    let display = error.to_string();
+    let tracing_payload = zuno_error::source::describe(&error);
+    assert!(!debug.contains(SENTINEL), "{debug}");
+    assert!(!display.contains(SENTINEL), "{display}");
+    assert!(!tracing_payload.contains(SENTINEL), "{tracing_payload}");
+    assert!(!debug.contains("private-search"), "{debug}");
+    assert!(!display.contains("private-search"), "{display}");
+    assert!(
+        !tracing_payload.contains("private-search"),
+        "{tracing_payload}"
+    );
+    assert!(debug.contains("exa"), "{debug}");
+    assert!(debug.contains("/mcp"), "{debug}");
+    assert!(!debug.contains("exaApiKey"), "{debug}");
+
+    let ToolError::Transient { source, .. } = error else {
+        panic!("503 must remain transient");
+    };
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+    while let Some(error) = current {
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(SENTINEL), "{rendered}");
+        assert!(!rendered.contains("private-search"), "{rendered}");
+        current = error.source();
+    }
+}
+
+#[tokio::test]
+async fn transport_errors_strip_the_wire_url_before_entering_the_cause_chain() {
+    const SENTINEL: &str = "sentinel-transport-key-must-never-escape";
+    let endpoint =
+        format!("http://127.0.0.1:1/mcp?exaApiKey={SENTINEL}&query=private-transport-query");
+    let error = run(
+        WebSearchTool::with_config(config(&[
+            (ENV_PROVIDER, "exa"),
+            (ENV_EXA_API_KEY, SENTINEL),
+        ]))
+        .with_endpoint(endpoint),
+        json!({ "queries": ["private-transport-query"] }),
+        context("ses_transport_redaction"),
+    )
+    .await
+    .expect_err("closed local port must fail");
+
+    let rendered = format!(
+        "{error:?}\n{}\n{}",
+        error,
+        zuno_error::source::describe(&error)
+    );
+    assert!(!rendered.contains(SENTINEL), "{rendered}");
+    assert!(!rendered.contains("private-transport-query"), "{rendered}");
+    assert!(!rendered.contains("exaApiKey"), "{rendered}");
+    assert!(rendered.contains("provider `exa`"), "{rendered}");
+    assert!(rendered.contains("http://127.0.0.1:1/mcp"), "{rendered}");
+}
+
+#[tokio::test]
+async fn authorization_headers_and_provider_response_bodies_never_enter_diagnostics() {
+    const SENTINEL: &str = "sentinel-parallel-auth-must-never-escape";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_string(format!("Bearer {SENTINEL}: private-query")),
+        )
+        .mount(&server)
+        .await;
+    let error = run(
+        WebSearchTool::with_config(config(&[
+            (ENV_PROVIDER, "parallel"),
+            (ENV_PARALLEL_API_KEY, SENTINEL),
+        ]))
+        .with_endpoint(format!("{}/mcp?diagnostic=secret", server.uri())),
+        json!({ "queries": ["private-query"] }),
+        context("ses_header_redaction"),
+    )
+    .await
+    .expect_err("provider status failure");
+
+    let rendered = format!(
+        "{error:?}\n{}\n{}",
+        error,
+        zuno_error::source::describe(&error)
+    );
+    assert!(!rendered.contains(SENTINEL), "{rendered}");
+    assert!(!rendered.contains("private-query"), "{rendered}");
+    assert!(!rendered.contains("diagnostic=secret"), "{rendered}");
+    assert!(rendered.contains("parallel"), "{rendered}");
+    assert!(rendered.contains("/mcp"), "{rendered}");
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        requests[0].headers[reqwest::header::AUTHORIZATION.as_str()]
+            .to_str()
+            .expect("authorization"),
+        format!("Bearer {SENTINEL}")
+    );
+}
+
+#[tokio::test]
 async fn an_sse_response_is_normalized_like_json() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -376,7 +499,7 @@ async fn a_failed_http_query_cancels_a_sibling_waiting_for_response_headers() {
     assert_eq!(retry_after, Some(Duration::from_secs(4)));
     assert!(matches!(
         source.downcast_ref::<WebError>(),
-        Some(WebError::Status { status: 500, .. })
+        Some(WebError::SearchStatus { status: 500, .. })
     ));
 }
 
@@ -400,7 +523,7 @@ async fn transport_and_parse_failures_remain_classified() {
     };
     assert!(matches!(
         source.downcast_ref::<WebError>(),
-        Some(WebError::Status { status: 401, .. })
+        Some(WebError::SearchStatus { status: 401, .. })
     ));
 
     let malformed = MockServer::start().await;

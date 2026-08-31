@@ -15,7 +15,9 @@ use crate::webfetch::body::read_bounded;
 use crate::webfetch::bounds::WebError;
 use crate::websearch::gating::Provider;
 use serde_json::{Value, json};
+use std::fmt;
 use std::time::Duration;
+use zuno_network::DiagnosticEndpoint;
 use zuno_tool::InterruptHandle;
 
 /// Exa's MCP endpoint.
@@ -46,31 +48,68 @@ pub const EXA_TOOL: &str = "web_search_exa";
 /// The tool name invoked on Parallel's server.
 pub const PARALLEL_TOOL: &str = "web_search";
 
-/// Exa's endpoint with the API key attached, when one is configured.
-///
-/// Oracle: `packages/core/src/tool/websearch.ts:145-150` — the key rides in the
-/// `exaApiKey` query parameter rather than a header, and is URL-encoded by
-/// `searchParams.set`.
-#[must_use]
-pub fn exa_url(api_key: Option<&str>) -> String {
-    let Some(key) = api_key else {
-        return EXA_URL.to_owned();
-    };
-    match url::Url::parse(EXA_URL) {
-        Ok(mut url) => {
-            url.query_pairs_mut().append_pair("exaApiKey", key);
-            url.to_string()
+/// A credential-bearing wire URL paired with its safe diagnostic identity.
+#[derive(Clone)]
+pub struct SearchEndpoint {
+    wire: url::Url,
+    diagnostic: DiagnosticEndpoint,
+    provider: Provider,
+}
+
+impl SearchEndpoint {
+    /// Construct the hosted endpoint for a provider.
+    #[must_use]
+    pub fn hosted(provider: Provider, api_key: Option<&str>) -> Self {
+        let raw = match provider {
+            Provider::Exa => EXA_URL,
+            Provider::Parallel => PARALLEL_URL,
+        };
+        let mut wire = url::Url::parse(raw).expect("shipped search endpoint is an absolute URL");
+        if provider == Provider::Exa
+            && let Some(key) = api_key
+        {
+            wire.query_pairs_mut().append_pair("exaApiKey", key);
         }
-        Err(_) => EXA_URL.to_owned(),
+        Self {
+            diagnostic: DiagnosticEndpoint::from_url(&wire),
+            wire,
+            provider,
+        }
+    }
+
+    /// Parse an endpoint override without ever retaining its query in diagnostics.
+    pub fn override_for(provider: Provider, raw: &str) -> Result<Self, WebError> {
+        let wire = url::Url::parse(raw).map_err(|_| WebError::InvalidSearchEndpoint {
+            provider: provider.as_str(),
+        })?;
+        if !matches!(wire.scheme(), "http" | "https") || wire.host().is_none() {
+            return Err(WebError::InvalidSearchEndpoint {
+                provider: provider.as_str(),
+            });
+        }
+        Ok(Self {
+            diagnostic: DiagnosticEndpoint::from_url(&wire),
+            wire,
+            provider,
+        })
+    }
+
+    fn wire(&self) -> &str {
+        self.wire.as_str()
+    }
+
+    fn diagnostic(&self) -> &DiagnosticEndpoint {
+        &self.diagnostic
     }
 }
 
-/// The endpoint for `provider`, with its key applied in the shape that provider wants.
-#[must_use]
-pub fn endpoint(provider: Provider, api_key: Option<&str>) -> String {
-    match provider {
-        Provider::Exa => exa_url(api_key),
-        Provider::Parallel => PARALLEL_URL.to_owned(),
+impl fmt::Debug for SearchEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SearchEndpoint")
+            .field("provider", &self.provider.as_str())
+            .field("endpoint", &self.diagnostic)
+            .finish()
     }
 }
 
@@ -94,13 +133,13 @@ pub fn request_body(tool: &str, arguments: Value) -> Value {
 /// is polled while the body streams.
 ///
 /// # Errors
-/// - [`WebError::Status`] on a non-2xx answer.
+/// - [`WebError::SearchStatus`] on a non-2xx answer.
 /// - [`WebError::TooLarge`] when the response exceeds [`MAX_RESPONSE_BYTES`].
 /// - [`WebError::MalformedSearchResponse`] when no envelope in the body carries text.
-/// - [`WebError::Transport`] or [`WebError::Interrupted`] from the body read.
+/// - [`WebError::SearchTransport`] or [`WebError::Interrupted`] from the body read.
 pub async fn call(
     client: &reqwest::Client,
-    url: &str,
+    endpoint: &SearchEndpoint,
     provider: Provider,
     tool: &str,
     arguments: Value,
@@ -108,7 +147,7 @@ pub async fn call(
     interrupt: &dyn InterruptHandle,
 ) -> Result<String, WebError> {
     let mut request = client
-        .post(url)
+        .post(endpoint.wire())
         .header(
             reqwest::header::ACCEPT,
             "application/json, text/event-stream",
@@ -123,23 +162,34 @@ pub async fn call(
             return Err(WebError::Interrupted { read: 0 });
         }
         response = request.send() => {
-            response.map_err(|source| WebError::Transport {
-                url: url.to_owned(),
-                source,
+            response.map_err(|source| WebError::SearchTransport {
+                provider: provider.as_str(),
+                endpoint: endpoint.diagnostic().clone(),
+                source: source.without_url(),
             })?
         }
     };
 
     let status = response.status();
     if !status.is_success() {
-        return Err(WebError::Status {
-            url: url.to_owned(),
+        return Err(WebError::SearchStatus {
+            provider: provider.as_str(),
+            endpoint: endpoint.diagnostic().clone(),
             status: status.as_u16(),
             retry_after: crate::webfetch::bounds::retry_after(response.headers()),
         });
     }
 
-    let body = read_bounded(response, MAX_RESPONSE_BYTES, interrupt).await?;
+    let body = match read_bounded(response, MAX_RESPONSE_BYTES, interrupt).await {
+        Err(WebError::Transport { source, .. }) => {
+            return Err(WebError::SearchTransport {
+                provider: provider.as_str(),
+                endpoint: endpoint.diagnostic().clone(),
+                source,
+            });
+        }
+        result => result?,
+    };
     parse_response(&String::from_utf8_lossy(&body)).ok_or(WebError::MalformedSearchResponse {
         provider: provider.as_str(),
     })
@@ -224,20 +274,57 @@ mod tests {
     }
 
     #[test]
-    fn the_exa_key_rides_in_the_query_string_url_encoded() {
-        let url = exa_url(Some("key/with+chars"));
-        assert!(url.starts_with(EXA_URL), "{url}");
-        assert!(url.contains("exaApiKey=key%2Fwith%2Bchars"), "{url}");
+    fn the_exa_key_rides_on_the_wire_but_not_in_diagnostics() {
+        let endpoint = SearchEndpoint::hosted(Provider::Exa, Some("key/with+chars"));
+        assert!(endpoint.wire().starts_with(EXA_URL));
+        assert!(
+            endpoint.wire().contains("exaApiKey=key%2Fwith%2Bchars"),
+            "{}",
+            endpoint.wire()
+        );
+        let diagnostic = format!("{endpoint:?}");
+        assert!(!diagnostic.contains("key/with"));
+        assert!(!diagnostic.contains("exaApiKey"));
     }
 
     #[test]
     fn no_exa_key_leaves_the_url_bare() {
-        assert_eq!(exa_url(None), EXA_URL);
+        assert_eq!(SearchEndpoint::hosted(Provider::Exa, None).wire(), EXA_URL);
     }
 
     #[test]
     fn parallel_never_puts_its_key_in_the_url() {
-        assert_eq!(endpoint(Provider::Parallel, Some("secret")), PARALLEL_URL);
+        assert_eq!(
+            SearchEndpoint::hosted(Provider::Parallel, Some("secret")).wire(),
+            PARALLEL_URL
+        );
+    }
+
+    #[test]
+    fn override_diagnostics_drop_secret_query_parameters() {
+        let endpoint = SearchEndpoint::override_for(
+            Provider::Exa,
+            "https://example.test/mcp?exaApiKey=sentinel-secret",
+        )
+        .unwrap();
+        let rendered = format!("{endpoint:?}");
+        assert!(!rendered.contains("sentinel-secret"));
+        assert!(!rendered.contains("exaApiKey"));
+        assert!(rendered.contains("https://example.test/mcp"));
+    }
+
+    #[test]
+    fn overrides_require_an_http_endpoint_with_a_host() {
+        for endpoint in [
+            "file:///tmp/search",
+            "data:text/plain,no",
+            "mailto:test@example.com",
+        ] {
+            assert!(matches!(
+                SearchEndpoint::override_for(Provider::Exa, endpoint),
+                Err(WebError::InvalidSearchEndpoint { provider: "exa" })
+            ));
+        }
     }
 
     #[test]

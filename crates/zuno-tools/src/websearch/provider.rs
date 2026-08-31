@@ -149,10 +149,17 @@ impl McpSearchProvider {
         self
     }
 
-    fn endpoint(&self, provider: Provider) -> String {
-        self.endpoint_override
-            .clone()
-            .unwrap_or_else(|| mcp::endpoint(provider, self.config.api_key(provider)))
+    fn endpoint(
+        &self,
+        provider: Provider,
+    ) -> Result<mcp::SearchEndpoint, crate::webfetch::bounds::WebError> {
+        match self.endpoint_override.as_deref() {
+            Some(endpoint) => mcp::SearchEndpoint::override_for(provider, endpoint),
+            None => Ok(mcp::SearchEndpoint::hosted(
+                provider,
+                self.config.api_key(provider),
+            )),
+        }
     }
 }
 
@@ -187,9 +194,12 @@ impl WebSearchProvider for McpSearchProvider {
             ),
         };
         let headers = auth_headers(provider, self.config.api_key(provider));
+        let endpoint = self
+            .endpoint(provider)
+            .map_err(WebSearchProviderError::from)?;
         let text = mcp::call(
             &self.client,
-            &self.endpoint(provider),
+            &endpoint,
             provider,
             tool,
             arguments,
