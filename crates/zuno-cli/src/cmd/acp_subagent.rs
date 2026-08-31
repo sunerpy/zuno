@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use serde_json::json;
 use tokio::sync::Notify;
@@ -57,6 +57,16 @@ impl AcpSubagentBridge {
         AcpSubagentFlush {
             shared: Arc::clone(&self.shared),
         }
+    }
+
+    pub(crate) fn bind_attachment_store(
+        &self,
+        store: Arc<zuno_attachment::AttachmentStore>,
+    ) -> Result<(), String> {
+        self.shared
+            .attachments
+            .set(store)
+            .map_err(|_| "ACP subagent attachment service was already bound".to_owned())
     }
 
     pub(crate) async fn shutdown(self) -> Result<(), String> {
@@ -121,6 +131,7 @@ struct Shared {
     processed: AtomicU64,
     worker_finished: AtomicBool,
     failure: Mutex<Option<String>>,
+    attachments: OnceLock<Arc<zuno_attachment::AttachmentStore>>,
 }
 
 #[derive(Default)]
@@ -269,11 +280,17 @@ async fn run_worker(
                     if opened.background {
                         background.insert(opened.session_id);
                     } else {
+                        let attachments = shared.attachments.get().ok_or_else(|| {
+                            "ACP subagent projector received a child before attachment services \
+                             were activated"
+                                .to_owned()
+                        })?;
                         open_child(
                             &client,
                             pool.as_ref(),
                             &replay_root,
                             default_context_size,
+                            attachments.as_ref(),
                             opened,
                             &mut children,
                         )
@@ -375,6 +392,7 @@ async fn open_child(
     pool: &zuno_db::pool::Pool,
     replay_root: &std::path::Path,
     default_context_size: u64,
+    attachments: &zuno_attachment::AttachmentStore,
     opened: ChildSessionOpened,
     children: &mut HashMap<String, ChildProjection>,
 ) -> Result<(), String> {
@@ -396,13 +414,14 @@ async fn open_child(
         .map_err(|error| error.to_string())?;
 
     let connection = pool.open_connection().map_err(|error| error.to_string())?;
-    let history = zuno_engine::r#loop::hydrate_retained_history_tail(
+    let mut history = zuno_engine::r#loop::hydrate_retained_history_tail(
         &connection,
         &opened.session_id,
         zuno_acp::REPLAY_MESSAGE_CAP,
         zuno_acp::REPLAY_TRANSCRIPT_BYTE_CAP,
     )
     .map_err(|error| error.to_string())?;
+    super::acp::hydrate_replay_attachments(&mut history.messages, attachments)?;
     let replay = zuno_acp::durable_updates(
         &history.messages,
         &zuno_acp::ReplayPolicy::for_workspace(replay_root),

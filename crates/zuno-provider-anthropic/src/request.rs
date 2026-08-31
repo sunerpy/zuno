@@ -192,6 +192,9 @@ fn content_value(block: &RequestContentBlock) -> Result<Value, ProviderError> {
                 "data": data,
             }
         })),
+        RequestContentBlock::ImageAttachment { .. } => {
+            unreachable!("attachment references must be resolved before provider request shaping")
+        }
     }
 }
 

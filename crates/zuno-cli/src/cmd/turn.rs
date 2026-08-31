@@ -1853,6 +1853,7 @@ pub(crate) struct TurnHost {
     runtime: HarnessRuntime,
     driver: Arc<dyn AgentDriver>,
     database: Arc<zuno_db::pool::Pool>,
+    attachments: Arc<zuno_attachment::AttachmentStore>,
     connection: rusqlite::Connection,
     inbox: zuno_db::inbox::SessionInbox,
     providers: ProviderRegistry,
@@ -3009,11 +3010,38 @@ impl TurnHost {
                 .collect();
             let tool_concurrency = ToolConcurrencyLimit::new(concurrency.tool_calls)
                 .expect("configuration validates tool concurrency");
+            let image = plan
+                .config
+                .attachment
+                .as_ref()
+                .and_then(|attachment| attachment.image.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let attachment_root = match database.location() {
+                zuno_paths::DbLocation::File(_) => zuno_paths::data().to_path_buf(),
+                zuno_paths::DbLocation::Memory => std::env::temp_dir().join("zuno-attachments"),
+            };
+            let attachments = Arc::new(
+                zuno_attachment::AttachmentStore::new(
+                    attachment_root,
+                    &zuno_attachment::AttachmentStore::database_identity(database.target()),
+                    zuno_attachment::ImageAdmissionPolicy {
+                        auto_resize: image.resolved_auto_resize(),
+                        max_source_bytes: image.resolved_max_source_bytes(),
+                        max_width: image.resolved_max_width(),
+                        max_height: image.resolved_max_height(),
+                        max_pixels: image.resolved_max_pixels(),
+                        max_encoded_bytes: image.resolved_max_encoded_bytes(),
+                    },
+                )
+                .map_err(to_string)?,
+            );
             let mut host = Self {
                 profile_runtime: profile_runtime.clone(),
                 runtime,
                 driver,
                 database,
+                attachments,
                 connection,
                 inbox,
                 providers,
@@ -4112,6 +4140,11 @@ impl TurnHost {
         Arc::clone(&self.database)
     }
 
+    /// Database-scoped image admission service shared by every client surface.
+    pub(crate) fn attachment_store(&self) -> Arc<zuno_attachment::AttachmentStore> {
+        Arc::clone(&self.attachments)
+    }
+
     /// Goal state shared with interactive surfaces that settle durable human requests.
     pub(crate) fn goal_store(&self) -> Arc<GoalStore> {
         Arc::clone(&self.goal_store)
@@ -4385,6 +4418,29 @@ impl TurnHost {
             DriveInputOptions::plain(
                 Some(message_id),
                 None,
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::User,
+            ),
+            &guard,
+            events,
+        )
+        .await
+    }
+
+    /// Drive rich input whose durable inbox row was already promoted by the caller.
+    pub(crate) async fn drive_promoted_content_with_guard(
+        &mut self,
+        prompt: &str,
+        content: &[RequestContentBlock],
+        message_id: &str,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        self.drive_input(
+            prompt,
+            DriveInputOptions::plain(
+                Some(message_id),
+                Some(content),
                 UserInputPersistence::AlreadyPromoted,
                 PlanningInputSource::User,
             ),
@@ -4755,6 +4811,7 @@ impl TurnHost {
                 now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
             },
             options.content,
+            &self.attachments,
         )?;
         let materialized = match options.persistence {
             UserInputPersistence::AdmitAndPromote => self.persist_user_input(&message, &parts)?,
@@ -5051,6 +5108,7 @@ impl TurnHost {
             guard.interrupt_signal(),
         )
         .with_live_inputs(guard, &self.inbox)
+        .with_attachments(Arc::clone(&self.attachments))
         .with_tool_concurrency(self.tool_concurrency);
         let outcome = self
             .driver
@@ -6121,6 +6179,12 @@ fn planning_content_facts(content: Option<&[RequestContentBlock]>) -> PlanningCo
                 total_bytes = total_bytes
                     .saturating_add(data.len())
                     .saturating_add(filename.as_deref().map_or(0, str::len));
+            }
+            RequestContentBlock::ImageAttachment { reference } => {
+                contextual_blocks = contextual_blocks.saturating_add(1);
+                total_bytes = total_bytes
+                    .saturating_add(usize::try_from(reference.encoded_bytes).unwrap_or(usize::MAX))
+                    .saturating_add(reference.filename.as_deref().map_or(0, str::len));
             }
             RequestContentBlock::SignedThinking { .. }
             | RequestContentBlock::ProviderEncryptedReasoning { .. }
@@ -8533,6 +8597,7 @@ fn consume_promoted_input(
 fn prepare_user_message(
     input: UserMessageInput<'_>,
     content: Option<&[RequestContentBlock]>,
+    attachments: &zuno_attachment::AttachmentStore,
 ) -> Result<
     (
         zuno_db::message::MessageRecord,
@@ -8553,7 +8618,7 @@ fn prepare_user_message(
     }))
     .map_err(to_string)?;
     let parts = match content {
-        Some(content) => request_content_parts(&input, &message.id, content)?,
+        Some(content) => request_content_parts(&input, &message.id, content, attachments)?,
         None => vec![
             zuno_db::message::PartRecord::from_json(
                 json!({
@@ -8584,6 +8649,7 @@ fn request_content_parts(
     input: &UserMessageInput<'_>,
     message_id: &str,
     content: &[RequestContentBlock],
+    attachments: &zuno_attachment::AttachmentStore,
 ) -> Result<Vec<zuno_db::message::PartRecord>, String> {
     if content.is_empty() {
         return Err("resolved prompt content must not be empty".to_owned());
@@ -8624,16 +8690,34 @@ fn request_content_parts(
                     filename,
                     media_type,
                     data,
-                } => json!({
-                    "id": prefixed_id("prt"),
-                    "sessionID": input.session_id,
-                    "messageID": message_id,
-                    "type": "file",
-                    "filename": filename,
-                    "mime": media_type,
-                    "data": data,
-                    "url": format!("data:{media_type};base64,{data}"),
-                }),
+                } => {
+                    let reference = attachments
+                        .admit_base64_typed(data, Some(media_type), filename.clone())
+                        .map_err(to_string)?;
+                    let normalized_filename = reference.filename.clone();
+                    let normalized_media_type = reference.media_type.clone();
+                    json!({
+                        "id": prefixed_id("prt"),
+                        "sessionID": input.session_id,
+                        "messageID": message_id,
+                        "type": "file",
+                        "filename": normalized_filename,
+                        "mime": normalized_media_type,
+                        "attachment": reference,
+                    })
+                }
+                RequestContentBlock::ImageAttachment { reference } => {
+                    attachments.read(reference).map_err(to_string)?;
+                    json!({
+                        "id": prefixed_id("prt"),
+                        "sessionID": input.session_id,
+                        "messageID": message_id,
+                        "type": "file",
+                        "filename": reference.filename,
+                        "mime": reference.media_type,
+                        "attachment": reference,
+                    })
+                }
                 RequestContentBlock::SignedThinking { .. }
                 | RequestContentBlock::ProviderEncryptedReasoning { .. }
                 | RequestContentBlock::ToolUse { .. }

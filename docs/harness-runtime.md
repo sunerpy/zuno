@@ -802,14 +802,22 @@ Commands, Skills, Council requests, and host commands are queued even if their U
 gesture requested immediate delivery. The HTTP prompt API follows the same rule:
 omitting `delivery` means `queue`, while `steer` must be explicit.
 
-User input is typed rich content, not only a rendered string. A local image is
-persisted before execution as a durable file part carrying filename, MIME type,
-data URL, and base64 payload, then reconstructed as a provider-neutral image
-block on replay. Root sessions, attached child sessions, direct sends, queued
-inputs, and steering use the same content path. The visible `[Image #N]` token
-is draft presentation state and is never treated as attachment identity. Bounded
-UTF-8 `@file` and `zuno run --file` inputs become explicit text context; supported
-images remain typed. See [images and file references](reference/attachments.md).
+User input is typed rich content, not only a rendered string. Every new local or
+client-supplied image is admitted before the durable inbox write through the
+profile's `AttachmentStore`. Admission applies source, dimension, pixel, and
+encoded-byte policy; orientation and metadata normalization; and atomic private
+content-addressed publication under the current database identity. The durable
+file part stores only an `ImageAttachmentRef`, never new base64 data.
+
+Provider request assembly resolves and verifies the object late, optionally
+caches a route-policy-derived encoding, and then reconstructs the existing
+provider-neutral inline image block. A missing object or digest/reference
+mismatch is a permanent durable-state failure and never falls back to the source
+path. Historical inline `media_type`/`data` parts remain readable without an
+automatic rewrite. Root sessions, attached children, direct sends, queued
+inputs, steering, TUI, `zuno run --file`, ACP, and server ingress use this same
+path. The visible `[Image #N]` token remains draft presentation state. See
+[images and file references](reference/attachments.md).
 
 A provider stream or provider-retry delay is wakeable for explicit steering:
 Zuno checkpoints any partial assistant output with `finish: steer`, promotes the

@@ -2701,6 +2701,7 @@ async fn drive_turns(
                         driver.host.session_inbox(),
                         driver.host.control(),
                         driver.reference_root.clone(),
+                        Some(driver.host.attachment_store()),
                         driver.queued_inputs.clone(),
                         driver.queue_wake.clone(),
                         prompt,
@@ -2726,6 +2727,7 @@ async fn drive_turns(
                                 driver.host.session_inbox(),
                                 driver.host.control(),
                                 driver.reference_root.clone(),
+                                Some(driver.host.attachment_store()),
                                 driver.queued_inputs.clone(),
                                 driver.queue_wake.clone(),
                                 prompt,
@@ -3171,6 +3173,7 @@ async fn drive_one(
             let capture = begin_snapshot(&snapshots.store, events).await;
             let inbox = host.session_inbox();
             let control = host.control();
+            let attachment_store = host.attachment_store();
             let admission_root = reference_root.to_path_buf();
             let admission_events = events.clone();
             let mut admissions: FuturesUnordered<BoxFuture<'static, Result<(), String>>> =
@@ -3180,6 +3183,7 @@ async fn drive_one(
                     inbox.clone(),
                     control.clone(),
                     admission_root.clone(),
+                    Some(Arc::clone(&attachment_store)),
                     queued_inputs.clone(),
                     queue_wake.clone(),
                     followup,
@@ -3224,6 +3228,7 @@ async fn drive_one(
                                     inbox.clone(),
                                     control.clone(),
                                     admission_root.clone(),
+                                    Some(Arc::clone(&attachment_store)),
                                     queued_inputs.clone(),
                                     queue_wake.clone(),
                                     prompt,
@@ -3256,6 +3261,7 @@ async fn drive_one(
                         inbox.clone(),
                         control.clone(),
                         admission_root.clone(),
+                        Some(Arc::clone(&attachment_store)),
                         queued_inputs.clone(),
                         queue_wake.clone(),
                         followup.prompt,
@@ -3420,11 +3426,12 @@ fn soft_interrupt(
     if delivery != zuno_db::inbox::InputDelivery::Steer {
         return None;
     }
-    let (content, images) = match prompt {
-        PromptSubmission::Text(text) => (text.clone(), Vec::new()),
+    let (content, images, attachments) = match prompt {
+        PromptSubmission::Text(text) => (text.clone(), Vec::new(), Vec::new()),
         PromptSubmission::Content { content, .. } => {
             let mut text = Vec::new();
             let mut images = Vec::new();
+            let mut attachments = Vec::new();
             for block in content {
                 match block {
                     zuno_llm::event::RequestContentBlock::Text { text: block } => {
@@ -3441,10 +3448,13 @@ fn soft_interrupt(
                     } => {
                         images.push((media_type.clone(), data.clone()));
                     }
+                    zuno_llm::event::RequestContentBlock::ImageAttachment { reference } => {
+                        attachments.push(reference.clone());
+                    }
                     _ => return None,
                 }
             }
-            (text.join("\n\n"), images)
+            (text.join("\n\n"), images, attachments)
         }
         PromptSubmission::Command { .. }
         | PromptSubmission::Skill { .. }
@@ -3455,6 +3465,7 @@ fn soft_interrupt(
         input_id: Some(input_id.to_owned()),
         content,
         images,
+        attachments,
         urgent: false,
         source: zuno_engine::interrupt::SoftInterruptSource::User,
     })
@@ -3464,13 +3475,16 @@ async fn admit_followup(
     inbox: zuno_db::inbox::SessionInbox,
     control: zuno_engine::status::SessionControl,
     reference_root: PathBuf,
+    attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
     queued_inputs: QueuedInputProjection,
     queue_wake: mpsc::Sender<TerminalEvent>,
     prompt: PromptEnvelope,
 ) -> Result<(), String> {
     let origin = prompt.origin;
     let delivery = followup_delivery(&prompt);
-    let prompt = super::tui_reference::resolve_submission(&reference_root, prompt.payload).await?;
+    let mut prompt =
+        super::tui_reference::resolve_submission(&reference_root, prompt.payload).await?;
+    admit_submission_images(attachments.as_deref(), &mut prompt)?;
     let input_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     inbox
         .admit(zuno_db::inbox::NewSessionInput::new(
@@ -3514,6 +3528,41 @@ async fn admit_followup(
                 input_id,
                 "turn ended before steering; durable TUI input remains pending"
             ),
+        }
+    }
+    Ok(())
+}
+
+fn admit_submission_images(
+    store: Option<&zuno_attachment::AttachmentStore>,
+    prompt: &mut PromptSubmission,
+) -> Result<(), String> {
+    let PromptSubmission::Content { content, .. } = prompt else {
+        return Ok(());
+    };
+    for block in content {
+        match block {
+            zuno_llm::event::RequestContentBlock::Image {
+                filename,
+                media_type,
+                data,
+            } => {
+                let store = store.ok_or_else(|| {
+                    "image input cannot enter the durable inbox without an attachment store"
+                        .to_owned()
+                })?;
+                let reference = store
+                    .admit_base64_typed(data, Some(media_type), filename.clone())
+                    .map_err(to_string)?;
+                *block = zuno_llm::event::RequestContentBlock::ImageAttachment { reference };
+            }
+            zuno_llm::event::RequestContentBlock::ImageAttachment { reference } => {
+                let store = store.ok_or_else(|| {
+                    "durable image input cannot be verified without an attachment store".to_owned()
+                })?;
+                store.read(reference).map_err(to_string)?;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -4157,6 +4206,7 @@ mod tests {
             inbox.clone(),
             registry.control("ses_tui_steer"),
             reference_root.path().to_path_buf(),
+            None,
             projection.clone(),
             wake,
             PromptEnvelope::new(
@@ -4233,6 +4283,7 @@ mod tests {
             inbox.clone(),
             registry.control("ses_tui_steer_race"),
             reference_root.path().to_path_buf(),
+            None,
             projection,
             wake,
             PromptEnvelope::new(
@@ -4312,6 +4363,56 @@ mod tests {
             vec![(String::from("image/png"), String::from("AAAA"))]
         );
         assert!(!message.urgent);
+    }
+
+    #[test]
+    fn tui_image_admission_replaces_inline_data_before_steering() {
+        let root = tempfile::tempdir().expect("temporary attachment root");
+        let store = zuno_attachment::AttachmentStore::new(
+            root.path(),
+            "tui-image-admission",
+            zuno_attachment::ImageAdmissionPolicy::default(),
+        )
+        .expect("attachment store");
+        let source = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DAAAAEAQEARwbK3gAAAABJRU5ErkJggg==";
+        let mut submission = PromptSubmission::Content {
+            text: String::from("inspect @pixel.png"),
+            content: vec![
+                zuno_llm::event::RequestContentBlock::Text {
+                    text: String::from("inspect @pixel.png"),
+                },
+                zuno_llm::event::RequestContentBlock::Image {
+                    filename: Some(String::from("pixel.png")),
+                    media_type: String::from("image/png"),
+                    data: source.to_owned(),
+                },
+            ],
+        };
+
+        admit_submission_images(Some(&store), &mut submission)
+            .expect("TUI admission stores the image");
+        let PromptSubmission::Content { content, .. } = &submission else {
+            panic!("content submission remains content")
+        };
+        let reference = match &content[1] {
+            zuno_llm::event::RequestContentBlock::ImageAttachment { reference } => {
+                reference.clone()
+            }
+            block => panic!("inline image survived admission: {block:?}"),
+        };
+        assert_eq!(
+            store.read(&reference).expect("stored image reads").len(),
+            usize::try_from(reference.encoded_bytes).expect("encoded size fits usize")
+        );
+
+        let message = soft_interrupt(
+            zuno_db::inbox::InputDelivery::Steer,
+            "msg_image",
+            &submission,
+        )
+        .expect("admitted content can steer");
+        assert!(message.images.is_empty());
+        assert_eq!(message.attachments, vec![reference]);
     }
 
     #[test]

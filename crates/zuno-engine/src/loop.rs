@@ -500,6 +500,8 @@ pub enum TurnError {
     Hook(String),
     #[error(transparent)]
     Database(#[from] DbError),
+    #[error("durable image attachment state is invalid")]
+    Attachment(#[source] zuno_attachment::AttachmentError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
@@ -568,6 +570,7 @@ impl TurnError {
             Self::EventConsumerClosed => "event_consumer_closed",
             Self::Hook(_) => "hook",
             Self::Database(_) => "database",
+            Self::Attachment(_) => "attachment",
             Self::Provider(_) => "provider",
             Self::PromptAssembly(_) => "prompt_assembly",
             Self::ProviderRetryDeadlineExceeded { .. } => "provider_retry_deadline",
@@ -637,6 +640,7 @@ impl TurnError {
                 | DbError::Conflict { .. }
                 | DbError::Decode { .. },
             ) => TurnRecovery::Fail,
+            Self::Attachment(_) => TurnRecovery::Fail,
             Self::Provider(ProviderError::ContextLimit { .. }) => TurnRecovery::Compact,
             Self::Provider(ProviderError::RateLimited { retry_after }) => TurnRecovery::Retry {
                 reason: TurnRetryReason::RateLimited,
@@ -1032,6 +1036,7 @@ pub struct TurnContext<'a> {
     interrupt: &'a InterruptSignal,
     hooks: Arc<dyn TurnHooks>,
     live_inputs: Option<LiveInputs<'a>>,
+    attachments: Option<Arc<zuno_attachment::AttachmentStore>>,
     tool_concurrency: ToolConcurrencyLimit,
 }
 
@@ -1057,6 +1062,7 @@ impl<'a> TurnContext<'a> {
             interrupt,
             hooks: Arc::new(NoopHooks),
             live_inputs: None,
+            attachments: None,
             tool_concurrency: ToolConcurrencyLimit::SERIAL,
         }
     }
@@ -1071,6 +1077,13 @@ impl<'a> TurnContext<'a> {
     #[must_use]
     pub fn with_live_inputs(mut self, guard: &'a SessionRunGuard, inbox: &'a SessionInbox) -> Self {
         self.live_inputs = Some(LiveInputs { guard, inbox });
+        self
+    }
+
+    /// Bind the database-scoped durable image object service.
+    #[must_use]
+    pub fn with_attachments(mut self, attachments: Arc<zuno_attachment::AttachmentStore>) -> Self {
+        self.attachments = Some(attachments);
         self
     }
 
@@ -1457,11 +1470,12 @@ async fn run_turn_in_span(
                 .await?;
         }
 
-        let history = hydrate_retained_history(context.connection, &request.session_id)?;
+        let mut history = hydrate_retained_history(context.connection, &request.session_id)?;
         let requested = requested_turn(&request.session_id, &history)?;
         if inject_live_inputs(&mut context, &request, &requested)?.count > 0 {
             continue;
         }
+        resolve_history_attachments(&mut history, context.attachments.as_deref())?;
         let agent = context
             .resolver
             .resolve_agent(&requested.agent)
@@ -2675,7 +2689,13 @@ fn inject_live_inputs(
         {
             continue;
         }
-        persist_live_input(context.connection, request, requested, &message)?;
+        persist_live_input(
+            context.connection,
+            request,
+            requested,
+            &message,
+            context.attachments.as_deref(),
+        )?;
         injected.count = injected.count.saturating_add(1);
         injected.skip_remaining_tools |= message.urgent;
     }
@@ -2687,6 +2707,7 @@ fn persist_live_input(
     request: &RunTurnRequest,
     requested: &RequestedTurn,
     input: &SoftInterruptMessage,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
 ) -> Result<(), TurnError> {
     let transaction = open::immediate_transaction(connection)?;
     let latest = MessageStore::new(&transaction).latest_time_created(&request.session_id)?;
@@ -2727,17 +2748,48 @@ fn persist_live_input(
         created,
     )?);
     for (offset, (media_type, data)) in input.images.iter().enumerate() {
+        let store = attachments.ok_or_else(|| {
+            TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
+        })?;
+        let reference = store
+            .admit_base64_typed(data, Some(media_type), None)
+            .map_err(TurnError::Attachment)?;
+        let filename = reference.filename.clone();
+        let normalized_media_type = reference.media_type.clone();
+        let value = json!({
+                "id": format!("prt_{}", Uuid::new_v4().simple()),
+                "sessionID": request.session_id,
+                "messageID": message.id,
+                "type": "file",
+                "filename": filename,
+                "mime": normalized_media_type,
+                "attachment": reference
+        });
+        parts.push(PartRecord::from_json(
+            value,
+            created.saturating_add(i64::try_from(offset).unwrap_or(i64::MAX).saturating_add(1)),
+        )?);
+    }
+    for (offset, reference) in input.attachments.iter().enumerate() {
+        let store = attachments.ok_or_else(|| {
+            TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
+        })?;
+        store.read(reference).map_err(TurnError::Attachment)?;
         parts.push(PartRecord::from_json(
             json!({
                 "id": format!("prt_{}", Uuid::new_v4().simple()),
                 "sessionID": request.session_id,
                 "messageID": message.id,
                 "type": "file",
-                "mime": media_type,
-                "data": data,
-                "url": format!("data:{media_type};base64,{data}")
+                "filename": reference.filename,
+                "mime": reference.media_type,
+                "attachment": reference
             }),
-            created.saturating_add(i64::try_from(offset).unwrap_or(i64::MAX).saturating_add(1)),
+            created.saturating_add(
+                i64::try_from(input.images.len().saturating_add(offset))
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1),
+            ),
         )?);
     }
     {
@@ -3269,6 +3321,47 @@ fn append_user_message_owned(messages: &mut Vec<Message>, parts: Vec<PartRecord>
     if !content.is_empty() {
         messages.push(Message::from_content(Role::User, content));
     }
+}
+
+fn resolve_history_attachments(
+    history: &mut [MessageWithParts],
+    store: Option<&zuno_attachment::AttachmentStore>,
+) -> Result<(), TurnError> {
+    for message in history {
+        for part in &mut message.parts {
+            if part.kind != PartKind::File || part.data.get("attachment").is_none() {
+                continue;
+            }
+            let store = store.ok_or_else(|| {
+                TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable)
+            })?;
+            let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+                part.data
+                    .get("attachment")
+                    .cloned()
+                    .expect("checked attachment value"),
+            )
+            .map_err(|_| {
+                TurnError::Attachment(zuno_attachment::AttachmentError::InvalidReference)
+            })?;
+            let resolved = store
+                .resolve(&reference, zuno_attachment::ImageRequestPolicy::default())
+                .map_err(TurnError::Attachment)?;
+            part.data.insert(
+                "mime".to_owned(),
+                Value::String(resolved.media_type.clone()),
+            );
+            part.data
+                .insert("data".to_owned(), Value::String(resolved.data));
+            if !part.data.contains_key("filename")
+                && let Some(filename) = reference.filename
+            {
+                part.data
+                    .insert("filename".to_owned(), Value::String(filename));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn request_file_block(data: &Map<String, Value>) -> Option<RequestContentBlock> {

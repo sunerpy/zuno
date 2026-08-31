@@ -66,10 +66,12 @@ zuno run --print-logs --log-level DEBUG "summarize the build failure"
 
 ## Attaching files
 
-`-f`/`--file` is repeatable, and `--attach` carries an attachment. A supported image
-becomes a typed image block under the 20 MiB image limit; any other reference must be UTF-8
-text within 51,200 bytes and 2,000 lines, inserted with explicit begin and end markers.
-Unsupported binary files, including PDFs, are not silently converted. See
+`-f`/`--file` is repeatable, and `--attach` carries an attachment. A supported
+image is normalized and admitted to the database-scoped durable object store
+before the inbox write; the default source limit is 20 MiB and the normalized
+encoded limit is 5 MiB. Any other reference must be UTF-8 text within 51,200
+bytes and 2,000 lines, inserted with explicit begin and end markers. Unsupported
+binary files, including PDFs, are not silently converted. See
 [Images and file references](/reference/attachments).
 
 ## Confinement in a script

@@ -262,6 +262,7 @@
       "type": "object"
     },
     "AttachmentConfig": {
+      "additionalProperties": false,
       "description": "Attachment processing (`config/attachment.ts:22-24`).",
       "properties": {
         "image": {
@@ -699,6 +700,7 @@
       "type": "object"
     },
     "ImageAttachmentConfig": {
+      "additionalProperties": false,
       "description": "Image attachment limits (`config/attachment.ts:6-19`).",
       "properties": {
         "auto_resize": {
@@ -708,9 +710,9 @@
             "null"
           ]
         },
-        "max_base64_bytes": {
-          "description": "Maximum base64 payload in bytes. Defaults to 5242880.",
-          "format": "uint32",
+        "max_encoded_bytes": {
+          "description": "Maximum normalized encoded bytes. Defaults to 5 MiB.",
+          "format": "uint64",
           "minimum": 1,
           "type": [
             "integer",
@@ -720,6 +722,24 @@
         "max_height": {
           "description": "Maximum height before resizing or rejecting. Defaults to 2000.",
           "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_pixels": {
+          "description": "Maximum decoded pixel count. Defaults to 4,000,000.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_source_bytes": {
+          "description": "Maximum source bytes accepted before decoding. Defaults to 20 MiB.",
+          "format": "uint64",
           "minimum": 1,
           "type": [
             "integer",

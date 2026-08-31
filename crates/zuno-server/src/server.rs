@@ -42,6 +42,7 @@ pub struct SessionPromptExecution {
     pub directory: PathBuf,
     pub message_id: String,
     pub prompt: String,
+    pub content: Vec<zuno_llm::event::RequestContentBlock>,
     pub agent: Option<String>,
     pub model: Option<SessionModelSelection>,
 }

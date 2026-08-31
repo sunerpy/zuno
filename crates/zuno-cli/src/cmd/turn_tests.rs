@@ -1603,6 +1603,13 @@ fn permanent_provider_failure_blocks_the_goal_with_a_typed_reason() {
 #[test]
 fn prepared_user_message_persistence_preserves_database_busy() {
     let directory = tempfile::tempdir().expect("temporary database directory");
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "locked",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let location = zuno_paths::DbLocation::File(directory.path().join("locked.db"));
     let mut connection = zuno_db::open::open(&location).expect("open primary connection");
     zuno_db::migration::apply(&mut connection).expect("apply schema");
@@ -1624,6 +1631,7 @@ fn prepared_user_message_persistence_preserves_database_busy() {
             now: 1_780_000_000_000,
         },
         None,
+        &attachments,
     )
     .expect("prepare user message");
 
@@ -1649,6 +1657,13 @@ fn stub_internals() -> Internals {
 
 #[test]
 fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "reference",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let input = UserMessageInput {
         session_id: "ses_reference",
         agent: "build",
@@ -1668,11 +1683,11 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
         RequestContentBlock::Image {
             filename: Some("diagram.png".to_owned()),
             media_type: "image/png".to_owned(),
-            data: "aW1hZ2U=".to_owned(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_owned(),
         },
     ];
 
-    let parts = request_content_parts(&input, "msg_reference", &content)
+    let parts = request_content_parts(&input, "msg_reference", &content, &attachments)
         .expect("text and image request blocks are valid user content");
 
     assert_eq!(
@@ -1686,9 +1701,20 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
         .iter()
         .find(|part| part.kind == zuno_db::message::PartKind::File)
         .expect("the image became a stored file part");
-    assert_eq!(image.data["mime"], "image/png");
     assert_eq!(image.data["filename"], "diagram.png");
-    assert_eq!(image.data["data"], "aW1hZ2U=");
+    assert!(
+        image.data.get("data").is_none() && image.data.get("url").is_none(),
+        "new durable image parts must not persist inline base64: {:?}",
+        image.data
+    );
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+        image.data["attachment"].clone(),
+    )
+    .expect("durable image reference");
+    assert_eq!(image.data["mime"], reference.media_type);
+    attachments
+        .read(&reference)
+        .expect("the durable object is readable");
 }
 
 #[test]
@@ -2865,6 +2891,13 @@ fn an_empty_catalog_with_no_request_still_explains_the_policy() {
 
 #[test]
 fn new_session_is_lazy_and_first_user_message_commits_with_it() {
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "new-session",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let mut connection =
         zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
     zuno_db::migration::apply(&mut connection).expect("apply schema");
@@ -2893,6 +2926,7 @@ fn new_session_is_lazy_and_first_user_message_commits_with_it() {
             now,
         },
         None,
+        &attachments,
     )
     .expect("prepare prompt");
     let SessionMaterializer::Pending(mut input) = prepared.materializer else {
@@ -5594,6 +5628,7 @@ fn every_turn_error() -> Vec<TurnError> {
             elapsed: std::time::Duration::from_secs(180),
         },
         TurnError::Cache(zuno_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
+        TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable),
     ]
 }
 
@@ -5649,13 +5684,14 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::PromptAssembly(_) => "PromptAssembly",
             TurnError::ProviderRetryDeadlineExceeded { .. } => "ProviderRetryDeadlineExceeded",
             TurnError::Cache(_) => "Cache",
+            TurnError::Attachment(_) => "Attachment",
         };
         named.insert(name);
     }
 
     assert_eq!(
         named.len(),
-        20,
+        21,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
@@ -8880,6 +8916,13 @@ mod reflection_runtime {
 
     #[test]
     fn durable_reflection_transcript_replays_delivered_text_and_terminal_tool_results() {
+        let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+        let attachments = zuno_attachment::AttachmentStore::new(
+            attachment_root.path(),
+            "reflection",
+            zuno_attachment::ImageAdmissionPolicy::default(),
+        )
+        .expect("attachment store");
         let mut connection =
             zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open database");
         zuno_db::migration::apply(&mut connection).expect("initialize schema");
@@ -8898,6 +8941,7 @@ mod reflection_runtime {
                 now,
             },
             None,
+            &attachments,
         )
         .expect("prepare user message");
         persist_prepared_user_message(&connection, &user, &user_parts)

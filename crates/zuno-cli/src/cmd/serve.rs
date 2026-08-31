@@ -319,13 +319,24 @@ impl SessionMutationExecutor for ServerSessionMutationExecutor {
             };
             let mut host = executor.open_active(&spec).await?;
             let outcome = async {
-                host.drive_with_message_id_and_guard(
-                    &request.prompt,
-                    Some(&request.message_id),
-                    guard,
-                    events.clone(),
-                )
-                .await?;
+                if request.content.is_empty() {
+                    host.drive_promoted_with_guard(
+                        &request.prompt,
+                        &request.message_id,
+                        guard,
+                        events.clone(),
+                    )
+                    .await?;
+                } else {
+                    host.drive_promoted_content_with_guard(
+                        &request.prompt,
+                        &request.content,
+                        &request.message_id,
+                        guard,
+                        events.clone(),
+                    )
+                    .await?;
+                }
                 while host
                     .continue_goal_if_idle(zuno_goal::QueuedUserInput::Absent, events.clone())
                     .await?
@@ -445,6 +456,27 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
             .map_err(|error| format!("invalid shell configuration: {error}"))?;
         let pool = Arc::new(zuno_db::Pool::open_default().map_err(|error| error.to_string())?);
         let events = EventService::new(Arc::clone(&pool), DEFAULT_EVENT_SUBSCRIBER_CAPACITY);
+        let image = harness_config
+            .attachment
+            .as_ref()
+            .and_then(|attachment| attachment.image.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let attachments = Arc::new(
+            zuno_attachment::AttachmentStore::new(
+                zuno_paths::data(),
+                &zuno_attachment::AttachmentStore::database_identity(pool.target()),
+                zuno_attachment::ImageAdmissionPolicy {
+                    auto_resize: image.resolved_auto_resize(),
+                    max_source_bytes: image.resolved_max_source_bytes(),
+                    max_width: image.resolved_max_width(),
+                    max_height: image.resolved_max_height(),
+                    max_pixels: image.resolved_max_pixels(),
+                    max_encoded_bytes: image.resolved_max_encoded_bytes(),
+                },
+            )
+            .map_err(|error| error.to_string())?,
+        );
         let server_config = ServerConfig::default()
             .with_hostname(&args.hostname)
             .with_port(args.port)
@@ -453,6 +485,7 @@ pub(super) fn execute(args: &ServeArgs, environment: &StartupEnvironment) -> Res
         let state = ApiState::open_default(&directory)
             .map_err(|error| error.to_string())?
             .with_configured_shell(harness_config.shell.clone())
+            .with_attachment_store(attachments)
             .with_events(events.clone());
         let goals = Arc::new(
             zuno_goal::GoalStore::from_pool(Arc::clone(&pool), zuno_goal::default_spill_dir())

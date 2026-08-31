@@ -266,6 +266,10 @@ fn portable_bundle_and_attachment_guides_document_the_public_contracts() {
             "zuno run -f/--file",
             "unsupported_capability",
             "durable file part",
+            "ImageAttachmentRef",
+            "max_encoded_bytes",
+            "database-identity",
+            "do not contain base64",
         ],
     );
     for relative in ["README.md", "docs/readme/README.zh-CN.md", "docs/README.md"] {

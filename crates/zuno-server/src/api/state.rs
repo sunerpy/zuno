@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use zuno_db::Pool;
@@ -15,6 +16,7 @@ use crate::EventService;
 #[derive(Clone, Debug)]
 pub struct ApiState {
     pool: Arc<Pool>,
+    attachments: Arc<zuno_attachment::AttachmentStore>,
     pty: PtyService,
     directory: Arc<str>,
     artifact_paths: ArtifactGcPaths,
@@ -48,6 +50,7 @@ impl ApiState {
             Pool::open(&DbLocation::Memory)?,
             directory,
             ArtifactGcPaths::from_data_root(&artifact_root),
+            artifact_root,
         )
     }
 
@@ -60,6 +63,7 @@ impl ApiState {
             Pool::open_default()?,
             directory.into(),
             ArtifactGcPaths::in_layout(zuno_paths::global()),
+            zuno_paths::data().to_path_buf(),
         )
     }
 
@@ -72,13 +76,19 @@ impl ApiState {
         directory: impl Into<String>,
         artifact_paths: ArtifactGcPaths,
     ) -> Result<Self, DbError> {
-        Self::initialize(pool, directory.into(), artifact_paths)
+        let data_root = artifact_paths
+            .snapshots
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("zuno-api-artifacts"));
+        Self::initialize(pool, directory.into(), artifact_paths, data_root)
     }
 
     fn initialize(
         pool: Pool,
         directory: String,
         artifact_paths: ArtifactGcPaths,
+        attachment_data_root: PathBuf,
     ) -> Result<Self, DbError> {
         {
             let mut connection = pool.get()?;
@@ -101,10 +111,22 @@ impl ApiState {
         } else {
             Arc::from(project.directory.to_string_lossy().into_owned())
         };
+        let attachments = Arc::new(
+            zuno_attachment::AttachmentStore::new(
+                attachment_data_root.clone(),
+                &zuno_attachment::AttachmentStore::database_identity(pool.target()),
+                zuno_attachment::ImageAdmissionPolicy::default(),
+            )
+            .map_err(|source| DbError::Open {
+                path: attachment_data_root,
+                source: Box::new(source),
+            })?,
+        );
         Ok(Self {
             pty: PtyService::new(&directory),
             directory: Arc::from(directory),
             pool: Arc::new(pool),
+            attachments,
             artifact_paths,
             events: None,
             env: Arc::new(Env::from_process()),
@@ -117,6 +139,16 @@ impl ApiState {
     #[must_use]
     pub fn with_events(mut self, events: EventService) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Uses the exact profile-resolved image policy for HTTP prompt admission.
+    #[must_use]
+    pub fn with_attachment_store(
+        mut self,
+        attachments: Arc<zuno_attachment::AttachmentStore>,
+    ) -> Self {
+        self.attachments = attachments;
         self
     }
 
@@ -227,6 +259,10 @@ impl ApiState {
 
     pub(crate) fn pool_arc(&self) -> Arc<Pool> {
         Arc::clone(&self.pool)
+    }
+
+    pub(super) fn attachments(&self) -> &zuno_attachment::AttachmentStore {
+        &self.attachments
     }
 
     pub(super) fn artifact_paths(&self) -> &ArtifactGcPaths {

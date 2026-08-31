@@ -77,7 +77,8 @@ impl Provider for Echo {
                 | RequestContentBlock::ProviderEncryptedReasoning { .. }
                 | RequestContentBlock::ToolUse { .. }
                 | RequestContentBlock::ToolResult { .. }
-                | RequestContentBlock::Image { .. } => None,
+                | RequestContentBlock::Image { .. }
+                | RequestContentBlock::ImageAttachment { .. } => None,
             })
             .collect();
         events.push(Ok(StreamEvent::MessageEnd {

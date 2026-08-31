@@ -29,6 +29,7 @@ publish.workspace = true
 # ---------------------------------------------------------------------------
 [dependencies]
 zuno-auth = { workspace = true }
+zuno-attachment = { workspace = true }
 zuno-config = { workspace = true }
 zuno-error = { workspace = true }
 zuno-network = { workspace = true }

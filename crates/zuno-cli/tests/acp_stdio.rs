@@ -2547,7 +2547,7 @@ async fn acp_images_and_embedded_context_reach_the_provider_and_durable_replay()
                 {
                     "type": "image",
                     "mimeType": "image/png",
-                    "data": "iVBORw0KGgo=",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DAAAAEAQEARwbK3gAAAABJRU5ErkJggg==",
                     "uri": "file:///tmp/screenshot.png"
                 },
                 {
@@ -2573,7 +2573,7 @@ async fn acp_images_and_embedded_context_reach_the_provider_and_durable_replay()
         .expect("provider requests");
     assert!(received.iter().any(|request| {
         let body = String::from_utf8_lossy(&request.body);
-        body.contains("data:image/png;base64,iVBORw0KGgo=")
+        body.contains("data:image/png;base64,")
             && body.contains(selection_uri)
             && body.contains("fn selected() {}")
     }));

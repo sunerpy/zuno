@@ -19,6 +19,7 @@
 //!   upserting `put_message_at` makes import a silent editor of live history and
 //!   fails here.
 
+use base64::Engine as _;
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use zuno_db::message::{MessageRecord, MessageStore, PartRecord};
@@ -28,6 +29,8 @@ use zuno_db::{migration, open};
 const SESSION: &str = "ses_export00000000000000000000ab";
 const USER: &str = "msg_export00000000000000000000us";
 const ASSISTANT: &str = "msg_export00000000000000000000as";
+const PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
 fn database() -> Connection {
     let mut connection =
@@ -228,6 +231,148 @@ fn session_export_orders_messages_oldest_first_and_parts_by_id() {
             "prt_export0000000000000000000003",
         ]
     );
+}
+
+#[test]
+fn session_export_reinlines_durable_images_and_leaves_legacy_inline_rows_readable() {
+    let connection = seeded();
+    let root = tempfile::tempdir().expect("attachment root");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        root.path(),
+        "export",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
+    let reference = attachments
+        .admit_base64(PNG_BASE64, Some("pixel.png".to_owned()))
+        .expect("admit image");
+    write_part(
+        &connection,
+        "prt_export0000000000000000000010",
+        USER,
+        json!({
+            "type": "file",
+            "filename": reference.filename,
+            "mime": reference.media_type,
+            "attachment": reference.clone()
+        }),
+        1_110,
+    );
+    write_part(
+        &connection,
+        "prt_export0000000000000000000011",
+        USER,
+        json!({
+            "type": "file",
+            "filename": "legacy.png",
+            "mime": "image/png",
+            "data": "legacy-inline",
+            "url": "data:image/png;base64,legacy-inline"
+        }),
+        1_111,
+    );
+
+    let document = session_export::export_with_attachments(&connection, SESSION, &attachments)
+        .expect("portable export");
+    let parts = document
+        .messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .collect::<Vec<_>>();
+    let exported = parts
+        .iter()
+        .find(|part| part["id"] == "prt_export0000000000000000000010")
+        .expect("durable image part");
+    assert!(exported.get("attachment").is_none());
+    assert_eq!(exported["mime"], reference.media_type);
+    let data = exported["data"].as_str().expect("inline base64");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .expect("decode exported image"),
+        attachments.read(&reference).expect("canonical object")
+    );
+    assert_eq!(
+        exported["url"],
+        format!("data:{};base64,{data}", reference.media_type)
+    );
+
+    let legacy = parts
+        .iter()
+        .find(|part| part["id"] == "prt_export0000000000000000000011")
+        .expect("legacy inline part");
+    assert_eq!(legacy["data"], "legacy-inline");
+    assert_eq!(legacy["url"], "data:image/png;base64,legacy-inline");
+}
+
+#[test]
+fn session_export_import_admits_portable_inline_images_before_persistence() {
+    let source = seeded();
+    let source_root = tempfile::tempdir().expect("source attachment root");
+    let source_store = zuno_attachment::AttachmentStore::new(
+        source_root.path(),
+        "source",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("source attachment store");
+    let reference = source_store
+        .admit_base64(PNG_BASE64, Some("pixel.png".to_owned()))
+        .expect("source image");
+    write_part(
+        &source,
+        "prt_export0000000000000000000012",
+        USER,
+        json!({
+            "type": "file",
+            "filename": reference.filename,
+            "mime": reference.media_type,
+            "attachment": reference
+        }),
+        1_112,
+    );
+    let document = session_export::export_with_attachments(&source, SESSION, &source_store)
+        .expect("portable export")
+        .to_json()
+        .expect("encode export");
+
+    let mut target = database();
+    let target_root = tempfile::tempdir().expect("target attachment root");
+    let target_store = zuno_attachment::AttachmentStore::new(
+        target_root.path(),
+        "target",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("target attachment store");
+    let transaction = target.transaction().expect("begin import");
+    session_export::import_with_attachments(
+        &transaction,
+        &document,
+        &ImportTarget {
+            project_id: "prj_export".to_owned(),
+            directory: "/srv/imported".to_owned(),
+            path: String::new(),
+        },
+        &target_store,
+    )
+    .expect("import portable image");
+    transaction.commit().expect("commit import");
+
+    let persisted = MessageStore::new(&target)
+        .hydrate_session(SESSION)
+        .expect("imported transcript")
+        .into_iter()
+        .flat_map(|message| message.parts)
+        .find(|part| part.id == "prt_export0000000000000000000012")
+        .expect("imported image part");
+    assert!(persisted.data.get("data").is_none());
+    assert!(persisted.data.get("url").is_none());
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+        persisted.data["attachment"].clone(),
+    )
+    .expect("durable imported reference");
+    target_store
+        .read(&reference)
+        .expect("imported canonical object");
 }
 
 #[test]

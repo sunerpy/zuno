@@ -29,8 +29,6 @@ const ACP_PROTOCOL_VERSION: u64 = 1;
 const ACP_SCHEMA_VERSION: &str = "1.21.0";
 const ACP_TEXT_RESOURCE_MAX_BYTES: usize = 50 * 1_024;
 const ACP_TEXT_RESOURCE_MAX_LINES: usize = 2_000;
-const ACP_IMAGE_MAX_BYTES: usize = 5 * 1_024 * 1_024;
-const ACP_IMAGE_MAX_BASE64_BYTES: usize = (ACP_IMAGE_MAX_BYTES / 3 + 1) * 4;
 const MAX_OPEN_ACP_SESSIONS: usize = 32;
 
 pub(super) fn execute(args: &AcpArgs, environment: &StartupEnvironment) -> Result<(), String> {
@@ -792,6 +790,23 @@ async fn open_session_resources(
             }));
         }
     };
+    if let Some(bridge) = subagents.as_ref()
+        && let Err(error) = bridge.bind_attachment_store(host.attachment_store())
+    {
+        let shutdown = host.shutdown().await;
+        if let Some(mcp) = mcp.take() {
+            mcp.shutdown().await;
+        }
+        let bridge = shutdown_subagent_bridge(&mut subagents).await;
+        let shutdown = shutdown
+            .err()
+            .map(|shutdown| format!("; candidate ACP host shutdown failed: {shutdown}"))
+            .unwrap_or_default();
+        let bridge = bridge
+            .map(|bridge| format!("; ACP subagent projector shutdown failed: {bridge}"))
+            .unwrap_or_default();
+        return Err(format!("{error}{shutdown}{bridge}"));
+    }
     if let Err(error) = session_route.bind_root(host.session_id()) {
         let shutdown = host.shutdown().await;
         if let Some(mcp) = mcp.take() {
@@ -1236,7 +1251,7 @@ impl AcpSession {
 
     async fn prompt(
         &self,
-        prompt: AcpPrompt,
+        mut prompt: AcpPrompt,
         state: &AcpState,
         client: zuno_acp::ClientConnection,
     ) -> Result<Value, zuno_acp::RpcError> {
@@ -1254,6 +1269,11 @@ impl AcpSession {
         let activated = self.ensure_active(state, client.clone()).await?;
         if activated {
             self.defer_available_commands(&client).await?;
+        }
+        {
+            let resources = self.resources.lock().await;
+            let resources = resources.as_ref().ok_or_else(|| self.closed_error())?;
+            prompt.admit_images(resources.host.attachment_store().as_ref())?;
         }
         self.recover_pending_human_requests(&client).await?;
         let (context_size, invocation) = {
@@ -1726,13 +1746,26 @@ impl AcpSession {
         let connection = pool
             .open_connection()
             .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
-        let history = zuno_engine::r#loop::hydrate_retained_history_tail(
+        let mut history = zuno_engine::r#loop::hydrate_retained_history_tail(
             &connection,
             &self.id,
             zuno_acp::REPLAY_MESSAGE_CAP,
             zuno_acp::REPLAY_TRANSCRIPT_BYTE_CAP,
         )
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        let attachments = self
+            .resources
+            .lock()
+            .await
+            .as_ref()
+            .map(|resources| resources.host.attachment_store())
+            .ok_or_else(|| {
+                zuno_acp::RpcError::internal(
+                    "active ACP session has no attachment service for durable replay",
+                )
+            })?;
+        hydrate_replay_attachments(&mut history.messages, attachments.as_ref())
+            .map_err(zuno_acp::RpcError::internal)?;
         let work_state = replay_work_state(Arc::clone(&pool), &self.id)?;
         let context_size = stored
             .usage
@@ -1772,6 +1805,7 @@ impl AcpSession {
                 &self.id,
                 &self.replay_root,
                 configured_context_size,
+                Arc::clone(&attachments),
             )
             .await?;
         }
@@ -1906,6 +1940,7 @@ async fn replay_child_sessions(
     root_session_id: &str,
     replay_root: &std::path::Path,
     default_context_size: u64,
+    attachments: Arc<zuno_attachment::AttachmentStore>,
 ) -> Result<(), zuno_acp::RpcError> {
     let store = zuno_db::session::Store::new(pool.as_ref());
     let mut pending = VecDeque::from([root_session_id.to_owned()]);
@@ -1946,13 +1981,15 @@ async fn replay_child_sessions(
                 }),
             )
             .await?;
-        let history = zuno_engine::r#loop::hydrate_retained_history_tail(
+        let mut history = zuno_engine::r#loop::hydrate_retained_history_tail(
             &connection,
             &child.id,
             zuno_acp::REPLAY_MESSAGE_CAP,
             zuno_acp::REPLAY_TRANSCRIPT_BYTE_CAP,
         )
         .map_err(|error| zuno_acp::RpcError::internal(error.to_string()))?;
+        hydrate_replay_attachments(&mut history.messages, attachments.as_ref())
+            .map_err(zuno_acp::RpcError::internal)?;
         let replay = zuno_acp::durable_updates(
             &history.messages,
             &zuno_acp::ReplayPolicy::for_workspace(replay_root),
@@ -1988,6 +2025,44 @@ async fn replay_child_sessions(
                 }),
             )
             .await?;
+    }
+    Ok(())
+}
+
+pub(super) fn hydrate_replay_attachments(
+    messages: &mut [zuno_db::message::MessageWithParts],
+    store: &zuno_attachment::AttachmentStore,
+) -> Result<(), String> {
+    for message in messages {
+        for part in &mut message.parts {
+            if part.kind != zuno_db::message::PartKind::File {
+                continue;
+            }
+            let Some(reference) = part.data.get("attachment").cloned() else {
+                continue;
+            };
+            let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+                reference,
+            )
+            .map_err(|error| {
+                format!(
+                    "durable image part `{}` has an invalid attachment reference: {error}",
+                    part.id
+                )
+            })?;
+            let bytes = store.read(&reference).map_err(|error| {
+                format!(
+                    "durable image part `{}` cannot resolve attachment {}: {error}",
+                    part.id, reference.id
+                )
+            })?;
+            part.data
+                .insert("mime".to_owned(), json!(reference.media_type));
+            part.data.insert(
+                "data".to_owned(),
+                json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            );
+        }
     }
     Ok(())
 }
@@ -2347,6 +2422,40 @@ impl AcpPrompt {
             _ => None,
         }
     }
+
+    fn admit_images(
+        &mut self,
+        store: &zuno_attachment::AttachmentStore,
+    ) -> Result<(), zuno_acp::RpcError> {
+        for block in &mut self.content {
+            match block {
+                RequestContentBlock::Image {
+                    filename,
+                    media_type,
+                    data,
+                } => {
+                    let reference = store
+                        .admit_base64_typed(data, Some(media_type), filename.clone())
+                        .map_err(|error| {
+                            zuno_acp::RpcError::invalid_params(format!(
+                                "image admission failed: {error}"
+                            ))
+                        })?;
+                    *block = RequestContentBlock::ImageAttachment { reference };
+                }
+                RequestContentBlock::ImageAttachment { reference } => {
+                    store.read(reference).map_err(|error| {
+                        zuno_acp::RpcError::invalid_params(format!(
+                            "durable image attachment is invalid: {error}"
+                        ))
+                    })?;
+                }
+                _ => {}
+            }
+        }
+        self.text = render_acp_prompt(&self.content);
+        Ok(())
+    }
 }
 
 fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
@@ -2354,7 +2463,6 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
         .get("prompt")
         .and_then(Value::as_array)
         .ok_or_else(|| zuno_acp::RpcError::invalid_params("prompt must be an array"))?;
-    let mut rendered = Vec::new();
     let mut content = Vec::new();
     for block in blocks {
         let kind = block.get("type").and_then(Value::as_str).ok_or_else(|| {
@@ -2408,20 +2516,11 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
                 )));
             }
         };
-        let text = resolved.provider_text().map(|text| text.into_owned());
-        if let Some(text) = text.filter(|text| !text.is_empty()) {
-            rendered.push(text);
-            content.push(resolved);
-        } else if let RequestContentBlock::Image {
-            filename,
-            media_type,
-            ..
-        } = &resolved
+        if resolved
+            .provider_text()
+            .is_some_and(|text| !text.is_empty())
+            || matches!(resolved, RequestContentBlock::Image { .. })
         {
-            rendered.push(filename.as_ref().map_or_else(
-                || format!("Attached image ({media_type})"),
-                |filename| format!("Attached image: {filename} ({media_type})"),
-            ));
             content.push(resolved);
         }
     }
@@ -2431,9 +2530,38 @@ fn parse_prompt(params: &Value) -> Result<AcpPrompt, zuno_acp::RpcError> {
         ));
     }
     Ok(AcpPrompt {
-        text: rendered.join("\n\n"),
+        text: render_acp_prompt(&content),
         content,
     })
+}
+
+fn render_acp_prompt(content: &[RequestContentBlock]) -> String {
+    content
+        .iter()
+        .filter_map(|block| {
+            if let Some(text) = block.provider_text().filter(|text| !text.is_empty()) {
+                return Some(text.into_owned());
+            }
+            match block {
+                RequestContentBlock::Image {
+                    filename,
+                    media_type,
+                    ..
+                } => Some(filename.as_ref().map_or_else(
+                    || format!("Attached image ({media_type})"),
+                    |filename| format!("Attached image: {filename} ({media_type})"),
+                )),
+                RequestContentBlock::ImageAttachment { reference } => {
+                    Some(reference.filename.as_ref().map_or_else(
+                        || format!("Attached image ({})", reference.media_type),
+                        |filename| format!("Attached image: {filename} ({})", reference.media_type),
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn parse_image_block(block: &Value) -> Result<RequestContentBlock, zuno_acp::RpcError> {
@@ -2530,52 +2658,11 @@ fn validated_image(
             "image block MIME type must start with image/, got {media_type}"
         )));
     }
-    if data.len() > ACP_IMAGE_MAX_BASE64_BYTES {
-        return Err(zuno_acp::RpcError::invalid_params(format!(
-            "image exceeds the {} MiB limit",
-            ACP_IMAGE_MAX_BYTES / (1024 * 1024)
-        )));
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&data)
-        .map_err(|error| {
-            zuno_acp::RpcError::invalid_params(format!("image data is not valid base64: {error}"))
-        })?;
-    if bytes.len() > ACP_IMAGE_MAX_BYTES {
-        return Err(zuno_acp::RpcError::invalid_params(format!(
-            "image exceeds the {} MiB limit",
-            ACP_IMAGE_MAX_BYTES / (1024 * 1024)
-        )));
-    }
-    let detected = image_media_type(&bytes).ok_or_else(|| {
-        zuno_acp::RpcError::invalid_params(
-            "image data is not a supported PNG, JPEG, GIF, or WebP payload",
-        )
-    })?;
-    if detected != media_type {
-        return Err(zuno_acp::RpcError::invalid_params(format!(
-            "image MIME {media_type} does not match detected {detected}"
-        )));
-    }
     Ok(RequestContentBlock::Image {
         filename: uri.and_then(filename_from_uri),
         media_type: media_type.to_owned(),
         data,
     })
-}
-
-fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
 }
 
 fn filename_from_uri(uri: &str) -> Option<String> {
@@ -3277,7 +3364,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_parser_accepts_embedded_image_blobs_and_rejects_oversized_images() {
+    fn prompt_parser_defers_embedded_image_limits_to_admission() {
         let parsed = parse_prompt(&json!({
             "prompt": [{
                 "type": "resource",
@@ -3298,15 +3385,31 @@ mod tests {
             } if filename == "pixel.png" && media_type == "image/png"
         ));
 
-        let oversized = "A".repeat(ACP_IMAGE_MAX_BASE64_BYTES + 1);
-        let error = parse_prompt(&json!({
+        let mut oversized = parse_prompt(&json!({
             "prompt": [{
                 "type": "image",
                 "mimeType": "image/png",
-                "data": oversized
+                "data": "AAAA"
             }]
         }))
-        .expect_err("oversized image must be rejected");
-        assert!(error.message.contains("exceeds"));
+        .expect("the parser only validates the ACP shape");
+        let root = tempfile::tempdir().expect("attachment root");
+        let store = zuno_attachment::AttachmentStore::new(
+            root.path(),
+            "database",
+            zuno_attachment::ImageAdmissionPolicy {
+                max_source_bytes: 1,
+                ..zuno_attachment::ImageAdmissionPolicy::default()
+            },
+        )
+        .expect("attachment store");
+        let error = oversized
+            .admit_images(&store)
+            .expect_err("admission must enforce the configured byte limit");
+        assert!(
+            error.message.contains("admission limit"),
+            "unexpected admission error: {}",
+            error.message
+        );
     }
 }
