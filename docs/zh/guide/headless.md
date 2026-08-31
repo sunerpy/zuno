@@ -47,6 +47,14 @@ zuno run --format json "summarize the diff"
 
 `default` 是给人读的文本；`json` 是给解析用的。脚本中请用 `json`，而不是去抓取格式化输出，因为格式化后的形态属于展示层。
 
+Provider 可见的推理进度需要显式启用：
+
+```sh
+zuno run --show-reasoning "summarize the failure" > answer.txt 2> reasoning.txt
+```
+
+最终答案只留在 stdout。stderr 只接收 provider 明确提供的 reasoning delta，并放在 `<<<zuno:reasoning>>>` 与 `<<<zuno:end-reasoning>>>` 之间；signed thinking 与 encrypted reasoning 永不显示。若 provider 缺少 start 事件，Zuno 会等首个 delta 再打开区块，并在 provider 错误或流结束时保证闭合。`--show-reasoning --format json` 会被拒绝，因为 JSON 模式已经输出结构化事件。
+
 日志绝不会写到 stdout。诊断时把它们镜像到 stderr：
 
 ```sh

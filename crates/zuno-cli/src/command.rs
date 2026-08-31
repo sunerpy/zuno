@@ -222,6 +222,9 @@ pub struct RunArgs {
     pub agent: Option<String>,
     #[arg(long, value_enum, default_value_t)]
     pub format: RunFormat,
+    /// Write provider-supplied reasoning deltas to stderr.
+    #[arg(long, default_value_t = false)]
+    pub show_reasoning: bool,
     #[arg(short = 'f', long)]
     pub file: Vec<String>,
     #[arg(long)]

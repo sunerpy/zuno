@@ -169,7 +169,7 @@ fn headless_turn_progress_reaches_the_liveness_watchdog() {
 
     let run = compact(&cli_source("src/cmd/run.rs"));
     for needle in [
-        "render_events(receiver, args.format, progress)",
+        "render_events(receiver, args.format, args.show_reasoning, progress)",
         "while let Some(event) = receiver.recv().await { report_progress(progress);",
     ] {
         assert!(

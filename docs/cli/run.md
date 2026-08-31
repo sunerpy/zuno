@@ -38,6 +38,7 @@ zuno run [OPTIONS] [message]...
 | `-m`, `--model <MODEL>` | | |
 | `--agent <AGENT>` | | |
 | `--format <FORMAT>` | Possible values: `default`, `json` | `default` |
+| `--show-reasoning` | Write provider-supplied reasoning deltas to stderr between stable markers | |
 | `-f`, `--file <FILE>` | | |
 | `--title <TITLE>` | | |
 | `--attach <ATTACH>` | | |
@@ -70,6 +71,19 @@ Emit JSON so a script can parse the result rather than scraping formatted text.
 ```sh
 zuno run --format json "list the failing tests" > result.json
 ```
+
+Opt in to provider-visible reasoning progress without mixing it into the final
+answer stream.
+
+```sh
+zuno run --show-reasoning "inspect the failure" > answer.txt 2> progress.txt
+```
+
+Only explicit provider reasoning deltas are shown. Signed thinking and encrypted
+reasoning are never rendered. Each block is delimited by
+`<<<zuno:reasoning>>>` and `<<<zuno:end-reasoning>>>`, including when the stream
+ends with an error. `--show-reasoning` cannot be combined with `--format json`;
+JSON mode keeps the existing structured event stream.
 
 Fork an existing session with a specific agent, leaving the original transcript intact.
 

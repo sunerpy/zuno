@@ -58,6 +58,20 @@ zuno run --format json "summarize the diff"
 `default` is human-readable text; `json` is for parsing. Use `json` in scripts rather than
 scraping formatted output, because the formatted shape is presentation.
 
+Provider-visible reasoning is opt-in:
+
+```sh
+zuno run --show-reasoning "summarize the failure" > answer.txt 2> reasoning.txt
+```
+
+Final answer text stays on stdout. Stderr receives only explicit provider
+reasoning deltas between `<<<zuno:reasoning>>>` and
+`<<<zuno:end-reasoning>>>`; signed thinking and encrypted reasoning are never
+shown. Zuno delays the opening marker until the first delta if the provider
+omits a start event and always closes an open block on provider error or stream
+end. `--show-reasoning --format json` is rejected because JSON mode already
+emits structured events.
+
 Logs never go to stdout. Mirror them to stderr when diagnosing:
 
 ```sh
