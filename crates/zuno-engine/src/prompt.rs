@@ -220,6 +220,18 @@ impl RuntimePromptPolicy {
                  before retrying any side effect whose outcome is uncertain.",
             ));
         }
+        if self.shell_workspace_write && has("shell") {
+            sections.push(RuntimePromptSection::new(
+                "runtime.git_attribution",
+                "Default the author and committer of commits you create to \
+                 `zuno-agent <zuno-agent@firlab.app>` with \
+                 `git -c user.name=zuno-agent -c user.email=zuno-agent@firlab.app commit ...`; \
+                 never alter Git configuration. User, repository, or selected Skill instructions \
+                 may replace or disable it. On amend, preserve the existing author unless \
+                 explicitly reset; the fallback identifies only the new committer. Add no \
+                 attribution trailer unless instructed.",
+            ));
+        }
         let mut verification = String::from(if tools.is_empty() {
             "Do not declare completion from intent or plausibility. Report the evidence you \
                  could inspect, identify what remains unverified, and state any blocker explicitly."
@@ -847,6 +859,7 @@ mod tests {
             ("runtime.intent", "CURRENT INTENT"),
             ("runtime.execution", "EXECUTION"),
             ("runtime.editing", "EDITING"),
+            ("runtime.git_attribution", "GIT ATTRIBUTION"),
             ("runtime.verification", "VERIFICATION"),
             ("runtime.delegation", "DELEGATION"),
             ("runtime.persistence", "PERSISTENCE"),
@@ -858,7 +871,7 @@ mod tests {
 
         let envelope = prompt.envelope();
         assert_eq!(envelope.agent_role.len(), 1);
-        assert_eq!(envelope.runtime_policy.len(), 6);
+        assert_eq!(envelope.runtime_policy.len(), 7);
         assert_eq!(
             envelope
                 .runtime_policy
@@ -869,6 +882,7 @@ mod tests {
                 "runtime.intent",
                 "runtime.execution",
                 "runtime.editing",
+                "runtime.git_attribution",
                 "runtime.verification",
                 "runtime.delegation",
                 "runtime.persistence",
@@ -881,6 +895,7 @@ mod tests {
                 "CURRENT INTENT",
                 "EXECUTION",
                 "EDITING",
+                "GIT ATTRIBUTION",
                 "VERIFICATION",
                 "DELEGATION",
                 "PERSISTENCE",
@@ -921,6 +936,7 @@ mod tests {
                 "runtime.intent",
                 "runtime.execution",
                 "runtime.editing",
+                "runtime.git_attribution",
                 "runtime.verification",
                 "runtime.delegation",
                 "runtime.persistence",
@@ -983,6 +999,31 @@ mod tests {
             "long-running turns must provide concise visible progress"
         );
         assert!(
+            text.contains("`zuno-agent <zuno-agent@firlab.app>`")
+                && text.contains(
+                    "`git -c user.name=zuno-agent -c user.email=zuno-agent@firlab.app commit ...`"
+                ),
+            "workspace-writing Shell must receive the default Git identity and command-scoped form"
+        );
+        assert!(
+            text.contains("User, repository, or selected Skill instructions")
+                && text.contains("may replace or disable it"),
+            "user-owned instructions and Skills must be able to override the default identity"
+        );
+        assert!(
+            text.contains("never alter Git configuration"),
+            "attribution must not mutate persistent Git configuration"
+        );
+        assert!(
+            text.contains("preserve the existing author")
+                && text.contains("fallback identifies only the new committer"),
+            "amend guidance must distinguish author from committer"
+        );
+        assert!(
+            text.contains("Add no attribution trailer unless instructed"),
+            "the default identity must not silently add a second attribution mechanism"
+        );
+        assert!(
             text.contains("stop calling tools and answer"),
             "completed work must terminate instead of extending the tool loop"
         );
@@ -997,7 +1038,7 @@ mod tests {
             .map(|section| section.content().len().div_ceil(4))
             .sum::<usize>();
         assert!(
-            estimated_tokens <= 800,
+            estimated_tokens <= 900,
             "runtime policy consumed {estimated_tokens} estimated tokens"
         );
 
@@ -1006,6 +1047,11 @@ mod tests {
             read_only
                 .iter()
                 .all(|section| section.id() != "runtime.editing")
+        );
+        assert!(
+            read_only
+                .iter()
+                .all(|section| section.id() != "runtime.git_attribution")
         );
         assert!(
             read_only
@@ -1031,6 +1077,14 @@ mod tests {
                 .iter()
                 .all(|section| !section.content().contains("backgroundPurpose")),
             "a bg-only surface must not describe an unavailable Shell argument"
+        );
+
+        let editor_only = policy.sections(["apply_patch"], false);
+        assert!(
+            editor_only
+                .iter()
+                .all(|section| section.id() != "runtime.git_attribution"),
+            "a non-Shell editor cannot create a Git commit"
         );
 
         let no_tools = policy.sections(std::iter::empty::<&str>(), false);
