@@ -370,6 +370,304 @@ pub struct MemoryEntryProjection {
     pub content: String,
 }
 
+/// User feedback attached to one durable assistant message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackRating {
+    Positive,
+    Negative,
+}
+
+impl FeedbackRating {
+    #[must_use]
+    pub const fn as_i64(self) -> i64 {
+        match self {
+            Self::Positive => 1,
+            Self::Negative => -1,
+        }
+    }
+
+    #[must_use]
+    pub const fn parse(value: i64) -> Option<Self> {
+        match value {
+            1 => Some(Self::Positive),
+            -1 => Some(Self::Negative),
+            _ => None,
+        }
+    }
+}
+
+/// Current feedback state for one durable message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageFeedbackProjection {
+    pub message_id: String,
+    pub session_id: String,
+    pub rating: FeedbackRating,
+    pub note: Option<String>,
+    pub revision: i64,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+/// What one durable experience records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceKind {
+    Outcome,
+    Problem,
+    UnresolvedIssue,
+    UserCorrection,
+    ExplicitFeedback,
+    Procedure,
+}
+
+impl ExperienceKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Outcome => "outcome",
+            Self::Problem => "problem",
+            Self::UnresolvedIssue => "unresolved_issue",
+            Self::UserCorrection => "user_correction",
+            Self::ExplicitFeedback => "explicit_feedback",
+            Self::Procedure => "procedure",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "outcome" => Some(Self::Outcome),
+            "problem" => Some(Self::Problem),
+            "unresolved_issue" => Some(Self::UnresolvedIssue),
+            "user_correction" => Some(Self::UserCorrection),
+            "explicit_feedback" => Some(Self::ExplicitFeedback),
+            "procedure" => Some(Self::Procedure),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn promotable(self) -> bool {
+        !matches!(self, Self::UnresolvedIssue)
+    }
+}
+
+/// Lifecycle of one durable experience.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperienceStatus {
+    Active,
+    Promoted,
+    Forgotten,
+}
+
+impl ExperienceStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Promoted => "promoted",
+            Self::Forgotten => "forgotten",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "promoted" => Some(Self::Promoted),
+            "forgotten" => Some(Self::Forgotten),
+            _ => None,
+        }
+    }
+}
+
+/// Frontend-neutral view of one learned experience.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExperienceProjection {
+    pub id: String,
+    pub project_id: String,
+    pub session_id: Option<String>,
+    pub source_message_id: Option<String>,
+    pub kind: ExperienceKind,
+    pub title: String,
+    pub summary: String,
+    pub resolution: Option<String>,
+    /// Confidence in basis points (`0..=10_000`).
+    pub confidence: u16,
+    pub status: ExperienceStatus,
+    pub promoted_memory_candidate_id: Option<String>,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+/// Lifecycle of one mined learning pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningPatternStatus {
+    Pending,
+    Promoted,
+    Rejected,
+    Superseded,
+}
+
+impl LearningPatternStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Promoted => "promoted",
+            Self::Rejected => "rejected",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "promoted" => Some(Self::Promoted),
+            "rejected" => Some(Self::Rejected),
+            "superseded" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+}
+
+/// Frontend-neutral view of one mined pattern.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningPatternProjection {
+    pub id: String,
+    pub project_id: Option<String>,
+    pub fingerprint: String,
+    pub title: String,
+    pub summary: String,
+    pub learned_rules: Vec<String>,
+    pub independent_sessions: u32,
+    pub project_count: u32,
+    pub status: LearningPatternStatus,
+    pub evidence_version: i64,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+/// Lifecycle of a reviewable Skill change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillCandidateStatus {
+    PendingReview,
+    Evaluating,
+    Approved,
+    Applying,
+    Applied,
+    Rejected,
+    Stale,
+    Undoing,
+    Undone,
+    Failed,
+    Uncertain,
+}
+
+impl SkillCandidateStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingReview => "pending_review",
+            Self::Evaluating => "evaluating",
+            Self::Approved => "approved",
+            Self::Applying => "applying",
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+            Self::Stale => "stale",
+            Self::Undoing => "undoing",
+            Self::Undone => "undone",
+            Self::Failed => "failed",
+            Self::Uncertain => "uncertain",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending_review" => Some(Self::PendingReview),
+            "evaluating" => Some(Self::Evaluating),
+            "approved" => Some(Self::Approved),
+            "applying" => Some(Self::Applying),
+            "applied" => Some(Self::Applied),
+            "rejected" => Some(Self::Rejected),
+            "stale" => Some(Self::Stale),
+            "undoing" => Some(Self::Undoing),
+            "undone" => Some(Self::Undone),
+            "failed" => Some(Self::Failed),
+            "uncertain" => Some(Self::Uncertain),
+            _ => None,
+        }
+    }
+}
+
+/// Filesystem effect proposed by a Skill candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillCandidateOperation {
+    Apply,
+    Revoke,
+}
+
+impl SkillCandidateOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Revoke => "revoke",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "apply" => Some(Self::Apply),
+            "revoke" => Some(Self::Revoke),
+            _ => None,
+        }
+    }
+}
+
+/// Review projection for a complete Skill candidate and its evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillCandidateProjection {
+    pub id: String,
+    pub project_id: String,
+    pub pattern_id: Option<String>,
+    pub name: String,
+    pub target_source: String,
+    pub target_digest: String,
+    pub proposed_digest: String,
+    pub diff: String,
+    pub learned_rules: Vec<String>,
+    pub operation: SkillCandidateOperation,
+    pub reverts_candidate_id: Option<String>,
+    pub status: SkillCandidateStatus,
+    pub evaluation_run_id: Option<String>,
+    pub error: Option<String>,
+    pub time_created: i64,
+    pub time_updated: i64,
+}
+
+/// Frontend-neutral learning projection shared by TUI, Server, and ACP.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningStateProjection {
+    pub feedback: Vec<MessageFeedbackProjection>,
+    pub experiences: Vec<ExperienceProjection>,
+    pub patterns: Vec<LearningPatternProjection>,
+    pub skill_candidates: Vec<SkillCandidateProjection>,
+}
+
 /// Active goal summary shown by clients.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalPauseProjection {
@@ -544,4 +842,5 @@ pub struct WorkStateProjection {
     pub jobs: Vec<JobProjection>,
     pub memory_candidates: Vec<MemoryCandidateProjection>,
     pub memory_entries: Vec<MemoryEntryProjection>,
+    pub learning: LearningStateProjection,
 }

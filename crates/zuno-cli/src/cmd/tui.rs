@@ -2067,7 +2067,10 @@ async fn apply_selection(
             next.directory = Some(PathBuf::from(target.directory));
             return SelectionOutcome::Remount(Box::new(RemountRequest::plain(next)));
         }
-        zuno_tui::views::session::Selection::SessionDelete(id) => {
+        zuno_tui::views::session::Selection::SessionDelete {
+            id,
+            cleanup_derived_experiences,
+        } => {
             let target = match host.switchable_session(&id) {
                 Ok(Some(target)) => target,
                 Ok(None) => {
@@ -2136,7 +2139,7 @@ async fn apply_selection(
             } else {
                 None
             };
-            if let Err(error) = host.delete_session(&id) {
+            if let Err(error) = host.delete_session(&id, cleanup_derived_experiences) {
                 let _reported = rebuild
                     .events
                     .publish(TurnEvent::Provider {
@@ -2481,6 +2484,8 @@ fn queued_submission_display(submission: &PromptSubmission) -> (String, bool) {
                 HostCommand::Undo => "/undo".to_owned(),
                 HostCommand::Redo => "/redo".to_owned(),
                 HostCommand::Goal(arguments) => format!("/goal {arguments}"),
+                HostCommand::Learn(arguments) => format!("/learn {arguments}"),
+                HostCommand::Reflect(arguments) => format!("/reflect {arguments}"),
                 HostCommand::Preset(Some(preset)) => format!("/preset {preset}"),
                 HostCommand::Preset(None) => "/preset".to_owned(),
                 HostCommand::Council(arguments) => format!("/council {arguments}"),
@@ -3657,6 +3662,9 @@ async fn restore_snapshot(
         HostCommand::Goal(_) => {
             return Err("goal commands must be handled by the turn host".to_owned());
         }
+        HostCommand::Learn(_) | HostCommand::Reflect(_) => {
+            return Err("learning commands must be handled by the turn host".to_owned());
+        }
         HostCommand::Preset(_) => {
             return Err("preset controls must be handled by the TUI selection layer".to_owned());
         }
@@ -3702,6 +3710,14 @@ async fn execute_host_command(
             .map_err(|error| error.to_string()),
         HostCommand::Goal(arguments) => host
             .execute_session_command(SessionCommand::Goal, &arguments, events.clone())
+            .await
+            .map_err(|error| error.to_string()),
+        HostCommand::Learn(arguments) => host
+            .execute_session_command(SessionCommand::Learn, &arguments, events.clone())
+            .await
+            .map_err(|error| error.to_string()),
+        HostCommand::Reflect(arguments) => host
+            .execute_session_command(SessionCommand::Reflect, &arguments, events.clone())
             .await
             .map_err(|error| error.to_string()),
         HostCommand::Undo | HostCommand::Redo => restore_snapshot(command, snapshots, events).await,

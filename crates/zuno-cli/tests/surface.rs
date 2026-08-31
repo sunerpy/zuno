@@ -279,7 +279,12 @@ const IMPLEMENTED_PROBES: &[Probe] = &[
     },
     Probe {
         command: "session",
-        argv: &["session", "delete", "ses_probe000000000000000000000a"],
+        argv: &[
+            "session",
+            "delete",
+            "ses_probe000000000000000000000a",
+            "--keep-derived-experiences",
+        ],
         evidence: "Session not found: ses_probe000000000000000000000a",
     },
     Probe {

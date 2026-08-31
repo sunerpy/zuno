@@ -1129,7 +1129,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         title: None,
         internals: stub_internals(),
         presets: PresetLibrary::new(),
-        reflection_model: None,
+        learning_model: None,
         window: TokenWindow {
             context: 0,
             max_output: 0,
@@ -3276,7 +3276,10 @@ fn internal_models_keep_the_responses_surface_selected_by_the_catalog() {
     let config: zuno_config::schema::Config = serde_json::from_str(
         r#"{
           "small_model": "kiro-local/gpt-5.6-sol",
-          "memory": {"reflection": true},
+          "learning": {
+            "enabled": true,
+            "extractor_model": "kiro-local/gpt-5.6-sol"
+          },
           "provider": {
             "kiro-local": {
               "transport": "openai",
@@ -3330,11 +3333,12 @@ fn internal_models_keep_the_responses_surface_selected_by_the_catalog() {
         );
     }
 
-    let reflection = resolve_reflection_model(&config, &catalog, "kiro-local", &env, &mut notes)
-        .expect("reflection resolution succeeds")
-        .expect("reflection is enabled by the explicit small model");
-    assert_eq!(reflection.provider.surface, ApiSurface::Responses);
-    assert_eq!(reflection.surface, ApiSurface::Responses);
+    let learning = resolve_learning_model(&config, &catalog, "kiro-local", &env, &mut notes)
+        .expect("learning resolution succeeds")
+        .expect("learning is enabled by the explicit extractor model");
+    assert_eq!(learning.model.provider.surface, ApiSurface::Responses);
+    assert_eq!(learning.model.surface, ApiSurface::Responses);
+    assert_eq!(learning.max_output_tokens, 2_048);
 }
 
 /// Every name the roster declares internal must resolve here.
@@ -4164,6 +4168,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4229,6 +4234,7 @@ fn interaction_tool_ids(
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4338,6 +4344,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4412,6 +4419,7 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4511,6 +4519,7 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4683,6 +4692,7 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4801,6 +4811,7 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -4868,6 +4879,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                experience_search: None,
                 tool_authority: None,
             },
         )
@@ -4969,6 +4981,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             councils: test_councils(),
             job_controller: test_job_controller(),
             memory: None,
+            experience_search: None,
             tool_authority: None,
         },
     )
@@ -6256,6 +6269,7 @@ mod production_registry {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                experience_search: None,
                 tool_authority,
             },
         )?;
@@ -6657,6 +6671,7 @@ mod production_registry {
                 councils: test_councils(),
                 job_controller: test_job_controller(),
                 memory: None,
+                experience_search: None,
                 tool_authority: None,
             },
         )
@@ -6717,8 +6732,9 @@ mod skill_prompt {
     #[test]
     fn council_routing_is_typed_and_scoped_to_one_resolver_clone() {
         let resolver = resolver();
-        let routed = resolver
-            .with_prompt_section(
+        let mut routed = resolver.clone();
+        routed
+            .append_prompt_section(
                 "routing.council",
                 "zuno-tui:/council",
                 "Invoke council_run exactly once.",
@@ -8611,17 +8627,13 @@ fn the_generation_controls_are_wired_into_the_turns_own_resolution() {
     );
 }
 
-mod reflection_runtime {
+mod learning_runtime {
     use super::*;
     use futures::stream;
     use std::sync::Mutex;
-    use zuno_agent::reflection::{
-        ReflectionMemoryEntry, ReflectionMemoryScope, ReflectionTurn, TranscriptEvent,
-        TurnDelivery, TurnTranscript,
-    };
     use zuno_llm::registry::{Capabilities, ProviderStream};
 
-    const SESSION_ID: &str = "ses_reflection_runtime";
+    const SESSION_ID: &str = "ses_learning_runtime";
 
     #[derive(Debug)]
     struct ScriptedProvider {
@@ -8631,35 +8643,29 @@ mod reflection_runtime {
 
     impl Provider for ScriptedProvider {
         fn id(&self) -> &str {
-            "reflection-provider"
+            "learning-provider"
         }
 
         fn capabilities(&self) -> Capabilities {
-            Capabilities {
-                tool_calls: true,
-                ..Capabilities::text_only()
-            }
+            Capabilities::text_only()
         }
 
         fn stream(&self, request: CompletionRequest) -> ProviderStream<'_> {
             self.requests
                 .lock()
-                .expect("reflection request lock")
+                .expect("learning request lock")
                 .push(request);
             Box::pin(stream::iter(self.events.clone().into_iter().map(Ok)))
         }
     }
 
-    struct Fixture {
-        _directory: tempfile::TempDir,
-        memory: Arc<MemoryService>,
-        events: zuno_db::event_log::SessionEventLog,
-        fork: ReflectionFork,
-        requests: Arc<Mutex<Vec<CompletionRequest>>>,
-    }
-
-    fn fixture(provider_events: Vec<StreamEvent>) -> Fixture {
-        let directory = tempfile::tempdir().expect("temporary memory directory");
+    fn fixture(
+        provider_events: Vec<StreamEvent>,
+    ) -> (
+        ProviderLearningExtractor,
+        zuno_db::event_log::SessionEventLog,
+        Arc<Mutex<Vec<CompletionRequest>>>,
+    ) {
         let pool =
             Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
         let mut connection = pool.open_connection().expect("database connection");
@@ -8671,204 +8677,126 @@ mod reflection_runtime {
                  INSERT INTO session (
                      id, project_id, slug, directory, title, version, time_created, time_updated
                  ) VALUES (
-                     'ses_reflection_runtime', 'project', 'reflection-runtime', '/workspace',
-                     'Reflection runtime', 'zuno', 1, 1
+                     'ses_learning_runtime', 'project', 'learning-runtime', '/workspace',
+                     'Learning runtime', 'zuno', 1, 1
                  );",
             )
-            .expect("seed reflection session");
+            .expect("seed learning session");
         drop(connection);
 
-        let memory = Arc::new(MemoryService::new(
-            Arc::clone(&pool),
-            ScopePaths::at(
-                directory.path().join("global/MEMORY.md"),
-                directory.path().join("project/RULES.md"),
-            ),
-            ScopeLimits::default(),
-            PromotionPolicy::Review,
-        ));
-        let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let runner = ProviderReflectionRunner {
+        let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool));
+        let extractor = ProviderLearningExtractor {
             provider: Arc::new(ScriptedProvider {
                 events: provider_events,
                 requests: Arc::clone(&requests),
             }),
             model: EngineModel::new(
-                Spec::new("reflection-provider"),
-                "small-model",
+                Spec::new("learning-provider"),
+                "extractor-model",
                 ApiSurface::Chat,
             ),
             events: zuno_db::event_log::SessionEventLog::new(pool),
         };
-        let fork = ReflectionFork::new(
-            Arc::new(runner),
-            erase(zuno_tools::MemoryTool::reflection(Arc::clone(&memory))),
-        );
-        Fixture {
-            _directory: directory,
-            memory,
-            events,
-            fork,
-            requests,
-        }
+        (extractor, events, requests)
     }
 
-    async fn run(fixture: &Fixture) -> Result<(), ReflectionError> {
-        fixture
-            .fork
-            .spawn_after_turn(
-                ReflectionTurn::new(
-                    TurnDelivery::new(true, false),
-                    TurnTranscript::new(vec![
-                        TranscriptEvent::user("remember the verified repository gate"),
-                        TranscriptEvent::assistant("The gate passed and is reusable."),
-                    ]),
-                    ToolContext::new(
-                        SESSION_ID,
-                        "msg_delivered",
-                        "call_reflection",
-                        "build",
-                        Arc::new(AllowAll),
-                        Arc::new(NeverInterrupted),
-                    ),
-                )
-                .with_resident_memory(vec![ReflectionMemoryEntry::new(
-                    ReflectionMemoryScope::Project,
-                    "Use cargo check before the workspace test suite.",
-                )]),
-            )
-            .expect("reflection task")
-            .await
-            .expect("reflection supervisor task")
-    }
-
-    fn tool_events(name: &str, input: &str, with_end: bool) -> Vec<StreamEvent> {
-        let mut events = vec![
-            StreamEvent::ToolUseStart {
-                id: "call_memory".to_owned(),
-                name: name.to_owned(),
-            },
-            StreamEvent::ToolInputDelta {
-                id: "call_memory".to_owned(),
-                delta: input.to_owned(),
-            },
-            StreamEvent::ToolUseEnd {
-                id: "call_memory".to_owned(),
-            },
-        ];
-        if with_end {
-            events.push(StreamEvent::MessageEnd {
-                stop_reason: Some(zuno_llm::event::FinishReason::ToolCalls),
-            });
+    fn request() -> ExtractionRequest {
+        ExtractionRequest {
+            project_id: "project".to_owned(),
+            session_id: SESSION_ID.to_owned(),
+            source_message_id: "msg_delivered".to_owned(),
+            transcript: r#"[{"type":"user","text":"record this outcome"}]"#.to_owned(),
+            had_tool_calls: true,
+            had_artifacts: false,
+            recovered_from_error: false,
+            user_corrected: false,
+            explicit_feedback: false,
         }
-        events
     }
 
     #[tokio::test]
-    async fn provider_reflection_persists_request_outcome_and_pending_candidate() {
-        let fixture = fixture(tool_events(
-            "memory_propose",
-            r#"{"target":"project","action":"add","content":"run cargo test","reason":"verified repository gate","confidence":0.98}"#,
-            true,
-        ));
+    async fn provider_learning_extractor_is_tool_free_and_audited() {
+        let body = r#"{"experiences":[{"kind":"procedure","title":"Repository gate","summary":"The workspace check passed.","resolution":"Run cargo check before publishing.","confidence":0.98,"evidence":[{"kind":"tool","source_id":"msg_delivered","excerpt":"cargo check passed"}]}],"memories":[]}"#;
+        let (extractor, events, requests) = fixture(vec![
+            StreamEvent::TextDelta(body.to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(zuno_llm::event::FinishReason::Stop),
+            },
+        ]);
 
-        run(&fixture).await.expect("reflection review");
-
-        let candidates = fixture.memory.candidates().expect("memory candidates");
-        assert_eq!(candidates.len(), 1);
+        let extraction = extractor.extract(request()).await.expect("extraction");
+        assert_eq!(extraction.experiences.len(), 1);
+        let requests = requests.lock().expect("learning requests");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].tools.is_empty());
         assert_eq!(
-            candidates[0].status,
-            zuno_types::MemoryCandidateStatus::Pending
+            requests[0].request_context(),
+            Some(&ProviderRequestContext::Learning)
         );
-        let events = fixture
-            .events
+        let events = events
             .read_after(SESSION_ID, None)
-            .expect("reflection events");
+            .expect("learning events");
         assert_eq!(
             events
                 .iter()
                 .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
-            ["memory.reflection.request", "memory.reflection.outcome"]
+            ["learning.extraction.request", "learning.extraction.outcome"]
         );
-        assert_eq!(events[0].properties["tool"]["name"], "memory_propose");
-        assert_eq!(
-            events[0].properties["residentMemory"][0]["scope"],
-            "project"
-        );
-        assert_eq!(
-            events[0].properties["residentMemory"][0]["content"],
-            "Use cargo check before the workspace test suite."
-        );
-        assert!(
-            events[0].properties["prompt"]
-                .as_str()
-                .is_some_and(|prompt| prompt.contains("prefer replace over add"))
-        );
+        assert_eq!(events[0].properties["tools"], json!([]));
         assert_eq!(events[1].properties["status"], "completed");
-        assert_eq!(events[1].properties["toolCalls"], 1);
-        let requests = fixture.requests.lock().expect("reflection requests");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].request_context(),
-            Some(&ProviderRequestContext::Reflection),
-            "reflection must not join the foreground provider conversation"
-        );
     }
 
     #[tokio::test]
-    async fn malformed_denied_and_truncated_reflection_streams_are_durable_failures() {
+    async fn provider_learning_extractor_rejects_tool_calls_and_truncated_streams() {
         for (events, expected) in [
             (
-                tool_events("memory_propose", "{", true),
-                "malformed tool arguments",
+                vec![
+                    StreamEvent::ToolUseStart {
+                        id: "call_forbidden".to_owned(),
+                        name: "shell".to_owned(),
+                    },
+                    StreamEvent::ToolInputDelta {
+                        id: "call_forbidden".to_owned(),
+                        delta: r#"{"command":"echo forbidden"}"#.to_owned(),
+                    },
+                    StreamEvent::ToolUseEnd {
+                        id: "call_forbidden".to_owned(),
+                    },
+                    StreamEvent::MessageEnd {
+                        stop_reason: Some(zuno_llm::event::FinishReason::ToolCalls),
+                    },
+                ],
+                "attempted a tool call",
             ),
             (
-                tool_events("shell", r#"{"command":"echo forbidden"}"#, true),
-                "denied non-whitelisted tool",
-            ),
-            (
-                tool_events(
-                    "memory_propose",
-                    r#"{"target":"project","action":"add","content":"x","reason":"y","confidence":1}"#,
-                    false,
-                ),
+                vec![StreamEvent::TextDelta(
+                    r#"{"experiences":[],"memories":[]}"#.to_owned(),
+                )],
                 "ended before MessageEnd",
             ),
         ] {
-            let fixture = fixture(events);
-            let error = run(&fixture)
+            let (extractor, durable_events, _) = fixture(events);
+            let error = extractor
+                .extract(request())
                 .await
-                .expect_err("invalid reflection stream must fail the durable job");
+                .expect_err("invalid extraction stream must fail");
             assert!(
                 error.to_string().contains(expected),
                 "missing `{expected}` in {error}"
             );
-
-            assert!(
-                fixture.memory.candidates().expect("candidates").is_empty(),
-                "failed reflection wrote a candidate"
-            );
-            let events = fixture
-                .events
+            let events = durable_events
                 .read_after(SESSION_ID, None)
-                .expect("reflection events");
+                .expect("learning events");
             let outcome = events.last().expect("failure outcome");
-            assert_eq!(outcome.event_type, "memory.reflection.outcome");
+            assert_eq!(outcome.event_type, "learning.extraction.outcome");
             assert_eq!(outcome.properties["status"], "failed");
-            assert!(
-                outcome.properties["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains(expected)),
-                "missing `{expected}` in {}",
-                outcome.properties["error"]
-            );
         }
     }
 
     #[test]
-    fn durable_reflection_transcript_replays_delivered_text_and_terminal_tool_results() {
+    fn durable_learning_turn_replays_text_tools_artifacts_and_corrections() {
         let mut connection =
             zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open database");
         zuno_db::migration::apply(&mut connection).expect("initialize schema");
@@ -8882,8 +8810,8 @@ mod reflection_runtime {
                 agent: "build",
                 provider_id: "provider",
                 model_id: "model",
-                text: "verify the gate",
-                message_id: Some("msg_reflection_user"),
+                text: "不对，我说的是验证并记录这个 gate",
+                message_id: Some("msg_learning_user"),
                 now,
             },
             None,
@@ -8893,36 +8821,34 @@ mod reflection_runtime {
             .expect("persist user message");
 
         let assistant = zuno_db::message::MessageRecord::from_json(json!({
-            "id": "msg_reflection_assistant",
+            "id": "msg_learning_assistant",
             "sessionID": session.id,
             "role": "assistant",
-            "time": {"created": now + 1, "completed": now + 2},
+            "time": {"created": now + 1},
             "parentID": user.id,
             "modelID": "model",
             "providerID": "provider",
-            "mode": "build",
             "agent": "build",
             "path": {"cwd": "/workspace", "root": "/workspace"},
             "cost": 0,
             "tokens": {
-                "input": 1,
-                "output": 1,
+                "input": 0,
+                "output": 0,
                 "reasoning": 0,
                 "cache": {"read": 0, "write": 0}
-            },
-            "finish": "stop"
+            }
         }))
         .expect("assistant message");
         let parts = [
             json!({
-                "id": "prt_reflection_text",
+                "id": "prt_learning_text",
                 "sessionID": session.id,
                 "messageID": assistant.id,
                 "type": "text",
                 "text": "I verified the gate."
             }),
             json!({
-                "id": "prt_reflection_failed",
+                "id": "prt_learning_failed",
                 "sessionID": session.id,
                 "messageID": assistant.id,
                 "type": "tool",
@@ -8935,7 +8861,7 @@ mod reflection_runtime {
                 }
             }),
             json!({
-                "id": "prt_reflection_succeeded",
+                "id": "prt_learning_succeeded",
                 "sessionID": session.id,
                 "messageID": assistant.id,
                 "type": "tool",
@@ -8946,6 +8872,14 @@ mod reflection_runtime {
                     "input": {"command": "cargo test"},
                     "output": "all tests passed"
                 }
+            }),
+            json!({
+                "id": "prt_learning_patch",
+                "sessionID": session.id,
+                "messageID": assistant.id,
+                "type": "patch",
+                "hash": "abc123",
+                "files": ["Cargo.toml"]
             }),
         ]
         .into_iter()
@@ -8965,26 +8899,27 @@ mod reflection_runtime {
                 .expect("persist assistant part");
         }
 
-        let transcript =
-            durable_reflection_transcript(&connection, &session.id, "msg_reflection_assistant")
-                .expect("durable transcript");
+        let turn = durable_learning_turn(&connection, &session.id, "msg_learning_assistant")
+            .expect("durable learning turn");
+        assert!(turn.had_artifacts);
+        assert!(turn.user_corrected);
         assert_eq!(
-            transcript,
+            turn.transcript,
             TurnTranscript::new(vec![
-                TranscriptEvent::user("verify the gate"),
+                TranscriptEvent::user("不对，我说的是验证并记录这个 gate"),
                 TranscriptEvent::assistant("I verified the gate."),
                 TranscriptEvent::command(
                     "cargo test",
-                    zuno_agent::reflection::CommandOutcome::failed("first attempt failed"),
+                    CommandOutcome::failed("first attempt failed"),
                 ),
                 TranscriptEvent::command(
                     "cargo test",
-                    zuno_agent::reflection::CommandOutcome::succeeded("all tests passed"),
+                    CommandOutcome::succeeded("all tests passed"),
                 ),
             ])
         );
         assert!(
-            durable_reflection_transcript(&connection, &session.id, "msg_missing")
+            durable_learning_turn(&connection, &session.id, "msg_missing")
                 .expect_err("missing delivered message must fail")
                 .contains("missing from durable history")
         );

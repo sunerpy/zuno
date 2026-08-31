@@ -153,12 +153,38 @@ fn views_session_picker_delete_emits_without_closing_so_another_row_can_follow()
         DialogStep::Emitted(DialogOutcome::Session(SessionDialogAction::Delete {
             id: String::from("ses_2"),
             title: String::from("Theme resolution"),
+            cleanup_derived_experiences: false,
         }))
     );
     assert_eq!(
         dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
         DialogStep::Redraw,
         "the emitted delete must leave the session picker ready to arm another deletion"
+    );
+}
+
+#[test]
+fn views_session_picker_requires_an_explicit_keep_or_clean_learning_choice() {
+    let mut dialog = session_picker(ViewContext::defaults(), sessions());
+    assert_eq!(
+        dialog.handle_action(action("session_delete"), &press(KeyCode::Char('d'))),
+        DialogStep::Redraw
+    );
+    let prompt = dialog
+        .lines(60)
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("keep learning"), "{prompt}");
+    assert!(prompt.contains("clean learning"), "{prompt}");
+    assert_eq!(
+        dialog.handle_action(action("session_rename"), &press(KeyCode::Char('r'))),
+        DialogStep::Emitted(DialogOutcome::Session(SessionDialogAction::Delete {
+            id: String::from("ses_1"),
+            title: String::from("Port the keybind table"),
+            cleanup_derived_experiences: true,
+        }))
     );
 }
 

@@ -768,6 +768,188 @@
       ],
       "type": "object"
     },
+    "LearningAggregationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "interval_ms": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_new_records": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningConfig": {
+      "additionalProperties": false,
+      "description": "User-experience extraction and reviewed Skill evolution.",
+      "properties": {
+        "aggregation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningAggregationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Project-level pattern mining."
+        },
+        "enabled": {
+          "description": "Master switch. Learning is disabled unless explicitly enabled.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "extractor_model": {
+          "description": "Dedicated model used by the no-tools structured extractor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "global_promotion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningGlobalPromotionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Cross-project pattern promotion."
+        },
+        "post_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningPostTurnConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Fast post-turn extraction."
+        },
+        "retrieval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningRetrievalConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Automatic and explicit experience retrieval."
+        },
+        "skill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LearningSkillConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Skill-candidate evidence and review thresholds."
+        }
+      },
+      "type": "object"
+    },
+    "LearningGlobalPromotionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "interval_ms": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_projects": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningPostTurnConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningRetrievalConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_context_tokens": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_items": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "LearningSkillConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "max_learned_rules": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_independent_sessions": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "require_review": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "LocalKind": {
       "description": "The `type: \"local\"` discriminator.",
       "oneOf": [
@@ -1106,6 +1288,7 @@
       "description": "Persistent memory: a master boolean, or component settings."
     },
     "MemoryOptions": {
+      "additionalProperties": false,
       "description": "Fine-grained settings under the `memory` top-level key.",
       "properties": {
         "auto_confidence": {
@@ -1123,15 +1306,6 @@
           "description": "Character cap for global agent notes. Defaults to 2200.",
           "format": "uint32",
           "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "nudge_interval": {
-          "description": "Reflect every N delivered turns; zero disables only the periodic trigger.",
-          "format": "uint32",
-          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -1156,13 +1330,6 @@
             }
           ],
           "description": "Candidate promotion policy. Defaults to `review`."
-        },
-        "reflection": {
-          "description": "Run post-response background reflection.",
-          "type": [
-            "boolean",
-            "null"
-          ]
         },
         "resident": {
           "description": "Inject frozen resident blocks into each session's system prompt.",
@@ -2895,6 +3062,17 @@
         "array",
         "null"
       ]
+    },
+    "learning": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LearningConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "User-experience extraction, retrieval, aggregation, and Skill review."
     },
     "logLevel": {
       "anyOf": [

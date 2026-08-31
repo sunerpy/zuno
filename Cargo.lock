@@ -6260,9 +6260,11 @@ dependencies = [
  "zuno-db",
  "zuno-engine",
  "zuno-error",
+ "zuno-eval",
  "zuno-extension",
  "zuno-goal",
  "zuno-harness",
+ "zuno-learning",
  "zuno-llm",
  "zuno-lsp",
  "zuno-mcp",
@@ -6374,6 +6376,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zuno-eval"
+version = "0.0.3"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+ "zuno-db",
+ "zuno-error",
+ "zuno-paths",
+]
+
+[[package]]
 name = "zuno-extension"
 version = "0.0.3"
 dependencies = [
@@ -6432,6 +6449,29 @@ dependencies = [
  "zuno-runtime",
  "zuno-tool",
  "zuno-tools",
+]
+
+[[package]]
+name = "zuno-learning"
+version = "0.0.3"
+dependencies = [
+ "async-trait",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+ "zuno-config",
+ "zuno-db",
+ "zuno-error",
+ "zuno-eval",
+ "zuno-memory",
+ "zuno-paths",
+ "zuno-types",
 ]
 
 [[package]]
@@ -6810,11 +6850,13 @@ dependencies = [
  "zuno-engine",
  "zuno-error",
  "zuno-goal",
+ "zuno-learning",
  "zuno-llm",
  "zuno-observability",
  "zuno-paths",
  "zuno-permission",
  "zuno-pty",
+ "zuno-types",
 ]
 
 [[package]]
@@ -6918,6 +6960,7 @@ dependencies = [
  "zuno-config",
  "zuno-db",
  "zuno-error",
+ "zuno-learning",
  "zuno-llm",
  "zuno-memory",
  "zuno-network",
@@ -6982,6 +7025,9 @@ dependencies = [
 [[package]]
 name = "zuno-types"
 version = "0.0.3"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zuno-watch"

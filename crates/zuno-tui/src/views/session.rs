@@ -737,8 +737,11 @@ pub enum Selection {
     NewSession,
     /// Rename a session after its prompt has supplied a non-empty title.
     SessionRename { id: String, title: String },
-    /// Delete a session after the list has confirmed the destructive action.
-    SessionDelete(String),
+    /// Delete a session after explicitly choosing whether derived learning is kept.
+    SessionDelete {
+        id: String,
+        cleanup_derived_experiences: bool,
+    },
     /// Cancel one running background subagent job.
     JobCancel(String),
     /// Approve one durable memory candidate.
@@ -4164,7 +4167,16 @@ impl SessionScreen {
             Selection::SessionRename { id, title } => {
                 format!("renaming session {id} to {title}")
             }
-            Selection::SessionDelete(id) => format!("deleting session {id}"),
+            Selection::SessionDelete {
+                id,
+                cleanup_derived_experiences,
+            } => {
+                if *cleanup_derived_experiences {
+                    format!("deleting session {id} and cleaning derived learning")
+                } else {
+                    format!("deleting session {id} and keeping derived learning")
+                }
+            }
             Selection::JobCancel(id) => format!("cancelling background job {id}"),
             Selection::MemoryApply(id) => format!("approving memory candidate {id}"),
             Selection::MemoryReject(id) => format!("rejecting memory candidate {id}"),
@@ -4502,13 +4514,24 @@ impl ActionComponent for SessionScreen {
                 EventResult::REDRAW
             }
             crate::views::dialog::DialogOutcome::Session(
-                crate::views::picker::SessionDialogAction::Delete { id, title },
+                crate::views::picker::SessionDialogAction::Delete {
+                    id,
+                    title,
+                    cleanup_derived_experiences,
+                },
             ) => {
-                let (notice, level) = self.commit_selection(Selection::SessionDelete(id.clone()));
+                let (notice, level) = self.commit_selection(Selection::SessionDelete {
+                    id: id.clone(),
+                    cleanup_derived_experiences: *cleanup_derived_experiences,
+                });
                 self.toasts.push(Toast::new(
                     level,
                     if level == ToastLevel::Success {
-                        format!("deleting session {title}")
+                        if *cleanup_derived_experiences {
+                            format!("deleting session {title} and preparing learning revocations")
+                        } else {
+                            format!("deleting session {title} and keeping learned experience")
+                        }
                     } else {
                         notice
                     },

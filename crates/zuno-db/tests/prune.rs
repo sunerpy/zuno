@@ -128,6 +128,13 @@ fn seed(connection: &Connection) {
     {
         let seq = i64::try_from(index).expect("small fixture index");
         let message_id = format!("msg_{session_id}");
+        let project_id: String = connection
+            .query_row(
+                "SELECT project_id FROM session WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .expect("read fixture project");
         connection
             .execute(
                 "INSERT INTO message (id, session_id, time_created, time_updated, data)
@@ -221,6 +228,31 @@ fn seed(connection: &Connection) {
                 rusqlite::params![format!("reflection_{session_id}"), session_id, message_id],
             )
             .expect("insert reflection job");
+        connection
+            .execute(
+                "INSERT INTO learning_job
+                   (id, project_id, session_id, source_message_id, kind, extractor_version,
+                    idempotency_key, status, attempt, scheduled_at, payload, result,
+                    time_created, time_updated, time_completed)
+                 VALUES (?1, ?2, ?3, ?4, 'extraction', 'extractor-v1', ?5,
+                         'completed', 1, 1, '{}', '{}', 1, 1, 1)",
+                rusqlite::params![
+                    format!("learning_{session_id}"),
+                    project_id,
+                    session_id,
+                    message_id,
+                    format!("learning:{session_id}"),
+                ],
+            )
+            .expect("insert learning job");
+        connection
+            .execute(
+                "INSERT INTO message_feedback
+                   (message_id, session_id, rating, note, revision, time_created, time_updated)
+                 VALUES (?1, ?2, 1, 'useful', 1, 1, 1)",
+                rusqlite::params![message_id, session_id],
+            )
+            .expect("insert message feedback");
         connection
             .execute(
                 "INSERT INTO session_context_epoch (session_id, baseline, snapshot, baseline_seq)
@@ -361,7 +393,7 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     assert_eq!(all_table_counts(&connection), before);
     assert!(remote.calls.borrow().is_empty(), "preview never unshares");
     assert_eq!(outcome.preview.tables.len(), PRUNE_TABLES.len());
-    assert_eq!(outcome.preview.total_rows, 48);
+    assert_eq!(outcome.preview.total_rows, 54);
     assert!(outcome.preview.total_bytes > 0);
     assert_eq!(outcome.preview.cost, 7.5);
     assert_eq!(outcome.preview.tokens.input, 6);
@@ -427,6 +459,8 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
     for (table, column) in [
         ("memory_reflection_job", "session_id"),
         ("memory_reflection_delivery", "session_id"),
+        ("learning_job", "session_id"),
+        ("message_feedback", "session_id"),
         ("agent_job", "parent_session_id"),
         ("work_item", "session_id"),
         ("work_plan", "session_id"),
@@ -596,7 +630,7 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
 fn prune_delete_order_and_true_related_table_count_are_pinned() {
     assert_eq!(
         PRUNE_TABLES.len(),
-        14,
+        16,
         "every session-owned schema table must be explicit"
     );
     assert_eq!(
@@ -604,6 +638,8 @@ fn prune_delete_order_and_true_related_table_count_are_pinned() {
         [
             "memory_reflection_job",
             "memory_reflection_delivery",
+            "learning_job",
+            "message_feedback",
             "agent_job",
             "work_item",
             "work_plan",

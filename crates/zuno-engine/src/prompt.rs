@@ -328,6 +328,7 @@ pub struct PromptEnvelope {
     pub selected_skills: Vec<PromptBlock>,
     pub skill_index: Vec<PromptBlock>,
     pub memory: Vec<PromptBlock>,
+    pub experience: Vec<PromptBlock>,
     ordered: Vec<PromptBlock>,
 }
 
@@ -349,6 +350,7 @@ impl PromptEnvelope {
                 "selected_skill" => &mut envelope.selected_skills,
                 "skill_index" => &mut envelope.skill_index,
                 "memory" => &mut envelope.memory,
+                "experience" => &mut envelope.experience,
                 _ => &mut envelope.runtime_policy,
             };
             destination.push(section.clone());
@@ -671,6 +673,8 @@ fn semantics(id: &str) -> PromptSemantics {
         ("selected_skill", "user", 800)
     } else if id == "skills.index" {
         ("skill_index", "discovered", 300)
+    } else if id.starts_with("learning.") {
+        ("experience", "stored", 625)
     } else if id.starts_with("memory.") {
         ("memory", "stored", 650)
     } else {
@@ -696,7 +700,8 @@ fn canonical_section_rank(role: &str) -> u8 {
         "selected_skill" => 8,
         "skill_index" => 9,
         "memory" => 10,
-        _ => 11,
+        "experience" => 11,
+        _ => 12,
     }
 }
 
@@ -764,6 +769,13 @@ mod tests {
             .push("memory.session", "sqlite:memory", "MEMORY")
             .expect("memory");
         prompt
+            .push(
+                "learning.experiences",
+                "learning://project/example/experiences#sha256=digest",
+                "EXPERIENCE",
+            )
+            .expect("experience");
+        prompt
             .push_selected_skill("codegraph", "/skills/codegraph/SKILL.md", "FULL SKILL")
             .expect("selected skill");
         prompt
@@ -798,6 +810,10 @@ mod tests {
             Some("codegraph")
         );
         assert_eq!(envelope.skill_index[0].content(), "SKILLS");
+        assert_eq!(envelope.memory[0].content(), "MEMORY");
+        assert_eq!(envelope.experience[0].content(), "EXPERIENCE");
+        assert_eq!(envelope.experience[0].semantics().role, "experience");
+        assert_eq!(envelope.experience[0].semantics().trust, "stored");
         assert_eq!(
             envelope.system_messages(),
             vec![
@@ -809,11 +825,12 @@ mod tests {
                 "FULL SKILL",
                 "SKILLS",
                 "MEMORY",
+                "EXPERIENCE",
             ]
         );
         assert_eq!(
             prompt.provider_projection(),
-            "BUILD ROLE\n\nPLAN MODE\n\nINTENT\n\nGLOBAL\n\nPROJECT\n\nFULL SKILL\n\nSKILLS\n\nMEMORY"
+            "BUILD ROLE\n\nPLAN MODE\n\nINTENT\n\nGLOBAL\n\nPROJECT\n\nFULL SKILL\n\nSKILLS\n\nMEMORY\n\nEXPERIENCE"
         );
     }
 
@@ -1087,6 +1104,13 @@ mod tests {
         prompt
             .push("agent.base", "native:build", "BASE")
             .expect("base");
+        prompt
+            .push(
+                "learning.experiences",
+                "learning://project/project-1/experiences?ids=exp-1#sha256=source-digest",
+                "<experience id=\"exp-1\">verified rule</experience>",
+            )
+            .expect("learning experience");
         let system = vec!["BASE".to_owned()];
         let developer = vec!["RUNTIME".to_owned()];
         let projection = PromptProviderProjection {
@@ -1098,6 +1122,19 @@ mod tests {
         assert!(unchanged.get("actualSystemPrompt").is_none());
         assert_eq!(unchanged["sections"][0]["content"], "BASE");
         assert!(unchanged["sections"][0].get("skillName").is_none());
+        assert_eq!(unchanged["sections"][1]["id"], "learning.experiences");
+        assert_eq!(
+            unchanged["sections"][1]["source"],
+            "learning://project/project-1/experiences?ids=exp-1#sha256=source-digest"
+        );
+        assert_eq!(
+            unchanged["sections"][1]["content"],
+            "<experience id=\"exp-1\">verified rule</experience>"
+        );
+        assert_eq!(
+            unchanged["sections"][1]["sha256"],
+            sha256("<experience id=\"exp-1\">verified rule</experience>")
+        );
         assert_eq!(unchanged["providerProjection"]["developer"][0], "RUNTIME");
 
         prompt
