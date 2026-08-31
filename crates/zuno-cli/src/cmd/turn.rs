@@ -2736,6 +2736,9 @@ impl TurnHost {
             let tool_contributions = runtime
                 .service::<zuno_harness::ToolContributions>()
                 .ok_or_else(|| "profile did not register tool contributions".to_owned())?;
+            let public_http = runtime
+                .service::<zuno_network::PublicHttpClient>()
+                .ok_or_else(|| "profile did not register a public HTTP transport".to_owned())?;
             let todo_store = Arc::clone(&database);
             let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
             let goal_store = Arc::new(
@@ -2935,6 +2938,7 @@ impl TurnHost {
                     model_id: &plan.model_id,
                     manifest: tool_manifest,
                     contributions: tool_contributions,
+                    public_http,
                     question,
                     background_executions: Arc::clone(&background_executions),
                     sandbox: None,

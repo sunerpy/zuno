@@ -91,6 +91,7 @@ pub(crate) struct ToolSelection<'a> {
     pub(crate) model_id: &'a str,
     pub(crate) manifest: Arc<zuno_harness::ToolManifest>,
     pub(crate) contributions: Arc<zuno_harness::ToolContributions>,
+    pub(crate) public_http: Arc<zuno_network::PublicHttpClient>,
     pub(crate) question: Option<Arc<dyn QuestionAsker>>,
     pub(crate) background_executions: Arc<zuno_pty::BackgroundExecutionService>,
     /// Test seam for a resolver supplied by the composition root.
@@ -348,7 +349,12 @@ pub(crate) fn assemble(
             erase(zuno_tools::GlobTool::new(tooling.clone())),
         ),
         (BuiltinSlot::Grep, erase(zuno_tools::GrepTool::new(tooling))),
-        (BuiltinSlot::Fetch, erase(zuno_tools::WebFetchTool::new())),
+        (
+            BuiltinSlot::Fetch,
+            erase(zuno_tools::WebFetchTool::with_public_client(Arc::clone(
+                &selection.public_http,
+            ))),
+        ),
         (
             BuiltinSlot::Search,
             erase(zuno_tools::WebSearchTool::with_config(search)),

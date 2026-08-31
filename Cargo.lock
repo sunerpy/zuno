@@ -6428,6 +6428,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "zuno-engine",
+ "zuno-network",
  "zuno-orchestration",
  "zuno-runtime",
  "zuno-tool",
@@ -6538,8 +6539,12 @@ dependencies = [
 name = "zuno-network"
 version = "0.0.3"
 dependencies = [
+ "async-trait",
  "reqwest",
+ "thiserror 2.0.19",
  "tokio",
+ "url",
+ "wiremock",
 ]
 
 [[package]]

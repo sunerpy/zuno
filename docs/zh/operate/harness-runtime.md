@@ -91,6 +91,8 @@ Shell 执行受 OS 沙箱约束。`read-only` 与 `workspace-write` 都要求一
 
 网络出口受沙箱的网络授权控制。`deny` 会创建私有网络命名空间并拒绝网络系统调用，而不是一条可被绕过的防火墙规则。
 
+公开网页抓取使用独立 `PublicHttpClient`：只接受无凭据 HTTP(S)，直连且不使用环境代理；每次请求和每次重定向都重新解析、校验全部地址并进行 DNS pinning。公私混合 DNS、回环/私网/链路本地/CGNAT/保留地址，以及 IPv4-mapped IPv6 与 NAT64 中嵌套的非公开地址都会整体拒绝。
+
 ## 提示词工作流 V2 验收
 
 提示词工作流 V2 的验收条件与证据记录在 [提示词与工作流指南](/zh/operate/prompt-workflow) 与 [设计文档](https://github.com/sunerpy/zuno/blob/main/docs/design/prompt-workflow-v2.zh-CN.md)。

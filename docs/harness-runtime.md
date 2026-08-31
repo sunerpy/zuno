@@ -1478,6 +1478,17 @@ is proxy-aware, while IMDS and approved local ECS credential endpoints are
 direct. Remote HTTPS container credential endpoints remain on the proxy-aware
 transport.
 
+Public web fetch uses the separate `PublicHttpClient` security capability. It
+accepts only credential-free HTTP(S), disables reqwest auto-redirects, and uses
+direct/no-proxy transport so an environment proxy cannot bypass target
+validation. Each request and each of at most five redirects resolves the host,
+rejects the whole answer if any address is non-public, handles mapped or
+embedded IPv4 forms including NAT64, and pins the validated addresses while
+retaining the original hostname for Host and TLS SNI. Redirect credentials are
+never forwarded. Literal and resolved loopback, private, link-local, CGNAT,
+multicast, unspecified, documentation, and reserved destinations fail before
+the request is sent.
+
 Child processes inherit the process proxy environment unless their typed
 configuration deliberately overrides a variable. The agent loop does not
 rewrite process globals per session; deployment-specific proxy choices belong

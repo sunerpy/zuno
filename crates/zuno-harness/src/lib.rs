@@ -18,6 +18,7 @@ const ORCHESTRATION_CAPABILITIES_BUNDLE_ID: &str = "zuno.orchestration-capabilit
 const ORCHESTRATION_CAPABILITIES_COMPONENT_ID: &str = "zuno.orchestration-capabilities";
 const TOOL_MANIFEST_COMPONENT_ID: &str = "zuno.tools";
 const TOOL_CONTRIBUTIONS_COMPONENT_ID: &str = "zuno.tool-contributions";
+const PUBLIC_HTTP_COMPONENT_ID: &str = "zuno.public-http";
 const PRODUCT_CAPABILITY_SCOPE: &str = "profile";
 const PRODUCT_CAPABILITY_VERSION: CapabilityVersion = CapabilityVersion::new(1, 0);
 
@@ -213,6 +214,27 @@ struct ToolContributionsComponent {
     contributions: Arc<ToolContributions>,
 }
 
+struct PublicHttpComponent {
+    client: Arc<zuno_network::PublicHttpClient>,
+}
+
+impl PublicHttpComponent {
+    fn new(client: Arc<zuno_network::PublicHttpClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl Component for PublicHttpComponent {
+    fn id(&self) -> &str {
+        PUBLIC_HTTP_COMPONENT_ID
+    }
+
+    async fn prepare(&self, context: &mut PrepareContext) -> Result<(), RuntimeError> {
+        context.provide(Arc::clone(&self.client))
+    }
+}
+
 impl ToolContributionsComponent {
     fn new(contributions: ToolContributions) -> Self {
         Self {
@@ -369,11 +391,34 @@ pub fn profile_with_tools(
     tools: ToolManifest,
     contributions: ToolContributions,
 ) -> HarnessProfile {
+    profile_with_tools_and_public_http(
+        id,
+        driver,
+        tools,
+        contributions,
+        Arc::new(zuno_network::PublicHttpClient::new()),
+    )
+}
+
+/// Build a profile with an explicitly owned public-internet transport.
+///
+/// This is the injection seam for host-specific DNS resolution and public-target
+/// policy. `webfetch` consumes the activated typed service rather than constructing
+/// a process-global client.
+#[must_use]
+pub fn profile_with_tools_and_public_http(
+    id: impl Into<String>,
+    driver: Arc<dyn AgentDriver>,
+    tools: ToolManifest,
+    contributions: ToolContributions,
+    public_http: Arc<zuno_network::PublicHttpClient>,
+) -> HarnessProfile {
     HarnessProfile::new(id).with_bundle(
         ProfileBundle::new(CORE_BUNDLE_ID)
             .with_component(AgentDriverComponent::new(driver))
             .with_component(ToolManifestComponent::new(tools))
-            .with_component(ToolContributionsComponent::new(contributions)),
+            .with_component(ToolContributionsComponent::new(contributions))
+            .with_component(PublicHttpComponent::new(public_http)),
     )
 }
 
