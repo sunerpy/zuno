@@ -1562,6 +1562,112 @@ fn available_tools_omits_unconditionally_denied_entries() {
     );
 }
 
+#[tokio::test]
+async fn deferred_tools_are_discovered_monotonically_before_they_become_callable() {
+    let docs_calls = Arc::new(AtomicUsize::new(0));
+    let issue_calls = Arc::new(AtomicUsize::new(0));
+    let dispatcher = dispatcher(
+        vec![
+            Arc::new(RecordingTool::read_only(
+                "read",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Arc::new(RecordingTool::read_only(
+                "mcp_docs_search",
+                Arc::clone(&docs_calls),
+            )),
+            Arc::new(RecordingTool::read_only(
+                "mcp_issue_lookup",
+                Arc::clone(&issue_calls),
+            )),
+        ],
+        vec![allow_all_rule()],
+        Arc::new(RecordingApprover::default()),
+    )
+    .with_deferred_tools(vec![
+        "mcp_docs_search".to_owned(),
+        "mcp_issue_lookup".to_owned(),
+    ]);
+
+    let initial = dispatcher.available_tools();
+    assert_eq!(initial.revision, 0);
+    assert_eq!(
+        initial
+            .definitions
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<Vec<_>>(),
+        ["read", "tool_search"]
+    );
+
+    let hidden = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call_hidden",
+            "mcp_docs_search",
+            json!({ "command": "docs" }),
+        ))
+        .await;
+    assert!(hidden.is_error);
+    assert_eq!(docs_calls.load(Ordering::SeqCst), 0);
+
+    let first_search = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call_search_docs",
+            "tool_search",
+            json!({ "query": "docs" }),
+        ))
+        .await;
+    assert!(!first_search.is_error, "{}", first_search.output.output);
+    assert_eq!(
+        first_search.output.metadata["newlyExposedTools"],
+        json!(["mcp_docs_search"])
+    );
+
+    let after_docs = dispatcher.available_tools();
+    assert_eq!(after_docs.revision, 1);
+    assert_eq!(
+        after_docs
+            .definitions
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<Vec<_>>(),
+        ["read", "mcp_docs_search", "tool_search"]
+    );
+    let docs = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call_docs",
+            "mcp_docs_search",
+            json!({ "command": "docs" }),
+        ))
+        .await;
+    assert!(!docs.is_error, "{}", docs.output.output);
+    assert_eq!(docs_calls.load(Ordering::SeqCst), 1);
+
+    let second_search = dispatcher
+        .dispatch(request(
+            &dispatcher,
+            "call_search_issues",
+            "tool_search",
+            json!({ "query": "issue" }),
+        ))
+        .await;
+    assert!(!second_search.is_error, "{}", second_search.output.output);
+
+    let after_issues = dispatcher.available_tools();
+    assert_eq!(after_issues.revision, 2);
+    assert_eq!(
+        after_issues
+            .definitions
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<Vec<_>>(),
+        ["read", "mcp_docs_search", "mcp_issue_lookup", "tool_search"]
+    );
+}
+
 /// A tool whose failure carries a cause two links deep, like an MCP proxy relaying a
 /// server's rejection of a call the transport had already refused.
 struct NestedFailureTool;

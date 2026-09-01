@@ -42,7 +42,7 @@ use zuno_llm::cache::{LockedTools, McpToolStatus, ToolSnapshot};
 use zuno_permission::Rule;
 use zuno_permission::visibility::retain_visible_tools;
 use zuno_tool::{Attachment, Tool, ToolContext, ToolEffect, ToolOutput};
-use zuno_tools::registry::{CustomTool, McpToolLoader};
+use zuno_tools::registry::{CustomTool, McpToolLoader, McpToolSnapshot};
 
 use crate::protocol::lock;
 use crate::stdio::{ToolCallResult, ToolDefinition, tool_name};
@@ -316,6 +316,11 @@ struct Inner {
     /// Server names configuration asked for. Discovery stays
     /// [`McpToolStatus::Pending`] until every one of them has reported.
     expected: Mutex<BTreeSet<String>>,
+    /// Servers supplied as part of an explicit session contract.
+    ///
+    /// Their connected tools must be present in the first provider request.
+    /// Ordinary host-configured servers are still discovered progressively.
+    eager_servers: BTreeSet<String>,
     events: broadcast::Sender<CatalogEvent>,
 }
 
@@ -354,11 +359,28 @@ impl Catalog {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        Self::new_with_eager_servers(expected, std::iter::empty::<String>())
+    }
+
+    /// A catalog whose selected servers are an explicit session dependency.
+    ///
+    /// Tools contributed by `eager_servers` are kept in the first provider
+    /// request. Other connected servers in the same catalog remain eligible for
+    /// progressive discovery.
+    #[must_use]
+    pub fn new_with_eager_servers<I, S, J, T>(expected: I, eager_servers: J) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        J: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Self {
             inner: Arc::new(Inner {
                 entries: Mutex::new(BTreeMap::new()),
                 expected: Mutex::new(expected.into_iter().map(Into::into).collect()),
+                eager_servers: eager_servers.into_iter().map(Into::into).collect(),
                 events,
             }),
         }
@@ -521,27 +543,39 @@ impl Catalog {
     /// resources (`session/tools.ts:155-157`).
     #[must_use]
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tool_snapshot().tools
+    }
+
+    fn tool_snapshot(&self) -> McpToolSnapshot {
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-        {
-            let entries = lock(&self.inner.entries);
-            for (server, entry) in entries.iter() {
-                if !entry.status.is_connected() {
-                    continue;
-                }
-                let Some(handle) = entry.handle.as_ref() else {
-                    tracing::warn!(%server, "connected MCP server has no handle; skipping its tools");
-                    continue;
-                };
-                for definition in &entry.tools {
-                    tools.push(Arc::new(McpToolProxy::new(
-                        server,
-                        definition,
-                        Arc::clone(handle),
-                    )));
-                }
+        let mut eager_tool_ids = Vec::new();
+        let mut has_resources = false;
+        let mut eager_resources = false;
+        let entries = lock(&self.inner.entries);
+        for (server, entry) in entries.iter() {
+            if !entry.status.is_connected() {
+                continue;
             }
+            let Some(handle) = entry.handle.as_ref() else {
+                tracing::warn!(%server, "connected MCP server has no handle; skipping its tools");
+                continue;
+            };
+            let eager = self.inner.eager_servers.contains(server);
+            for definition in &entry.tools {
+                if eager {
+                    eager_tool_ids.push(tool_name(server, &definition.name));
+                }
+                tools.push(Arc::new(McpToolProxy::new(
+                    server,
+                    definition,
+                    Arc::clone(handle),
+                )));
+            }
+            has_resources |= handle.supports_resources();
+            eager_resources |= eager && handle.supports_resources();
         }
-        if !self.resource_servers().is_empty() {
+        drop(entries);
+        if has_resources {
             tools.push(Arc::new(ListResourcesTool {
                 catalog: self.clone(),
             }));
@@ -552,7 +586,13 @@ impl Catalog {
                 catalog: self.clone(),
             }));
         }
-        tools
+        if eager_resources {
+            eager_tool_ids.extend(RESOURCE_TOOLS.map(str::to_owned));
+        }
+        McpToolSnapshot {
+            tools,
+            eager_tool_ids,
+        }
     }
 
     /// [`Self::tools`] with tools hidden by an unconditional deny removed.
@@ -783,6 +823,14 @@ pub struct CatalogLoader {
 impl McpToolLoader for CatalogLoader {
     fn tools(&self) -> Vec<CustomTool> {
         self.catalog.tools()
+    }
+
+    fn eager_tool_ids(&self) -> Vec<String> {
+        self.catalog.tool_snapshot().eager_tool_ids
+    }
+
+    fn snapshot(&self) -> McpToolSnapshot {
+        self.catalog.tool_snapshot()
     }
 }
 

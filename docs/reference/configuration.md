@@ -824,20 +824,19 @@ permission deny always wins.
 Zuno discovers skills in this scope order:
 
 1. project `.zuno/skill(s)` roots from the current directory to the worktree;
-2. project `.agents/skills`, then `.claude/skills`, over the same walk;
+2. project `.agents/skills` roots over the same walk;
 3. Zuno's global and configured config directories;
-4. global `~/.agents/skills`, then `~/.claude/skills`;
+4. global `~/.agents/skills`;
 5. explicit `skills.paths`;
 6. configured remote indexes.
 
 Project scope is therefore advertised before user-global scope. Zuno never
-scans `.opencode` or `$XDG_CONFIG_HOME/opencode` for skills. The same canonical
+scans `.claude`, `.opencode`, or another product's config directory implicitly.
+Such a directory may still be selected explicitly through `skills.paths`. The same canonical
 source path is de-duplicated, including symlink aliases, while same-named files
 from different sources remain independently addressable; no hidden winner is
-selected. Set `ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable `.agents` and
-`.claude` roots, or `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` to disable only Claude
-skill roots. Zuno-native `.zuno` roots remain enabled by the broad external
-switch.
+selected. Set `ZUNO_DISABLE_EXTERNAL_SKILLS=1` to disable implicit `.agents`
+roots. Zuno-native `.zuno` roots remain enabled by the external switch.
 
 The model prompt receives a bounded catalog rather than every `SKILL.md` body.
 By default its approximate budget is two percent of the model context (8,000

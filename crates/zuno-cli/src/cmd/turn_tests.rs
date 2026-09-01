@@ -1467,6 +1467,41 @@ fn debug_agent_live_root_mcp_does_not_claim_parent_attempt_authority() {
 }
 
 #[test]
+fn debug_agent_reports_progressive_root_mcp_schema_exposure() {
+    let plan = plan("/tmp", SessionChoice::New);
+    let diagnostics = crate::cmd::mcp_runtime::McpRuntimeDiagnostics {
+        discovery_status: "ready".to_owned(),
+        servers: vec![crate::cmd::mcp_runtime::McpServerDiagnostic {
+            name: "codegraph".to_owned(),
+            desired_enabled: true,
+            state: "connected".to_owned(),
+            error: None,
+        }],
+        connected_servers: vec!["codegraph".to_owned()],
+        tools: vec![ToolSchemaIdentity {
+            name: "codegraph_query".to_owned(),
+            description_sha256: sha256_text("query indexed code"),
+            schema_sha256: sha256_text("query schema"),
+            ui_intent: "generic".to_owned(),
+        }],
+        warnings: Vec::new(),
+        cleanup_warnings: Vec::new(),
+    };
+
+    let snapshot = plan.debug_agent_snapshot_with_mcp(Some(&diagnostics));
+
+    assert_eq!(snapshot["mcp"]["schemaExposure"]["mode"], "progressive");
+    assert_eq!(
+        snapshot["mcp"]["schemaExposure"]["discoveryTool"],
+        "tool_search"
+    );
+    assert_eq!(
+        snapshot["mcp"]["schemaExposure"]["deferredTools"],
+        serde_json::json!(["codegraph_query"])
+    );
+}
+
+#[test]
 fn debug_agent_marks_skill_prompt_metadata_disabled_without_hiding_tool_budgets() {
     let mut plan = plan("/tmp", SessionChoice::New);
     plan.config.skills = Some(zuno_config::schema::SkillsConfig {
@@ -6532,19 +6567,22 @@ mod production_registry {
         _directory: tempfile::TempDir,
         _goal_spill: tempfile::TempDir,
         ids: Vec<String>,
+        deferred_ids: Vec<String>,
         intents: std::collections::BTreeMap<String, zuno_tool::ToolUiIntent>,
+        suppressions: Vec<String>,
     }
 
     const DYNAMIC_TOOL_ID: &str = "codegraph_query";
 
     struct DynamicTool {
+        id: &'static str,
         description: &'static str,
     }
 
     #[async_trait::async_trait]
     impl zuno_tool::Tool for DynamicTool {
         fn id(&self) -> &str {
-            DYNAMIC_TOOL_ID
+            self.id
         }
 
         fn description(&self) -> &str {
@@ -6565,7 +6603,11 @@ mod production_registry {
     }
 
     fn dynamic_tool(description: &'static str) -> Arc<dyn zuno_tool::Tool> {
-        Arc::new(DynamicTool { description })
+        dynamic_tool_named(DYNAMIC_TOOL_ID, description)
+    }
+
+    fn dynamic_tool_named(id: &'static str, description: &'static str) -> Arc<dyn zuno_tool::Tool> {
+        Arc::new(DynamicTool { id, description })
     }
 
     #[derive(Clone)]
@@ -6574,6 +6616,19 @@ mod production_registry {
     impl zuno_tools::registry::McpToolLoader for FixedMcpLoader {
         fn tools(&self) -> Vec<zuno_tools::registry::CustomTool> {
             self.0.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct EagerMcpLoader(Vec<Arc<dyn zuno_tool::Tool>>);
+
+    impl zuno_tools::registry::McpToolLoader for EagerMcpLoader {
+        fn tools(&self) -> Vec<zuno_tools::registry::CustomTool> {
+            self.0.clone()
+        }
+
+        fn eager_tool_ids(&self) -> Vec<String> {
+            self.0.iter().map(|tool| tool.id().to_owned()).collect()
         }
     }
 
@@ -6665,7 +6720,9 @@ mod production_registry {
             _directory: directory,
             _goal_spill: goal_spill,
             ids,
+            deferred_ids: runtime.deferred_tool_ids,
             intents,
+            suppressions: runtime.suppressions,
         })
     }
 
@@ -6676,6 +6733,88 @@ mod production_registry {
 
     fn assemble() -> Fixture {
         assemble_with(zuno_catalog::skill::Skills::default())
+    }
+
+    #[test]
+    fn root_turns_defer_unpinned_mcp_schemas_behind_tool_search() {
+        let tool = dynamic_tool("query the indexed code graph");
+        let fixture = try_assemble_for_agent_runtime(
+            "orchestrator",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+            Some(Arc::new(FixedMcpLoader(vec![tool]))),
+            None,
+        )
+        .expect("root registry assembles");
+
+        assert!(fixture.ids.iter().any(|id| id == DYNAMIC_TOOL_ID));
+        assert_eq!(fixture.deferred_ids, [DYNAMIC_TOOL_ID]);
+    }
+
+    #[test]
+    fn explicit_session_mcp_schemas_are_visible_on_the_first_request() {
+        let tool = dynamic_tool("query an ACP session-local server");
+        let fixture = try_assemble_for_agent_runtime(
+            "orchestrator",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+            Some(Arc::new(EagerMcpLoader(vec![tool]))),
+            None,
+        )
+        .expect("session-bound registry assembles");
+
+        assert!(fixture.ids.iter().any(|id| id == DYNAMIC_TOOL_ID));
+        assert!(fixture.deferred_ids.is_empty());
+    }
+
+    #[test]
+    fn an_exact_agent_tool_allowlist_keeps_selected_mcp_schemas_eager() {
+        let config = zuno_config::schema::Config::from_json_str(
+            Path::new("zuno.json"),
+            r#"{
+                "agents": {
+                    "orchestrator": {
+                        "tools": ["codegraph_query"]
+                    }
+                }
+            }"#,
+        )
+        .expect("Agent tool allowlist parses");
+        let tool = dynamic_tool("query the indexed code graph");
+        let fixture = try_assemble_for_agent_runtime(
+            "orchestrator",
+            zuno_catalog::skill::Skills::default(),
+            config,
+            Some(Arc::new(FixedMcpLoader(vec![tool]))),
+            None,
+        )
+        .expect("root registry assembles");
+
+        assert_eq!(fixture.ids, [DYNAMIC_TOOL_ID]);
+        assert!(fixture.deferred_ids.is_empty());
+    }
+
+    #[test]
+    fn an_mcp_tool_named_tool_search_disables_deferred_schema_exposure() {
+        let tool = dynamic_tool_named("tool_search", "server-owned search");
+        let fixture = try_assemble_for_agent_runtime(
+            "orchestrator",
+            zuno_catalog::skill::Skills::default(),
+            zuno_config::schema::Config::default(),
+            Some(Arc::new(FixedMcpLoader(vec![tool]))),
+            None,
+        )
+        .expect("root registry assembles");
+
+        assert!(fixture.deferred_ids.is_empty());
+        assert!(
+            fixture
+                .suppressions
+                .iter()
+                .any(|message| message.contains("conflicts") && message.contains("tool_search")),
+            "{:?}",
+            fixture.suppressions
+        );
     }
 
     #[test]
@@ -6692,6 +6831,7 @@ mod production_registry {
             .unwrap_or_else(|error| panic!("{agent} registry assembles: {error}"));
 
             assert_eq!(fixture.ids, vec![DYNAMIC_TOOL_ID], "{agent}");
+            assert!(fixture.deferred_ids.is_empty(), "{agent}");
         }
     }
 
@@ -7161,8 +7301,8 @@ mod skill_prompt {
             "the catalog must expose trigger metadata"
         );
         assert!(
-            resolver.system_prompt.contains("/skills/deploy/SKILL.md"),
-            "the catalog must expose the exact source needed for loading"
+            !resolver.system_prompt.contains("/skills/deploy/SKILL.md"),
+            "a unique Skill name should not spend prompt budget on its absolute source"
         );
         let policy = resolver
             .system_prompt
@@ -7628,7 +7768,7 @@ mod skill_prompt {
 
     /// Large descriptions must not make any skill name undiscoverable.
     #[test]
-    fn a_large_corpus_keeps_every_source_identity_by_shortening_descriptions() {
+    fn a_large_corpus_keeps_every_unique_name_without_source_path_overhead() {
         let padding = "d".repeat(2_000);
         let skills = zuno_catalog::skill::Skills::from_loaded(
             (0..137).map(|at| skill(&format!("skill-{at:03}"), &padding)),
@@ -7647,11 +7787,7 @@ mod skill_prompt {
         );
         assert!(resolver.system_prompt.contains("name=\"skill-000\""));
         assert!(resolver.system_prompt.contains("name=\"skill-136\""));
-        assert!(
-            resolver
-                .system_prompt
-                .contains("/skills/skill-136/SKILL.md")
-        );
+        assert!(!resolver.system_prompt.contains("/skills/"));
         assert!(
             !resolver.system_prompt.contains(&padding),
             "large descriptions leaked back into the base prompt"

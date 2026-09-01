@@ -20,7 +20,7 @@ current process:
 
 Built-in Skills from `zuno-orchestration` are compiled into the executable and
 do not need a physical copy in the bundle. External shared Skill roots such as
-`~/.agents/skills` and `~/.claude/skills` are not Zuno-owned and are not
+`~/.agents/skills` and directories selected explicitly through `skills.paths` are not Zuno-owned and are not
 exported.
 
 The default bundle deliberately excludes:

@@ -317,6 +317,64 @@ struct FakeDispatcher {
     calls: Mutex<Vec<DispatchRequest>>,
 }
 
+#[derive(Debug, Default)]
+struct ProgressiveDispatcher {
+    exposed: AtomicBool,
+}
+
+impl ProgressiveDispatcher {
+    fn definition(id: &str, description: &str) -> ToolDefinition {
+        ToolDefinition {
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            description: description.to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            }),
+            ui_intent: ToolUiIntent::Generic,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolDispatcher for ProgressiveDispatcher {
+    fn available_tools(&self) -> AvailableTools {
+        let exposed = self.exposed.load(Ordering::Acquire);
+        let mut definitions = vec![Self::definition(
+            "tool_search",
+            "Search connected-tool metadata.",
+        )];
+        if exposed {
+            definitions.push(Self::definition(
+                "mcp_docs_search",
+                "Search connected documentation.",
+            ));
+        }
+        AvailableTools::new(definitions, McpToolStatus::Ready).with_revision(u64::from(exposed))
+    }
+
+    async fn prepare(&self, request: DispatchRequest) -> PreparedToolDispatch {
+        match request.call.name.as_str() {
+            "tool_search" => {
+                self.exposed.store(true, Ordering::Release);
+                PreparedToolDispatch::ready(ToolDispatchResult::success(ToolOutput::text(
+                    "Tool search",
+                    "mcp_docs_search is available on the next step",
+                )))
+            }
+            "mcp_docs_search" => PreparedToolDispatch::ready(ToolDispatchResult::success(
+                ToolOutput::text("Docs", "matched documentation"),
+            )),
+            other => PreparedToolDispatch::ready(ToolDispatchResult::error(ToolOutput::text(
+                "Unavailable tool",
+                format!("{other} is unavailable"),
+            ))),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SnapshotDispatcher {
     definitions: Vec<ToolDefinition>,
@@ -1391,6 +1449,106 @@ async fn one_durable_session_identity_spans_every_tool_continuation() {
         requests[0].request_context(),
         requests[1].request_context(),
         "tool continuation must keep the exact durable session affinity"
+    );
+}
+
+#[tokio::test]
+async fn a_new_tool_catalog_revision_expands_the_next_provider_request() {
+    let mut connection = seeded();
+    put_user(
+        &connection,
+        "msg_progressive_tools",
+        10,
+        "find the connected documentation tool and use it",
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        ScriptedResponse::complete(vec![
+            StreamEvent::ToolUseStart {
+                id: "call-search".to_owned(),
+                name: "tool_search".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call-search".to_owned(),
+                delta: r#"{"query":"documentation"}"#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call-search".to_owned(),
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+        ]),
+        ScriptedResponse::complete(vec![
+            StreamEvent::ToolUseStart {
+                id: "call-docs".to_owned(),
+                name: "mcp_docs_search".to_owned(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call-docs".to_owned(),
+                delta: r#"{"query":"cache"}"#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call-docs".to_owned(),
+            },
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::ToolCalls),
+            },
+        ]),
+        ScriptedResponse::complete(vec![
+            StreamEvent::TextDelta("documentation found".to_owned()),
+            StreamEvent::MessageEnd {
+                stop_reason: Some(FinishReason::Stop),
+            },
+        ]),
+    ]));
+    let providers = registry(&provider);
+    let resolver = FakeResolver;
+    let dispatcher = ProgressiveDispatcher::default();
+    let interrupt = InterruptSignal::new();
+    let (sender, receiver) = event_channel();
+
+    let turn = run_turn(
+        request("turn-progressive-tools"),
+        TurnContext::new(
+            &mut connection,
+            &providers,
+            &resolver,
+            &dispatcher,
+            &interrupt,
+        ),
+        sender,
+    );
+    let (outcome, _events) = tokio::join!(turn, collect_events(receiver));
+    assert!(matches!(
+        outcome.expect("progressive tool turn succeeds"),
+        TurnOutcome::Completed { steps: 3, .. }
+    ));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["tool_search"]
+    );
+    assert_eq!(
+        requests[1]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["tool_search", "mcp_docs_search"]
+    );
+    assert_eq!(
+        requests[2]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["tool_search", "mcp_docs_search"]
     );
 }
 

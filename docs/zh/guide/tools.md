@@ -24,6 +24,11 @@
 
 持久工作状态会额外加入 `plan_get`、`plan_update`、`todo_get`、`todo_update` 以及 `goal_get`/`goal_update`。启用记忆时会出现 `memory_propose`，当前 Agent 能够触达时会出现 `council_run`。
 
+当已连接的 MCP 工具通过能力与权限过滤后，Zuno 仍保留其可执行实现，但默认不把所有
+完整 JSON schema 注入模型请求。此时会条件性出现 `tool_search`：它搜索紧凑元数据，
+匹配项从下一次模型 step 开始进入可见工具集。这样无需在每次请求中支付所有外部服务的
+提示词成本。参见 [MCP server](/zh/guide/mcp)。
+
 可选的连续性工具只有在 `continuity` 开启，并且通过最终工具与权限过滤后才会出现：
 
 | 工具 | action | 作用域 |
@@ -68,7 +73,9 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 
 由于 `SideEffecting` 是默认值，一个未知的 harness 或 MCP 工具会失败即拒绝。混合型工具可以基于校验后的参数来分类：`bg list`、`bg output` 和 `bg wait` 是只读的，而 `bg cancel` 有副作用。
 
-原生读取、`glob`、`grep`、skill 与会话与 job 检查、只读 LSP、MCP 资源读取、`webfetch` 和 `web_search` 不会收到额外的 strict 询问。Shell、文件写入、持久状态变更、委派、产品 Agent、扩展生命周期变更以及未知的 MCP 工具会收到。
+原生读取、`glob`、`grep`、skill 与会话与 job 检查、`tool_search`、只读 LSP、MCP
+资源读取、`webfetch` 和 `web_search` 不会收到额外的 strict 询问。Shell、文件写入、
+持久状态变更、委派、产品 Agent、扩展生命周期变更以及未知的 MCP 工具会收到。
 
 混合型工具按通过校验后的 action 决定策略。所有 `history` action 和三个 Notes 读取
 action 都是 `ReadOnly`；Notes 追加与替换是 `SideEffecting`。缺少或未知的 Notes
@@ -78,8 +85,8 @@ action 会按 `SideEffecting` 失败即拒绝。
 
 工具执行默认是至多一次。除非某个实现显式声明 `Safe`，否则继承 `Never`，而当前的
 安全集合都是只读或幂等的检查类操作：文件读取、glob、grep、skill 查找、当前会话
-History、Notes 读取、job 状态、LSP 检查、goal 状态，以及网络搜索或获取。Notes
-写入保持 `Never`。
+History、Notes 读取、job 状态、LSP 检查、goal 状态、外部工具元数据搜索，以及网络
+搜索或获取。Notes 写入保持 `Never`。
 
 | 策略 | 失败后的行为 |
 | --- | --- |

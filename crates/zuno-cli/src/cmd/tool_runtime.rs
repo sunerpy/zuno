@@ -65,15 +65,18 @@ use zuno_tools::FileTools;
 use zuno_tools::exposure::ExposureFlags;
 use zuno_tools::question::{QuestionAsker, QuestionTool};
 use zuno_tools::registry::{
-    BuiltinSlot, CustomTool, McpToolLoader, RegistryFlags, ResolveInput, ToolRegistryBuilder,
+    BuiltinSlot, CustomTool, McpToolLoader, McpToolSnapshot, RegistryFlags, ResolveInput,
+    ToolRegistryBuilder,
 };
 use zuno_tools::search_common::{SearchScope, SearchTooling};
 use zuno_tools::websearch::gating::{SearchConfig, require_provider};
 
 /// The executable tools and the ruleset that governs them, for one turn.
 pub(crate) struct ToolRuntime {
-    /// The model-visible, permission-filtered tools in provider order.
+    /// Every executable, permission-filtered tool in provider order.
     pub(crate) tools: Vec<Arc<dyn Tool>>,
+    /// Connected tools whose schemas are revealed through `tool_search`.
+    pub(crate) deferred_tool_ids: Vec<String>,
     /// The merged ruleset the dispatcher re-evaluates before every call.
     pub(crate) rules: Vec<Rule>,
     /// Same-name replacements made while assembling, for the host to surface.
@@ -119,11 +122,23 @@ pub(crate) struct ToolSelection<'a> {
 #[derive(Clone)]
 struct FrozenMcpToolLoader {
     tools: Vec<CustomTool>,
+    eager_tool_ids: Vec<String>,
 }
 
 impl McpToolLoader for FrozenMcpToolLoader {
     fn tools(&self) -> Vec<CustomTool> {
         self.tools.clone()
+    }
+
+    fn eager_tool_ids(&self) -> Vec<String> {
+        self.eager_tool_ids.clone()
+    }
+
+    fn snapshot(&self) -> McpToolSnapshot {
+        McpToolSnapshot {
+            tools: self.tools.clone(),
+            eager_tool_ids: self.eager_tool_ids.clone(),
+        }
     }
 }
 
@@ -192,14 +207,26 @@ pub(crate) fn assemble(
         .iter()
         .map(|tool| tool.id().to_owned())
         .collect::<BTreeSet<_>>();
-    let frozen_mcp_tools = selection.mcp_loader.as_ref().map(|loader| loader.tools());
+    let frozen_mcp = selection
+        .mcp_loader
+        .as_ref()
+        .map(|loader| loader.snapshot());
+    let mcp_tool_identities = frozen_mcp
+        .iter()
+        .flat_map(|snapshot| snapshot.tools.iter())
+        .map(|tool| tool.definition().schema_identity())
+        .collect::<Vec<_>>();
+    let eager_mcp_tool_ids = frozen_mcp
+        .iter()
+        .flat_map(|snapshot| snapshot.eager_tool_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let dynamic_tool_names = harness_tool_names
         .iter()
         .cloned()
         .chain(
-            frozen_mcp_tools
+            frozen_mcp
                 .iter()
-                .flatten()
+                .flat_map(|snapshot| snapshot.tools.iter())
                 .map(|tool| tool.id().to_owned()),
         )
         .collect::<BTreeSet<_>>();
@@ -387,8 +414,11 @@ pub(crate) fn assemble(
             .register_builtin(BuiltinSlot::Shell, Arc::new(shell))
             .map_err(|error| error.to_string())?;
     }
-    if let Some(tools) = frozen_mcp_tools {
-        builder = builder.with_mcp_loader(Arc::new(FrozenMcpToolLoader { tools }));
+    if let Some(snapshot) = frozen_mcp {
+        builder = builder.with_mcp_loader(Arc::new(FrozenMcpToolLoader {
+            tools: snapshot.tools,
+            eager_tool_ids: snapshot.eager_tool_ids,
+        }));
     }
 
     if let Some(memory) = selection.memory {
@@ -437,21 +467,21 @@ pub(crate) fn assemble(
     }
 
     let registry = builder.build();
-    let suppressions = registry
+    let mut suppressions = registry
         .diagnostics()
         .iter()
         .map(ToString::to_string)
-        .collect();
+        .collect::<Vec<_>>();
     let mut tools = registry.resolve(ResolveInput::new(
         selection.model_id,
         selection.provider_id,
         &rules,
     ));
-    if let Some(allowlist) = &selected_agent.tools {
-        let allowlist = allowlist
-            .iter()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
+    let explicit_tool_allowlist = selected_agent
+        .tools
+        .as_ref()
+        .map(|tools| tools.iter().map(String::as_str).collect::<BTreeSet<_>>());
+    if let Some(allowlist) = &explicit_tool_allowlist {
         tools.retain(|tool| allowlist.contains(tool.id()));
     }
     if !selected_profile.capabilities().can_delegate() {
@@ -470,8 +500,39 @@ pub(crate) fn assemble(
             authority.iter().any(|expected| expected == &identity)
         });
     }
+    let mut deferred_tool_ids = if selection.tool_authority.is_some() {
+        Vec::new()
+    } else {
+        tools
+            .iter()
+            .filter(|tool| {
+                let identity = tool.definition().schema_identity();
+                mcp_tool_identities
+                    .iter()
+                    .any(|candidate| candidate == &identity)
+                    && explicit_tool_allowlist
+                        .as_ref()
+                        .is_none_or(|allowlist| !allowlist.contains(tool.id()))
+                    && !eager_mcp_tool_ids.contains(tool.id())
+            })
+            .map(|tool| tool.id().to_owned())
+            .collect::<Vec<_>>()
+    };
+    if !deferred_tool_ids.is_empty()
+        && tools
+            .iter()
+            .any(|tool| tool.id() == zuno_engine::dispatch::TOOL_SEARCH_ID)
+    {
+        deferred_tool_ids.clear();
+        suppressions.push(format!(
+            "registered tool `{}` conflicts with Zuno's progressive-discovery tool; \
+             connected tool schemas remain eagerly visible for this turn",
+            zuno_engine::dispatch::TOOL_SEARCH_ID
+        ));
+    }
     Ok(ToolRuntime {
         tools,
+        deferred_tool_ids,
         rules,
         suppressions,
         sandbox_notice,

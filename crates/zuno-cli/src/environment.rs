@@ -35,7 +35,7 @@ pub const ZUNO_SANDBOX_MODE: &str = "ZUNO_SANDBOX_MODE";
 pub const ZUNO_SANDBOX_ON_UNAVAILABLE: &str = "ZUNO_SANDBOX_ON_UNAVAILABLE";
 
 /// Environment values read by the CLI and its command implementations.
-pub const ZUNO_FLAG_NAMES: [&str; 38] = [
+pub const ZUNO_FLAG_NAMES: [&str; 37] = [
     "ZUNO_ALWAYS_NOTIFY_UPDATE",
     "ZUNO_AUTO_HEAP_SNAPSHOT",
     "ZUNO_CLIENT",
@@ -45,7 +45,6 @@ pub const ZUNO_FLAG_NAMES: [&str; 38] = [
     "ZUNO_DB",
     "ZUNO_DISABLE_AUTOCOMPACT",
     "ZUNO_DISABLE_AUTOUPDATE",
-    "ZUNO_DISABLE_CLAUDE_CODE",
     "ZUNO_DISABLE_FFF",
     "ZUNO_DISABLE_MODELS_FETCH",
     "ZUNO_DISABLE_MOUSE",

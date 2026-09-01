@@ -15,7 +15,7 @@
 - `$HOME/.zuno`，包括存放在其中的 Zuno 原生用户资产。
 
 来自 `zuno-orchestration` 的内置 Skill 已编译进可执行文件，不需要在 bundle 中保留物理副本。
-外部共享 Skill 根目录，例如 `~/.agents/skills` 和 `~/.claude/skills`，不属于 Zuno 所有，
+外部共享 Skill 根目录，例如 `~/.agents/skills` 和通过 `skills.paths` 显式选择的目录，不属于 Zuno 所有，
 因此不会被导出。
 
 默认 bundle 刻意排除：

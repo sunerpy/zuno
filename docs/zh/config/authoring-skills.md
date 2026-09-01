@@ -56,20 +56,24 @@ Zuno 按这个作用域顺序发现 Skill：
 | 序号 | 根目录 | 模式 |
 | --- | --- | --- |
 | 1 | 从当前目录向上直到 worktree 的每个项目 `.zuno` | `{skill,skills}/**/SKILL.md` |
-| 2 | 每个项目的 `.agents`，然后 `.claude` | `skills/**/SKILL.md` |
+| 2 | 每个项目的 `.agents` | `skills/**/SKILL.md` |
 | 3 | Zuno 的全局与已配置的 config 目录 | `{skill,skills}/**/SKILL.md` |
-| 4 | `$HOME/.agents`，然后 `$HOME/.claude` | `skills/**/SKILL.md` |
+| 4 | `$HOME/.agents` | `skills/**/SKILL.md` |
 | 5 | 每个 `skills.paths` 条目 | `**/SKILL.md` |
 | 6 | 每个由 `skills.urls` 索引产生的缓存目录 | `**/SKILL.md` |
 
-项目作用域会先于用户全局作用域被公布。Zuno 绝不扫描 `.opencode` 或 OpenCode 的配置目录。
+项目作用域会先于用户全局作用域被公布。Zuno 不会隐式扫描 `.claude`、
+`.opencode` 或其他产品的配置目录；只有确实需要共享时才通过 `skills.paths`
+显式加入。
 
-同一个规范化来源路径会被去重，包括符号链接别名。来自不同来源的同名 Skill 仍可各自独立寻址，不会选出隐藏的胜出者 —— 这就是目录会报告一个 `source` 定位符、以及名称有歧义时模型必须提供一个来源的原因。有歧义的名称还会禁用直接的 `/<skill-name>` 斜杠形式。
+同一个规范化来源路径会被去重，包括符号链接别名。来自不同来源的同名 Skill
+仍可各自独立寻址，不会选出隐藏的胜出者。紧凑提示词索引对唯一名称省略来源
+路径，只为同名歧义项报告 `source` 定位符；名称有歧义时模型必须提供来源，
+并且不能使用直接的 `/<skill-name>` 斜杠形式。
 
 | 变量 | 效果 |
 | --- | --- |
-| `ZUNO_DISABLE_EXTERNAL_SKILLS=1` | 禁用 `.agents` 与 `.claude` 根目录 |
-| `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` | 只禁用 Claude 的 skill 根目录 |
+| `ZUNO_DISABLE_EXTERNAL_SKILLS=1` | 禁用隐式 `.agents` 根目录 |
 
 在这个较宽的外部开关下，Zuno 原生的 `.zuno` 根目录仍然启用。
 

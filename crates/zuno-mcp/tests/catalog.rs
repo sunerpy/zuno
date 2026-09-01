@@ -292,6 +292,35 @@ fn catalog_two_servers_sharing_a_tool_name_do_not_collide() {
     );
 }
 
+#[test]
+fn catalog_loader_marks_only_explicit_session_servers_eager() {
+    let catalog = Catalog::new_with_eager_servers(["global", "session"], ["session"]);
+    connect(&catalog, FakeServer::new("global", &["search"]));
+    connect(
+        &catalog,
+        FakeServer::new("session", &["lookup"])
+            .with_resources(vec![resource("mcp://session", "session")]),
+    );
+
+    assert_eq!(
+        catalog.loader().eager_tool_ids(),
+        [
+            vec!["session_lookup".to_owned()],
+            RESOURCE_TOOLS.map(str::to_owned).to_vec(),
+        ]
+        .concat()
+    );
+    assert_eq!(
+        catalog.tool_ids(),
+        [
+            vec!["global_search".to_owned(), "session_lookup".to_owned()],
+            RESOURCE_TOOLS.map(str::to_owned).to_vec(),
+        ]
+        .concat(),
+        "the eager marker must not remove or reorder the merged catalog"
+    );
+}
+
 #[tokio::test]
 async fn catalog_namespaced_call_reaches_the_right_server_under_the_local_name() {
     let catalog = Catalog::new(["docs", "wiki"]);

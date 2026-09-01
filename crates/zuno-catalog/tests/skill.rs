@@ -102,7 +102,7 @@ fn expected_names(tail: &[&str]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn every_root_contributes_and_the_builtin_comes_first() {
+async fn every_supported_root_contributes_and_claude_roots_are_ignored() {
     let tree = Tree::new();
     tree.skill(
         "proj/sub/.zuno/skill/from-project-zuno",
@@ -145,11 +145,9 @@ async fn every_root_contributes_and_the_builtin_comes_first() {
         expected_names(&[
             "from-project-zuno",
             "from-project-agents",
-            "from-project-claude",
             "from-config",
             "from-config-plural",
             "from-agents",
-            "from-claude",
             "from-path",
         ])
     );
@@ -209,7 +207,7 @@ async fn a_duplicate_name_keeps_both_sources_and_requires_disambiguation() {
 }
 
 #[tokio::test]
-async fn a_config_directory_does_not_hide_same_named_external_skills() {
+async fn a_config_directory_does_not_hide_same_named_agent_skills() {
     let tree = Tree::new();
     tree.skill("home/.claude/skills/dupe", "dupe", Some("from claude"));
     tree.skill("home/.agents/skills/dupe", "dupe", Some("from agents"));
@@ -217,7 +215,7 @@ async fn a_config_directory_does_not_hide_same_named_external_skills() {
 
     let skills = load(&tree.options("proj")).await;
 
-    assert_eq!(skills.named("dupe").len(), 3);
+    assert_eq!(skills.named("dupe").len(), 2);
     assert!(skills.get("dupe").is_none());
     assert!(skills.warnings().is_empty());
 }
@@ -263,14 +261,18 @@ async fn path_dedup_and_name_dedup_are_different_mechanisms() {
 async fn a_symlink_alias_is_one_canonical_source() {
     let tree = Tree::new();
     tree.skill("home/.agents/skills/canonical", "canonical", Some("real"));
-    fs::create_dir_all(tree.home().join(".claude/skills")).expect("mkdir");
+    fs::create_dir_all(tree.at("aliases")).expect("mkdir");
     std::os::unix::fs::symlink(
         tree.home().join(".agents/skills/canonical"),
-        tree.home().join(".claude/skills/canonical"),
+        tree.at("aliases/canonical"),
     )
     .expect("symlink");
 
-    let skills = load(&tree.options("proj")).await;
+    let skills = load(&tree.options_with_paths(
+        "proj",
+        vec![tree.at("aliases").to_string_lossy().into_owned()],
+    ))
+    .await;
 
     assert_eq!(
         skills.named("canonical").len(),

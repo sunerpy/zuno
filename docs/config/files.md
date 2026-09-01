@@ -142,7 +142,7 @@ still narrow either override or force the unavailable action back to `deny`. See
 | --- | --- |
 | Agents | `agent/*.md` and `agents/*.md` under the global config root and each project `.zuno` |
 | Commands | `command/**/*.md` and `commands/**/*.md`, recursively, at the same roots |
-| Skills | Project `.zuno/skill(s)`, project `.agents/skills` then `.claude/skills`, global config roots, `~/.agents/skills` then `~/.claude/skills`, `skills.paths`, remote indexes |
+| Skills | Project `.zuno/skill(s)`, project `.agents/skills`, global config roots, `~/.agents/skills`, `skills.paths`, remote indexes |
 | Extensions | `.zuno/extensions` for a project; `extensions` under the global config root |
 
 Zuno never scans `.opencode` or an OpenCode configuration directory for any of these.

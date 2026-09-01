@@ -2,39 +2,14 @@
 //!
 //! Zuno keeps the imported list and verbose forms for client surfaces, but the
 //! runtime prompt uses [`Form::Index`]: a bounded metadata catalog carrying each
-//! skill's name, source locator, and as much description detail as fits. The
-//! selected instructions are then read through the `skill` tool.
+//! skill's name and as much description detail as fits. Exact source locators are
+//! carried only for ambiguous names. The selected instructions are then read
+//! through the `skill` tool.
 //!
-//! The oracle:
-//!
-//! ```text
-//! export function fmt(list: Info[], opts: { verbose: boolean }) {
-//!   const described = list.filter((skill) => skill.description !== undefined)
-//!   if (described.length === 0) return "No skills are currently available."
-//!   if (opts.verbose) {
-//!     return [
-//!       "<available_skills>",
-//!       ...described.toSorted((a, b) => a.name.localeCompare(b.name)).flatMap((skill) => [
-//!         "  <skill>",
-//!         `    <name>${skill.name}</name>`,
-//!         `    <description>${skill.description}</description>`,
-//!         `    <location>${escapeHtml(skill.location)}</location>`,
-//!         "  </skill>",
-//!       ]),
-//!       "</available_skills>",
-//!     ].join("\n")
-//!   }
-//!   return [
-//!     "## Available Skills",
-//!     ...described.toSorted((a, b) => a.name.localeCompare(b.name))
-//!       .map((skill) => `- **${skill.name}**: ${skill.description}`),
-//!   ].join("\n")
-//! }
-//! ```
-//!
-//! Zuno adds [`Form::Index`], a bounded progressive-discovery catalog. Every
-//! admitted entry carries the source identity needed to disambiguate same-named
-//! skills. Description detail is shortened before an identity is omitted.
+//! [`Form::Index`] is Zuno's bounded progressive-discovery catalog. Unique names
+//! do not repeat long absolute paths; same-named entries carry the exact source
+//! identity needed to disambiguate them. Description detail is shortened before
+//! an identity is omitted.
 //!
 //! Three details are easy to lose and all three are load-bearing:
 //!
@@ -45,6 +20,8 @@
 //! 3. The compact index escapes name, source, and description because all three
 //!    are user-controlled XML attribute values.
 
+use std::collections::BTreeSet;
+
 use crate::skill::Skill;
 
 /// Which form to render.
@@ -54,12 +31,12 @@ pub enum Form {
     List,
     /// The `<available_skills>` XML block used in the system prompt.
     Verbose,
-    /// A compact `<skill_index>` containing bounded name, source, and description
-    /// metadata.
+    /// A compact `<skill_index>` containing bounded name and description metadata,
+    /// plus source locators for ambiguous names.
     Index,
 }
 
-/// What the oracle returns when nothing describable is left.
+/// Stable model-visible result when nothing describable is left.
 pub const NO_SKILLS: &str = "No skills are currently available.";
 
 /// Render a skill list into one of the model-facing forms.
@@ -163,6 +140,10 @@ fn described_sorted(list: &[Skill]) -> Vec<&Skill> {
 }
 
 fn assemble(described: &[&Skill], form: Form) -> String {
+    if form == Form::Index {
+        let duplicate_names = duplicate_names(described);
+        return assemble_index(described, INDEX_DESCRIPTION_MAX_BYTES, &duplicate_names);
+    }
     let mut lines: Vec<String> = vec![open_line(form).to_string()];
     for skill in described {
         lines.extend(entry_lines(skill, form));
@@ -200,7 +181,7 @@ fn entry_lines(skill: &Skill, form: Form) -> Vec<String> {
             "  </skill>".to_string(),
         ],
         Form::List => vec![format!("- **{}**: {description}", skill.name)],
-        Form::Index => vec![index_line(skill, INDEX_DESCRIPTION_MAX_BYTES)],
+        Form::Index => vec![index_line(skill, INDEX_DESCRIPTION_MAX_BYTES, true)],
     }
 }
 
@@ -209,9 +190,10 @@ fn entry_lines(skill: &Skill, form: Form) -> Vec<String> {
 const INDEX_DESCRIPTION_MAX_BYTES: usize = 1_024;
 
 fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
-    let minimum = assemble_index(described, 0);
+    let duplicate_names = duplicate_names(described);
+    let minimum = assemble_index(described, 0, &duplicate_names);
     if minimum.len() <= budget {
-        let full = assemble_index(described, INDEX_DESCRIPTION_MAX_BYTES);
+        let full = assemble_index(described, INDEX_DESCRIPTION_MAX_BYTES, &duplicate_names);
         if full.len() <= budget {
             return Budgeted {
                 text: full,
@@ -225,13 +207,13 @@ fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
         let mut high = INDEX_DESCRIPTION_MAX_BYTES;
         while low < high {
             let middle = low + (high - low).div_ceil(2);
-            if assemble_index(described, middle).len() <= budget {
+            if assemble_index(described, middle, &duplicate_names).len() <= budget {
                 low = middle;
             } else {
                 high = middle - 1;
             }
         }
-        let text = assemble_index(described, low);
+        let text = assemble_index(described, low, &duplicate_names);
         let truncated = described
             .iter()
             .filter(|skill| normalized_description(skill).len() > low)
@@ -246,7 +228,12 @@ fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
 
     let mut by_cost = described
         .iter()
-        .map(|skill| (index_line(skill, 0).len() + 1, *skill))
+        .map(|skill| {
+            (
+                index_line(skill, 0, duplicate_names.contains(skill.name.as_str())).len() + 1,
+                *skill,
+            )
+        })
         .collect::<Vec<_>>();
     by_cost.sort_by(|left, right| {
         left.0
@@ -276,37 +263,58 @@ fn index_within(described: &[&Skill], budget: usize) -> Budgeted {
         locale_compare(&left.name, &right.name).then_with(|| left.location.cmp(&right.location))
     });
     Budgeted {
-        text: assemble_index(&kept, 0),
+        text: assemble_index(&kept, 0, &duplicate_names),
         rendered: kept.len(),
         omitted: described.len() - kept.len(),
         truncated: kept.len(),
     }
 }
 
-fn assemble_index(described: &[&Skill], description_bytes: usize) -> String {
+fn assemble_index(
+    described: &[&Skill],
+    description_bytes: usize,
+    duplicate_names: &BTreeSet<&str>,
+) -> String {
     let mut lines = Vec::with_capacity(described.len() + 2);
     lines.push(open_line(Form::Index).to_owned());
-    lines.extend(
-        described
-            .iter()
-            .map(|skill| index_line(skill, description_bytes)),
-    );
+    lines.extend(described.iter().map(|skill| {
+        index_line(
+            skill,
+            description_bytes,
+            duplicate_names.contains(skill.name.as_str()),
+        )
+    }));
     lines.push(close_line(Form::Index).unwrap_or_default().to_owned());
     lines.join("\n")
 }
 
-fn index_line(skill: &Skill, description_bytes: usize) -> String {
+fn index_line(skill: &Skill, description_bytes: usize, include_source: bool) -> String {
     let name = escape_html(&skill.name);
-    let source = escape_html(&skill.location);
     let description = truncate_utf8(&normalized_description(skill), description_bytes);
+    let source = if include_source {
+        format!(" source=\"{}\"", escape_html(&skill.location))
+    } else {
+        String::new()
+    };
     if description.is_empty() {
-        format!("  <skill name=\"{name}\" source=\"{source}\" />")
+        format!("  <skill name=\"{name}\"{source} />")
     } else {
         format!(
-            "  <skill name=\"{name}\" source=\"{source}\">{}</skill>",
+            "  <skill name=\"{name}\"{source}>{}</skill>",
             escape_html(&description)
         )
     }
+}
+
+fn duplicate_names<'a>(described: &[&'a Skill]) -> BTreeSet<&'a str> {
+    let mut seen = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for skill in described {
+        if !seen.insert(skill.name.as_str()) {
+            duplicates.insert(skill.name.as_str());
+        }
+    }
+    duplicates
 }
 
 fn normalized_description(skill: &Skill) -> String {
