@@ -97,7 +97,7 @@ async fn same_named_skills_require_the_source_returned_by_discovery() {
 }
 
 #[tokio::test]
-async fn list_and_search_return_the_source_needed_for_an_exact_load() {
+async fn list_and_search_omit_the_source_for_a_unique_name() {
     let subject = tool(vec![skill(
         "release-rust",
         Some("Release and publish a Rust CLI."),
@@ -114,11 +114,73 @@ async fn list_and_search_return_the_source_needed_for_an_exact_load() {
             .await
             .expect("metadata discovery succeeds");
         assert!(
-            output.output.contains("/skills/release-rust/SKILL.md"),
+            !output.output.contains("/skills/release-rust/SKILL.md"),
             "{}",
             output.output
         );
     }
+}
+
+#[tokio::test]
+async fn list_and_search_include_sources_when_a_name_is_ambiguous() {
+    let erased = zuno_tool::erase(tool(vec![
+        Skill::embedded_at_path(
+            "release",
+            Some("Release the first product.".to_owned()),
+            PathBuf::from("/skills/first/SKILL.md"),
+            "first",
+        ),
+        Skill::embedded_at_path(
+            "release",
+            Some("Release the second product.".to_owned()),
+            PathBuf::from("/skills/second/SKILL.md"),
+            "second",
+        ),
+    ]));
+
+    for arguments in [
+        serde_json::json!({"action": "list"}),
+        serde_json::json!({"action": "search", "query": "release"}),
+    ] {
+        let output = erased
+            .invoke(arguments, ctx())
+            .await
+            .expect("metadata discovery succeeds");
+        assert!(output.output.contains("/skills/first/SKILL.md"));
+        assert!(output.output.contains("/skills/second/SKILL.md"));
+    }
+}
+
+#[tokio::test]
+async fn search_uses_sidecar_metadata_and_hides_explicit_only_skills() {
+    let mut searchable = skill(
+        "powerapps",
+        Some("Long generic description."),
+        "searchable body",
+    );
+    searchable.display_name = Some("Power Apps Engineering".to_owned());
+    searchable.short_description = Some("Canvas application governance".to_owned());
+    searchable.exposure = zuno_catalog::skill::SkillExposure::Search;
+    let mut explicit = skill(
+        "private-release",
+        Some("Secret release workflow."),
+        "explicit body",
+    );
+    explicit.exposure = zuno_catalog::skill::SkillExposure::Explicit;
+    let subject = tool(vec![searchable, explicit]);
+
+    let output = subject
+        .run(SkillParams::search("canvas engineering", Some(10)), ctx())
+        .await
+        .expect("sidecar terms are searchable");
+    assert!(output.output.contains("powerapps (Power Apps Engineering)"));
+    assert!(!output.output.contains("private-release"));
+
+    let loaded = subject
+        .run(SkillParams::load("private-release"), ctx())
+        .await
+        .expect("explicit-only Skill remains directly loadable");
+    assert!(loaded.output.contains("explicit body"));
 }
 
 #[tokio::test]

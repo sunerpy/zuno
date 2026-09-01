@@ -39,6 +39,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use zuno_config::Config;
+use zuno_config::schema::{SkillCatalogExposure, SkillPathConfig};
 use zuno_paths::{Env, Layout, PROJECT_CONFIG_DIRECTORY, node_path, walk};
 
 use crate::skill::scan::{self, EXTERNAL_PREFIXES, ROOT_PREFIXES, ZUNO_PREFIXES};
@@ -63,6 +64,8 @@ pub struct SkillOptions {
     layout: Layout,
     paths: Vec<String>,
     urls: Vec<String>,
+    raw_path_config: Vec<SkillPathConfig>,
+    path_config: Vec<ResolvedSkillPathConfig>,
     external_disabled: bool,
 }
 
@@ -83,6 +86,8 @@ impl SkillOptions {
             layout: Layout::resolve(env),
             paths,
             urls,
+            raw_path_config: Vec::new(),
+            path_config: Vec::new(),
             external_disabled: env.flag(ZUNO_DISABLE_EXTERNAL_SKILLS),
         }
     }
@@ -95,16 +100,17 @@ impl SkillOptions {
         env: &Env,
         config: &Config,
     ) -> Self {
-        let (paths, urls) = config.skills.as_ref().map_or_else(
-            || (Vec::new(), Vec::new()),
+        let (paths, urls, path_config) = config.skills.as_ref().map_or_else(
+            || (Vec::new(), Vec::new(), Vec::new()),
             |skills| {
                 (
                     skills.paths.clone().unwrap_or_default(),
                     skills.urls.clone().unwrap_or_default(),
+                    skills.config.clone().unwrap_or_default(),
                 )
             },
         );
-        Self::new(directory, worktree, env, paths, urls)
+        Self::new(directory, worktree, env, paths, urls).with_path_config(path_config)
     }
 
     /// Build from the process environment and a merged [`Config`].
@@ -122,6 +128,28 @@ impl SkillOptions {
     #[must_use]
     pub fn with_layout(mut self, layout: Layout) -> Self {
         self.layout = layout;
+        self.path_config = self
+            .raw_path_config
+            .iter()
+            .cloned()
+            .map(|entry| ResolvedSkillPathConfig::new(entry, &self))
+            .collect();
+        self
+    }
+
+    /// Add ordered per-path enablement and catalog-exposure rules.
+    ///
+    /// Paths are expanded after the layout is known. Matching is canonical when
+    /// the target exists and lexical otherwise, so a configured path may safely
+    /// refer to a Skill that will be installed later.
+    #[must_use]
+    pub fn with_path_config(mut self, entries: Vec<SkillPathConfig>) -> Self {
+        self.path_config = entries
+            .iter()
+            .cloned()
+            .map(|entry| ResolvedSkillPathConfig::new(entry, &self))
+            .collect();
+        self.raw_path_config = entries;
         self
     }
 
@@ -171,6 +199,53 @@ impl SkillOptions {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedSkillPathConfig {
+    target_key: String,
+    target_is_skill_file: bool,
+    enabled: bool,
+    exposure: Option<SkillCatalogExposure>,
+    recursive: bool,
+}
+
+impl ResolvedSkillPathConfig {
+    fn new(entry: SkillPathConfig, options: &SkillOptions) -> Self {
+        let expanded = expand_path(&entry.path, options);
+        let target_is_skill_file = expanded.is_file()
+            || expanded
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"));
+        let target = canonical_or_normalized(&expanded);
+        Self {
+            target_key: path_key(&target),
+            target_is_skill_file,
+            enabled: entry.enabled.unwrap_or(true),
+            exposure: entry.exposure,
+            recursive: entry.recursive.unwrap_or(false),
+        }
+    }
+
+    fn matches(&self, skill_path: &Path) -> bool {
+        let skill = canonical_or_normalized(skill_path);
+        let skill_key = path_key(&skill);
+        if self.target_is_skill_file {
+            return skill_key == self.target_key;
+        }
+        if self.recursive {
+            return key_is_within(&skill_key, &self.target_key);
+        }
+        skill
+            .parent()
+            .is_some_and(|parent| path_key(parent) == self.target_key)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EffectivePathConfig {
+    enabled: bool,
+    exposure: Option<SkillCatalogExposure>,
+}
+
 /// Which root produced a match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Root {
@@ -193,6 +268,7 @@ pub enum Root {
 pub struct SkillPath {
     path: PathBuf,
     root: Root,
+    exposure: Option<SkillCatalogExposure>,
 }
 
 impl SkillPath {
@@ -207,6 +283,12 @@ impl SkillPath {
     pub fn root(&self) -> Root {
         self.root
     }
+
+    /// Final configured catalog exposure for this path, when overridden.
+    #[must_use]
+    pub fn exposure(&self) -> Option<SkillCatalogExposure> {
+        self.exposure
+    }
 }
 
 /// The local half of discovery: matches in Zuno precedence order, the directories
@@ -216,6 +298,8 @@ pub struct SkillSources {
     matches: Vec<SkillPath>,
     seen: HashSet<String>,
     urls: Vec<String>,
+    path_config: Vec<ResolvedSkillPathConfig>,
+    disabled_sources: Vec<String>,
     warnings: Vec<SkillWarning>,
 }
 
@@ -227,6 +311,7 @@ impl SkillSources {
     pub fn discover(options: &SkillOptions) -> Self {
         let mut sources = Self {
             urls: options.urls.clone(),
+            path_config: options.path_config.clone(),
             ..Self::default()
         };
         let external = options.external_dirs();
@@ -313,11 +398,29 @@ impl SkillSources {
             if !self.seen.insert(key) {
                 continue;
             }
+            let policy = self.path_policy(&path);
+            if policy.is_some_and(|policy| !policy.enabled) {
+                self.disabled_sources
+                    .push(path.to_string_lossy().into_owned());
+                continue;
+            }
             self.matches.push(SkillPath {
                 path,
                 root: provenance,
+                exposure: policy.and_then(|policy| policy.exposure),
             });
         }
+    }
+
+    fn path_policy(&self, path: &Path) -> Option<EffectivePathConfig> {
+        self.path_config
+            .iter()
+            .filter(|entry| entry.matches(path))
+            .map(|entry| EffectivePathConfig {
+                enabled: entry.enabled,
+                exposure: entry.exposure,
+            })
+            .next_back()
     }
 
     /// Every match, in discovery order, de-duplicated by path.
@@ -354,6 +457,10 @@ impl SkillSources {
         &self.warnings
     }
 
+    pub(crate) fn take_disabled_sources(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.disabled_sources)
+    }
+
     pub(crate) fn take_warnings(&mut self) -> Vec<SkillWarning> {
         std::mem::take(&mut self.warnings)
     }
@@ -382,6 +489,32 @@ fn expand_path(entry: &str, options: &SkillOptions) -> PathBuf {
 fn identity(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     node_path::normalize(&resolved.to_string_lossy())
+}
+
+fn canonical_or_normalized(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| PathBuf::from(node_path::normalize(&path.to_string_lossy())))
+}
+
+fn path_key(path: &Path) -> String {
+    let normalized = node_path::normalize(&path.to_string_lossy());
+    #[cfg(windows)]
+    {
+        normalized.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
+}
+
+fn key_is_within(candidate: &str, root: &str) -> bool {
+    candidate == root
+        || candidate.strip_prefix(root).is_some_and(|suffix| {
+            suffix.starts_with(std::path::MAIN_SEPARATOR)
+                || suffix.starts_with('/')
+                || suffix.starts_with('\\')
+        })
 }
 
 #[cfg(test)]

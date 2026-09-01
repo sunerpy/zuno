@@ -515,11 +515,15 @@ digest. Present sections are sorted into stable semantic lanes:
 10. the bounded Skill metadata index;
 11. memory.
 
-The trigger policy makes a named or clearly matching skill a pre-action
+The trigger policy makes a named or clearly matching indexed Skill a pre-action
 requirement. The base prompt carries bounded name, description, and source
-metadata; descriptions are shortened before a source identity is omitted.
-`skills.maxContextTokens` overrides the default two-percent catalog budget,
-while `skills.includeInstructions: false` disables catalog injection.
+metadata only for `index` exposure; `search` exposure remains available through
+the `skill` tool, and `explicit` exposure requires `$name`, `/<name>`,
+`requiredSkills`, or an exact load. Descriptions are shortened before a source
+identity is omitted. `skills.maxContextTokens` overrides the default character
+budget equal to two percent of a known context; an unknown context falls back
+to approximately 8,000 characters, while `skills.includeInstructions: false`
+disables prompt catalog injection.
 
 Fully selected Skill bodies have a separate aggregate budget. By default it is
 ten percent of a known model context, with a 2,000-token floor and a
@@ -529,12 +533,12 @@ the ceiling. Loading or restoring a body that would exceed the aggregate budget
 fails before the provider request; Zuno does not silently omit part of a
 selected Skill or reuse the metadata budget for full instructions.
 
-The `skill` tool pages the complete catalog with `list`, searches it with
-`search`, reads a selected body with `load`, and resolves relative text with
-`read_resource`. Same-named sources remain distinct and require the advertised
-source locator. Reads use content-bound cursors and must continue to completion;
-disk bodies are read after selection rather than retained for the process
-lifetime.
+The `skill` tool pages the `index` and `search` catalog with `list`, searches it
+with `search`, reads a selected body with `load`, and resolves relative text
+with `read_resource`. Unique names omit source locators; same-named enabled
+sources remain distinct and require an advertised source locator. Reads use
+content-bound cursors and must continue to completion; disk bodies are read
+after selection rather than retained for the process lifetime.
 
 Skill discovery is Zuno-owned. It advertises project `.zuno` and `.agents`
 roots before Zuno's user-global config and user-global Agent Skills, then
@@ -546,6 +550,15 @@ separate identities that require source-qualified selection. Unique names omit
 their source path from the compact prompt index; ambiguous names retain it.
 Discovery order controls presentation and provenance; it does not silently
 choose a same-name winner.
+
+Filesystem Skills may carry `agents/openai.yaml` shared metadata and a
+field-wise `agents/zuno.yaml` override. Zuno consumes display name, short
+description, and implicit-invocation policy; the native file may additionally
+select `index`, `search`, or `explicit` exposure. Ordered `skills.config` path
+rules have final precedence and can disable, re-enable, or reclassify an exact
+Skill or recursive subtree. Existing path and symlink aliases resolve to one
+canonical policy identity. Disabled sources never enter the runtime catalog;
+client surfaces consume the same effective catalog and diagnostics.
 
 A visible Skill whose name is unique across sources and does not collide with a
 real command is also advertised as `/<skill-name>`. A bare invocation loads the

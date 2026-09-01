@@ -8,7 +8,7 @@ Skill 不授予任何东西。它不会增加工具、权限、文件系统访�
 
 两个原因。
 
-全量加载代价高：只适用于某一类工作的指令会在每个回合都消耗上下文。渐进式披露解决了这一点。提示词收到的是一份有界的元数据目录，只有当某个 Skill 的名字被显式指出、或它的描述与请求明确匹配时，才会加载正文。
+全量加载代价高：只适用于某一类工作的指令会在每个回合都消耗上下文。渐进式披露解决了这一点。提示词只收到一份有界的初始索引，较大的可发现目录通过搜索按需提供，正文只会在选中之后加载。
 
 第二个原因是身份。Skill 有来源，因此来自两个根目录的同名 Skill 仍可各自独立寻址，不会有一个隐藏的优先级胜出者被选中。这正是为什么一个项目 Skill 与一个同名的全局 Skill 会成为可见的歧义，而不是一个无声的意外。
 
@@ -43,22 +43,47 @@ ZUNO_DISABLE_EXTERNAL_SKILLS=1 zuno
   "skills": {
     "includeInstructions": true,
     "maxContextTokens": 8000,
-    "maxSelectedContextTokens": 16000
+    "maxSelectedContextTokens": 16000,
+    "config": [
+      {
+        "path": "~/.config/zuno/skill/powerapps",
+        "recursive": true,
+        "exposure": "search"
+      }
+    ]
   }
 }
 ```
 
-`maxContextTokens` 限定紧凑目录的规模。它的默认值大约是模型上下文的百分之二，上下文未知时为约 8,000 个 Token，上限为 10,000。
+`maxContextTokens` 以近似 Token 显式限定紧凑目录的规模。未配置时，Zuno
+使用等于已知模型窗口数值约 2% 的字符预算；上下文未知时回退为约 8,000 个
+字符，而不是固定限制为 2,000 个字符。显式覆盖项会换算为字符，并最多按
+10,000 个 Token 计算。
 唯一名称不会在提示词索引中重复注入绝对来源路径；只有同名歧义项才携带
 `source` 定位符。
 
+每个已启用 Skill 都有一种目录暴露方式：
+
+| 暴露方式 | 初始索引 | `skill search` / `list` | 精确加载、`$name`、`/<name>`、`requiredSkills` |
+| --- | --- | --- | --- |
+| `index` | 是 | 是 | 是 |
+| `search` | 否 | 是 | 是 |
+| `explicit` | 否 | 否 | 是 |
+
+默认值是 `index`。大型供应商或领域包适合设为 `search`：仍然可以搜索，但不占用每次初始提示词。必须避免能力匹配自动选中的指导应设为 `explicit`。模型会知道存在多少个仅搜索来源，但显式来源的名称会刻意完全隐藏。
+
 被完整选中的正文共用另一份聚合预算。它的默认值是已知上下文的百分之十，下限 2,000 个 Token，上限 32,000 个。`maxSelectedContextTokens` 可以覆盖它，但仍受 32,000 的上限约束。如果被选中的正文装不下，加载或恢复会话会在 provider 请求之前失败，而不是静默丢弃指令。
 
-`includeInstructions: false` 会同时把触发策略和目录从提示词中移除。`skill` 工具仍然支持分页的 `list` 与 `search`。
+`includeInstructions: false` 会同时把触发策略和初始索引从提示词中移除。`skill` 工具仍然支持对 `index` 与 `search` 条目的分页 `list` 与 `search`。
 
 因此即使个人 Skill 库很大，也不会把每个 `SKILL.md` 正文注入每次请求。若某个
-供应商或领域包很少使用，建议把它放在隐式根目录之外，并只在需要的项目中通过
-`skills.paths` 引入；不要仅为了减少数量而删除或合并语义不同的 Skill。
+供应商或领域包很少使用，可以让它继续留在普通发现根目录，只用一条递归
+`skills.config` 规则把它设为仅搜索；不要仅为了减少数量而删除或合并语义不同的 Skill。
+
+精确的 `skills.config` 条目还可以设置 `"enabled": false`。路径可以指向 Skill
+目录或它的 `SKILL.md`；`"recursive": true` 会作用于所有后代。条目按顺序求值，
+最后一个匹配项获胜，因此较后的精确条目可以重新启用或重新分类一个被更宽子树
+规则覆盖的 Skill。已存在路径会规范化，包括符号链接别名。
 
 ## 加载是分页的，且必须读完
 
@@ -74,7 +99,7 @@ ZUNO_DISABLE_EXTERNAL_SKILLS=1 zuno
 
 ## 内置 Skill
 
-Zuno 把九个第一方 Skill 编译进 `zuno-orchestration` 包：`customize-zuno`、`develop-zuno`、`deepwork`、`codemap`、`verification-planning`、`reflect`、`worktree`、`git-workflow` 和 `ui-design`。
+Zuno 把十个第一方 Skill 编译进 `zuno-orchestration` 包：`customize-zuno`、`develop-zuno`、`deepwork`、`codemap`、`verification-planning`、`reflect`、`worktree`、`git-workflow`、`github-delivery` 和 `ui-design`。
 
 每一个都有稳定的 `builtin://zuno-orchestration/...` 来源、内容哈希、来源溯源、允许的 Agent profile，以及所需工具声明。它们被编译进可执行文件，不会复制到你的配置目录，因此随二进制一起更新。把其中一个复制到用户 Skill 目录来「覆盖」它，只会造成同名来源歧义。
 
@@ -107,7 +132,7 @@ zuno debug skill
 zuno debug agent explorer
 ```
 
-`debug skill` 报告原始发现结果：来自不同来源的同名条目会被保留，摘要会报告来源数、有描述数、唯一数，以及存在歧义的名字。`debug agent` 报告经 Agent 过滤的视图，含预算与覆盖情况。
+`debug skill` 报告原始发现结果：来自不同来源的同名条目会被保留，摘要会报告来源数、初始索引数、可搜索数、仅显式数、已禁用数与唯一数，以及存在歧义的名字。`debug agent` 报告经 Agent 过滤的视图，含预算与覆盖情况。
 
 ## 参见
 

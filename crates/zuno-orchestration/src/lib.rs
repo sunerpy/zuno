@@ -205,7 +205,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 10] = [
         location: pack_location!("customize-zuno"),
         allowed_profiles: USER_FACING_PROFILES,
         required_tools: &["read", "glob", "grep"],
-        content_sha256: "f243f24bc396f7ef3cbe0cf51d753ad6c84de3f2a86d604afa2a8733b8167a9c",
+        content_sha256: "2d95bcf802d8d49e9c5a0c46a6105d234977a45a1fa6ef4eb025f33b83d46360",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {
@@ -216,7 +216,7 @@ pub const SKILLS: [BuiltinSkillDescriptor; 10] = [
         location: pack_location!("develop-zuno"),
         allowed_profiles: USER_FACING_PROFILES,
         required_tools: &["read", "glob", "grep"],
-        content_sha256: "e0ea2035be9220076bd020cf9d5eed2ec9159b54cfe370daa28ee3298a79a696",
+        content_sha256: "bd92eb5b2988d57385d666e7e0ae1a26aad7349f1bfee23294e481998b83a13b",
         provenance: NATIVE_PROVENANCE,
     },
     BuiltinSkillDescriptor {

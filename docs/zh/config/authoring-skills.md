@@ -11,6 +11,9 @@ Skill 是带自身身份的可复用指导，在匹配时加载，而不是每�
 ```text
 my-skill/
   SKILL.md
+  agents/
+    openai.yaml
+    zuno.yaml
   references/
     ci.md
     architecture.md
@@ -45,9 +48,40 @@ Steps and criteria go here.
 - `name` 是数字、布尔值或 null 会导致该 Skill 被整体丢弃；
 - `description` 存在但不是字符串同样会导致它被丢弃 —— 包括一个不带取值的裸 `description:`，YAML 会把它解析为 null。
 
-一个完全没有 `description` 的 Skill 会被加载，但会从面向模型的目录中隐藏。对于只会按名称显式调用的 Skill，这偶尔正是你想要的；其他情况下绝不是。
+一个完全没有 `description` 的 Skill 会被加载，但会从模型驱动的发现中隐藏，除非受支持的侧车文件提供 `interface.short_description`。对于只会按名称显式调用的 Skill，这偶尔正是你想要的；其他情况下绝不是。
 
-`description` 是触发面。它应当同时说明这个 Skill 做什么、以及何时使用它，因为模型是拿请求与这段文本做匹配，别无其他依据。写成「dependency helper」的描述不会触发；写成「Use when adding, upgrading, or reviewing a third-party package」的会。
+没有侧车文件时，`description` 是主要触发面。它应当同时说明这个 Skill 做什么、
+以及何时使用它。搜索还会考虑调用名称与可选侧车显示元数据；初始索引优先使用
+`interface.short_description`，未提供时才回退到 frontmatter 描述。写成
+「dependency helper」的描述太弱；写成「Use when adding, upgrading, or reviewing
+a third-party package」才足够可执行。
+
+## 可选侧车元数据
+
+`agents/openai.yaml` 是共享的 Agent Skills 元数据表面。Zuno 只消费已经有运行时语义的字段，并忽略未知字段：
+
+```yaml
+interface:
+  display_name: Dependency Audit
+  short_description: Audit third-party packages before adding or upgrading them
+policy:
+  allow_implicit_invocation: false
+```
+
+- `interface.display_name` 是搜索和诊断使用的人类可读标题。
+- `interface.short_description` 会替代较长的 frontmatter 描述进入有界目录，但搜索仍会同时考虑两者。
+- `policy.allow_implicit_invocation: false` 会把 Skill 设为 `explicit`。
+
+`agents/zuno.yaml` 按字段覆盖共享文件，并可额外设置 Zuno 原生的目录暴露方式：
+
+```yaml
+policy:
+  exposure: search
+```
+
+支持 `index`、`search` 与 `explicit`。原生 exposure 覆盖
+`allow_implicit_invocation`；匹配的用户 `skills.config` 条目最终覆盖两个侧车。
+受支持字段格式错误会产生发现警告，但不会丢弃一份原本有效的 `SKILL.md`。
 
 ## 发现顺序
 
@@ -82,10 +116,11 @@ Zuno 按这个作用域顺序发现 Skill：
 | 键 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `includeInstructions` | `boolean` \| `null` | 启用 | 各回合是否接收 skill 触发策略与元数据目录 |
-| `maxContextTokens` | 正整数 \| `null` | 模型上下文的 2%；未知时约 8,000 个 Token | 目录使用的最大近似 Token 数。超过 10,000 的值会被运行时夹住 |
+| `maxContextTokens` | 正整数 \| `null` | 模型上下文的 2%；未知时约 8,000 个字符 | 目录的显式近似 Token 上限。超过 10,000 的值会被运行时夹住 |
 | `maxSelectedContextTokens` | 正整数 \| `null` | 已知上下文的 10%，下限 2,000，上限 32,000；未知时为 8,000 | 一个会话提示词中所有被完整选中的 Skill 正文使用的最大近似 Token 数。超过运行时上限的值会被夹住 |
 | `paths` | `string[]` \| `null` | 无 | 额外的 skill 文件夹路径 |
 | `urls` | `string[]` \| `null` | 无 | 用于抓取 skill 的 URL |
+| `config` | object[] \| `null` | 无 | 按顺序应用的逐路径启停与暴露方式覆盖 |
 
 ```json
 {
@@ -93,10 +128,37 @@ Zuno 按这个作用域顺序发现 Skill：
     "includeInstructions": true,
     "maxContextTokens": 8000,
     "maxSelectedContextTokens": 16000,
-    "paths": ["~/work/shared-skills"]
+    "paths": ["~/work/shared-skills"],
+    "config": [
+      {
+        "path": "~/.agents/skills/private-release",
+        "enabled": false
+      },
+      {
+        "path": "~/.config/zuno/skill/powerapps",
+        "recursive": true,
+        "exposure": "search"
+      }
+    ]
   }
 }
 ```
+
+默认元数据字符预算是已知模型上下文数值的 2%；上下文未知时使用约
+8,000 个字符。`maxContextTokens` 仍是显式的近似 Token 覆盖；Zuno 会将其
+换算为字符，并最多按 10,000 Token 计算。
+
+每个 `config` 对象接受：
+
+| 键 | 类型 | 含义 |
+| --- | --- | --- |
+| `path` | string | Skill 目录、精确 `SKILL.md` 或子树根目录 |
+| `enabled` | boolean | 加载或排除匹配 Skill；省略表示启用 |
+| `exposure` | `index` \| `search` \| `explicit` | 覆盖模型发现暴露方式 |
+| `recursive` | boolean | 将条目应用到 `path` 下的所有 Skill |
+
+条目按顺序求值，最后一个匹配项获胜。已存在路径会规范化，因此符号链接别名
+会匹配同一来源。配置中暂时不存在的路径不是错误，因为 Skill 可能稍后安装。
 
 这两份预算是刻意分开的。`maxContextTokens` 限定紧凑的元数据目录 —— 名称与描述。`maxSelectedContextTokens` 限定一个会话提示词中被完整加载的正文总量。如果被选中的正文装不下，加载或恢复会话会在 provider 请求之前失败，而不是静默丢弃指令，因为一个只加载了一部分的 Skill 比没有更糟。
 
@@ -108,7 +170,7 @@ Zuno 按这个作用域顺序发现 Skill：
 
 | 动作 | 返回 |
 | --- | --- |
-| `list` | 对模型可见的 Skill 的分页目录，带确切的 `source` 定位符 |
+| `list` | `index` 与 `search` 条目的分页目录；只有同名歧义时才带 `source` |
 | `search` | 针对一个能力查询的元数据匹配结果 |
 | `load` | 一份 Skill 正文，分页并带续读游标 |
 | `read_resource` | 一个被引用的文本资源，按相对路径读取 |

@@ -9,7 +9,9 @@
 //! spacing, indentation, tag names, or ordering shows up as a diff before it
 //! reaches a prompt.
 
-use zuno_catalog::skill::{Form, NO_SKILLS, Skill, escape_html, render, render_within};
+use zuno_catalog::skill::{
+    Form, NO_SKILLS, Skill, SkillExposure, escape_html, render, render_within,
+};
 
 fn skill(name: &str, description: Option<&str>, location: &str) -> Skill {
     Skill::embedded(
@@ -66,6 +68,55 @@ fn index_form_omits_redundant_sources_for_unique_names() {
     assert!(rendered.contains("name=\"add-office365\""));
     assert!(rendered.contains("Adds Office 365 Outlook connector"));
     assert!(!rendered.contains(" source="), "{rendered}");
+}
+
+#[test]
+fn exposure_filters_the_initial_index_without_hiding_search_only_metadata() {
+    let indexed = skill("indexed", Some("Initial metadata."), "/indexed/SKILL.md");
+    let mut search = skill("search", Some("Search metadata."), "/search/SKILL.md");
+    search.exposure = SkillExposure::Search;
+    let mut explicit = skill("explicit", Some("Explicit metadata."), "/explicit/SKILL.md");
+    explicit.exposure = SkillExposure::Explicit;
+    let list = vec![indexed, search, explicit];
+
+    let index = render(&list, Form::Index);
+    assert!(index.contains("name=\"indexed\""));
+    assert!(!index.contains("name=\"search\""));
+    assert!(!index.contains("name=\"explicit\""));
+
+    let searchable = render(&list, Form::List);
+    assert!(searchable.contains("indexed"));
+    assert!(searchable.contains("search"));
+    assert!(!searchable.contains("explicit"));
+}
+
+#[test]
+fn sidecar_short_description_replaces_long_frontmatter_metadata() {
+    let mut subject = skill(
+        "release",
+        Some("A long frontmatter description that should not reach the index."),
+        "/release/SKILL.md",
+    );
+    subject.short_description = Some("Promote verified artifacts.".to_owned());
+
+    let rendered = render(&[subject], Form::Index);
+    assert!(rendered.contains("Promote verified artifacts."));
+    assert!(!rendered.contains("long frontmatter"));
+}
+
+#[test]
+fn an_indexed_name_keeps_its_source_when_a_hidden_skill_makes_it_ambiguous() {
+    let indexed = skill("release", Some("Visible release."), "/visible/SKILL.md");
+    let mut explicit = skill("release", Some("Private release."), "/private/SKILL.md");
+    explicit.exposure = SkillExposure::Explicit;
+
+    let rendered = render(&[indexed, explicit], Form::Index);
+
+    assert!(
+        rendered.contains("source=\"/visible/SKILL.md\""),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("/private/SKILL.md"), "{rendered}");
 }
 
 #[test]
@@ -161,7 +212,7 @@ fn verbose_form_has_a_fixed_line_budget() {
 fn an_unspent_budget_is_byte_identical_to_the_unbounded_form() {
     for form in [Form::List, Form::Verbose, Form::Index] {
         let unbounded = render(&corpus(), form);
-        let budgeted = render_within(&corpus(), form, unbounded.len());
+        let budgeted = render_within(&corpus(), form, unbounded.chars().count());
         assert_eq!(budgeted.text, unbounded, "{form:?}");
         assert_eq!(budgeted.rendered, 4, "one of the five has no description");
         assert_eq!(budgeted.omitted, 0, "{form:?}");
@@ -184,7 +235,7 @@ fn a_large_unique_index_keeps_every_name_without_repeating_absolute_paths() {
 
     assert_eq!(budgeted.rendered, 137);
     assert_eq!(budgeted.omitted, 0);
-    assert!(budgeted.text.len() < 16 * 1024);
+    assert!(budgeted.text.chars().count() < 16 * 1024);
     assert!(budgeted.text.contains("name=\"skill-000\""));
     assert!(budgeted.text.contains("name=\"skill-136\""));
     assert!(!budgeted.text.contains(" source="));
@@ -219,20 +270,20 @@ fn the_progressive_catalog_spends_budget_on_source_identity_before_description_d
     assert!(budgeted.text.contains("/skills/first/SKILL.md"));
     assert!(budgeted.text.contains("/skills/second/SKILL.md"));
     assert!(
-        budgeted.text.len() <= 512,
+        budgeted.text.chars().count() <= 512,
         "descriptions must be shortened before a source identity is hidden"
     );
 }
 
 #[test]
-fn a_budget_never_returns_more_bytes_than_it_was_given() {
-    let full = render(&corpus(), Form::Verbose).len();
+fn a_budget_never_returns_more_characters_than_it_was_given() {
+    let full = render(&corpus(), Form::Verbose).chars().count();
     for budget in 0..=full {
         let budgeted = render_within(&corpus(), Form::Verbose, budget);
         assert!(
-            budgeted.text.len() <= budget,
-            "budget {budget} produced {} bytes",
-            budgeted.text.len()
+            budgeted.text.chars().count() <= budget,
+            "budget {budget} produced {} characters",
+            budgeted.text.chars().count()
         );
         assert_eq!(
             budgeted.rendered + budgeted.omitted,
@@ -246,7 +297,7 @@ fn a_budget_never_returns_more_bytes_than_it_was_given() {
 #[test]
 fn a_partial_budget_keeps_the_most_names_and_still_sorts_them_by_name() {
     let full = render(&corpus(), Form::Verbose);
-    let budgeted = render_within(&corpus(), Form::Verbose, full.len() * 2 / 3);
+    let budgeted = render_within(&corpus(), Form::Verbose, full.chars().count() * 2 / 3);
 
     assert!(budgeted.omitted > 0, "two thirds must not fit everything");
     assert!(budgeted.rendered > 0, "two thirds must fit something");
@@ -263,6 +314,28 @@ fn a_partial_budget_keeps_the_most_names_and_still_sorts_them_by_name() {
     sorted.sort_unstable();
     assert_eq!(names, sorted, "survivors stay in name order");
     assert_eq!(names.len(), budgeted.rendered);
+}
+
+#[test]
+fn a_character_budget_does_not_penalize_multibyte_metadata() {
+    let description = "中文能力".repeat(400);
+    let corpus = vec![skill(
+        "multibyte",
+        Some(&description),
+        "/skills/multibyte/SKILL.md",
+    )];
+    let full = render(&corpus, Form::Index);
+    let character_budget = full.chars().count();
+
+    let budgeted = render_within(&corpus, Form::Index, character_budget);
+
+    assert_eq!(budgeted.text, full);
+    assert_eq!(budgeted.rendered, 1);
+    assert_eq!(budgeted.omitted, 0);
+    assert!(
+        budgeted.text.len() > character_budget,
+        "the fixture must prove UTF-8 bytes exceed the character budget"
+    );
 }
 
 #[test]

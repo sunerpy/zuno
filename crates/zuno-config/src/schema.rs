@@ -459,6 +459,40 @@ pub struct SkillsConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_selected_context_tokens: Option<NonZeroU32>,
+    /// Per-path Skill enablement and model-discovery overrides.
+    ///
+    /// Entries are evaluated in order and the last matching entry wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<Vec<SkillPathConfig>>,
+}
+
+/// How one enabled Skill participates in model-driven discovery.
+#[derive(JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillCatalogExposure {
+    /// Advertise the Skill in the initial bounded index and in search.
+    Index,
+    /// Keep it out of the initial index but retain it in `skill search` and `list`.
+    Search,
+    /// Permit only explicit invocation, such as `/<name>` or `requiredSkills`.
+    Explicit,
+}
+
+/// One exact or recursive path override under [`SkillsConfig::config`].
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillPathConfig {
+    /// Skill directory, `SKILL.md`, or subtree root when `recursive` is true.
+    pub path: String,
+    /// Whether matching Skills are loaded. Omitted means enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Override sidecar-derived model-discovery exposure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<SkillCatalogExposure>,
+    /// Apply this entry to every Skill below `path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recursive: Option<bool>,
 }
 
 /// File-watcher configuration (`config/config.ts:49`).

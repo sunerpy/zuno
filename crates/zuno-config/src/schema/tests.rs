@@ -1374,6 +1374,52 @@ fn positive_int_fields_reject_zero_and_negatives() {
 }
 
 #[test]
+fn skill_path_rules_preserve_order_and_typed_exposure() {
+    let config = parse_value(json!({
+        "skills": {
+            "config": [
+                {
+                    "path": "~/.agents/skills/private",
+                    "enabled": false
+                },
+                {
+                    "path": "~/.config/zuno/skill/powerapps",
+                    "recursive": true,
+                    "exposure": "search"
+                }
+            ]
+        }
+    }))
+    .expect("skill path rules deserialize");
+    let rules = config.skills.expect("skills").config.expect("path config");
+
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].path, "~/.agents/skills/private");
+    assert_eq!(rules[0].enabled, Some(false));
+    assert_eq!(rules[1].exposure, Some(SkillCatalogExposure::Search));
+    assert_eq!(rules[1].recursive, Some(true));
+}
+
+#[test]
+fn skill_path_rules_reject_unknown_exposure_and_missing_paths() {
+    let unknown = parse_value(json!({
+        "skills": {
+            "config": [{"path": "/skills/a", "exposure": "hidden"}]
+        }
+    }))
+    .expect_err("exposure is a closed vocabulary");
+    assert_eq!(issue_path(&unknown), "skills.config.0.exposure");
+
+    let missing = parse_value(json!({
+        "skills": {
+            "config": [{"enabled": false}]
+        }
+    }))
+    .expect_err("path is required");
+    assert_eq!(issue_path(&missing), "skills.config.0");
+}
+
+#[test]
 fn an_mcp_callback_port_stays_inside_the_port_range() {
     parse_value(json!({
         "mcp": { "x": { "type": "remote", "url": "u", "oauth": { "callbackPort": 65535 } } }

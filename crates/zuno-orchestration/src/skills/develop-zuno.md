@@ -52,6 +52,10 @@ help text, dispatch path, permissions, and failure behavior all exist.
 - Agent definitions use `agent/**/*.md` or `agents/**/*.md`.
 - Skills use `skill/<name>/SKILL.md` or `skills/<name>/SKILL.md`; keep supporting
   `scripts/`, `references/`, and `assets/` inside the same Skill directory.
+- Shared Skill display and implicit-invocation metadata belongs in
+  `agents/openai.yaml`; Zuno-specific field overrides and `policy.exposure`
+  belong in `agents/zuno.yaml`. Keep `SKILL.md` frontmatter limited to its
+  native `name` and `description`.
 - User Markdown commands use `command/**/*.md` or `commands/**/*.md`.
 - Static and process extension packages live below `extensions/<id>/` and must
   contain a validated `extension.json`.

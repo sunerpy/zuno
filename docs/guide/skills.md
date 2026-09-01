@@ -15,8 +15,8 @@ Two reasons.
 
 Loading everything is expensive: instructions that apply to one kind of work would consume
 context on every turn. Progressive disclosure fixes that. The prompt receives a bounded
-metadata catalog, and a body is loaded only when its name is explicit or its description
-clearly matches the request.
+metadata index, search keeps the larger model-discoverable catalog available on demand, and
+a body is loaded only after selection.
 
 Identity is the second reason. A Skill has a source, so the same name from two roots stays
 independently addressable and no hidden precedence winner is chosen. That is what makes a
@@ -55,15 +55,38 @@ The prompt gets the catalog, not the bodies:
   "skills": {
     "includeInstructions": true,
     "maxContextTokens": 8000,
-    "maxSelectedContextTokens": 16000
+    "maxSelectedContextTokens": 16000,
+    "config": [
+      {
+        "path": "~/.config/zuno/skill/powerapps",
+        "recursive": true,
+        "exposure": "search"
+      }
+    ]
   }
 }
 ```
 
-`maxContextTokens` bounds the compact catalog. Its default is roughly two percent of the
-model context, or 8,000 approximate tokens when the context is unknown, capped at 10,000.
+`maxContextTokens` explicitly bounds the compact catalog in approximate tokens. Without an
+override, Zuno uses a character budget equal to roughly two percent of a known model
+context. If the context is unknown, the fallback is approximately 8,000 characters rather
+than a 2,000-character fixed cap. The explicit override is converted to characters and
+capped at 10,000 tokens.
 Unique Skill names omit their absolute source path from this prompt index. A source
 locator is included only for same-named entries that would otherwise be ambiguous.
+
+Every enabled Skill has one catalog exposure:
+
+| Exposure | Initial index | `skill search` / `list` | Exact load, `$name`, `/<name>`, `requiredSkills` |
+| --- | --- | --- | --- |
+| `index` | yes | yes | yes |
+| `search` | no | yes | yes |
+| `explicit` | no | no | yes |
+
+`index` is the default. Use `search` for large vendor or domain packs that should remain
+discoverable without occupying every initial prompt. Use `explicit` for instructions that
+must never be selected from a capability match. The model is told how many search-only
+sources exist, but explicit-only names are intentionally absent.
 
 Fully selected bodies share a separate aggregate budget. Its default is ten percent of a
 known context, with a 2,000-token floor and a 32,000-token ceiling.
@@ -71,13 +94,20 @@ known context, with a 2,000-token floor and a 32,000-token ceiling.
 not fit, loading or restoring the session fails before a provider request rather than
 silently dropping instructions.
 
-`includeInstructions: false` removes both the trigger policy and the catalog from prompts.
-The `skill` tool still supports paged `list` and `search`.
+`includeInstructions: false` removes both the trigger policy and the initial index from
+prompts. The `skill` tool still supports paged `list` and `search` over `index` and `search`
+entries.
 
 A large personal library therefore does not inject every `SKILL.md` body into every
-request. If a vendor or domain pack is rarely relevant, keep it outside the implicit
-roots and add that pack through a project-specific `skills.paths` entry; do not delete or
-merge distinct Skills merely to reduce the catalog count.
+request. A vendor or domain pack can remain in a normal discovery root while one recursive
+`skills.config` entry makes it search-only. Do not delete or merge distinct Skills merely
+to reduce the catalog count.
+
+An exact `skills.config` entry can also set `"enabled": false`. Paths may name a Skill
+directory or its `SKILL.md`; `"recursive": true` applies the entry to descendants. Entries
+are evaluated in order and the last matching entry wins, so a later exact entry can
+re-enable or reclassify one Skill below a broader subtree rule. Existing paths are
+canonicalized, including symlink aliases.
 
 ## Loading is paged and must complete
 
@@ -157,8 +187,9 @@ zuno debug agent explorer
 ```
 
 `debug skill` reports raw discovery: same-name entries from different sources are
-preserved, and the summary reports source, described, and unique counts plus ambiguous
-names. `debug agent` reports the agent-filtered view with budgets and coverage.
+preserved, and the summary reports source, indexed, searchable, explicit, disabled, and
+unique counts plus ambiguous names. `debug agent` reports the agent-filtered view with
+budgets and coverage.
 
 ## See also
 

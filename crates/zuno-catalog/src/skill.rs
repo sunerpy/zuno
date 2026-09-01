@@ -39,6 +39,7 @@
 pub mod builtin;
 pub mod discovery;
 pub mod frontmatter;
+mod metadata;
 pub mod remote;
 pub mod render;
 pub mod scan;
@@ -50,6 +51,7 @@ use std::path::{Path, PathBuf};
 
 use futures::stream::StreamExt;
 use serde::Serialize;
+use zuno_config::schema::SkillCatalogExposure;
 use zuno_error::{ConfigError, ConfigIssue};
 
 pub use crate::skill::discovery::{Root, SkillOptions, SkillPath, SkillSources};
@@ -64,6 +66,35 @@ pub use crate::skill::render::{
 /// keeping independent sources parallel.
 pub const LOCAL_CONCURRENCY: usize = 8;
 
+/// How an enabled Skill participates in model-driven discovery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillExposure {
+    /// Advertise metadata in the initial bounded prompt index and in search.
+    #[default]
+    Index,
+    /// Keep metadata out of the initial prompt while retaining search and list.
+    Search,
+    /// Permit only explicit selection by exact name/source.
+    Explicit,
+}
+
+impl SkillExposure {
+    const fn is_index(&self) -> bool {
+        matches!(self, Self::Index)
+    }
+}
+
+impl From<SkillCatalogExposure> for SkillExposure {
+    fn from(value: SkillCatalogExposure) -> Self {
+        match value {
+            SkillCatalogExposure::Index => Self::Index,
+            SkillCatalogExposure::Search => Self::Search,
+            SkillCatalogExposure::Explicit => Self::Explicit,
+        }
+    }
+}
+
 /// One discovered skill.
 ///
 /// The catalog owns metadata and source identity, not a permanent copy of every
@@ -73,11 +104,23 @@ pub const LOCAL_CONCURRENCY: usize = 8;
 pub struct Skill {
     /// The `name` from frontmatter. The key skills are addressed by.
     pub name: String,
-    /// The `description` from frontmatter. `None` hides the skill from model-facing
-    /// discovery forms while leaving it in [`Skills::all`], which is deliberate in
-    /// the imported behavior (`:322`).
+    /// The `description` from frontmatter. Without a sidecar short description,
+    /// `None` hides the skill from model-driven discovery while leaving it in
+    /// [`Skills::all`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Optional human-facing name supplied by a recognized sidecar.
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional bounded catalog description supplied by a recognized sidecar.
+    #[serde(rename = "shortDescription", skip_serializing_if = "Option::is_none")]
+    pub short_description: Option<String>,
+    /// Effective model-discovery policy after sidecars and path configuration.
+    #[serde(skip_serializing_if = "SkillExposure::is_index")]
+    pub exposure: SkillExposure,
+    /// Sidecars that contributed recognized metadata.
+    #[serde(rename = "metadataSources", skip_serializing_if = "Vec::is_empty")]
+    pub metadata_sources: Vec<String>,
     /// Where it came from: an absolute path or a stable `builtin://` source.
     pub location: String,
     /// How its `SKILL.md` body is materialized.
@@ -101,6 +144,10 @@ impl Skill {
         Self {
             name,
             description,
+            display_name: None,
+            short_description: None,
+            exposure: SkillExposure::Index,
+            metadata_sources: Vec::new(),
             location: path.to_string_lossy().into_owned(),
             document: SkillDocument::File(path),
         }
@@ -117,6 +164,10 @@ impl Skill {
         Self {
             name: name.into(),
             description,
+            display_name: None,
+            short_description: None,
+            exposure: SkillExposure::Index,
+            metadata_sources: Vec::new(),
             location: location.into(),
             document: SkillDocument::Embedded {
                 content: content.into(),
@@ -137,6 +188,10 @@ impl Skill {
         Self {
             name: name.into(),
             description,
+            display_name: None,
+            short_description: None,
+            exposure: SkillExposure::Index,
+            metadata_sources: Vec::new(),
             location: path.to_string_lossy().into_owned(),
             document: SkillDocument::Embedded {
                 content: content.into(),
@@ -152,6 +207,53 @@ impl Skill {
             SkillDocument::File(path) => path.parent(),
             SkillDocument::Embedded { resource_root, .. } => resource_root.as_deref(),
         }
+    }
+
+    /// Description used for prompt metadata and search results.
+    #[must_use]
+    pub fn catalog_description(&self) -> Option<&str> {
+        self.short_description
+            .as_deref()
+            .or(self.description.as_deref())
+    }
+
+    /// Human-facing title, falling back to the exact invocation name.
+    #[must_use]
+    pub fn catalog_display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Whether this Skill belongs in the bounded initial prompt index.
+    #[must_use]
+    pub fn is_indexed(&self) -> bool {
+        self.exposure == SkillExposure::Index && self.catalog_description().is_some()
+    }
+
+    /// Whether this Skill belongs in `skill search` and `skill list`.
+    #[must_use]
+    pub fn is_searchable(&self) -> bool {
+        self.exposure != SkillExposure::Explicit && self.catalog_description().is_some()
+    }
+
+    /// Whether model-driven selection requires an explicit exact reference.
+    #[must_use]
+    pub fn is_explicit_only(&self) -> bool {
+        self.exposure == SkillExposure::Explicit
+    }
+
+    fn apply_metadata(
+        mut self,
+        metadata: metadata::SkillMetadata,
+        configured_exposure: Option<SkillCatalogExposure>,
+    ) -> Self {
+        let sidecar_exposure = metadata.resolved_exposure();
+        self.display_name = metadata.display_name;
+        self.short_description = metadata.short_description;
+        self.exposure = configured_exposure
+            .map(Into::into)
+            .unwrap_or(sidecar_exposure);
+        self.metadata_sources = metadata.sources;
+        self
     }
 
     /// Read the selected body and verify that the source still declares this skill.
@@ -233,6 +335,10 @@ pub enum SkillWarningKind {
     MissingName,
     /// A `description` that is present but not a string.
     InvalidDescription,
+    /// A recognized sidecar could not be read.
+    MetadataUnreadable(io::ErrorKind),
+    /// A recognized sidecar contains invalid supported metadata.
+    MetadataMalformed(String),
     /// `index.json` could not be reached.
     IndexUnreachable(String),
     /// `index.json`, or one of its files, exceeded [`remote::REMOTE_TIMEOUT`].
@@ -320,6 +426,12 @@ impl fmt::Display for SkillWarning {
                 "skill {} has a `description` that is not a string",
                 self.source
             ),
+            SkillWarningKind::MetadataUnreadable(kind) => {
+                write!(f, "failed to read skill metadata {}: {kind}", self.source)
+            }
+            SkillWarningKind::MetadataMalformed(detail) => {
+                write!(f, "failed to load skill metadata {}: {detail}", self.source)
+            }
             SkillWarningKind::IndexUnreachable(detail) => {
                 write!(f, "failed to fetch index {}: {detail}", self.source)
             }
@@ -362,6 +474,7 @@ pub struct Skills {
     by_name: HashMap<String, Vec<usize>>,
     by_source: HashMap<String, usize>,
     dirs: Vec<PathBuf>,
+    disabled_sources: Vec<String>,
     warnings: Vec<SkillWarning>,
 }
 
@@ -419,7 +532,7 @@ impl Skills {
         self.ordered
             .iter()
             .filter(|skill| {
-                skill.description.is_some()
+                skill.catalog_description().is_some()
                     && self
                         .by_name
                         .get(&skill.name)
@@ -442,10 +555,52 @@ impl Skills {
         list
     }
 
+    /// Model-searchable Skills, sorted by exact invocation name and source.
+    #[must_use]
+    pub fn searchable_sorted(&self) -> Vec<Skill> {
+        self.sorted()
+            .into_iter()
+            .filter(Skill::is_searchable)
+            .collect()
+    }
+
+    /// Number of Skills advertised in the initial prompt index.
+    #[must_use]
+    pub fn indexed_count(&self) -> usize {
+        self.ordered
+            .iter()
+            .filter(|skill| skill.is_indexed())
+            .count()
+    }
+
+    /// Number of Skills available through model-driven search.
+    #[must_use]
+    pub fn searchable_count(&self) -> usize {
+        self.ordered
+            .iter()
+            .filter(|skill| skill.is_searchable())
+            .count()
+    }
+
+    /// Number of enabled Skills that require an exact explicit reference.
+    #[must_use]
+    pub fn explicit_count(&self) -> usize {
+        self.ordered
+            .iter()
+            .filter(|skill| skill.is_explicit_only())
+            .count()
+    }
+
     /// `Skill.dirs` (`:306-308`).
     #[must_use]
     pub fn dirs(&self) -> &[PathBuf] {
         &self.dirs
+    }
+
+    /// Discovered filesystem sources excluded by `skills.config`.
+    #[must_use]
+    pub fn disabled_sources(&self) -> &[String] {
+        &self.disabled_sources
     }
 
     /// Everything that was skipped, and why.
@@ -460,7 +615,7 @@ impl Skills {
         render(&self.ordered, form)
     }
 
-    /// [`Self::render`], bounded to `budget` bytes.
+    /// [`Self::render`], bounded to `budget` Unicode scalar values.
     #[must_use]
     pub fn render_within(&self, form: Form, budget: usize) -> Budgeted {
         render_within(&self.ordered, form, budget)
@@ -571,6 +726,7 @@ pub async fn load(options: &SkillOptions) -> Skills {
     let dirs = sources.dirs();
     let mut skills = Skills {
         dirs,
+        disabled_sources: sources.take_disabled_sources(),
         warnings: sources.take_warnings(),
         ..Skills::default()
     };
@@ -578,24 +734,27 @@ pub async fn load(options: &SkillOptions) -> Skills {
         skills.insert(skill);
     }
 
-    let paths: Vec<PathBuf> = sources
-        .matches()
-        .iter()
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
+    let paths = sources.matches().to_vec();
 
-    let read = futures::stream::iter(paths.into_iter().map(|path| async move {
+    let read = futures::stream::iter(paths.into_iter().map(|entry| async move {
+        let path = entry.path().to_path_buf();
         let outcome = tokio::fs::read_to_string(&path).await;
-        (path, outcome)
+        let (metadata, metadata_warnings) = metadata::load(&path).await;
+        (path, entry.exposure(), outcome, metadata, metadata_warnings)
     }))
     .buffered(LOCAL_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
 
-    for (path, outcome) in read {
+    for (path, configured_exposure, outcome, metadata, metadata_warnings) in read {
+        for warning in metadata_warnings {
+            warn(&mut skills.warnings, warning);
+        }
         match outcome {
             Ok(source) => match parse_source(&path, &source) {
-                Ok(skill) => skills.insert(skill),
+                Ok(skill) => {
+                    skills.insert(skill.apply_metadata(metadata, configured_exposure));
+                }
                 Err(rejection) => warn(
                     &mut skills.warnings,
                     SkillWarning::new(path.to_string_lossy().as_ref(), rejection.into()),
@@ -616,7 +775,15 @@ pub async fn load(options: &SkillOptions) -> Skills {
         .values()
         .filter(|matches| matches.len() > 1)
         .count();
-    tracing::info!(count = skills.all().len(), ambiguous_names, "skills loaded");
+    tracing::info!(
+        count = skills.all().len(),
+        indexed = skills.indexed_count(),
+        searchable = skills.searchable_count(),
+        explicit = skills.explicit_count(),
+        disabled = skills.disabled_sources().len(),
+        ambiguous_names,
+        "skills loaded"
+    );
     skills
 }
 

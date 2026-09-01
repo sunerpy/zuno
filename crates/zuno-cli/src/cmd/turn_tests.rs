@@ -1432,7 +1432,7 @@ fn debug_agent_evaluates_live_mcp_tools_and_exact_parent_schema_authority() {
                     && entry["reason"] == "schema differs from the parent attempt tool authority"
             }))
     );
-    assert!(snapshot["skills"]["summary"]["metadataBudgetBytes"].is_number());
+    assert!(snapshot["skills"]["summary"]["metadataBudgetCharacters"].is_number());
     assert!(
         snapshot["skills"]["summary"]["previewOmitted"]
             .as_u64()
@@ -1512,7 +1512,7 @@ fn debug_agent_marks_skill_prompt_metadata_disabled_without_hiding_tool_budgets(
     let snapshot = plan.debug_agent_snapshot();
 
     assert_eq!(snapshot["skills"]["summary"]["metadataEnabled"], false);
-    assert!(snapshot["skills"]["summary"]["metadataBudgetBytes"].is_null());
+    assert!(snapshot["skills"]["summary"]["metadataBudgetCharacters"].is_null());
     assert!(snapshot["skills"]["summary"]["metadataBudgetApproxTokens"].is_null());
     assert!(snapshot["skills"]["summary"]["metadataCoverage"].is_null());
     assert!(
@@ -7327,6 +7327,62 @@ mod skill_prompt {
     }
 
     #[test]
+    fn search_only_skills_are_counted_but_omitted_from_the_initial_index() {
+        let mut searchable = skill("powerapps", "Search-only Power Apps guidance.");
+        searchable.exposure = zuno_catalog::skill::SkillExposure::Search;
+        let skills = zuno_catalog::skill::Skills::from_loaded([
+            skill("codegraph", "Indexed code navigation."),
+            searchable,
+        ]);
+        let mut resolver = resolver();
+
+        announce_skills(&mut resolver, &skills, 0, None).expect("announce skills");
+
+        assert!(resolver.system_prompt.contains("name=\"codegraph\""));
+        assert!(!resolver.system_prompt.contains("name=\"powerapps\""));
+        assert!(
+            resolver
+                .system_prompt
+                .contains("1 additional search-only Skill source"),
+            "{}",
+            resolver.system_prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_only_skills_require_a_dollar_reference_for_prompt_preloading() {
+        let mut explicit = skill("private-release", "Explicit release guidance.");
+        explicit.exposure = zuno_catalog::skill::SkillExposure::Explicit;
+        let skills = zuno_catalog::skill::Skills::from_loaded([explicit]);
+        let mut resolver = resolver();
+        let mut loaded = BTreeSet::new();
+
+        let implicit = preload_explicit_skills(
+            &mut resolver,
+            &skills,
+            &mut loaded,
+            "please use private-release for this task",
+            SELECTED_SKILL_PROMPT_MAX_BYTES,
+        )
+        .await
+        .expect("bare mention is ignored");
+        assert!(implicit.is_empty());
+        assert!(loaded.is_empty());
+
+        let explicit = preload_explicit_skills(
+            &mut resolver,
+            &skills,
+            &mut loaded,
+            "please use $private-release for this task",
+            SELECTED_SKILL_PROMPT_MAX_BYTES,
+        )
+        .await
+        .expect("dollar reference selects");
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].name, "private-release");
+    }
+
+    #[test]
     fn required_skills_resolve_unique_sources_in_configured_order() {
         let skills = zuno_catalog::skill::Skills::from_loaded([
             zuno_catalog::skill::Skill::embedded_at_path(
@@ -7679,8 +7735,23 @@ mod skill_prompt {
         );
         assert_eq!(
             skill_metadata_budget(1_000_000, Some(&config)),
-            APPROX_BYTES_PER_TOKEN
+            APPROX_CHARS_PER_TOKEN
         );
+    }
+
+    #[test]
+    fn an_unknown_model_context_uses_the_eight_thousand_character_metadata_budget() {
+        assert_eq!(
+            skill_metadata_budget(0, None),
+            DEFAULT_SKILL_METADATA_CHAR_BUDGET
+        );
+        assert_eq!(skill_metadata_budget(0, None), 8_000);
+    }
+
+    #[test]
+    fn a_known_model_context_uses_two_percent_as_the_character_budget() {
+        assert_eq!(skill_metadata_budget(128_000, None), 2_560);
+        assert_eq!(skill_metadata_budget(1_000_000, None), 20_000);
     }
 
     #[test]
@@ -7777,13 +7848,13 @@ mod skill_prompt {
         announce_skills(&mut resolver, &skills, 1_000_000, None).expect("announce skill index");
 
         assert!(
-            resolver.system_prompt.len()
-                < "AGENT PROMPT".len()
-                    + MAX_SKILL_METADATA_TOKEN_BUDGET * APPROX_BYTES_PER_TOKEN
-                    + SKILL_USAGE_POLICY.len()
+            resolver.system_prompt.chars().count()
+                < "AGENT PROMPT".chars().count()
+                    + MAX_SKILL_METADATA_TOKEN_BUDGET * APPROX_CHARS_PER_TOKEN
+                    + SKILL_USAGE_POLICY.chars().count()
                     + 512,
-            "the compact index exceeded its budget: {} bytes",
-            resolver.system_prompt.len()
+            "the compact index exceeded its budget: {} characters",
+            resolver.system_prompt.chars().count()
         );
         assert!(resolver.system_prompt.contains("name=\"skill-000\""));
         assert!(resolver.system_prompt.contains("name=\"skill-136\""));

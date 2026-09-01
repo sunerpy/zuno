@@ -9,8 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use zuno_catalog::skill::{
-    Form, Skill, SkillOptions, SkillWarningKind, Skills, builtin, load, parse_file,
+    Form, Skill, SkillExposure, SkillOptions, SkillWarningKind, Skills, builtin, load, parse_file,
 };
+use zuno_config::schema::{SkillCatalogExposure, SkillPathConfig};
 use zuno_error::ConfigError;
 use zuno_paths::Env;
 use zuno_paths::env::{HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME};
@@ -87,6 +88,10 @@ impl Tree {
             paths,
             Vec::new(),
         )
+    }
+
+    fn sidecar(&self, skill_dir: &str, name: &str, body: &str) -> PathBuf {
+        self.write(&format!("{skill_dir}/agents/{name}.yaml"), body)
     }
 }
 
@@ -309,6 +314,195 @@ async fn a_description_less_skill_loads_but_never_renders() {
     assert!(skills.get("quiet").is_some());
     assert!(!skills.render(Form::List).contains("quiet"));
     assert!(!skills.render(Form::Verbose).contains("quiet"));
+}
+
+#[tokio::test]
+async fn shared_sidecar_metadata_can_require_explicit_invocation() {
+    let tree = Tree::new();
+    tree.skill(
+        "home/.agents/skills/release",
+        "release",
+        Some("Long release instructions."),
+    );
+    let sidecar = tree.sidecar(
+        "home/.agents/skills/release",
+        "openai",
+        "interface:\n  display_name: Release Engineering\n  short_description: Promote verified artifacts\npolicy:\n  allow_implicit_invocation: false\n",
+    );
+
+    let skills = load(&tree.options("proj")).await;
+    let release = skills.get("release").expect("release loads");
+
+    assert_eq!(release.catalog_display_name(), "Release Engineering");
+    assert_eq!(
+        release.catalog_description(),
+        Some("Promote verified artifacts")
+    );
+    assert_eq!(release.exposure, SkillExposure::Explicit);
+    assert!(!release.is_searchable());
+    assert!(
+        !skills
+            .render(Form::Index)
+            .contains("<skill name=\"release\"")
+    );
+    assert_eq!(
+        release.metadata_sources,
+        vec![sidecar.to_string_lossy().into_owned()]
+    );
+    assert!(
+        release
+            .read_body()
+            .await
+            .expect("explicit Skill remains loadable")
+            .contains("body of release")
+    );
+}
+
+#[tokio::test]
+async fn native_sidecar_overlays_shared_metadata_and_can_select_search_only() {
+    let tree = Tree::new();
+    tree.skill(
+        "home/.config/zuno/skill/powerapps",
+        "powerapps",
+        Some("Long shared description."),
+    );
+    tree.sidecar(
+        "home/.config/zuno/skill/powerapps",
+        "openai",
+        "interface:\n  display_name: Shared title\npolicy:\n  allow_implicit_invocation: false\n",
+    );
+    tree.sidecar(
+        "home/.config/zuno/skill/powerapps",
+        "zuno",
+        "interface:\n  short_description: Search the Power Apps catalog\npolicy:\n  exposure: search\n",
+    );
+
+    let skills = load(&tree.options("proj")).await;
+    let skill = skills.get("powerapps").expect("powerapps loads");
+
+    assert_eq!(skill.catalog_display_name(), "Shared title");
+    assert_eq!(
+        skill.catalog_description(),
+        Some("Search the Power Apps catalog")
+    );
+    assert_eq!(skill.exposure, SkillExposure::Search);
+    assert!(skill.is_searchable());
+    assert!(!skill.is_indexed());
+    assert!(!skills.render(Form::Index).contains("powerapps"));
+    assert!(skills.render(Form::List).contains("powerapps"));
+}
+
+#[tokio::test]
+async fn malformed_sidecar_metadata_warns_without_dropping_the_skill() {
+    let tree = Tree::new();
+    tree.skill(
+        "home/.agents/skills/usable",
+        "usable",
+        Some("Still usable."),
+    );
+    let sidecar = tree.sidecar(
+        "home/.agents/skills/usable",
+        "openai",
+        "policy:\n  allow_implicit_invocation: no\n",
+    );
+
+    let skills = load(&tree.options("proj")).await;
+
+    assert!(skills.get("usable").is_some());
+    let warning = skills
+        .warnings()
+        .iter()
+        .find(|warning| matches!(warning.kind(), SkillWarningKind::MetadataMalformed(_)))
+        .expect("malformed metadata is visible");
+    assert_eq!(warning.source(), sidecar.to_string_lossy());
+}
+
+#[tokio::test]
+async fn ordered_path_rules_disable_a_subtree_and_reenable_one_exact_skill() {
+    let tree = Tree::new();
+    let kept = tree.skill("home/.agents/skills/powerapps/kept", "kept", Some("Kept."));
+    let disabled = tree.skill(
+        "home/.agents/skills/powerapps/disabled",
+        "disabled",
+        Some("Disabled."),
+    );
+    let root = tree.at("home/.agents/skills/powerapps");
+    let options = tree.options("proj").with_path_config(vec![
+        SkillPathConfig {
+            path: root.to_string_lossy().into_owned(),
+            enabled: Some(false),
+            exposure: None,
+            recursive: Some(true),
+        },
+        SkillPathConfig {
+            path: kept
+                .parent()
+                .expect("skill directory")
+                .to_string_lossy()
+                .into_owned(),
+            enabled: None,
+            exposure: Some(SkillCatalogExposure::Explicit),
+            recursive: None,
+        },
+    ]);
+
+    let skills = load(&options).await;
+
+    let kept = skills.get("kept").expect("last exact rule reenables");
+    assert_eq!(kept.exposure, SkillExposure::Explicit);
+    assert!(skills.get("disabled").is_none());
+    assert_eq!(
+        skills.disabled_sources(),
+        [disabled.to_string_lossy().into_owned()]
+    );
+    assert!(skills.warnings().is_empty(), "{:?}", skills.warnings());
+}
+
+#[tokio::test]
+async fn a_missing_path_rule_is_non_fatal_and_does_not_disable_other_skills() {
+    let tree = Tree::new();
+    tree.skill("home/.agents/skills/usable", "usable", Some("Usable."));
+    let options = tree.options("proj").with_path_config(vec![SkillPathConfig {
+        path: tree.at("future/skill").to_string_lossy().into_owned(),
+        enabled: Some(false),
+        exposure: None,
+        recursive: None,
+    }]);
+
+    let skills = load(&options).await;
+
+    assert!(skills.get("usable").is_some());
+    assert!(skills.disabled_sources().is_empty());
+    assert!(skills.warnings().is_empty(), "{:?}", skills.warnings());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_path_rule_matches_a_symlink_alias_of_the_skill_directory() {
+    let tree = Tree::new();
+    let real = tree.skill(
+        "home/.agents/skills/canonical",
+        "canonical",
+        Some("Canonical."),
+    );
+    fs::create_dir_all(tree.at("aliases")).expect("alias parent");
+    let alias = tree.at("aliases/canonical");
+    std::os::unix::fs::symlink(real.parent().expect("skill directory"), &alias)
+        .expect("skill alias");
+    let options = tree.options("proj").with_path_config(vec![SkillPathConfig {
+        path: alias.to_string_lossy().into_owned(),
+        enabled: Some(false),
+        exposure: None,
+        recursive: None,
+    }]);
+
+    let skills = load(&options).await;
+
+    assert!(skills.get("canonical").is_none());
+    assert_eq!(
+        skills.disabled_sources(),
+        [real.to_string_lossy().into_owned()]
+    );
 }
 
 #[tokio::test]

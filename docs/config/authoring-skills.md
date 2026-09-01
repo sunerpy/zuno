@@ -15,6 +15,9 @@ A Skill is a directory containing `SKILL.md`, plus whatever resources it referen
 ```text
 my-skill/
   SKILL.md
+  agents/
+    openai.yaml
+    zuno.yaml
   references/
     ci.md
     architecture.md
@@ -53,14 +56,48 @@ Two failure modes are worth knowing because they are silent-looking:
 - a `description` that is present but not a string also drops it — including a bare
   `description:` with no value, which YAML resolves to null.
 
-A Skill with no `description` at all is loaded but hidden from the model-facing
-catalog. That is occasionally what you want for a Skill only invoked explicitly by
-name, and never what you want otherwise.
+A Skill with no `description` at all is loaded but hidden from model-driven discovery
+unless a recognized sidecar supplies `interface.short_description`. That is occasionally
+what you want for a Skill only invoked explicitly by name, and never what you want
+otherwise.
 
-`description` is the trigger surface. It should state both what the Skill does and when
-to use it, because the model matches a request against this text and nothing else. A
-description reading "dependency helper" will not fire; "Use when adding, upgrading, or
-reviewing a third-party package" will.
+Without a sidecar, `description` is the primary trigger surface. It should state both what
+the Skill does and when to use it. Search also considers the invocation name and optional
+sidecar display metadata; the initial index uses `interface.short_description` when present
+and otherwise falls back to the frontmatter description. A description reading "dependency
+helper" is weak; "Use when adding, upgrading, or reviewing a third-party package" is
+actionable.
+
+## Optional sidecar metadata
+
+`agents/openai.yaml` is the shared Agent Skills metadata surface. Zuno consumes only the
+fields with active runtime behavior and ignores unknown fields:
+
+```yaml
+interface:
+  display_name: Dependency Audit
+  short_description: Audit third-party packages before adding or upgrading them
+policy:
+  allow_implicit_invocation: false
+```
+
+- `interface.display_name` is a human-facing search and diagnostic title.
+- `interface.short_description` replaces the longer frontmatter description in bounded
+  catalog output while both remain searchable.
+- `policy.allow_implicit_invocation: false` makes the Skill `explicit`.
+
+`agents/zuno.yaml` overlays the shared file field-by-field and may additionally set native
+catalog exposure:
+
+```yaml
+policy:
+  exposure: search
+```
+
+The supported values are `index`, `search`, and `explicit`. A native exposure overrides
+`allow_implicit_invocation`; a matching user `skills.config` entry overrides both
+sidecars. A malformed recognized field produces a discovery warning but does not drop an
+otherwise valid `SKILL.md`.
 
 ## Discovery order
 
@@ -96,10 +133,11 @@ Zuno-native `.zuno` roots stay enabled under the broad external switch.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `includeInstructions` | `boolean` \| `null` | enabled | Whether turns receive the skill trigger policy and metadata catalog |
-| `maxContextTokens` | positive integer \| `null` | 2% of model context; 8,000 approximate tokens when unknown | Maximum approximate tokens used by the catalog. Values above 10,000 are clamped by the runtime |
+| `maxContextTokens` | positive integer \| `null` | 2% of model context; about 8,000 characters when unknown | Explicit approximate-token limit for the catalog. Values above 10,000 are clamped by the runtime |
 | `maxSelectedContextTokens` | positive integer \| `null` | 10% of known context, floor 2,000, ceiling 32,000; 8,000 when unknown | Maximum approximate tokens used by all fully selected Skill bodies in one session prompt. Values above the runtime ceiling are clamped |
 | `paths` | `string[]` \| `null` | none | Additional paths to skill folders |
 | `urls` | `string[]` \| `null` | none | URLs to fetch skills from |
+| `config` | object[] \| `null` | none | Ordered per-path enablement and exposure overrides |
 
 ```json
 {
@@ -107,10 +145,39 @@ Zuno-native `.zuno` roots stay enabled under the broad external switch.
     "includeInstructions": true,
     "maxContextTokens": 8000,
     "maxSelectedContextTokens": 16000,
-    "paths": ["~/work/shared-skills"]
+    "paths": ["~/work/shared-skills"],
+    "config": [
+      {
+        "path": "~/.agents/skills/private-release",
+        "enabled": false
+      },
+      {
+        "path": "~/.config/zuno/skill/powerapps",
+        "recursive": true,
+        "exposure": "search"
+      }
+    ]
   }
 }
 ```
+
+The default metadata character budget is two percent of a known model context. When the
+context is unknown, Zuno uses approximately 8,000 characters. `maxContextTokens` remains
+an explicit approximate-token override; Zuno converts it to characters and caps it at
+10,000 tokens.
+
+Each `config` object accepts:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `path` | string | Skill directory, exact `SKILL.md`, or subtree root |
+| `enabled` | boolean | Load or exclude matching Skills; omission means enabled |
+| `exposure` | `index` \| `search` \| `explicit` | Override model-discovery exposure |
+| `recursive` | boolean | Apply the entry to every Skill below `path` |
+
+Entries are evaluated in order and the last matching entry wins. Existing paths are
+canonicalized, so a symlink alias matches the same source. A missing configured path is
+not an error because the Skill may be installed later.
 
 The two budgets are separate on purpose. `maxContextTokens` bounds the compact
 metadata catalog — names and descriptions. `maxSelectedContextTokens` bounds the
@@ -129,7 +196,7 @@ pulls what it needs:
 
 | Action | Returns |
 | --- | --- |
-| `list` | Paged catalog of model-visible Skills with exact `source` locators |
+| `list` | Paged `index` and `search` catalog; `source` appears only for ambiguous names |
 | `search` | Metadata matches for a capability query |
 | `load` | One Skill body, paged with a continuation cursor |
 | `read_resource` | One referenced text resource, by relative path |

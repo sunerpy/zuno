@@ -31,7 +31,18 @@
     "urls": ["https://example.com/.well-known/skills/"],
     "includeInstructions": true,
     "maxContextTokens": 8000,
-    "maxSelectedContextTokens": 16000
+    "maxSelectedContextTokens": 16000,
+    "config": [
+      {
+        "path": "~/.agents/skills/private-release",
+        "enabled": false
+      },
+      {
+        "path": "~/.config/zuno/skill/powerapps",
+        "exposure": "search",
+        "recursive": true
+      }
+    ]
   },
   "references": {
     "shorthand": "github.com/sst/opencode",

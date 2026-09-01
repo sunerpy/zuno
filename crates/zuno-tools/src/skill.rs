@@ -602,7 +602,7 @@ impl SkillTool {
             .skills
             .all()
             .iter()
-            .filter(|skill| skill.description.is_some())
+            .filter(|skill| skill.is_searchable())
             .collect::<Vec<_>>();
         if described.is_empty() {
             return Err(reject(SkillRejection::Empty));
@@ -638,16 +638,12 @@ impl SkillTool {
                 described.len()
             )];
             lines.extend(matches.iter().map(|(_, skill)| {
-                format!(
-                    "- {}: {} (source: `{}`)",
-                    skill.name,
-                    display_description(skill.description.as_deref().unwrap_or_default()),
-                    skill.location
-                )
+                display_catalog_entry(skill, self.skills.named(&skill.name).len() > 1)
             }));
             lines.push(
                 "Load the selected instructions with action `load`, its exact `name`, and \
-                 the advertised `source`; do not treat a description as the skill body."
+                 the advertised `source` when one is present; do not treat a description as the \
+                 skill body."
                     .to_owned(),
             );
             lines.join("\n")
@@ -661,12 +657,7 @@ impl SkillTool {
     }
 
     fn list(&self, cursor: Option<&str>) -> Result<ToolOutput, ToolError> {
-        let listed = self
-            .skills
-            .sorted()
-            .into_iter()
-            .filter(|skill| skill.description.is_some())
-            .collect::<Vec<_>>();
+        let listed = self.skills.searchable_sorted();
         if listed.is_empty() {
             return Err(reject(SkillRejection::Empty));
         }
@@ -674,10 +665,11 @@ impl SkillTool {
             .iter()
             .map(|skill| {
                 format!(
-                    "{}\0{}\0{}",
+                    "{}\0{}\0{}\0{}",
                     skill.name,
                     skill.location,
-                    skill.description.as_deref().unwrap_or_default()
+                    skill.catalog_display_name(),
+                    skill.catalog_description().unwrap_or_default()
                 )
             })
             .collect::<Vec<_>>()
@@ -696,14 +688,11 @@ impl SkillTool {
             end,
             listed.len()
         )];
-        lines.extend(listed[start..end].iter().map(|skill| {
-            format!(
-                "- {}: {} (source: `{}`)",
-                skill.name,
-                display_description(skill.description.as_deref().unwrap_or_default()),
-                skill.location
-            )
-        }));
+        lines.extend(
+            listed[start..end].iter().map(|skill| {
+                display_catalog_entry(skill, self.skills.named(&skill.name).len() > 1)
+            }),
+        );
         let next_cursor = (end < listed.len())
             .then(|| encode_cursor(SkillAction::List, end, &identity, &identity));
         if let Some(next) = &next_cursor {
@@ -851,7 +840,7 @@ fn unknown(skills: &Skills, requested: &str) -> SkillRejection {
     let mut available: Vec<&str> = skills
         .all()
         .iter()
-        .filter(|skill| skill.description.is_some())
+        .filter(|skill| skill.is_searchable())
         .map(|skill| skill.name.as_str())
         .collect();
     if available.is_empty() {
@@ -882,6 +871,12 @@ fn search_terms(query: &str) -> Vec<String> {
 
 fn search_score(skill: &Skill, query: &str, terms: &[String]) -> usize {
     let name = skill.name.to_lowercase();
+    let display_name = skill.catalog_display_name().to_lowercase();
+    let short_description = skill
+        .short_description
+        .as_deref()
+        .unwrap_or_default()
+        .to_lowercase();
     let description = skill
         .description
         .as_deref()
@@ -894,8 +889,16 @@ fn search_score(skill: &Skill, query: &str, terms: &[String]) -> usize {
     } else if name.contains(query) {
         score += 2_000;
     }
-    if description.contains(query) {
+    if display_name == query {
+        score += 8_000;
+    } else if display_name.contains(query) {
+        score += 1_500;
+    }
+    if short_description.contains(query) {
         score += 1_000;
+    }
+    if description.contains(query) {
+        score += 500;
     }
 
     for term in terms {
@@ -909,11 +912,37 @@ fn search_score(skill: &Skill, query: &str, terms: &[String]) -> usize {
         } else if name.contains(term) {
             score += 150;
         }
+        if display_name
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|part| part == term)
+        {
+            score += 125;
+        } else if display_name.contains(term) {
+            score += 75;
+        }
+        if short_description.contains(term) {
+            score += 60;
+        }
         if description.contains(term) {
-            score += 50;
+            score += 30;
         }
     }
     score
+}
+
+fn display_catalog_entry(skill: &Skill, include_source: bool) -> String {
+    let display_name = skill.catalog_display_name();
+    let title = if display_name == skill.name {
+        skill.name.clone()
+    } else {
+        format!("{} ({display_name})", skill.name)
+    };
+    let description = display_description(skill.catalog_description().unwrap_or_default());
+    if include_source {
+        format!("- {title}: {description} (source: `{}`)", skill.location)
+    } else {
+        format!("- {title}: {description}")
+    }
 }
 
 fn display_description(description: &str) -> String {

@@ -24,5 +24,10 @@ or extension manifests.
    from another agent product's configuration or from a catalog-only entry.
 6. Preserve project and global scope. State whether a restart is required before
    claiming a disk configuration change is active.
-7. Keep process-local extensions distinct from static extension manifests and
+7. For a large Skill library, preserve atomic packages and control discovery
+   instead of merging unrelated instructions. Use ordered `skills.config` path
+   rules to disable an exact source or assign `index`, `search`, or `explicit`
+   exposure. Inspect `agents/openai.yaml` and `agents/zuno.yaml` before
+   overriding sidecar policy; user path configuration has final precedence.
+8. Keep process-local extensions distinct from static extension manifests and
    never imply that a Skill owns the runtime lifecycle.

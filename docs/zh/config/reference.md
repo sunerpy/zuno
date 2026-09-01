@@ -270,8 +270,14 @@ ZUNO_SANDBOX_ON_UNAVAILABLE=run-unconfined zuno
 | `includeInstructions` | boolean | 是否把 Skill 指令纳入提示词 |
 | `maxContextTokens` | number | Skill 目录的 token 预算 |
 | `maxSelectedContextTokens` | number | 已选中 Skill 正文的 token 预算 |
+| `config` | array | 按路径启停 Skill，或设置 `index` / `search` / `explicit` 暴露方式 |
 
-编写 Skill 的目录结构与 frontmatter 见 [编写 Skill](/zh/config/authoring-skills)。
+已知模型窗口的默认元数据字符预算是上下文数值的约 2%；窗口未知时回退为约
+8,000 个字符。显式 `maxContextTokens` 会换算为近似字符预算，并最多按
+10,000 token 计算。`config` 条目按顺序应用，最后一个路径匹配项获胜，并支持
+对一个子树递归设置。`agents/openai.yaml` 可控制共享显示元数据与隐式调用，
+`agents/zuno.yaml` 可覆盖这些字段并设置原生 exposure。完整目录结构、字段与
+优先级见 [编写 Skill](/zh/config/authoring-skills)。
 
 ## 可复用工作流：Skill 与 Markdown 命令
 
