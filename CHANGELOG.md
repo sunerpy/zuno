@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.0](https://github.com/sunerpy/zuno/compare/v0.1.0...v0.2.0) (2026-09-01)
+
+
+### Features
+
+* **cli:** harden cross-platform setup and release ([ff26de1](https://github.com/sunerpy/zuno/commit/ff26de1c17566099caca56d39016cd07ea99a3b1))
+* **cli:** harden cross-platform setup and release ([a880bca](https://github.com/sunerpy/zuno/commit/a880bca1afa75c83f472449c716a1c37f5fb69c5))
+
+
+### Bug Fixes
+
+* **release:** invoke macOS lipo with input first ([2978f3a](https://github.com/sunerpy/zuno/commit/2978f3a279609bf86075df0896aa2d81166df2d6))
+* **release:** invoke macOS lipo with input first ([97c6fe0](https://github.com/sunerpy/zuno/commit/97c6fe0fda01d78070c8603aacc2db720a8f0c2e))
+* **release:** separate certification from auto merge ([cfc90f5](https://github.com/sunerpy/zuno/commit/cfc90f50b515fdf06cbd0f2ac6ce5e5daf9072df))
+
 ## [0.1.0](https://github.com/sunerpy/zuno/compare/v0.0.3...v0.1.0) (2026-09-01)
 
 
