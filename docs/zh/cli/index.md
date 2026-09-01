@@ -49,7 +49,7 @@ zuno <command> --help
 | --- | --- |
 | [`zuno self-update`](/zh/cli/self-update) | 用一份经校验和验证的 GitHub release 替换正在运行的可执行文件。 |
 | [`zuno debug`](/zh/cli/debug) | 检视路径、解析后的配置、提示、权限、沙箱与快照。 |
-| [`zuno completion`](/zh/cli/completion) | 输出 bash、elvish、fish、powershell 或 zsh 的 Shell 补全语法。 |
+| [`zuno completion`](/zh/cli/completion) | 生成或安装 bash、elvish、fish、powershell 或 zsh 的 Shell 补全。 |
 
 ## 已排除
 

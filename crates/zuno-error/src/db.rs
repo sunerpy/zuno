@@ -29,9 +29,9 @@ pub enum DbError {
         source: BoxSource,
     },
 
-    /// The file belongs to another unreleased schema format.
+    /// The file belongs to another unsupported schema format.
     #[error(
-        "database uses an unsupported pre-release schema format (expected {expected}, observed {observed:?}); rebuild the Zuno database"
+        "database uses an unsupported schema format (expected {expected}, observed {observed:?}); preserve the database and use a compatible Zuno version or a validated forward migration"
     )]
     SchemaMismatch {
         expected: u32,
@@ -198,7 +198,9 @@ mod tests {
         let message = e.to_string();
         assert!(message.contains("expected 7"), "{message}");
         assert!(message.contains("Some(9)"), "{message}");
-        assert!(message.contains("rebuild"), "{message}");
+        assert!(message.contains("preserve the database"), "{message}");
+        assert!(message.contains("validated forward migration"), "{message}");
+        assert!(!message.contains("rebuild"), "{message}");
         assert!(!e.is_retryable());
     }
 

@@ -1,46 +1,75 @@
 # 安装
 
-Zuno 每个平台只发布一个可执行文件。安装就是三件事：把二进制文件放到 `PATH` 上、校验它的 checksum、确认 `rg` 可用。其他什么都不需要安装，也不需要维护版本对齐。
+Zuno 在每个平台上发布一个可执行文件。预编译二进制无需 Node、Python、ripgrep 或
+bubblewrap，就能启动、加载配置、打开数据库、连接 Provider，并提供 TUI、headless、
+ACP 与 HTTP 客户端。
 
-## 前置条件
+## 依赖边界
 
-| 前置条件 | 原因 |
+| 前置条件 | 作用范围 |
 | --- | --- |
-| Linux、macOS 或 Windows | 见下面的发布目标 |
-| `rg`（ripgrep）14 或更新 | `glob` 与 `grep` 驱动真正的 ripgrep 可执行文件 |
-| `bwrap`（bubblewrap）0.8.0 或更新，仅 Linux | `read-only` 与 `workspace-write` 沙箱后端需要 |
-| `curl` 或 `wget`，以及 `tar` | 仅 shell 安装脚本需要 |
+| Linux、macOS 或 Windows | 支持的发布宿主见下表 |
+| `rg`（ripgrep）14 或更新 | 只作为 `glob` 与 `grep` 工具后端；不是 Zuno 启动或核心运行依赖 |
+| `bwrap`（bubblewrap）0.8.0 或更新 | 只作为 Linux 上 `read-only` 与 `workspace-write` 的受约束 Shell 后端 |
+| `curl` 或 `wget`、`tar`、`sha256sum` 或 `shasum` | 仅 Linux/macOS 安装器需要 |
+| Windows PowerShell 5.1 或 PowerShell 7 | Windows 安装器使用 `Invoke-WebRequest`、`Get-FileHash` 与 `Expand-Archive` |
 
-在 Linux 上如果没有可用的约束后端，受限沙箱模式默认失败即拒绝。在依赖任一受约束模式
-之前先安装 bubblewrap，并用 `zuno debug sandbox` 验证。有意不使用 OS 约束的受信部署，
-可以改为显式选择 `danger-full-access`，或把 `sandbox.onUnavailable` 设为
-`run-unconfined`，仅对符合条件、具备写能力的 `workspace-write` 请求降级。精确边界、
-完整探测项清单以及 Ubuntu AppArmor 这个特例见[权限与沙箱](/zh/guide/permissions)。
+没有 `rg` 时 Zuno 仍能启动，只有真正调用 `glob` 或 `grep` 的操作缺少后端。没有
+`bwrap` 时 Linux 无法提供受约束执行，但这不会阻止 Zuno 本身启动，也不会阻止显式
+受信的原生执行模式。
 
-## 安装脚本
+### 各平台沙箱行为
 
-安装脚本会下载发布归档及其 `SHA256SUMS`，比对该确切资产的摘要，不匹配时拒绝解包。checksum 校验失败是硬错误，绝不只是警告。
+| 平台 | 受约束的 `read-only` / `workspace-write` | 原生执行 |
+| --- | --- | --- |
+| Linux | 需要受信的 bubblewrap 0.8.0 或更新版本 | 显式 `danger-full-access`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
+| macOS | 尚未实现 | 显式 `danger-full-access`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
+| Windows | 尚未实现 | 显式 `danger-full-access`，或符合条件且受信的 `workspace-write` `run-unconfined` 降级 |
+
+`run-unconfined` 不是通用的“忽略沙箱”开关。它只在具备写能力的
+`workspace-write` 请求遇到 typed、符合条件的后端不可用错误时生效。`read-only`
+永不降级，仍然失败即拒绝。参见[权限与沙箱](/zh/guide/permissions)。
+
+## Release 安装器
+
+安装器会下载发布归档与 `SHA256SUMS`，只选取该确切资产对应的行，比对 SHA-256，
+任何不匹配都会在解包前失败。
+
+### Linux 与 macOS
+
+Shell 安装器通过 `uname` 选择 x86_64 或 aarch64，需要 `curl` 或 `wget`、`tar`，
+以及 `sha256sum` 或 `shasum`。默认安装到 `$HOME/.local/bin`：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh | sh
 ```
 
+固定版本或安装目录：
+
+```sh
+ZUNO_VERSION=v0.1.0 \
+ZUNO_INSTALL_DIR="$HOME/bin" \
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh)"
+```
+
+### Windows
+
+在 Windows PowerShell 5.1 或 PowerShell 7 中运行。Windows 只发布 x86_64 MSVC
+目标，默认安装到 `$env:LOCALAPPDATA\Programs\zuno`：
+
 ```powershell
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-两个安装脚本都读取两个环境变量：
+固定版本或安装目录：
 
-| 变量 | 含义 | 默认值 |
-| --- | --- | --- |
-| `ZUNO_VERSION` | 要安装的发布版本，带或不带前导 `v` 均可 | 最新已发布版本 |
-| `ZUNO_INSTALL_DIR` | 目标目录 | `$HOME/.local/bin`；Windows 上为 `%LOCALAPPDATA%\Programs\zuno` |
-
-```sh
-ZUNO_VERSION=v0.0.1 ZUNO_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.sh)"
+```powershell
+$env:ZUNO_VERSION = "v0.1.0"
+$env:ZUNO_INSTALL_DIR = Join-Path $HOME "bin"
+irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-如果目标目录还不在 `PATH` 上，安装脚本会打印需要添加的那一行。
+目标目录不在 `PATH` 时，安装器会打印需要添加的值。修改用户 `PATH` 后请打开新终端。
 
 ## 发布目标
 
@@ -52,85 +81,176 @@ ZUNO_VERSION=v0.0.1 ZUNO_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw
 | macOS aarch64 | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
 
-Linux 始终使用静态 musl 产物。`aarch64-pc-windows-msvc` 是有意缺失的：没有可用的 runner 能执行该产物，而流水线不会发布一个自己从未运行过的二进制文件。
+Linux 使用静态 musl 产物。当前没有发布 Windows aarch64 产物。
 
-## 手动下载与校验
+## 手动下载与 checksum 校验
 
-手动做就是安装脚本执行的那三步，在策略禁止把远程脚本管道给 shell 时，这是正确选择。
+如果策略禁止把远程脚本通过管道交给 shell，就手动复现安装器步骤。Linux x86_64：
 
 ```sh
-version=0.0.1
+version=0.1.0
 target=x86_64-unknown-linux-musl
+asset="zuno-${version}-${target}.tar.gz"
 base="https://github.com/sunerpy/zuno/releases/download/v${version}"
 
-curl -fsSLO "${base}/zuno-${version}-${target}.tar.gz"
+curl -fsSLO "${base}/${asset}"
 curl -fsSLO "${base}/SHA256SUMS"
-
-grep " zuno-${version}-${target}.tar.gz\$" SHA256SUMS | sha256sum --check -
-tar -xzf "zuno-${version}-${target}.tar.gz"
+grep " ${asset}\$" SHA256SUMS | sha256sum --check -
+tar -xzf "$asset"
 install -m 755 zuno "$HOME/.local/bin/zuno"
 ```
 
-要校验你所用那个确切资产的摘要。否则，一个列出了五个归档的 `SHA256SUMS` 文件可以被用来「校验」另一个归档。
+Windows x86_64：
+
+```powershell
+$version = "0.1.0"
+$asset = "zuno-$version-x86_64-pc-windows-msvc.zip"
+$base = "https://github.com/sunerpy/zuno/releases/download/v$version"
+
+Invoke-WebRequest "$base/$asset" -OutFile $asset
+Invoke-WebRequest "$base/SHA256SUMS" -OutFile SHA256SUMS
+$line = Get-Content SHA256SUMS |
+  Where-Object { $_ -match "\s\*?$([Regex]::Escape($asset))$" } |
+  Select-Object -First 1
+if (-not $line) { throw "$asset is absent from SHA256SUMS" }
+$expected = ($line -split "\s+")[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "checksum mismatch for $asset" }
+Expand-Archive $asset -DestinationPath .
+```
+
+必须匹配确切资产名。包含多个归档的 checksum 文件不能当作另一个文件的校验证明。
+
+## 配置与数据路径
+
+Zuno 在所有平台上都使用自己的 XDG 风格布局，包括 macOS 与 Windows：
+
+| 平台 | 默认配置目录 | 默认持久数据目录 |
+| --- | --- | --- |
+| Linux | `${XDG_CONFIG_HOME:-$HOME/.config}/zuno` | `${XDG_DATA_HOME:-$HOME/.local/share}/zuno` |
+| macOS | `${XDG_CONFIG_HOME:-$HOME/.config}/zuno` | `${XDG_DATA_HOME:-$HOME/.local/share}/zuno` |
+| Windows | `$HOME\.config\zuno` | `$HOME\.local\share\zuno` |
+
+Windows 配置不会自动放到 `%APPDATA%`。受管部署需要其他根目录时，可以设置
+`XDG_CONFIG_HOME` 或 `ZUNO_CONFIG_DIR`。`ZUNO_CONFIG_DIR` 会增加最后一个更高优先级
+的配置目录；使用 `zuno debug paths` 和 `zuno debug config` 核对解析结果。
+
+PowerShell 示例：
+
+```powershell
+$config = Join-Path $HOME ".config\zuno"
+New-Item -ItemType Directory -Force -Path $config | Out-Null
+Copy-Item .\examples\config\zuno.json (Join-Path $config "zuno.json")
+notepad (Join-Path $config "zuno.json")
+
+# 可选的切换式覆盖层：
+$env:ZUNO_CONFIG_DIR = Join-Path $config "profiles\work"
+zuno debug paths
+zuno debug config
+```
 
 ## 从源码构建
 
-源码构建适用于本地开发，或者发布矩阵未覆盖的目标平台。
+源码构建需要：
+
+- Git；
+- Rust 1.98.0 与 Cargo；仓库门禁还需要 `rustfmt` 和 Clippy；
+- 可用的 C 编译器和原生 linker，因为 bundled SQLite 与 `aws-lc-sys` 会构建原生代码；
+- Linux：GCC 或 Clang，以及正常工作的原生 linker；
+- macOS：Xcode Command Line Tools（`xcode-select --install`）；
+- Windows：Visual Studio 2022 Build Tools、MSVC v143 C++ 工具链与 Windows SDK，
+  并在 x64 developer 环境中运行。
+
+ripgrep 与 bubblewrap 是前述运行时工具/后端依赖，不是源码编译前置。
+
+```sh
+rustup toolchain install 1.98.0 --component rustfmt clippy
+git clone https://github.com/sunerpy/zuno.git
+cd zuno
+cargo build --locked -p zuno-cli --bin zuno
+cargo test -p zuno-cli --test docs
+```
+
+直接通过 Cargo 安装：
 
 ```sh
 cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
 ```
 
-源码构建没有 channel define，所以它的 channel 是 `local`，打开的是 `zuno-local.db` 而不是发布版的 `zuno.db`。在已安装的发布版与源码构建之间切换后立刻看到空的会话列表，是这个原因，不是数据丢了。如何让一个构建指向另一个的数据库，见[数据库生命周期](/zh/operate/migration)。
+源码构建的 channel 是 `local`，通常打开 `zuno-local.db`；发布版打开 `zuno.db`。
+切换构建后会话列表看似为空，通常只是选中了不同的 channel 数据库。参见
+[数据库生命周期](/zh/operate/migration)。
 
-## 确认安装结果
+## 验证安装
+
+Linux 与 macOS：
 
 ```sh
+command -v zuno
 zuno --version
 zuno debug paths
+```
+
+Windows PowerShell：
+
+```powershell
+Get-Command zuno
+zuno --version
+zuno debug paths
+```
+
+单独验证可选工具后端：
+
+```sh
+rg --version
+# 仅 Linux 受约束模式：
+bwrap --version
 zuno debug sandbox --mode workspace-write --check
 ```
 
-`debug paths` 打印解析出的各个根目录，这是确认这个可执行文件实际使用哪些配置和数据目录的方式：
+macOS 与 Windows 上，受约束的 `workspace-write` 检查应报告 OS 后端尚未实现。若只想
+验证显式原生路径而不运行模型任务：
 
-```text
-home       /config
-data       /config/.local/share/zuno
-bin        /config/.cache/zuno/bin
-log        /config/.local/share/zuno/log
-repos      /config/.local/share/zuno/repos
-cache      /config/.cache/zuno
-config     /config/.config/zuno
-state      /config/.local/state/zuno
-tmp        /tmp/zuno
+```powershell
+zuno debug sandbox --mode danger-full-access --check
 ```
-
-当请求的策略无法部署时，`debug sandbox --check` 会以失败退出，因此它可以当作部署门禁使用，而不是让人用眼睛去读。
 
 ## Shell 补全
 
+可以先把脚本生成到 stdout，供检查或手工放置：
+
 ```sh
-zuno completion zsh > "${fpath[1]}/_zuno"
-zuno completion bash > /etc/bash_completion.d/zuno
+zuno completion bash
 ```
 
-支持 `bash`、`elvish`、`fish`、`powershell` 和 `zsh`。参见 [zuno completion](/zh/cli/completion)。
+也可以安装到当前用户确定的补全目录：
+
+```sh
+zuno completion bash --install
+zuno completion zsh --install
+zuno completion fish --install
+zuno completion powershell --install
+zuno completion elvish --install
+```
+
+安装只会创建或原子替换补全文件，不会编辑任何 Shell profile；命令会打印安装路径与激活
+说明。参见 [Shell 补全](/zh/cli/completion)。
 
 ## 升级
 
 ```sh
 zuno self-update --check
 zuno self-update
-zuno self-update --tag v0.0.1
+zuno self-update --tag v0.1.0
 ```
 
-`self-update` 用一个经 checksum 校验的 GitHub release 替换正在运行的可执行文件。它会下载 `SHA256SUMS`，要求所选归档恰好有一条摘要，并且在任何不匹配的情况下都在触碰当前可执行文件之前停止。没有 `--yes` 时，非交互式调用会失败即拒绝，而不是静默替换二进制文件。
-
-如果可执行文件路径属于另一个用户，请重新安装到一个可写的 `PATH` 目录，例如 `$HOME/.local/bin`，而不是用提升的权限运行更新器。参见[自更新](/zh/operate/self-update)。
+`self-update` 会先校验确切归档，再原子替换可执行文件。非交互式替换需要 `--yes`。
+如果可执行文件不可写，请安装到用户拥有的目录，不要提升 updater 权限。参见
+[自更新](/zh/operate/self-update)。
 
 ## 卸载
 
-没有一个真会干活的 `zuno uninstall`；这个命令存在只是为了说明这件事。请自己移除各个部分：
+可执行文件、配置和持久数据需要分别移除。删除数据根目录会丢弃会话数据库、日志和凭据。
 
 ```sh
 rm "$HOME/.local/bin/zuno"
@@ -139,17 +259,22 @@ rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/zuno"
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/zuno"
 ```
 
-数据根目录保存会话数据库、日志和凭据存储，所以移除它会丢弃持久的会话历史。如果其中任何内容还有用，先导出：
+Windows PowerShell：
 
-```sh
-zuno export "$HOME/zuno-backup.zuno-bundle"
+```powershell
+Remove-Item (Join-Path $env:LOCALAPPDATA "Programs\zuno\zuno.exe")
+# 仅在确定不再需要配置和历史时删除：
+Remove-Item -Recurse -Force (Join-Path $HOME ".config\zuno")
+Remove-Item -Recurse -Force (Join-Path $HOME ".local\share\zuno")
+Remove-Item -Recurse -Force (Join-Path $HOME ".cache\zuno")
 ```
 
-默认 bundle 携带配置、Skill、扩展和 Agent，并有意排除会话数据库与凭据存储。参见[可移植 bundle](/zh/operate/portable-bundles)。
+删除持久数据前先导出需要保留的内容。可移植 bundle 有意排除会话数据库与凭据存储；
+参见[可移植 bundle](/zh/operate/portable-bundles)。
 
 ## 参见
 
 - [快速开始](/zh/guide/quick-start)
+- [权限与沙箱](/zh/guide/permissions)
 - [自更新](/zh/operate/self-update)
-- [可移植 bundle](/zh/operate/portable-bundles)
 - [数据库生命周期](/zh/operate/migration)

@@ -1267,9 +1267,10 @@ Every value is validated in `1..=64`.
 `glob` and `grep` use the official `rg` executable as their only search engine.
 Zuno contributes a thin adapter for typed arguments, cancellation, bounded JSON
 decoding, stable ordering, and result shaping; it does not maintain a second
-ripgrep-compatible walker. `rg` major version 14 or newer must be available on
-`PATH` (or packaged beside Zuno by a distributor). Missing or unsupported
-ripgrep is a startup error for the tool runtime, never a silent fallback.
+ripgrep-compatible walker. Discovery is lazy, so unrelated commands and tools do
+not require ripgrep. When either search tool is invoked, `rg` major version 14 or
+newer must be available on `PATH` (or packaged beside Zuno by a distributor);
+missing or unsupported ripgrep is a typed tool error, never a silent fallback.
 
 The Shell tool is admitted through tree-sitter command analysis, the deterministic
 destructive-command gate, and permission checks, then compiled by the selected

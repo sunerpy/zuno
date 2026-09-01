@@ -21,8 +21,8 @@ Zuno is a local coding agent with a built-in terminal interface, headless execut
 ACP support, and HTTP serving. It stores sessions in SQLite and runs as a native Rust
 binary; Node and Python are not part of the runtime.
 
-The project is in active pre-release development. Zuno defines its own configuration,
-commands, data formats, tool arguments, and extension protocol.
+The project is in active early-stage 0.x development. Zuno defines its own
+configuration, commands, data formats, tool arguments, and extension protocol.
 
 ## Why Zuno
 
@@ -59,16 +59,26 @@ To build from source:
 cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
 ```
 
-Zuno requires `rg` (ripgrep) 14 or newer. Confined Shell execution on Linux also
-requires bubblewrap 0.8.0 or newer. See
-[Installation](./docs/guide/installation.md) for release targets, manual checksum
-verification, and sandbox requirements.
+`rg` (ripgrep) 14 or newer is required only when the `glob` or `grep` tool is used;
+it is not a Zuno startup or core-runtime dependency. Bubblewrap 0.8.0 or newer is
+required only for confined `read-only` and `workspace-write` Shell execution on
+Linux. Explicit `danger-full-access` runs natively, as can an eligible, trusted
+`workspace-write` `run-unconfined` fallback. macOS and Windows currently use those
+native paths because no confined backend is implemented there. See
+[Installation](./docs/guide/installation.md) for platform tools, configuration
+paths, release targets, checksum verification, and source-build prerequisites.
 
 An installed release can update itself:
 
 ```sh
 zuno self-update --check
 zuno self-update
+```
+
+Install completion for the current user without editing a shell profile:
+
+```sh
+zuno completion zsh --install
 ```
 
 The complete update contract is documented in
@@ -88,15 +98,31 @@ zuno debug config
 zuno models myopenai --verbose
 ```
 
+On Windows PowerShell the default configuration path is
+`$HOME\.config\zuno\zuno.json`:
+
+```powershell
+$config = Join-Path $HOME ".config\zuno"
+New-Item -ItemType Directory -Force -Path $config | Out-Null
+Copy-Item examples\config\zuno.json (Join-Path $config "zuno.json")
+notepad (Join-Path $config "zuno.json")
+$env:MYOPENAI_API_KEY | zuno providers login --provider myopenai
+zuno debug config
+zuno models myopenai --verbose
+```
+
 The example uses the native `openai` transport. For a prebuilt installation without a
 source checkout, copy the contents of
 [`examples/config/zuno.json`](./examples/config/zuno.json) into the same config path.
 
-Verify the full path with a read-only run:
+On Linux with working confinement, verify the full path with a read-only run:
 
 ```sh
 zuno run --agent plan "summarize this repository's architecture"
 ```
+
+On macOS or Windows, or on a trusted Linux host without confinement, use the explicit
+native path documented in [Quick start](./docs/guide/quick-start.md).
 
 Then start the terminal application or run a bounded task directly:
 

@@ -68,20 +68,29 @@ cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
 
 :::
 
-Zuno 需要 ripgrep 14 或更新版本。Linux 上的受限 Shell 还需要 bubblewrap 0.8.0
-或更新版本。安装器会使用 `SHA256SUMS` 校验所选 release 的归档。
+ripgrep 14 或更新版本只是 `glob` 与 `grep` 工具的后端，不是 Zuno 启动或核心运行
+依赖。bubblewrap 0.8.0 或更新版本也只用于 Linux 上受约束的 `read-only` 与
+`workspace-write` Shell。显式 `danger-full-access`，以及符合条件且受信的
+`workspace-write` `run-unconfined` 降级，都走原生执行。macOS 与 Windows 当前没有
+受约束后端。安装器会使用 `SHA256SUMS` 校验所选 release 的归档。
 
 ## 开始运行
 
-配置 Provider 后，先用只读的 `plan` Agent 验证模型和工具链路，再允许写入：
+配置 Provider 后，先验证配置与模型目录：
 
 ```sh
 zuno debug config
 zuno models myopenai --verbose
+```
+
+在具备可用约束后端的 Linux 上，再用只读的 `plan` Agent 验证完整模型与工具链路：
+
+```sh
 zuno run --agent plan "概述这个仓库的架构"
 ```
 
-需要交付改动时：
+macOS、Windows，或没有约束后端的受信 Linux 宿主，应按
+[快速开始](/zh/guide/quick-start)显式选择原生执行路径。需要交付改动时：
 
 ```sh
 zuno run "为 users 接口增加分页并运行测试"

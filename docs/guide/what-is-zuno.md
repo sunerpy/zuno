@@ -78,15 +78,17 @@ services and effects through a `HarnessProfile`; profile replacement validates t
 profile before publication and rolls back failed mounts in reverse order.
 
 Extensions can contribute agents, workflows, Skills, WASI components, or contained
-process tools. Zuno does not load Rust dynamic libraries. The only required external
-runtime tool is `rg` (ripgrep) 14 or newer for `glob` and `grep`.
+process tools. Zuno does not load Rust dynamic libraries. `glob` and `grep` use an
+external `rg` (ripgrep) 14 or newer, but its absence does not prevent Zuno or unrelated
+tools from starting; the search tools report the missing capability when invoked.
 
 See [Harness Runtime](/harness-runtime), [Plugins and extensions](/plugins), and the
 [Harness comparison](https://github.com/sunerpy/zuno/blob/main/docs/design/harness-comparison.md).
 
 ## Current boundaries
 
-- Zuno is in pre-release development; data and extension formats may change.
+- Zuno is in early 0.x development; data and extension formats may change through
+  documented versioning and migration boundaries.
 - It is a local CLI and server, not a hosted coding service.
 - It uses Zuno configuration and protocols rather than compatibility layers for other
   coding agents.

@@ -1,8 +1,8 @@
 # zuno completion
 
-`zuno completion` 把某一个 Shell 的补全脚本打印到 stdout。它不写磁盘，也不编辑任何 Shell
-配置，所以输出去哪儿由你决定：直接为当前 Shell source，或者保存到你的 Shell 已经会加载的
-补全目录里。
+`zuno completion` 根据 Zuno 当前的命令树生成补全。默认把脚本写到 stdout；使用
+`--install` 时，Zuno 会把它原子写入当前用户确定的目录，并打印激活说明。命令绝不会
+编辑 Shell profile。
 
 ## 用法
 
@@ -14,12 +14,13 @@ zuno completion [OPTIONS] <SHELL>
 
 | 参数 | 说明 |
 | --- | --- |
-| `<SHELL>` | 应输出其补全语法的 Shell。可选值：`bash`、`elvish`、`fish`、`powershell`、`zsh` |
+| `<SHELL>` | 要生成的补全语法。可选值：`bash`、`elvish`、`fish`、`powershell`、`zsh` |
 
 ## 选项
 
 | 选项 | 说明 | 默认值 |
 | --- | --- | --- |
+| `--install` | 为当前用户安装，而不是把脚本写到 stdout | |
 | `-v`, `--version` | 显示 Zuno 包版本 | |
 | `--print-logs` | 除结构化本地日志存储之外，同时把日志打印到 stderr | |
 | `--log-level <LOG_LEVEL>` | 设置最低日志级别。可选值：`TRACE`、`DEBUG`、`INFO`、`WARN`、`ERROR` | |
@@ -27,34 +28,58 @@ zuno completion [OPTIONS] <SHELL>
 | `--sandbox-on-unavailable <ACTION>` | 选择受限 Shell 无法部署时的处理方式。可选值：`deny`、`run-unconfined` | `deny` |
 | `-h`, `--help` | 打印帮助（用 `-h` 查看摘要） | |
 
+## 安装路径
+
+| Shell | 用户级路径 |
+| --- | --- |
+| Bash | `$XDG_DATA_HOME/bash-completion/completions/zuno`，通常为 `~/.local/share/bash-completion/completions/zuno` |
+| Zsh | `~/.zsh/completions/_zuno` |
+| Fish | `$XDG_CONFIG_HOME/fish/completions/zuno.fish`，通常为 `~/.config/fish/completions/zuno.fish` |
+| PowerShell | `%LOCALAPPDATA%\zuno\completions\_zuno.ps1`；没有 `LOCALAPPDATA` 时使用 XDG data 路径 |
+| Elvish | `$XDG_CONFIG_HOME/elvish/lib/zuno.elv`，通常为 `~/.config/elvish/lib/zuno.elv` |
+
+路径按宿主原生路径处理，Unix 上可以包含非 UTF-8 部分。重复安装只替换补全文件；不会修改
+`.bashrc`、`.zshrc`、PowerShell profile 或其他启动文件。
+
 ## 示例
 
-把 bash 脚本打印到 stdout，在安装任何东西之前先检查它。
+只检查或临时 source 生成结果，不安装：
 
 ```sh
 zuno completion bash
-```
-
-只为当前 bash Shell 启用补全，不触碰配置文件。
-
-```sh
 source <(zuno completion bash)
 ```
 
-把 zsh 脚本安装到你的 Shell 已经会加载的补全目录中。
+安装 zsh 补全，然后在 `compinit` 前把目录加入 `fpath`：
 
 ```sh
-zuno completion zsh > ~/.zsh/completions/_zuno
+zuno completion zsh --install
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
 ```
 
-把 fish 脚本安装到标准的用户补全目录中。
+Fish 会自动发现已安装的用户补全：
 
 ```sh
-zuno completion fish > ~/.config/fish/completions/zuno.fish
+zuno completion fish --install
+```
+
+PowerShell 安装会打印确切脚本路径。可在当前会话中 dot-source，或自行写入受管理的 profile：
+
+```powershell
+zuno completion powershell --install
+. "$env:LOCALAPPDATA\zuno\completions\_zuno.ps1"
+```
+
+Elvish：
+
+```sh
+zuno completion elvish --install
+use zuno
 ```
 
 ## 参见
 
+- [安装](/zh/guide/installation)
 - [CLI 参考](/zh/cli/)
 - [全局选项](/zh/cli/global-options)
-- [FAQ](/zh/operate/faq)

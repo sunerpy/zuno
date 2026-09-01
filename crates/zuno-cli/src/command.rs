@@ -741,12 +741,15 @@ pub enum DebugSnapshotCommand {
     Diff { hash: String },
 }
 
-/// Generate a shell completion script from Zuno's current clap command tree.
+/// Generate or install shell completion from Zuno's current clap command tree.
 #[derive(Debug, Clone, Args)]
 pub struct CompletionArgs {
     /// Shell whose completion syntax should be emitted.
     #[arg(value_enum, value_name = "SHELL")]
     pub shell: clap_complete::Shell,
+    /// Install the script into this user's deterministic completion directory.
+    #[arg(long)]
+    pub install: bool,
 }
 
 /// Update the running executable from a verified GitHub release.
@@ -805,7 +808,7 @@ pub enum Command {
     Db(DbArgs),
     /// Diagnostics and introspection.
     Debug(DebugArgs),
-    /// Generate shell completion output.
+    /// Generate or install shell completion.
     Completion(CompletionArgs),
     /// Update Zuno in place from a checksum-verified GitHub release.
     SelfUpdate(SelfUpdateArgs),

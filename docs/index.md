@@ -69,22 +69,32 @@ cargo install --git https://github.com/sunerpy/zuno zuno-cli --locked
 
 :::
 
-Zuno requires ripgrep 14 or newer. Linux hosts also need bubblewrap 0.8.0 or newer
-for confined Shell modes. The installer verifies the selected release archive against
-its `SHA256SUMS`.
+Ripgrep 14 or newer is only the backend for the `glob` and `grep` tools; it is not
+required to start Zuno or use the core runtime. Bubblewrap 0.8.0 or newer is only
+the Linux backend for confined `read-only` and `workspace-write` Shell modes.
+Explicit `danger-full-access` and an eligible trusted `workspace-write`
+`run-unconfined` fallback execute natively. macOS and Windows currently have no
+confined backend. The installer verifies the selected release archive against its
+`SHA256SUMS`.
 
 ## Start a run
 
-Configure a provider, then use the read-only `plan` agent to verify the model and tool
-path before allowing writes:
+Configure a provider and verify its model catalog first:
 
 ```sh
 zuno debug config
 zuno models myopenai --verbose
+```
+
+On Linux with working confinement, use the read-only `plan` agent to verify the full
+model and tool path before allowing writes:
+
+```sh
 zuno run --agent plan "summarize this repository's architecture"
 ```
 
-For delivery work:
+On macOS or Windows, or on a trusted Linux host without confinement, follow the
+[Quick start](/guide/quick-start) native-execution guidance. For delivery work:
 
 ```sh
 zuno run "add pagination to the users endpoint and run the tests"

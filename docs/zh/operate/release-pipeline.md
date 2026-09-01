@@ -10,8 +10,9 @@ Zuno 的发布产物只构建一次。release-please PR 会在其精确 head com
 - `release.yml` 负责 release-please、精确候选调度、发布身份校验和最终发布；它不安装 Rust，
   也不编译二进制。
 - `release-candidate.yml` 负责完整测试和五个发布目标。每个目标在同一 job 中共同构建
-  `zuno` 与 `zuno-smoke`，打包并解包归档，在原生架构上执行归档内二进制，生成 provenance，
-  最后才上传产物。
+  `zuno` 与 `zuno-smoke`，打包并解包归档，校验精确可执行架构并运行归档内二进制，生成
+  provenance，最后才上传产物。Linux、Windows 和 arm64 macOS 原生执行；
+  x86_64 macOS 在 `macos-15` Arm64 runner 上通过 Rosetta 2 执行。
 
 Linux 源码门禁安装固定版本的 `cargo-nextest`。Linux 的 Clippy 与测试在同一 job 内复用
 本地 target；原生 Windows 的 Clippy 与测试拆成两个并行 job，避免在测试执行前形成全局
@@ -43,8 +44,17 @@ MSVC 版 `zuno.exe` 通过仅作用于该二进制的 build-script linker 参数
 全局 `RUSTFLAGS`，因此库和约两百个测试二进制仍可复用原有编译缓存身份。
 
 两个工作流都使用固定提交的官方 sccache action 及其 GitHub Actions 后端。CI 设置
-`CARGO_INCREMENTAL=0`，Cargo registry/Git 下载使用按平台隔离的缓存；不上传原始
-`target/`，避免 Cargo 文件锁竞争和跨 job 陈旧产物。
+`CARGO_INCREMENTAL=0`，Cargo registry/Git 下载使用按平台隔离的缓存。普通 CI、候选测试、
+Linux 发布目标和 Windows 发布目标都设置 `cache-targets: false`，不会上传大型 `target/`
+目录。只有两个 macOS 候选 leg 启用 Rust 依赖 target 缓存；缓存 key 包含精确 Rust target，
+并显式设置 `cache-workspace-crates: false`，因此 `x86_64-apple-darwin` 与
+`aarch64-apple-darwin` 不会相互恢复对方的 target 产物。
+
+Artifact 传输固定到 `actions/upload-artifact` v7.0.1 和
+`actions/download-artifact` v8.0.1 的精确提交，这两个 action 使用 Node 24 runtime。
+Linux musl leg 不再使用基于 Node 的 Zig setup action；`.github/scripts/install-zig.sh`
+会按 Linux runner 的 x86_64 或 aarch64 架构选择 Zig 0.13.0 官方归档，并在解压前使用
+硬编码的官方 SHA-256 校验。
 
 Linux 作业会安装发行版提供的 `bwrap-userns-restrict` AppArmor profile，并在运行 Zuno 前
 分别验证 user/mount/PID namespace 路径和 network namespace 路径。它不会关闭 Ubuntu
@@ -55,6 +65,12 @@ Linux 作业会安装发行版提供的 `bwrap-userns-restrict` AppArmor profile
 随后通过 `cargo-zigbuild` 链接全部 Windows GNU 测试二进制但不执行。这条交叉检查可以在本地发现 Windows
 条件编译与链接错误，但无法证明 MSVC、ConPTY、Windows Job Object 或 hosted runner
 的 loopback 行为，因此原生 Windows CI 仍是最终证据。
+
+两个 macOS 发布目标仍保留精确 Rust triple。`x86_64-apple-darwin` leg 在
+`macos-15` Arm64 runner 上交叉构建，先通过 `lipo` 校验 `zuno` 与 `zuno-smoke`，
+再用 `arch -x86_64` 运行 x86_64 smoke driver，通过 Rosetta 2 实际执行归档内的
+x86_64 二进制。`aarch64-apple-darwin` leg 则以 `arch -arm64` 校验并执行。
+翻译层、架构或 smoke 任一失败都会阻止 attestation 和上传；这项优化不会用静态检查替代执行。
 
 仓库 ruleset 严格要求 `zuno/pr-gate`，并要求分支相对 base 保持最新。缺少这条规则时，候选
 工作流会拒绝合并。验证通过后，它只为精确 PR head 启用 squash auto-merge，等待 GitHub
@@ -94,5 +110,6 @@ release-please 创建 tag 和 draft release。晋级过程只在 draft 状态上
 ## 时延证据
 
 从 release PR 创建开始计时，到公开 release 发布结束，runner 排队也计入。只有连续三次
-端到端运行都在 15 分钟内完成、发布阶段不超过三分钟，并且下载后的发布资产通过 checksum、
-provenance 与黑盒 smoke，才能宣称这项改造完成。
+端到端运行都在 20 分钟内完成、发布阶段不超过三分钟，并且下载后的发布资产通过 checksum、
+provenance 与黑盒 smoke，才能宣称这项改造完成。时延目标不会放宽逐目标实际执行、
+候选字节身份或发布校验。
