@@ -1003,12 +1003,20 @@ fn release_controller_dispatches_exact_source_and_never_compiles() {
         "--ref \"$HEAD_REF\"",
         "-f expected_head_sha=\"$HEAD_SHA\"",
         "-f mode=automatic",
+        "if [ \"${#numbers[@]}\" -eq 0 ]; then",
+        "echo \"dispatch=false\" >> \"$GITHUB_OUTPUT\"",
+        "if [ \"${#numbers[@]}\" -gt 1 ]; then",
+        "if: steps.release_pr.outputs.dispatch == 'true'",
     ] {
         assert!(
             dispatch.contains(required),
             "release controller lost exact candidate dispatch field {required:?}"
         );
     }
+    assert!(
+        !dispatch.contains("if [ \"${#numbers[@]}\" -ne 1 ]; then"),
+        "a routine main push without a release PR must be a successful no-op"
+    );
     for forbidden in [
         "dtolnay/rust-toolchain@",
         "cargo build",
