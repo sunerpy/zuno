@@ -41,6 +41,9 @@ Notes 从不暴露宿主路径。每个作用域最多 100 个文档，单文档
 宿主持久 Plan 不依赖模型工具是否可见。禁用 `plan_update` 只会隐藏模型的修改入口，
 不会关闭宿主创建 Plan 或重启恢复。
 
+完整的开启/关闭、profile 覆盖、权限、revision 与重启说明见
+[History 与 Notes 连续性配置](/zh/config/continuity)。
+
 `edit`、`execute` 和 `lsp` 作为已注册的槽位存在，但不属于默认工具面。`edit` 仍可供显式构造的 profile 使用；默认的编辑路径是 `apply_patch` 加 `write`。
 
 `webfetch` 只接受无凭据 HTTP(S) 目标。Zuno 会解析并校验全部地址，整体拒绝公私混合 DNS，固定已经校验的地址，绕过环境代理，并在最多五次重定向的每一跳重复校验。跨域跳转只有在新的公开目标独立通过同样检查后才允许。
@@ -145,6 +148,7 @@ History、Notes 读取、job 状态、LSP 检查、goal 状态，以及网络搜
 ## 参见
 
 - [权限与沙箱](/zh/guide/permissions)
+- [History 与 Notes 连续性配置](/zh/config/continuity)
 - [Agent](/zh/guide/agents)
 - [MCP server](/zh/guide/mcp)
 - [Harness 运行时](/zh/operate/harness-runtime)

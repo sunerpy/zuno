@@ -18,6 +18,7 @@ configuration, not here.
 ## Configure and use
 
 - [Configuration](reference/configuration.md)
+- [History and Notes continuity](config/continuity.md)
 - [Providers and credentials](reference/providers.md)
 - [Agents](guide/agents.md)
 - [Tools](guide/tools.md)

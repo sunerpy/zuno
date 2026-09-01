@@ -206,5 +206,6 @@ zuno
 
 - [Your first session](/guide/first-session)
 - [Configuration overview](/config/)
+- [History and Notes continuity](/config/continuity)
 - [Providers and credentials](/reference/providers)
 - [Permissions and sandboxing](/guide/permissions)

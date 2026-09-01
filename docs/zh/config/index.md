@@ -9,6 +9,7 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 | 内容 | 文件 | 页面 |
 | --- | --- | --- |
 | 运行时、provider、Agent、权限、沙箱 | `zuno.json` / `zuno.jsonc` | [配置文件与优先级](/zh/config/files) |
+| 模型可见的会话 History 与 Notes | `zuno.json` / `zuno.jsonc` | [History 与 Notes 连续性配置](/zh/config/continuity) |
 | 主题、快捷键、鼠标、提示框尺寸、diff 布局、通知 | `tui.json` / `tui.jsonc` | [主题与快捷键](/zh/config/theming) |
 | 注入每条提示词的指令 | `AGENTS.md`、`AGENTS.local.md` | [指令与 AGENTS.md](/zh/config/instructions) |
 | 带自身身份的可复用指导 | Skill 目录中的 `SKILL.md` | [编写 Skill](/zh/config/authoring-skills) |
@@ -26,7 +27,7 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 
 ## 顶层结构
 
-一共有四十一个键。按它们决定什么来分组：
+一共有四十三个键。按它们决定什么来分组：
 
 | 分组 | 键 |
 | --- | --- |
@@ -34,7 +35,7 @@ Zuno 读取 `zuno.json` 与 `zuno.jsonc`。所有可以告诉运行时的东西�
 | Agent 与委派 | `agents`、`default_agent`、`subagent_depth`、`subagent_model_selection`、`workflows`、`productAgent` |
 | 权限 | `permission`、`sandbox`、`shell` |
 | 指令、Skill 与学习 | `instructions`、`skills`、`command`、`memory`、`learning` |
-| 上下文 | `compaction`、`tool_output`、`attachment`、`references` |
+| 上下文 | `compaction`、`continuity`、`tool_output`、`attachment`、`references` |
 | 集成 | `mcp`、`lsp`、`formatter`、`web_search`、`watcher` |
 | 运行时 | `concurrency`、`goal`、`snapshot`、`tools`、`logLevel` |
 | 部署 | `server`、`share`、`autoupdate`、`enterprise`、`experimental` |
@@ -158,6 +159,7 @@ ZUNO_CONFIG_DIR="$HOME/.config/zuno/profiles/kiro" zuno
 ## 参见
 
 - [配置文件与优先级](/zh/config/files)
+- [History 与 Notes 连续性配置](/zh/config/continuity)
 - [配置项参考](/zh/config/reference)
 - [变量与替换](/zh/config/variables)
 - [模型路由](/zh/config/models)

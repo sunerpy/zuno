@@ -55,6 +55,8 @@ Zuno is a released, fast-moving Rust agent harness. Prefer the correct foundatio
 - Before adopting DeepSeek Harness behavior, run the project skill `$zuno-dsh-sync`; compare the pinned reference with current upstream tags and record adopt, adapt, or reject.
 - Treat DeepSeek Harness, Codex, oh-my-openagent, pi-agent, OpenCode, and Claw Code as design sources, not compatibility targets.
 - Non-trivial runtime changes update the relevant architecture or design document in the same change.
+- Every code change includes a documentation-impact review. A user-visible behavior, configuration, CLI, protocol, persistence, permission, platform, deployment, or operational change updates the relevant English and Chinese guides or references in the same change; generated CLI/schema material and documentation contract tests must be refreshed when applicable. A genuinely internal-only change records why no user documentation changed instead of silently skipping the review.
+- Adding, renaming, or removing a documentation page also updates repository entry links and the FirLab site navigation or sync contract so the published page is discoverable. A documentation-bearing delivery is not complete until the `Publish docs` workflow succeeds and the corresponding live route is verified after the source change reaches `main`.
 - Tests describe Zuno behavior. Remove tests whose only purpose is cross-product parity.
 
 ## Checks

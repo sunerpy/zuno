@@ -172,6 +172,9 @@ Council 让多个隔离的席位各自独立评估同一个问题，然后综合
 `"tools": {"plan_update": false}` 只会隐藏模型工具；默认 profile 中类型化的宿主
 Planning capability 仍会创建、持久化并恢复 Plan。
 
+Profile 切换、ACP 环境示例、最终工具过滤、Notes revision 流程和验证命令见
+[History 与 Notes 连续性配置](/zh/config/continuity)。
+
 ## 插件包
 
 `plugin` 相关配置声明扩展包。扩展要么是显式 WASI 授权下的 WebAssembly 组件，要么是使用行分隔 JSON-RPC 的受限子进程。能力经过声明与校验，不会被意外继承。

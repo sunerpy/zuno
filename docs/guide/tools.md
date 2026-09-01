@@ -51,6 +51,9 @@ The host's durable Plan is independent from model tool visibility. Disabling
 `plan_update` hides model mutation but does not disable host Plan creation or
 restart recovery.
 
+See [History and Notes continuity](/config/continuity) for complete enable/disable,
+profile-overlay, permission, revision, and restart guidance.
+
 `edit`, `execute`, and `lsp` exist as registered slots but are not part of the default
 surface. `edit` remains available to explicitly constructed profiles; the default editing
 path is `apply_patch` plus `write`.
@@ -195,6 +198,7 @@ model window.
 ## See also
 
 - [Permissions and sandboxing](/guide/permissions)
+- [History and Notes continuity](/config/continuity)
 - [Agents](/guide/agents)
 - [MCP servers](/guide/mcp)
 - [Harness runtime](/harness-runtime)

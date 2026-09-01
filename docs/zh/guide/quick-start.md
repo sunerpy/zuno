@@ -189,5 +189,6 @@ zuno
 
 - [你的第一个会话](/zh/guide/first-session)
 - [配置总览](/zh/config/)
+- [History 与 Notes 连续性配置](/zh/config/continuity)
 - [Provider 与凭据](/zh/config/providers)
 - [权限与沙箱](/zh/guide/permissions)
