@@ -806,48 +806,23 @@ fn workspace_metadata() -> serde_json::Value {
 }
 
 #[test]
-fn crates_io_surface_is_complete_versioned_and_installs_as_zuno() {
+fn workspace_crates_are_private_and_release_is_binary_only() {
     let metadata = workspace_metadata();
     let packages = metadata["packages"]
         .as_array()
         .expect("cargo metadata lists packages");
-    let internal_names = packages
-        .iter()
-        .map(|package| {
-            package["name"]
-                .as_str()
-                .expect("workspace package has a name")
-        })
-        .collect::<BTreeSet<_>>();
-    let publishable = packages
-        .iter()
-        .filter(|package| {
-            package["publish"]
-                .as_array()
-                .is_some_and(|registries| !registries.is_empty())
-        })
-        .collect::<Vec<_>>();
     assert!(
-        publishable.len() >= 40,
-        "only {} workspace packages are publishable; the registry dependency closure is \
-         incomplete",
-        publishable.len()
+        packages
+            .iter()
+            .all(|package| package["publish"] == serde_json::json!([])),
+        "every workspace package must remain private; Zuno is distributed as prebuilt \
+         GitHub Release archives"
     );
 
-    let versions = publishable
-        .iter()
-        .map(|package| package["version"].as_str().expect("package version"))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        versions.len(),
-        1,
-        "publishable first-party crates must move in one release version: {versions:?}"
-    );
-
-    let zuno = publishable
+    let zuno = packages
         .iter()
         .find(|package| package["name"] == "zuno")
-        .expect("the installable crates.io package is named zuno");
+        .expect("the release binary package is named zuno");
     assert!(
         packages.iter().all(|package| package["name"] != "zuno-cli"),
         "the old package name zuno-cli is still present in cargo metadata"
@@ -861,56 +836,53 @@ fn crates_io_surface_is_complete_versioned_and_installs_as_zuno() {
                         .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
             })
         }),
-        "the crates.io package zuno does not expose the zuno binary"
+        "the release package zuno does not expose the zuno binary"
     );
-
-    for package in &publishable {
-        let package_name = package["name"].as_str().expect("package name");
-        for dependency in package["dependencies"]
-            .as_array()
-            .expect("package dependencies")
-        {
-            let dependency_name = dependency["name"].as_str().expect("dependency name");
-            if dependency["kind"] == "dev" || !internal_names.contains(dependency_name) {
-                continue;
-            }
-            assert_ne!(
-                dependency["req"].as_str(),
-                Some("*"),
-                "{package_name} has no registry version for first-party dependency \
-                 {dependency_name}"
-            );
-        }
-    }
-
-    for private in ["zuno-testkit", "zuno-reaping-fixture"] {
-        let package = packages
-            .iter()
-            .find(|package| package["name"] == private)
-            .unwrap_or_else(|| panic!("workspace package {private} is missing"));
-        assert_eq!(
-            package["publish"],
-            serde_json::json!([]),
-            "{private} is a test-only package and must not be published"
-        );
-    }
 
     let manifest =
         std::fs::read_to_string(workspace_root().join("Cargo.toml")).expect("root manifest");
-    assert_eq!(
-        manifest.matches("# x-release-please-version").count(),
-        publishable.len(),
-        "release-please must update the workspace version and every publishable first-party \
-         dependency in one change"
-    );
-    let release_please =
-        std::fs::read_to_string(workspace_root().join("release-please-config.json"))
-            .expect("release-please config");
     assert!(
-        release_please.contains("\"type\": \"generic\"")
-            && release_please.contains("\"path\": \"Cargo.toml\""),
-        "release-please is not configured to update all annotated Cargo.toml versions"
+        manifest.contains("publish = false"),
+        "the workspace manifest must fail closed against cargo publish"
     );
+
+    let publish_workflow = workspace_root().join(".github/workflows/publish-crates.yml");
+    let publish_script = workspace_root().join(".github/scripts/publish-crates.py");
+    assert!(
+        !publish_workflow.exists() && !publish_script.exists(),
+        "registry publication files must not exist"
+    );
+
+    let release = workflow("release.yml");
+    for forbidden in [
+        "publish_crates",
+        "publish-crates.yml",
+        "CRATES_IO_",
+        "crates.io",
+    ] {
+        assert!(
+            !release.contains(forbidden),
+            "release.yml still contains registry publication surface {forbidden:?}"
+        );
+    }
+
+    for path in [
+        "README.md",
+        "docs/index.md",
+        "docs/zh/index.md",
+        "docs/readme/README.zh-CN.md",
+        "docs/guide/installation.md",
+        "docs/zh/guide/installation.md",
+        "docs/operate/release-pipeline.md",
+        "docs/zh/operate/release-pipeline.md",
+    ] {
+        let text = std::fs::read_to_string(workspace_root().join(path))
+            .unwrap_or_else(|error| panic!("read {path}: {error}"));
+        assert!(
+            !text.contains("cargo install zuno --locked") && !text.contains("crates.io"),
+            "{path} still advertises registry publication"
+        );
+    }
 }
 
 #[test]
@@ -948,108 +920,6 @@ fn windows_arm64_is_installed_and_updated_from_the_native_msvc_asset() {
              \"aarch64-pc-windows-msvc\""
         ),
         "self-update does not select the Windows ARM64 release asset"
-    );
-}
-
-#[test]
-fn crates_io_publish_uses_bootstrap_once_then_short_lived_oidc() {
-    let publish = workflow("publish-crates.yml");
-    let jobs = job_names(&publish);
-    for required in ["validate", "bootstrap", "trusted"] {
-        assert!(
-            jobs.contains(required),
-            "publish-crates.yml is missing the {required} job"
-        );
-    }
-
-    let validate = job_body(&publish, "validate").join("\n");
-    for required in [
-        "ref: ${{ inputs.tag }}",
-        "gh release view \"$TAG\"",
-        "--json isDraft,tagName",
-        "python .github/scripts/publish-crates.py --mode check",
-    ] {
-        assert!(
-            validate.contains(required),
-            "crates.io validation lost release identity check {required:?}"
-        );
-    }
-
-    let bootstrap = job_body(&publish, "bootstrap").join("\n");
-    for required in [
-        "if: inputs.auth_mode == 'bootstrap'",
-        "environment: crates-io",
-        "CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}",
-        "python .github/scripts/publish-crates.py --mode publish",
-    ] {
-        assert!(
-            bootstrap.contains(required),
-            "the one-time crates.io bootstrap path is missing {required:?}"
-        );
-    }
-    assert!(
-        !bootstrap.contains("crates-io-auth-action@"),
-        "the initial publication cannot use trusted publishing before the crates exist"
-    );
-
-    let trusted = job_body(&publish, "trusted").join("\n");
-    for required in [
-        "if: inputs.auth_mode == 'trusted'",
-        "id-token: write",
-        "environment: crates-io",
-        "rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5",
-        "CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}",
-    ] {
-        assert!(
-            trusted.contains(required),
-            "trusted crates.io publication is missing {required:?}"
-        );
-    }
-    assert!(
-        !trusted.contains("secrets.CRATES_IO_TOKEN"),
-        "routine publication still depends on the long-lived bootstrap token"
-    );
-
-    let release = workflow("release.yml");
-    let publish_job = job_body(&release, "publish_crates").join("\n");
-    for required in [
-        "needs: [resolve_release, promote]",
-        "needs.promote.result == 'success'",
-        "vars.CRATES_IO_TRUSTED_PUBLISHING == 'true'",
-        "uses: ./.github/workflows/publish-crates.yml",
-        "auth_mode: trusted",
-    ] {
-        assert!(
-            publish_job.contains(required),
-            "release-to-crates.io handoff is missing {required:?}"
-        );
-    }
-}
-
-#[test]
-fn crates_io_publication_is_dependency_ordered_and_checksum_idempotent() {
-    let script =
-        std::fs::read_to_string(workspace_root().join(".github/scripts/publish-crates.py"))
-            .expect("publish script");
-    for required in [
-        "publishable workspace dependency cycle",
-        "the installable `zuno` package is not the final dependency-ordered crate",
-        "still contains path dependency",
-        "already exists with checksum",
-        "identical crate already published",
-        "publish command failed after registry commit",
-        "wait_for_published_checksum(name, version, expected_checksum, 30)",
-        "did not become visible within 180 seconds",
-        "CARGO_REGISTRY_TOKEN is required for publish mode",
-    ] {
-        assert!(
-            script.contains(required),
-            "crates.io publication lost safety contract {required:?}"
-        );
-    }
-    assert!(
-        !script.contains("latest"),
-        "crates.io publication must never select a package or version by recency"
     );
 }
 
@@ -1175,7 +1045,7 @@ fn release_pipeline_docs_keep_the_verified_twenty_minute_slo() {
     ] {
         let docs = std::fs::read_to_string(workspace_root().join(path))
             .unwrap_or_else(|error| panic!("read {path}: {error}"));
-        for required in [twenty, "Rosetta 2", identity, targets, "crates.io"] {
+        for required in [twenty, "Rosetta 2", identity, targets] {
             assert!(
                 docs.contains(required),
                 "{path} lost the release timing or verification contract {required:?}"
@@ -1246,7 +1116,6 @@ fn public_workflows_use_only_standard_github_hosted_runners() {
         ("release.yml", workflow("release.yml")),
         ("release-candidate.yml", workflow("release-candidate.yml")),
         ("publish-docs.yml", workflow("publish-docs.yml")),
-        ("publish-crates.yml", workflow("publish-crates.yml")),
     ];
     for (name, text) in &workflows {
         let code = text
@@ -2109,12 +1978,11 @@ fn the_ci_gate_requires_every_job_in_the_workflow() {
     );
 }
 
-/// Nextest runs each test case in a separate process, so `startup.rs`'s static
-/// mutex cannot protect its wall-clock measurements from unrelated workspace
-/// tests. The repository configuration must reserve the complete nextest pool
-/// for this binary rather than loosening the product's startup budget.
+/// Startup telemetry is isolated so it remains useful, but ordinary hosted CI
+/// must not turn shared-runner wall-clock variance into a product failure.
+/// Stable hosts can opt into the absolute ceilings explicitly.
 #[test]
-fn nextest_globally_isolates_the_startup_budget() {
+fn startup_measurements_are_isolated_and_hosted_ci_is_observational() {
     let config_path = workspace_root().join(".config/nextest.toml");
     let config = std::fs::read_to_string(&config_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", config_path.display()));
@@ -2137,8 +2005,19 @@ fn nextest_globally_isolates_the_startup_budget() {
         startup.contains(
             "#[cfg(not(windows))]\nconst BUDGET_SESSION_LIST: Duration = Duration::from_millis(100);"
         ),
-        "the Linux session-list startup budget changed instead of isolating its measurement"
+        "the stable-host Linux startup target changed without new measurements"
     );
+    for required in [
+        r#"const ENFORCE_STARTUP_BUDGET_ENV: &str = "ZUNO_ENFORCE_STARTUP_BUDGET";"#,
+        "fn enforce_startup_budget() -> bool",
+        "startup_medians_are_reported_and_stable_host_budgets_are_optional",
+        "observational budget exceedance (not a hosted-CI failure)",
+    ] {
+        assert!(
+            startup.contains(required),
+            "startup measurement lost its explicit stable-host boundary {required:?}"
+        );
+    }
     assert!(
         !startup.contains(r#"measure("watchdog-cost""#),
         "the watchdog-active session-list path is already covered by the primary startup \
@@ -2149,17 +2028,28 @@ fn nextest_globally_isolates_the_startup_budget() {
     let scheduler = std::fs::read_to_string(&scheduler_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", scheduler_path.display()));
     for required in [
-        "def is_windows_startup_budget_only_failure(target, code, output):",
-        "if os.name != 'nt' or target != 'startup' or code != 101:",
-        "'startup regressed past its budget:' in normalized",
-        "startup_medians_are_inside_their_budgets",
-        r"r'test result: FAILED\. \d+ passed; 1 failed;'",
-        "retry_code, retry_output, retry_elapsed = run_once(",
-        "code = retry_code",
+        "isolated_suites = {'startup'}",
+        "def publish_startup_measurement(index):",
+        "shutil.copyfile(source, stable)",
+        "GITHUB_STEP_SUMMARY",
+        "ZUNO_ENFORCE_STARTUP_BUDGET=1",
+        "if target == 'startup':",
+        "arguments.append('--nocapture')",
     ] {
         assert!(
             scheduler.contains(required),
-            "the Windows startup confirmation lost its fail-closed condition {required:?}"
+            "the startup telemetry path lost {required:?}"
+        );
+    }
+    for forbidden in [
+        "is_windows_startup_budget_only_failure",
+        "WINDOWS STARTUP POST-LINK FIRST PROCESS",
+        "WINDOWS STARTUP FRESH-PROCESS CONFIRMATION",
+        "retry_code, retry_output, retry_elapsed",
+    ] {
+        assert!(
+            !scheduler.contains(forbidden),
+            "hosted CI still retries a wall-clock observation via {forbidden:?}"
         );
     }
 }

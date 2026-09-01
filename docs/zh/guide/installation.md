@@ -30,18 +30,6 @@ ACP 与 HTTP 客户端。
 `workspace-write` 请求遇到 typed、符合条件的后端不可用错误时生效。`read-only`
 永不降级，仍然失败即拒绝。参见[权限与沙箱](/zh/guide/permissions)。
 
-## 通过 Cargo 安装
-
-从 crates.io 安装已发布的 `zuno` 二进制 crate：
-
-```sh
-cargo install zuno --locked
-```
-
-这种方式会为当前宿主本机编译，因此需要 Rust 1.98，以及[从源码构建](#从源码构建)
-列出的原生编译前置。希望直接使用经过平台验证的预构建归档时，请使用下面的 Release
-安装器。
-
 ## Release 安装器
 
 安装器会下载发布归档与 `SHA256SUMS`，只选取该确切资产对应的行，比对 SHA-256，

@@ -32,18 +32,6 @@ write-capable `workspace-write` request encounters a typed, eligible backend-ava
 failure. `read-only` never falls back and continues to fail closed. See
 [Permissions and sandboxing](/guide/permissions).
 
-## Cargo installation
-
-Install the released `zuno` binary crate from crates.io:
-
-```sh
-cargo install zuno --locked
-```
-
-This compiles Zuno for the current host and therefore requires Rust 1.98 plus the native
-build prerequisites listed under [Build from source](#build-from-source). Use a release
-installer below when you prefer a prebuilt, platform-certified archive.
-
 ## Release installers
 
 The installers download the release archive and `SHA256SUMS`, select the line for that

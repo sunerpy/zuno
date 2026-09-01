@@ -279,6 +279,7 @@ jobs:
             target/test-parallel/suites.tsv
             target/test-parallel/codes.tsv
             target/test-parallel/doctests.log
+            target/test-parallel/startup.log
             target/test-parallel/logs/
           if-no-files-found: warn
           retention-days: 3

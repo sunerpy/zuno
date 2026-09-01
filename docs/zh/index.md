@@ -62,13 +62,9 @@ curl -fsSL https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.s
 irm https://raw.githubusercontent.com/sunerpy/zuno/main/scripts/install.ps1 | iex
 ```
 
-```sh [Cargo]
-cargo install zuno --locked
-```
-
 :::
 
-如需安装尚未发布的当前 Git revision：
+如需从源码构建并安装当前 Git revision：
 
 ```sh
 cargo install --git https://github.com/sunerpy/zuno zuno --locked

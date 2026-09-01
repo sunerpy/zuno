@@ -11,8 +11,7 @@ the release tag has the same Git tree.
   forks with read-only permissions and no repository secrets.
 - `release.yml` owns release-please, exact candidate dispatch, release identity,
   and GitHub asset publication. Its candidate-promotion path never installs Rust
-  or recompiles a binary; crates.io publication is delegated after the GitHub
-  release is public.
+  or recompiles a binary.
 - `release-candidate.yml` owns the full test gate and the six release targets.
   Each target builds `zuno` and `zuno-smoke` together, packages and unpacks the
   archive, verifies the exact executable architecture, runs the packaged binary,
@@ -163,38 +162,12 @@ release-please creates the tag and draft release. Promotion uploads assets while
 the release remains draft and makes it public only after the complete asset set
 has been re-read and verified. A mismatch leaves the draft unpublished.
 
-After GitHub publication, `.github/workflows/publish-crates.yml` packages the complete
-first-party crates.io dependency closure in topological order. Every local dependency
-must retain an explicit registry version, every normalized `.crate` manifest must be
-free of path dependencies, and an existing version is skipped only when crates.io
-reports the exact expected checksum. A checksum mismatch is permanent and stops the
-run; a partial publication can be resumed safely with the same tag.
-
-The first crates.io publication is an explicit bootstrap:
-
-1. create the protected `crates-io` GitHub environment and add a crates.io API token as
-   `CRATES_IO_TOKEN`;
-2. dispatch `publish-crates.yml` for the already-public release tag with
-   `auth_mode=bootstrap`;
-3. register this repository, `.github/workflows/publish-crates.yml`, and the
-   `crates-io` environment as a Trusted Publisher for every published Zuno crate;
-4. set the repository variable `CRATES_IO_TRUSTED_PUBLISHING=true`.
-
-Subsequent releases exchange GitHub's OIDC identity for a short-lived crates.io token;
-the long-lived bootstrap token is no longer used. Leaving the repository variable
-absent or false keeps GitHub Releases functional while crates.io remains deliberately
-disabled.
-
 Automatic failure never falls back to recompilation. Recovery is explicit:
 
 1. dispatch `release-candidate.yml` with `mode=backfill` on the exact release tag;
 2. record the successful run ID;
 3. dispatch `release.yml` with `mode=promote`, that run ID, the merged release PR,
    its candidate source SHA, and the existing tag.
-
-For crates.io-only recovery, rerun `publish-crates.yml` against the same public tag.
-The immutable version/checksum check resumes missing packages and refuses to overwrite
-different bytes.
 
 This keeps the normal path singular while allowing an operator to recover from
 expired artifacts or an interrupted finalization without weakening identity
