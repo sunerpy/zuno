@@ -78,6 +78,15 @@ fn insert_work_state(connection: &Connection, session_id: &str) {
         .expect("insert work plan");
     connection
         .execute(
+            "INSERT INTO work_plan_archive \
+             (id, session_id, stack_depth, revision, title, steps, state, time_created, \
+              time_updated, time_archived) \
+             VALUES (?1, ?2, 0, 1, 'previous ship plan', '[]', 'superseded', 1, 1, 1)",
+            rusqlite::params![format!("archived_plan_{session_id}"), session_id],
+        )
+        .expect("insert archived work plan");
+    connection
+        .execute(
             "INSERT INTO work_item \
              (id, session_id, subject, description, status, priority, dependencies, revision, \
               time_created, time_updated) \
@@ -1349,6 +1358,7 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
             count(&connection, "SELECT count(*) FROM message"),
             count(&connection, "SELECT count(*) FROM part"),
             count(&connection, "SELECT count(*) FROM work_plan"),
+            count(&connection, "SELECT count(*) FROM work_plan_archive"),
             count(&connection, "SELECT count(*) FROM work_item"),
             count(&connection, "SELECT count(*) FROM session_message"),
             count(&connection, "SELECT count(*) FROM session_input"),
@@ -1360,7 +1370,7 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
     };
     assert_eq!(
         before,
-        (4, 4, 5, 4, 4, 4, 4, 4, 1, 4, 8),
+        (4, 4, 5, 4, 4, 4, 4, 4, 4, 1, 4, 8),
         "fixture row counts before the delete"
     );
 
@@ -1423,6 +1433,7 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
     for table in [
         "message",
         "work_plan",
+        "work_plan_archive",
         "work_item",
         "session_message",
         "session_input",
@@ -1497,6 +1508,7 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
         count(&connection, "SELECT count(*) FROM message"),
         count(&connection, "SELECT count(*) FROM part"),
         count(&connection, "SELECT count(*) FROM work_plan"),
+        count(&connection, "SELECT count(*) FROM work_plan_archive"),
         count(&connection, "SELECT count(*) FROM work_item"),
         count(&connection, "SELECT count(*) FROM session_message"),
         count(&connection, "SELECT count(*) FROM session_input"),
@@ -1507,7 +1519,7 @@ fn removing_a_parent_removes_the_whole_subtree_and_leaves_no_orphaned_parts() {
     );
     assert_eq!(
         after,
-        (1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 2),
+        (1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 2),
         "row counts after the delete: only the bystander's rows remain"
     );
 }

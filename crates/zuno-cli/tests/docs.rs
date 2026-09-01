@@ -914,30 +914,33 @@ fn completion_docs_describe_stdout_and_profile_safe_installation() {
 }
 
 #[test]
-fn database_docs_describe_guarded_format_five_to_six_migration() {
+fn database_docs_describe_guarded_format_five_or_six_to_seven_migration() {
     contains_all(
         "docs/migration.md",
         &[
-            "current database format is 6",
+            "current database format is 7",
             "Format 5",
+            "Format 6",
             "`BEGIN IMMEDIATE`",
-            "marker from 5 to 6",
-            "`session`, `message`, or `memory_candidate` rows",
+            "marker from 5 or 6 to 7",
+            "`session`, `message`, `memory_candidate`, or `work_plan` values",
             "future format",
             "fails closed without modification",
             "format marker updated last",
-            "A valid format-5 database should",
+            "A valid format-5 or format-6 database should",
             "open and migrate automatically",
         ],
     );
     contains_all(
         "docs/zh/operate/migration.md",
         &[
-            "当前数据库格式为 6",
+            "当前数据库格式为 7",
             "format 5",
+            "format 6",
             "`BEGIN IMMEDIATE`",
-            "marker 从 5 改为 6",
-            "`session`、`message` 或",
+            "marker 从 5 或 6 改为 7",
+            "`session`、`message`、",
+            "`work_plan` 值",
             "未来格式",
             "失败关闭且不修改文件",
             "最后更新格式 marker",
@@ -947,12 +950,14 @@ fn database_docs_describe_guarded_format_five_to_six_migration() {
     contains_all(
         "docs/zh/operate/prompt-workflow.md",
         &[
-            "数据库当前格式为 6",
+            "数据库当前格式为 7",
             "format 5",
+            "format 6",
             "`BEGIN IMMEDIATE`",
             "`session`",
             "`message`",
             "`memory_candidate`",
+            "`work_plan`",
             "不要求重建数据库",
         ],
     );

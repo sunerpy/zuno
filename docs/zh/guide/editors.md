@@ -166,7 +166,7 @@ Plan 模式总是激活只读的 `plan` Agent。回到 Build 模式会恢复所�
 
 `/compact` 不接受参数。它调用与 TUI 相同的持久压缩路径，只在该命令达到终态生命周期事件之后才返回，并且不会把字面的斜杠命令发送给模型。原生控制项优先，因此一个用户定义的名为 `compact` 的命令或 Skill 不会作为第二个有歧义的条目被发布。
 
-`/goal` 暴露与 TUI 相同的持久 goal 处理器。不带参数时显示当前 Goal；`/goal <目标>` 会在尚无 Goal 或上一条 Goal 已完成、已取消时创建新 Goal，否则更新当前目标并保留生命周期状态、预算和累计用量。`show`、`history`、`create <目标>`、`edit <目标>`、`pause`、`resume`、`block <原因>`、`complete` 和 `cancel` 等显式 action 仍然可用，且首词匹配时优先。目标变化还会同步活跃 Plan：上一活跃 epoch 中尚未完成的步骤会转为 `completed`，并在标题前加 `Superseded:`；活跃 Plan 会绑定当前 `goal_id`，多阶段工作会建立新的 epoch。若新目标是原子任务，已终态的历史 Plan 不会改绑。该命令的输出投影为一条普通的 Agent 消息，而不是推理内容；显式 action 的非法参数会返回 JSON-RPC invalid params，而不是内部会话错误。
+`/goal` 暴露与 TUI 相同的持久 goal 处理器。不带参数时显示当前 Goal；`/goal <目标>` 会在尚无 Goal 或上一条 Goal 已完成、已取消时创建新 Goal，否则更新当前目标并保留生命周期状态、预算和累计用量。`show`、`history`、`create <目标>`、`edit <目标>`、`pause`、`resume`、`block <原因>`、`complete` 和 `cancel` 等显式 action 仍然可用，且首词匹配时优先。目标变化还会同步活跃 Plan：多阶段工作会归档此前可见 Plan，并安装一个绑定当前 `goal_id` 的新根 Plan；若新目标是原子任务，已终态的历史 Plan 不会改绑。该命令的输出投影为一条普通的 Agent 消息，而不是推理内容；显式 action 的非法参数会返回 JSON-RPC invalid params，而不是内部会话错误。
 
 `/plan` 在 Build 与 Plan 之间切换。`/start-plan` 直接进入只读的 Plan 模式，而 `/start-work` 返回 Build。离开 Plan 需要存在一个持久 plan，因此过早的交接会显式失败，而不是削弱模式边界。成功的更改会发出 ACP 的 `current_mode_update` 与 `config_option_update` 通知，让 Zed 的选择器保持同步。这些原生命令都不会被发送给模型。
 

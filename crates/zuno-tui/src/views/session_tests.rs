@@ -252,6 +252,164 @@ fn session_screen_a_submission_during_work_is_queued_for_the_next_turn() {
         !rendered.contains("not sent: a turn is already running"),
         "the old channel-capacity refusal remained visible:\n{rendered}"
     );
+    assert!(
+        rendered.contains("1. [next] change direction"),
+        "the committed FIFO entry is not fixed above the composer:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ctrl+return send now"),
+        "the queue dock does not show the effective force-submit binding:\n{rendered}"
+    );
+    assert_eq!(
+        rendered.matches("change direction").count(),
+        1,
+        "the queued prompt appeared in both the dock and transcript history:\n{rendered}"
+    );
+
+    projection.publish(
+        Vec::new(),
+        Some(crate::views::picker::QueuedInputNotice {
+            input_id: String::from("msg_queued"),
+            kind: crate::views::picker::QueuedInputNoticeKind::Promoted,
+        }),
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    assert!(
+        screen
+            .submissions()
+            .iter()
+            .any(|text| text == "change direction"),
+        "a promoted queue entry did not move into transcript history"
+    );
+    let rendered = rows(&render_offscreen(&mut screen, 72, 10).expect("infallible")).join("\n");
+    assert!(
+        !rendered.contains("[next] change direction"),
+        "the promoted entry remained in the queue dock:\n{rendered}"
+    );
+}
+
+#[test]
+fn session_screen_queue_dock_keeps_fifo_order_and_uses_a_rebound_send_now_key() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (mutations, _mutation_source) = mpsc::channel(2);
+    let projection = crate::views::picker::QueuedInputProjection::default();
+    let mut context = ViewContext::defaults();
+    context.config.keybinds.insert(
+        String::from("input_force_submit"),
+        serde_json::from_value(serde_json::json!("alt+enter")).expect("valid key binding"),
+    );
+    let mut screen =
+        SessionScreen::new(context, sender).with_queued_inputs(projection.clone(), mutations);
+    projection.publish(
+        vec![
+            crate::views::picker::QueuedInputEntry {
+                id: String::from("first"),
+                text: String::from("first follow-up"),
+                delivery: crate::views::picker::QueuedInputDelivery::Queue,
+                revision: 1,
+                editable: true,
+            },
+            crate::views::picker::QueuedInputEntry {
+                id: String::from("second"),
+                text: String::from("second follow-up"),
+                delivery: crate::views::picker::QueuedInputDelivery::Steer,
+                revision: 1,
+                editable: true,
+            },
+        ],
+        None,
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+
+    let rendered = rows(&render_offscreen(&mut screen, 72, 14).expect("infallible")).join("\n");
+    let first = rendered
+        .find("1. [next] first follow-up")
+        .expect("first row");
+    let second = rendered
+        .find("2. [steer] second follow-up")
+        .expect("second row");
+    assert!(
+        first < second,
+        "the dock changed durable FIFO order:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("alt+enter send now"),
+        "the dock used a hard-coded shortcut instead of the resolved keymap:\n{rendered}"
+    );
+}
+
+#[test]
+fn session_screen_cancelling_a_queued_prompt_does_not_turn_it_into_history() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (mutations, _mutation_source) = mpsc::channel(2);
+    let projection = crate::views::picker::QueuedInputProjection::default();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_queued_inputs(projection.clone(), mutations);
+    projection.publish(
+        vec![crate::views::picker::QueuedInputEntry {
+            id: String::from("cancel-me"),
+            text: String::from("do not send this"),
+            delivery: crate::views::picker::QueuedInputDelivery::Queue,
+            revision: 1,
+            editable: true,
+        }],
+        None,
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    projection.publish(
+        Vec::new(),
+        Some(crate::views::picker::QueuedInputNotice {
+            input_id: String::from("cancel-me"),
+            kind: crate::views::picker::QueuedInputNoticeKind::Cancelled,
+        }),
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+
+    assert!(
+        !screen
+            .submissions()
+            .iter()
+            .any(|text| text == "do not send this"),
+        "a cancelled queued prompt was presented as sent history"
+    );
+}
+
+#[test]
+fn session_screen_a_failed_stale_mutation_does_not_turn_a_removed_prompt_into_history() {
+    let (sender, _shutdown) = terminal_event_channel();
+    let (mutations, _mutation_source) = mpsc::channel(2);
+    let projection = crate::views::picker::QueuedInputProjection::default();
+    let mut screen = SessionScreen::new(ViewContext::defaults(), sender)
+        .with_queued_inputs(projection.clone(), mutations);
+    projection.publish(
+        vec![crate::views::picker::QueuedInputEntry {
+            id: String::from("removed-elsewhere"),
+            text: String::from("do not infer delivery"),
+            delivery: crate::views::picker::QueuedInputDelivery::Queue,
+            revision: 1,
+            editable: true,
+        }],
+        None,
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+    projection.publish(
+        Vec::new(),
+        Some(crate::views::picker::QueuedInputNotice {
+            input_id: String::from("removed-elsewhere"),
+            kind: crate::views::picker::QueuedInputNoticeKind::Failed(String::from(
+                "the row no longer exists",
+            )),
+        }),
+    );
+    screen.handle_event(&AppEvent::Terminal(TerminalEvent::Wake));
+
+    assert!(
+        !screen
+            .submissions()
+            .iter()
+            .any(|text| text == "do not infer delivery"),
+        "a failed stale mutation was misreported as a promoted user turn"
+    );
 }
 
 #[test]
@@ -754,6 +912,8 @@ fn session_screen_start_work_confirms_the_durable_plan_before_orchestrated_work(
         plan: Some(zuno_types::PlanProjection {
             id: String::from("plan_release"),
             goal_id: None,
+            parent_plan_id: None,
+            stack_depth: 0,
             revision: 3,
             title: String::from("Release hardening"),
             steps: vec![zuno_types::PlanStepProjection {

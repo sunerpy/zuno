@@ -1258,6 +1258,8 @@ pub struct QueuedInputEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueuedInputNoticeKind {
     Admitted(QueuedInputDelivery),
+    /// The durable inbox promoted this row into the next model turn.
+    Promoted,
     Edited,
     Cancelled,
     Failed(String),

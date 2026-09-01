@@ -15,6 +15,7 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | --- | --- |
 | 对话记录 | 持久的 assistant 内容、工具卡片、错误、中断标记 |
 | 侧边栏 | 会话、job、用量以及持久的子会话 |
+| 队列停靠栏 | 活跃工作期间固定在编辑区上方的持久 FIFO 后续消息 |
 | 编辑区 | 你正在起草的输入 |
 | 身份行 | 解析出的 Agent、目录中的模型显示名、配置的推理强度 |
 | 末行 | 实时控制面：回合脉冲、中断按键、提示词占用率、命令按键、Agent 与模型徽标 |
@@ -34,7 +35,11 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 | `Shift+Enter`、`Alt+Enter`、`Ctrl+J` | 换行 | 换行 |
 | `Escape` | — | 中断；再按一次确认 |
 
-只有在 SQLite 提交之后，某一项才会被报告为已排队。待处理项可以按 revision 编辑或取消，并且能在进程重启后存活。
+只有在 SQLite 提交之后，某一项才会被报告为已排队。最早的条目会按持久 FIFO 顺序固定
+在编辑区正上方，并标记为 `next` 或 `steer`。停靠栏显示实际生效的
+`input_force_submit` 绑定，而不是假定默认 `Ctrl+Enter`，同时显示队列管理器按键。
+待处理项可以按 revision 编辑或取消，并且能在进程重启后存活。条目被提升后才进入对话
+历史；取消只会移除条目，不会伪装成已经发送。
 
 引导可以唤醒一个 provider 流或一段重试等待：Zuno 会为部分 assistant 输出打检查点、提升持久输入，然后启动下一个模型步骤。正在执行的工具不会为了引导而被抛弃，因此它的结果会先到达下一个安全点。如果回合在某次引导被消费之前就结束了，已准入的条目会保持待处理，并在下一回合按 FIFO 顺序被提升。它绝不会丢失，也不会重复。
 
@@ -110,9 +115,8 @@ zuno tui --model openai/gpt-5 --prompt "review the diff on this branch"
 TUI 的 `/goal <目标>` 与 ACP 使用同一个持久宿主命令。尚无 Goal，或上一条 Goal
 已完成、已取消时，它会创建新 Goal；其他状态下则更新当前 Goal。`/goal show`、
 `/goal edit ...`、`/goal complete` 等显式 action 仍然可用。目标变化也会同步活跃
-Plan：上一活跃 epoch 未完成的步骤会转为 `completed`，并在标题前加 `Superseded:`；
-活跃 Plan 会绑定当前 `goal_id`，多阶段工作会建立新的 epoch。原子目标不会改绑已终态
-的历史 Plan。
+Plan：多阶段工作会归档此前可见 Plan，并安装一个绑定当前 `goal_id` 的新根 Plan。
+原子目标不会改绑已终态的历史 Plan。
 
 资源选择器沿用同一套命名：`/model`、`/agent`、`/session`、`/skill`、`/theme`、`/mcp`、`/diff`、`/commands`、`/help`。
 
@@ -126,7 +130,10 @@ Plan：上一活跃 epoch 未完成的步骤会转为 `completed`，并在标题
 
 ## 鼠标与滚动
 
-当 `mouse` 缺省或为 `true` 时，Zuno 捕获按下、拖动、释放和滚轮事件。释放拖动会通过配置的剪贴板复制选区，并保留高亮可见。对话记录的选区会被夹住，不会越入侧边栏；折叠行可点击；内容溢出的对话会挂载一个可拖动的滚动条。
+当 `mouse` 缺省或为 `true` 时，Zuno 捕获按下、拖动、释放和滚轮事件。释放拖动会
+通过配置的剪贴板复制选区，并保留高亮可见。对话记录按语义内容复制：说话者标签、
+边框、填充和终端软折行不会进入剪贴板，只有源文本中明确存在的换行才复制为换行。
+选区会被夹住，不会越入侧边栏；折叠行可点击；内容溢出的对话会挂载一个可拖动的滚动条。
 
 滚轮输入起始是精确的：第一格移动一行，随后持续的快速手势会加速。`scroll_speed` 改为选择一个恒定倍数；`scroll_acceleration.enabled` 显式选择速度加速，且在两者同时存在时优先。
 

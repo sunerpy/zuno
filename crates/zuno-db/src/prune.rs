@@ -18,7 +18,7 @@ const SSE_AGGREGATE_PREFIX: &str = "sse:";
 /// retention while losing only the deleted provenance pointer. `experience_record`
 /// follows the same policy so retained learning can be reviewed independently of
 /// transcript retention.
-pub const PRUNE_TABLES: [&str; 18] = [
+pub const PRUNE_TABLES: [&str; 19] = [
     "session_note_operation",
     "session_note",
     "memory_reflection_job",
@@ -28,6 +28,7 @@ pub const PRUNE_TABLES: [&str; 18] = [
     "agent_job",
     "work_item",
     "work_plan",
+    "work_plan_archive",
     "session_context_epoch",
     "session_input",
     "session_message",
@@ -45,7 +46,7 @@ pub const PRUNE_TABLES: [&str; 18] = [
 /// which foreign-key cascades happen to exist in one schema revision. Dependants
 /// precede their owners (`memory_reflection_job` before its delivery row and
 /// `agent_job` before its optional report input).
-pub const DELETE_ORDER: [&str; 18] = PRUNE_TABLES;
+pub const DELETE_ORDER: [&str; 19] = PRUNE_TABLES;
 
 /// A reversible change to `session.time_archived`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -708,7 +709,7 @@ const OPTIONAL_TABLE_SPECS: [TableSpec; 2] = [
     },
 ];
 
-const TABLE_SPECS: [TableSpec; 16] = [
+const TABLE_SPECS: [TableSpec; 17] = [
     TableSpec {
         name: "memory_reflection_job",
         relation: Relation::SessionId,
@@ -827,12 +828,32 @@ const TABLE_SPECS: [TableSpec; 16] = [
         columns: &[
             "session_id",
             "id",
+            "parent_plan_id",
+            "stack_depth",
             "goal_id",
             "revision",
             "title",
             "steps",
             "time_created",
             "time_updated",
+        ],
+    },
+    TableSpec {
+        name: "work_plan_archive",
+        relation: Relation::SessionId,
+        columns: &[
+            "id",
+            "session_id",
+            "parent_plan_id",
+            "stack_depth",
+            "goal_id",
+            "revision",
+            "title",
+            "steps",
+            "state",
+            "time_created",
+            "time_updated",
+            "time_archived",
         ],
     },
     TableSpec {

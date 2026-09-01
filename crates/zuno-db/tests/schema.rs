@@ -86,6 +86,10 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
              INSERT INTO work_plan \
                (session_id, id, revision, title, steps, time_created, time_updated) \
              VALUES ('session-1', 'plan-1', 1, 'ship', '[]', 1, 1);
+             INSERT INTO work_plan_archive \
+               (id, session_id, stack_depth, revision, title, steps, state, time_created, \
+                time_updated, time_archived) \
+             VALUES ('plan-old', 'session-1', 0, 3, 'old work', '[]', 'completed', 1, 2, 3);
              INSERT INTO work_item \
                (id, session_id, subject, description, status, priority, dependencies, revision, \
                 time_created, time_updated) \
@@ -118,6 +122,7 @@ fn schema_session_delete_cascades_through_every_declared_dependent_table() {
         "message",
         "part",
         "work_plan",
+        "work_plan_archive",
         "work_item",
         "session_message",
         "session_input",

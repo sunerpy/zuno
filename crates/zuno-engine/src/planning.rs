@@ -89,7 +89,7 @@ pub enum ExistingPlanState {
     None,
     /// At least one step remains pending or in progress.
     Active,
-    /// Every existing step completed; a new user objective may append a new epoch.
+    /// Every existing step completed; a new user objective may replace the visible Plan.
     Terminal,
 }
 
@@ -279,7 +279,7 @@ impl PlanningPolicy {
             if input.existing_plan == ExistingPlanState::Active {
                 return PlanningDecision::Maintain(reason(
                     "active_plan_continuation",
-                    "an empty continuation does not create a new plan epoch",
+                    "an empty continuation does not replace the active plan",
                 ));
             }
             return PlanningDecision::Atomic(reason(
@@ -304,9 +304,9 @@ impl PlanningPolicy {
             return create_plan(
                 input,
                 if input.source == PlanningInputSource::GoalObjective {
-                    "goal_objective_epoch"
+                    "goal_objective_replaced"
                 } else if input.existing_plan == ExistingPlanState::Active {
-                    "active_plan_new_epoch"
+                    "active_plan_replaced"
                 } else {
                     "typed_context"
                 },
@@ -336,11 +336,11 @@ impl PlanningPolicy {
             if input.existing_plan == ExistingPlanState::Active
                 && input.source != PlanningInputSource::GoalObjective
             {
-                "active_plan_new_epoch"
+                "active_plan_replaced"
             } else if input.source == PlanningInputSource::GoalObjective {
-                "goal_objective_epoch"
+                "goal_objective_replaced"
             } else if input.existing_plan == ExistingPlanState::Terminal {
-                "terminal_plan_new_epoch"
+                "terminal_plan_replaced"
             } else {
                 "durable_plan_required"
             },
@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn a_substantial_new_user_request_preempts_an_active_plan_with_a_new_epoch() {
+    fn a_substantial_new_user_request_replaces_the_visible_active_plan() {
         let decision = PlanningPolicy::classify(
             PlanningInput::new(
                 "另外，深入定位 GitHub Actions 失败并修复发布链路。",
@@ -684,11 +684,11 @@ mod tests {
         );
 
         assert!(matches!(decision, PlanningDecision::Create(_)));
-        assert_eq!(decision.rationale().code(), "active_plan_new_epoch");
+        assert_eq!(decision.rationale().code(), "active_plan_replaced");
     }
 
     #[test]
-    fn a_short_constraint_followup_keeps_the_active_epoch() {
+    fn a_short_constraint_followup_keeps_the_active_plan() {
         let decision = PlanningPolicy::classify(
             PlanningInput::new("使用 zsh 调用 gh，避免重复启动轮询。", "orchestrator")
                 .with_existing_plan(ExistingPlanState::Active),
@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_goal_objective_supersedes_an_active_plan_epoch() {
+    fn a_changed_goal_objective_replaces_an_active_plan() {
         let decision = PlanningPolicy::classify(
             PlanningInput::new(
                 "Audit the full release contract, fix the root cause, and verify it.",
@@ -710,11 +710,11 @@ mod tests {
         );
 
         assert!(matches!(decision, PlanningDecision::Create(_)));
-        assert_eq!(decision.rationale().code(), "goal_objective_epoch");
+        assert_eq!(decision.rationale().code(), "goal_objective_replaced");
     }
 
     #[test]
-    fn a_goal_objective_that_starts_with_continue_still_creates_its_own_epoch() {
+    fn a_goal_objective_that_starts_with_continue_still_creates_its_own_plan() {
         let decision = PlanningPolicy::classify(
             PlanningInput::new(
                 "Continue implementing the release fix and verify the exact artifact.",
@@ -725,7 +725,7 @@ mod tests {
         );
 
         assert!(matches!(decision, PlanningDecision::Create(_)));
-        assert_eq!(decision.rationale().code(), "goal_objective_epoch");
+        assert_eq!(decision.rationale().code(), "goal_objective_replaced");
     }
 
     #[test]
@@ -743,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_plan_allows_a_new_user_objective_to_create_an_epoch() {
+    fn a_terminal_plan_allows_a_new_user_objective_to_create_a_plan() {
         let decision = PlanningPolicy::classify(
             PlanningInput::new(
                 "Investigate the new failure, implement the fix, and verify it.",
@@ -753,7 +753,7 @@ mod tests {
         );
 
         assert!(matches!(decision, PlanningDecision::Create(_)));
-        assert_eq!(decision.rationale().code(), "terminal_plan_new_epoch");
+        assert_eq!(decision.rationale().code(), "terminal_plan_replaced");
     }
 
     #[test]

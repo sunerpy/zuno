@@ -5462,6 +5462,8 @@ impl TurnHost {
         });
         let plan = work.plan.map(|plan| zuno_types::PlanProjection {
             id: plan.id,
+            parent_plan_id: plan.parent_plan_id,
+            stack_depth: plan.stack_depth,
             goal_id: plan.goal_id,
             revision: plan.revision,
             title: plan.title,
@@ -7894,14 +7896,6 @@ fn supersede_incomplete_plan_steps(steps: &mut [zuno_tools::PlanStep]) {
     }
 }
 
-fn preempt_in_progress_plan_step(steps: &mut [zuno_tools::PlanStep]) {
-    for step in steps {
-        if step.status == zuno_tools::PlanStepStatus::InProgress {
-            step.status = zuno_tools::PlanStepStatus::Pending;
-        }
-    }
-}
-
 fn ensure_host_plan(
     database: &Arc<zuno_db::pool::Pool>,
     request: HostPlanningRequest<'_>,
@@ -7970,44 +7964,28 @@ fn ensure_host_plan(
             changed: true,
         });
     };
-    let epoch = existing
-        .as_ref()
-        .map_or(1_i64, |plan| plan.revision.saturating_add(1));
-    let mut steps = existing
-        .as_ref()
-        .map(|plan| plan.steps.clone())
-        .unwrap_or_default();
-    if source == PlanningInputSource::GoalObjective {
-        supersede_incomplete_plan_steps(&mut steps);
-    } else if existing_state == ExistingPlanState::Active {
-        preempt_in_progress_plan_step(&mut steps);
-    }
-    steps.extend(
-        seed.steps()
-            .iter()
-            .enumerate()
-            .map(|(index, step)| zuno_tools::PlanStep {
-                id: if existing.is_some() {
-                    format!("epoch-{epoch}-{}", step.id())
-                } else {
-                    step.id().to_owned()
-                },
-                title: step.title().to_owned(),
-                status: if index == 0 {
-                    zuno_tools::PlanStepStatus::InProgress
-                } else {
-                    zuno_tools::PlanStepStatus::Pending
-                },
-            }),
-    );
+    let steps = seed
+        .steps()
+        .iter()
+        .enumerate()
+        .map(|(index, step)| zuno_tools::PlanStep {
+            id: step.id().to_owned(),
+            title: step.title().to_owned(),
+            status: if index == 0 {
+                zuno_tools::PlanStepStatus::InProgress
+            } else {
+                zuno_tools::PlanStepStatus::Pending
+            },
+        })
+        .collect();
     let params = zuno_tools::PlanUpdateParams {
         expected_revision: existing.as_ref().map(|plan| plan.revision),
         goal_id,
         title: seed.title().to_owned(),
         steps,
     };
-    if source == PlanningInputSource::GoalObjective {
-        store.update_plan_for_goal_boundary(session_id, params)
+    if existing.is_some() {
+        store.replace_plan_for_objective(session_id, params)
     } else {
         store.update_plan(session_id, params)
     }

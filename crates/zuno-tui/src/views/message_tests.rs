@@ -168,6 +168,62 @@ fn views_chat_transcript_paints_from_the_palette_not_from_a_literal() {
     );
 }
 
+#[test]
+fn transcript_copy_uses_semantic_text_without_frames_or_soft_wrap_newlines() {
+    let source = "A long queued instruction should remain one continuous sentence when the \
+                  terminal wraps it across several visual rows.";
+    let mut view = view();
+    view.transcript_mut().push(Message::user(source));
+    let rendered = draw(&mut view, 28, 20).join("\n");
+    assert!(
+        rendered.contains(USER_BOX_RULE),
+        "fixture did not draw the user frame"
+    );
+    assert!(
+        view.begin_selection(0, 0),
+        "selection did not start inside the transcript"
+    );
+    assert!(view.update_selection(27, 19));
+
+    assert_eq!(
+        view.selected_text().as_deref(),
+        Some(source),
+        "clipboard projection must omit speaker labels, borders, padding, and visual wraps"
+    );
+}
+
+#[test]
+fn transcript_copy_preserves_only_explicit_source_newlines_and_cjk_width() {
+    let source = "第一行需要在终端中自动折行但复制时连续。\n第二行是明确换行。";
+    let mut view = view();
+    view.transcript_mut().push(Message::user(source));
+    draw(&mut view, 20, 20);
+    assert!(view.begin_selection(0, 0));
+    assert!(view.update_selection(19, 19));
+
+    assert_eq!(view.selected_text().as_deref(), Some(source));
+    assert_eq!(
+        view.selected_text()
+            .expect("selection")
+            .chars()
+            .filter(|character| *character == '\n')
+            .count(),
+        1,
+        "visual wrapping invented clipboard line endings"
+    );
+}
+
+#[test]
+fn semantic_source_partition_rejoins_exactly_after_visual_wrapping() {
+    let source = "alpha beta\n界面 gamma";
+    let rows = vec![
+        String::from("alpha"),
+        String::from("beta 界"),
+        String::from("面 gamma"),
+    ];
+    assert_eq!(partition_semantic_source(source, &rows).concat(), source);
+}
+
 // ---------------------------------------------------------------------------
 // Incremental streaming
 // ---------------------------------------------------------------------------

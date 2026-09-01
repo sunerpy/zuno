@@ -56,13 +56,19 @@ provider 请求前以 typed error 失败；不会静默截断 AGENTS、历史、
 默认 profile 提供类型化的宿主 Planning capability。该 capability 存在时，宿主会在
 第一次 provider request 之前运行确定性分类器；分类不依赖 `plan_update` 是否对模型可见：
 
-- session 已有 active Plan：保持并继续维护，不用通用模板覆盖；
-- completed Plan 遇到新的多阶段用户目标：保留已完成步骤并追加新的 epoch；
+- session 已有 active Plan 且输入是明确继续：保持并继续维护；
+- 新的实质性多阶段目标：归档此前可见 Plan，并安装一个只包含新目标步骤的新根 Plan，
+  不把通用模板重复追加到同一个列表；
 - child report、steering、retry 不会自行创建 Plan；
 - 直接回答、一次有界读取、对已经准备好的修改执行一次短小 commit：可作为原子操作；
 - 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
   输入：默认进入 planned path；
 - 其他普通工程任务：宿主先写入 Agent 对应的轻量 durable Plan，再把请求交给模型。
+
+一个活跃步骤需要聚焦临时工作时，使用 `plan_update action=push` 持久暂停父 Plan，
+让子 Plan 暂时成为客户端唯一可见的 Plan；子步骤全部完成后使用 `action=pop`，父
+Plan 只恢复一次。工作开始、完成、阻塞或范围变化时立即更新活跃 Plan，最终回复前
+必须对账。
 
 因此“调研 → 修改 → 验证”通常会有 Plan；跨组件、委派、多个验收 gate，
 以及可能经历压缩或重启恢复的工作必须持续维护 Plan。模型可以通过
@@ -335,9 +341,10 @@ Todo、Plan step、pending report 与 Job，并记录 omitted count；稳定 ide
 状态、revision 和 reconciliation 字段优先保留。若权威 identity 本身仍无法放入
 预算，组装会失败关闭。typed tools 仍是进一步查询和修改这些 Store 的唯一入口。
 
-数据库当前格式为 6。format 5 会在一个 `BEGIN IMMEDIATE` 事务中
-增加 learning 表和索引，最后以条件更新将 marker 改为 6，并保留已有的 `session`、
-`message` 与 `memory_candidate` 行。未来格式、缺少 marker 或结构损坏会在不修改
+数据库当前格式为 7。format 5 会在一个 `BEGIN IMMEDIATE` 事务中
+增加 learning 表、Plan 栈字段和 archive 表；format 6 只增加 Plan 栈部分。两条路径
+都在最后以条件更新将 marker 改为 7，并保留已有的 `session`、`message`、
+`memory_candidate` 与 `work_plan` 值。未来格式、缺少 marker 或结构损坏会在不修改
 数据库的情况下失败关闭；当前二进制支持的旧格式不要求重建数据库。
 
 ## 10. 诊断命令

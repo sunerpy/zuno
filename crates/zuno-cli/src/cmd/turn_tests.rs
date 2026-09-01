@@ -400,7 +400,7 @@ async fn hiding_plan_update_does_not_disable_host_plan_creation_or_recovery() {
 }
 
 #[test]
-fn host_planning_classifier_appends_a_new_epoch_after_terminal_work() {
+fn host_planning_classifier_replaces_terminal_work_without_duplicate_steps() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -447,7 +447,7 @@ fn host_planning_classifier_appends_a_new_epoch_after_terminal_work() {
             goal_id: None,
         },
     )
-    .expect("append new epoch");
+    .expect("replace terminal plan");
 
     assert!(matches!(outcome.decision, PlanningDecision::Create(_)));
     assert!(outcome.changed);
@@ -455,16 +455,26 @@ fn host_planning_classifier_appends_a_new_epoch_after_terminal_work() {
         .plan("ses-plan-epoch")
         .expect("read plan")
         .expect("updated plan");
-    assert_eq!(updated.revision, first.revision + 1);
-    assert_eq!(updated.steps[0].id, "verify");
+    assert_ne!(updated.id, first.id);
+    assert_eq!(updated.revision, 1);
     assert_eq!(
         updated
             .steps
             .iter()
-            .skip(1)
             .map(|step| step.id.as_str())
             .collect::<Vec<_>>(),
-        ["epoch-2-investigate", "epoch-2-implement", "epoch-2-verify"]
+        ["investigate", "implement", "verify"]
+    );
+    let connection = pool.get().expect("open archive connection");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM work_plan_archive WHERE id=?1",
+                [&first.id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read archived terminal plan"),
+        "completed"
     );
 }
 
@@ -523,21 +533,27 @@ fn host_planning_classifier_preempts_active_ordinary_work_for_a_new_user_objecti
             goal_id: None,
         },
     )
-    .expect("append a preempting plan epoch");
+    .expect("replace the active plan");
 
     assert!(matches!(outcome.decision, PlanningDecision::Create(_)));
-    assert_eq!(outcome.decision.rationale().code(), "active_plan_new_epoch");
+    assert_eq!(outcome.decision.rationale().code(), "active_plan_replaced");
     assert!(outcome.changed);
     let updated = store
         .plan("ses-plan-preempt")
         .expect("read plan")
         .expect("updated plan");
-    assert_eq!(updated.revision, first.revision + 1);
-    assert_eq!(updated.steps[0].status, zuno_tools::PlanStepStatus::Pending);
-    assert_eq!(updated.steps[1].status, zuno_tools::PlanStepStatus::Pending);
-    assert_eq!(updated.steps[2].id, "epoch-2-investigate");
+    assert_ne!(updated.id, first.id);
+    assert_eq!(updated.revision, 1);
     assert_eq!(
-        updated.steps[2].status,
+        updated
+            .steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        ["investigate", "execute", "integrate", "verify"]
+    );
+    assert_eq!(
+        updated.steps[0].status,
         zuno_tools::PlanStepStatus::InProgress
     );
     assert_eq!(
@@ -548,10 +564,21 @@ fn host_planning_classifier_preempts_active_ordinary_work_for_a_new_user_objecti
             .count(),
         1
     );
+    let connection = pool.get().expect("open archive connection");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM work_plan_archive WHERE id=?1",
+                [&first.id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read superseded plan"),
+        "superseded"
+    );
 }
 
 #[test]
-fn host_planning_classifier_keeps_an_explicit_continuation_on_the_active_epoch() {
+fn host_planning_classifier_keeps_an_explicit_continuation_on_the_active_plan() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -613,7 +640,7 @@ fn host_planning_classifier_keeps_an_explicit_continuation_on_the_active_epoch()
 }
 
 #[test]
-fn goal_objective_supersedes_active_plan_and_binds_the_new_epoch() {
+fn goal_objective_replaces_the_active_plan_and_binds_the_new_root() {
     let pool = Arc::new(
         zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open shared database"),
     );
@@ -665,7 +692,7 @@ fn goal_objective_supersedes_active_plan_and_binds_the_new_epoch() {
         )
         .with_work_context(Some(zuno_db::job::JobWorkContext::new(
             None,
-            stale.id,
+            stale.id.clone(),
             stale.revision,
             "patch",
         ))),
@@ -684,7 +711,7 @@ fn goal_objective_supersedes_active_plan_and_binds_the_new_epoch() {
             goal_id: Some("goal-current".to_owned()),
         },
     )
-    .expect("replace plan epoch for the Goal objective");
+    .expect("replace plan for the Goal objective");
 
     assert!(matches!(outcome.decision, PlanningDecision::Create(_)));
     assert!(outcome.changed);
@@ -693,12 +720,25 @@ fn goal_objective_supersedes_active_plan_and_binds_the_new_epoch() {
         .expect("read plan")
         .expect("updated plan");
     assert_eq!(plan.goal_id.as_deref(), Some("goal-current"));
-    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::Completed);
-    assert_eq!(plan.steps[1].status, zuno_tools::PlanStepStatus::Completed);
-    assert!(plan.steps[0].title.starts_with("Superseded: "));
-    assert!(plan.steps[1].title.starts_with("Superseded: "));
-    assert_eq!(plan.steps[2].id, "epoch-2-investigate");
-    assert_eq!(plan.steps[2].status, zuno_tools::PlanStepStatus::InProgress);
+    assert_eq!(
+        plan.steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        ["investigate", "execute", "integrate", "verify"]
+    );
+    assert_eq!(plan.steps[0].status, zuno_tools::PlanStepStatus::InProgress);
+    let connection = pool.get().expect("open archive connection");
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT state FROM work_plan_archive WHERE id=?1",
+                [&stale.id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read stale Plan archive"),
+        "superseded"
+    );
     assert_eq!(
         jobs.get("job-stale-goal").expect("read stale job").status,
         zuno_db::job::JobStatus::Running,

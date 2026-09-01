@@ -132,16 +132,14 @@ Before the first provider request for a user or resolved-command input, a host
 with that capability applies one deterministic classifier shared by CLI, TUI,
 ACP, server, and child turns. A
 bounded answer, atomic action, or explicit continuation retains an active Plan.
-A substantial new ordinary user or resolved-command objective preempts the
-current `in_progress` step back to `pending` and appends a new epoch, preserving
-the prior backlog for explicit resumption or supersession. A completed Plan also
-allows a later multi-stage objective to append a new epoch. Creating or
-materially editing a durable Goal is a stronger objective boundary: the host
-terminalizes unfinished steps in an active prior epoch as `completed` with a
-`Superseded:` title, binds that Plan to the exact `goal_id`, and seeds a new epoch
-when the objective is multi-stage. An already terminal historical Plan remains
-attached to the Goal that produced it. Child reports, steering, and retry
-continuations never manufacture a new Plan.
+A substantial new ordinary user or resolved-command objective archives the
+current visible Plan and installs one new root Plan containing only the new
+objective's seed steps. A completed Plan is archived as completed; unfinished
+work is archived as superseded. Creating or materially editing a durable Goal
+uses the same objective boundary and binds the replacement Plan to the exact
+`goal_id`. An atomic Goal objective may terminalize stale unfinished work without
+seeding a replacement. Child reports, steering, and retry continuations never
+manufacture a new Plan.
 
 A direct answer, one bounded read, or one short commit of already-prepared
 changes may proceed atomically. Other ordinary engineering work receives an
@@ -160,9 +158,14 @@ ownership, dependency, or recovery tracking. They
 must not mechanically mirror every Plan step. Refinement preserves existing
 step ids and completed states while updating titles/statuses or appending new
 steps, so concurrent clients and recovery snapshots retain stable identities.
+When one active step needs a focused temporary workflow, `plan_update` with
+`action=push` atomically suspends the parent and displays a durable child Plan.
+After every child step completes, `action=pop` archives the child and restores
+the exact parent once. The model updates the active Plan when work starts,
+completes, blocks, or changes scope, and reconciles it before a final answer.
 Completed verification steps are immutable historical evidence. If their commit,
 build, tag, deployment, configuration, or other relevant input changes, the
-model appends a new artifact-scoped verification step or epoch.
+model appends a new artifact-scoped verification step.
 
 Native Task admission also captures the active Plan location in the Job's
 versioned `workContext`: optional Goal id, Plan id, Plan revision, and Plan step
@@ -932,6 +935,13 @@ returns to directory, context, and command discovery. Transient `working` rows a
 inserted into the transcript; durable activity, errors, interruption markers, and
 assistant content remain reconstructable from session events.
 
+Durably admitted user follow-ups are shown in FIFO order in a fixed dock directly
+above the composer while a turn is active. Ordinary submit labels an entry for
+the next turn; the dock resolves and shows the user's actual
+`input_force_submit` binding for steering the active turn, plus the queue-manager
+binding. Promotion removes the entry from the dock and adds it to transcript
+history; cancellation removes it without fabricating a sent message.
+
 Context occupancy is the most recent complete provider prompt divided by the catalog
 context limit. It is replaced on each provider report rather than accumulated across
 the session; cumulative disjoint token buckets remain available in the usage
@@ -980,10 +990,10 @@ objective or show/history/create/edit/pause/resume/block/complete/cancel against
 the durable goal store. A direct objective creates a goal when none exists or
 the previous goal is complete or cancelled; otherwise it updates the objective
 while preserving lifecycle state, budget, and usage. Create, edit, and shorthand
-objective changes also reconcile an active durable Plan: unfinished prior steps become
-terminal `completed` entries titled `Superseded: ...`, a multi-stage objective
-receives a new epoch, and the active Plan stores the current `goal_id`. An atomic
-objective does not rebind an already terminal historical Plan. Recognized action
+objective changes also reconcile an active durable Plan: a multi-stage objective
+archives the previous visible Plan and installs a new root bound to the current
+`goal_id`; an atomic objective can terminalize stale unfinished work without
+replacing an already terminal historical Plan. Recognized action
 words take precedence over the shorthand.
 Neither surface sends the slash text to the model or synthesizes a private client-only result. Goal output is a typed
 session-command output event, not reasoning. Invalid explicit action arguments
@@ -1050,8 +1060,8 @@ Notes reads are `Safe + ParallelSafe + ReadOnly`; Notes writes are
 `Never + Exclusive + SideEffecting`. Missing or unknown actions take the strict
 write policy before typed argument validation.
 
-The component owns additive `session_note` and `session_note_operation` tables;
-database format 5 does not change. Session cascade deletion and prune include
+The component owns additive `session_note` and `session_note_operation` tables.
+Session cascade deletion and prune include
 both tables. Session export/import preserves notes and their operation ledger,
 validates logical names and quotas on import, and sanitized export redacts note
 identity/content while dropping the idempotency ledger.

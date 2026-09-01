@@ -1,9 +1,10 @@
 //! Atomic current-schema creation and guarded format upgrades.
 //!
 //! Format 5 is the first historical layout Zuno upgrades in place. The learning
-//! flywheel adds only new tables and indices, so the upgrade can preserve every
-//! existing session, message, and resident-memory row. Other older, newer, or
-//! unmarked layouts are still rejected without mutation.
+//! flywheel and durable Plan stack add only tables, indices, and nullable/defaulted
+//! columns, so the upgrade can preserve every existing session, message, Plan, and
+//! resident-memory row. Other older, newer, or unmarked layouts are still rejected
+//! without mutation.
 
 use crate::{open, schema};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, TransactionBehavior, params};
@@ -12,8 +13,9 @@ use zuno_error::DbError;
 /// Current database format.
 ///
 /// Bump this whenever [`crate::schema`] changes incompatibly.
-pub const CURRENT_FORMAT: u32 = 6;
+pub const CURRENT_FORMAT: u32 = 7;
 const LEARNING_UPGRADE_FROM: u32 = 5;
+const PLAN_STACK_UPGRADE_FROM: u32 = 6;
 
 const FORMAT_TABLE: &str = "zuno_schema";
 const FORMAT_SQL: &str = "
@@ -24,10 +26,10 @@ CREATE TABLE zuno_schema (
 
 /// Ensure that `connection` uses the current all-at-once schema.
 ///
-/// Empty databases are initialized. Format-5 databases receive the additive
-/// learning schema in one `BEGIN IMMEDIATE` transaction, with the marker changed
-/// only after every new table and index exists. Other existing formats are only
-/// validated or rejected.
+/// Empty databases are initialized. Format-5 databases receive both additive
+/// upgrades and format-6 databases receive the Plan-stack upgrade in one
+/// `BEGIN IMMEDIATE` transaction, with the marker changed only after every new
+/// object exists. Other existing formats are only validated or rejected.
 ///
 /// # Errors
 ///
@@ -40,8 +42,9 @@ pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
         return create_current(connection);
     }
     match observed_format(connection, &tables)? {
-        Some(CURRENT_FORMAT) => validate_current(&tables),
+        Some(CURRENT_FORMAT) => validate_current(connection, &tables),
         Some(LEARNING_UPGRADE_FROM) => migrate_learning(connection),
+        Some(PLAN_STACK_UPGRADE_FROM) => migrate_plan_stack(connection),
         observed => Err(DbError::SchemaMismatch {
             expected: CURRENT_FORMAT,
             observed,
@@ -49,8 +52,13 @@ pub fn apply(connection: &mut Connection) -> Result<(), DbError> {
     }
 }
 
-fn validate_current(tables: &[String]) -> Result<(), DbError> {
-    let required = ["session", "message_feedback", "experience_record"];
+fn validate_current(connection: &Connection, tables: &[String]) -> Result<(), DbError> {
+    let required = [
+        "session",
+        "message_feedback",
+        "experience_record",
+        "work_plan_archive",
+    ];
     let missing = required
         .into_iter()
         .find(|required| !tables.iter().any(|table| table == required));
@@ -58,6 +66,14 @@ fn validate_current(tables: &[String]) -> Result<(), DbError> {
         return Err(failure(std::io::Error::other(format!(
             "current schema marker exists without required table `{missing}`"
         ))));
+    }
+    let work_plan_columns = column_names(connection, "work_plan")?;
+    for required in ["parent_plan_id", "stack_depth"] {
+        if !work_plan_columns.iter().any(|column| column == required) {
+            return Err(failure(std::io::Error::other(format!(
+                "current schema marker exists without required work_plan column `{required}`"
+            ))));
+        }
     }
     Ok(())
 }
@@ -99,7 +115,7 @@ fn create_current(connection: &mut Connection) -> Result<(), DbError> {
     transaction.commit().map_err(map_error)
 }
 
-/// Add the format-6 learning tables without rewriting any format-5 row.
+/// Add every post-format-5 additive object without rewriting any historical row.
 fn migrate_learning(connection: &mut Connection) -> Result<(), DbError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -118,6 +134,7 @@ fn migrate_learning(connection: &mut Connection) -> Result<(), DbError> {
         )));
     }
     schema::up_learning(&transaction)?;
+    schema::up_plan_stack(&transaction)?;
     let changed = transaction
         .execute(
             "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
@@ -127,6 +144,39 @@ fn migrate_learning(connection: &mut Connection) -> Result<(), DbError> {
     if changed != 1 {
         return Err(failure(std::io::Error::other(
             "format-5 marker changed while the learning migration was running",
+        )));
+    }
+    transaction.commit().map_err(map_error)
+}
+
+/// Add durable Plan frames without rewriting any format-6 row.
+fn migrate_plan_stack(connection: &mut Connection) -> Result<(), DbError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_error)?;
+    let tables = transaction_table_names(&transaction)?;
+    let observed = observed_format(&transaction, &tables)?;
+    if observed != Some(PLAN_STACK_UPGRADE_FROM) {
+        return Err(DbError::SchemaMismatch {
+            expected: PLAN_STACK_UPGRADE_FROM,
+            observed,
+        });
+    }
+    if !tables.iter().any(|table| table == "work_plan") {
+        return Err(failure(std::io::Error::other(
+            "format-6 marker exists without the required work_plan table",
+        )));
+    }
+    schema::up_plan_stack(&transaction)?;
+    let changed = transaction
+        .execute(
+            "UPDATE zuno_schema SET format = ?1 WHERE singleton = 1 AND format = ?2",
+            params![CURRENT_FORMAT, PLAN_STACK_UPGRADE_FROM],
+        )
+        .map_err(map_error)?;
+    if changed != 1 {
+        return Err(failure(std::io::Error::other(
+            "format-6 marker changed while the Plan-stack migration was running",
         )));
     }
     transaction.commit().map_err(map_error)
@@ -155,6 +205,19 @@ fn query_table_names(connection: &Connection) -> Result<Vec<String>, DbError> {
         .map_err(map_error)
 }
 
+fn column_names(connection: &Connection, table: &str) -> Result<Vec<String>, DbError> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+        ))
+        .map_err(map_error)?;
+    statement
+        .query_map([], |row| row.get(0))
+        .map_err(map_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_error)
+}
+
 pub(crate) fn map_error(error: rusqlite::Error) -> DbError {
     if open::is_busy(&error) {
         return open::map_error(error);
@@ -175,6 +238,16 @@ mod tests {
 
     fn memory() -> Connection {
         open::open(&zuno_paths::DbLocation::Memory).expect("open memory database")
+    }
+
+    fn remove_plan_stack_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TABLE work_plan_archive;
+                 ALTER TABLE work_plan DROP COLUMN parent_plan_id;
+                 ALTER TABLE work_plan DROP COLUMN stack_depth;",
+            )
+            .expect("construct pre-Plan-stack schema");
     }
 
     #[test]
@@ -253,9 +326,43 @@ mod tests {
     }
 
     #[test]
+    fn current_marker_without_plan_stack_columns_is_rejected_without_mutation() {
+        let mut connection = memory();
+        create_current(&mut connection).expect("create current schema");
+        connection
+            .execute_batch(
+                "DROP TABLE work_plan_archive;
+                 ALTER TABLE work_plan DROP COLUMN parent_plan_id;
+                 ALTER TABLE work_plan DROP COLUMN stack_depth;
+                 CREATE TABLE work_plan_archive (id text PRIMARY KEY);",
+            )
+            .expect("construct corrupt current shape");
+
+        let error = apply(&mut connection).expect_err("corrupt current shape must fail");
+        assert!(matches!(error, DbError::Schema { .. }));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT format FROM zuno_schema WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .expect("read unchanged marker"),
+            CURRENT_FORMAT
+        );
+        assert!(
+            !column_names(&connection, "work_plan")
+                .expect("read unchanged columns")
+                .iter()
+                .any(|column| column == "stack_depth")
+        );
+    }
+
+    #[test]
     fn format_five_upgrades_without_rewriting_history() {
         let mut connection = memory();
-        create_current(&mut connection).expect("create format six");
+        create_current(&mut connection).expect("create current schema");
+        remove_plan_stack_schema(&connection);
         connection
             .execute_batch(
                 "INSERT INTO project \
@@ -273,6 +380,13 @@ mod tests {
                  ) VALUES (
                    'memory-1', 'project', '/workspace/MEMORY.md', 'add', 'keep history',
                    'fixture', 9000, 'user', 'session-1', 'message-1', 'pending', 1, 1
+                 );
+                 INSERT INTO work_plan
+                   (session_id, id, goal_id, revision, title, steps, time_created, time_updated)
+                 VALUES (
+                   'session-1', 'plan-1', NULL, 4, 'preserve the plan',
+                   '[{\"id\":\"inspect\",\"title\":\"Inspect history\",\"status\":\"in_progress\"}]',
+                   1, 2
                  );
                  DROP TABLE skill_candidate;
                  DROP TABLE evaluation_result;
@@ -309,6 +423,13 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read memory before migration");
+        let plan_before: (String, i64, String) = connection
+            .query_row(
+                "SELECT id, revision, steps FROM work_plan WHERE session_id = 'session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read plan before migration");
 
         apply(&mut connection).expect("upgrade format five");
 
@@ -352,10 +473,119 @@ mod tests {
         );
         assert_eq!(
             connection
+                .query_row(
+                    "SELECT id, revision, steps FROM work_plan WHERE session_id = 'session-1'",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?
+                    )),
+                )
+                .expect("read plan after migration"),
+            plan_before
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT parent_plan_id, stack_depth FROM work_plan \
+                     WHERE session_id = 'session-1'",
+                    [],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("read migrated Plan stack fields"),
+            (None, 0)
+        );
+        assert_eq!(
+            connection
                 .query_row("SELECT count(*) FROM experience_record", [], |row| {
                     row.get::<_, i64>(0)
                 })
                 .expect("query newly installed table"),
+            0
+        );
+    }
+
+    #[test]
+    fn format_six_adds_plan_stack_without_rewriting_the_active_plan() {
+        let mut connection = memory();
+        create_current(&mut connection).expect("create current schema");
+        remove_plan_stack_schema(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO project \
+                   (id, worktree, time_created, time_updated, sandboxes) \
+                 VALUES ('project-1', '/workspace', 1, 1, '[]');
+                 INSERT INTO session \
+                   (id, project_id, slug, directory, title, version, time_created, time_updated) \
+                 VALUES ('session-1', 'project-1', 'slug', '/workspace', 'history', '1', 1, 1);
+                 INSERT INTO work_plan
+                   (session_id, id, goal_id, revision, title, steps, time_created, time_updated)
+                 VALUES (
+                   'session-1', 'plan-1', 'goal-1', 7, 'durable plan',
+                   '[{\"id\":\"verify\",\"title\":\"Verify release\",\"status\":\"in_progress\"}]',
+                   2, 3
+                 );
+                 UPDATE zuno_schema SET format = 6 WHERE singleton = 1;",
+            )
+            .expect("construct format-six schema");
+        let before: (String, Option<String>, i64, String, String, i64, i64) = connection
+            .query_row(
+                "SELECT id, goal_id, revision, title, steps, time_created, time_updated \
+                 FROM work_plan WHERE session_id='session-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("read format-six plan");
+
+        apply(&mut connection).expect("upgrade format six");
+
+        let after: (String, Option<String>, i64, String, String, i64, i64) = connection
+            .query_row(
+                "SELECT id, goal_id, revision, title, steps, time_created, time_updated \
+                 FROM work_plan WHERE session_id='session-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("read migrated plan");
+        assert_eq!(after, before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT parent_plan_id, stack_depth FROM work_plan \
+                     WHERE session_id='session-1'",
+                    [],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("read Plan stack defaults"),
+            (None, 0)
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM work_plan_archive", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("query archive"),
             0
         );
     }

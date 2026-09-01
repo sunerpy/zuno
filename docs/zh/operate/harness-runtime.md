@@ -49,7 +49,12 @@ Agent 具有显式的正向职责、负向委派边界、权限以及结构化�
 
 ## Plan 与 Work 状态迁移
 
-持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」这类文字不构成进展。默认 profile 发布类型化的宿主 Planning capability；即使最终工具过滤隐藏了 `plan_update`，宿主仍会创建、持久化并在重启后恢复 Plan。隐藏工具只会移除模型修改入口。
+持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」
+这类文字不构成进展。默认 profile 发布类型化的宿主 Planning capability；即使最终工具
+过滤隐藏了 `plan_update`，宿主仍会创建、持久化并在重启后恢复 Plan。明确继续会维护
+当前 Plan；新的实质性目标归档旧 Plan 并安装只含新目标步骤的新根 Plan。临时聚焦工作
+通过 `action=push` 暂停父 Plan，子步骤全部完成后由 `action=pop` 精确恢复父 Plan 一次。
+工作状态变化时立即更新，并在最终回复前对账。隐藏工具只会移除模型修改入口。
 
 ## 原生会话命令、压缩与硬中断
 
@@ -66,7 +71,7 @@ Notes 每个作用域最多 100 个文档，单文档 256 KiB，总计 1 MiB。�
 读取采用 `Safe + ParallelSafe + ReadOnly`，写入采用
 `Never + Exclusive + SideEffecting`；非法 action 按最严格策略失败即拒绝。
 
-组件自有的 `session_note` 与 `session_note_operation` 是 format 5 上的增量表。它们随
+组件自有的 `session_note` 与 `session_note_operation` 是增量表。它们随
 session 级联删除，并进入 session export/import、sanitize 与 prune。TUI、server、ACP
 和 child turn 都消费同一套运行时工具快照，不拥有私有连续性逻辑。
 

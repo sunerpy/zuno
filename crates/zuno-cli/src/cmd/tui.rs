@@ -3596,7 +3596,16 @@ fn promote_pending_prompt(
     else {
         return Ok(None);
     };
-    refresh_queued_input_projection(&inbox, host.session_id(), queued_inputs, queue_wake, None);
+    refresh_queued_input_projection(
+        &inbox,
+        host.session_id(),
+        queued_inputs,
+        queue_wake,
+        Some(QueuedInputNotice {
+            input_id: promoted.id.clone(),
+            kind: QueuedInputNoticeKind::Promoted,
+        }),
+    );
     Ok(Some(DriverPrompt::promoted(promoted.id, submission)))
 }
 

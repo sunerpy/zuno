@@ -204,6 +204,15 @@ fn seed(connection: &Connection) {
             .expect("insert work plan");
         connection
             .execute(
+                "INSERT INTO work_plan_archive
+                   (id, session_id, stack_depth, revision, title, steps, state,
+                    time_created, time_updated, time_archived)
+                 VALUES (?1, ?2, 0, 1, 'previous ship plan', '[]', 'superseded', 1, 1, 1)",
+                rusqlite::params![format!("archived_plan_{session_id}"), session_id],
+            )
+            .expect("insert archived work plan");
+        connection
+            .execute(
                 "INSERT INTO work_item
                    (id, session_id, subject, description, status, priority, dependencies,
                     revision, time_created, time_updated)
@@ -393,7 +402,7 @@ fn prune_default_preview_is_inert_across_every_real_table() {
     assert_eq!(all_table_counts(&connection), before);
     assert!(remote.calls.borrow().is_empty(), "preview never unshares");
     assert_eq!(outcome.preview.tables.len(), PRUNE_TABLES.len());
-    assert_eq!(outcome.preview.total_rows, 54);
+    assert_eq!(outcome.preview.total_rows, 57);
     assert!(outcome.preview.total_bytes > 0);
     assert_eq!(outcome.preview.cost, 7.5);
     assert_eq!(outcome.preview.tokens.input, 6);
@@ -524,6 +533,7 @@ fn prune_preview_counts_exactly_match_the_subsequent_transactional_delete() {
         ("agent_job", "parent_session_id"),
         ("work_item", "session_id"),
         ("work_plan", "session_id"),
+        ("work_plan_archive", "session_id"),
         ("session_context_epoch", "session_id"),
         ("session_input", "session_id"),
         ("session_message", "session_id"),
@@ -690,7 +700,7 @@ fn prune_rolled_back_delete_preserves_the_original_preview() {
 fn prune_delete_order_and_true_related_table_count_are_pinned() {
     assert_eq!(
         PRUNE_TABLES.len(),
-        18,
+        19,
         "every session-owned schema table must be explicit"
     );
     assert_eq!(
@@ -705,6 +715,7 @@ fn prune_delete_order_and_true_related_table_count_are_pinned() {
             "agent_job",
             "work_item",
             "work_plan",
+            "work_plan_archive",
             "session_context_epoch",
             "session_input",
             "session_message",

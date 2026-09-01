@@ -49,7 +49,11 @@ rejecting stale concurrent writes.
 
 The host's durable Plan is independent from model tool visibility. Disabling
 `plan_update` hides model mutation but does not disable host Plan creation or
-restart recovery.
+restart recovery. Its optional `action` is `update` by default. `push` suspends
+the active Plan and installs a focused durable child; `pop` is accepted only
+after every child step completes and restores the exact parent once. The active
+Plan should be updated when work starts, completes, blocks, or changes scope,
+then reconciled before a final answer.
 
 See [History and Notes continuity](/config/continuity) for complete enable/disable,
 profile-overlay, permission, revision, and restart guidance.

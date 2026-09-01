@@ -5,7 +5,7 @@ use rusqlite::Transaction;
 use zuno_error::DbError;
 
 /// Number of application tables created by the current schema's single `up`.
-pub const TABLE_COUNT: usize = 36;
+pub const TABLE_COUNT: usize = 37;
 
 const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE `workspace` (
@@ -268,6 +268,8 @@ CREATE TABLE `agent_job` (
 CREATE TABLE `work_plan` (
   `session_id` text PRIMARY KEY,
   `id` text NOT NULL UNIQUE,
+  `parent_plan_id` text,
+  `stack_depth` integer NOT NULL DEFAULT 0 CHECK (`stack_depth` >= 0),
   `goal_id` text,
   `revision` integer NOT NULL CHECK (`revision` >= 1),
   `title` text NOT NULL,
@@ -275,6 +277,21 @@ CREATE TABLE `work_plan` (
   `time_created` integer NOT NULL,
   `time_updated` integer NOT NULL,
   CONSTRAINT `fk_work_plan_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
+);
+CREATE TABLE `work_plan_archive` (
+  `id` text PRIMARY KEY,
+  `session_id` text NOT NULL,
+  `parent_plan_id` text,
+  `stack_depth` integer NOT NULL CHECK (`stack_depth` >= 0),
+  `goal_id` text,
+  `revision` integer NOT NULL CHECK (`revision` >= 1),
+  `title` text NOT NULL,
+  `steps` text NOT NULL,
+  `state` text NOT NULL CHECK (`state` IN ('suspended','completed','superseded')),
+  `time_created` integer NOT NULL,
+  `time_updated` integer NOT NULL,
+  `time_archived` integer NOT NULL,
+  CONSTRAINT `fk_work_plan_archive_session_id_session_id_fk` FOREIGN KEY (`session_id`) REFERENCES `session`(`id`) ON DELETE CASCADE
 );
 CREATE TABLE `work_item` (
   `id` text PRIMARY KEY,
@@ -394,6 +411,7 @@ CREATE INDEX `session_project_idx` ON `session` (`project_id`);
 CREATE INDEX `session_workspace_idx` ON `session` (`workspace_id`);
 CREATE INDEX `session_parent_idx` ON `session` (`parent_id`);
 CREATE INDEX `work_plan_goal_idx` ON `work_plan` (`goal_id`);
+CREATE INDEX `work_plan_archive_session_state_idx` ON `work_plan_archive` (`session_id`,`state`,`time_archived`);
 CREATE INDEX `work_item_session_status_created_idx` ON `work_item` (`session_id`,`status`,`time_created`);
 CREATE INDEX `work_item_goal_idx` ON `work_item` (`goal_id`);
 CREATE INDEX `work_item_plan_step_idx` ON `work_item` (`plan_step_id`);
@@ -671,5 +689,34 @@ pub fn up(transaction: &Transaction<'_>) -> Result<(), DbError> {
 pub(crate) fn up_learning(transaction: &Transaction<'_>) -> Result<(), DbError> {
     transaction
         .execute_batch(LEARNING_SCHEMA_SQL)
+        .map_err(migration::map_error)
+}
+
+/// Add durable suspended/completed Plan frames to a format-6 database.
+pub(crate) fn up_plan_stack(transaction: &Transaction<'_>) -> Result<(), DbError> {
+    transaction
+        .execute_batch(
+            "ALTER TABLE work_plan ADD COLUMN parent_plan_id text;
+             ALTER TABLE work_plan ADD COLUMN stack_depth integer NOT NULL DEFAULT 0
+               CHECK (stack_depth >= 0);
+             CREATE TABLE work_plan_archive (
+               id text PRIMARY KEY,
+               session_id text NOT NULL,
+               parent_plan_id text,
+               stack_depth integer NOT NULL CHECK (stack_depth >= 0),
+               goal_id text,
+               revision integer NOT NULL CHECK (revision >= 1),
+               title text NOT NULL,
+               steps text NOT NULL,
+               state text NOT NULL CHECK (state IN ('suspended','completed','superseded')),
+               time_created integer NOT NULL,
+               time_updated integer NOT NULL,
+               time_archived integer NOT NULL,
+               CONSTRAINT fk_work_plan_archive_session_id_session_id_fk
+                 FOREIGN KEY (session_id) REFERENCES session(id) ON DELETE CASCADE
+             );
+             CREATE INDEX work_plan_archive_session_state_idx
+               ON work_plan_archive(session_id,state,time_archived);",
+        )
         .map_err(migration::map_error)
 }

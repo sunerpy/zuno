@@ -66,10 +66,9 @@ Goal 是续跑的授权来源。一个活跃的 goal 会持续下去，直到它
 
 `/goal` 显示当前状态。`/goal <目标>` 会在尚无 Goal，或上一条 Goal 已完成、已取消时
 创建新 Goal；否则直接更新当前目标，同时保留已有状态、预算和累计用量。生命周期管理仍可
-使用显式 action 形式。创建、编辑或简写更新目标时，宿主也会同步活跃 Plan：上一
-活跃 epoch 尚未完成的步骤会转为 `completed`，并在标题前加 `Superseded:` 以明确
-表示被新目标替代；多阶段目标建立新 epoch，并将活跃 Plan 绑定到当前 `goal_id`。
-若新目标是原子任务，已终态的历史 Plan 不会改绑。
+使用显式 action 形式。创建、编辑或简写更新目标时，宿主也会同步活跃 Plan：
+多阶段目标会归档此前可见 Plan，并安装一个只包含新目标步骤、绑定当前 `goal_id` 的
+新根 Plan。若新目标是原子任务，可以终结陈旧未完成工作，但不会改绑已终态的历史 Plan。
 
 当首词为已知 action 时，action 优先：`show`、`get`、`status`、`history`、`create`、
 `edit`、`pause`、`resume`、`block`、`complete`、`cancel` 和 `help`。如果目标本身以
@@ -88,9 +87,11 @@ Plan 承载阶段、它们的依赖顺序，以及它们的验收状态。它存
 - 只要还有 pending 的步骤，就恰好有一个步骤处于进行中。
 - `completed` 是不可回退的终态。
 - 一个完全完成的 plan 没有进行中的步骤。
-- 有界回答、原子操作或明确的“继续”会维持当前 epoch。新的实质性普通目标会把旧的
-  `in_progress` 步骤退回 `pending`，再追加一个新 epoch，避免新请求被陈旧 Plan
-  静默吞掉。
+- 有界回答、原子操作或明确的“继续”会维持当前 Plan。新的实质性普通目标会归档旧
+  Plan，并安装一个只包含新目标步骤的新根 Plan，避免可见进度不断累积重复通用步骤。
+- 聚焦的临时工作使用 `plan_update action=push`：父 Plan 被持久暂停，子 Plan 暂时
+  成为可见 Plan。子步骤全部完成后使用 `action=pop`，父 Plan 只恢复一次。工作开始、
+  完成、阻塞或范围变化时立即更新活跃 Plan，并在最终回复前完成状态对账。
 - 验证证据只属于实际检查过的 commit、build、tag、部署、配置和输入。任一项发生变化
   后都要追加新的验收门，不能复用旧的已完成结果。
 - Task job 由宿主绑定到准入它的 Plan 步骤。关联 job 仍为 queued、running、

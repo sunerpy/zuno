@@ -585,9 +585,9 @@ side effect，并在同一事务内替换未消费的 uncertain report。
 
 - 用户输入或已解析 command 可以创建 Plan；child report、steering、retry 只能继续
   既有状态，不能自行创建新 Plan；
-- 已有 active durable Plan：继续维护；
-- 已完成的 Plan 遇到新的多阶段用户目标：保留已完成 step，追加带新 epoch id 的
-  steps；
+- 已有 active durable Plan 且输入是明确继续：继续维护；
+- 新的实质性多阶段目标：归档此前可见 Plan，并安装一个只包含新目标 seed steps 的
+  新根 Plan；不会把通用步骤重复追加到同一个进度列表；
 - 直接回答、一次有界读取、一次短小的既有变更 commit：允许原子执行；
 - 图片、resource、selection、branch diff 等 typed context，以及足够大的多文本块
   输入：进入 planned path；
@@ -598,6 +598,10 @@ side effect，并在同一事务内替换未消费的 uncertain report。
 跳过 Plan。只有最终仍可见的 `plan_update` 才允许模型精炼；隐藏该工具不影响宿主
 创建、持久化、投影或重启恢复 Plan。精炼必须保留已有 step id 和 completed 状态，
 可更新标题/状态或追加 step。Todo 是 step 下的可选细化，不要求机械一一对应。
+若一个活跃步骤需要聚焦的临时工作流，模型使用 `plan_update action=push` 在同一事务
+中暂停父 Plan 并安装持久子 Plan；子步骤全部完成后使用 `action=pop`，归档子 Plan
+并精确恢复父 Plan 一次。工作开始、完成、阻塞或范围变化时立即更新活跃 Plan，最终
+回复前必须完成状态对账。
 
 ### 9.2 执行波次
 

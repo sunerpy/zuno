@@ -1,9 +1,9 @@
 # Zuno database lifecycle
 
-Zuno owns its configuration and data roots. The current database format is 6.
+Zuno owns its configuration and data roots. The current database format is 7.
 Empty databases are created at the current format, and supported older formats advance
 through guarded forward migrations. Format 5 is the first supported historical format
-and upgrades in place to format 6 without rebuilding the database.
+and upgrades in place to format 7 without rebuilding the database.
 
 ## The channel database
 
@@ -52,27 +52,32 @@ it opened. See
 
 Database opening recognizes these states:
 
-1. **Empty database.** The complete format-6 schema and the single `zuno_schema`
+1. **Empty database.** The complete format-7 schema and the single `zuno_schema`
    marker are created atomically.
-2. **Format 6.** The marker and required current tables are validated before
+2. **Format 7.** The marker and required current tables are validated before
    application queries run.
-3. **Format 5.** The additive learning schema is migrated to format 6 in place.
-4. **Any other state.** An older unsupported format, a future format, a missing marker,
+3. **Format 6.** Durable Plan-stack columns and `work_plan_archive` are added in place.
+4. **Format 5.** The additive learning schema and Plan-stack schema are migrated to
+   format 7 in one transaction.
+5. **Any other state.** An older unsupported format, a future format, a missing marker,
    or a marker whose required tables are absent fails closed without modification.
 
-### Format 5 to format 6
+### Format 5 or 6 to format 7
 
 The supported migration uses one SQLite `BEGIN IMMEDIATE` transaction:
 
-1. Re-read the table inventory and require the marker to be exactly format 5.
-2. Require the format-5 `session` table before changing anything.
-3. Create all format-6 learning tables and indexes.
-4. Update the singleton marker from 5 to 6 with a conditional update.
-5. Commit only after every schema operation and the marker update succeed.
+1. Re-read the table inventory and require the marker to be exactly format 5 or 6.
+2. Require the historical `session` and `work_plan` tables before changing anything.
+3. From format 5, create all format-6 learning tables and indexes.
+4. Add nullable `parent_plan_id`, defaulted `stack_depth`, and
+   `work_plan_archive` without rewriting the active Plan row.
+5. Update the singleton marker from 5 or 6 to 7 with a conditional update.
+6. Commit only after every schema operation and the marker update succeed.
 
 Any failure rolls the transaction back. The migration does not rewrite existing
-`session`, `message`, or `memory_candidate` rows. Tests compare representative row
-values before and after migration and then query the new learning tables.
+`session`, `message`, `memory_candidate`, or `work_plan` values. Tests construct
+exact format-5 and format-6 shapes, compare representative rows before and after,
+then query the new learning and Plan archive tables.
 
 Changing only `zuno_schema.format` is never a valid repair: application queries require
 the matching tables and indexes. Do not manually advance or downgrade the marker.
@@ -85,7 +90,7 @@ copy before any operator-led recovery.
 
 For important data, use the exact older binary to export it or implement and validate an
 explicit forward migration. Do not guess the schema, silently drop rows, or require a
-rebuild for a format that the current binary supports. A valid format-5 database should
+rebuild for a format that the current binary supports. A valid format-5 or format-6 database should
 open and migrate automatically.
 
 ## Rules for future schema changes

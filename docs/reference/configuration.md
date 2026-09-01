@@ -269,7 +269,7 @@ sequence first. Keyboard or pointer interaction while the overlay remains active
 restarts the five-second deadline; resolving or abandoning the sequence still closes it
 immediately.
 
-With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events. The transcript and both root and child composers provide their own selection and copy behavior. Releasing a drag copies the selected text through the configured clipboard and leaves the highlight visible. Transcript selection remains clamped instead of crossing into the sidebar; tool and sidebar disclosure rows are clickable, and an overflowing conversation mounts a draggable scrollbar.
+With `mouse` absent or `true`, Zuno captures button, drag, release, and wheel events. The transcript and both root and child composers provide their own selection and copy behavior. Releasing a drag copies the selected text through the configured clipboard and leaves the highlight visible. Transcript clipboard text omits role labels, borders, padding, and visual soft wraps; only explicit source newlines are retained. Transcript selection remains clamped instead of crossing into the sidebar; tool and sidebar disclosure rows are clickable, and an overflowing conversation mounts a draggable scrollbar.
 
 Wheel input is precise at the start of a gesture: the default first notch moves one
 row, then a sustained fast gesture accelerates. Setting `scroll_speed` chooses a

@@ -224,10 +224,11 @@ pub use crate::question::{
 };
 pub use crate::work_state::{
     PLAN_GET_DESCRIPTION, PLAN_GET_TOOL_ID, PLAN_UPDATE_DESCRIPTION, PLAN_UPDATE_TOOL_ID,
-    PlanGetTool, PlanStep, PlanStepStatus, PlanUpdateParams, PlanUpdateTool, TODO_GET_DESCRIPTION,
-    TODO_GET_TOOL_ID, TODO_UPDATE_DESCRIPTION, TODO_UPDATE_TOOL_ID, TodoGetTool, TodoUpdateParams,
-    TodoUpdateTool, WorkItem, WorkItemChange, WorkItemPriority, WorkItemStatus, WorkPlan,
-    WorkStateError, WorkStateGetParams, WorkStateSnapshot, WorkStateStore, work_state_tools,
+    PlanGetTool, PlanMutationAction, PlanMutationParams, PlanStep, PlanStepStatus,
+    PlanUpdateParams, PlanUpdateTool, TODO_GET_DESCRIPTION, TODO_GET_TOOL_ID,
+    TODO_UPDATE_DESCRIPTION, TODO_UPDATE_TOOL_ID, TodoGetTool, TodoUpdateParams, TodoUpdateTool,
+    WorkItem, WorkItemChange, WorkItemPriority, WorkItemStatus, WorkPlan, WorkStateError,
+    WorkStateGetParams, WorkStateSnapshot, WorkStateStore, work_state_tools,
 };
 pub use crate::workflow::{
     WIRE_ID as WORKFLOW_WIRE_ID, WorkflowHost, WorkflowNodeRequest, WorkflowParams,

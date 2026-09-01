@@ -531,6 +531,7 @@ fn vacuum_stats_counts_every_table_the_live_schema_actually_has() {
             "skill_candidate",
             "work_item",
             "work_plan",
+            "work_plan_archive",
             "workspace",
             "zuno_schema",
         ],

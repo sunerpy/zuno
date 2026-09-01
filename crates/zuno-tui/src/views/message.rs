@@ -1418,6 +1418,18 @@ struct MessageRows {
     lines: Vec<Line<'static>>,
     tools: Vec<(usize, String)>,
     reasoning: Vec<(usize, ReasoningKey)>,
+    copy: Vec<Option<CopyRow>>,
+}
+
+/// One visual row's semantic clipboard projection.
+///
+/// `text` is a slice of the durable source, not the padded terminal row. Consecutive
+/// rows therefore concatenate back to the exact source: visual wrapping contributes
+/// no newline, while explicit source newlines remain embedded in `text`.
+#[derive(Debug, Clone)]
+struct CopyRow {
+    content_start: u16,
+    text: String,
 }
 
 /// Stable identity of one reasoning part in the append-only transcript.
@@ -1738,14 +1750,15 @@ impl TranscriptView {
         if area.width == 0 {
             return None;
         }
-        let rows = self.lines(area.width);
+        let rows = self.selection_rows(area.width);
         let (start, end) = selection.ordered();
         if start.row >= rows.len() {
             return None;
         }
-        let mut selected = Vec::new();
+        let mut selected = String::new();
+        let mut boundary = false;
         let last = end.row.min(rows.len().saturating_sub(1));
-        for (row, line) in rows
+        for (row, copy) in rows
             .iter()
             .enumerate()
             .take(last.saturating_add(1))
@@ -1754,16 +1767,38 @@ impl TranscriptView {
             let Some((left, right)) = selection.columns(row, area.width) else {
                 continue;
             };
-            let text = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            let slice = slice_columns(&text, left, right);
-            selected.push(slice.trim_end().to_owned());
+            let Some(copy) = copy else {
+                if !selected.is_empty() {
+                    boundary = true;
+                }
+                continue;
+            };
+            let content_width =
+                u16::try_from(semantic_display_width(&copy.text)).unwrap_or(u16::MAX);
+            let content_end = copy.content_start.saturating_add(content_width);
+            let selected_left = left.max(copy.content_start);
+            let selected_right = right.min(content_end);
+            let slice = if copy.text == "\n" && left <= copy.content_start {
+                String::from("\n")
+            } else if selected_left < selected_right {
+                slice_semantic_columns(
+                    &copy.text,
+                    selected_left.saturating_sub(copy.content_start),
+                    selected_right.saturating_sub(copy.content_start),
+                )
+            } else {
+                String::new()
+            };
+            if slice.is_empty() {
+                continue;
+            }
+            if boundary && !selected.ends_with('\n') {
+                selected.push('\n');
+            }
+            boundary = false;
+            selected.push_str(&slice);
         }
-        let text = selected.join("\n");
-        (!text.is_empty()).then_some(text)
+        (!selected.is_empty()).then_some(selected)
     }
 
     fn point_at(&self, column: u16, row: u16, clamp: bool) -> Option<TextPoint> {
@@ -1900,6 +1935,20 @@ impl TranscriptView {
         lines
     }
 
+    fn selection_rows(&self, width: u16) -> Vec<Option<CopyRow>> {
+        let mut rows = Vec::new();
+        let mut previous: Option<Role> = None;
+        for (index, message) in self.transcript.messages.iter().enumerate() {
+            let message_rows = self.message_rows(index, message, previous, width);
+            rows.extend(message_rows.copy);
+            previous = Some(message.role);
+        }
+        if previous.is_some() {
+            rows.push(None);
+        }
+        rows
+    }
+
     /// One message's rows: its separator or header, then each of its parts.
     ///
     /// Factored out of [`Self::lines`] rather than duplicated into the cached path,
@@ -1945,10 +1994,12 @@ impl TranscriptView {
                 &mut lines,
                 &mut reasoning,
             );
+            let copy = self.copy_rows(message, previous, width, &lines);
             return MessageRows {
                 lines,
                 tools,
                 reasoning,
+                copy,
             };
         }
         if previous != Some(message.role)
@@ -2008,11 +2059,84 @@ impl TranscriptView {
                 &mut lines,
             );
         }
+        let copy = self.copy_rows(message, previous, width, &lines);
         MessageRows {
             lines,
             tools,
             reasoning,
+            copy,
         }
+    }
+
+    fn copy_rows(
+        &self,
+        message: &Message,
+        previous: Option<Role>,
+        width: u16,
+        lines: &[Line<'static>],
+    ) -> Vec<Option<CopyRow>> {
+        let separator_rows = usize::from(previous.is_some());
+        let gutter = u16::try_from(display_width(message.role.marker()) + 1).unwrap_or(2);
+        let mut first_content = separator_rows;
+        let mut last_content = lines.len();
+        if message.role == Role::User {
+            let edge = u16::try_from(display_width(USER_BOX_RIGHT)).unwrap_or(1);
+            let inner = width.saturating_sub(gutter.saturating_add(edge));
+            if inner >= USER_BOX_MIN_INNER_COLS {
+                first_content = first_content.saturating_add(1);
+                last_content = last_content.saturating_sub(1);
+            } else if self.role_label(Role::User).is_some() {
+                first_content = first_content.saturating_add(1);
+            }
+        } else if previous != Some(message.role) && self.role_label(message.role).is_some() {
+            first_content = first_content.saturating_add(1);
+        }
+        first_content = first_content.min(lines.len());
+        last_content = last_content.max(first_content).min(lines.len());
+
+        let mut copy = vec![None; lines.len()];
+        let content_indices = (first_content..last_content).collect::<Vec<_>>();
+        if content_indices.is_empty() {
+            return copy;
+        }
+        let rendered = content_indices
+            .iter()
+            .map(|index| {
+                let text = lines[*index]
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                let right = width.saturating_sub(u16::from(message.role == Role::User));
+                slice_columns(&text, gutter, right).trim_end().to_owned()
+            })
+            .collect::<Vec<_>>();
+
+        let source = message
+            .parts
+            .iter()
+            .map(|part| match part {
+                MessagePart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| parts.join("\n"));
+        let semantic = source.map_or_else(
+            || rendered.clone(),
+            |source| partition_semantic_source(&source, &rendered),
+        );
+        for ((index, text), rendered) in content_indices.into_iter().zip(semantic).zip(rendered) {
+            let text = if text.is_empty() && rendered.is_empty() {
+                String::from("\n")
+            } else {
+                text
+            };
+            copy[index] = Some(CopyRow {
+                content_start: gutter,
+                text,
+            });
+        }
+        copy
     }
 
     fn activity_lines(
@@ -3923,6 +4047,104 @@ pub fn summary(text: &str) -> Option<String> {
                 line.to_owned()
             }
         })
+}
+
+/// Partition durable source across visual content rows without inventing separators.
+///
+/// The widths come from the rendered rows, but the returned chunks are byte-for-byte
+/// slices of `source`. A soft terminal wrap therefore rejoins to the original space,
+/// while a source newline remains a newline. Newlines count as one layout column here
+/// because CommonMark renders an ordinary line ending as a space; they still remain the
+/// original `\n` in the clipboard chunk.
+fn partition_semantic_source(source: &str, rendered: &[String]) -> Vec<String> {
+    if rendered.is_empty() {
+        return Vec::new();
+    }
+    if rendered.len() == 1 {
+        return vec![source.to_owned()];
+    }
+    let mut chunks = Vec::with_capacity(rendered.len());
+    let mut offset = 0usize;
+    for (index, row) in rendered.iter().enumerate() {
+        if index + 1 == rendered.len() {
+            chunks.push(source[offset..].to_owned());
+            break;
+        }
+        let target = display_width(row);
+        let mut used = 0usize;
+        let mut end = offset;
+        for (relative, character) in source[offset..].char_indices() {
+            let cost = if character == '\n' {
+                1
+            } else {
+                unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
+            };
+            if used >= target && cost > 0 {
+                break;
+            }
+            if used.saturating_add(cost) > target && used > 0 {
+                break;
+            }
+            used = used.saturating_add(cost);
+            end = offset
+                .saturating_add(relative)
+                .saturating_add(character.len_utf8());
+        }
+        if end == offset && offset < source.len() {
+            let character = source[offset..]
+                .chars()
+                .next()
+                .expect("non-empty source tail has a first character");
+            end = offset.saturating_add(character.len_utf8());
+        }
+        chunks.push(source[offset..end].to_owned());
+        offset = end;
+    }
+    chunks.resize(rendered.len(), String::new());
+    chunks
+}
+
+fn semantic_display_width(text: &str) -> usize {
+    text.chars()
+        .map(|character| {
+            if character == '\n' {
+                1
+            } else {
+                unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
+            }
+        })
+        .sum()
+}
+
+fn slice_semantic_columns(text: &str, left: u16, right: u16) -> String {
+    let left = usize::from(left);
+    let right = usize::from(right);
+    let mut column = 0usize;
+    let mut out = String::new();
+    let mut selected_previous = false;
+    for character in text.chars() {
+        let width = if character == '\n' {
+            1
+        } else {
+            unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
+        };
+        if width == 0 {
+            if selected_previous {
+                out.push(character);
+            }
+            continue;
+        }
+        let end = column.saturating_add(width);
+        selected_previous = column < right && end > left;
+        if selected_previous {
+            out.push(character);
+        }
+        column = end;
+        if column >= right {
+            break;
+        }
+    }
+    out
 }
 
 /// Break `text` into rows no wider than `width` **columns**, on word boundaries where
