@@ -45,6 +45,8 @@ Agent 具有显式的正向职责、负向委派边界、权限以及结构化�
 
 用户提示词、steering 以及子 Agent 报告在执行前进入持久 FIFO 收件箱。`reportDelivery: nextStep` 必须完成子结果结算、准许父级输入并唤醒父级，且不存在轮询竞态。
 
+图像入口在写入 inbox 前统一经过 `AttachmentStore`：规范化方向、像素与编码，原子发布当前数据库身份下的内容寻址对象，持久 part 只保存 `ImageAttachmentRef`。Provider 请求组装时才校验并内联对象；缺失或 digest 不符是永久持久状态失败，不回退原始路径。
+
 ## Plan 与 Work 状态迁移
 
 持久的 Goal、Plan、Todo、收件箱和 job 状态控制续跑，而不是自然语言。「接下来我会……」这类文字不构成进展。
@@ -89,6 +91,8 @@ Unix PTY 通过前台守护进程拥有进程组与终端前台切换。Windows 
 
 副作用附近的超时或响应丢失属于结果不确定。这种情况会被持久化，要求检查权威状态，绝不机械重放调用。
 
+`subagent_model_selection` 默认关闭。开启后，精确 model allowlist 会在 profile 激活时解析，并按 session 持久冻结为带 digest 的策略；`task` 才会出现可选 `model`/`effort`。续跑不能改变首次冻结的模型或强度。
+
 ## 并发网络搜索
 
 `web_search` 接受一批查询，并在单查询 provider 之上拥有并发、取消、稳定排序、限流与 URL 去重。
@@ -96,6 +100,10 @@ Unix PTY 通过前台守护进程拥有进程组与终端前台切换。Windows 
 ## 网络出口
 
 网络出口受沙箱的网络授权控制。`deny` 会创建私有网络命名空间并拒绝网络系统调用，而不是一条可被绕过的防火墙规则。
+
+公开网页抓取使用独立 `PublicHttpClient`：只接受无凭据 HTTP(S)，直连且不使用环境代理；每次请求和每次重定向都重新解析、校验全部地址并进行 DNS pinning。公私混合 DNS、回环/私网/链路本地/CGNAT/保留地址，以及 IPv4-mapped IPv6 与 NAT64 中嵌套的非公开地址都会整体拒绝。
+
+WebSearch 的带密钥 wire URL 不进入诊断。错误只保留 provider、scheme、host、path、状态与类别，reqwest cause 在进入错误链前移除 URL。
 
 ## 提示词工作流 V2 验收
 
@@ -110,6 +118,10 @@ Unix PTY 通过前台守护进程拥有进程组与终端前台切换。Windows 
 ## 客户端界面
 
 客户端界面消费持久事件、收件箱状态和投影。TUI、server、ACP 以及未来的 GUI 客户端不得获得私有的 Agent 循环行为。
+
+`zuno run --show-reasoning` 只把 provider 明确提供的 reasoning delta 用稳定区块写入 stderr，最终答案继续只写 stdout；signed/encrypted reasoning 永不显示，且不能与 JSON 格式组合。
+
+`zuno serve --browser-auth` 是显式的纯回环模式：单次 256-bit 启动 token 换取绑定 authority 的 30 天签名 Cookie；Basic Auth 与 Cookie 任一有效即可授权，Cookie 的非安全方法还要求精确 Origin。bootstrap query 在访问日志前被脱敏。
 
 ## 参见
 

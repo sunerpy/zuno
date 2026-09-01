@@ -808,6 +808,12 @@ pub(crate) fn summary_safe_message_owned(message: Message) -> Message {
                         |filename| format!("[Attached {filename} ({media_type})]"),
                     ),
                 },
+                RequestContentBlock::ImageAttachment { reference } => RequestContentBlock::Text {
+                    text: reference.filename.map_or_else(
+                        || format!("[Attached {}]", reference.media_type),
+                        |filename| format!("[Attached {filename} ({})]", reference.media_type),
+                    ),
+                },
                 RequestContentBlock::Text { text } => RequestContentBlock::Text { text },
                 link @ RequestContentBlock::ResourceLink { .. } => link,
                 RequestContentBlock::SignedThinking {

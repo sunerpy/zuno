@@ -48,6 +48,7 @@ configuration, not here.
 ## Design records
 
 - [Harness comparison](design/harness-comparison.md)
+- [DSH alpha.2 adoption ledger](design/dsh-alpha2-adoption-ledger.md)
 - [Client interfaces](design/client-interfaces.md)
 - [Provider authentication](design/provider-authentication.md)
 - [Product agents](design/product-agents.md)

@@ -100,6 +100,13 @@ pub enum ContentBlock {
         media_type: String,
         data: String,
     },
+    /// Durable image object reference admitted before entering the session inbox.
+    ///
+    /// Engine request assembly resolves this into [`Self::Image`]. Provider crates
+    /// never receive this variant.
+    ImageAttachment {
+        reference: zuno_attachment::ImageAttachmentRef,
+    },
 }
 
 impl ContentBlock {
@@ -160,6 +167,9 @@ impl ContentBlock {
                 filename: filename.clone(),
                 media_type: media_type.clone(),
                 data: data.clone(),
+            }),
+            Self::ImageAttachment { reference } => Some(RequestContentBlock::ImageAttachment {
+                reference: reference.clone(),
             }),
         }
     }
@@ -225,6 +235,10 @@ pub enum RequestContentBlock {
         media_type: String,
         data: String,
     },
+    /// Durable image object reference resolved during provider request assembly.
+    ImageAttachment {
+        reference: zuno_attachment::ImageAttachmentRef,
+    },
 }
 
 impl RequestContentBlock {
@@ -267,7 +281,8 @@ impl RequestContentBlock {
             | Self::ProviderEncryptedReasoning { .. }
             | Self::ToolUse { .. }
             | Self::ToolResult { .. }
-            | Self::Image { .. } => None,
+            | Self::Image { .. }
+            | Self::ImageAttachment { .. } => None,
         }
     }
 }

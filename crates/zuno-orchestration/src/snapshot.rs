@@ -334,6 +334,8 @@ pub struct AttemptSeed {
     pub capability: CapabilitySnapshot,
     pub agent: AgentAttemptIdentity,
     pub preset: Option<PresetSelection>,
+    #[serde(default = "default_subagent_model_policy_sha256")]
+    pub subagent_model_policy_sha256: String,
     pub parent_attempt: Option<SnapshotIdentity>,
     pub workflow: Option<String>,
     pub workflow_node: Option<String>,
@@ -350,10 +352,19 @@ pub struct AttemptSnapshot {
     pub owner: OwnerLineage,
     pub agent: AgentAttemptIdentity,
     pub model: ModelAttemptIdentity,
+    #[serde(default = "default_subagent_model_policy_sha256")]
+    pub subagent_model_policy_sha256: String,
     pub selected_skills: Vec<SelectedSkillIdentity>,
     pub prompt: PromptReceiptIdentity,
     /// Preserves provider-visible order rather than sorting by name.
     pub tools: Vec<ToolSchemaIdentity>,
+}
+
+fn default_subagent_model_policy_sha256() -> String {
+    sha256_json(&serde_json::json!({
+        "enabled": false,
+        "allowedModels": [],
+    }))
 }
 
 impl AttemptSnapshot {
@@ -522,6 +533,7 @@ mod tests {
                     sha256: sha256_text("house routes"),
                 }),
             },
+            subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
             selected_skills: vec![SelectedSkillIdentity {
                 name: "codemap".to_owned(),
                 source: "builtin://skill/codemap".to_owned(),

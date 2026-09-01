@@ -21,6 +21,7 @@ use zuno_db::session::SessionCreate;
 use zuno_engine::interrupt::{HardInterruptReason, HardInterruptRequest, HardInterruptSource};
 use zuno_engine::r#loop::{TurnEvent, TurnEventSender};
 use zuno_engine::status::{AbortDisposition, SessionStatus};
+use zuno_llm::event::RequestContentBlock;
 use zuno_paths::DbLocation;
 use zuno_permission::ReplyKind;
 use zuno_pty::{CreateInput, PtyId, TicketScope};
@@ -1331,9 +1332,93 @@ async fn api_prompt_wait_and_interrupt_share_one_live_turn_signal() {
             directory: "/repo".into(),
             message_id: "msg_http".to_owned(),
             prompt: "hello".to_owned(),
+            content: Vec::new(),
             agent: None,
             model: None,
         }]
+    );
+}
+
+#[tokio::test]
+async fn api_image_prompt_persists_only_an_attachment_reference() {
+    let fixture = MutationApiFixture::new("ses_image");
+    let executor = Arc::new(BlockingMutationExecutor::default());
+    let services = ServerServices::new(64).with_mutations(executor.clone());
+    let app = ServerBuilder::new(ServerConfig::default().with_default_directory("/repo"))
+        .with_services(services.clone())
+        .with_routes(api::router(fixture.state))
+        .router();
+    let source = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DAAAAEAQEARwbK3gAAAABJRU5ErkJggg==";
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/session/ses_image/prompt",
+            Some(json!({
+                "id": "msg_image",
+                "prompt": {
+                    "text": "inspect the image",
+                    "files": [{
+                        "filename": "pixel.png",
+                        "mimeType": "image/png",
+                        "data": source
+                    }],
+                    "agents": []
+                },
+                "delivery": "steer"
+            })),
+        ))
+        .await
+        .expect("image prompt responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["data"]["prompt"]["files"][0]["type"], "image");
+    assert!(
+        body["data"]["prompt"]["files"][0].get("data").is_none(),
+        "the HTTP response must not echo durable base64"
+    );
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+        body["data"]["prompt"]["files"][0]["attachment"].clone(),
+    )
+    .expect("response contains a typed attachment reference");
+
+    executor.wait_until_prompt_started().await;
+    let requests = executor.prompts();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].content,
+        vec![
+            RequestContentBlock::Text {
+                text: "inspect the image".to_owned(),
+            },
+            RequestContentBlock::ImageAttachment {
+                reference: reference.clone(),
+            },
+        ]
+    );
+
+    let stored = SessionInbox::new(Arc::clone(&fixture.pool))
+        .promote_id("ses_image", "msg_image")
+        .expect("durable image input can be inspected");
+    assert!(
+        stored.is_none(),
+        "the active driver already promoted the admitted image"
+    );
+    let connection = fixture.pool.get().expect("inspection connection");
+    let persisted: String = connection
+        .query_row(
+            "SELECT prompt FROM session_input WHERE session_id = ?1 AND id = ?2",
+            rusqlite::params!["ses_image", "msg_image"],
+            |row| row.get(0),
+        )
+        .expect("persisted prompt reads");
+    assert!(persisted.contains(&reference.id.to_string()));
+    assert!(!persisted.contains(source));
+    assert!(!persisted.contains("\"data\""));
+
+    assert_eq!(
+        services.runs.abort("ses_image", api_cancel()),
+        AbortDisposition::Active
     );
 }
 

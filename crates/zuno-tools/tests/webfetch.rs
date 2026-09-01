@@ -14,11 +14,13 @@
 //! - **time**: [`a_hanging_endpoint_fails_at_the_timeout`]
 
 use serde_json::json;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer as WireMockServer, ResponseTemplate};
 use zuno_error::ToolError;
 use zuno_tool::{AllowAll, DenyAll, InterruptHandle, NeverInterrupted, ToolContext, ToolOutput};
 use zuno_tools::WebFetchTool;
@@ -40,6 +42,31 @@ const FIXTURE_TURNDOWN: &str = include_str!("fixtures/webfetch_page.turndown.md"
 /// `htmlparser2`'s text for [`FIXTURE_HTML`], captured by running upstream's
 /// `extractTextFromHTML`. Asserted byte-for-byte.
 const FIXTURE_TEXT: &str = include_str!("fixtures/webfetch_page.txt");
+
+/// A loopback server presented to the tool as a non-literal hostname.
+///
+/// The production parser must reject `127.0.0.1` before permission or I/O. These
+/// response-semantics tests use the explicitly raw client seam, so they pin this
+/// public-looking test name to wiremock without weakening target validation.
+struct MockServer(WireMockServer);
+
+impl MockServer {
+    async fn start() -> Self {
+        Self(WireMockServer::start().await)
+    }
+
+    fn uri(&self) -> String {
+        format!("http://webfetch.test:{}", self.0.address().port())
+    }
+}
+
+impl Deref for MockServer {
+    type Target = WireMockServer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 fn context() -> ToolContext {
     ToolContext::new(
@@ -105,7 +132,24 @@ fn html_response(body: &str) -> ResponseTemplate {
 
 /// Drives the tool the way the dispatcher does: erased, over raw JSON arguments.
 async fn run(args: serde_json::Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-    zuno_tool::Tool::execute(&zuno_tool::Typed(WebFetchTool::new()), args, ctx).await
+    let target = url::Url::parse(
+        args.get("url")
+            .and_then(serde_json::Value::as_str)
+            .expect("webfetch test URL"),
+    )
+    .expect("absolute webfetch test URL");
+    let mut builder = zuno_network::direct_client_builder()
+        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS));
+    if let (Some(host), Some(port)) = (target.host_str(), target.port_or_known_default()) {
+        builder = builder.resolve(host, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+    }
+    let client = builder.build().expect("loopback test client");
+    zuno_tool::Tool::execute(
+        &zuno_tool::Typed(WebFetchTool::with_client(client)),
+        args,
+        ctx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

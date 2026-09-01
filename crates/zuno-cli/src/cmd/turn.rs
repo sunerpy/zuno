@@ -126,6 +126,7 @@ const COMPATIBLE_PROVIDER: &str = "openai-compatible";
 pub(crate) const DEFAULT_AGENT: &str = "orchestrator";
 
 const ZUNO_ENABLE_EXPERIMENTAL_MODELS: &str = "ZUNO_ENABLE_EXPERIMENTAL_MODELS";
+const SUBAGENT_MODEL_POLICY_EVENT: &str = "session.subagent-model-policy";
 
 /// A native session-command failure with enough type information for each client surface.
 #[derive(Debug)]
@@ -435,6 +436,8 @@ pub(crate) struct TurnPlan {
     instructions: zuno_config::LoadedInstructions,
     /// Catalog facts for the models a delegation may name. See [`delegation_facts`].
     delegation_facts: Arc<zuno_tools::task::FixedFacts>,
+    /// Exact child model-selection authority frozen for this session.
+    subagent_model_policy: zuno_tools::task::SubagentModelPolicy,
     /// Whether any reachable model accepts images, which gates one delegation target.
     vision_available: bool,
     /// Whether the session's model declares reasoning support in the catalog.
@@ -742,6 +745,7 @@ impl TurnPlan {
         let reflection_model =
             resolve_reflection_model(&config, &catalog, &provider_id, env, &mut notes)?;
         let delegation_facts = Arc::new(delegation_facts(&catalog));
+        let subagent_model_policy = resolve_subagent_model_policy(&config, &catalog)?;
         let all_skills =
             zuno_catalog::skill::load(&zuno_catalog::skill::SkillOptions::from_config(
                 &directory,
@@ -763,6 +767,7 @@ impl TurnPlan {
             capability: capability.as_ref().clone(),
             agent: agent_attempt_identity(&agent, options.tool_authority.as_deref())?,
             preset,
+            subagent_model_policy_sha256: subagent_model_policy.digest().to_owned(),
             parent_attempt: None,
             workflow: None,
             workflow_node: None,
@@ -850,6 +855,7 @@ impl TurnPlan {
             required_skills,
             instructions,
             delegation_facts,
+            subagent_model_policy,
             vision_available,
             reasoning_supported,
             effort,
@@ -900,6 +906,26 @@ impl TurnPlan {
             workflow_node: workflow_node.map(str::to_owned),
             ..seed
         }));
+        Ok(())
+    }
+
+    /// Replace config-derived child model authority with a durable session snapshot.
+    pub(super) fn use_subagent_model_policy(
+        &mut self,
+        policy: zuno_tools::task::SubagentModelPolicy,
+    ) -> Result<(), String> {
+        policy.validate().map_err(to_string)?;
+        let seed = self
+            .resolver
+            .orchestration_seed
+            .as_deref()
+            .cloned()
+            .ok_or_else(|| "turn plan has no resolved orchestration seed".to_owned())?;
+        self.resolver.orchestration_seed = Some(Arc::new(AttemptSeed {
+            subagent_model_policy_sha256: policy.digest().to_owned(),
+            ..seed
+        }));
+        self.subagent_model_policy = policy;
         Ok(())
     }
 
@@ -1853,6 +1879,7 @@ pub(crate) struct TurnHost {
     runtime: HarnessRuntime,
     driver: Arc<dyn AgentDriver>,
     database: Arc<zuno_db::pool::Pool>,
+    attachments: Arc<zuno_attachment::AttachmentStore>,
     connection: rusqlite::Connection,
     inbox: zuno_db::inbox::SessionInbox,
     providers: ProviderRegistry,
@@ -1877,6 +1904,7 @@ pub(crate) struct TurnHost {
     session_directory: String,
     session_usage: zuno_db::session::SessionUsage,
     session_materializer: SessionMaterializer,
+    subagent_model_policy: zuno_tools::task::SubagentModelPolicy,
     /// The title the session already carried when this host opened it.
     ///
     /// A snapshot, deliberately not kept current: the only writer is the prelude, and a
@@ -2678,7 +2706,7 @@ impl TurnHost {
             let prepared = prepare_turn_host(&connection, &plan, now)?;
             Ok((connection, prepared))
         })();
-        let (connection, prepared) = match prepared_session {
+        let (mut connection, prepared) = match prepared_session {
             Ok(prepared) => prepared,
             Err(error) => {
                 let ownership = extension_ownership
@@ -2692,6 +2720,19 @@ impl TurnHost {
                 };
             }
         };
+        if prepared.identity.is_materialized() {
+            match load_subagent_model_policy(&database, prepared.identity.id())? {
+                Some(policy) => plan.use_subagent_model_policy(policy)?,
+                None => {
+                    zuno_db::event_log::append_with_connection(
+                        &mut connection,
+                        prepared.identity.id(),
+                        subagent_model_policy_event(&plan.subagent_model_policy)?,
+                    )
+                    .map_err(to_string)?;
+                }
+            }
+        }
         let skill_context_window = plan.window.context;
         let skill_config = plan.config.skills.clone();
         let selected_skill_prompt_budget =
@@ -2736,6 +2777,9 @@ impl TurnHost {
             let tool_contributions = runtime
                 .service::<zuno_harness::ToolContributions>()
                 .ok_or_else(|| "profile did not register tool contributions".to_owned())?;
+            let public_http = runtime
+                .service::<zuno_network::PublicHttpClient>()
+                .ok_or_else(|| "profile did not register a public HTTP transport".to_owned())?;
             let todo_store = Arc::clone(&database);
             let inbox = zuno_db::inbox::SessionInbox::new(Arc::clone(&todo_store));
             let goal_store = Arc::new(
@@ -2935,6 +2979,7 @@ impl TurnHost {
                     model_id: &plan.model_id,
                     manifest: tool_manifest,
                     contributions: tool_contributions,
+                    public_http,
                     question,
                     background_executions: Arc::clone(&background_executions),
                     sandbox: None,
@@ -2964,6 +3009,7 @@ impl TurnHost {
                                 .unwrap_or(zuno_tools::task::DEFAULT_SUBAGENT_DEPTH),
                         },
                         vision_available: plan.vision_available,
+                        subagent_model_policy: plan.subagent_model_policy.clone(),
                     },
                     product_agents: Arc::new(product_agents.clone()),
                     workflows: Arc::new(workflow_host.clone()),
@@ -3005,11 +3051,38 @@ impl TurnHost {
                 .collect();
             let tool_concurrency = ToolConcurrencyLimit::new(concurrency.tool_calls)
                 .expect("configuration validates tool concurrency");
+            let image = plan
+                .config
+                .attachment
+                .as_ref()
+                .and_then(|attachment| attachment.image.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            let attachment_root = match database.location() {
+                zuno_paths::DbLocation::File(_) => zuno_paths::data().to_path_buf(),
+                zuno_paths::DbLocation::Memory => std::env::temp_dir().join("zuno-attachments"),
+            };
+            let attachments = Arc::new(
+                zuno_attachment::AttachmentStore::new(
+                    attachment_root,
+                    &zuno_attachment::AttachmentStore::database_identity(database.target()),
+                    zuno_attachment::ImageAdmissionPolicy {
+                        auto_resize: image.resolved_auto_resize(),
+                        max_source_bytes: image.resolved_max_source_bytes(),
+                        max_width: image.resolved_max_width(),
+                        max_height: image.resolved_max_height(),
+                        max_pixels: image.resolved_max_pixels(),
+                        max_encoded_bytes: image.resolved_max_encoded_bytes(),
+                    },
+                )
+                .map_err(to_string)?,
+            );
             let mut host = Self {
                 profile_runtime: profile_runtime.clone(),
                 runtime,
                 driver,
                 database,
+                attachments,
                 connection,
                 inbox,
                 providers,
@@ -3027,6 +3100,7 @@ impl TurnHost {
                 session_directory: prepared.directory,
                 session_usage: prepared.usage,
                 session_materializer: prepared.materializer,
+                subagent_model_policy: plan.subagent_model_policy,
                 session_title: prepared.title,
                 agent: plan.agent.name().to_owned(),
                 provider_id: plan.provider_id,
@@ -3155,6 +3229,11 @@ impl TurnHost {
         let transaction =
             zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
         zuno_db::session::create(&transaction, &input).map_err(to_string)?;
+        append_subagent_model_policy_in(
+            &transaction,
+            self.session_identity.id(),
+            &self.subagent_model_policy,
+        )?;
         transaction.commit().map_err(to_string)?;
         self.session_materializer = SessionMaterializer::Existing;
         self.session_identity.mark_materialized();
@@ -4108,6 +4187,11 @@ impl TurnHost {
         Arc::clone(&self.database)
     }
 
+    /// Database-scoped image admission service shared by every client surface.
+    pub(crate) fn attachment_store(&self) -> Arc<zuno_attachment::AttachmentStore> {
+        Arc::clone(&self.attachments)
+    }
+
     /// Goal state shared with interactive surfaces that settle durable human requests.
     pub(crate) fn goal_store(&self) -> Arc<GoalStore> {
         Arc::clone(&self.goal_store)
@@ -4381,6 +4465,29 @@ impl TurnHost {
             DriveInputOptions::plain(
                 Some(message_id),
                 None,
+                UserInputPersistence::AlreadyPromoted,
+                PlanningInputSource::User,
+            ),
+            &guard,
+            events,
+        )
+        .await
+    }
+
+    /// Drive rich input whose durable inbox row was already promoted by the caller.
+    pub(crate) async fn drive_promoted_content_with_guard(
+        &mut self,
+        prompt: &str,
+        content: &[RequestContentBlock],
+        message_id: &str,
+        guard: SessionRunGuard,
+        events: TurnEventSender,
+    ) -> Result<(), String> {
+        self.drive_input(
+            prompt,
+            DriveInputOptions::plain(
+                Some(message_id),
+                Some(content),
                 UserInputPersistence::AlreadyPromoted,
                 PlanningInputSource::User,
             ),
@@ -4751,6 +4858,7 @@ impl TurnHost {
                 now: zuno_db::message::created_after(zuno_db::message::now_millis(), latest),
             },
             options.content,
+            &self.attachments,
         )?;
         let materialized = match options.persistence {
             UserInputPersistence::AdmitAndPromote => self.persist_user_input(&message, &parts)?,
@@ -4883,6 +4991,11 @@ impl TurnHost {
                 let transaction =
                     zuno_db::open::immediate_transaction(&self.connection).map_err(to_string)?;
                 zuno_db::session::create(&transaction, &input).map_err(to_string)?;
+                append_subagent_model_policy_in(
+                    &transaction,
+                    &self.session_id,
+                    &self.subagent_model_policy,
+                )?;
                 zuno_db::inbox::admit_and_promote_in(&transaction, durable_input)
                     .map_err(to_string)?;
                 persist_prepared_user_message(&transaction, message, parts).map_err(to_string)?;
@@ -5047,6 +5160,7 @@ impl TurnHost {
             guard.interrupt_signal(),
         )
         .with_live_inputs(guard, &self.inbox)
+        .with_attachments(Arc::clone(&self.attachments))
         .with_tool_concurrency(self.tool_concurrency);
         let outcome = self
             .driver
@@ -6118,6 +6232,12 @@ fn planning_content_facts(content: Option<&[RequestContentBlock]>) -> PlanningCo
                     .saturating_add(data.len())
                     .saturating_add(filename.as_deref().map_or(0, str::len));
             }
+            RequestContentBlock::ImageAttachment { reference } => {
+                contextual_blocks = contextual_blocks.saturating_add(1);
+                total_bytes = total_bytes
+                    .saturating_add(usize::try_from(reference.encoded_bytes).unwrap_or(usize::MAX))
+                    .saturating_add(reference.filename.as_deref().map_or(0, str::len));
+            }
             RequestContentBlock::SignedThinking { .. }
             | RequestContentBlock::ProviderEncryptedReasoning { .. }
             | RequestContentBlock::ToolUse { .. }
@@ -7044,6 +7164,88 @@ fn delegation_facts(catalog: &Catalog) -> zuno_tools::task::FixedFacts {
         );
     }
     facts
+}
+
+fn resolve_subagent_model_policy(
+    config: &zuno_config::schema::Config,
+    catalog: &Catalog,
+) -> Result<zuno_tools::task::SubagentModelPolicy, String> {
+    let configured = config
+        .subagent_model_selection
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    let policy =
+        zuno_tools::task::SubagentModelPolicy::new(configured.enabled, configured.allowed_models)
+            .map_err(to_string)?;
+    if policy.enabled() {
+        for qualified in policy.allowed_models() {
+            let (provider, model) = qualified
+                .split_once('/')
+                .expect("SubagentModelPolicy validates provider/model identities");
+            if catalog.model(provider, model).is_none() {
+                return Err(format!(
+                    "subagent_model_selection.allowed_models contains unresolved model `{qualified}`"
+                ));
+            }
+        }
+    }
+    Ok(policy)
+}
+
+fn subagent_model_policy_event(
+    policy: &zuno_tools::task::SubagentModelPolicy,
+) -> Result<zuno_db::event_log::NewSessionEvent, String> {
+    let properties = json!({"policy": policy})
+        .as_object()
+        .cloned()
+        .expect("the subagent policy payload is an object");
+    zuno_db::event_log::NewSessionEvent::new(SUBAGENT_MODEL_POLICY_EVENT, properties)
+        .map_err(to_string)
+}
+
+fn load_subagent_model_policy(
+    database: &Arc<zuno_db::pool::Pool>,
+    session_id: &str,
+) -> Result<Option<zuno_tools::task::SubagentModelPolicy>, String> {
+    let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(database))
+        .read_after(session_id, None)
+        .map_err(to_string)?;
+    let mut policies = events
+        .into_iter()
+        .filter(|event| event.event_type == SUBAGENT_MODEL_POLICY_EVENT)
+        .map(|event| {
+            let value = event.properties.get("policy").cloned().ok_or_else(|| {
+                format!(
+                    "durable event `{SUBAGENT_MODEL_POLICY_EVENT}` is missing its policy payload"
+                )
+            })?;
+            let policy: zuno_tools::task::SubagentModelPolicy =
+                serde_json::from_value(value).map_err(to_string)?;
+            policy.validate().map_err(to_string)?;
+            Ok(policy)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if policies.len() > 1 {
+        return Err(format!(
+            "session `{session_id}` has multiple durable subagent model policies"
+        ));
+    }
+    Ok(policies.pop())
+}
+
+fn append_subagent_model_policy_in(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    policy: &zuno_tools::task::SubagentModelPolicy,
+) -> Result<(), String> {
+    zuno_db::event_log::append_in(
+        transaction,
+        session_id,
+        subagent_model_policy_event(policy)?,
+    )
+    .map(|_| ())
+    .map_err(to_string)
 }
 
 /// Which request-shape family a transport's reasoning options belong to.
@@ -8529,6 +8731,7 @@ fn consume_promoted_input(
 fn prepare_user_message(
     input: UserMessageInput<'_>,
     content: Option<&[RequestContentBlock]>,
+    attachments: &zuno_attachment::AttachmentStore,
 ) -> Result<
     (
         zuno_db::message::MessageRecord,
@@ -8549,7 +8752,7 @@ fn prepare_user_message(
     }))
     .map_err(to_string)?;
     let parts = match content {
-        Some(content) => request_content_parts(&input, &message.id, content)?,
+        Some(content) => request_content_parts(&input, &message.id, content, attachments)?,
         None => vec![
             zuno_db::message::PartRecord::from_json(
                 json!({
@@ -8580,6 +8783,7 @@ fn request_content_parts(
     input: &UserMessageInput<'_>,
     message_id: &str,
     content: &[RequestContentBlock],
+    attachments: &zuno_attachment::AttachmentStore,
 ) -> Result<Vec<zuno_db::message::PartRecord>, String> {
     if content.is_empty() {
         return Err("resolved prompt content must not be empty".to_owned());
@@ -8620,16 +8824,34 @@ fn request_content_parts(
                     filename,
                     media_type,
                     data,
-                } => json!({
-                    "id": prefixed_id("prt"),
-                    "sessionID": input.session_id,
-                    "messageID": message_id,
-                    "type": "file",
-                    "filename": filename,
-                    "mime": media_type,
-                    "data": data,
-                    "url": format!("data:{media_type};base64,{data}"),
-                }),
+                } => {
+                    let reference = attachments
+                        .admit_base64_typed(data, Some(media_type), filename.clone())
+                        .map_err(to_string)?;
+                    let normalized_filename = reference.filename.clone();
+                    let normalized_media_type = reference.media_type.clone();
+                    json!({
+                        "id": prefixed_id("prt"),
+                        "sessionID": input.session_id,
+                        "messageID": message_id,
+                        "type": "file",
+                        "filename": normalized_filename,
+                        "mime": normalized_media_type,
+                        "attachment": reference,
+                    })
+                }
+                RequestContentBlock::ImageAttachment { reference } => {
+                    attachments.read(reference).map_err(to_string)?;
+                    json!({
+                        "id": prefixed_id("prt"),
+                        "sessionID": input.session_id,
+                        "messageID": message_id,
+                        "type": "file",
+                        "filename": reference.filename,
+                        "mime": reference.media_type,
+                        "attachment": reference,
+                    })
+                }
                 RequestContentBlock::SignedThinking { .. }
                 | RequestContentBlock::ProviderEncryptedReasoning { .. }
                 | RequestContentBlock::ToolUse { .. }

@@ -151,6 +151,40 @@ fn round_trip_is_stable_on_a_second_pass() {
 }
 
 #[test]
+fn image_attachment_policy_uses_the_native_hard_limits_and_rejects_retired_keys() {
+    let config = parse_value(json!({
+        "attachment": {
+            "image": {
+                "auto_resize": false,
+                "max_source_bytes": 20971520,
+                "max_width": 2000,
+                "max_height": 2000,
+                "max_pixels": 4000000,
+                "max_encoded_bytes": 5242880
+            }
+        }
+    }))
+    .expect("native image attachment policy");
+    let image = config
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.image.as_ref())
+        .expect("image policy");
+    assert!(!image.resolved_auto_resize());
+    assert_eq!(image.resolved_max_source_bytes(), 20 * 1024 * 1024);
+    assert_eq!(image.resolved_max_width(), 2_000);
+    assert_eq!(image.resolved_max_height(), 2_000);
+    assert_eq!(image.resolved_max_pixels(), 4_000_000);
+    assert_eq!(image.resolved_max_encoded_bytes(), 5 * 1024 * 1024);
+
+    let error = parse_value(json!({
+        "attachment": {"image": {"max_base64_bytes": 5242880}}
+    }))
+    .expect_err("the retired ambiguous key must not be ignored");
+    assert_eq!(issue_path(&error), "attachment.image.max_base64_bytes");
+}
+
+#[test]
 fn presets_are_structured_ordered_and_use_canonical_reasoning() {
     let config = parse(
         r#"{

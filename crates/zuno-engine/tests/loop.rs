@@ -211,6 +211,7 @@ fn trace_seed() -> Arc<AttemptSeed> {
             prompt_policy_sha256: sha256_text("build prompt policy"),
         },
         preset: None,
+        subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         parent_attempt: None,
         workflow: None,
         workflow_node: None,
@@ -1903,6 +1904,7 @@ async fn loop_injects_a_durable_background_report_at_the_tool_safe_point() {
                 input_id: Some("msg_steer".to_owned()),
                 content: "include benchmark".to_owned(),
                 images: Vec::new(),
+                attachments: Vec::new(),
                 urgent: false,
                 source: SoftInterruptSource::BackgroundTask,
             },
@@ -1994,6 +1996,7 @@ async fn live_input_persistence_failure_rolls_back_without_losing_the_promoted_i
                 input_id: Some("msg_atomic_steer".to_owned()),
                 content: "recover this input".to_owned(),
                 images: Vec::new(),
+                attachments: Vec::new(),
                 urgent: false,
                 source: SoftInterruptSource::User,
             },
@@ -2065,6 +2068,7 @@ async fn collect_and_steer_hanging_provider(
                     input_id: Some("msg_live_steer".to_owned()),
                     content: "change direction now".to_owned(),
                     images: Vec::new(),
+                    attachments: Vec::new(),
                     urgent: false,
                     source: SoftInterruptSource::User,
                 })
@@ -2232,6 +2236,7 @@ async fn loop_live_steer_waits_for_a_running_tool_instead_of_cancelling_it() {
                         input_id: Some("msg_tool_steer".to_owned()),
                         content: "keep the result, then continue".to_owned(),
                         images: Vec::new(),
+                        attachments: Vec::new(),
                         urgent: false,
                         source: SoftInterruptSource::User,
                     })
@@ -2392,6 +2397,7 @@ async fn collect_and_steer_retry_backoff(
                     input_id: Some("msg_retry_steer".to_owned()),
                     content: "do this instead".to_owned(),
                     images: Vec::new(),
+                    attachments: Vec::new(),
                     urgent: false,
                     source: SoftInterruptSource::User,
                 })
@@ -3514,7 +3520,8 @@ async fn loop_repairs_a_missing_tool_result_before_the_provider_sees_history() {
                 | RequestContentBlock::ProviderEncryptedReasoning { .. }
                 | RequestContentBlock::ToolUse { .. }
                 | RequestContentBlock::ToolResult { .. }
-                | RequestContentBlock::Image { .. } => {}
+                | RequestContentBlock::Image { .. }
+                | RequestContentBlock::ImageAttachment { .. } => {}
             }
         }
     }

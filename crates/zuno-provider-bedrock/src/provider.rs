@@ -522,6 +522,11 @@ fn converse_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provid
                     "source": {"bytes": data}
                 }
             })),
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         })
         .collect()
 }
@@ -672,6 +677,11 @@ fn anthropic_content(blocks: &[RequestContentBlock]) -> Result<Vec<Value>, Provi
             RequestContentBlock::ProviderEncryptedReasoning { .. } => Err(ProviderError::fatal(
                 RequestShapeError::EncryptedReasoningUnsupported,
             )),
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         })
         .collect()
 }

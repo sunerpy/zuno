@@ -17,6 +17,7 @@ clap = { workspace = true }
 futures = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+zuno-attachment = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-catalog = { workspace = true }
 zuno-config = { workspace = true }

@@ -625,6 +625,11 @@ fn message_payload_bytes(message: &Message) -> usize {
             RequestContentBlock::Image {
                 media_type, data, ..
             } => media_type.len() + data.len(),
+            RequestContentBlock::ImageAttachment { reference } => {
+                reference.id.to_string().len()
+                    + reference.filename.as_ref().map_or(0, String::len)
+                    + reference.media_type.len()
+            }
         })
         .sum()
 }

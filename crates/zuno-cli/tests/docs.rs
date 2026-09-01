@@ -266,6 +266,10 @@ fn portable_bundle_and_attachment_guides_document_the_public_contracts() {
             "zuno run -f/--file",
             "unsupported_capability",
             "durable file part",
+            "ImageAttachmentRef",
+            "max_encoded_bytes",
+            "database-identity",
+            "do not contain base64",
         ],
     );
     for relative in ["README.md", "docs/readme/README.zh-CN.md", "docs/README.md"] {
@@ -294,6 +298,9 @@ fn zed_acp_guide_documents_cross_platform_setup_and_agent_selection() {
             "`/plan`",
             "`/start-plan`",
             "`/start-work`",
+            "Streamable HTTP",
+            "complete list",
+            "never stored in SQLite or logs",
             "dev: open acp logs",
             "stdout",
             "cargo test -p zuno-cli --test acp_stdio",
@@ -353,12 +360,29 @@ fn architecture_documents_pin_the_native_harness_decisions() {
             "528c682e061696f5a160f363f236ecbf53cbd006",
             "dsh-v0.1.1-rc.2",
             "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+            "dsh-v0.1.2-alpha.2",
+            "0a53fb55bea101816fa226bb964ae2bed71c343b",
+            "alpha.2 adoption ledger",
             "OpenAI Codex",
             "oh-my-openagent",
             "pi-agent",
             "OpenCode",
             "Claw Code",
             "Cross-project compatibility",
+        ],
+    );
+    contains_all(
+        "docs/design/dsh-alpha2-adoption-ledger.md",
+        &[
+            "1,313 commits",
+            "6,808 changed files",
+            "No unclassified path group remains",
+            "Public web fetch target validation",
+            "ACP session-provided MCP",
+            "Loopback browser authentication",
+            "Provider Files API fallback",
+            "reject",
+            "watch",
         ],
     );
     contains_all(

@@ -194,6 +194,7 @@ Zed 呈现权限与征询请求，但策略拥有者仍然是 Zuno：
 - Zuno 的 Shell 沙箱控制文件系统与网络权限；
 - 原生文件工具为 Zed 发出类型化的创建与编辑 diff；
 - 当所选 Agent profile 允许时，Zuno 配置的 MCP server 仍然可用；
+- ACP 客户端提供的 stdio 与 Streamable HTTP MCP server 以 session 为作用域，只有完整集合全部连接并发现成功后才发布工具；
 - 取消、会话加载、恢复、关闭、plan 状态、用量和工具历史使用与 TUI 相同的持久运行时。
 
 结构化的 `question` 调用使用 ACP 表单控件，而不是通用提示：
@@ -235,9 +236,9 @@ Zuno 还支持经过评审的官方 `codex-acp` 适配器所使用的草案版�
 
 由子级发起的权限与提问只在原生模式下使用子会话 id。对于不支持原生子 Agent 的客户端，Zuno 会在已知的根会话上发送该请求，并在 `_meta.zuno.childSessionId` 中包含持久的子级 id；这既避免客户端收到一个未知的会话 id，又保留了归属信息。
 
-ACP 提供的客户端 MCP、客户端文件系统 RPC 和终端 RPC 都不会被公布。Zuno 通过自己的工具、权限策略和沙箱处理文件与 Shell 工作，而不是声称实现了 Zed 客户端 RPC 处理器。
+ACP 提供的 MCP 公布 stdio 与 Streamable HTTP，SSE 仍不支持。每次 new/load/resume 都必须提供完整列表。名称会被校验或稳定 slug 化；stdio command 必须是绝对路径并使用会话目录作为 cwd；HTTP header 会被严格校验。所有 server 都必须连接并完成 discovery，工具才会原子发布；部分启动按逆序清理。command、environment 值与 header 永不写入 SQLite 或日志。客户端文件系统 RPC 和终端 RPC 仍不公布；Zuno 通过自己的工具、权限策略和沙箱处理文件与 Shell 工作。
 
-恢复一个线程刻意是冷启动的。`session/load` 与 `session/resume` 会校验该会话、暴露它的选择器并发布命令，但不启动 `TurnHost`，也不连接已配置的 MCP server。第一条提示词才执行这次激活。每个打开的 ACP 会话只发送一次加载重放，并受这些上限约束：最新 512 条保留消息、16 MiB 的已存储 part 与总投影预算，以及每次更新 8 MiB 的帧上限。当历史超出这些边界时，Zuno 会发出一条省略通知。已存储的 part blob 会先在 SQLite 中测量大小，再做 JSON 水合，因此一个过大的工具输出不会先被加载进进程内存然后丢弃。
+恢复一个线程刻意是冷启动的。`session/load` 与 `session/resume` 会校验会话和完整的客户端 MCP 声明、暴露选择器并发布命令，但不启动 `TurnHost`。第一条提示词才执行事务性激活。后续 load/resume 只按新请求提供的完整列表重建进程资源，绝不复用旧的客户端 MCP 进程。加载重放受这些上限约束：最新 512 条保留消息、16 MiB 的已存储 part 与总投影预算，以及每次更新 8 MiB 的帧上限。当历史超出这些边界时，Zuno 会发出一条省略通知。已存储的 part blob 会先在 SQLite 中测量大小，再做 JSON 水合，因此一个过大的工具输出不会先被加载进进程内存然后丢弃。
 
 历史文件引用不会仅因为它们是持久的就被信任。只有那些确实存在、且规范化后位于项目 worktree 内的普通文件，才仍然可作为 diff 路径、位置或本地资源链接使用。缺失的、外部的或通过符号链接逃逸的本地资源会显示为不可操作的说明文本。一个 ACP stdio 连接最多保留 32 个打开的会话；`session/close` 会释放该槽位，并关停任何已激活的宿主与 MCP 运行时。
 

@@ -260,11 +260,13 @@ user-Agent roster.
 
 ### Direct delegation routing
 
-The model-facing `task` tool does not accept `model`, `effort`, or `category`.
-The selected Agent, active preset, and parent session determine the effective
-model and reasoning level. This keeps routing and authority in validated host
-configuration instead of allowing a prompt to select an arbitrary provider or
-reasoning policy.
+By default the model-facing `task` tool does not accept `model`, `effort`, or
+`category`. The selected Agent, active preset, and parent session determine the
+effective model and reasoning level. A host may explicitly enable
+`subagent_model_selection` with an exact catalog-validated allowlist; only then
+does the schema add optional `model` and `effort`. That durable policy prevents
+a prompt from selecting an arbitrary provider or undeclared reasoning variant.
+Category routing remains host-owned.
 
 ## Recommended switchable configuration
 
@@ -375,13 +377,21 @@ silently ignoring them.
 
 For `task` with `agent`, Zuno chooses the child model in this order:
 
-1. `agents.<target>.model`;
-2. `presets.<active>.agents.<target>`;
-3. the parent session model.
+1. an explicit model authorized by the session's durable
+   `subagent_model_selection` policy, when present;
+2. `agents.<target>.model`;
+3. `presets.<active>.agents.<target>`;
+4. the parent session model.
 
 An unavailable or unqualified model produces a visible routing diagnostic and
 falls through to the next configured candidate. Model ids must use
 `provider/model` form and exist in the resolved catalog.
+
+An explicit effort is valid only with the explicit allowed model and must map
+to a variant declared by that model. Without an explicit model, the existing
+Agent/preset reasoning route remains authoritative. The chosen model, effort,
+and policy digest are frozen into the child identity; `task_id` continuation
+cannot change them.
 
 Reasoning or variant resolution uses the reasoning or variant attached to the
 winning Agent route, then the selected model/provider default.
@@ -409,8 +419,10 @@ Example direct delegation:
 ```
 
 Unknown fields, including the removed `description`, `prompt`,
-`subagent_type`, `category`, `model`, `effort`, and `load_skills`, fail schema
-validation. Zuno does not translate the old shape.
+`subagent_type`, `category`, and `load_skills`, fail schema validation. `model`
+and `effort` are also absent and rejected unless the session's durable
+`subagent_model_selection` policy is enabled. Zuno does not translate the old
+shape.
 
 ## Host-owned category routing
 
@@ -668,11 +680,13 @@ exhausted. Inspect `zuno agent list` and `zuno debug permissions`.
 Configure `presets.<active>.categories.<category>`. Host-owned category routes
 do not use the `general` Agent's configured or preset Agent route.
 
-### “The child ignored a model or effort field in the task”
+### “The task schema has no model or effort field”
 
-Those fields are not part of the `task` schema. Configure
-`agents.<name>.model`, `agents.<name>.reasoning`, or the active preset route
-instead.
+That is the default. Configure `agents.<name>.model`,
+`agents.<name>.reasoning`, or the active preset route. If model-facing selection
+is intentionally required, enable `subagent_model_selection` with a non-empty
+exact allowlist before creating the session; an existing session keeps the
+policy snapshot it started with.
 
 ### “The custom reviewer cannot be targeted”
 

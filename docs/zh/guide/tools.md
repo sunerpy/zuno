@@ -26,6 +26,10 @@
 
 `edit`、`execute` 和 `lsp` 作为已注册的槽位存在，但不属于默认工具面。`edit` 仍可供显式构造的 profile 使用；默认的编辑路径是 `apply_patch` 加 `write`。
 
+`webfetch` 只接受无凭据 HTTP(S) 目标。Zuno 会解析并校验全部地址，整体拒绝公私混合 DNS，固定已经校验的地址，绕过环境代理，并在最多五次重定向的每一跳重复校验。跨域跳转只有在新的公开目标独立通过同样检查后才允许。
+
+`web_search` 不会把 provider 凭据或完整 wire URL 放进错误与日志。诊断只标识 provider、scheme、host、path、状态与错误类别，不包含 API key、认证头或完整 query。
+
 `glob` 与 `grep` 驱动官方的 `rg` 可执行文件，Zuno 只贡献带类型的参数、取消、有界解码和稳定排序。必须有 ripgrep 14 或更新版本可用；缺失时工具运行时报启动错误，而不是静默回退到更慢的遍历器。
 
 ## 副作用分类

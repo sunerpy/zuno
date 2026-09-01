@@ -10,7 +10,14 @@
 //! cloud metadata services whose credentials must never be forwarded to an
 //! ambient proxy.
 
+mod public_http;
+
 use reqwest::{Client, ClientBuilder};
+
+pub use public_http::{
+    DiagnosticEndpoint, HostResolver, PublicHttpClient, PublicHttpError, PublicHttpPolicy,
+    PublicTarget, SystemHostResolver, is_public_ip,
+};
 
 /// How an outbound HTTP client treats process proxy configuration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

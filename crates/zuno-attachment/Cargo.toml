@@ -1,6 +1,5 @@
 [package]
-name = "zuno-network"
-description = "Shared outbound HTTP and proxy policy for Zuno."
+name = "zuno-attachment"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,15 +9,16 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
-reqwest = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+image = { workspace = true }
+kamadak-exif = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
-url = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
-wiremock = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

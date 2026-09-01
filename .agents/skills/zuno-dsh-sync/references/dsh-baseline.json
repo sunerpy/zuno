@@ -2,9 +2,9 @@
   "schema_version": 1,
   "repository": "https://github.com/deepseek-ai/deepseek-harness.git",
   "tracking_ref": "origin/master",
-  "reviewed_commit": "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
-  "reviewed_tag": "dsh-v0.1.1-rc.2",
-  "reviewed_at": "2026-08-21",
-  "reviewed_against_zuno": "45d1d0c",
-  "notes": "Initial tracked baseline after reviewing dsh-v0.1.1-rc.1 and dsh-v0.1.1-rc.2."
+  "reviewed_commit": "0a53fb55bea101816fa226bb964ae2bed71c343b",
+  "reviewed_tag": "dsh-v0.1.2-alpha.2",
+  "reviewed_at": "2026-08-31",
+  "reviewed_against_zuno": "160456a9f3c3fcf2f46cf7d7e5eeab9e534a724a",
+  "notes": "Reviewed the complete 1,313-commit, 6,808-file delta from dsh-v0.1.1-rc.2. Every material group is classified in docs/design/dsh-alpha2-adoption-ledger.md; seven Zuno-native adaptations passed the shared feature-tip gates before this baseline advanced."
 }

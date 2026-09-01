@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zuno_agent::builtin::{Agent, delegable};
@@ -255,6 +255,156 @@ pub struct TaskParams {
     pub task_id: Option<String>,
 }
 
+/// Arguments exposed only when the session's durable model-selection policy is enabled.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SelectableTaskParams {
+    /// The typed work agreement passed to the child.
+    #[serde(flatten)]
+    pub contract: DelegationContract,
+    /// The specific Agent to delegate to.
+    pub agent: String,
+    /// Run asynchronously and report a job id immediately. Defaults to foreground.
+    #[serde(default)]
+    pub background: Option<bool>,
+    /// What to do with the terminal report of a background dispatch.
+    #[serde(default, rename = "reportDelivery")]
+    pub report_delivery: Option<ReportDelivery>,
+    /// Continue a previous delegation's session instead of creating a new one.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Exact allowlisted `provider/model` identity for this child.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Exact variant declared by `model`; valid only together with `model`.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+impl SelectableTaskParams {
+    fn into_parts(self) -> (TaskParams, DelegationModelRequest) {
+        (
+            TaskParams {
+                contract: self.contract,
+                agent: self.agent,
+                background: self.background,
+                report_delivery: self.report_delivery,
+                task_id: self.task_id,
+            },
+            DelegationModelRequest {
+                model: self.model,
+                effort: self.effort,
+            },
+        )
+    }
+}
+
+/// Immutable child model-selection authority frozen into one durable session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubagentModelPolicy {
+    enabled: bool,
+    allowed_models: Vec<String>,
+    digest: String,
+}
+
+impl Default for SubagentModelPolicy {
+    fn default() -> Self {
+        Self::new(false, Vec::<String>::new()).expect("the disabled subagent model policy is valid")
+    }
+}
+
+impl SubagentModelPolicy {
+    /// Build a canonical policy with a sorted exact allowlist.
+    ///
+    /// # Errors
+    ///
+    /// Enabled policies require at least one unique non-empty `provider/model`.
+    pub fn new(
+        enabled: bool,
+        allowed_models: impl IntoIterator<Item = String>,
+    ) -> Result<Self, SubagentModelPolicyError> {
+        let mut allowed_models = allowed_models.into_iter().collect::<Vec<_>>();
+        if allowed_models.iter().any(|model| {
+            model.trim().is_empty()
+                || model.split_once('/').is_none_or(|(provider, model)| {
+                    provider.is_empty() || model.is_empty() || model.contains('/')
+                })
+        }) {
+            return Err(SubagentModelPolicyError::InvalidModel);
+        }
+        allowed_models.sort();
+        let mut unique = BTreeSet::new();
+        for model in &allowed_models {
+            if !unique.insert(model.as_str()) {
+                return Err(SubagentModelPolicyError::Duplicate(model.clone()));
+            }
+        }
+        if enabled && allowed_models.is_empty() {
+            return Err(SubagentModelPolicyError::EmptyEnabledAllowlist);
+        }
+        let digest = subagent_policy_digest(enabled, &allowed_models);
+        Ok(Self {
+            enabled,
+            allowed_models,
+            digest,
+        })
+    }
+
+    /// Verify a decoded durable policy before trusting it.
+    pub fn validate(&self) -> Result<(), SubagentModelPolicyError> {
+        let canonical = Self::new(self.enabled, self.allowed_models.clone())?;
+        if canonical.allowed_models != self.allowed_models || canonical.digest != self.digest {
+            return Err(SubagentModelPolicyError::DigestMismatch);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn allowed_models(&self) -> &[String] {
+        &self.allowed_models
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    #[must_use]
+    pub fn allows(&self, model: &str) -> bool {
+        self.enabled
+            && self
+                .allowed_models
+                .binary_search_by(|candidate| candidate.as_str().cmp(model))
+                .is_ok()
+    }
+}
+
+fn subagent_policy_digest(enabled: bool, allowed_models: &[String]) -> String {
+    sha256_json(&json!({
+        "enabled": enabled,
+        "allowedModels": allowed_models,
+    }))
+}
+
+/// Invalid configuration or corrupt durable state for child model selection.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SubagentModelPolicyError {
+    #[error("an enabled subagent model selection policy requires a non-empty allowlist")]
+    EmptyEnabledAllowlist,
+    #[error("each allowed subagent model must be an exact non-empty `provider/model` identity")]
+    InvalidModel,
+    #[error("allowed subagent model `{0}` is listed more than once")]
+    Duplicate(String),
+    #[error("the durable subagent model selection policy digest is invalid")]
+    DigestMismatch,
+}
+
 /// The recursion bound, and the reason it cannot be waived here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegationLimits {
@@ -356,6 +506,12 @@ pub struct ChildTurnRequest {
     /// Produced by [`zuno_llm::effort::EffortResolution`] or by the model's own
     /// declared variant, so nothing is synthesised here.
     pub provider_options: Map<String, Value>,
+    /// Durable model-selection authority inherited by the child session.
+    pub subagent_model_policy: SubagentModelPolicy,
+    /// Exact model field supplied by the caller, for continuation validation.
+    pub requested_model: Option<String>,
+    /// Exact effort field supplied by the caller, for continuation validation.
+    pub requested_effort: Option<String>,
     /// Whether the caller asked not to wait.
     pub background: bool,
     /// How a background child reports its terminal state.
@@ -475,6 +631,22 @@ pub enum TaskRejection {
          foreground delegation, or add `background: true` to receive the result later."
     )]
     ReportDeliveryRequiresBackground,
+    #[error("`effort` requires an explicit allowlisted `model`; add `model` or remove `effort`.")]
+    EffortRequiresModel,
+    #[error(
+        "Model `{requested}` is not authorized for this session. Choose exactly one of: {allowed}."
+    )]
+    ModelNotAllowed { requested: String, allowed: String },
+    #[error("Model `{requested}` is authorized but is not present in the resolved model catalog.")]
+    ModelUnavailable { requested: String },
+    #[error(
+        "Effort `{requested}` is not a variant declared by `{model}`. Choose exactly one of: {declared}."
+    )]
+    EffortNotDeclared {
+        requested: String,
+        model: String,
+        declared: String,
+    },
 }
 
 /// The guidance a `task` refusal from the permission layer carries.
@@ -605,6 +777,7 @@ pub struct TaskTool {
     limits: DelegationLimits,
     vision_available: bool,
     targets: Option<DelegationTargets>,
+    subagent_model_policy: SubagentModelPolicy,
 }
 
 impl TaskTool {
@@ -620,6 +793,7 @@ impl TaskTool {
             limits: DelegationLimits::default(),
             vision_available: false,
             targets: None,
+            subagent_model_policy: SubagentModelPolicy::default(),
         }
     }
 
@@ -663,6 +837,23 @@ impl TaskTool {
     pub fn with_targets(mut self, targets: DelegationTargets) -> Self {
         self.targets = Some(targets);
         self
+    }
+
+    /// Bind the tool schema and every child request to one durable session policy.
+    #[must_use]
+    pub fn with_subagent_model_policy(mut self, policy: SubagentModelPolicy) -> Self {
+        self.subagent_model_policy = policy;
+        self
+    }
+
+    /// Expose the opt-in schema that includes `model` and `effort`.
+    #[must_use]
+    pub fn selectable(self) -> SelectableTaskTool {
+        SelectableTaskTool(self)
+    }
+
+    pub(crate) fn subagent_model_policy(&self) -> SubagentModelPolicy {
+        self.subagent_model_policy.clone()
     }
 
     pub(crate) fn targets(&self) -> Vec<String> {
@@ -857,29 +1048,64 @@ impl TaskTool {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl TypedTool for TaskTool {
-    type Params = TaskParams;
-
-    fn id(&self) -> &str {
-        WIRE_ID
+    fn strict_plan(
+        &self,
+        agent: &str,
+        request: &DelegationModelRequest,
+    ) -> Result<DelegationPlan, ToolError> {
+        if request.effort.is_some() && request.model.is_none() {
+            return Err(reject(TaskRejection::EffortRequiresModel));
+        }
+        let Some(requested) = request.model.as_deref() else {
+            return Ok(self.plan(agent, None, &DelegationModelRequest::default()));
+        };
+        if !self.subagent_model_policy.allows(requested) {
+            return Err(reject(TaskRejection::ModelNotAllowed {
+                requested: requested.to_owned(),
+                allowed: self.subagent_model_policy.allowed_models().join(", "),
+            }));
+        }
+        let model = ModelChoice::new(requested);
+        let facts = self.facts.facts(&model).ok_or_else(|| {
+            reject(TaskRejection::ModelUnavailable {
+                requested: requested.to_owned(),
+            })
+        })?;
+        let (effort, provider_options) = match request.effort.as_deref() {
+            None => (None, Map::new()),
+            Some(requested_effort) => {
+                let Some(options) = facts.variants.get(requested_effort) else {
+                    return Err(reject(TaskRejection::EffortNotDeclared {
+                        requested: requested_effort.to_owned(),
+                        model: requested.to_owned(),
+                        declared: facts
+                            .variants
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    }));
+                };
+                (requested_effort.parse().ok(), options.clone())
+            }
+        };
+        Ok(DelegationPlan {
+            agent: agent.to_owned(),
+            category: None,
+            model: Some(model),
+            effort,
+            provider_options,
+            notes: Vec::new(),
+        })
     }
 
-    fn description(&self) -> &str {
-        DESCRIPTION
-    }
-
-    fn ui_intent(&self) -> ToolUiIntent {
-        ToolUiIntent::Subagent
-    }
-
-    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
-        ToolConcurrencyPolicy::IsolatedBackground
-    }
-
-    async fn run(&self, params: TaskParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn run_with_request(
+        &self,
+        params: TaskParams,
+        request: DelegationModelRequest,
+        ctx: ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
         params.contract.validate().map_err(reject)?;
         let background = params.background.unwrap_or(false);
         if !background && params.report_delivery.is_some() {
@@ -887,10 +1113,6 @@ impl TypedTool for TaskTool {
         }
         let report_delivery = params.report_delivery.unwrap_or_default();
 
-        // Argument validity precedes the human prompt, unlike upstream, which asks
-        // before checking the agent exists (`task.ts:118-183`). Asking a user to
-        // approve delegation to a target that cannot exist spends the one interaction
-        // budget this tool has on a call that is going to fail anyway.
         let agent = self.target(&params.agent)?;
         self.guard_depth(&ctx).await?;
 
@@ -917,8 +1139,14 @@ impl TypedTool for TaskTool {
         )
         .await?;
 
-        let plan = self.plan(&agent, None, &DelegationModelRequest::default());
+        let plan = if self.subagent_model_policy.enabled() {
+            self.strict_plan(&agent, &request)?
+        } else {
+            self.plan(&agent, None, &DelegationModelRequest::default())
+        };
         let logical_key = delegation_logical_key(&agent, &params.contract);
+        let requested_model = request.model.clone();
+        let requested_effort = request.effort.clone();
         let turn = self
             .host
             .dispatch(
@@ -935,6 +1163,9 @@ impl TypedTool for TaskTool {
                     model: plan.model.clone(),
                     effort: plan.effort,
                     provider_options: plan.provider_options.clone(),
+                    subagent_model_policy: self.subagent_model_policy.clone(),
+                    requested_model,
+                    requested_effort,
                     background,
                     report_delivery,
                 },
@@ -960,6 +1191,66 @@ impl TypedTool for TaskTool {
         }
 
         Ok(render(&params, &plan, &turn, background))
+    }
+}
+
+#[async_trait]
+impl TypedTool for TaskTool {
+    type Params = TaskParams;
+
+    fn id(&self) -> &str {
+        WIRE_ID
+    }
+
+    fn description(&self) -> &str {
+        DESCRIPTION
+    }
+
+    fn ui_intent(&self) -> ToolUiIntent {
+        ToolUiIntent::Subagent
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::IsolatedBackground
+    }
+
+    async fn run(&self, params: TaskParams, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+        self.run_with_request(params, DelegationModelRequest::default(), ctx)
+            .await
+    }
+}
+
+/// Opt-in `task` definition whose schema includes explicit model and effort fields.
+#[derive(Clone)]
+pub struct SelectableTaskTool(TaskTool);
+
+#[async_trait]
+impl TypedTool for SelectableTaskTool {
+    type Params = SelectableTaskParams;
+
+    fn id(&self) -> &str {
+        WIRE_ID
+    }
+
+    fn description(&self) -> &str {
+        DESCRIPTION
+    }
+
+    fn ui_intent(&self) -> ToolUiIntent {
+        ToolUiIntent::Subagent
+    }
+
+    fn concurrency_policy(&self) -> ToolConcurrencyPolicy {
+        ToolConcurrencyPolicy::IsolatedBackground
+    }
+
+    async fn run(
+        &self,
+        params: SelectableTaskParams,
+        ctx: ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let (params, request) = params.into_parts();
+        self.0.run_with_request(params, request, ctx).await
     }
 }
 

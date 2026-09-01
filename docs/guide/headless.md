@@ -58,6 +58,20 @@ zuno run --format json "summarize the diff"
 `default` is human-readable text; `json` is for parsing. Use `json` in scripts rather than
 scraping formatted output, because the formatted shape is presentation.
 
+Provider-visible reasoning is opt-in:
+
+```sh
+zuno run --show-reasoning "summarize the failure" > answer.txt 2> reasoning.txt
+```
+
+Final answer text stays on stdout. Stderr receives only explicit provider
+reasoning deltas between `<<<zuno:reasoning>>>` and
+`<<<zuno:end-reasoning>>>`; signed thinking and encrypted reasoning are never
+shown. Zuno delays the opening marker until the first delta if the provider
+omits a start event and always closes an open block on provider error or stream
+end. `--show-reasoning --format json` is rejected because JSON mode already
+emits structured events.
+
 Logs never go to stdout. Mirror them to stderr when diagnosing:
 
 ```sh
@@ -66,10 +80,12 @@ zuno run --print-logs --log-level DEBUG "summarize the build failure"
 
 ## Attaching files
 
-`-f`/`--file` is repeatable, and `--attach` carries an attachment. A supported image
-becomes a typed image block under the 20 MiB image limit; any other reference must be UTF-8
-text within 51,200 bytes and 2,000 lines, inserted with explicit begin and end markers.
-Unsupported binary files, including PDFs, are not silently converted. See
+`-f`/`--file` is repeatable, and `--attach` carries an attachment. A supported
+image is normalized and admitted to the database-scoped durable object store
+before the inbox write; the default source limit is 20 MiB and the normalized
+encoded limit is 5 MiB. Any other reference must be UTF-8 text within 51,200
+bytes and 2,000 lines, inserted with explicit begin and end markers. Unsupported
+binary files, including PDFs, are not silently converted. See
 [Images and file references](/reference/attachments).
 
 ## Confinement in a script
@@ -167,10 +183,12 @@ zuno serve --port 4096
 zuno acp --check
 ```
 
-The server adds no authentication on your behalf. Binding to `0.0.0.0` or advertising over
-mDNS exposes it beyond the local host, so restrict the bind address and CORS origins to
-what the deployment needs. For ACP, stdout carries protocol framing, so send diagnostics to
-stderr with `--print-logs`. See [Editors and ACP](/reference/zed-acp).
+The server supports Basic Auth through `ZUNO_SERVER_PASSWORD` and the explicit
+loopback-only `--browser-auth` bootstrap. Browser auth prints one launch URI,
+consumes its token once, and issues an authority-bound signed cookie. It never
+makes a non-loopback listener acceptable. For ACP, stdout carries protocol
+framing, so send diagnostics to stderr with `--print-logs`. See
+[Editors and ACP](/reference/zed-acp).
 
 ## See also
 

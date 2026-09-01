@@ -103,6 +103,15 @@ Set `"oauth": false` to suppress auto-detection for a server that advertises OAu
 you do not want used. For a static token, a header is simpler than an OAuth flow, but keep
 the value in the environment rather than in the JSON file.
 
+## ACP session servers
+
+An ACP client may supply a complete session-local `mcpServers` list on
+new/load/resume. Zuno supports stdio and Streamable HTTP there, not SSE. These
+servers are not written into `zuno.json`: they are validated process-local
+effects, all connect and discover before tools publish, and any partial startup
+is disposed in reverse order. Client commands, environment values, and headers
+are never stored in the session database or logs. See [zuno acp](/cli/acp).
+
 ## How MCP tools become available
 
 Registration is not authorization. Four things must hold for a model to call an MCP tool:

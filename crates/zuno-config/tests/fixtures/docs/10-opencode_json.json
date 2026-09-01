@@ -3,9 +3,11 @@
   "attachment": {
     "image": {
       "auto_resize": true,
+      "max_source_bytes": 20971520,
       "max_width": 2000,
       "max_height": 2000,
-      "max_base64_bytes": 5242880
+      "max_pixels": 4000000,
+      "max_encoded_bytes": 5242880
     }
   }
 }

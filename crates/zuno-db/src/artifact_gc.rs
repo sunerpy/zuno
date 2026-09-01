@@ -37,6 +37,8 @@ pub struct ArtifactGcPaths {
     pub snapshots: PathBuf,
     /// `$DATA/tool-output`.
     pub tool_output: PathBuf,
+    /// `$DATA/attachments`.
+    pub attachments: PathBuf,
 }
 
 impl ArtifactGcPaths {
@@ -46,6 +48,7 @@ impl ArtifactGcPaths {
         Self {
             snapshots: data.join("snapshot"),
             tool_output: data.join("tool-output"),
+            attachments: data.join("attachments"),
         }
     }
 
@@ -55,6 +58,7 @@ impl ArtifactGcPaths {
         Self {
             snapshots: layout.snapshot_root(),
             tool_output: layout.tool_output(),
+            attachments: layout.data().join("attachments"),
         }
     }
 }
@@ -110,6 +114,8 @@ pub enum ArtifactKind {
     SnapshotStore,
     /// One persisted tool output file.
     ToolOutput,
+    /// One canonical or route-derived image object.
+    AttachmentObject,
 }
 
 /// Why one path is safe to reclaim.
@@ -122,6 +128,8 @@ pub enum ReclaimReason {
     /// A foreign tool-output filename has no session attribution and is older
     /// than the configured backstop.
     UnattributedToolOutputExpired,
+    /// No surviving durable part in this database references the object digest.
+    UnreferencedAttachment,
 }
 
 /// One candidate observed during a pass.
@@ -258,6 +266,7 @@ pub fn execute(
     let mut candidates = Vec::new();
     discover_snapshot_candidates(paths, &survivors, &mut candidates)?;
     discover_tool_output_candidates(paths, request, &deleted_session_ids, &mut candidates)?;
+    discover_attachment_candidates(&transaction, paths, &deleted_session_ids, &mut candidates)?;
     candidates.sort_by(|left, right| left.path.cmp(&right.path));
 
     let mut report = ArtifactGcReport::default();
@@ -446,6 +455,126 @@ fn discover_tool_output_candidates(
     Ok(())
 }
 
+fn discover_attachment_candidates(
+    connection: &Connection,
+    paths: &ArtifactGcPaths,
+    deleted_session_ids: &BTreeSet<String>,
+    candidates: &mut Vec<Candidate>,
+) -> Result<(), ArtifactGcError> {
+    if !table_exists(connection, "part")? {
+        return Ok(());
+    }
+    let Some(database) = connection.path().filter(|path| !path.is_empty()) else {
+        // A pooled in-memory URI is not recoverable from a bare rusqlite
+        // connection. Refusing to guess prevents one in-memory database from
+        // deleting another database's object scope.
+        return Ok(());
+    };
+    let identity = zuno_attachment::AttachmentStore::database_identity(database.as_bytes());
+    let root = paths.attachments.join("v1").join(identity);
+    if !is_real_directory(&root)? {
+        return Ok(());
+    }
+    let live = live_attachment_digests(connection, deleted_session_ids)?;
+    for directory in [root.join("objects"), root.join("derived")] {
+        discover_unreferenced_attachment_files(&directory, &live, candidates)?;
+    }
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, ArtifactGcError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(open::map_error)
+        .map_err(ArtifactGcError::from)
+}
+
+fn live_attachment_digests(
+    connection: &Connection,
+    deleted_session_ids: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, ArtifactGcError> {
+    let mut statement = connection
+        .prepare("SELECT session_id, data FROM part ORDER BY id")
+        .map_err(open::map_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(open::map_error)?;
+    let mut live = BTreeSet::new();
+    for row in rows {
+        let (session_id, data) = row.map_err(open::map_error)?;
+        if deleted_session_ids.contains(&session_id) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("file") {
+            continue;
+        }
+        if let Some(digest) = value
+            .pointer("/attachment/id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| id.strip_prefix("sha256:"))
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        {
+            live.insert(digest.to_owned());
+        }
+    }
+    Ok(live)
+}
+
+fn discover_unreferenced_attachment_files(
+    root: &Path,
+    live: &BTreeSet<String>,
+    candidates: &mut Vec<Candidate>,
+) -> Result<(), ArtifactGcError> {
+    if !is_real_directory(root)? {
+        return Ok(());
+    }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in read_directory(&directory)? {
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|source| filesystem_error("inspect", &path, source))?;
+            if kind.is_dir() && !kind.is_symlink() {
+                pending.push(path);
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let digest = name.split('-').next().unwrap_or_default();
+            if digest.len() != 64 || live.contains(digest) {
+                continue;
+            }
+            candidates.push(Candidate {
+                path,
+                target: Target::File,
+                kind: ArtifactKind::AttachmentObject,
+                reason: ReclaimReason::UnreferencedAttachment,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn read_directory(path: &Path) -> Result<Vec<fs::DirEntry>, ArtifactGcError> {
     let read = match fs::read_dir(path) {
         Ok(read) => read,
@@ -601,6 +730,75 @@ mod tests {
             .expect("set fixture mtime");
     }
 
+    fn attachment_database(path: &Path, session_id: &str, live_digest: &str) -> Connection {
+        let connection = Connection::open(path).expect("open attachment database");
+        connection
+            .execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);\
+                 CREATE TABLE session (\
+                   id TEXT PRIMARY KEY,\
+                   project_id TEXT NOT NULL,\
+                   directory TEXT NOT NULL\
+                 );\
+                 CREATE TABLE part (\
+                   id TEXT PRIMARY KEY,\
+                   session_id TEXT NOT NULL,\
+                   data TEXT NOT NULL\
+                 );",
+            )
+            .expect("create attachment GC schema");
+        insert_project(
+            &connection,
+            "project",
+            path.parent().expect("database parent"),
+        );
+        insert_session(
+            &connection,
+            session_id,
+            "project",
+            path.parent().expect("database parent"),
+        );
+        connection
+            .execute(
+                "INSERT INTO part (id, session_id, data) VALUES (?1, ?2, ?3)",
+                params![
+                    format!("part_{session_id}"),
+                    session_id,
+                    serde_json::json!({
+                        "type": "file",
+                        "attachment": {
+                            "id": format!("sha256:{live_digest}"),
+                            "mediaType": "image/png",
+                            "width": 1,
+                            "height": 1,
+                            "encodedBytes": 1
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .expect("insert live attachment reference");
+        connection
+    }
+
+    fn attachment_file(
+        paths: &ArtifactGcPaths,
+        database: &Path,
+        directory: &str,
+        name: &str,
+    ) -> PathBuf {
+        let identity = zuno_attachment::AttachmentStore::database_identity(
+            database.to_string_lossy().as_bytes(),
+        );
+        paths
+            .attachments
+            .join("v1")
+            .join(identity)
+            .join(directory)
+            .join(&name[..2])
+            .join(name)
+    }
+
     #[test]
     fn zero_total_sessions_refuses_gc_and_names_the_database() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -733,6 +931,68 @@ mod tests {
             "old foreign output uses the backstop"
         );
         assert!(fresh_foreign.exists(), "fresh foreign output is retained");
+    }
+
+    #[test]
+    fn attachment_gc_is_scoped_to_the_open_database_and_retains_live_derivations() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ArtifactGcPaths::from_data_root(&temp.path().join("data"));
+        let database_a = temp.path().join("a.db");
+        let database_b = temp.path().join("b.db");
+        let live_a = "11".repeat(32);
+        let orphan_a = "22".repeat(32);
+        let live_b = "33".repeat(32);
+        let mut connection_a = attachment_database(&database_a, "ses_a", &live_a);
+        let _connection_b = attachment_database(&database_b, "ses_b", &live_b);
+
+        let live_a_object = attachment_file(&paths, &database_a, "objects", &live_a);
+        let live_a_derived =
+            attachment_file(&paths, &database_a, "derived", &format!("{live_a}-policy"));
+        let orphan_a_object = attachment_file(&paths, &database_a, "objects", &orphan_a);
+        let orphan_a_derived = attachment_file(
+            &paths,
+            &database_a,
+            "derived",
+            &format!("{orphan_a}-policy"),
+        );
+        let live_b_object = attachment_file(&paths, &database_b, "objects", &live_b);
+        let orphan_b = "44".repeat(32);
+        let orphan_b_object = attachment_file(&paths, &database_b, "objects", &orphan_b);
+        for path in [
+            &live_a_object,
+            &live_a_derived,
+            &orphan_a_object,
+            &orphan_a_derived,
+            &live_b_object,
+            &orphan_b_object,
+        ] {
+            write(path, b"object");
+        }
+
+        let report = execute(
+            &mut connection_a,
+            &paths,
+            &ArtifactGcRequest::new(Vec::<String>::new(), SystemTime::now()).deleting(),
+        )
+        .expect("collect database A attachments");
+
+        assert!(live_a_object.is_file());
+        assert!(live_a_derived.is_file());
+        assert!(!orphan_a_object.exists());
+        assert!(!orphan_a_derived.exists());
+        assert!(live_b_object.is_file());
+        assert!(
+            orphan_b_object.is_file(),
+            "database A GC must not inspect database B's object scope"
+        );
+        assert_eq!(
+            report
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.kind == ArtifactKind::AttachmentObject)
+                .count(),
+            2
+        );
     }
 
     #[test]

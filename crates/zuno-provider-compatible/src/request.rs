@@ -419,6 +419,11 @@ fn translate_response_assistant(message: &Message) -> Vec<Value> {
             RequestContentBlock::SignedThinking { .. }
             | RequestContentBlock::ToolResult { .. }
             | RequestContentBlock::Image { .. } => {}
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         }
     }
     flush_response_assistant_text(&mut items, &mut content);
@@ -450,6 +455,11 @@ fn translate_response_tool_results(message: &Message, quirks: &Quirks) -> Vec<Va
                     "type": "input_image",
                     "image_url": format!("data:{media_type};base64,{data}"),
                 })),
+                RequestContentBlock::ImageAttachment { .. } => {
+                    unreachable!(
+                        "attachment references must be resolved before provider request shaping"
+                    )
+                }
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -501,6 +511,11 @@ fn response_content(message: &Message, quirks: &Quirks) -> Vec<Value> {
                 "type": "input_image",
                 "image_url": format!("data:{media_type};base64,{data}"),
             })),
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
             _ => None,
         })
         .collect()
@@ -535,6 +550,11 @@ fn single_text_response_content(message: &Message, quirks: &Quirks) -> Vec<Value
                 "type": "input_image",
                 "image_url": format!("data:{media_type};base64,{data}"),
             })),
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
             _ => {}
         }
     }
@@ -598,6 +618,11 @@ fn translate_plain(message: &Message, quirks: &Quirks) -> Vec<Value> {
             | RequestContentBlock::ProviderEncryptedReasoning { .. }
             | RequestContentBlock::ToolUse { .. }
             | RequestContentBlock::ToolResult { .. } => {}
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         }
     }
 
@@ -645,6 +670,11 @@ fn translate_assistant(message: &Message, quirks: &Quirks) -> Vec<Value> {
                 "function": { "name": name, "arguments": input.to_string() }
             })),
             RequestContentBlock::ToolResult { .. } | RequestContentBlock::Image { .. } => {}
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         }
     }
 
@@ -708,6 +738,11 @@ fn translate_tool_results(message: &Message) -> Vec<Value> {
             | RequestContentBlock::ProviderEncryptedReasoning { .. }
             | RequestContentBlock::ToolUse { .. }
             | RequestContentBlock::Image { .. } => None,
+            RequestContentBlock::ImageAttachment { .. } => {
+                unreachable!(
+                    "attachment references must be resolved before provider request shaping"
+                )
+            }
         })
         .collect()
 }

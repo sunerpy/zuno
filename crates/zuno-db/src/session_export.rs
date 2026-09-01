@@ -22,6 +22,7 @@
 //! inserted `ON CONFLICT DO NOTHING`, so importing the same file twice is not a
 //! way to mutate an existing transcript.
 
+use base64::Engine as _;
 use rusqlite::{Connection, Transaction, params};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Value};
@@ -131,21 +132,114 @@ fn normalize_numbers(value: &mut Value) {
 /// [`DbError::NotFound`] when no session has this id, and [`DbError::Query`] or
 /// [`DbError::Decode`] if a row cannot be read.
 pub fn export(connection: &Connection, session_id: &str) -> Result<ExportDocument, DbError> {
+    let attachments = attachment_store_for_connection(connection)?;
+    export_inner(connection, session_id, attachments.as_ref())
+}
+
+/// Export using the caller's exact database-scoped attachment store.
+///
+/// Durable image references are converted back to portable inline data URLs so
+/// importing the document never depends on an object store from another database.
+pub fn export_with_attachments(
+    connection: &Connection,
+    session_id: &str,
+    attachments: &zuno_attachment::AttachmentStore,
+) -> Result<ExportDocument, DbError> {
+    export_inner(connection, session_id, Some(attachments))
+}
+
+fn export_inner(
+    connection: &Connection,
+    session_id: &str,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
+) -> Result<ExportDocument, DbError> {
     let session = crate::session::get(connection, session_id)?;
     let hydrated = MessageStore::new(connection).hydrate_session(session_id)?;
+    let mut messages = Vec::with_capacity(hydrated.len());
+    for mut message in hydrated {
+        message.parts.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut parts = Vec::with_capacity(message.parts.len());
+        for part in &message.parts {
+            let mut value = part.to_json();
+            reinline_attachment(&mut value, attachments)?;
+            parts.push(value);
+        }
+        messages.push(ExportMessage {
+            info: message.info.to_json(),
+            parts,
+        });
+    }
     Ok(ExportDocument {
         info: session_info(session),
-        messages: hydrated
-            .into_iter()
-            .map(|mut message| {
-                message.parts.sort_by(|left, right| left.id.cmp(&right.id));
-                ExportMessage {
-                    info: message.info.to_json(),
-                    parts: message.parts.iter().map(PartRecord::to_json).collect(),
-                }
-            })
-            .collect(),
+        messages,
     })
+}
+
+fn reinline_attachment(
+    part: &mut Value,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
+) -> Result<(), DbError> {
+    let Some(object) = part.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(reference) = object.get("attachment").cloned() else {
+        return Ok(());
+    };
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(reference)
+        .map_err(|source| DbError::Decode {
+            table: "part".to_owned(),
+            source,
+        })?;
+    let store = attachments.ok_or_else(|| DbError::Query {
+        source: Box::new(zuno_attachment::AttachmentError::StoreUnavailable),
+    })?;
+    let bytes = store.read(&reference).map_err(|source| DbError::Query {
+        source: Box::new(source),
+    })?;
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    object.insert(
+        "mime".to_owned(),
+        Value::String(reference.media_type.clone()),
+    );
+    object.insert("data".to_owned(), Value::String(data.clone()));
+    object.insert(
+        "url".to_owned(),
+        Value::String(format!("data:{};base64,{data}", reference.media_type)),
+    );
+    object.remove("attachment");
+    Ok(())
+}
+
+fn attachment_store_for_connection(
+    connection: &Connection,
+) -> Result<Option<zuno_attachment::AttachmentStore>, DbError> {
+    let mut statement = connection
+        .prepare("PRAGMA database_list")
+        .map_err(open::map_error)?;
+    let mut rows = statement.query([]).map_err(open::map_error)?;
+    let mut target = None;
+    while let Some(row) = rows.next().map_err(open::map_error)? {
+        let name: String = row.get(1).map_err(open::map_error)?;
+        if name == "main" {
+            let path: String = row.get(2).map_err(open::map_error)?;
+            if !path.is_empty() {
+                target = Some(path);
+            }
+            break;
+        }
+    }
+    target
+        .map(|target| {
+            zuno_attachment::AttachmentStore::new(
+                zuno_paths::data(),
+                &zuno_attachment::AttachmentStore::database_identity(target.as_bytes()),
+                zuno_attachment::ImageAdmissionPolicy::default(),
+            )
+            .map_err(|source| DbError::Query {
+                source: Box::new(source),
+            })
+        })
+        .transpose()
 }
 
 /// Where an imported session is re-homed.
@@ -186,6 +280,29 @@ pub fn import(
     document: &Value,
     target: &ImportTarget,
 ) -> Result<Imported, DbError> {
+    let attachments = attachment_store_for_connection(transaction)?;
+    import_inner(transaction, document, target, attachments.as_ref())
+}
+
+/// Import using the caller's exact database-scoped attachment store.
+///
+/// Inline image parts in portable documents are admitted before their rows are
+/// written, so all newly persisted image content uses durable references.
+pub fn import_with_attachments(
+    transaction: &Transaction<'_>,
+    document: &Value,
+    target: &ImportTarget,
+    attachments: &zuno_attachment::AttachmentStore,
+) -> Result<Imported, DbError> {
+    import_inner(transaction, document, target, Some(attachments))
+}
+
+fn import_inner(
+    transaction: &Transaction<'_>,
+    document: &Value,
+    target: &ImportTarget,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
+) -> Result<Imported, DbError> {
     let root = object(document, DOCUMENT)?;
     let info = root
         .get("info")
@@ -214,13 +331,15 @@ pub fn import(
             .and_then(Value::as_array)
             .ok_or_else(|| decode_error("a message has no `parts` array"))?;
         for part in parts {
+            let mut part = part.clone();
+            admit_imported_image(&mut part, attachments)?;
             let created = part
                 .get("time")
                 .and_then(Value::as_object)
                 .and_then(|time| time.get("start").or_else(|| time.get("created")))
                 .and_then(Value::as_i64)
                 .unwrap_or(record.time_created);
-            let record = PartRecord::from_json(rehome(part.clone(), &session_id), created)?;
+            let record = PartRecord::from_json(rehome(part, &session_id), created)?;
             store.insert_part_if_absent(&record)?;
             parts_written += 1;
         }
@@ -230,6 +349,94 @@ pub fn import(
         messages: messages.len(),
         parts: parts_written,
     })
+}
+
+fn admit_imported_image(
+    part: &mut Value,
+    attachments: Option<&zuno_attachment::AttachmentStore>,
+) -> Result<(), DbError> {
+    let Some(object) = part.as_object_mut() else {
+        return Ok(());
+    };
+    if object.get("type").and_then(Value::as_str) != Some("file") {
+        return Ok(());
+    }
+    if let Some(reference) = object.get("attachment").cloned() {
+        let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(reference)
+            .map_err(|source| DbError::Decode {
+                table: "part".to_owned(),
+                source,
+            })?;
+        let store = attachments.ok_or_else(|| DbError::Query {
+            source: Box::new(zuno_attachment::AttachmentError::StoreUnavailable),
+        })?;
+        store.read(&reference).map_err(|source| DbError::Query {
+            source: Box::new(source),
+        })?;
+        return Ok(());
+    }
+
+    let media_type = object
+        .get("mime")
+        .and_then(Value::as_str)
+        .filter(|media_type| {
+            matches!(
+                *media_type,
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            )
+        })
+        .map(str::to_owned);
+    let Some(media_type) = media_type else {
+        return Ok(());
+    };
+    let data = object
+        .get("data")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            object
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| url.strip_prefix(&format!("data:{media_type};base64,")))
+                .map(str::to_owned)
+        });
+    let Some(data) = data else {
+        return Ok(());
+    };
+    let store = attachments.ok_or_else(|| DbError::Query {
+        source: Box::new(zuno_attachment::AttachmentError::StoreUnavailable),
+    })?;
+    let filename = object
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reference = store
+        .admit_base64_typed(&data, Some(&media_type), filename)
+        .map_err(|source| DbError::Query {
+            source: Box::new(source),
+        })?;
+    match reference.filename.clone() {
+        Some(filename) => {
+            object.insert("filename".to_owned(), Value::String(filename));
+        }
+        None => {
+            object.remove("filename");
+        }
+    }
+    object.insert(
+        "mime".to_owned(),
+        Value::String(reference.media_type.clone()),
+    );
+    object.insert(
+        "attachment".to_owned(),
+        serde_json::to_value(reference).map_err(|source| DbError::Decode {
+            table: "part".to_owned(),
+            source,
+        })?,
+    );
+    object.remove("data");
+    object.remove("url");
+    Ok(())
 }
 
 /// Point a message or part at the session id the document declares.

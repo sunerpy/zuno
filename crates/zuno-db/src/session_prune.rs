@@ -427,6 +427,7 @@ fn artifact_kind(kind: ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::SnapshotStore => "snapshot_store",
         ArtifactKind::ToolOutput => "tool_output",
+        ArtifactKind::AttachmentObject => "attachment_object",
     }
 }
 
@@ -437,6 +438,7 @@ fn reclaim_reason(reason: &ReclaimReason) -> String {
         ReclaimReason::UnattributedToolOutputExpired => {
             "unattributed_tool_output_expired".to_owned()
         }
+        ReclaimReason::UnreferencedAttachment => "unreferenced_attachment".to_owned(),
     }
 }
 

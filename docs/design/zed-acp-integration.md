@@ -115,7 +115,7 @@ loop.
 | Human input | Routes ordinary tool permission through `session/request_permission`. Structured question forms are exposed only to Plan turns when the client advertises elicitation; ordinary Work finishes with a direct question only for a genuinely blocking choice, so it does not hold an active ACP tool call open for optional preferences. Question options remain native ACP `oneOf` single-select or array multi-select controls; when a typed answer is allowed, Zuno adds a separate optional `Other` field instead of degrading the choices into descriptive text. Reusable permission asks expose an ACP `allow_always` choice labelled `Allow for session`; Zuno stores the exact grant across host remounts and clears it on `session/close`. Manual asks remain one-shot. Effective `allow_all`, including `danger-full-access`, emits no ordinary permission request. A child permission ask uses its child route only after native subagents were negotiated; otherwise it uses the declared root session and carries `_meta.zuno.childSessionId` for attribution. Delegated children do not receive `question`; they report blockers to the parent, which owns any later direct question or Plan elicitation on the root session. Unknown, malformed, declined, and cancelled outcomes fail closed. |
 | Cancellation | `session/cancel`, JSON-RPC `$/cancel_request`, stdin EOF, and process shutdown abort active work and settle pending agent-to-client requests instead of leaving the transport hung. Request-id cancellation calls back into the Agent with the original method and params before dropping the handler future, allowing Zuno to abort the matching session process tree. Cancelling a parent prompt also cancels its foreground child and pending permission or elicitation request. `session/close` cancels and joins only background jobs owned by that root before releasing the host, MCP runtime, child projector, permission grants, and session slot. |
 | Durable load replay | Reconstructs a bounded retained suffix of user/assistant content, reasoning, tools, raw input/output, safe typed diffs and locations, resource links and image output, followed by the current plan and latest-context usage. Question and delegation tools replay as static cards while retaining raw details. When native subagents are negotiated, the durable child tree is restored in parent-before-child order and historical terminal state is conservatively `disconnected`. Omitted history is reported explicitly. |
-| ACP-provided MCP | HTTP and SSE MCP capabilities remain `false`. Zuno may still mount MCP servers from its own validated native configuration. |
+| ACP-provided MCP | Advertises stdio and Streamable HTTP; SSE remains `false`. New/load/resume validate the complete client list before publication. Each session mounts an isolated bundle, publishes tools only after every required server connects and discovers successfully, and rolls partial startup back in reverse order. |
 | Client filesystem RPC | Not advertised. Agent file reads and writes use Zuno tools, sandbox/permission policy, and durable events; they do not masquerade as ACP client filesystem handlers. |
 | Terminal RPC | Not advertised. Zuno will not emit terminal references until create/output/wait/kill/release ownership and cancellation are implemented as one lifecycle. |
 
@@ -179,19 +179,42 @@ than 5 MiB; the ACP transport also enforces its 8 MiB frame ceiling. Binary
 embedded resources other than images are rejected instead of injecting opaque
 base64 into model context.
 
+### Session-provided MCP
+
+The production initialize response advertises `stdio: true`, `http: true`, and
+`sse: false`. The client supplies the complete standard `mcpServers` array on
+every new, load, or resume request. A load or resume therefore rebuilds only the
+resources declared by that request and never revives a prior process.
+
+Names use `[A-Za-z0-9_-]{1,32}`. Other non-empty names are converted to a stable
+slug with an eight-character digest suffix; collisions after normalization are
+rejected. A stdio command must be an absolute path and runs with the session
+directory as cwd. HTTP accepts only absolute HTTP(S) URLs. Environment entries,
+header names and values, and case-insensitive duplicate header names are
+validated before the session becomes visible.
+
+Client MCP servers are required profile effects. The session connects and
+discovers all of them before atomically publishing their tools. Any startup
+failure disposes already-started servers in reverse order. Close, activation
+failure, process EOF, and profile replacement use the same exact shutdown path.
+Commands, environment values, and headers are held only in process memory and
+have redacted `Debug`; they are not stored in SQLite or logs. Discovered tool
+schemas and later attempts still use Zuno's ordinary durable authority,
+permission, and result records.
+
 ## Restore and teardown safety
 
 Zed may retain an external-Agent process and its last selected thread after the
 Agent panel is hidden. Hiding the panel is therefore not treated as
 `session/close`. Zuno contains that client behavior at the ACP boundary:
 
-- `session/load` and `session/resume` resolve validated session configuration
-  and publish the cached command catalog, but keep the session dormant. They do
-  not create a `TurnHost` or connect configured MCP servers until the first
-  `session/prompt`.
-- A second `session/load` for the same open ACP session is idempotent. A
-  `session/resume` also marks replay as already satisfied, so a later load
-  cannot duplicate a transcript the client already owns.
+- `session/load` and `session/resume` validate their complete client MCP list,
+  resolve session configuration, and publish the command catalog while keeping
+  the session dormant. The first `session/prompt` activates the `TurnHost` and
+  transactionally connects the Zuno-configured and client-provided MCP set.
+- A later load or resume for the same durable session replaces the prior
+  process-local resources with the newly supplied complete list. Replay remains
+  bounded and is not sent by resume.
 - One stdio connection retains at most 32 open ACP sessions. A request that
   would exceed the bound fails explicitly instead of growing an unbounded host
   and MCP registry.

@@ -154,7 +154,7 @@ struct StoredEvent {
     data: String,
 }
 
-pub(crate) fn append_in(
+pub fn append_in(
     transaction: &Transaction<'_>,
     session_id: &str,
     event: NewSessionEvent,

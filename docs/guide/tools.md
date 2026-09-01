@@ -33,6 +33,16 @@ Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, an
 surface. `edit` remains available to explicitly constructed profiles; the default editing
 path is `apply_patch` plus `write`.
 
+`webfetch` accepts only credential-free HTTP(S) targets. Zuno resolves and
+validates every address, rejects a whole mixed public/private DNS answer, pins
+the validated addresses, bypasses environment proxies, and repeats validation
+for each of at most five redirects. Public cross-origin redirects are allowed
+only after the new target independently passes the same checks.
+
+`web_search` keeps provider credentials and full wire URLs out of errors and
+logs. Diagnostics identify only provider, scheme, host, path, status, and error
+category; they do not contain an API key, authorization header, or full query.
+
 `glob` and `grep` drive the official `rg` executable, with Zuno contributing only typed
 arguments, cancellation, bounded decoding, and stable ordering. Ripgrep 14 or newer must
 be available; a missing one is a startup error for the tool runtime rather than a silent

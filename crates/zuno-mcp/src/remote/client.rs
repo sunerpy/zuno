@@ -49,6 +49,7 @@ impl RemoteClient {
             Err(error) if error.is_authorization_required() => {
                 authorization_outcome(server, config, store, error).await
             }
+            Err(streamable) if config.streamable_http_only => Err(streamable),
             Err(streamable) => {
                 match connect_transport(&server, config, RemoteTransport::Sse, bearer).await {
                     Ok(client) => Ok(RemoteConnect::Connected(client)),

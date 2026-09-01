@@ -26,6 +26,7 @@ clap_complete = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
 zuno-agent = { workspace = true }
+zuno-attachment = { workspace = true }
 zuno-auth = { workspace = true }
 zuno-catalog = { workspace = true }
 zuno-config = { workspace = true }

@@ -257,6 +257,8 @@ owner:
 - native file tools emit typed creation and edit diffs for Zed;
 - Zuno-configured MCP servers remain available when the selected Agent profile
   permits them;
+- ACP-provided stdio and Streamable HTTP MCP servers are session-scoped and
+  published only after the complete requested set connects and discovers;
 - cancellation, session load, resume, close, plan state, usage, and tool
   history use the same durable runtime as the TUI.
 
@@ -339,19 +341,25 @@ session id while preserving attribution. Delegated children do not receive the
 `question` tool; they report blockers to the parent, which owns any subsequent
 user elicitation on the root session.
 
-ACP-provided client MCP, client filesystem RPC, and terminal RPC are not
-advertised. Zuno handles file and Shell work through its own tools, permission
-policy, and sandbox rather than claiming Zed client RPC handlers.
+ACP-provided MCP advertises stdio and Streamable HTTP; SSE remains unsupported.
+Every new/load/resume request supplies the complete list. Names are validated or
+stably slugged, stdio commands must be absolute and use the session directory as
+cwd, and HTTP headers are strictly validated. All servers must connect and
+discover before their tools are atomically published; partial startup is
+disposed in reverse order. Commands, environment values, and headers are never stored in SQLite or logs. Client filesystem RPC and terminal RPC remain
+unadvertised; Zuno handles file and Shell work through its own tools, permission
+policy, and sandbox.
 
 Restoring a thread is deliberately cold. `session/load` and `session/resume`
-validate the session, expose its selectors, and publish commands without
-starting a `TurnHost` or connecting configured MCP servers. The first prompt
-performs that activation. Load replay is sent once per open ACP session and is
-bounded to the newest 512 retained messages, a 16 MiB stored-part and total
-projection budget, and an 8 MiB per-update frame. Zuno emits an omission notice
-when history exceeds those bounds. Stored part blobs are sized in SQLite before
-JSON hydration, so an oversized tool output is not first loaded into process
-memory and then discarded.
+validate the session and complete client MCP declaration, expose selectors, and
+publish commands without starting a `TurnHost`. The first prompt performs the
+transactional activation. A later load or resume rebuilds process resources
+from the newly supplied complete list; it never reuses an earlier client MCP
+process. Load replay is bounded to the newest 512 retained messages, a 16 MiB
+stored-part and total projection budget, and an 8 MiB per-update frame. Zuno
+emits an omission notice when history exceeds those bounds. Stored part blobs
+are sized in SQLite before JSON hydration, so an oversized tool output is not
+first loaded into process memory and then discarded.
 
 Historical file references are not trusted merely because they were durable.
 Only existing regular files that canonicalize inside the project worktree

@@ -76,6 +76,7 @@ pub const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "presets",
     "default_agent",
     "subagent_depth",
+    "subagent_model_selection",
     "username",
     "agents",
     "workflows",
@@ -166,6 +167,9 @@ pub struct Config {
     /// Maximum subagent nesting depth. Defaults to 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_depth: Option<u32>,
+    /// Host-owned allowlist for model-facing child model and effort selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_model_selection: Option<SubagentModelSelectionConfig>,
     /// Name to show for the user instead of the system username.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
@@ -231,6 +235,18 @@ pub struct Config {
     /// Options under active development.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<ExperimentalConfig>,
+}
+
+/// Host-global child model selection policy, frozen into each durable session.
+#[derive(JsonSchema, Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentModelSelectionConfig {
+    /// Expose optional `model` and `effort` fields on the `task` tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exact `provider/model` identities the model may select.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
 }
 
 impl Config {
@@ -430,6 +446,7 @@ pub struct WatcherConfig {
 
 /// Attachment processing (`config/attachment.ts:22-24`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentConfig {
     /// Image attachment limits.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -438,19 +455,60 @@ pub struct AttachmentConfig {
 
 /// Image attachment limits (`config/attachment.ts:6-19`).
 #[derive(JsonSchema, Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageAttachmentConfig {
     /// Resize oversized images instead of rejecting them. Defaults to true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_resize: Option<bool>,
+    /// Maximum source bytes accepted before decoding. Defaults to 20 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_source_bytes: Option<NonZeroU64>,
     /// Maximum width before resizing or rejecting. Defaults to 2000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_width: Option<NonZeroU32>,
     /// Maximum height before resizing or rejecting. Defaults to 2000.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_height: Option<NonZeroU32>,
-    /// Maximum base64 payload in bytes. Defaults to 5242880.
+    /// Maximum decoded pixel count. Defaults to 4,000,000.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_base64_bytes: Option<NonZeroU32>,
+    pub max_pixels: Option<NonZeroU64>,
+    /// Maximum normalized encoded bytes. Defaults to 5 MiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_encoded_bytes: Option<NonZeroU64>,
+}
+
+impl ImageAttachmentConfig {
+    #[must_use]
+    pub fn resolved_auto_resize(&self) -> bool {
+        self.auto_resize.unwrap_or(true)
+    }
+
+    #[must_use]
+    pub fn resolved_max_source_bytes(&self) -> u64 {
+        self.max_source_bytes
+            .map_or(20 * 1024 * 1024, NonZeroU64::get)
+    }
+
+    #[must_use]
+    pub fn resolved_max_width(&self) -> u32 {
+        self.max_width.map_or(2_000, NonZeroU32::get)
+    }
+
+    #[must_use]
+    pub fn resolved_max_height(&self) -> u32 {
+        self.max_height.map_or(2_000, NonZeroU32::get)
+    }
+
+    #[must_use]
+    pub fn resolved_max_pixels(&self) -> u64 {
+        self.max_pixels.map_or(4_000_000, NonZeroU64::get)
+    }
+
+    #[must_use]
+    pub fn resolved_max_encoded_bytes(&self) -> u64 {
+        self.max_encoded_bytes
+            .map_or(5 * 1024 * 1024, NonZeroU64::get)
+    }
 }
 
 /// Enterprise deployment settings (`config/config.ts:134-136`).

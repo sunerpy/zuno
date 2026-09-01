@@ -366,10 +366,20 @@ them and cancels and joins only background jobs owned by the closing root.
 A child resolves through the same configuration, model catalog, MCP catalog,
 Skill discovery roots, permission ceiling, and sandbox configuration as its
 parent composition. In the absence of a per-Agent or preset route, the child
-inherits the parent session model and reasoning choice. The model-facing `task`
-surface cannot override model, effort, category, MCP, Skill, or sandbox policy;
-configured host workflows use the same validated routing layer without adding
-those fields to the model contract.
+inherits the parent session model and reasoning choice. By default the
+model-facing `task` surface cannot override model, effort, category, MCP, Skill,
+or sandbox policy. `subagent_model_selection.enabled` may expose optional
+`model` and `effort` fields under a separate host-global exact allowlist;
+category, MCP, Skill, and sandbox policy remain host-owned.
+
+The enabled state and canonical sorted allowlist are validated against the
+active model catalog and persisted as a durable session policy event with a
+digest. Every Attempt references that digest and each child inherits the same
+snapshot, so later configuration edits cannot change an existing session.
+Explicit effort requires an explicit allowed model and must resolve to a variant
+that model actually declares. A `task_id` continuation may omit both fields or
+repeat the first frozen values exactly; any change is rejected before child
+execution.
 
 A native child does not recompute an independent tool superset from the current
 configuration. The parent Attempt persists the exact provider-visible tool schemas used
@@ -802,14 +812,22 @@ Commands, Skills, Council requests, and host commands are queued even if their U
 gesture requested immediate delivery. The HTTP prompt API follows the same rule:
 omitting `delivery` means `queue`, while `steer` must be explicit.
 
-User input is typed rich content, not only a rendered string. A local image is
-persisted before execution as a durable file part carrying filename, MIME type,
-data URL, and base64 payload, then reconstructed as a provider-neutral image
-block on replay. Root sessions, attached child sessions, direct sends, queued
-inputs, and steering use the same content path. The visible `[Image #N]` token
-is draft presentation state and is never treated as attachment identity. Bounded
-UTF-8 `@file` and `zuno run --file` inputs become explicit text context; supported
-images remain typed. See [images and file references](reference/attachments.md).
+User input is typed rich content, not only a rendered string. Every new local or
+client-supplied image is admitted before the durable inbox write through the
+profile's `AttachmentStore`. Admission applies source, dimension, pixel, and
+encoded-byte policy; orientation and metadata normalization; and atomic private
+content-addressed publication under the current database identity. The durable
+file part stores only an `ImageAttachmentRef`, never new base64 data.
+
+Provider request assembly resolves and verifies the object late, optionally
+caches a route-policy-derived encoding, and then reconstructs the existing
+provider-neutral inline image block. A missing object or digest/reference
+mismatch is a permanent durable-state failure and never falls back to the source
+path. Historical inline `media_type`/`data` parts remain readable without an
+automatic rewrite. Root sessions, attached children, direct sends, queued
+inputs, steering, TUI, `zuno run --file`, ACP, and server ingress use this same
+path. The visible `[Image #N]` token remains draft presentation state. See
+[images and file references](reference/attachments.md).
 
 A provider stream or provider-retry delay is wakeable for explicit steering:
 Zuno checkpoints any partial assistant output with `finish: steer`, promotes the
@@ -1285,6 +1303,15 @@ Codex's ordinary MCP topology. They terminate with bounded `SIGTERM` to
 `SIGKILL` escalation. Zuno inserts no `__zuno_child_guard` process in front of
 or beside MCP.
 
+An ACP session may add required stdio or Streamable HTTP MCP servers to its own
+profile bundle. The complete declaration is validated on new/load/resume;
+stdio commands are absolute and use the session directory as cwd, HTTP
+headers are strictly validated, and SSE is unsupported. All required servers
+connect and discover before their tools publish atomically. Partial startup,
+session close, load failure, profile replacement, and ACP process exit dispose
+the exact started set in reverse order. Client commands, environment values,
+and headers remain process-local and redacted rather than durable session data.
+
 Other resident and interactive hosts retain dedicated guards where a surviving
 per-tree owner or Unix terminal foreground transfer is required. The direct
 child returned by `guarded_argv` is the guard, not the payload; owners request
@@ -1467,6 +1494,12 @@ The first failed query cancels its siblings and waits for every request to settl
 
 Provider adapters normalize transport output into `SearchResult` and `SearchSource`; they do not own batch scheduling or model-facing presentation.
 
+Credential-bearing provider wire URLs are private implementation data. Search
+diagnostics retain only provider, scheme, host, path, status, and an error
+category. Reqwest errors remove their URL before entering a cause chain, and
+query text, authorization headers, and API keys are forbidden from `Debug`,
+`Display`, `ToolError`, tracing, response bodies, and retry notices.
+
 ## Network egress
 
 `zuno-network` owns the outbound HTTP construction policy shared by providers,
@@ -1482,6 +1515,17 @@ therefore has two transports with separate lifecycles: runtime and SSO traffic
 is proxy-aware, while IMDS and approved local ECS credential endpoints are
 direct. Remote HTTPS container credential endpoints remain on the proxy-aware
 transport.
+
+Public web fetch uses the separate `PublicHttpClient` security capability. It
+accepts only credential-free HTTP(S), disables reqwest auto-redirects, and uses
+direct/no-proxy transport so an environment proxy cannot bypass target
+validation. Each request and each of at most five redirects resolves the host,
+rejects the whole answer if any address is non-public, handles mapped or
+embedded IPv4 forms including NAT64, and pins the validated addresses while
+retaining the original hostname for Host and TLS SNI. Redirect credentials are
+never forwarded. Literal and resolved loopback, private, link-local, CGNAT,
+multicast, unspecified, documentation, and reserved destinations fail before
+the request is sent.
 
 Child processes inherit the process proxy environment unless their typed
 configuration deliberately overrides a variable. The agent loop does not
@@ -1540,5 +1584,21 @@ The headless CLI drains its bounded event channel concurrently with turn executi
 and closes both the detached observer and the producer on success or failure before
 host shutdown. A failed turn therefore cannot leave the renderer waiting forever
 for a sender retained only by the failed producer path.
+
+`zuno run --show-reasoning` is an explicit presentation option. It writes only
+provider `ReasoningDelta` content to stderr between stable start/end markers,
+while final answer text remains on stdout. Signed thinking and encrypted
+reasoning are never rendered. A missing start is opened lazily on the first
+delta, and every error or stream end closes an open block. JSON mode rejects the
+flag and retains the existing structured event output.
+
+`zuno serve --browser-auth` is an explicit loopback-only HTTP surface. Each
+process launch creates one 256-bit token and prints its bootstrap URI exactly
+once outside tracing. Atomic exchange sets an authority-bound 30-day HMAC cookie
+using the private persistent `$DATA/server/browser-auth.key`; the token is then
+unusable. Basic Auth and the cookie compose with OR semantics, but unsafe
+cookie-authorized methods require an exact current-authority Origin. The
+bootstrap query is removed before access logging, and non-loopback resolution
+rejects the mode even when Basic Auth is configured.
 
 The design sources and explicit adopt/adapt/reject decisions are recorded in [the harness comparison](design/harness-comparison.md).

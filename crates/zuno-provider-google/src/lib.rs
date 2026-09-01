@@ -2308,7 +2308,7 @@ fn unsupported_content(
     }
 }
 
-const fn block_kind(block: &RequestContentBlock) -> &'static str {
+fn block_kind(block: &RequestContentBlock) -> &'static str {
     match block {
         RequestContentBlock::Text { .. } => "text",
         RequestContentBlock::ResourceLink { .. } => "resource-link",
@@ -2317,6 +2317,9 @@ const fn block_kind(block: &RequestContentBlock) -> &'static str {
         RequestContentBlock::ToolUse { .. } => "tool-use",
         RequestContentBlock::ToolResult { .. } => "tool-result",
         RequestContentBlock::Image { .. } => "image",
+        RequestContentBlock::ImageAttachment { .. } => {
+            unreachable!("attachment references must be resolved before provider request shaping")
+        }
     }
 }
 

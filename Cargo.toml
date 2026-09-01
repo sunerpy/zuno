@@ -38,6 +38,7 @@ all = "warn"
 # -- first-party crates (path-only; the workspace is not published) ----------
 zuno-acp = { path = "crates/zuno-acp" }
 zuno-agent = { path = "crates/zuno-agent" }
+zuno-attachment = { path = "crates/zuno-attachment" }
 zuno-auth = { path = "crates/zuno-auth" }
 zuno-catalog = { path = "crates/zuno-catalog" }
 zuno-cli = { path = "crates/zuno-cli" }
@@ -101,6 +102,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
   "charset",
   "http2",
 ] }
+http = "1.5.0"
 url = "2.5.8"
 
 # -- serialization ----------------------------------------------------------
@@ -193,6 +195,13 @@ signal-hook = "=0.4.1"
 dirs = "6.0.0"
 globset = "0.4.20"
 ignore = "0.4.33"
+image = { version = "0.25.10", default-features = false, features = [
+  "gif",
+  "jpeg",
+  "png",
+  "webp",
+] }
+kamadak-exif = "0.6.1"
 notify = "8.2.0"
 tree-sitter = "0.26.11"
 tree-sitter-bash = "0.25.1"

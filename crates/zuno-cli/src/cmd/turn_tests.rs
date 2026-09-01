@@ -873,6 +873,7 @@ fn test_delegation() -> tool_runtime::Delegation {
         presets: zuno_agent::model_policy::PresetLibrary::new(),
         limits: zuno_tools::task::DelegationLimits::default(),
         vision_available: false,
+        subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
     }
 }
 
@@ -1096,6 +1097,7 @@ fn plan(directory: &str, session: SessionChoice) -> TurnPlan {
         },
         catalog_models: Vec::new(),
         reasoning_efforts: std::collections::BTreeMap::new(),
+        subagent_model_policy: zuno_tools::task::SubagentModelPolicy::default(),
         skills: Arc::new(zuno_catalog::skill::Skills::default()),
         required_skills: Vec::new(),
         capability: test_capability(),
@@ -1317,6 +1319,7 @@ fn orchestration_seed(capability: &CapabilitySnapshot) -> Arc<AttemptSeed> {
             prompt_policy_sha256: sha256_text("build prompt policy"),
         },
         preset: None,
+        subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         parent_attempt: None,
         workflow: None,
         workflow_node: None,
@@ -1345,6 +1348,7 @@ fn parent_attempt(capability: CapabilitySnapshot) -> AttemptSnapshot {
             reasoning_sha256: sha256_text("max"),
             preset: None,
         },
+        subagent_model_policy_sha256: sha256_text("subagent-model-policy"),
         selected_skills: Vec::new(),
         prompt: zuno_orchestration::PromptReceiptIdentity {
             event_id: Some("evt-parent".to_owned()),
@@ -1606,6 +1610,13 @@ fn permanent_provider_failure_blocks_the_goal_with_a_typed_reason() {
 #[test]
 fn prepared_user_message_persistence_preserves_database_busy() {
     let directory = tempfile::tempdir().expect("temporary database directory");
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "locked",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let location = zuno_paths::DbLocation::File(directory.path().join("locked.db"));
     let mut connection = zuno_db::open::open(&location).expect("open primary connection");
     zuno_db::migration::apply(&mut connection).expect("apply schema");
@@ -1627,6 +1638,7 @@ fn prepared_user_message_persistence_preserves_database_busy() {
             now: 1_780_000_000_000,
         },
         None,
+        &attachments,
     )
     .expect("prepare user message");
 
@@ -1652,6 +1664,13 @@ fn stub_internals() -> Internals {
 
 #[test]
 fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "reference",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let input = UserMessageInput {
         session_id: "ses_reference",
         agent: "build",
@@ -1671,11 +1690,11 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
         RequestContentBlock::Image {
             filename: Some("diagram.png".to_owned()),
             media_type: "image/png".to_owned(),
-            data: "aW1hZ2U=".to_owned(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_owned(),
         },
     ];
 
-    let parts = request_content_parts(&input, "msg_reference", &content)
+    let parts = request_content_parts(&input, "msg_reference", &content, &attachments)
         .expect("text and image request blocks are valid user content");
 
     assert_eq!(
@@ -1689,9 +1708,20 @@ fn resolved_prompt_blocks_become_the_text_and_file_parts_the_engine_projects() {
         .iter()
         .find(|part| part.kind == zuno_db::message::PartKind::File)
         .expect("the image became a stored file part");
-    assert_eq!(image.data["mime"], "image/png");
     assert_eq!(image.data["filename"], "diagram.png");
-    assert_eq!(image.data["data"], "aW1hZ2U=");
+    assert!(
+        image.data.get("data").is_none() && image.data.get("url").is_none(),
+        "new durable image parts must not persist inline base64: {:?}",
+        image.data
+    );
+    let reference = serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(
+        image.data["attachment"].clone(),
+    )
+    .expect("durable image reference");
+    assert_eq!(image.data["mime"], reference.media_type);
+    attachments
+        .read(&reference)
+        .expect("the durable object is readable");
 }
 
 #[test]
@@ -2815,6 +2845,44 @@ fn a_config_specified_model_selects_with_no_catalog_at_all() {
     );
 }
 
+#[test]
+fn subagent_model_selection_resolves_every_enabled_allowlist_entry_at_activation() {
+    let mut config = self_specified_config();
+    config.subagent_model_selection = Some(zuno_config::schema::SubagentModelSelectionConfig {
+        enabled: true,
+        allowed_models: vec!["private/house-model".to_owned()],
+    });
+    let catalog = Catalog::resolve(
+        &zuno_llm::catalog::models_dev::CatalogDocument::new(),
+        &ResolveInput::new().with_config(&config),
+    );
+
+    let policy =
+        resolve_subagent_model_policy(&config, &catalog).expect("configured model resolves");
+    assert!(policy.enabled());
+    assert_eq!(policy.allowed_models(), &["private/house-model".to_owned()]);
+
+    config
+        .subagent_model_selection
+        .as_mut()
+        .expect("selection config")
+        .allowed_models = vec!["private/missing".to_owned()];
+    let unresolved =
+        resolve_subagent_model_policy(&config, &catalog).expect_err("missing model must fail");
+    assert!(unresolved.contains("contains unresolved model `private/missing`"));
+
+    config
+        .subagent_model_selection
+        .as_mut()
+        .expect("selection config")
+        .allowed_models = Vec::new();
+    assert!(
+        resolve_subagent_model_policy(&config, &catalog)
+            .expect_err("enabled empty allowlist must fail")
+            .contains("requires a non-empty allowlist")
+    );
+}
+
 /// The other half: a model nobody defines still fails immediately, and names the fix.
 #[test]
 fn a_model_no_config_defines_fails_immediately_and_names_the_fix() {
@@ -2871,8 +2939,114 @@ fn an_empty_catalog_with_no_request_still_explains_the_policy() {
     );
 }
 
+fn subagent_policy_fixture(session_id: &str) -> Arc<zuno_db::Pool> {
+    let pool =
+        Arc::new(zuno_db::Pool::open(&zuno_paths::DbLocation::Memory).expect("open database"));
+    let mut connection = pool.open_connection().expect("open connection");
+    zuno_db::migration::apply(&mut connection).expect("apply schema");
+    connection
+        .execute(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('project_subagent_policy', '/workspace', 1, 1, '[]')",
+            [],
+        )
+        .expect("seed project");
+    connection
+        .execute(
+            "INSERT INTO session (
+                 id, project_id, slug, directory, title, version, time_created, time_updated
+             ) VALUES (?1, 'project_subagent_policy', 'subagent-policy', '/workspace',
+                 'Subagent policy', 'zuno', 1, 1)",
+            [session_id],
+        )
+        .expect("seed session");
+    pool
+}
+
+#[test]
+fn durable_subagent_policy_is_canonical_and_ignores_later_config_choices() {
+    let session_id = "ses_subagent_policy";
+    let pool = subagent_policy_fixture(session_id);
+    let durable = zuno_tools::task::SubagentModelPolicy::new(
+        true,
+        ["provider/z-model".to_owned(), "provider/a-model".to_owned()],
+    )
+    .expect("durable policy");
+    zuno_db::event_log::SessionEventLog::new(Arc::clone(&pool))
+        .append(
+            session_id,
+            subagent_model_policy_event(&durable).expect("policy event"),
+        )
+        .expect("append policy");
+
+    let later_config =
+        zuno_tools::task::SubagentModelPolicy::new(true, ["provider/other-model".to_owned()])
+            .expect("later policy");
+    let restored = load_subagent_model_policy(&pool, session_id)
+        .expect("load durable policy")
+        .expect("policy exists");
+
+    assert_eq!(restored, durable);
+    assert_ne!(restored, later_config);
+    assert_eq!(
+        restored.allowed_models(),
+        &["provider/a-model".to_owned(), "provider/z-model".to_owned()]
+    );
+}
+
+#[test]
+fn corrupt_or_duplicate_durable_subagent_policies_are_permanent_failures() {
+    let corrupt_session = "ses_subagent_policy_corrupt";
+    let corrupt_pool = subagent_policy_fixture(corrupt_session);
+    zuno_db::event_log::SessionEventLog::new(Arc::clone(&corrupt_pool))
+        .append(
+            corrupt_session,
+            zuno_db::event_log::NewSessionEvent::new(
+                SUBAGENT_MODEL_POLICY_EVENT,
+                serde_json::json!({
+                    "policy": {
+                        "enabled": true,
+                        "allowedModels": ["provider/model"],
+                        "digest": "not-the-policy-digest"
+                    }
+                })
+                .as_object()
+                .cloned()
+                .expect("event properties"),
+            )
+            .expect("corrupt event"),
+        )
+        .expect("append corrupt event");
+    let corrupt = load_subagent_model_policy(&corrupt_pool, corrupt_session)
+        .expect_err("a corrupt durable policy must block the session");
+    assert!(corrupt.contains("digest is invalid"), "{corrupt}");
+
+    let duplicate_session = "ses_subagent_policy_duplicate";
+    let duplicate_pool = subagent_policy_fixture(duplicate_session);
+    let policy = zuno_tools::task::SubagentModelPolicy::default();
+    let events = zuno_db::event_log::SessionEventLog::new(Arc::clone(&duplicate_pool));
+    for _ in 0..2 {
+        events
+            .append(
+                duplicate_session,
+                subagent_model_policy_event(&policy).expect("policy event"),
+            )
+            .expect("append duplicate policy event");
+    }
+    let duplicate = load_subagent_model_policy(&duplicate_pool, duplicate_session)
+        .expect_err("multiple immutable policy snapshots must block the session");
+    assert!(duplicate.contains("multiple durable subagent model policies"));
+}
+
 #[test]
 fn new_session_is_lazy_and_first_user_message_commits_with_it() {
+    let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+    let attachments = zuno_attachment::AttachmentStore::new(
+        attachment_root.path(),
+        "new-session",
+        zuno_attachment::ImageAdmissionPolicy::default(),
+    )
+    .expect("attachment store");
     let mut connection =
         zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open memory database");
     zuno_db::migration::apply(&mut connection).expect("apply schema");
@@ -2901,6 +3075,7 @@ fn new_session_is_lazy_and_first_user_message_commits_with_it() {
             now,
         },
         None,
+        &attachments,
     )
     .expect("prepare prompt");
     let SessionMaterializer::Pending(mut input) = prepared.materializer else {
@@ -4153,6 +4328,7 @@ fn production_registry_exposes_all_three_goal_tools() {
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4218,6 +4394,7 @@ fn interaction_tool_ids(
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question,
             interaction_policy: policy,
             background_executions: test_background_executions(directory.path()),
@@ -4327,6 +4504,7 @@ async fn production_registry_wires_configured_shell_into_the_shell_tool() {
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4401,6 +4579,7 @@ async fn explicit_full_access_uses_the_native_backend_and_retains_managed_lifecy
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4500,6 +4679,7 @@ async fn unavailable_fallback_is_visible_and_keeps_managed_shell_guards_and_auth
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: Arc::clone(&background_executions),
@@ -4672,6 +4852,7 @@ fn read_only_agent_refuses_unavailable_fallback_even_when_trusted_config_allows_
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4790,6 +4971,7 @@ async fn a_read_only_agent_contract_narrows_a_full_access_invocation() {
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -4855,6 +5037,7 @@ fn production_registry_exposes_council_only_to_a_delegating_profile() {
                 model_id: "model",
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
+                public_http: Arc::new(zuno_network::PublicHttpClient::new()),
                 question: None,
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
@@ -4958,6 +5141,7 @@ fn production_registry_uses_the_frozen_profile_rules() {
             model_id: "model",
             manifest: Arc::new(zuno_harness::ToolManifest::standard()),
             contributions: Arc::new(zuno_harness::ToolContributions::default()),
+            public_http: Arc::new(zuno_network::PublicHttpClient::new()),
             question: None,
             interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
             background_executions: test_background_executions(directory.path()),
@@ -5598,6 +5782,7 @@ fn every_turn_error() -> Vec<TurnError> {
             elapsed: std::time::Duration::from_secs(180),
         },
         TurnError::Cache(zuno_llm::cache::CacheViolation::StaticPrefixChanged { turn: 2 }),
+        TurnError::Attachment(zuno_attachment::AttachmentError::StoreUnavailable),
     ]
 }
 
@@ -5653,13 +5838,14 @@ fn the_variant_table_covers_the_whole_enum() {
             TurnError::PromptAssembly(_) => "PromptAssembly",
             TurnError::ProviderRetryDeadlineExceeded { .. } => "ProviderRetryDeadlineExceeded",
             TurnError::Cache(_) => "Cache",
+            TurnError::Attachment(_) => "Attachment",
         };
         named.insert(name);
     }
 
     assert_eq!(
         named.len(),
-        20,
+        21,
         "the table covers only {named:?}; every variant needs a value or the rendering \
          claims above are vacuous for the ones missing"
     );
@@ -6248,6 +6434,7 @@ mod production_registry {
                 model_id: "model",
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
+                public_http: Arc::new(zuno_network::PublicHttpClient::new()),
                 question: None,
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
@@ -6649,6 +6836,7 @@ mod production_registry {
                 model_id: "model",
                 manifest: Arc::new(zuno_harness::ToolManifest::standard()),
                 contributions: Arc::new(zuno_harness::ToolContributions::default()),
+                public_http: Arc::new(zuno_network::PublicHttpClient::new()),
                 question: None,
                 interaction_policy: zuno_goal::InteractionPolicy::WorkAutonomous,
                 background_executions: test_background_executions(directory.path()),
@@ -8907,6 +9095,13 @@ mod reflection_runtime {
 
     #[test]
     fn durable_reflection_transcript_replays_delivered_text_and_terminal_tool_results() {
+        let attachment_root = tempfile::tempdir().expect("temporary attachment directory");
+        let attachments = zuno_attachment::AttachmentStore::new(
+            attachment_root.path(),
+            "reflection",
+            zuno_attachment::ImageAdmissionPolicy::default(),
+        )
+        .expect("attachment store");
         let mut connection =
             zuno_db::open::open(&zuno_paths::DbLocation::Memory).expect("open database");
         zuno_db::migration::apply(&mut connection).expect("initialize schema");
@@ -8925,6 +9120,7 @@ mod reflection_runtime {
                 now,
             },
             None,
+            &attachments,
         )
         .expect("prepare user message");
         persist_prepared_user_message(&connection, &user, &user_parts)

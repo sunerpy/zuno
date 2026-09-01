@@ -20,6 +20,7 @@ use zuno_engine::interrupt::{
 use zuno_engine::r#loop::event_channel;
 use zuno_engine::status::{SessionRunGuard, SessionStatus};
 use zuno_error::DbError;
+use zuno_llm::event::RequestContentBlock;
 use zuno_paths::GLOBAL_PROJECT_ID;
 
 use super::Data;
@@ -748,12 +749,13 @@ pub async fn prompt(
     })?);
     let PromptBody {
         id,
-        prompt,
+        mut prompt,
         delivery,
         resume,
         agent,
         model,
     } = input;
+    let admitted_attachments = admit_prompt_files(&state, &mut prompt)?;
     let message_id = id.unwrap_or_else(|| format!("msg_{}", Uuid::new_v4().simple()));
     let delivery = delivery.unwrap_or(PromptDelivery::Queue);
     let created = zuno_db::message::now_millis();
@@ -798,6 +800,7 @@ pub async fn prompt(
                         input_id: Some(message_id),
                         content: prompt.text,
                         images: Vec::new(),
+                        attachments: admitted_attachments,
                         urgent: false,
                         source: SoftInterruptSource::User,
                     },
@@ -905,14 +908,18 @@ fn prompt_execution(
             prompt,
             agent,
             model,
-        } => Ok(SessionPromptExecution {
-            session_id: input.session_id,
-            directory: session.directory.into(),
-            message_id: input.id,
-            prompt: prompt.text,
-            agent,
-            model: model.map(SessionModelSelection::from),
-        }),
+        } => {
+            let content = prompt_request_content(&prompt)?;
+            Ok(SessionPromptExecution {
+                session_id: input.session_id,
+                directory: session.directory.into(),
+                message_id: input.id,
+                prompt: prompt.text,
+                content,
+                agent,
+                model: model.map(SessionModelSelection::from),
+            })
+        }
         PersistedDriverInput::SubagentReport { text, .. } => {
             let model =
                 session_model(session.model.as_deref()).map_err(|error| error.to_string())?;
@@ -921,11 +928,109 @@ fn prompt_execution(
                 directory: session.directory.into(),
                 message_id: input.id,
                 prompt: text,
+                content: Vec::new(),
                 agent: session.agent,
                 model,
             })
         }
     }
+}
+
+fn admit_prompt_files(
+    state: &ApiState,
+    prompt: &mut PromptInputBody,
+) -> Result<Vec<zuno_attachment::ImageAttachmentRef>, ApiError> {
+    let mut admitted = Vec::with_capacity(prompt.files.len());
+    let mut durable = Vec::with_capacity(prompt.files.len());
+    for (index, file) in prompt.files.iter().enumerate() {
+        let object = file.as_object().ok_or_else(|| {
+            ApiError::InvalidPrompt(format!("prompt.files[{index}] must be an object"))
+        })?;
+        let reference = if let Some(value) = object.get("attachment") {
+            let reference =
+                serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(value.clone())
+                    .map_err(|_| {
+                        ApiError::InvalidPrompt(format!(
+                            "prompt.files[{index}].attachment is invalid"
+                        ))
+                    })?;
+            state.attachments().read(&reference).map_err(|error| {
+                ApiError::InvalidPrompt(format!(
+                    "prompt.files[{index}] references an invalid image object: {error}"
+                ))
+            })?;
+            reference
+        } else {
+            let media_type = object
+                .get("mimeType")
+                .or_else(|| object.get("mime"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::InvalidPrompt(format!(
+                        "prompt.files[{index}] must contain a non-empty image MIME type"
+                    ))
+                })?;
+            if !media_type.starts_with("image/") {
+                return Err(ApiError::InvalidPrompt(format!(
+                    "prompt.files[{index}] uses unsupported MIME type {media_type}; only images are accepted"
+                )));
+            }
+            let data = object
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::InvalidPrompt(format!(
+                        "prompt.files[{index}] must contain non-empty base64 data"
+                    ))
+                })?;
+            let filename = object
+                .get("filename")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            state
+                .attachments()
+                .admit_base64_typed(data, Some(media_type), filename)
+                .map_err(|error| {
+                    ApiError::InvalidPrompt(format!(
+                        "prompt.files[{index}] image admission failed: {error}"
+                    ))
+                })?
+        };
+        durable.push(json!({
+            "type": "image",
+            "attachment": reference,
+        }));
+        admitted.push(reference);
+    }
+    prompt.files = durable;
+    Ok(admitted)
+}
+
+fn prompt_request_content(prompt: &PromptInputBody) -> Result<Vec<RequestContentBlock>, String> {
+    if prompt.files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut content = Vec::with_capacity(1 + prompt.files.len());
+    if !prompt.text.is_empty() {
+        content.push(RequestContentBlock::Text {
+            text: prompt.text.clone(),
+        });
+    }
+    for (index, file) in prompt.files.iter().enumerate() {
+        let reference = file
+            .get("attachment")
+            .cloned()
+            .ok_or_else(|| format!("persisted prompt file {index} has no attachment reference"))
+            .and_then(|value| {
+                serde_json::from_value::<zuno_attachment::ImageAttachmentRef>(value).map_err(|_| {
+                    format!("persisted prompt file {index} has an invalid attachment reference")
+                })
+            })?;
+        content.push(RequestContentBlock::ImageAttachment { reference });
+    }
+    Ok(content)
 }
 
 async fn run_prompt_execution(

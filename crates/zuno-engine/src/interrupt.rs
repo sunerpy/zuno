@@ -49,7 +49,10 @@ pub struct SoftInterruptMessage {
     /// Durable inbox id, when this message was admitted before wake-up.
     pub input_id: Option<String>,
     pub content: String,
+    /// Legacy inline image payloads admitted by non-object-aware callers.
     pub images: Vec<(String, String)>,
+    /// Durable normalized image objects admitted before the inbox write.
+    pub attachments: Vec<zuno_attachment::ImageAttachmentRef>,
     /// Whether the turn loop may skip remaining tools before injecting this message.
     pub urgent: bool,
     pub source: SoftInterruptSource,
