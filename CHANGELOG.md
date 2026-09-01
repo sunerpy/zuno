@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.2](https://github.com/sunerpy/zuno/compare/v0.2.1...v0.2.2) (2026-09-01)
+
+
+### Bug Fixes
+
+* **docs:** document continuity configuration ([6192432](https://github.com/sunerpy/zuno/commit/6192432902c1040db897dc78aa5a03ff0ef02f5d))
+* **docs:** document continuity configuration ([8301266](https://github.com/sunerpy/zuno/commit/8301266402ee8c2671edfd016ebf3ef9efb35e47))
+
 ## [0.2.1](https://github.com/sunerpy/zuno/compare/v0.2.0...v0.2.1) (2026-09-01)
 
 
