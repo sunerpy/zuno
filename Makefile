@@ -103,8 +103,9 @@ test:
 	$(CARGO) test --workspace --no-fail-fast $(OFFLINE)
 
 # The cross-platform CI runner. nextest compiles the workspace once and schedules
-# test binaries concurrently; Cargo still owns doctests because nextest does not
-# execute them.
+# test binaries concurrently; `.config/nextest.toml` reserves the complete worker
+# pool for the startup wall-clock suite. Cargo still owns doctests because nextest
+# does not execute them.
 test-nextest:
 	@$(CARGO) nextest --version > /dev/null 2>&1 \
 	  || { echo "cargo-nextest is required; install cargo-nextest 0.9.103"; exit 1; }

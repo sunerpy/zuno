@@ -468,10 +468,19 @@ than sampled.
 ## Startup budget
 
 G1's startup budget is enforced by `crates/zuno-cli/tests/startup.rs`, which
-`make test` runs in CI's `test` job — the reference implementation has eight
+`make test-nextest` runs in CI's `test` job — the reference implementation has eight
 startup budgets and runs none of them in CI, and §7 records that as the weakness
 rather than the thing to copy. Budgets are re-measured here rather than adopted,
 because this is a different binary with a different startup path.
+
+The measurement is globally isolated from the concurrent workspace suite.
+Nextest launches each test case in a separate process, so the Rust `static
+Mutex` in `startup.rs` can coordinate `cargo test` threads but cannot coordinate
+nextest processes. `.config/nextest.toml` therefore selects `binary(startup)`
+and assigns it `threads-required = "num-test-threads"`, reserving the complete
+nextest worker pool while each startup case runs. Native Windows uses the same
+quiet-host boundary in `scripts/test-parallel.sh`. The 100 ms Linux budget is
+not loosened to absorb unrelated load.
 
 Nine runs per invocation, first run discarded (it pays for faulting the binary's
 pages in), isolated `XDG_CONFIG_HOME` and `XDG_DATA_HOME`, debug profile:
@@ -955,6 +964,14 @@ version, `cargo-nextest 0.9.103`: compilation took 20.58 s, nextest ran 5122
 tests across 204 binaries in 14.47 s (5122 passed, 9 skipped), and
 `make test-nextest` including all doctests completed in 53.33 s. This is local
 Linux evidence from one complete run, not a Windows benchmark.
+
+Linux CI run `33479400100` supplied the matching isolation correction. Under the
+full concurrent nextest suite, `zuno session list` measured 137.459 ms median
+and failed its unchanged 100 ms budget, while an immediate isolated rerun on the
+same revision measured 30.292 ms. The product path was not slower; the benchmark
+was sharing the runner with unrelated test processes. The repository-level
+nextest override described in *Startup budget* now gives Linux the same
+isolate-one/run-the-rest-concurrently topology already used on Windows.
 
 Native Windows run `33384920656` supplied the missing negative evidence. Its
 nextest step started at `11:06:31Z` and was still running at `11:34:09Z`, at least

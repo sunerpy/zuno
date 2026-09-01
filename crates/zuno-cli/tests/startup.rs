@@ -3,7 +3,7 @@
 //! §7's G1 says the reference implementation has eight startup budgets and runs
 //! **none of them in CI**, and that not running them is the weakness rather than
 //! the thing to copy. So this lives in `crates/zuno-cli/tests/`, which
-//! `make test` already runs in the workflow's `test` job: a startup regression
+//! `make test-nextest` runs in the workflow's `test` job: a startup regression
 //! fails a build instead of being noticed later.
 //!
 //! # Why a step in an existing job rather than a new one
@@ -23,9 +23,12 @@
 //!
 //! # Why this can be a wall-clock gate without being flaky
 //!
-//! Three reasons. The reported value is a median of [`RUNS`] runs, so one
+//! Four reasons. The reported value is a median of [`RUNS`] runs, so one
 //! descheduled process cannot fail the build. The budgets sit far enough above
 //! the measured medians that runner-to-runner variation is inside the headroom.
+//! `.config/nextest.toml` reserves the complete nextest worker pool for this
+//! test binary, so workspace concurrency cannot turn unrelated CPU or SQLite
+//! contention into a startup regression.
 //! And the assertion that actually catches the regression this gate exists for —
 //! a blocking step added to startup — is [`startup_version_pays_for_no_log_file_and_no_reexec`],
 //! which is structural and has no timing in it at all.
@@ -34,6 +37,7 @@
 //!
 //! ```text
 //! cargo test -p zuno-cli --test startup -- --nocapture
+//! cargo nextest run -p zuno-cli --test startup --no-tests=warn
 //! ```
 
 use std::collections::BTreeSet;
@@ -55,7 +59,12 @@ const RUNS: usize = 9;
 ///
 /// Rust runs integration-test functions in parallel by default. Every test in
 /// this binary takes this lock, including structural tests that launch only one
-/// child, so the wall-clock assertions never benchmark sibling test processes.
+/// child, so `cargo test` never benchmarks sibling functions from this binary.
+///
+/// Nextest launches each test case in a separate process, so this mutex cannot
+/// coordinate that runner. `.config/nextest.toml` independently reserves all
+/// nextest worker slots for the `startup` binary, excluding unrelated workspace
+/// tests while each of these processes runs.
 static STARTUP_MEASUREMENT_LOCK: Mutex<()> = Mutex::new(());
 
 fn startup_measurement_lock() -> MutexGuard<'static, ()> {
