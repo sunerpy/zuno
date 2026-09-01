@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/sunerpy/zuno/compare/v0.3.0...v0.4.0) (2026-09-01)
+
+
+### Features
+
+* add progressive tool and skill discovery ([#65](https://github.com/sunerpy/zuno/issues/65)) ([28ac8c9](https://github.com/sunerpy/zuno/commit/28ac8c92387991bf59d116dc559b8a0a5aa6147d))
+* improve TUI and extend release distribution ([#61](https://github.com/sunerpy/zuno/issues/61)) ([4a40067](https://github.com/sunerpy/zuno/commit/4a40067c3ddae9e057f81267b59e6962fb5d1945))
+
+
+### Bug Fixes
+
+* **release:** preserve manual approval gate ([#63](https://github.com/sunerpy/zuno/issues/63)) ([519003e](https://github.com/sunerpy/zuno/commit/519003e9c90987b7d39468986a6fb37a591febfa))
+* **release:** stabilize candidate dispatch ([#66](https://github.com/sunerpy/zuno/issues/66)) ([fe3e035](https://github.com/sunerpy/zuno/commit/fe3e0352b86257bf937eb8edfe747d636a4fdb57))
+* **test:** synchronize PTY retention ordering ([#64](https://github.com/sunerpy/zuno/issues/64)) ([30e289e](https://github.com/sunerpy/zuno/commit/30e289eea2e667676d7862adc119cb5ed9fd10a7))
+
 ## [0.3.0](https://github.com/sunerpy/zuno/compare/v0.2.2...v0.3.0) (2026-09-01)
 
 
