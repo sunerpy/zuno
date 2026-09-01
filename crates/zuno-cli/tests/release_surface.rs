@@ -1409,6 +1409,65 @@ fn ci_runs_before_the_protected_merge_without_a_duplicate_push_run() {
 }
 
 #[test]
+fn automated_release_prs_keep_the_manual_actions_approval_gate() {
+    let root = workspace_root();
+    let config_text = std::fs::read_to_string(root.join("release-please-config.json"))
+        .expect("release-please config");
+    let config: serde_json::Value =
+        serde_json::from_str(&config_text).expect("valid release-please config");
+    let title = config["pull-request-title-pattern"]
+        .as_str()
+        .expect("release PR title pattern");
+    assert!(
+        !title.to_ascii_lowercase().contains("skip"),
+        "release-please must not bypass the manual Actions approval with a skip marker"
+    );
+    let header = config["pull-request-header"]
+        .as_str()
+        .expect("release PR approval instructions");
+    for required in [
+        "Manual release approval required",
+        "exact head SHA",
+        "approve the pending **CI** Actions run",
+        "`zuno/pr-gate`",
+        "manually merging",
+    ] {
+        assert!(
+            header.contains(required),
+            "release PR header lost manual approval instruction {required:?}"
+        );
+    }
+    for forbidden in ["[skip ci]", "[ci skip]", "pull_request_target"] {
+        if forbidden == "pull_request_target" {
+            assert!(
+                header.contains("Do not bypass") && header.contains(forbidden),
+                "release PR header must explicitly reject privileged {forbidden}"
+            );
+        } else {
+            assert!(
+                !config_text.to_ascii_lowercase().contains(forbidden),
+                "release-please config bypasses approval with {forbidden}"
+            );
+        }
+    }
+
+    let release = workflow("release.yml");
+    let dispatch = job_body(&release, "dispatch_candidate").join("\n");
+    for required in [
+        "name: Record required manual approval",
+        "Manual release approval required",
+        "Approve its pending **CI** Actions run",
+        "Wait for the independently dispatched \\`zuno/pr-gate\\` candidate",
+        "Do not replace this approval with a skip marker",
+    ] {
+        assert!(
+            dispatch.contains(required),
+            "release controller does not surface required operator action {required:?}"
+        );
+    }
+}
+
+#[test]
 fn release_controller_dispatches_exact_source_and_never_compiles() {
     let release = workflow("release.yml");
     let dispatch = job_body(&release, "dispatch_candidate").join("\n");

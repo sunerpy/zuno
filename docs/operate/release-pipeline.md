@@ -22,15 +22,22 @@ the release tag has the same Git tree.
   uses the standard `windows-11-arm` hosted runner.
 
 GitHub places `pull_request` workflow runs created by `GITHUB_TOKEN` into an
-approval-required state. The repository therefore keeps
+approval-required state. This is an intentional human gate, not a test failure
+and not something the release automation may bypass. The repository keeps
 `actions/permissions/fork-pr-contributor-approval` at
-`first_time_contributors_new_to_github`: accounts new to GitHub still require an
-operator approval, while the established `github-actions[bot]` can reach the
-workflow router. `ci.yml` accepts the lightweight route only when the actor, PR
-author, same-repository head, `main` base, and release-please branch prefix all
-match. It gives that route a non-protected check name and skips every build job;
-the exact-head candidate workflow remains the sole owner of `zuno/pr-gate`.
-Ordinary and fork PRs still run the complete CI matrix.
+`all_external_contributors`; it does not add a CI skip marker, switch to
+`pull_request_target`, or give release-please a privileged token.
+
+After release-please creates or updates its PR, a maintainer reviews the exact
+head SHA and approves the pending `CI` Actions run. `ci.yml` then accepts the
+lightweight route only when the actor, PR author, same-repository head, `main`
+base, and release-please branch prefix all match. It gives that route a
+non-protected check name and skips every duplicate build job; the exact-head
+candidate workflow remains the sole owner of `zuno/pr-gate`. Ordinary and fork
+PRs still run the complete CI matrix. An `action_required` run that has not yet
+been approved is waiting for this operator action and must not be reported as a
+completed release. Leaving it unattended until GitHub expires it produces the
+misleading failed `chore: release ...` history that this procedure prevents.
 
 The Linux source gate installs pinned `cargo-nextest`. Linux Clippy and tests
 share one job-local target directory; native Windows Clippy and tests are
