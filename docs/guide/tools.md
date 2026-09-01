@@ -29,6 +29,12 @@ Durable work state adds `plan_get`, `plan_update`, `todo_get`, `todo_update`, an
 `goal_get`/`goal_update`. `memory_propose` appears when memory is enabled, and
 `council_run` when the active agent can reach it.
 
+When connected MCP tools survive capability and permission filtering, Zuno keeps their
+implementations executable but normally withholds their full JSON schemas. A conditional
+`tool_search` tool searches compact metadata; each match expands the provider-visible
+tool set on the next model step. This avoids paying the prompt cost of every connected
+service on every request. See [MCP servers](/guide/mcp).
+
 Optional continuity tools appear only when enabled by `continuity` and retained
 by the final tool and permission filters:
 
@@ -99,8 +105,8 @@ Because `SideEffecting` is the default, an unknown harness or MCP tool fails clo
 mixed tool may classify from validated arguments: `bg list`, `bg output`, and `bg wait`
 are read-only while `bg cancel` is side-effecting.
 
-Native reads, `glob`, `grep`, skill and session and job inspection, read-only LSP, MCP
-resource reads, `webfetch`, and `web_search` do not receive the extra strict prompt.
+Native reads, `glob`, `grep`, skill and session and job inspection, `tool_search`,
+read-only LSP, MCP resource reads, `webfetch`, and `web_search` do not receive the extra strict prompt.
 Shell, file writes, durable state changes, delegation, product agents, extension
 lifecycle mutations, and unknown MCP tools do.
 
@@ -114,8 +120,8 @@ the three Notes read actions are `ReadOnly`; Notes append and replacement are
 Tool execution is at-most-once by default. `Never` is inherited unless an implementation
 explicitly declares `Safe`, and the current safe set is read-only or idempotent
 inspection: file reads, glob, grep, skill lookup, current-session history, Notes reads,
-job status, LSP inspection, goal status, and web search or fetch. Notes writes remain
-`Never`.
+job status, LSP inspection, goal status, connected-tool metadata search, and web search
+or fetch. Notes writes remain `Never`.
 
 | Policy | Behaviour after a failure |
 | --- | --- |

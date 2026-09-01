@@ -17,20 +17,22 @@ Skill 不授予任何东西。它不会增加工具、权限、文件系统访�
 Zuno 按这个作用域顺序发现 Skill：
 
 1. 项目 `.zuno/skill` 与 `.zuno/skills` 根目录，从当前目录一路到 worktree；
-2. 项目 `.agents/skills`，然后 `.claude/skills`，沿同一路径遍历；
+2. 项目 `.agents/skills` 根目录，沿同一路径遍历；
 3. Zuno 的全局与已配置的 config 目录；
-4. 全局 `~/.agents/skills`，然后 `~/.claude/skills`；
+4. 全局 `~/.agents/skills`；
 5. 显式的 `skills.paths`；
 6. 已配置的远端索引。
 
-因此项目作用域会先于用户全局作用域被公布。Zuno 绝不扫描 `.opencode` 或 OpenCode 的配置目录。同一个规范化来源路径会被去重，包括符号链接别名。
+因此项目作用域会先于用户全局作用域被公布。Zuno 不会隐式扫描 `.claude`、
+`.opencode` 或其他产品的配置目录；确实需要共享时，仍可通过 `skills.paths`
+显式选择该目录。同一个规范化来源路径会被去重，包括符号链接别名。
 
 ```sh
 ZUNO_DISABLE_EXTERNAL_SKILLS=1 zuno
-ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1 zuno
 ```
 
-第一个同时禁用 `.agents` 与 `.claude` 根目录；第二个只禁用 Claude 的根目录。在这个较宽的开关下，Zuno 原生的 `.zuno` 根目录仍然启用。
+这个开关禁用隐式 `.agents` 根目录；Zuno 原生 `.zuno` 根目录、已配置的 Zuno
+根目录与显式 `skills.paths` 仍然启用。
 
 ## 一个 Skill 如何到达模型
 
@@ -47,10 +49,16 @@ ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1 zuno
 ```
 
 `maxContextTokens` 限定紧凑目录的规模。它的默认值大约是模型上下文的百分之二，上下文未知时为约 8,000 个 Token，上限为 10,000。
+唯一名称不会在提示词索引中重复注入绝对来源路径；只有同名歧义项才携带
+`source` 定位符。
 
 被完整选中的正文共用另一份聚合预算。它的默认值是已知上下文的百分之十，下限 2,000 个 Token，上限 32,000 个。`maxSelectedContextTokens` 可以覆盖它，但仍受 32,000 的上限约束。如果被选中的正文装不下，加载或恢复会话会在 provider 请求之前失败，而不是静默丢弃指令。
 
 `includeInstructions: false` 会同时把触发策略和目录从提示词中移除。`skill` 工具仍然支持分页的 `list` 与 `search`。
+
+因此即使个人 Skill 库很大，也不会把每个 `SKILL.md` 正文注入每次请求。若某个
+供应商或领域包很少使用，建议把它放在隐式根目录之外，并只在需要的项目中通过
+`skills.paths` 引入；不要仅为了减少数量而删除或合并语义不同的 Skill。
 
 ## 加载是分页的，且必须读完
 

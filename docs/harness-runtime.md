@@ -421,6 +421,17 @@ reorder tool schemas, but the engine rejects any added, replaced, or duplicated 
 before provider dispatch. The durable Attempt therefore records the exact post-hook set
 without allowing the hook seam to widen registered authority.
 
+Root turns progressively disclose connected MCP schemas. Filtered MCP implementations
+stay executable in the dispatcher while `tool_search` searches compact metadata; each
+successful search increments a turn-local revision and expands the frozen provider tool
+snapshot on the next step. Unversioned registry drift remains ignored, while stale
+revisions cannot roll the snapshot back. An exact Agent `tools` allowlist pins its named
+MCP schemas eagerly. ACP session-local `mcpServers` also pin their schemas eagerly after
+the strict connection gate, while host-configured servers in the same catalog remain
+deferred. The catalog carries that session boundary into child and background turns.
+Child turns do not receive a fresh deferred superset: schemas that survived the parent's
+exact Attempt authority are eager inside that already-bounded ceiling.
+
 MCP and extension tools therefore do not flow unconditionally into every child. An
 exact schema must be present in the parent Attempt and no later allowlist or explicit
 deny may remove it. Work-capable native roles may opt into automatic extension
@@ -523,12 +534,14 @@ source locator. Reads use content-bound cursors and must continue to completion;
 disk bodies are read after selection rather than retained for the process
 lifetime.
 
-Skill discovery is Zuno-owned. It advertises project `.zuno`, `.agents`, and
-`.claude` roots before Zuno's user-global config and user-global Agent Skills,
-then configured paths and pulled URL caches. `.agents` precedes `.claude` within
-the same scope. Zuno does not scan OpenCode directories. Canonical paths are
-de-duplicated, including symlink aliases, but same-named files from distinct
-sources remain separate identities that require source-qualified selection.
+Skill discovery is Zuno-owned. It advertises project `.zuno` and `.agents`
+roots before Zuno's user-global config and user-global Agent Skills, then
+configured paths and pulled URL caches. Zuno does not implicitly scan Claude,
+OpenCode, or another product's directories; operators may select a shared
+directory explicitly through `skills.paths`. Canonical paths are de-duplicated,
+including symlink aliases, but same-named files from distinct sources remain
+separate identities that require source-qualified selection. Unique names omit
+their source path from the compact prompt index; ambiguous names retain it.
 Discovery order controls presentation and provenance; it does not silently
 choose a same-name winner.
 

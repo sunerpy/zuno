@@ -269,6 +269,7 @@ pub enum McpToolStatus {
 pub struct ToolSnapshot<T> {
     tools: Vec<T>,
     rebuilt_for_late_mcp: bool,
+    changed: bool,
 }
 
 impl<T> ToolSnapshot<T> {
@@ -284,6 +285,12 @@ impl<T> ToolSnapshot<T> {
         self.rebuilt_for_late_mcp
     }
 
+    /// Whether this request intentionally replaced the locked tool definitions.
+    #[must_use]
+    pub const fn changed(&self) -> bool {
+        self.changed
+    }
+
     /// Consume the snapshot.
     #[must_use]
     pub fn into_tools(self) -> Vec<T> {
@@ -291,12 +298,14 @@ impl<T> ToolSnapshot<T> {
     }
 }
 
-/// A tool list frozen on first request with one late-MCP rebuild allowance.
+/// A tool list frozen on first request with one late-MCP rebuild and explicit,
+/// monotonic disclosure revisions.
 #[derive(Debug, Clone)]
 pub struct LockedTools<T> {
     locked: Option<Vec<T>>,
     late_mcp_resolved: bool,
     rebuild_count: u8,
+    revision: u64,
 }
 
 impl<T> Default for LockedTools<T> {
@@ -305,6 +314,7 @@ impl<T> Default for LockedTools<T> {
             locked: None,
             late_mcp_resolved: false,
             rebuild_count: 0,
+            revision: 0,
         }
     }
 }
@@ -321,28 +331,59 @@ impl<T: Clone + PartialEq> LockedTools<T> {
     /// Todo 47's MCP merge calls this with [`McpToolStatus::Ready`] when its
     /// asynchronous discovery settles. If the first request was made while MCP
     /// was pending and the list changed, this replaces the snapshot exactly once.
-    /// Later registry changes are ignored until [`reset`](Self::reset).
+    /// Later unversioned registry changes are ignored until [`reset`](Self::reset);
+    /// callers may opt into an intentional change through
+    /// [`Self::tools_for_request_with_revision`].
     pub fn tools_for_request(
         &mut self,
         available: &[T],
         mcp_status: McpToolStatus,
     ) -> ToolSnapshot<T> {
+        self.tools_for_request_with_revision(available, mcp_status, 0)
+    }
+
+    /// Freeze `available` while accepting explicitly versioned disclosure changes.
+    ///
+    /// An unchanged revision preserves the original cache-safety contract: arbitrary
+    /// registry drift is ignored, except for the single late-MCP transition. A
+    /// strictly newer revision is an intentional provider-tool expansion and may
+    /// replace the snapshot. Stale revisions never roll the visible set back.
+    pub fn tools_for_request_with_revision(
+        &mut self,
+        available: &[T],
+        mcp_status: McpToolStatus,
+        revision: u64,
+    ) -> ToolSnapshot<T> {
         if self.locked.is_none() {
             self.locked = Some(available.to_vec());
             self.late_mcp_resolved = mcp_status == McpToolStatus::Ready;
+            self.revision = revision;
             return ToolSnapshot {
                 tools: available.to_vec(),
                 rebuilt_for_late_mcp: false,
+                changed: false,
             };
         }
 
-        let mut rebuilt = false;
-        if !self.late_mcp_resolved && mcp_status == McpToolStatus::Ready {
+        let stale_revision = revision < self.revision;
+        let mut changed = false;
+        if revision > self.revision {
+            let locked = self.locked.as_ref().expect("locked snapshot checked above");
+            if locked != available {
+                self.locked = Some(available.to_vec());
+                changed = true;
+            }
+            self.revision = revision;
+        }
+
+        let mut rebuilt_for_late_mcp = false;
+        if !stale_revision && !self.late_mcp_resolved && mcp_status == McpToolStatus::Ready {
             let locked = self.locked.as_ref().expect("locked snapshot checked above");
             if locked != available {
                 self.locked = Some(available.to_vec());
                 self.rebuild_count = 1;
-                rebuilt = true;
+                changed = true;
+                rebuilt_for_late_mcp = true;
             }
             self.late_mcp_resolved = true;
         }
@@ -353,7 +394,8 @@ impl<T: Clone + PartialEq> LockedTools<T> {
                 .as_ref()
                 .expect("locked snapshot initialized above")
                 .clone(),
-            rebuilt_for_late_mcp: rebuilt,
+            rebuilt_for_late_mcp,
+            changed,
         }
     }
 
@@ -363,11 +405,18 @@ impl<T: Clone + PartialEq> LockedTools<T> {
         self.rebuild_count
     }
 
+    /// Latest accepted progressive-disclosure revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Explicitly unlock tools and re-arm one late-MCP rebuild.
     pub fn reset(&mut self) {
         self.locked = None;
         self.late_mcp_resolved = false;
         self.rebuild_count = 0;
+        self.revision = 0;
     }
 }
 
@@ -464,18 +513,39 @@ impl<T: Clone + PartialEq> PromptCache<T> {
         available_tools: &[T],
         mcp_status: McpToolStatus,
     ) -> Result<PreparedTurn<T>, CacheViolation> {
-        let tool_snapshot = self.tools.tools_for_request(available_tools, mcp_status);
-        if tool_snapshot.rebuilt_for_late_mcp() {
+        self.prepare_turn_with_tool_revision(
+            stable_history,
+            dynamic,
+            available_tools,
+            mcp_status,
+            0,
+        )
+    }
+
+    /// Assemble one provider request with a monotonic tool-disclosure revision.
+    pub fn prepare_turn_with_tool_revision(
+        &mut self,
+        stable_history: &[Message],
+        dynamic: DynamicContext,
+        available_tools: &[T],
+        mcp_status: McpToolStatus,
+        tool_revision: u64,
+    ) -> Result<PreparedTurn<T>, CacheViolation> {
+        let tool_snapshot =
+            self.tools
+                .tools_for_request_with_revision(available_tools, mcp_status, tool_revision);
+        if tool_snapshot.changed() {
             self.tracker.reset();
         }
         self.tracker
             .record(self.prompt.static_prefix(), stable_history)?;
+        let rebuilt_tools = tool_snapshot.rebuilt_for_late_mcp();
         Ok(PreparedTurn {
             system_static: self.prompt.static_prefix().clone(),
             messages: stable_history.to_vec(),
             developer_context: dynamic.into_developer_context(),
             tools: tool_snapshot.into_tools(),
-            rebuilt_tools: self.tools.rebuild_count() == 1 && self.tracker.turn() == 1,
+            rebuilt_tools,
         })
     }
 
@@ -492,18 +562,39 @@ impl<T: Clone + PartialEq> PromptCache<T> {
         available_tools: &[T],
         mcp_status: McpToolStatus,
     ) -> Result<PreparedTurn<T>, CacheViolation> {
-        let tool_snapshot = self.tools.tools_for_request(available_tools, mcp_status);
-        if tool_snapshot.rebuilt_for_late_mcp() {
+        self.prepare_turn_owned_with_tool_revision(
+            stable_history,
+            dynamic,
+            available_tools,
+            mcp_status,
+            0,
+        )
+    }
+
+    /// Owned-history variant of [`Self::prepare_turn_with_tool_revision`].
+    pub fn prepare_turn_owned_with_tool_revision(
+        &mut self,
+        stable_history: Vec<Message>,
+        dynamic: DynamicContext,
+        available_tools: &[T],
+        mcp_status: McpToolStatus,
+        tool_revision: u64,
+    ) -> Result<PreparedTurn<T>, CacheViolation> {
+        let tool_snapshot =
+            self.tools
+                .tools_for_request_with_revision(available_tools, mcp_status, tool_revision);
+        if tool_snapshot.changed() {
             self.tracker.reset();
         }
         self.tracker
             .record(self.prompt.static_prefix(), &stable_history)?;
+        let rebuilt_tools = tool_snapshot.rebuilt_for_late_mcp();
         Ok(PreparedTurn {
             system_static: self.prompt.static_prefix().clone(),
             messages: stable_history,
             developer_context: dynamic.into_developer_context(),
             tools: tool_snapshot.into_tools(),
-            rebuilt_tools: self.tools.rebuild_count() == 1 && self.tracker.turn() == 1,
+            rebuilt_tools,
         })
     }
 
@@ -747,6 +838,82 @@ mod tests {
         assert!(!frozen.rebuilt_for_late_mcp());
         assert_eq!(frozen.tools(), ["shell", "mcp-first"]);
         assert_eq!(tools.rebuild_count(), 1);
+    }
+
+    #[test]
+    fn explicit_tool_revisions_expand_more_than_once_and_ignore_stale_snapshots() {
+        let mut tools = LockedTools::new();
+        let initial = tools.tools_for_request_with_revision(
+            &["shell", "tool_search"],
+            McpToolStatus::Ready,
+            0,
+        );
+        let first = tools.tools_for_request_with_revision(
+            &["shell", "tool_search", "mcp-browser"],
+            McpToolStatus::Ready,
+            1,
+        );
+        let second = tools.tools_for_request_with_revision(
+            &["shell", "tool_search", "mcp-browser", "mcp-docs"],
+            McpToolStatus::Ready,
+            2,
+        );
+        let stale = tools.tools_for_request_with_revision(
+            &["shell", "tool_search"],
+            McpToolStatus::Ready,
+            1,
+        );
+
+        assert!(!initial.changed());
+        assert!(first.changed());
+        assert!(second.changed());
+        assert_eq!(
+            stale.tools(),
+            ["shell", "tool_search", "mcp-browser", "mcp-docs"]
+        );
+        assert!(!stale.changed());
+        assert_eq!(tools.revision(), 2);
+        assert_eq!(
+            tools.rebuild_count(),
+            0,
+            "progressive disclosure is distinct from the one late-MCP rebuild"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_accepts_versioned_tool_expansion_but_not_unversioned_drift() {
+        let history = [message(Role::User, "question")];
+        let mut cache = PromptCache::new("stable");
+        let initial = cache
+            .prepare_turn_with_tool_revision(
+                &history,
+                DynamicContext::default(),
+                &["shell", "tool_search"],
+                McpToolStatus::Ready,
+                0,
+            )
+            .unwrap();
+        let expanded = cache
+            .prepare_turn_with_tool_revision(
+                &history,
+                DynamicContext::default(),
+                &["shell", "tool_search", "mcp-browser"],
+                McpToolStatus::Ready,
+                1,
+            )
+            .unwrap();
+        let ignored = cache
+            .prepare_turn(
+                &history,
+                DynamicContext::default(),
+                &["shell"],
+                McpToolStatus::Ready,
+            )
+            .unwrap();
+
+        assert_eq!(initial.tools(), ["shell", "tool_search"]);
+        assert_eq!(expanded.tools(), ["shell", "tool_search", "mcp-browser"]);
+        assert_eq!(ignored.tools(), expanded.tools());
     }
 
     #[test]

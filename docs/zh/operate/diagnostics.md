@@ -45,7 +45,9 @@ zuno debug agent build
 
 `debug agent <name>` 打印该 Agent 的生效契约：解析出的模型路由、工具可见性、权限规则集，
 以及经 Agent 过滤后的 Skill 视图，包含元数据与已选正文预算、已渲染/已省略/已截断的覆盖
-情况，以及一段有界预览。
+情况，以及一段有界预览。对于已连接 MCP 工具，`mcp.schemaExposure` 会区分策略可见能力
+与首次实际发送给 provider 的 schema，列出隐藏在 `tool_search` 后的工具，并报告会迫使
+立即暴露的已注册同名冲突。
 
 在改动 `tools`、`permission`、`requiredSkills` 或某个预设之后都应读一次。解析后的集合是
 多层作用的产物，仅凭配置无法可靠预测。参见 [自定义 Agent](/zh/config/custom-agents)。

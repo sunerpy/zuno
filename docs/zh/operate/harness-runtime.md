@@ -25,6 +25,13 @@ Agent 具有显式的正向职责、负向委派边界、权限以及结构化�
 
 内置 Agent 的分工：`build` 负责端到端交付，`plan` 是只读规划，`deep` 承担困难的跨领域实现且不再递归委派。
 
+根回合对已连接 MCP schema 使用渐进式披露：调度器保留可执行实现，`tool_search`
+只搜索紧凑元数据，匹配项从下一次 provider step 起按单调 revision 扩展确切工具快照。
+Agent 的确切 `tools` 允许列表会立即公开其中点名的 MCP schema；子级仍受父级 Attempt
+中已持久化的确切 schema 上限约束，不能搜索出更大的权限面。ACP session-local
+`mcpServers` 在严格连接门禁后也立即公开，但同一目录中的宿主配置 server 仍延迟发现；
+Catalog 会把这个会话边界传递到子回合与后台续跑。
+
 ## 扩展包与可执行插件宿主
 
 扩展要么是显式 WASI 授权下的 WebAssembly 组件，要么是使用行分隔 JSON-RPC 的受限子进程。能力必须声明，不会被默认赋予。

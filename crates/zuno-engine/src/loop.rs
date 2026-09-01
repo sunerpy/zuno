@@ -822,6 +822,8 @@ pub trait AgentModelResolver: Send + Sync {
 pub struct AvailableTools {
     pub definitions: Vec<ToolDefinition>,
     pub mcp_status: McpToolStatus,
+    /// Monotonic turn-local revision for intentional progressive disclosure.
+    pub revision: u64,
 }
 
 impl AvailableTools {
@@ -830,7 +832,15 @@ impl AvailableTools {
         Self {
             definitions,
             mcp_status,
+            revision: 0,
         }
+    }
+
+    /// Attach the current progressive-disclosure revision.
+    #[must_use]
+    pub const fn with_revision(mut self, revision: u64) -> Self {
+        self.revision = revision;
+        self
     }
 }
 
@@ -1589,11 +1599,12 @@ async fn run_turn_in_span(
         } else {
             request.dynamic_context.clone()
         };
-        let prepared = cache.prepare_turn_owned(
+        let prepared = cache.prepare_turn_owned_with_tool_revision(
             stable_history,
             dynamic_context,
             &definitions,
             available.mcp_status,
+            available.revision,
         )?;
         let prepared = if step_limit_finalization.is_some() {
             prepared.without_tools()

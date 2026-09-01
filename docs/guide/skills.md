@@ -28,23 +28,23 @@ silent surprise.
 Zuno discovers Skills in this scope order:
 
 1. project `.zuno/skill` and `.zuno/skills` roots, from the current directory to the worktree;
-2. project `.agents/skills`, then `.claude/skills`, over the same walk;
+2. project `.agents/skills` roots over the same walk;
 3. Zuno's global and configured config directories;
-4. global `~/.agents/skills`, then `~/.claude/skills`;
+4. global `~/.agents/skills`;
 5. explicit `skills.paths`;
 6. configured remote indexes.
 
 Project scope is therefore advertised before user-global scope. Zuno never scans
-`.opencode` or an OpenCode config directory. The same canonical source path is
-de-duplicated, including symlink aliases.
+`.claude`, `.opencode`, or another product's config directory implicitly. A shared
+directory can still be selected deliberately through `skills.paths`. The same canonical
+source path is de-duplicated, including symlink aliases.
 
 ```sh
 ZUNO_DISABLE_EXTERNAL_SKILLS=1 zuno
-ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1 zuno
 ```
 
-The first disables both `.agents` and `.claude` roots; the second disables only the Claude
-roots. Zuno-native `.zuno` roots stay enabled under the broad switch.
+This disables implicit `.agents` roots. Zuno-native `.zuno` roots, configured Zuno roots,
+and explicit `skills.paths` stay enabled.
 
 ## How a Skill reaches the model
 
@@ -62,6 +62,8 @@ The prompt gets the catalog, not the bodies:
 
 `maxContextTokens` bounds the compact catalog. Its default is roughly two percent of the
 model context, or 8,000 approximate tokens when the context is unknown, capped at 10,000.
+Unique Skill names omit their absolute source path from this prompt index. A source
+locator is included only for same-named entries that would otherwise be ambiguous.
 
 Fully selected bodies share a separate aggregate budget. Its default is ten percent of a
 known context, with a 2,000-token floor and a 32,000-token ceiling.
@@ -71,6 +73,11 @@ silently dropping instructions.
 
 `includeInstructions: false` removes both the trigger policy and the catalog from prompts.
 The `skill` tool still supports paged `list` and `search`.
+
+A large personal library therefore does not inject every `SKILL.md` body into every
+request. If a vendor or domain pack is rarely relevant, keep it outside the implicit
+roots and add that pack through a project-specific `skills.paths` entry; do not delete or
+merge distinct Skills merely to reduce the catalog count.
 
 ## Loading is paged and must complete
 

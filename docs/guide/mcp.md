@@ -141,6 +141,31 @@ work-capable role may opt into automatic inheritance, and a read-only agent can 
 one audited tool id explicitly in its own rules, but the parent schema ceiling and the
 exact-schema check still apply. See [Agents](/guide/agents).
 
+### Progressive schema discovery
+
+Passing the four gates above makes an MCP tool executable; it does not require Zuno to
+inject every connected schema into every provider request. For a root turn without an
+exact Agent `tools` allowlist, matching MCP schemas are deferred behind `tool_search`.
+That tool searches ids, display names, and descriptions. Matches are added cumulatively
+to the next provider step and cannot be called from the same assistant tool-call batch
+that discovered them.
+
+This changes prompt exposure, not authorization: search cannot restore a denied tool or
+one removed by capability filtering. An exact Agent `tools` allowlist is treated as an
+intentional schema selection, so the MCP tools named there remain eagerly visible. A
+delegated child receives only exact schemas recorded in the parent Attempt and does not
+gain a broader catalog by searching.
+
+ACP session-local `mcpServers` are also an explicit client contract. Their schemas are
+present in the first provider request after the session's strict connection gate
+succeeds; host-configured MCP servers in the same session remain progressively
+discoverable. This distinction follows the session across child and background turns.
+
+The provider-request snapshot records the exact post-search tool schemas. Search results
+also record matched ids and the monotonic catalog revision in the durable tool result. If
+another registered tool already defines `tool_search`, Zuno does not shadow it: schemas
+stay eager for that turn and the host emits a warning.
+
 ## Concurrency and timeouts
 
 ```json

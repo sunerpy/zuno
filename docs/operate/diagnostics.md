@@ -52,7 +52,9 @@ zuno debug agent build
 `debug agent <name>` prints the effective contract for that agent: its resolved model
 route, tool visibility, permission ruleset, and the agent-filtered Skill view including
 metadata and selected-body budgets, rendered/omitted/truncated coverage, and a bounded
-preview.
+preview. For connected MCP tools, `mcp.schemaExposure` distinguishes policy-visible
+capabilities from schemas initially sent to the provider, lists tools deferred behind
+`tool_search`, and reports a registered name conflict that forces eager exposure.
 
 Read this after any change to `tools`, `permission`, `requiredSkills`, or a preset. The
 resolved set is a product of several layers and is not reliably predictable from

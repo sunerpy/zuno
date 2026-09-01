@@ -189,9 +189,38 @@ pub struct RegistryFlags {
 }
 
 /// MCP tools supplied by the wave-8 MCP host.
+#[derive(Clone, Default)]
+pub struct McpToolSnapshot {
+    /// Connected tools in provider order.
+    pub tools: Vec<CustomTool>,
+    /// Tool ids that an explicit session contract requires on the first request.
+    pub eager_tool_ids: Vec<String>,
+}
+
+/// MCP tools supplied by the wave-8 MCP host.
 pub trait McpToolLoader: Send + Sync {
     /// Return the connected servers' tools in host-defined order.
     fn tools(&self) -> Vec<CustomTool>;
+
+    /// Return connected tool ids that are part of an explicit session contract.
+    ///
+    /// These schemas must be visible on the first provider request rather than
+    /// waiting for progressive discovery. The default keeps ordinary
+    /// host-configured MCP catalogs deferred.
+    fn eager_tool_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Freeze tools and first-request exposure metadata together.
+    ///
+    /// Loaders backed by mutable catalogs should override this method so a
+    /// disconnect cannot race the two halves of the snapshot.
+    fn snapshot(&self) -> McpToolSnapshot {
+        McpToolSnapshot {
+            tools: self.tools(),
+            eager_tool_ids: self.eager_tool_ids(),
+        }
+    }
 }
 
 /// The default until MCP tool discovery is wired.
@@ -372,7 +401,7 @@ impl ToolRegistryBuilder {
                     ToolSource::Mcp => insert_tools(
                         &mut sourced_tools,
                         &mut diagnostics,
-                        self.mcp_loader.tools(),
+                        self.mcp_loader.snapshot().tools,
                         source,
                     ),
                 }

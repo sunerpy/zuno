@@ -22,6 +22,7 @@ use zuno_tool::{
     ToolConcurrencyPolicy, ToolContext, ToolDefinition, ToolOutput, ToolReplayPolicy,
 };
 
+use crate::deferred_tools::DeferredToolCatalog;
 use crate::hooks::{NoopHooks, PermissionHookDecision, ToolHooks};
 use crate::r#loop::{
     AvailableTools, DispatchRequest, PreparedToolDispatch, ToolBlockKind, ToolDispatchResult,
@@ -29,6 +30,8 @@ use crate::r#loop::{
 };
 
 const TOOL_INTERRUPT_SETTLE_GRACE: Duration = Duration::from_secs(2);
+
+pub use crate::deferred_tools::TOOL_SEARCH_ID;
 
 /// Executable tools plus the policy collaborators needed at the dispatch boundary.
 pub struct ToolRegistryDispatcher {
@@ -38,6 +41,7 @@ pub struct ToolRegistryDispatcher {
     authorization: AuthorizationPolicy,
     mcp_status: McpToolStatus,
     hooks: Arc<dyn ToolHooks>,
+    deferred: Option<Arc<DeferredToolCatalog>>,
 }
 
 /// Cross-cutting authorization policy applied after explicit deny rules.
@@ -99,7 +103,34 @@ impl ToolRegistryDispatcher {
             authorization,
             mcp_status,
             hooks: Arc::new(NoopHooks),
+            deferred: None,
         }
+    }
+
+    /// Keep `ids` executable while withholding their schemas until `tool_search`
+    /// selects matching metadata.
+    ///
+    /// The supplied set has already passed Agent allowlists, parent authority, and
+    /// registry suppression. Permission-hidden tools are excluded again here so
+    /// discovery cannot reveal a capability this Agent is not allowed to see.
+    #[must_use]
+    pub fn with_deferred_tools(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+        let ids = ids.into_iter().collect::<BTreeSet<_>>();
+        if ids.is_empty() || self.tools.iter().any(|tool| tool.id() == TOOL_SEARCH_ID) {
+            return self;
+        }
+        let candidates = self
+            .tools
+            .iter()
+            .filter(|tool| ids.contains(tool.id()) && is_tool_visible(tool.id(), &self.rules))
+            .map(|tool| tool.definition())
+            .collect();
+        let Some(catalog) = DeferredToolCatalog::new(candidates) else {
+            return self;
+        };
+        self.tools.push(catalog.search_tool());
+        self.deferred = Some(catalog);
+        self
     }
 
     #[must_use]
@@ -114,15 +145,25 @@ impl ToolRegistryDispatcher {
     /// state the active Agent cannot actually update.
     #[must_use]
     pub fn has_visible_tool(&self, name: &str) -> bool {
-        self.tools
-            .iter()
-            .any(|tool| tool.id() == name && is_tool_visible(tool.id(), &self.rules))
+        self.tools.iter().any(|tool| {
+            tool.id() == name
+                && is_tool_visible(tool.id(), &self.rules)
+                && self
+                    .deferred
+                    .as_ref()
+                    .is_none_or(|catalog| !catalog.contains(name) || catalog.is_exposed(name))
+        })
     }
 
     fn visible_definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
-            .filter(|tool| is_tool_visible(tool.id(), &self.rules))
+            .filter(|tool| {
+                is_tool_visible(tool.id(), &self.rules)
+                    && self.deferred.as_ref().is_none_or(|catalog| {
+                        !catalog.contains(tool.id()) || catalog.is_exposed(tool.id())
+                    })
+            })
             .map(|tool| tool.definition())
             .collect()
     }
@@ -138,7 +179,11 @@ impl ToolRegistryDispatcher {
 #[async_trait]
 impl ToolDispatcher for ToolRegistryDispatcher {
     fn available_tools(&self) -> AvailableTools {
-        AvailableTools::new(self.visible_definitions(), self.mcp_status)
+        AvailableTools::new(self.visible_definitions(), self.mcp_status).with_revision(
+            self.deferred
+                .as_ref()
+                .map_or(0, |catalog| catalog.revision()),
+        )
     }
 
     fn concurrency_policy(&self, request: &DispatchRequest) -> ToolConcurrencyPolicy {

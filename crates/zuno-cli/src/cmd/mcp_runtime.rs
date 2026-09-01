@@ -147,7 +147,10 @@ impl McpRuntime {
             .filter(|(name, server)| self::enabled(server) && !required_set.contains(name))
             .map(|(name, _)| name.clone())
             .collect();
-        let catalog = zuno_mcp::Catalog::new(configs.keys().cloned());
+        let catalog = zuno_mcp::Catalog::new_with_eager_servers(
+            configs.keys().cloned(),
+            required_names.iter().cloned(),
+        );
         let controller = zuno_mcp::McpServerController::from_config(
             catalog.clone(),
             workspace,

@@ -60,13 +60,12 @@ fn verbose_form_bytes() {
 }
 
 #[test]
-fn index_form_contains_name_description_and_exact_source() {
+fn index_form_omits_redundant_sources_for_unique_names() {
     let rendered = render(&corpus(), Form::Index);
     assert!(rendered.starts_with("<skill_index>"));
     assert!(rendered.contains("name=\"add-office365\""));
     assert!(rendered.contains("Adds Office 365 Outlook connector"));
-    assert!(rendered.contains("source=\"/workspace/app/.zuno/skills/add-office365/SKILL.md\""));
-    assert!(rendered.contains("source=\"&lt;built-in&gt;\""));
+    assert!(!rendered.contains(" source="), "{rendered}");
 }
 
 #[test]
@@ -170,7 +169,7 @@ fn an_unspent_budget_is_byte_identical_to_the_unbounded_form() {
 }
 
 #[test]
-fn a_large_index_keeps_every_source_identity_by_shortening_descriptions() {
+fn a_large_unique_index_keeps_every_name_without_repeating_absolute_paths() {
     let corpus = (0..137)
         .map(|at| {
             skill(
@@ -188,11 +187,7 @@ fn a_large_index_keeps_every_source_identity_by_shortening_descriptions() {
     assert!(budgeted.text.len() < 16 * 1024);
     assert!(budgeted.text.contains("name=\"skill-000\""));
     assert!(budgeted.text.contains("name=\"skill-136\""));
-    assert!(
-        budgeted
-            .text
-            .contains("source=\"/skills/skill-136/SKILL.md\"")
-    );
+    assert!(!budgeted.text.contains(" source="));
     assert!(budgeted.truncated > 0);
     assert!(
         !budgeted.text.contains(&"trigger ".repeat(750)),
@@ -215,7 +210,7 @@ fn the_progressive_catalog_spends_budget_on_source_identity_before_description_d
         ),
     ];
 
-    let minimum = "<skill_index>\n  <name>same</name>\n  <name>same</name>\n</skill_index>";
+    let minimum = "<skill_index>\n  <skill name=\"same\" source=\"/skills/first/SKILL.md\" />\n  <skill name=\"same\" source=\"/skills/second/SKILL.md\" />\n</skill_index>";
     let budgeted = render_within(&corpus, Form::Index, 512);
 
     assert_eq!(budgeted.rendered, 2);

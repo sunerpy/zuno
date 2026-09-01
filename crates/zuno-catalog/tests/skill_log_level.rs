@@ -98,9 +98,9 @@ async fn same_named_sources_are_not_warnings_while_a_broken_skill_still_warns() 
     let tree = TempDir::new().expect("tempdir");
     let root = tree.path();
     skill(
-        &root.join("home/.claude/skills/dupe"),
+        &root.join("home/.config/zuno/skill/dupe"),
         "dupe",
-        "from claude",
+        "from zuno",
     );
     skill(
         &root.join("home/.agents/skills/dupe"),

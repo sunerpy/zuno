@@ -1,36 +1,30 @@
-//! The `SKILL.md` file scan — this project's stand-in for the oracle's three
-//! glob patterns.
+//! Deterministic `SKILL.md` discovery for Zuno-owned, Agent-shared, and
+//! explicitly configured roots.
 //!
-//! `skill/index.ts:23-25` declares them:
+//! Three root classes have intentionally different patterns:
 //!
 //! ```text
-//! EXTERNAL_SKILL_PATTERN  = "skills/**/SKILL.md"          // ~/.claude, ~/.agents, project
-//! ZUNO_SKILL_PATTERN  = "{skill,skills}/**/SKILL.md"   // every config directory
-//! SKILL_PATTERN           = "**/SKILL.md"                  // skills.paths[], pulled URLs
+//! AGENT_SKILL_PATTERN = "skills/**/SKILL.md"          // ~/.agents and project .agents
+//! ZUNO_SKILL_PATTERN  = "{skill,skills}/**/SKILL.md"  // every Zuno config directory
+//! SKILL_PATTERN       = "**/SKILL.md"                  // skills.paths[], pulled URLs
 //! ```
 //!
-//! and `scan` (`:142-171`) runs each through `Glob.scan` with
-//! `absolute: true, include: "file", symlink: true` and a per-call `dot`.
-//! Three of those options carry real behaviour and were each confirmed against
-//! `opencode debug skill` 1.18.13:
+//! Scans return absolute files, follow directory symlinks, and control hidden
+//! directory traversal per root class:
 //!
-//! * `symlink: true` becomes node-glob's `follow`, so `**` descends into
-//!   symlinked directories. A `~/.agents/skills/link -> /elsewhere/skill` is
-//!   found, and the *symlink* path is what the oracle reports as `location`,
-//!   not the resolved target. That is why matches are collected as walked.
-//! * `include: "file"` becomes `nodir`. A `SKILL.md` that is itself a symlink to
-//!   a file still matches.
-//! * `dot` is `true` for the external roots (`:193`, `:201`) and left unset —
-//!   therefore false — for config directories and `skills.paths[]`. A
+//! * `**` descends into symlinked directories. A
+//!   `~/.agents/skills/link -> /elsewhere/skill` is found, while later canonical
+//!   source de-duplication prevents the target from being advertised twice.
+//! * A `SKILL.md` that is itself a symlink to a file still matches.
+//! * Hidden traversal is enabled for Agent-shared roots and disabled for Zuno
+//!   config directories and `skills.paths[]`. A
 //!   `.hidden/x/SKILL.md` under a config directory is invisible; a
 //!   `.dotdir/x/SKILL.md` under `~/.agents/skills` is not.
 //!
 //! `**` also matches zero segments, so `~/.agents/skills/SKILL.md` is a match.
 //!
-//! One deliberate difference: matches are sorted before they are returned.
-//! node-glob's order is filesystem order, and the oracle then loads every match
-//! concurrently, which makes its duplicate-name winner genuinely racy (see
-//! [`crate::skill`]). Sorting is what makes this port's result reproducible.
+//! Matches are sorted before they are returned, so discovery and ambiguity
+//! reporting are reproducible across filesystems.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;

@@ -123,6 +123,25 @@ ACP 客户端可以在 new/load/resume 时提供完整的 session-local `mcpServ
 
 MCP 与扩展工具不会自动对每个只读 Agent 可用。具备工作能力的角色可以选择自动继承，只读 Agent 也可以在自己的规则中被显式授予一个经过审计的工具 id，但父级 schema 上限与确切 schema 校验仍然生效。参见 [Agent](/zh/guide/agents)。
 
+### 渐进式 schema 发现
+
+通过上述四道门禁意味着 MCP 工具可执行，并不意味着 Zuno 必须在每次 provider 请求中
+注入所有已连接 schema。对于没有 Agent 确切 `tools` 允许列表的根回合，匹配的 MCP
+schema 默认隐藏在 `tool_search` 后。该工具搜索 id、显示名称与描述；匹配项会累积加入
+下一次 provider step，不能在发现它们的同一批 assistant 工具调用中立即调用。
+
+这只改变提示词暴露，不改变授权：搜索无法恢复被权限拒绝或被能力过滤移除的工具。Agent
+确切 `tools` 允许列表被视为有意选择 schema，其中点名的 MCP 工具保持立即可见。被委派
+的子级只接收父级 Attempt 已记录的确切 schema，不能通过搜索获得更大的目录。
+
+ACP session-local `mcpServers` 同样属于客户端显式契约。严格连接门禁成功后，它们的
+schema 会出现在第一次 provider 请求中；同一会话里的宿主配置 MCP server 仍采用渐进式
+发现。该区分会随会话传递到子回合与后台续跑。
+
+provider 请求快照记录搜索后的确切工具 schema；搜索结果也会把匹配 id 与单调递增的
+目录 revision 写入持久工具结果。如果另一个已注册工具已经定义了 `tool_search`，Zuno
+不会遮蔽它：该回合保持 schema 立即可见，并由宿主发出警告。
+
 ## 并发与超时
 
 ```json

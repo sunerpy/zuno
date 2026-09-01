@@ -69,25 +69,25 @@ Zuno discovers Skills in this scope order:
 | # | Root | Pattern |
 | --- | --- | --- |
 | 1 | Every project `.zuno` from the current directory up to the worktree | `{skill,skills}/**/SKILL.md` |
-| 2 | Every project `.agents`, then `.claude` | `skills/**/SKILL.md` |
+| 2 | Every project `.agents` | `skills/**/SKILL.md` |
 | 3 | Zuno's global and configured config directories | `{skill,skills}/**/SKILL.md` |
-| 4 | `$HOME/.agents`, then `$HOME/.claude` | `skills/**/SKILL.md` |
+| 4 | `$HOME/.agents` | `skills/**/SKILL.md` |
 | 5 | Each `skills.paths` entry | `**/SKILL.md` |
 | 6 | Each cache directory a `skills.urls` index produced | `**/SKILL.md` |
 
-Project scope is advertised before user-global scope. Zuno never scans `.opencode` or
-an OpenCode configuration directory.
+Project scope is advertised before user-global scope. Zuno never scans `.claude`,
+`.opencode`, or another product's configuration directory implicitly. Add one through
+`skills.paths` only when that sharing is intentional.
 
 The same canonical source path is de-duplicated, including symlink aliases. Same-named
 Skills from different sources remain independently addressable and no hidden winner is
-selected — which is why the catalog reports a `source` locator and why the model must
-supply one when a name is ambiguous. An ambiguous name also disables the direct
-`/<skill-name>` slash form.
+selected. The compact prompt index omits source paths for unique names and reports a
+`source` locator only for ambiguous names; the model must supply one in that case. An
+ambiguous name also disables the direct `/<skill-name>` slash form.
 
 | Variable | Effect |
 | --- | --- |
-| `ZUNO_DISABLE_EXTERNAL_SKILLS=1` | Disable `.agents` and `.claude` roots |
-| `ZUNO_DISABLE_CLAUDE_CODE_SKILLS=1` | Disable only Claude skill roots |
+| `ZUNO_DISABLE_EXTERNAL_SKILLS=1` | Disable implicit `.agents` roots |
 
 Zuno-native `.zuno` roots stay enabled under the broad external switch.
 

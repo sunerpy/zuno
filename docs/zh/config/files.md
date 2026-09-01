@@ -123,7 +123,7 @@ zuno --sandbox workspace-write --sandbox-on-unavailable run-unconfined
 | --- | --- |
 | Agent | 全局配置根与每个项目 `.zuno` 之下的 `agent/*.md` 与 `agents/*.md` |
 | 命令 | 同样这些根目录下递归查找的 `command/**/*.md` 与 `commands/**/*.md` |
-| Skill | 项目 `.zuno/skill(s)`、项目 `.agents/skills` 然后 `.claude/skills`、全局配置根、`~/.agents/skills` 然后 `~/.claude/skills`、`skills.paths`、远端索引 |
+| Skill | 项目 `.zuno/skill(s)`、项目 `.agents/skills`、全局配置根、`~/.agents/skills`、`skills.paths`、远端索引 |
 | 扩展 | 项目使用 `.zuno/extensions`；全局配置根之下的 `extensions` |
 
 对以上任何一项，Zuno 都绝不扫描 `.opencode` 或 OpenCode 的配置目录。
